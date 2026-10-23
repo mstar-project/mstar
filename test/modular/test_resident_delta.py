@@ -40,6 +40,10 @@ from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
 
 
+def _no_kept_ids(rid):
+    return None
+
+
 def _entries(delta: OffloadDelta) -> list[tuple[str, MoveKind]]:
     return list(zip(delta.rids, delta.kinds, strict=True))
 
@@ -256,12 +260,12 @@ def test_replay_is_exempt_from_both_guards():
     delta = OffloadDelta.new()
     delta.add(MoveKind.OFFLOAD, "wire-a")
 
-    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.apply_resident_delta("node", delta, _no_kept_ids) is True
     assert engine.is_offloaded("node", "a")
 
     back = OffloadDelta.new()
     back.add(MoveKind.RELOAD, "wire-a")
-    assert engine.apply_resident_delta("node", back) is True
+    assert engine.apply_resident_delta("node", back, _no_kept_ids) is True
     assert not engine.is_offloaded("node", "a")
 
 
@@ -412,7 +416,7 @@ def test_replaying_a_delta_reproduces_the_leaders_state():
     delta.add(MoveKind.RELOAD, "wire-a")
     delta.add(MoveKind.OFFLOAD, "wire-a")
 
-    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.apply_resident_delta("node", delta, _no_kept_ids) is True
     assert engine.is_offloaded("node", "a"), (
         "replay ended with 'a' resident; the leader has it on the host"
     )
@@ -428,11 +432,11 @@ def test_a_refused_entry_stops_the_replay_where_it_is():
     delta.add(MoveKind.OFFLOAD, "wire-a")
     delta.add(MoveKind.OFFLOAD, "wire-b")
 
-    assert engine.apply_resident_delta("node", delta) is False
+    assert engine.apply_resident_delta("node", delta, _no_kept_ids) is False
     assert len(delta) == 2, "a refused entry must stay queued"
 
     engine.resource.refuse_offload = False
-    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.apply_resident_delta("node", delta, _no_kept_ids) is True
     assert engine.is_offloaded("node", "a") and engine.is_offloaded("node", "b")
 
 
@@ -444,11 +448,11 @@ def test_a_move_for_a_request_this_rank_has_not_taken_in_waits_for_it():
     delta.add(MoveKind.OFFLOAD, "wire-a")
     delta.add(MoveKind.OFFLOAD, "wire-b")
 
-    assert engine.apply_resident_delta("node", delta) is False
+    assert engine.apply_resident_delta("node", delta, _no_kept_ids) is False
     assert len(delta) == 2 and not engine.is_offloaded("node", "b"), "a move ran ahead of one still owed"
 
     engine._graph_runtime._live.add("a")
-    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.apply_resident_delta("node", delta, _no_kept_ids) is True
     assert engine.is_offloaded("node", "a"), "the move was lost while it waited"
 
 
@@ -461,7 +465,7 @@ def test_a_request_holding_nothing_is_not_a_refusal():
     delta = OffloadDelta.new()
     delta.add(MoveKind.OFFLOAD, "wire-a")
 
-    assert engine.apply_resident_delta("node", delta) is True
+    assert engine.apply_resident_delta("node", delta, _no_kept_ids) is True
     assert len(delta) == 0
 
 
@@ -472,7 +476,7 @@ def test_replaying_does_not_journal_it_onward():
     delta = OffloadDelta.new()
     delta.add(MoveKind.OFFLOAD, "wire-a")
 
-    engine.apply_resident_delta("node", delta)
+    engine.apply_resident_delta("node", delta, _no_kept_ids)
 
     assert len(engine.take_resident_delta("node")) == 0
 
@@ -492,7 +496,7 @@ def test_each_replayed_move_is_logged(caplog):
     delta.add(MoveKind.RELOAD, "wire-a")
 
     with caplog.at_level(logging.INFO, logger=engine_mod.__name__):
-        assert engine.apply_resident_delta("node", delta) is True
+        assert engine.apply_resident_delta("node", delta, _no_kept_ids) is True
 
     lines = [r.getMessage() for r in caplog.records]
     assert any("Replayed rank 0's offload of request wire-a from node" in ln for ln in lines), lines
@@ -508,7 +512,7 @@ def test_a_no_op_replay_is_not_logged_as_a_move(caplog):
     delta.add(MoveKind.OFFLOAD, "wire-a")  # already off here
 
     with caplog.at_level(logging.INFO, logger=engine_mod.__name__):
-        assert engine.apply_resident_delta("node", delta) is True
+        assert engine.apply_resident_delta("node", delta, _no_kept_ids) is True
 
     assert not [r for r in caplog.records if "Replayed" in r.getMessage()]
 
@@ -608,6 +612,7 @@ class _Leader:
         self.parallel_nodes = {"node"}
         self.parallel_leader_nodes = {"node"}
         self._tp_broadcast_seq = 0
+        self._victims = {}
         group = SimpleNamespace(_workers=["rank0", *followers])
         # The runtime owns both the sharding config and the handle table now.
         # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
@@ -807,7 +812,7 @@ def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     delta.add(MoveKind.RELOAD, "wire-a")
 
     with caplog.at_level(logging.WARNING, logger=engine_mod.__name__):
-        assert engine.apply_resident_delta("node", delta) is False
+        assert engine.apply_resident_delta("node", delta, _no_kept_ids) is False
 
     line = next(r.getMessage() for r in caplog.records if "does not fit" in r.getMessage())
     assert "reload of wire-a on node" in line
@@ -825,7 +830,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
     """A refused replay leaves moves owed, so the rids the head names do not mean
     here what they meant on the leader. Wait rather than build."""
     engine = SimpleNamespace(
-        apply_resident_delta=lambda node, delta: False,  # refuses
+        apply_resident_delta=lambda node, delta, kept_ids: False,  # refuses
         is_offloaded=lambda node, rid: False,
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
         get_max_batch_size=lambda node, walk: None,
@@ -1059,7 +1064,7 @@ class _FollowSpec:
     def __init__(self, *, replay_refuses: bool):
         self.worker_id = "worker_1"
         self.engine = SimpleNamespace(
-            apply_resident_delta=lambda node, delta: not replay_refuses,
+            apply_resident_delta=lambda node, delta, kept_ids: not replay_refuses,
             is_offloaded=lambda node, rid: False,
             reclaimable=lambda node, rid: 0,
             check_ready=lambda *a, **kw: FULL_ADMIT_OK,

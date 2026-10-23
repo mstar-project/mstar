@@ -30,7 +30,7 @@ NODE = "LLM"
 def _worker(kv):
     """The real handlers over one pool, with the engine's drop going straight to the pool."""
     engine = SimpleNamespace(
-        drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid: kv.drop(rid),
+        drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid, kept: kv.drop(rid),
     )
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()

@@ -80,7 +80,7 @@ def _prefill(kv: KVManager, rid: str, length: int, kind: str = "ids") -> None:
 def _engine(resources: dict) -> Engine:
     engine = Engine.__new__(Engine)
     engine._runner, engine._submodules = StepRunner(resources), {NODE: SimpleNamespace(resources=resources)}
-    engine._tp_follower_nodes = set()
+    engine._tp_follower_nodes, engine._resident_delta = set(), {}
     return engine
 
 
@@ -110,7 +110,7 @@ def test_a_refused_drop_changes_nothing(refusal):
     kv._overrides["r"].guaranteed = refusal == "guaranteed"
     assert refusal != "step" or kv.admit(*_step("r", 1)).ok
     kv._streams["r"]["main"].read_pending = refusal == "read"
-    kv._world_size = 2 if refusal == "ranks" else kv._world_size
+    kv._world_size, kv._counts = (2, False) if refusal == "ranks" else (kv._world_size, kv._counts)
     kv._cpu_pool = SimpleNamespace(is_offloaded=lambda rid: refusal == "host")
     pages = list(kv._streams["r"]["main"].page_indices)
 
@@ -134,7 +134,7 @@ def test_a_drop_keeps_the_sampler_and_starts_positions_and_recurrent_state_over(
     sampler._sampler._step_offset["r"] = 7
     sampler._sampler.get_token_mask("r").add_tokens(3)
 
-    engine.drop_request(NODE, "r")
+    engine.drop_request(NODE, "r", 0)
 
     assert sampler._sampler._step_offset["r"] == 7, "the RNG offset can't be recomputed"
     assert sampler._sampler.get_token_mask("r")._seen_token_mask[3], "the repetition mask can't be recomputed"
@@ -147,7 +147,7 @@ def test_a_sampler_that_scatters_in_its_graph_refuses_a_drop():
     sampler = SamplerResource(vocab_size=64, enable_repetion_penalty=False, device=CPU)
     sampler._cg_buffers = SimpleNamespace(ingraph_scatter=True)
     with pytest.raises(RuntimeError):
-        _engine({"sampler": sampler}).drop_request(NODE, "r")
+        _engine({"sampler": sampler}).drop_request(NODE, "r", 0)
 
 
 def test_a_refusal_by_any_resource_leaves_every_resource_alone():
@@ -161,7 +161,7 @@ def test_a_refusal_by_any_resource_leaves_every_resource_alone():
     rope._counters["r"]["main"] = PAGE_SIZE
 
     with pytest.raises(RuntimeError):
-        engine.drop_request(NODE, "r")
+        engine.drop_request(NODE, "r", 0)
     assert kv.is_resident("r") and kv._streams["r"]["main"].page_indices, "one KV cache dropped and the other kept"
     assert rope._counters["r"] == {"main": PAGE_SIZE}, "the positions were reset for a request that keeps its KV"
 
@@ -207,7 +207,7 @@ def test_a_publish_that_arrives_while_dropped_restores_neither_positions_nor_pag
     _prefill(kv, "r", 2 * PAGE_SIZE)
     # what the conductor sends back with every INPUT_SIGNALS
     published = {"kv": kv.publish("r", NODE, WALK), "rope": PublishedPositionInfo(counters={"main": 2 * PAGE_SIZE})}
-    engine.drop_request(NODE, "r")
+    engine.drop_request(NODE, "r", 0)
 
     outcome = engine.check_ready(NODE, "r", SimpleNamespace(graph_walk=WALK, resource_publish_info=published))
 

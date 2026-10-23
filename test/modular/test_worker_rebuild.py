@@ -42,7 +42,8 @@ def _cleanup(node, rids, wgs):
 def _worker(fresh: ScheduledBatch | None = None):
     eng = SimpleNamespace(dropped=[], landed=[], is_offloaded=lambda node, rid: False,
                           lay_out_rebuild=lambda node, rid, ids: PREFILL, get_max_batch_size=lambda node, walk: 1)
-    eng.is_resident, eng.drop_request = lambda _, rid: rid not in eng.dropped, lambda _, rid: eng.dropped.append(rid)
+    eng.is_resident = lambda _, rid: rid not in eng.dropped
+    eng.drop_request = lambda _, rid, kept: eng.dropped.append(rid)
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     w = Worker.__new__(Worker)
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")

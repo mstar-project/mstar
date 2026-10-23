@@ -591,8 +591,10 @@ class Worker:
         self.tp_async_sched, self.tp_async_nodes = _tp_async_sched_setting(
             os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
         )
-        # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
+        # Leader: monotonic seq stamped on every ScheduleTPNode it sends, and the
+        # followers it last sent one to, for a step with no rows.
         self._tp_broadcast_seq = 0
+        self._tp_followers: list[str] = []
         # Follower: leader steps that will NOT be followed by a head; the
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
@@ -623,6 +625,7 @@ class Worker:
         # worker; the runtime holds the table where the two meet.
         self.scheduler.runtime = self._graph_runtime
         self.scheduler.rid_of = self._rid
+        self.scheduler.kept_ids = self._kept_ids_of
         self.tensor_manager.rid_to_str = self._rid_str
 
         # wire request id -> messages for requests that are not in the queue.
@@ -1133,9 +1136,19 @@ class Worker:
                 f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a step, a backlog or the rebuild queue "
                 f"on {node_name}"
             )
-        freed = self.engine_manager.get_engine(node_name).drop_request(node_name, request_id)
+        kept = self._kept_ids_of(node_name, request_id)
+        freed = self.engine_manager.get_engine(node_name).drop_request(node_name, request_id, len(kept))
         self._dropped[request_id] = node_name
         return freed
+
+    def _kept_ids_of(self, node_name: str, request_id: int) -> array | None:
+        """The request's kept prompt and samples on ``node_name`` as one sequence, or None."""
+        kept = self._kept_ids.get(node_name, {}).get(request_id)
+        if kept is None:
+            return None
+        ids = array("i", kept.prompt)
+        ids.extend(kept.sampled)
+        return ids
 
     def _rebuildable(self, request_id: int, node_name: str) -> bool:
         """Whether the kept ids on ``node_name`` can rebuild the request's KV there.
@@ -1191,14 +1204,18 @@ class Worker:
         self._drop_victims()
         return True
 
-    def _drop_victims(self) -> None:
+    def _drop_victims(self, broadcast: str | None = None) -> None:
         """Drop each victim no step in flight holds. A backlogged row goes back to the runtime and a
-        queued rebuild row leaves its queue first, so neither runs on pages the drop gave up."""
+        queued rebuild row leaves its queue first, so neither runs on pages the drop gave up.
+
+        The followers drop a TP node's victim after every removal stamped with the step before, so rank 0 drops
+        it as it sends the node's next step, the node named by ``broadcast``.
+        """
         for rid, victim in list(self._victims.items()):
-            if rid in self._in_flight_rids:
+            kv = self._kv_caches[victim.key]
+            if rid in self._in_flight_rids or (broadcast not in kv.nodes and kv.nodes & self.parallel_nodes):
                 continue
             del self._victims[rid]
-            kv = self._kv_caches[victim.key]
             if not kv.cache.is_victim(rid):
                 continue  # the request it was chosen for has left
             arrival = kv.cache.arrival(rid)
@@ -1237,9 +1254,7 @@ class Worker:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} isn't dropped on {node_name}")
         if request_id in self._rebuild_rows or request_id in self._in_flight_rids:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} is already being rebuilt")
-        kept = self._kept_ids[node_name][request_id]
-        ids = array("i", kept.prompt)
-        ids.extend(kept.sampled)
+        ids = self._kept_ids_of(node_name, request_id)
         walk = engine.lay_out_rebuild(node_name, request_id, ids)
         (name,) = self._walk_inputs[(walk, node_name)]
         tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(self.device, dtype=torch.long)
@@ -1262,12 +1277,14 @@ class Worker:
                 self._rebuild(rid, node_name)
 
     def _runnable_rebuilds(self) -> dict[int, RebuildRow]:
-        """The queued rebuild rows the scheduler would run now: not held, failed or removed."""
+        """The queued rebuild rows the scheduler would run now: not held, failed, removed or a victim. A TP
+        node's victim is dropped as the node's next step goes out, so its row must not ride in that step."""
         now = _time.monotonic()
         held, failed = self.scheduler.held_until, self.scheduler.failed_rids
         return {
             rid: row for rid, row in self._rebuild_rows.items()
             if held.get(rid, 0.0) <= now and rid not in failed and rid not in self._pending_removes
+            and rid not in self._victims
         }
 
     def _schedule_rebuild(self) -> "tuple[ScheduledBatch, dict[int, RebuildRow]] | None":
@@ -2007,17 +2024,21 @@ class Worker:
         # draining per follower would give the first one everything and the rest
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
+        if self._victims:
+            self._drop_victims(node_batch.node_name)
         resident_delta = engine.take_resident_delta(node_batch.node_name)
         prefix_hits = engine.decide_cached_prefix(node_batch)
         page_trails = engine.page_trails(node_batch.node_name)
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
-        sample_rid = node_batch.request_ids[0]
         ctx = node_batch.step_context
-        workers = self._graph_runtime.get_sharding_config(sample_rid).get_sharding_group(
-            node_batch.node_name, ctx.walk_of(sample_rid)
-        )._workers[1:]
+        if node_batch.request_ids:
+            sample_rid = node_batch.request_ids[0]
+            self._tp_followers = self._graph_runtime.get_sharding_config(sample_rid).get_sharding_group(
+                node_batch.node_name, ctx.walk_of(sample_rid)
+            )._workers[1:]
+        workers = self._tp_followers
         walks, walk_idx = [], []
         if ctx.request_walks:
             rows = RequestWalks.from_walks(
@@ -2044,6 +2065,19 @@ class Worker:
                 )
             )
         return seq
+
+    def _flush_tp_moves(self) -> None:
+        """Send a TP node's followers a step with no rows while the node owes them a victim's drop. Rank 0 drops a
+        victim only as a step of its node goes out, and the request the victim was chosen for waits for the drop."""
+        for node_name in self.parallel_nodes & self.parallel_leader_nodes:
+            if any(
+                rid not in self._in_flight_rids and node_name in self._kv_caches[victim.key].nodes
+                for rid, victim in self._victims.items()
+            ):
+                self.maybe_send_zmq_to_tp_followers(self._make_executing_batch(
+                    node_name=node_name, graph_walk="", request_ids=[], per_request_input_tensors={},
+                    per_request_info={},
+                ))
 
     def _broadcast_tp_nospec(self, pending: PendingBatch) -> None:
         """Tell followers no speculative head will follow step ``pending.tp_seq``,
@@ -3366,13 +3400,6 @@ class Worker:
                 self.worker_id, message.spec_seq, message.spec_from_seq,
             )
             message = moves_alone(message)
-        elif not message.request_ids:
-            logger.warning(
-                "Worker %s: dropped empty ScheduleTPNode for %s/%s (seq %d)",
-                self.worker_id, message.node_name, message.graph_walk,
-                message.spec_seq,
-            )
-            return
         self.scheduler.register_tp_follow(message)
 
     def _close_tp_follow_step(self, pending: PendingBatch) -> None:
@@ -4853,6 +4880,10 @@ class Worker:
                 # scans through ``check_ready``'s reload — and none of it may run
                 # while N's admit is outstanding. See ``_await_admit_settled``.
                 self._await_admit_settled(pending)
+                if self._victims:
+                    # A pass that raised may still owe the followers a victim's drop. Send it before any removal
+                    # applies.
+                    self._flush_tp_moves()
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
@@ -5131,6 +5162,8 @@ class Worker:
                         )
                     if batch is None:
                         batch = self.scheduler.get_next_batch(self.request_state)
+                if self._victims and (batch is None or batch.node_name not in self.parallel_nodes):
+                    self._flush_tp_moves()
                 if batch is None:
                     self.communicator.wait_for_work(10)
                     continue

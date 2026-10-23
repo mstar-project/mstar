@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
-from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation  # noqa: E402
+from mstar.utils.ipc_format import RemoveRequest, ScheduleTPNode, TPNoSpeculation  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.worker import (  # noqa: E402
     Worker,
@@ -319,11 +319,15 @@ def test_flag_off_ignores_markers_and_queues_heads_verbatim():
     assert s.scheduler.peek_tp_follow() is h
 
 
-def test_empty_schedule_message_is_dropped_not_queued():
-    """Defensive: the serial path indexes request_ids[0]."""
+def test_a_step_with_no_rows_or_moves_is_queued_and_consumed():
+    """When a request leaves before its victims are dropped, its victims run on, and rank 0's flush still sends a
+    step with no rows and no moves. Rank 0 stamps its next removal with that step's seq, so this rank consumes the
+    step too."""
     s = _stub()
     s._register_tp_follow(ScheduleTPNode(NODE, WALK, [], spec_seq=3))
-    assert s.scheduler.peek_tp_follow() is None
+    assert s.scheduler._try_schedule_tp_follow(None) is None
+    removal = RemoveRequest(request_id="gone", after_tp_seq=3)
+    assert Worker._removal_step_reached(s, removal), "the removal waits until this rank admits the next step"
 
 
 def test_nospec_store_is_bounded():

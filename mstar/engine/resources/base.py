@@ -102,6 +102,8 @@ class MoveKind(IntEnum):
     RELOAD = 1
     RESERVE = 2
     UNRESERVE = 3
+    EARMARK = 4
+    DROP = 5
 
 
 class Resource(ABC):

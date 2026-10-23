@@ -586,7 +586,7 @@ class KVManager(AttentionResource):
         self._counts = leads
         self._decides = leads and self._rank == 0
         # set by the engine on rank 0 of a TP node
-        self.journal: Callable[[MoveKind, str, int], None] | None = None
+        self.journal: Callable[..., None] | None = None
         # An allotment covers the labels `_nodes` open.
         # `_waiting` is the queue in arrival order, each request with the pages `_enqueue` counted, which its allotment
         #   is sized from.
@@ -1545,7 +1545,10 @@ class KVManager(AttentionResource):
                 return held_back
             if published is None:
                 return _ADMITTED
-        elif self._short and self.waits(rid):
+        elif (
+            self._decides and (self._short or (self._world_size > 1 and (self._victims or self._earmarks)))
+            and self.waits(rid)
+        ):
             return _NOT_READY
         if published is None:
             return ADMIT_OK
@@ -2740,17 +2743,21 @@ class KVManager(AttentionResource):
             return False
         return self._cpu_pool is None or not self.is_offloaded(rid)
 
+    def in_step(self, rid: str) -> bool:
+        with self._lock:
+            return any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values())
+
     def check_drop(self, rid: str) -> str | None:
-        if self._world_size > 1:
+        if self._world_size > 1 and not self._counts:
             return (
                 f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
                 "would leave them holding different pages"
             )
         if self.is_offloaded(rid):
             return f"KV {self.name}: {rid} has a host copy, which a drop would leave behind"
+        if self.in_step(rid):
+            return f"KV {self.name}: {rid} has a step or a read in flight on its pages"
         with self._lock:
-            if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
-                return f"KV {self.name}: {rid} has a step or a read in flight on its pages"
             if self._overrides[rid].guaranteed:
                 return f"KV {self.name}: {rid} is guaranteed, so it is never preempted"
         return None
@@ -3564,11 +3571,16 @@ class KVManager(AttentionResource):
                         f"KV {self.name}: chose {victim} (arrival {self._overrides[victim].arrival}) to free pages "
                         f"for {rid} (arrival {arrival}), but a victim must be newer and droppable"
                     )
-            earmark = Earmark(rid, pages_short, set(victims))
-            for victim in victims:
-                self._victims[victim] = earmark
-            self._earmarks[rid] = earmark
+            self._earmark(rid, pages_short, victims)
             return victims
+
+    def _earmark(self, rid: str, pages: int, victims: list[str]) -> None:
+        earmark = Earmark(rid, pages, set(victims))
+        for victim in victims:
+            self._victims[victim] = earmark
+        self._earmarks[rid] = earmark
+        if self.journal is not None:
+            self.journal(MoveKind.EARMARK, rid, pages, victims)
 
     def readmit(self, rid: str, history: int) -> bool:
         """Allot dropped ``rid`` enough pages for its ``history`` kept tokens and one page more, at most its footprint.
@@ -3599,8 +3611,14 @@ class KVManager(AttentionResource):
         return None if overrides is None else overrides.arrival
 
     def waits(self, rid: str) -> bool:
-        """Whether ``rid`` waits for room: no drop could cover its shortage, and the room hasn't grown since."""
+        """Whether ``rid`` waits for room: no drop could cover its shortage, and the room hasn't grown since.
+        Above one rank, also while ``rid`` is a victim or holds an earmark.
+
+        A victim is dropped only as its node's next step goes out, after the readiness checks, so a step built
+        before then must take neither the victim nor the request it was chosen for."""
         with self._lock:
+            if self._world_size > 1 and (rid in self._victims or rid in self._earmarks):
+                return True
             room = self._short.get(rid)
             if room is None:
                 return False
@@ -3666,10 +3684,20 @@ class KVManager(AttentionResource):
     def counts(self) -> bool:
         return self._counts
 
-    def replay(self, kind: MoveKind, rid: str, count: int) -> None:
+    def replay(self, kind: MoveKind, rid: str, count: int, victims: list[str]) -> None:
         """Make rank 0's ``kind`` move on ``rid`` in this rank's counts, or raise if the move doesn't fit them."""
         with self._lock:
-            if kind == MoveKind.RESERVE:
+            if kind == MoveKind.EARMARK:
+                # The same filter as rank 0's `preempt`, which can choose a dropped request again once it is
+                # allotted pages.
+                stale = [victim for victim in victims if victim not in self._streams or not self._holds(victim)]
+                if stale or rid not in self._allotments:
+                    raise RuntimeError(
+                        f"KV {self.name}: rank 0 earmarked {count} pages for {rid} on victims {victims}, but here "
+                        f"{stale} aren't live or hold nothing, or {rid} holds no allotment"
+                    )
+                self._earmark(rid, count, victims)
+            elif kind == MoveKind.RESERVE:
                 if rid in self._allotments:
                     raise RuntimeError(f"KV {self.name}: rank 0 reserved {rid}, which already holds an allotment here")
                 if rid not in self._waiting and (failed := self._enqueue(rid)) is not None:

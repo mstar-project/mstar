@@ -2461,15 +2461,19 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
         )
 
-    def drop_request(self, node_name: str, request_id: int) -> int:
+    def drop_request(self, node_name: str, request_id: int, kept: int) -> int:
         """Discard the request's state on this node that can be recomputed from
-        its token ids, and return the pages freed."""
+        its token ids, and return the pages freed. ``kept`` is how many of those ids
+        this rank keeps, which rank 0 journals for its followers to check."""
         # check every resource before dropping any, so a refusal changes nothing,
         # as `reload_request` checks `can_reload`
         refusal = self.drop_refusal(node_name, request_id)
         if refusal is not None:
             raise RuntimeError(refusal)
-        return sum(resource.drop(request_id) for resource in self._submodules[node_name].resources.values())
+        freed = sum(resource.drop(request_id) for resource in self._submodules[node_name].resources.values())
+        if node_name in self._resident_delta:
+            self._journal(node_name, "", MoveKind.DROP, request_id, kept)
+        return freed
 
     def drop_refusal(self, node_name: str, request_id: int) -> str | None:
         """Why `drop_request` would refuse the request on this node, or None."""
@@ -2577,13 +2581,20 @@ class Engine:
         for node in self._tp_leader_nodes:
             self._resident_delta[node] = OffloadDelta.new()
 
-    def _journal(self, node_name: str, pool: str, kind: MoveKind, request_id: int, count: int) -> None:
+    def _journal(
+        self, node_name: str, pool: str, kind: MoveKind, request_id: int, count: int, victims: Sequence[int] = (),
+    ) -> None:
         wire_rid, journal = self._graph_runtime.get_rid_string(request_id), self._resident_delta[node_name]
         # an UNRESERVE right after its RESERVE cancels it, so the followers don't replay both moves at every
         # `check_ready` where a second KV cache on the node keeps the request not ready
         if kind == MoveKind.UNRESERVE and journal.cancel(wire_rid, MoveKind.RESERVE, pool):
             return
-        journal.add(kind, wire_rid, pool, count)
+        wire_victims = [self._graph_runtime.get_rid_string(victim) for victim in victims]
+        journal.add(kind, wire_rid, pool, count, wire_victims)
+        if kind in (MoveKind.EARMARK, MoveKind.DROP):
+            # matched against the followers' replay lines to compare the ranks' victims
+            logger.info("Journaled %s of request %s on %s (%d, victims %s)", kind.name, wire_rid, node_name, count,
+                        wire_victims)
 
     def take_resident_delta(
         self, node_name: str,
@@ -2599,11 +2610,12 @@ class Engine:
         return self._resident_delta[node_name].take()
 
     def apply_resident_delta(
-        self, node_name: str, delta: OffloadDelta,
+        self, node_name: str, delta: OffloadDelta, kept_ids: Callable[[int], Sequence[int] | None],
     ) -> bool:
         """Match the leader's resident set on this node. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
+        ``kept_ids`` gives the ids this rank keeps for a request on the node.
         """
 
         resources = self._submodules[node_name].resources.values()
@@ -2622,7 +2634,25 @@ class Engine:
                 )
                 return False
             if move.pool:
-                self._resources[move.pool].replay(kind, rid, move.count)
+                victims = [self._graph_runtime.get_rid_handle(victim) for victim in move.victims]
+                self._resources[move.pool].replay(kind, rid, move.count, victims)
+                if kind == MoveKind.EARMARK:
+                    logger.info("Replayed rank 0's EARMARK of request %s on %s (%d, victims %s)", wire_rid,
+                                node_name, move.count, move.victims)
+            elif kind == MoveKind.DROP:
+                if any(kv.cache.in_step(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes):
+                    logger.debug("Replay: %s's drop on %s waits for its step; %d moves still owed",
+                                 wire_rid, node_name, len(delta))
+                    return False
+                ids = kept_ids(rid)
+                if ids is None or len(ids) != move.count:
+                    raise RuntimeError(
+                        f"rank 0 dropped {wire_rid} keeping {move.count} ids, and this rank keeps "
+                        f"{None if ids is None else len(ids)}"
+                    )
+                freed = self.drop_request(node_name, rid, move.count)
+                logger.info("Replayed rank 0's DROP of request %s on %s (%d, %d pages freed)", wire_rid, node_name,
+                            move.count, freed)
             elif kind == MoveKind.OFFLOAD:
                 if self.is_offloaded(node_name, rid):
                     logger.debug(

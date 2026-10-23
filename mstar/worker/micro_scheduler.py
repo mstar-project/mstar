@@ -2,7 +2,7 @@ import functools
 import logging
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, NamedTuple
@@ -250,6 +250,8 @@ class MicroScheduler:
         # here already holds handles. Defaults to the identity so a scheduler
         # driven directly with its own keys (tests) needs no table.
         self.rid_of: Callable[[str], int | None] = lambda r: r
+        # (node, handle) -> the ids the worker keeps for the request on that node, or None. The worker installs it.
+        self.kept_ids: Callable[[str, int], Sequence[int] | None] = lambda node, rid: None
         self._warned_removed_rid = False
         self.sched_type = sched_type
 
@@ -394,7 +396,7 @@ class MicroScheduler:
             return True
 
         engine = self.engine_manager.get_engine(node_name)
-        return engine.apply_resident_delta(node_name, delta)
+        return engine.apply_resident_delta(node_name, delta, functools.partial(self.kept_ids, node_name))
 
     def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
         new_delta = None
@@ -543,7 +545,7 @@ class MicroScheduler:
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
         if not first_tp_node.request_ids:
-            # a step with moves and no rows, so pop it rather than build an empty batch
+            # a step with no rows, so pop it rather than build an empty batch
             self.pop_tp_follow_head()
             return
         popped = self.pop_ready_rids(
