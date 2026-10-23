@@ -26,6 +26,8 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
@@ -311,12 +313,18 @@ def test_a_follower_tears_down_what_it_deferred_before_it_takes_the_next_step(mo
 
     assert log.index(("teardown", "gone")) < log.index(("admit", 1)), log
 
-def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkeypatch):
+
+@pytest.mark.parametrize("cache_open", [False, True])
+def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkeypatch, cache_open):
     """N fails "also", so both ranks drop the speculative N+1 built on it. Rank 0 stamped
     "gone" with N+1 and tore it down before it sent N+2. Here "gone" is held until this
-    rank pops N+1, which it builds before it drops it, and goes before N+2's admit."""
+    rank pops N+1, which it does as it drops it, after building it when the prefix cache is
+    open, and goes before N+2's admit."""
     removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=1)
     w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [removal]])
+    w.engine_manager.get_engine = lambda node: SimpleNamespace(
+        prefix_cache_open=lambda node: cache_open, drop_cached_prefix=lambda head: None,
+    )
     # N+1 is dropped, so the serial path's next step is N+2
     w.scheduler.steps += [None, [HANDLES["kept"]]]
     build_executing, build_speculation = w._build_executing_batch, w._build_speculation

@@ -11,11 +11,14 @@ forward) and then hangs in the collective. So:
 * the leader ALWAYS sends one of {speculative head from N, ``TPNoSpeculation``
   marker for N} for every lockstep step it looked at speculating from;
 * the follower's ``_await_tp_follow_step`` — one loop that both waits for N
-  and watches the FIFO — builds and arms a head the moment it lands (during
-  N, the point of the flag), and once N has finished does not return without
-  a decision: builds and arms the head, or goes serial on the marker. The
-  follower builds the head even when N's verdict is ``admit_error`` or
-  ``failed_requests``, since the leader pre-planned it;
+  and watches the FIFO — builds a head the moment it lands (during N, the
+  point of the flag), and once N has finished does not return without a
+  decision: builds the head from N's real outputs, or goes serial on the
+  marker; N's verdict — ``admit_error`` / ``failed_requests`` on its
+  ``ExecutingBatch``, written by the GPU thread before N's future resolves —
+  drops a head without building it (the verdicts on which the leader clears
+  its own speculation before threading), unless the prefix cache is open,
+  where the leader pre-planned the head and the follower builds it too;
 * a step whose forward raised is closed (``_close_tp_follow_step``): its head
   is dropped, queued or arriving.
 
@@ -48,8 +51,14 @@ WALK = "decode"
 
 
 class _FakeEngineManager:
+    def __init__(self, cache_open: bool = False):
+        self.cache_open = cache_open
+
     def get_engine(self, node_name):
-        return types.SimpleNamespace(check_ready=lambda *a: FULL_ADMIT_OK, drop_cached_prefix=lambda head: None)
+        return types.SimpleNamespace(
+            check_ready=lambda *a: FULL_ADMIT_OK, drop_cached_prefix=lambda head: None,
+            prefix_cache_open=lambda node: self.cache_open,
+        )
 
 
 class _Communicator:
@@ -73,7 +82,7 @@ class _Communicator:
         self.inbox.extend(self.deliveries.pop(self.waits, []))
 
 
-def _stub():
+def _stub(cache_open: bool = False):
     stub = types.SimpleNamespace()
     stub.worker_id = "w1"
     stub.tp_async_sched = True
@@ -81,7 +90,7 @@ def _stub():
     stub._tp_async_for = lambda n: Worker._tp_async_for(stub, n)
     stub._tp_nospec = RecentSet(Worker._TP_NOSPEC_KEEP)
     stub._tp_leader_gap_warned = False
-    stub.engine_manager = _FakeEngineManager()
+    stub.engine_manager = _FakeEngineManager(cache_open)
     stub.scheduler = MicroScheduler(
         engine_manager=stub.engine_manager, parallel_leader_nodes=set(),
     )
@@ -115,6 +124,8 @@ def _stub():
     stub._await_tp_follow_step = (
         lambda p, arm: Worker._await_tp_follow_step(stub, p, arm)
     )
+    stub._step_voids_head = Worker._step_voids_head
+    stub._prefix_cache_open = lambda node: Worker._prefix_cache_open(stub, node)
     return stub
 
 
@@ -379,11 +390,51 @@ def test_await_waits_for_a_late_marker_then_goes_serial():
     assert s.communicator.waits == 3
 
 
+def test_await_drops_the_head_on_allocation_failure_without_building():
+    s = _stub()
+    s.build_results = [object()]   # would build if asked — it must not be
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    out = _output()
+    pending = _pending(4, _future(s, out), admit_error="kv cache: out of pages")
+    assert _await(s, pending) == (out, None)
+    assert s.scheduler.peek_tp_follow() is None
+    assert s.build_results, "head must be dropped, not built"
+
+
+def test_await_drops_the_head_on_failed_rids_without_building():
+    """Same verdict class as allocation failure: the leader clears its whole
+    speculation on ``failed_requests`` before threading, so the follower must
+    not build (and then unwind) what the leader will not run."""
+    s = _stub()
+    s.build_results = [object()]
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    out = _output()
+    pending = _pending(4, _future(s, out), failed_requests=["r0"])
+    assert _await(s, pending) == (out, None)
+    assert s.scheduler.peek_tp_follow() is None
+    assert s.build_results, "head must be dropped, not built"
+
+
+def test_await_has_no_verdict_to_apply_while_N_still_runs():
+    """admit_error is N's verdict; while N runs there is none yet, so a
+    head that lands early is built (the leader built it during N too — the
+    shared clear-or-thread flow after N voids it on both ranks alike). The
+    verdict is only read once ``future.done()``, never before."""
+    s = _stub()
+    spec = object()
+    s.build_results = [spec]
+    s.communicator.deliveries = {1: [_head(["r0"], seq=5, from_seq=4)]}
+    pending = _pending(
+        4, _future(s, _output(), done_after=10), admit_error="kv cache: out of pages",
+    )
+    assert _await(s, pending) == (None, spec)
+
+
 @pytest.mark.parametrize("verdict", [
     {"admit_error": "kv cache: out of pages"}, {"failed_requests": ["r0"]},
 ])
-def test_await_builds_and_arms_a_head_its_step_voids(verdict):
-    s = _stub()
+def test_with_the_prefix_cache_open_await_builds_and_arms_a_head_its_step_voids(verdict):
+    s = _stub(cache_open=True)
     spec = object()
     s.build_results = [spec]
     s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
