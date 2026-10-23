@@ -59,6 +59,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
+from mstar.worker.engine_manager import streamed_partitions
 
 logger = logging.getLogger(__name__)
 
@@ -585,6 +586,13 @@ class Conductor:
             specs = {s.resource_key: s for s in (self.model.get_node_resources() or [])}
             self._resource_specs_cache = specs
         return specs
+
+    def _streamed_partitions(self) -> frozenset[str]:
+        streamed = getattr(self, "_streamed_partitions_cache", None)
+        if streamed is None:
+            streamed = streamed_partitions(list(self._resource_specs().values()), self.model)
+            self._streamed_partitions_cache = streamed
+        return streamed
 
     def _get_resource_configs(
         self, model_kwargs: dict,
@@ -1201,6 +1209,8 @@ class Conductor:
         prefix_decode = kwargs.get("prefix_decode") or {}
         prefix_layout = kwargs.get("prefix_layout") or {}
         prefix_cache = kwargs.get("prefix_cache")
+        if not all(partition_states[name].is_done for name in self._streamed_partitions()):
+            prefix_cache = False
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
                 seed=seed,

@@ -60,10 +60,7 @@ class _Answering(Resource):
 class _Submodule:
     """Cuts the way a real AR submodule does, without being a torch module."""
 
-    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
-        return ARNodeSubmodule.split_inputs(
-            self, graph_walk, fwd_info, inputs, start, end,
-        )
+    split_inputs = ARNodeSubmodule.split_inputs
 
     @staticmethod
     def declare_step(inputs: NodeInputs) -> int:

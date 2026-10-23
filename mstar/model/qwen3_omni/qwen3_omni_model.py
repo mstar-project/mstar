@@ -30,6 +30,7 @@ Text-only mode:
 
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from jinja2 import TemplateError
@@ -55,7 +56,15 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import (
+    MAX_OUTPUT_TOKENS,
+    ForwardPassArgs,
+    Model,
+    PrefixStream,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+)
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -108,6 +117,19 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
         logger.warning("Error downloading from HuggingFace: %s", str(e))
         return repo_id
     return str(Path(local_dir))
+
+
+class ImageSpan(NamedTuple):
+    length: int
+    advance: int
+
+
+def image_span(grid_thw: torch.Tensor, merge_size: int) -> ImageSpan:
+    """An image's tokens share one temporal position and sit on the merged
+    grid, so it advances the position by the grid's longer side."""
+    t, h, w = (int(n) for n in grid_thw)
+    h, w = h // merge_size, w // merge_size
+    return ImageSpan(t * h * w + 2, max(h, w) + 2)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +304,21 @@ class Qwen3OmniModel(Model):
                 top_p=model_kwargs.get("code_predictor_top_p", 0.8),
             )
         }
+
+    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+        """The Thinker keys its prompt by text ids, each image and audio clip by
+        file, and its replies as they decode."""
+        return {THINKER_KV: {"main": PrefixStream(
+            "text_inputs", "ids", "prefill_text", "thinker_decode", ("prefill_vision", "prefill_audio"),
+        )}}
+
+    def checkpoint_path(self) -> str:
+        return self.local_dir
+
+    def _audio_frames(self, seqlens: torch.Tensor) -> torch.Tensor:
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
+
+        return _get_feat_extract_output_lengths(seqlens, n_window=self.config.audio_encoder.n_window)
 
     def _get_max_talker_output_tokens(self, **model_kwargs):
         return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
@@ -1078,7 +1115,7 @@ class Qwen3OmniModel(Model):
         input_metadata: dict[str, dict] = {},
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         """Build the full ChatML prompt + derived multimodal tensors.
 
         Uses HF's full ``AutoProcessor`` (combines tokenizer + image_processor
@@ -1101,6 +1138,9 @@ class Qwen3OmniModel(Model):
         The result has ``text_inputs`` containing the FULL templated +
         expanded token IDs, plus the per-modality tensor outputs needed by
         the Thinker's prefill walks.
+
+        A prompt with images or audio and no video, given their tensors, also
+        returns the Thinker's ``prefix_layout``.
         """
         result: NameToTensorList = {}
 
@@ -1240,7 +1280,26 @@ class Qwen3OmniModel(Model):
             result["video_grid_thw"] += vid_out["video_grid_thw"]
             result["pixel_values_videos"].append(vid_out["pixel_values_videos"])
 
-        return result
+        if not attached or not spans or "video" in input_modalities:
+            return result
+        layout = self._prefix_layout(parts, segments, result)
+        return ProcessPromptOutput(result, {"prefix_layout": {THINKER_KV: {"main": layout}}})
+
+    def _prefix_layout(
+        self, parts: list[PromptPart], segments: list[torch.Tensor], tensors: NameToTensorList,
+    ) -> list[Span]:
+        spans = []
+        for step in prefill_plan(parts):
+            if step.modality == TEXT:
+                length = segments[step.index].numel()
+                spans.append(Span("ids", "prefill_text", length, length, "text_inputs"))
+            elif step.modality == "image":
+                image = image_span(tensors["image_grid_thw"][step.index], self.config.vision.spatial_merge_size)
+                spans.append(Span("digest", "prefill_vision", image.length, image.advance, ("image", step.index)))
+            else:
+                slots = int(self._audio_frames(tensors["audio_seqlens"][step.index])) + 2
+                spans.append(Span("digest", "prefill_audio", slots, slots, ("audio", step.index)))
+        return spans
 
     # -----------------------------------------------------------------------
     # Model ABC: postprocess

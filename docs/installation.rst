@@ -121,7 +121,8 @@ Model families and some output formats need extra packages, exposed as pip *extr
        Install the matching XPU build of PyTorch.
    * - ``.[qwen3_omni]``
      - Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and
-       ``ninja`` (speeds up the JIT build of the vendored MoE align kernel).
+       ``ninja`` (speeds up the JIT build of the vendored MoE align kernel). It needs
+       ``transformers>=5.18``, whose ``transformers.vision_utils`` the vision encoder uses.
        **Also needs** ``flash-attn``, which is installed separately —
        see `flash-attn (Qwen3-Omni, LingBot-World)`_.
    * - ``.[orpheus]``
@@ -270,8 +271,9 @@ its dependencies:
 
 ``qwen-tts`` pins ``transformers==4.57.3`` and ``accelerate==1.12.0``. Installed with
 them, it can't share an environment with ``diffusers>=0.40`` (Wan 2.2, Cosmos3,
-FLUX.2 [klein]), which needs ``huggingface-hub>=1.23``, or with OmniVoice, which needs
-``transformers>=5.3``, and installing it after them downgrades their dependencies.
+FLUX.2 [klein]), which needs ``huggingface-hub>=1.23``, or with OmniVoice
+(``transformers>=5.3``) or Qwen3-Omni (``transformers>=5.18``). Installing it after them
+downgrades their dependencies.
 mstar reads only the speech-tokenizer source files and runs them under transformers
 4.57.3 or 5.x, so the package's own requirements are not needed. ``pip check`` still
 lists them (``transformers==4.57.3``, ``accelerate==1.12.0``, ``gradio``, ``sox`` and

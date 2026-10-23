@@ -16,10 +16,16 @@ import functools
 import inspect
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Optional
 
 import torch
 from torch import nn
+from transformers.vision_utils import (
+    get_vision_cu_seqlens,
+    get_vision_interpolation_indices_and_weights,
+    get_vision_position_ids,
+)
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -54,6 +60,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_SAMPLER,
     Qwen3OmniModelConfig,
 )
+from mstar.model.qwen3_omni.qwen3_omni_model import image_span
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -95,6 +102,10 @@ class AudioEncoderSubmodule(NodeSubmodule):
 
     Runs once per request (not batched across requests).
     """
+
+    # A dynamic=True compile takes minutes on the first clip, and marking the frame
+    # dimension dynamic still recompiles for each length.
+    eager_item_encoder = True
 
     def __init__(self, audio_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
@@ -168,6 +179,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
     Runs once per request (not batched across requests).
     """
 
+    marks_dynamic_dims = True
+
     def __init__(self, vision_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
         self.vision_encoder = vision_encoder
@@ -203,12 +216,24 @@ class VisionEncoderSubmodule(NodeSubmodule):
         if grid_thw.dim() == 1:
             grid_thw = grid_thw.unsqueeze(0)  # (1, 3)
 
-        return NodeInputs(
-            tensor_inputs={
-                "pixel_values": pixel_values,
-                "grid_thw": grid_thw,
-            }
+        # Built outside the compiled forward, since these helpers call `.tolist()` on the
+        # grid, which would compile a graph for every image size.
+        encoder = self.vision_encoder
+        interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+            grid_thw, num_grid_per_side=encoder.num_grid_per_side, mode=encoder.interpolation_mode,
+            align_corners=encoder.interpolation_align_corners, spatial_merge_size=encoder.spatial_merge_size,
         )
+        tensor_inputs = {
+            "pixel_values": pixel_values,
+            "grid_thw": grid_thw,
+            "interp_indices": interp_indices,
+            "interp_weights": interp_weights,
+            "position_ids": get_vision_position_ids(grid_thw, encoder.spatial_merge_size),
+            "cu_seqlens": get_vision_cu_seqlens(grid_thw),
+        }
+        for name in ("pixel_values", "interp_indices", "interp_weights", "position_ids"):
+            torch._dynamo.mark_dynamic(tensor_inputs[name], 0)
+        return NodeInputs(tensor_inputs=tensor_inputs)
 
     def forward(
         self,
@@ -235,6 +260,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
         encoder_output = self.vision_encoder(
             pixel_values,
             grid_thw=grid_thw,
+            # an image is one segment of all its patches, and no video frame's segment is longer
+            max_seqlen=pixel_values.shape[0],
+            **kwargs,
         )
 
         if isinstance(encoder_output, tuple):
@@ -426,24 +454,16 @@ class ThinkerSubmodule(ARNodeSubmodule):
             text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
             embeds = self.model.model.embed_tokens(text_ids)
             seq_len = text_ids.shape[0]
-
-            # Compute 3D MRoPE position IDs for a pure-text span.  Each
-            # prefill graph walk is single-modality so we use the simple
-            # per-modality helper instead of the full HF parser.
-            #
-            # ``start_pos`` is the next MRoPE position for this request,
-            # carried forward across walks by the stream's position counter
-            # (advanced by the runner's commit of each declared step).
-            pos_ids = get_rope_index_text(seq_len, start_pos, device)
             masks_for_talker = torch.stack([
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
                 self._get_talker_text_mask(text_ids) # text inclusion
             ])
+            # A text row leaves its positions to the plan, which starts from the
+            # counter a cache hit has already moved.
             return ARNodeInputs(
                 input_seq_len=seq_len,
                 input_embeds=embeds,
                 input_ids=text_ids,
-                custom_pos_ids=pos_ids,
                 tensor_inputs={
                     "masks_for_talker": masks_for_talker
                 }
@@ -520,7 +540,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
             # Sentinel token positions (text-like).
             start_pos_ids = get_rope_index_text(1, start_pos, device)
-            end_pos_base = float(vision_pos_ids.max().item()) + 1
+            if seconds_per_grid is None:
+                # Use the prompt layout's helper, so the cache and this walk move the position by the same amount.
+                end_pos_base = start_pos + image_span(grid_thw, self.config.vision.spatial_merge_size).advance - 1
+            else:
+                end_pos_base = float(vision_pos_ids.max().item()) + 1
             end_pos_ids = get_rope_index_text(1, end_pos_base, device)
 
             pos_ids = torch.cat(
@@ -550,6 +574,24 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 }
             )
 
+    def split_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs,
+        start: int,
+        end: int,
+    ) -> ARNodeInputs:
+        tensors = inputs.tensor_inputs
+        cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
+        cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
+        if graph_walk == "prefill_vision":
+            cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in tensors["deepstack"]]
+            cut.tensor_inputs["mrope_pos_advance"] = tensors["mrope_pos_advance"]
+        elif graph_walk == "prefill_audio":
+            cut.tensor_inputs["mrope_pos_advance"] = inputs.input_seq_len
+        return cut
+
     def declare_step(
         self, graph_walk: str,
         request_ids: list[str],
@@ -577,17 +619,17 @@ class ThinkerSubmodule(ARNodeSubmodule):
         }
 
         pos_advance = None
-        if "prefill_vision" in row_walks:
-            # A vision row's 3D-grid MRoPE span is larger than its token count,
-            # so it advances the counter by its own; other rows by their span.
+        if graph_walk != "thinker_decode" and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
+            # A vision row's 3D-grid MRoPE span differs from its token count, and
+            # a cut audio row moves past its whole clip, so each advances the
+            # counter by its own `mrope_pos_advance`.
             pos_advance = tuple(
-                int(inp.tensor_inputs.get("mrope_pos_advance", 0))
-                if walk == "prefill_vision" else inp.input_seq_len
-                for inp, walk in zip(inputs, row_walks, strict=True)
+                int(inp.tensor_inputs.get("mrope_pos_advance", inp.input_seq_len))
+                for inp in inputs
             )
         return SubmoduleStep(
             # must match `cg_key_info`, which picked the leased capture
-            cg_key_info=self.DEEPSTACK_KEY if pos_advance is not None else None,
+            cg_key_info=self.DEEPSTACK_KEY if "prefill_vision" in row_walks else None,
             segments=[
                 Segment(
                     request_id=rid,
@@ -621,9 +663,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         input_embeds = torch.cat([
             inp.input_embeds for inp in inputs
         ], dim=0)
-        position_ids_3d = torch.cat([
-            inp.custom_pos_ids for inp in inputs
-        ], dim=1)  # (3, total_tokens)
+        position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
         seq_lens = [
             inp.input_seq_len for inp in inputs
         ]
@@ -660,6 +700,21 @@ class ThinkerSubmodule(ARNodeSubmodule):
             },
             **extra_inputs
         }
+
+    def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
+        pos_ids = self.node_resources[THINKER_POS].pos_ids("main")
+        parts: list[torch.Tensor] = []
+        offset = 0
+        for inp in inputs:
+            if inp.custom_pos_ids is not None:
+                parts.append(inp.custom_pos_ids)
+            else:
+                assert pos_ids is not None, (
+                    "position resource has no plan for this step; `plan` must run before `preprocess`"
+                )
+                parts.append(pos_ids[offset:offset + inp.input_seq_len].float().unsqueeze(0).expand(3, -1))
+            offset += inp.input_seq_len
+        return torch.cat(parts, dim=1)
 
     def _deepstack_inputs(
         self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
