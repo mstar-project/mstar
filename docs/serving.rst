@@ -319,23 +319,25 @@ no longer read. It raises an error with a message describing the migration.
 cached pages. A single request opts out by sending ``prefix_cache=False``, which
 travels with its other ``model_kwargs``.
 
-On a single rank, a request waits at the head of its pool's queue until its prompt fits
-beside the prompts already admitted, and no request behind it starts first. A cache hit on
+On a single rank, a request waits at the head of its pool's queue until its reservation fits
+beside the reservations already admitted, and no request behind it starts first. A cache hit on
 a page only the prefix index holds counts as a page the request takes. A request that
 can't fit in its pool at its full output length gets a 400 if it asked for that length,
-and otherwise has the model's default length cut until it fits. The pool
-reserves only prompts, so a decode step can find no page outside the admitted prompts. The
+and otherwise has the model's default length cut until it fits. A request that can be
+rebuilt reserves only its prompt, so a decode step can find no page outside the reservations. The
 worker then drops the newest requests it can rebuild from their token ids and gives their
 pages to the request that ran short. A dropped request waits at its place in the queue
-until its history and one more page fit, then recomputes its KV in one prefill row.
+until its history and one more page fit, then recomputes its KV in one prefill row. A
+request that streams audio out, or holds KV made from media or another node's outputs,
+reserves its whole footprint in every pool, with every cache hit counted, and is never
+dropped. So does a request in the pools of a node that keeps no token ids to rebuild it.
+Voice requests then queue when the pool is short and are never preempted mid-stream.
 
-Above one rank, on a worker that runs only some of a node's walks, on a node with a second
-paged KV cache, such as Whisper's decoder, and while no request on a node keeps its token ids,
-as on Qwen3-TTS's Talker, a decode step that finds no page holds its requests until they time
-out. Elsewhere at one rank, a request that runs short and can't be dropped waits for room when
-dropping newer requests wouldn't cover its shortage. That is the case for a request with an
-image or audio in its KV, and for every request under ``MSTAR_SAMPLER_INGRAPH_SCATTER=1``,
-since the sampler then refuses every drop. Several such requests can wait on each other.
+Above one rank, a decode step that finds no page holds its requests until they time out.
+At one rank, a request that runs short and can't be dropped waits for room when dropping
+newer requests wouldn't cover its shortage. That is the case for every request under
+``MSTAR_SAMPLER_INGRAPH_SCATTER=1``, since the sampler then refuses every drop. Several such
+requests can wait on each other.
 ``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the
 pool's pages divided by the pages one request needs, prompt and output together, is a
 safe value. ``cpu_offload_pages`` moves a request to the host only in the cases above where
