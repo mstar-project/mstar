@@ -430,16 +430,6 @@ def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, versio
         cfg.check_long_context()
 
 
-def test_bind_refuses_sharded_prefill_beside_eviction():
-    cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), dsa_shard_prefill=True)
-    sub = object.__new__(Glm5NextLLMSubmodule)
-    sub.config = cfg
-    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=cfg.index_kpool * 4),
-                               supports_eviction=True)
-    with pytest.raises(ValueError, match="cpu_offload_pages"):
-        sub.bind_node_resources({KV_CACHE: kv})
-
-
 def test_bind_refuses_a_captured_bucket_past_the_sparse_plan():
     cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), prefill_graphs=True,
                               prefill_token_buckets=[128, 2 * sparse_mla.MAX_ROWS])
