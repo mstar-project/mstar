@@ -464,11 +464,14 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         *,
         loop_name: str,
         max_batch_size: int = 8,
+        capture_buckets: Sequence[tuple[str, Gr00tN17Shape]] = (),
+        capture_batch_sizes: Sequence[int] = (1, 2, 4, 8),
     ):
         # `attn_resource_key=None`: this node declares its own two resources rather
         # than the base's single one, as `ltx2_5` does for its four.
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=None,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
         )
         self.config = config
         self.action_encoder = action_encoder

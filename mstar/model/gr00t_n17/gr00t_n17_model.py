@@ -49,6 +49,7 @@ from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor
 from mstar.model.gr00t_n17.submodules import (
     Gr00tN17DenoiseStepSubmodule,
     Gr00tN17LLMSubmodule,
+    Gr00tN17Shape,
     Gr00tN17StateEncoderSubmodule,
     Gr00tN17VisionEncoderSubmodule,
     Gr00tN17VLBridgeSubmodule,
@@ -112,9 +113,20 @@ class Gr00tN17Model(Model):
         model_path_hf: str,
         backbone_path_hf: str | None = None,
         cache_dir: str | None = None,
+        accelerator_graph: bool = False,
+        capture_shapes: list[list[int]] | None = None,
+        capture_batch_sizes: list[int] | None = None,
         **kwargs,
     ):
         self.model_path_hf = model_path_hf
+        # `[text_rows, image_rows]` per denoise-step bucket to capture: the spans are
+        # inputs the DT attends over, so a request cannot be padded into a wider
+        # bucket, and an uncaptured shape runs the eager batched path
+        if accelerator_graph and not capture_shapes:
+            raise ValueError("accelerator_graph needs capture_shapes: [[text_rows, image_rows], ...]")
+        self.accelerator_graph = accelerator_graph
+        self.capture_shapes = [tuple(int(n) for n in shape) for shape in capture_shapes or ()]
+        self.capture_batch_sizes = [int(b) for b in capture_batch_sizes or (1, 2, 4, 8)]
         # GR00T's weights and its backbone's config live in two repos: the
         # action head is `nvidia/GR00T-N1.7-3B`, the Qwen3-VL dims come from
         # `nvidia/Cosmos-Reason2-2B`, which is gated (§3.7 row 1).
@@ -373,6 +385,16 @@ class Gr00tN17Model(Model):
         logger.info("built gr00t_n17 submodule for %s", node_name)
         return submodule
 
+    def capture_buckets(self) -> list[tuple[str, Gr00tN17Shape]]:
+        """The denoise step's graph buckets: the only node captured, and the one
+        that runs four times per request (C11's profile: 56% host time eager)."""
+        if not self.accelerator_graph:
+            return []
+        return [
+            (self.ACTION_GEN_WALK, Gr00tN17Shape(text_rows=text, image_rows=image))
+            for text, image in self.capture_shapes
+        ]
+
     def _create_submodule(self, node_name: str, device: str) -> NodeSubmodule | None:
         """One per node, with its checkpoint weights in it.
 
@@ -405,6 +427,8 @@ class Gr00tN17Model(Model):
                 DiT(config),
                 build_action_decoder(config),
                 loop_name=DENOISE_LOOP,
+                capture_buckets=self.capture_buckets(),
+                capture_batch_sizes=self.capture_batch_sizes,
             ))
         return None
 
