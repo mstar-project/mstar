@@ -15,6 +15,8 @@ use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+mod sched;
+
 
 /// Python's `NestedLoopIndices`.
 #[pyclass]
@@ -186,6 +188,10 @@ pub struct GraphRuntime {
     /// handed back to Python one at a time. None where the worker built the
     /// pyzmq communicator, which has no shareable object.
     communicator: Option<Arc<RawZmqCommunicator>>,
+
+    /// The micro-scheduler's backlog, round-robin table and any pass waiting
+    /// on check verdicts (see `sched.rs`).
+    sched: sched::SchedState,
 }
 
  impl GraphRuntime {
@@ -525,6 +531,22 @@ pub struct GraphRuntime {
                 }
             }
         }
+    }
+
+    /// The graph-ready rids by (node, walk), in the one order both
+    /// `get_ready_nodes` and the scheduler's scan report them.
+    fn ready_groups(
+        &self,
+        excluded: &FxHashSet<u32>,
+        target: Option<&(String, String)>,
+        exclude_target: Option<&(String, String)>,
+    ) -> Vec<(Sym, Sym, Vec<u32>)> {
+        let mut grouped: FxHashMap<(Sym, Sym), Vec<u32>> = FxHashMap::default();
+        self.scan_ready(excluded, target, exclude_target, |node, walk, rid| {
+            grouped.entry((node, walk)).or_default().push(rid);
+            true // keep scanning
+        });
+        grouped.into_iter().map(|((n, w), rids)| (n, w, rids)).collect()
     }
 
     /// Run the source node's outputs through the speculative slots and report
@@ -1590,6 +1612,7 @@ impl GraphRuntime {
             staged_specs: FxHashMap::default(),
             spec_counter: 0,
             combined_walk_of,
+            sched: sched::SchedState::default(),
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
         })
@@ -1782,6 +1805,9 @@ impl GraphRuntime {
         // worker drops its outputs on a speculative new iteration and prep
         // excludes it from speculation.
         self.pending_loop_stops.retain(|&(r, _, _)| r != rid);
+
+        // a backlogged row of a recycled handle would run as the next request
+        self.sched.drop_rids(&std::iter::once(rid).collect());
     }
 
     fn get_rid_handle(&self, rid: &str) -> Option<u32> {
@@ -1885,6 +1911,75 @@ impl GraphRuntime {
                 )
             })
             .collect()
+    }
+
+    // -- the micro-scheduler's pass (sched.rs) ------------------------------
+
+    /// Install the scheduling keys -- `(node, walk label, real walks under a
+    /// combined label, [(walk, cap)], [(walk, row cap)])` -- and the nodes
+    /// this rank leads. Once, before the first pass.
+    #[allow(clippy::type_complexity)]
+    fn sched_configure(
+        &mut self,
+        keys: Vec<(String, String, Vec<String>, Vec<(String, Option<u32>)>, Vec<(String, u32)>)>,
+        leaders: Vec<String>,
+    ) {
+        self.sched_configure_impl(keys, leaders);
+    }
+
+    /// Begin a pass. Returns `(done, check, batch)`: rows to check and
+    /// answer with `sched_resume`, or the pass's step (None for none).
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (target, exclude_target, pre_existing, waiting, failed, scan_exclude))]
+    fn sched_begin(
+        &mut self,
+        target: Option<(String, String)>,
+        exclude_target: Option<(String, String)>,
+        pre_existing: u32,
+        waiting: Vec<u32>,
+        failed: Vec<u32>,
+        scan_exclude: Vec<u32>,
+    ) -> PyResult<(bool, Option<sched::CheckOut>, Option<sched::BatchOut>)> {
+        self.sched_begin_impl(target, exclude_target, pre_existing, waiting, failed, scan_exclude)
+    }
+
+    /// Continue the waiting pass with one verdict byte per requested row.
+    #[allow(clippy::type_complexity)]
+    fn sched_resume(
+        &mut self, verdicts: &[u8],
+    ) -> PyResult<(bool, Option<sched::CheckOut>, Option<sched::BatchOut>)> {
+        self.sched_resume_impl(verdicts)
+    }
+
+    fn sched_room_for_continuing(&self, node: &str, walk: &str) -> PyResult<Option<u32>> {
+        self.sched_room_for_continuing_impl(node, walk)
+    }
+
+    #[pyo3(signature = (exclude_key, exclude_walk, waiting, failed))]
+    fn sched_backlog_has_schedulable(
+        &self, exclude_key: Option<(String, String)>, exclude_walk: Option<String>,
+        waiting: Vec<u32>, failed: Vec<u32>,
+    ) -> bool {
+        self.sched_backlog_has_schedulable_impl(exclude_key, exclude_walk, waiting, failed)
+    }
+
+    fn sched_backlog_rows(&self, exclude: Vec<u32>) -> Vec<(String, u32)> {
+        self.sched_backlog_rows_impl(exclude)
+    }
+
+    fn sched_drop_rids(&mut self, rids: Vec<u32>) {
+        self.sched.drop_rids(&rids.into_iter().collect());
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn sched_state(
+        &self,
+    ) -> (Vec<(String, String, Vec<u32>, Vec<String>)>, Vec<(String, String, u64)>, u64) {
+        self.sched_state_impl()
+    }
+
+    fn local_node_walks(&self) -> Vec<(String, String)> {
+        self.local_node_walks_impl()
     }
 
     // -- pending loop stops: good for exactly one iteration ----------------
@@ -2148,15 +2243,9 @@ impl GraphRuntime {
         exclude_target: Option<(String, String)>,
     ) -> Vec<(String, String, Vec<u32>)> {
         let excluded: FxHashSet<u32> = exclude_rids.into_iter().collect();
-        let mut grouped: FxHashMap<(Sym, Sym), Vec<u32>> = FxHashMap::default();
-        self.scan_ready(&excluded, target.as_ref(), exclude_target.as_ref(),
-            |node, walk, rid| {
-                grouped.entry((node, walk)).or_default().push(rid);
-                true // keep scanning
-            });
-        grouped
+        self.ready_groups(&excluded, target.as_ref(), exclude_target.as_ref())
             .into_iter()
-            .map(|((n, w), rids)| {
+            .map(|(n, w, rids)| {
                 (
                     self.interner.name(n).to_string(),
                     self.interner.name(w).to_string(),
