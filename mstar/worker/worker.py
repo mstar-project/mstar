@@ -88,7 +88,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch, moves_alone
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.worker_metrics import PreemptionCounts, WorkerMetrics
 
@@ -3326,14 +3326,7 @@ class Worker:
             self._tp_nospec.add(message.spec_from_seq)
 
     def _register_tp_follow(self, message: ScheduleTPNode) -> None:
-        """Queue a ScheduleTPNode; drop a head for a step this rank closed."""
-        if not message.request_ids:
-            logger.warning(
-                "Worker %s: dropped empty ScheduleTPNode for %s/%s (seq %d)",
-                self.worker_id, message.node_name, message.graph_walk,
-                message.spec_seq,
-            )
-            return
+        """Queue a ScheduleTPNode. A head for a step this rank closed is queued as a step of moves alone."""
         if (
             self._tp_async_for(message.node_name) and message.speculative
             and message.spec_from_seq in self._tp_nospec
@@ -3342,18 +3335,25 @@ class Worker:
                 "Worker %s: dropped speculative head seq %d (parent %d closed)",
                 self.worker_id, message.spec_seq, message.spec_from_seq,
             )
+            message = moves_alone(message)
+        elif not message.request_ids:
+            logger.warning(
+                "Worker %s: dropped empty ScheduleTPNode for %s/%s (seq %d)",
+                self.worker_id, message.node_name, message.graph_walk,
+                message.spec_seq,
+            )
             return
         self.scheduler.register_tp_follow(message)
 
     def _close_tp_follow_step(self, pending: PendingBatch) -> None:
         """This step's forward raised (symmetrically on the leader, which never
-        submitted its head): drop a queued head from it, and any arriving later."""
+        submitted its head): a head from it, queued or arriving later, becomes a step of moves alone."""
         self._tp_nospec.add(pending.tp_seq)
         head = self.scheduler.peek_tp_follow()
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
-            self.scheduler.pop_tp_follow_head()
             # settle may have adopted some of the head's hit, and the leader releases the whole lease
             self.engine_manager.get_engine(head.node_name).drop_cached_prefix(head)
+            self.scheduler.void_tp_follow_head()
 
     @staticmethod
     def _step_voids_head(pending: PendingBatch) -> str | None:
@@ -3385,7 +3385,7 @@ class Worker:
                 void = self._step_voids_head(pending) if outputs is not None else None
                 if void is not None and not self._prefix_cache_open(head.node_name):
                     # The leader clears its speculation on this verdict too.
-                    self.scheduler.pop_tp_follow_head()
+                    self.scheduler.void_tp_follow_head()
                     logger.debug(
                         "Worker %s: dropped speculative head seq %d (parent %d %s)",
                         self.worker_id, head.spec_seq, s, void,

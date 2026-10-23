@@ -83,6 +83,10 @@ class _Scheduler:
         self.last_consumed_tp_seq = -1
 
     def get_next_batch(self, request_state, **kwargs):
+        if self.heads and not self.heads[0].speculative:
+            # a step of moves alone, popped after its settle with no batch to build
+            self.pop_tp_follow_head()
+            return None
         if self.last_consumed_tp_seq + 1 >= len(self.steps):
             return None
         self.last_consumed_tp_seq += 1
@@ -93,6 +97,9 @@ class _Scheduler:
 
     def pop_tp_follow_head(self):
         self.last_consumed_tp_seq = self.heads.pop(0).spec_seq
+
+    def void_tp_follow_head(self):
+        self.heads[0].speculative = False
 
     def take_admit_errors(self):
         return {}
@@ -319,14 +326,15 @@ def test_a_follower_tears_down_what_it_deferred_before_it_takes_the_next_step(mo
 def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkeypatch, cache_open):
     """N fails "also", so both ranks drop the speculative N+1 built on it. Rank 0 stamped
     "gone" with N+1 and tore it down before it sent N+2. Here "gone" is held until this
-    rank pops N+1, which it does as it drops it, after building it when the prefix cache is
-    open, and goes before N+2's admit."""
+    rank pops N+1. On the serial path this rank pops N+1 once the voided head's moves land,
+    after building N+1 when the prefix cache is open. "gone" is then torn down before N+2's
+    admit."""
     removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=1)
     w, log = _rank(monkeypatch, tp_rank=1, inbox=[[], [removal]])
     w.engine_manager.get_engine = lambda node: SimpleNamespace(
         prefix_cache_open=lambda node: cache_open, drop_cached_prefix=lambda head: None,
     )
-    # N+1 is dropped, so the serial path's next step is N+2
+    # N+1 is voided, so after it the serial path's next step is N+2
     w.scheduler.steps += [None, [HANDLES["kept"]]]
     build_executing, build_speculation = w._build_executing_batch, w._build_speculation
 

@@ -3,7 +3,7 @@ import logging
 import time
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, NamedTuple
 
@@ -203,6 +203,11 @@ class PopReadyResult(NamedTuple):
     walk_output_signals: dict[str, list[str]] = {}
 
 
+def moves_alone(message: ScheduleTPNode) -> ScheduleTPNode:
+    """Return ``message`` without its rows, prefix hits and page trails, so it carries only rank 0's moves."""
+    return replace(message, request_ids=[], speculative=False, prefix_hits={}, page_trails={})
+
+
 class MicroScheduler:
     """
     Simple MVP scheduler: scans all worker graph queues for ready nodes,
@@ -392,10 +397,14 @@ class MicroScheduler:
         return engine.apply_resident_delta(node_name, delta)
 
     def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
+        new_delta = None
         if self._last_resident_delta < message.spec_seq:
             self._last_resident_delta = message.spec_seq
-            return self._apply_resident_delta(message.node_name, message.resident_delta)
-        return self._apply_resident_delta(message.node_name)
+            new_delta = message.resident_delta
+        try:
+            return self._apply_resident_delta(message.node_name, new_delta)
+        except Exception as exc:
+            raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
     def settle_tp_follow_delta(self, caught_up: bool) -> bool:
         """Replay the front head's resident delta; True once every move landed.
@@ -426,18 +435,29 @@ class MicroScheduler:
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
-        # and the async follower's build / drop / void paths) pops here, so the
-        # drain refcount is discharged in one place.
+        # and the async follower's build path) pops here. `void_tp_follow_head`
+        # discharges the drain refcount of a head this rank won't build.
         message = self.tp_batches_pending_schedule.popleft()
         self._apply_delta_from_message(message)
         self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
-        for rid in message.request_ids:
+        self._discharge(message.request_ids)
+        return message
+
+    def void_tp_follow_head(self) -> None:
+        """Turn the front head, which this rank won't build, into a step of moves alone. Rank 0 made the head's
+        moves and stamps the removals it makes next with the head's seq, so the seq counts as consumed only when
+        the step is popped, after its moves land."""
+        head = self.tp_batches_pending_schedule[0]
+        self._discharge(head.request_ids)
+        self.tp_batches_pending_schedule[0] = moves_alone(head)
+
+    def _discharge(self, rids: list[str]) -> None:
+        for rid in rids:
             if rid not in self.pending_tp_follow_count:
                 continue
             self.pending_tp_follow_count[rid] -= 1
             if self.pending_tp_follow_count[rid] <= 0:
                 self.pending_tp_follow_count.pop(rid, None)
-        return message
 
     def pop_ready_rids(
         self, request_state: RequestStateManager,
@@ -522,6 +542,10 @@ class MicroScheduler:
         # leader's graph walk. No step of the node is in flight on this path.
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
+        if not first_tp_node.request_ids:
+            # a step with moves and no rows, so pop it rather than build an empty batch
+            self.pop_tp_follow_head()
+            return
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name,
             first_tp_node.graph_walk, self.tp_rids(first_tp_node),
