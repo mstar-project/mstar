@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import torch
@@ -586,25 +586,28 @@ class Conductor:
                 )
         return {name: caps.get(name, n) for name, n in self._loop_max_iters.items()}
 
-    def _resource_specs(self) -> dict:
-        """The model's resource specs by key, after this deployment's YAML, for admission-time checks."""
+    def _resource_specs(self) -> list[dict]:
+        """Each worker's resource specs by key, after this deployment's YAML, for admission-time checks.
+        A spec's ``nodes`` is cut to the worker's own, as the worker's engine does when it builds the resource."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
             built = self.model.get_node_resources() or []
             apply_yaml_overrides(built, self.model_config)
-            specs = {s.resource_key: s for s in built}
-            self._resource_specs_cache = specs
+            specs = self._resource_specs_cache = [
+                {s.resource_key: replace(s, nodes=s.nodes & nodes) for s in built if s.nodes & nodes}
+                for nodes in {frozenset(self._worker_nodes(worker_id)) for worker_id in self._per_worker_graphs}
+            ]
         return specs
 
     def _fit_loop_caps(self, model_kwargs: dict, configs: dict, cap: int) -> tuple[int, dict[str, int]]:
         """The largest ``max_output_tokens`` up to ``cap``, and its loop caps, that keeps every loop
         within what the request's resources hold. A loop that ``max_output_tokens`` doesn't drive is
         left as it is, and ``validate`` then refuses the request if it doesn't fit."""
-        specs = self._resource_specs()
         room: dict[str, int] = {}
-        for key, cfg in configs.items():
-            for name, n in cfg.loop_room(specs.get(key)).items():
-                room[name] = min(n, room.get(name, n))
+        for specs in self._resource_specs():
+            for key, cfg in configs.items():
+                for name, n in cfg.loop_room(specs.get(key)).items():
+                    room[name] = min(n, room.get(name, n))
 
         def overrun(caps: dict[str, int]) -> int:
             return max((caps[name] - n for name, n in room.items() if name in caps), default=0)
@@ -1258,9 +1261,9 @@ class Conductor:
             )
             for key, cfg in request_data.resource_configs.items():
                 cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
-        specs = self._resource_specs()
-        for key, cfg in request_data.resource_configs.items():
-            cfg.validate(specs.get(key))
+        for specs in self._resource_specs():
+            for key, cfg in request_data.resource_configs.items():
+                cfg.validate(specs.get(key))
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True

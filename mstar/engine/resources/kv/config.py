@@ -303,12 +303,28 @@ class KVReqConfig(ResourceReqConfig):
             for loop, slots in layout.growth:
                 n = (spec.config.max_seq_len - layout.positions(caps) + slots * caps[loop]) // slots
                 room[loop] = min(n, room.get(loop, n))
+        pool, page_size = spec.config.request_pages, spec.config.page_size
+        if self.pages(spec.nodes, caps, page_size) > pool:
+            # each loop's room in pages, searched with the other loops at their caps
+            for loop, cap in caps.items():
+                low, high = 0, cap
+                while low < high:
+                    mid = (low + high + 1) // 2
+                    if self.pages(spec.nodes, {**caps, loop: mid}, page_size) <= pool:
+                        low = mid
+                    else:
+                        high = mid - 1
+                room[loop] = min(low, room.get(loop, low))
         return room
 
     def validate(self, spec: "KVSpec | None" = None) -> None:
         """``ValueError`` (a 400) when a label would hold more positions at the request's caps
         than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,
-        the one model that declares one, computes its positions in each forward."""
+        the one model that declares one, computes its positions in each forward.
+
+        Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool
+        has for requests. The pool admits on the prompt alone, so such a request would be admitted
+        and then could not finish even alone in an empty pool."""
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
@@ -318,6 +334,12 @@ class KVReqConfig(ResourceReqConfig):
                     f"this request needs {positions} positions of {label!r}, "
                     f"past the model's context of {spec.config.max_seq_len}"
                 )
+        pages = self.pages(spec.nodes, self.loop_caps or {}, spec.config.page_size)
+        if pages > spec.config.request_pages:
+            raise ValueError(
+                f"this request needs {pages} pages of {spec.resource_key!r} for labels "
+                f"{sorted(self.opened_labels(spec.nodes))}, and the pool has {spec.config.request_pages}"
+            )
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
