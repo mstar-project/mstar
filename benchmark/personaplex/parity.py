@@ -1,5 +1,5 @@
 # ruff: noqa: E402
-"""Private real-checkpoint numerical investigation; no synthetic-weight oracle.
+"""Real-checkpoint numerical comparison against NVIDIA's reference; no synthetic-weight oracle.
 
 NVIDIA is imported from its clean pin, under the SAME production Torch runtime.
 That runtime is outside NVIDIA's declared torch<2.5 range, explicitly reported.

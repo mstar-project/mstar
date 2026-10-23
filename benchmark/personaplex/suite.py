@@ -3,10 +3,10 @@
 import argparse
 import base64
 import csv
-import fcntl
 import hashlib
 import html
 import importlib.metadata
+import importlib.util
 import json
 import os
 import signal
@@ -22,6 +22,9 @@ from benchmark.personaplex.serving import write_json
 
 PIN = "3428dfd95309a7f3c84fd93259ded0f810d1ff91"
 STATUSES = {"PASS", "FAIL", "SKIP", "BLOCKED", "NOT RUN"}
+# With --deadline-seconds, stop launching stages this long before the deadline so
+# evidence can be written and servers stopped (smoke stages are shorter).
+STOP_RESERVE_S = {"smoke": 120, "full": 900}
 INTERRUPTED = False
 
 
@@ -50,7 +53,7 @@ def preflight(settings, root):
         raise ValueError("NVIDIA source pin differs")
     if git("-C", settings["source"], "status", "--porcelain"):
         raise ValueError("NVIDIA reference checkout is dirty")
-    for key in ("source", "assets", "voices", "cache", "extension", "server_config", "existing_clip"):
+    for key in ("source", "assets", "voices", "cache", "server_config", "existing_clip"):
         if not Path(settings[key]).exists():
             raise FileNotFoundError(f"Missing {key}: {settings[key]}")
     for name in ("model.safetensors", "tokenizer-e351c8d8-checkpoint125.safetensors", "tokenizer_spm_32k_3.model"):
@@ -58,8 +61,7 @@ def preflight(settings, root):
             raise FileNotFoundError(name)
     if not (Path(settings["voices"]) / "NATF2.pt").is_file():
         raise FileNotFoundError("NATF2.pt")
-    if not any(Path(settings["extension"]).glob("mstar_rust*.so")):
-        raise FileNotFoundError("Private built Rust extension")
+    extension = rust_extension_files(settings)
     entries = [entry(settings["existing_clip"], "existing-222")]
     if settings.get("english_clip") and Path(settings["english_clip"]).is_file():
         entries.append(entry(settings["english_clip"], "english"))
@@ -88,10 +90,7 @@ def preflight(settings, root):
         "inputs": checked,
         "server_config_sha256": hashlib.sha256(Path(settings["server_config"]).read_bytes()).hexdigest(),
         "source_sha": PIN,
-        "extension_sha256": {
-            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in sorted(Path(settings["extension"]).glob("mstar_rust*.so"))
-        },
+        "extension_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in extension},
         "reference_runtime_scope": "Same-runtime reference; supported NVIDIA runtime deferred",
     }
     identity["fingerprint"] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -109,6 +108,39 @@ def preflight(settings, root):
     write_json(old, identity)
     write_json(root / "settings.json", settings)
     return entries
+
+
+def rust_extension_files(settings):
+    """The mstar_rust binaries the run imports: a separately built ``extension``
+    directory, or else the module installed in the environment."""
+    if settings.get("extension"):
+        files = sorted(Path(settings["extension"]).glob("mstar_rust*.so"))
+        if not files:
+            raise FileNotFoundError(f"No mstar_rust*.so in extension directory {settings['extension']}")
+        return files
+    spec = importlib.util.find_spec("mstar_rust")
+    if spec is None or spec.origin is None:
+        raise FileNotFoundError("mstar_rust is not importable: build it (docs/installation.rst) or set extension")
+    origin = Path(spec.origin)
+    return sorted(origin.parent.glob("mstar_rust*.so")) if origin.name == "__init__.py" else [origin]
+
+
+def stage_deadline(started, deadline_seconds, smoke):
+    """Last moment to launch a stage: no limit unless a deadline is given."""
+    if deadline_seconds is None:
+        return float("inf")
+    return started + deadline_seconds - STOP_RESERVE_S["smoke" if smoke else "full"]
+
+
+def missing_clip_results(entries, smoke):
+    """BLOCKED rows for the English clip's parity cases when the settings name none.
+
+    Lifecycle and warm cells simply run without the clip, so only these two are missing.
+    """
+    if smoke or any(e["id"] == "english" for e in entries):
+        return {}
+    reason = "No english_clip in the settings; no substitute recording is used"
+    return {f"parity-english-{backend}": {"status": "BLOCKED", "reason": reason} for backend in ("dense", "resources")}
 
 
 def subprocess_case(command, output, logpath, deadline, timeout, env):
@@ -244,6 +276,10 @@ def main():
     parser.add_argument("--settings", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument(
+        "--deadline-seconds", type=float, default=None,
+        help="stop launching stages near this many seconds after start (e.g. a job's wall time); default: none",
+    )
     args = parser.parse_args()
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -260,28 +296,8 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("GPU unavailable; no numerical/serving evidence produced")
     smoke = args.mode == "smoke"
-    # Slurm submission allocates <=20min smoke and <=160min full. Reserve15min in full.
-    allocation_start = float(os.environ["PERSONAPLEX_ALLOCATION_START"])
-    allocation_seconds = int(os.environ["PERSONAPLEX_ALLOCATION_SECONDS"])
-    if allocation_seconds > (1200 if smoke else 9600):
-        raise ValueError("Allocation exceeds the agreed smoke/full budget")
-    budget_path = Path(settings["budget_file"])
-    budget_path.parent.mkdir(parents=True, exist_ok=True)
-    with budget_path.open("a+") as ledger:
-        fcntl.flock(ledger, fcntl.LOCK_EX)
-        ledger.seek(0)
-        content = ledger.read()
-        budget = json.loads(content) if content else {}
-        job = os.environ["SLURM_JOB_ID"]
-        if job not in budget:
-            if sum(budget.values()) + allocation_seconds > 10800:
-                raise ValueError("Three GPU-hour reservation cap reached; no new work launched")
-            budget[job] = allocation_seconds
-            ledger.seek(0)
-            ledger.truncate()
-            ledger.write(json.dumps(budget, indent=2))
-            ledger.flush()
-    deadline = allocation_start + allocation_seconds - (120 if smoke else 900)
+    started = time.time()
+    deadline = stage_deadline(started, args.deadline_seconds, smoke)
     env = dict(os.environ, MSTAR_SHM_ARENA="1", PYTHONUNBUFFERED="1", PERSONAPLEX_DEADLINE=str(deadline))
     env["PYTHONPATH"] = os.pathsep.join([str(Path.cwd()), env.get("PYTHONPATH", "")])
     write_json(
@@ -289,9 +305,8 @@ def main():
         {
             "gpu": torch.cuda.get_device_name(),
             "torch": str(torch.__version__),
-            "allocation_start": allocation_start,
-            "allocation_seconds": allocation_seconds,
-            "deadline": deadline,
+            "started": started,
+            "deadline_seconds": args.deadline_seconds,
             "slurm_job": os.environ.get("SLURM_JOB_ID"),
         },
     )
@@ -396,20 +411,7 @@ def main():
         raise ValueError("Existing results: use resume or a fresh output directory")
     for name, *_ in scenarios:
         results.setdefault(name, {"status": "NOT RUN"})
-    if not smoke and not any(e["id"] == "english" for e in entries):
-        for name in (
-            "parity-english-dense",
-            "parity-english-resources",
-            "lifecycle-english",
-            "soak-english",
-            "warm-english-c1",
-            "warm-english-c2",
-            "warm-english-c4",
-        ):
-            results[name] = {
-                "status": "BLOCKED",
-                "reason": "User English recording not supplied; no corpus substituted",
-            }
+    results.update(missing_clip_results(entries, smoke))
     write_json(result_path, results)
     for name, command, timeout, minimum in scenarios:
         prior = results[name]["status"]

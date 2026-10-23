@@ -217,3 +217,46 @@ def test_timing_summary_measures_frames_against_the_80ms_budget():
         summarize([], audio_seconds=1.0, total_seconds=1.0)
     merged = median_runs([{"rtf": 1.0, "note": "a"}, {"rtf": 3.0, "note": "b"}, {"rtf": 2.0, "note": "c"}])
     assert merged["rtf"] == 2.0 and merged["repeats"] == 3 and "note" not in merged
+
+
+def test_stage_deadline_is_optional_and_keeps_the_stop_reserve():
+    from benchmark.personaplex.suite import stage_deadline
+
+    assert stage_deadline(100.0, None, smoke=False) == float("inf")
+    assert stage_deadline(100.0, 3600, smoke=False) == 100.0 + 3600 - 900
+    assert stage_deadline(100.0, 1200, smoke=True) == 100.0 + 1200 - 120
+
+
+def test_missing_english_clip_blocks_only_its_parity_cases():
+    from benchmark.personaplex.suite import missing_clip_results
+
+    rows = missing_clip_results([{"id": "existing-222"}], smoke=False)
+    assert set(rows) == {"parity-english-dense", "parity-english-resources"}
+    assert all(row["status"] == "BLOCKED" for row in rows.values())
+    assert missing_clip_results([{"id": "existing-222"}, {"id": "english"}], smoke=False) == {}
+    assert missing_clip_results([{"id": "short-control"}], smoke=True) == {}
+
+
+def test_rust_extension_from_directory_or_installed_module(tmp_path, monkeypatch):
+    import importlib.util
+    import types
+
+    from benchmark.personaplex.suite import rust_extension_files
+
+    built = tmp_path / "ext"
+    built.mkdir()
+    (built / "mstar_rust.cpython-312-x86_64-linux-gnu.so").write_bytes(b"x")
+    assert [p.name for p in rust_extension_files({"extension": str(built)})] == [
+        "mstar_rust.cpython-312-x86_64-linux-gnu.so"]
+    with pytest.raises(FileNotFoundError, match="No mstar_rust"):
+        rust_extension_files({"extension": str(tmp_path)})
+    package = tmp_path / "site" / "mstar_rust"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "mstar_rust.cpython-312-x86_64-linux-gnu.so").write_bytes(b"y")
+    monkeypatch.setattr(importlib.util, "find_spec",
+                        lambda name: types.SimpleNamespace(origin=str(package / "__init__.py")))
+    assert [p.parent.name for p in rust_extension_files({})] == ["mstar_rust"]
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    with pytest.raises(FileNotFoundError, match="not importable"):
+        rust_extension_files({"extension": None})

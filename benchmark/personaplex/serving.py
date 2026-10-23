@@ -96,8 +96,9 @@ class Server:
             PERSONAPLEX_OWNERSHIP_ROOT=str(self.root),
             PERSONAPLEX_LIVE_BACKEND=self.backend,
         )
-        paths = [str(Path(__file__).parent / "observe"), self.settings["extension"], str(Path.cwd())]
-        env["PYTHONPATH"] = os.pathsep.join(paths + [env.get("PYTHONPATH", "")])
+        paths = [str(Path(__file__).parent / "observe"), self.settings.get("extension"), str(Path.cwd()),
+                 env.get("PYTHONPATH")]
+        env["PYTHONPATH"] = os.pathsep.join(p for p in paths if p)
         self.log = (self.root / "server.log").open("wb")
         command = [
             str(Path(sys.executable).with_name("mstar-serve")),
