@@ -655,6 +655,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.apply_conductor_config"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.apply_conductor_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.loop_room"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.loop_room()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.validate"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.validate()</span></code></a></li>
 </ul>
 </li>
@@ -822,6 +823,21 @@ tag of its own — a marker base, with no contract beyond the hooks below.</p>
 <dd></dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.ResourceReqConfig.loop_room">
+<span class="sig-name descname"><span class="pre">loop_room</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#ResourceReqConfig.loop_room"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.ResourceReqConfig.loop_room" title="Link to this definition">#</a></dt>
+<dd><p>The most iterations each loop can run before the request outgrows the
+resource built from <code class="docutils literal notranslate"><span class="pre">spec</span></code>. A loop the resource doesn’t bound is left out.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>spec</strong> (<a class="reference internal" href="#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em> | </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.spec.ResourceReqConfig.validate">
 <span class="sig-name descname"><span class="pre">validate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">spec</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#ResourceReqConfig.validate"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.ResourceReqConfig.validate" title="Link to this definition">#</a></dt>
 <dd><p>Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> if a client-supplied value is out of range, or
@@ -940,6 +956,7 @@ would otherwise be a silently ineffective setting.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.apply_conductor_config"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.apply_conductor_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.loop_room"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.loop_room()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.ResourceReqConfig.validate"><code class="docutils literal notranslate"><span class="pre">ResourceReqConfig.validate()</span></code></a></li>
 </ul>
 </li>

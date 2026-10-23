@@ -1009,8 +1009,13 @@ text and attachments in <code class="docutils literal notranslate"><span class="
 </pre></div>
 </div>
 <dl class="simple">
-<dt><code class="docutils literal notranslate"><span class="pre">get_loop_caps(self,</span> <span class="pre">**model_kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">int]</span></code></dt><dd><p>The iterations each named loop may run for this request. A loop runs the smaller of its
-graph <code class="docutils literal notranslate"><span class="pre">max_iters</span></code> and its cap, and speculation never runs past it. A model whose stop
+<dt><code class="docutils literal notranslate"><span class="pre">get_loop_caps(self,</span> <span class="pre">**model_kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">int]</span></code></dt><dd><p>The iterations each named loop may run for this request. The conductor refuses a request
+whose cap is past its loop’s graph <code class="docutils literal notranslate"><span class="pre">max_iters</span></code>, or whose layout at its caps holds more
+positions than its pool’s <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, with a 400. A request that sets no length has
+the default <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> cut to the context its prompt leaves, and a stop check
+reads that length from <code class="docutils literal notranslate"><span class="pre">request_info.max_tokens</span></code>, which carries the cut. A model that
+reads a length from another key lists it in <code class="docutils literal notranslate"><span class="pre">LENGTH_KWARGS</span></code>. Speculation never runs past a
+cap. A model whose stop
 check ends a loop at a count returns that count, so the cap and the stop check end the
 loop on the same iteration; <code class="docutils literal notranslate"><span class="pre">test/modular/test_model_kv_layouts.py</span></code> checks this for
 every model. Growth on an uncapped loop is counted to its graph <code class="docutils literal notranslate"><span class="pre">max_iters</span></code>.</p>
@@ -1510,7 +1515,8 @@ that <code class="docutils literal notranslate"><span class="pre">Loop</span></c
 concurrently.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">Loop(name,</span> <span class="pre">section,</span> <span class="pre">max_iters,</span> <span class="pre">outputs)</span></code> is a subgraph that iterates. Its body feeds
 its own outputs back as the inputs of the next iteration. It runs at most <code class="docutils literal notranslate"><span class="pre">max_iters</span></code>
-times, and can stop earlier. Give the loop a <code class="docutils literal notranslate"><span class="pre">name</span></code> so that a submodule’s
+times, and can stop earlier. A decode loop’s <code class="docutils literal notranslate"><span class="pre">max_iters</span></code> is the model’s context length,
+and each request’s own length is its cap from <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>. Give the loop a <code class="docutils literal notranslate"><span class="pre">name</span></code> so that a submodule’s
 <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> can register a stop signal against it. This is the usual <code class="docutils literal notranslate"><span class="pre">decode</span></code> loop.</p></li>
 </ul>
 <p>A minimal text generator has two walks: a <code class="docutils literal notranslate"><span class="pre">prefill</span></code> node that runs once, and a
@@ -1530,7 +1536,7 @@ times, and can stop earlier. Give the loop a <code class="docutils literal notra
             <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"text_inputs"</span><span class="p">],</span>
             <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"text_inputs"</span><span class="p">)],</span>  <span class="c1"># loop-back</span>
         <span class="p">),</span>
-        <span class="n">max_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">get_max_output_tokens</span><span class="p">(),</span>
+        <span class="n">max_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
         <span class="n">outputs</span><span class="o">=</span><span class="p">[],</span>
     <span class="p">)</span>
     <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="n">prefill</span><span class="o">=</span><span class="n">prefill</span><span class="p">,</span> <span class="n">decode</span><span class="o">=</span><span class="n">decode</span><span class="p">)</span>
