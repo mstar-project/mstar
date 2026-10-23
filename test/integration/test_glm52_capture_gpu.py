@@ -20,6 +20,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.model.glm52._testing import per_request_outputs
 from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
 from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -183,8 +184,7 @@ class _Node:
         finally:
             if lease is not None:
                 self.cg.release(lease, len(rids))
-        # a dict, or (with #258's graph runner) a BatchedModelOutput
-        out = getattr(raw, "per_rid_outputs", raw)
+        out = per_request_outputs(raw, out_ids)
         return {rid: {k: list(v) for k, v in out[out_ids[i]].items()} for i, rid in enumerate(rids)}
 
     def generate(self) -> dict[str, list[int]]:

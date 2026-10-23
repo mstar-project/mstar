@@ -179,10 +179,10 @@ def test_compiled_forward_does_not_recompile_per_request(monkeypatch):
     try:
         # the second call recompiles once as the RoPE cache fills
         for rid in ("a", "b"):
-            assert set(prefill(rid)) == {rid}
+            assert prefill(rid).row_outputs["new_token"].shape == (1,)
         frames = counter.frame_count
         for rid in ("c", "d"):
-            assert set(prefill(rid)) == {rid}
+            assert prefill(rid).row_outputs["new_token"].shape == (1,)
         assert counter.frame_count == frames
     finally:
         torch._dynamo.reset()

@@ -140,6 +140,10 @@ class Glm52ModelConfig:
     # per-hit-expert dequant loop, the numerics anchor (uncapturable). W8A8
     # activation quantization is the standard fp8 serving numerics, as in vLLM.
     moe_quant_kernel: str = "auto"
+    # torch.compile the forward the CUDA graphs capture and the uncaptured steps run. False
+    # (model_kwargs.graph_compile) captures and runs it eager, for an Inductor failure that
+    # would otherwise fail every capture and serve eager.
+    graph_compile: bool = True
 
     prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None

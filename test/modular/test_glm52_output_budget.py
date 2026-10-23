@@ -41,13 +41,13 @@ def test_request_budget_above_the_default_is_honored():
     assert m._tokenizer is None
 
 
-def test_request_budget_is_held_to_the_context_window():
+def test_the_published_limit_is_the_context_window():
     m = _model()
     guard = _guard(m.config)
     assert guard == 2048
-    # a one-token prompt emits at most `guard` tokens (the last is never
-    # stored); a larger budget is unreachable and check_stop could never fire
-    assert m.get_max_output_tokens(max_output_tokens=5000) == guard
+    # a one-token prompt emits at most `guard` tokens (the last is never stored); the
+    # conductor refuses a larger budget, which check_stop could never reach
+    assert m.get_max_output_tokens_limit() == guard
     assert m.get_max_output_tokens(max_output_tokens=guard) == guard
     assert m.get_max_output_tokens(max_output_tokens=7) == 7
 
@@ -57,7 +57,7 @@ def test_loop_cap_covers_every_reachable_budget_and_stays_below_the_guard():
     guard = _guard(m.config)
     decode = m.get_graph_walk_graphs()["decode"]
     # the largest budget check_stop can honor needs guard-1 iterations
-    assert decode.max_iters >= m.get_max_output_tokens(max_output_tokens=10_000) - 1
+    assert decode.max_iters >= m.get_max_output_tokens_limit() - 1
     # ...and the cap alone cannot run a one-token prompt into the guard
     assert decode.max_iters == guard - 1
     assert decode.max_iters < guard
@@ -69,7 +69,7 @@ def test_loop_cap_follows_the_dsa_serving_window():
     assert m.context_limit() == 8192
     decode = m.get_graph_walk_graphs()["decode"]
     assert decode.max_iters == 8191
-    assert m.get_max_output_tokens(max_output_tokens=10_000) == 8192
+    assert m.get_max_output_tokens_limit() == 8192
 
 
 def test_reduced_variant_cap_tracks_its_smaller_window():
@@ -78,7 +78,7 @@ def test_reduced_variant_cap_tracks_its_smaller_window():
     assert guard == 64
     decode = m.get_graph_walk_graphs()["decode"]
     assert decode.max_iters == guard - 1
-    assert m.get_max_output_tokens(max_output_tokens=1000) == guard
+    assert m.get_max_output_tokens_limit() == guard
 
 
 def test_process_prompt_refuses_a_prompt_without_room():
@@ -124,13 +124,12 @@ def test_sampling_knobs_without_a_config_default_reach_the_sampler():
     assert cfg[SAMPLER_RESOURCE].top_k == 20 and cfg[SAMPLER_RESOURCE].min_p == 0.05
 
 
-def test_the_compile_hatch_covers_uncaptured_steps(monkeypatch):
+def test_graph_compile_is_a_model_kwarg_that_covers_uncaptured_steps():
     from mstar.model.glm52.submodules import Glm52LLMSubmodule
 
+    assert _model().config.graph_compile
     sub = object.__new__(Glm52LLMSubmodule)
-    monkeypatch.delenv("MSTAR_GLM52_GRAPH_COMPILE", raising=False)
-    assert not sub.disable_torch_compile
-    monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
+    sub.config = _model(graph_compile=False).config
     assert sub.disable_torch_compile and not sub._compile_flags()["compile"]
 
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import torch
@@ -38,6 +37,8 @@ from mstar.model.glm52.config import (
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
 )
@@ -165,18 +166,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return blocked
 
     def _compile_flags(self) -> dict[str, Any]:
-        # MSTAR_GLM52_GRAPH_COMPILE=0 captures the eager forward (escape hatch
-        # for an Inductor toolchain crash); "default" is torch.compile's own
-        # mode (cuBLAS GEMMs, no autotuning), the fastest here.
-        return {
-            "compile": os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
-            "compile_mode": "default",
-        }
+        # "default" is torch.compile's own mode (cuBLAS GEMMs, no autotuning), the fastest here
+        return {"compile": self.config.graph_compile, "compile_mode": "default"}
 
     @property
     def disable_torch_compile(self) -> bool:
-        # the escape hatch covers the uncaptured steps too, which the engine compiles
-        return os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") != "1"
+        # graph_compile covers the uncaptured steps too, which the engine compiles
+        return not self.config.graph_compile
 
     def to(self, *args, **kwargs):
         """Honor device moves; refuse post-load dtype casts (per-param dtypes
@@ -382,14 +378,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     @torch.compiler.disable
     def _sample(
         self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = list(engine_inputs.request_ids)
+    ) -> BatchedModelOutput:
         new_tokens = engine_inputs.resources[SAMPLER_RESOURCE].sample(
-            request_ids, logits=logits)
-        return {
-            rid: {"new_token": [new_tokens[i : i + 1]]}
-            for i, rid in enumerate(request_ids)
-        }
+            list(engine_inputs.request_ids), logits=logits)
+        # Row i is request i: one clone and one D2H copy per step, not one per request
+        return BatchedModelOutput(
+            row_outputs={"new_token": new_tokens},
+            check_stop_buffers={"new_token": new_tokens},
+        )
 
     def postprocess(
         self, request_id: str,
@@ -409,15 +405,44 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
+        token = outputs["new_token"][0].item() if "new_token" in outputs else None
+        return self._stops(request_id, request_info, token)
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for every request off one ``tolist`` of the step's tokens."""
+        tokens = host_rows.buffers.get("new_token")
+        if not torch.is_tensor(tokens) or tokens.dim() == 0:
+            return None
+        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        stops: dict[str, set[str]] = {}
+        for rid in request_ids:
+            i = row_of.get(rid)
+            if i is None or i >= len(values):
+                continue  # no row, no output: the per-request path skips it too
+            loops = self._stops(rid, request_infos[rid], values[i])
+            if loops:
+                stops[rid] = loops
+        return stops
+
+    def _stops(
+        self, request_id: str, request_info: CurrentForwardPassInfo, token: int | None,
+    ) -> set[str]:
+        """The loops the request's new ``token`` stops; None when the step emitted none."""
         state = self.request_state(request_id)
         if state.get("ended_at_prefill"):
             return {"decode_loop"}
-        if "new_token" not in outputs:
+        if token is None:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
         # the prompt-aware cap from the prefill's preprocess, else the request's own
         budget = state.get("token_budget", request_info.max_tokens)
-        token = outputs["new_token"][0].item()
         is_eos = token in self.config.eos_token_ids
         if request_info.graph_walk == "prefill":
             # no decode_loop on this walk to stop: a stop token ends the reply at the first

@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 import torch
+from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
@@ -34,6 +35,7 @@ from mstar.model.glm52.config import (
     SAMPLER_RESOURCE,
     Glm52ModelConfig,
 )
+from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -80,6 +82,8 @@ class Glm52Model(Model):
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
+        if "graph_compile" in kwargs:
+            self.config.graph_compile = bool(kwargs["graph_compile"])
         for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
             if key in kwargs:
                 setattr(self.config, key, [int(n) for n in kwargs[key]])
@@ -338,35 +342,18 @@ class Glm52Model(Model):
         input_modalities: list[str],
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
+        prompt_parts: list[PromptPart] | None = None,
         **kwargs,
     ) -> NameToTensorList:
         if prompt is None:
             return {}
-        # the conductor reads these kwargs; read here first, a bad one is the
-        # client's 400 before the request reaches any rank
-        sampling = self.get_request_resource_configs({}, kwargs)[SAMPLER_RESOURCE]
-        self.get_max_output_tokens(**kwargs)
-        if sampling.min_p > 0:
-            # the node's sampler is built without min-p: a 400 here, not the worker's 500
-            raise ValueError(f"GLM-5.2 is served without min_p (min_p={sampling.min_p}); send none")
-
         if self._tokenizer_mode == "byte":
             # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
             vocab = self.config.vocab_size
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             input_ids = torch.tensor(byte_ids, dtype=torch.long)
-        # GLM-5.2 chat template (adds [gMASK]<sop> etc. and the assistant
-        # turn). TODO: thinking mode / reasoning_effort dial once the
-        # OpenAI adapter plumbs it through.
         elif getattr(self.tokenizer, "chat_template", None):
-            input_ids = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
-                add_generation_prompt=True,
-                return_tensors="pt",
-                # transformers 5.x defaults return_dict=True (a BatchEncoding);
-                # keep the bare-tensor return so [0] selects the row
-                return_dict=False,
-            )[0]
+            input_ids = self._render_chat(prompt, prompt_parts)
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 
@@ -377,6 +364,30 @@ class Glm52Model(Model):
                 f"at most {self.config.max_prompt_tokens}"
             )
         return {"text_inputs": [input_ids.to(torch.long)]}
+
+    def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None) -> torch.Tensor:
+        """The chat's turns, each in its own role, through the checkpoint's template, which
+        adds ``[gMASK]<sop>`` and opens the assistant turn. An entrypoint with no messages
+        sends the prompt as one user turn. TODO: the thinking mode / reasoning_effort dial."""
+        parts = prompt_parts or [PromptPart(modality=TEXT, text=prompt, role="user")]
+        messages = [
+            {"role": turn.role,
+             "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
+            for turn in chat_turns(parts)
+        ]
+        try:
+            input_ids = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                # transformers 5.x defaults return_dict=True (a BatchEncoding);
+                # keep the bare-tensor return so [0] selects the row
+                return_dict=False,
+            )
+        except TemplateError as exc:
+            # a chat the template refuses is the client's to fix: a 400, not a 500
+            raise ValueError(f"GLM-5.2's chat template refused the chat: {exc}") from exc
+        return input_ids[0]
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
@@ -406,13 +417,15 @@ class Glm52Model(Model):
         guard; every longer prompt stops sooner, via check_stop or the guard."""
         return self.context_limit() - 1
 
+    def get_max_output_tokens_limit(self) -> int:
+        """A one-token prompt emits at most ``context_limit`` tokens (the last is never
+        stored), so the conductor refuses a larger ``max_output_tokens`` with a 400."""
+        return self.context_limit()
+
     def get_max_output_tokens(self, **model_kwargs):
-        # the request's budget, held to the window: a one-token prompt emits at
-        # most ``context_limit`` tokens (the last is never stored), so a larger
-        # budget is unreachable and check_stop could never fire on it
         budget = normalize_generation_kwargs(model_kwargs).get(
             "max_output_tokens", self.config.max_output_tokens)
-        return self.context_limit() if budget is None else min(budget, self.context_limit())
+        return self.context_limit() if budget is None else budget
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
