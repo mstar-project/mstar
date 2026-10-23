@@ -656,6 +656,7 @@ class Worker:
             self._kv_caches[kv.key] = kv
             for node_name in kv.nodes:
                 self._kv_keys[node_name].append(kv.key)
+        self._logged_pools = [kv.cache for kv in self._kv_caches.values() if kv.cache.logs_counts]
         self._rebuild_rows: dict[int, RebuildRow] = {}
         self._dropped: dict[int, str] = {}
         self._victims: dict[int, Victim] = {}
@@ -4900,6 +4901,10 @@ class Worker:
                 # scans through ``check_ready``'s reload — and none of it may run
                 # while N's admit is outstanding. See ``_await_admit_settled``.
                 self._await_admit_settled(pending)
+                if self._logged_pools and pending is not None and pending.tp_seq >= 0:
+                    # after the step's admit, and before this pass moves a page, on every rank
+                    for cache in self._logged_pools:
+                        cache.log_counts(pending.tp_seq)
                 if self._victims:
                     # A pass that raised may still owe the followers a victim's drop. Send it before any removal
                     # applies.

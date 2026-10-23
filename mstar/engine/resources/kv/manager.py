@@ -585,6 +585,7 @@ class KVManager(AttentionResource):
         # so each rank admits a step from the same counts.
         self._counts = leads
         self._decides = leads and self._rank == 0
+        self.logs_counts = _DEBUG_ASSERTS and leads and self._world_size > 1
         # set by the engine on rank 0 of a TP node
         self.journal: Callable[..., None] | None = None
         # An allotment covers the labels `_nodes` open.
@@ -3602,6 +3603,17 @@ class KVManager(AttentionResource):
                 return False
             self._allot(rid, need)
             return True
+
+    def log_counts(self, tp_seq: int) -> None:
+        """Called after a step's admit, for comparing with the other ranks' lines. The cached count can move
+        with the step's commit, so compare it across ranks only once they are idle."""
+        with self._lock:
+            counts = self.page_counts()
+            logger.info(
+                "KV %s counts after tp seq %d: %d allotted unused, %d earmarked, %d dropped, %d used, %d cached",
+                self.name, tp_seq, self._unused, sum(earmark.pages for earmark in self._earmarks.values()),
+                len(self._dropped), counts.used, counts.cached,
+            )
 
     def is_victim(self, rid: str) -> bool:
         return rid in self._victims
