@@ -55,10 +55,13 @@ def _prefill(kv: KVManager, rid: str, n: int) -> None:
     kv.commit(step, ctx)
 
 
-def _decode(kv: KVManager, rids: tuple[str, ...], slot: int, pad: int = 0, commit: bool = True):
+def _decode(
+    kv: KVManager, rids: tuple[str, ...], slot: int, pad: int = 0, commit: bool = True,
+    sink: frozenset = frozenset(),
+):
     """One captured decode step over ``rids`` plus ``pad`` padding rows; returns the plan."""
     padded = rids + tuple(f"pad{i}" for i in range(pad))
-    step = KVStep(segments=tuple(Segment(r, "main", 1) for r in padded))
+    step = KVStep(segments=tuple(Segment(r, "main", 1) for r in padded), sink=sink)
     bucket = BucketKey(graph_walk=WALK, bs=len(padded), num_tokens=len(padded))
     ctx = StepContext(
         request_ids=rids, graph_walk=WALK, slot=slot, capture=False,
@@ -342,3 +345,17 @@ def test_a_prompt_chunk_or_another_packed_step_after_a_packed_one_misses():
     assert _flat(_decode(kv, ("a", "c"), slot=0)[0]) == _flat(_decode(ref, ("a", "c"), slot=0)[0])
     # the second packed step tried the cache and missed
     assert kv.plan_cache_stats == {"hit": 1, "miss": 1, "mismatch": 0}
+
+
+def test_a_step_with_sink_rows_is_planned_from_the_streams():
+    """A row on the step's sink holds no pages: the cached plan of the same
+    segments, which addresses that row's pages, must not be served."""
+    ref, kv = _manager(0), _manager(1)
+    for m in (ref, kv):
+        _prefill(m, "a", 5)
+        _prefill(m, "b", 7)
+        _decode(m, ("a", "b"), slot=0)
+        _decode(m, ("a", "b"), slot=1)
+    sink = frozenset({("b", "main")})
+    got = _decode(kv, ("a", "b"), slot=0, sink=sink, commit=False)[0]
+    assert _flat(got) == _flat(_decode(ref, ("a", "b"), slot=0, sink=sink, commit=False)[0])

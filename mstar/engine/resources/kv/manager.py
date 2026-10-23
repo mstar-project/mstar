@@ -2234,6 +2234,8 @@ class KVManager(AttentionResource):
             or ctx.capture
             or step.pre_forks
             or step.post_forks
+            # the cached rows hold pages; a sink row of the same segment must not
+            or step.sink
         ):
             return None
         if cache.epoch != self._plan_epoch or cache.pending != 1:
