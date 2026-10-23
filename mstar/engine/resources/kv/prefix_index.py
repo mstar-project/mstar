@@ -46,7 +46,9 @@ class PrefixIndex:
         return pages
 
     def insert(self, key: bytes, page: int, parent: int | None = None) -> bool:
-        """Name ``page`` by ``key`` under ``parent``; the first writer wins."""
+        """Name ``page`` by ``key`` under ``parent``; the first writer wins. When only the index holds
+        ``parent``, ``page`` is filed with no parent, since a held ``page`` under ``parent`` would stop
+        `evict` from freeing ``parent``, which the pool counts as evictable."""
         assert parent is None or self._key[parent] is not None, (
             f"page {page} indexed under parent page {parent}, which the index "
             "does not hold; a parent must outlive its children"
@@ -58,6 +60,8 @@ class PrefixIndex:
             f"indexed under {self._key[page].hex()[:16]}; evicting one entry "
             "would free a page the other still names"
         )
+        if parent is not None and self._arena.num_owners[parent] == 1:
+            parent = None
         self._clock += 1
         self._by_key[key] = page
         self._key[page] = key
