@@ -18,7 +18,6 @@ from mstar.engine.resources import (
     KVSpec,
     NodeResourceSpec,
     PagedKVConfig,
-    PositionConfig,
     PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
@@ -230,7 +229,7 @@ class Glm52Model(Model):
                 config=AttentionConfig(
                     kv_cache=KV_RESOURCE,
                     backend=AttnBackend.FLASHINFER_MLA,
-                    sm_scale=self.config.qk_head_dim ** -0.5,
+                    sm_scale=self.config.softmax_scale,
                 ),
             )
         else:
@@ -250,11 +249,10 @@ class Glm52Model(Model):
         specs = [
             KVSpec(resource_key=KV_RESOURCE, nodes=nodes, config=kv),
             attn,
-            # positions only: the layers rotate q_pe / k_pe themselves, in fp32 from one
-            # cos/sin table per forward that every layer and the indexer share
+            # the layers and the indexer rotate q_pe / k_pe with it (apply_qk)
             PositionSpec(
                 resource_key=POS_RESOURCE, nodes=nodes,
-                config=PositionConfig(kv_cache=KV_RESOURCE),
+                config=self.config.position_config(),
             ),
             SamplerSpec(
                 resource_key=SAMPLER_RESOURCE, nodes=nodes,

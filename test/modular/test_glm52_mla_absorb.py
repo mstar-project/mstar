@@ -31,6 +31,7 @@ def _cpu_flashinfer() -> types.ModuleType:
 @pytest.fixture(autouse=True)
 def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+    install_cpu_rope(monkeypatch)
 
 
 from mstar.engine.resources import (  # noqa: E402
@@ -41,12 +42,12 @@ from mstar.engine.resources import (  # noqa: E402
     SubmoduleStep,
 )
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
-from mstar.model.components.rope import rotate_gptj  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
+from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     KV_RESOURCE,
+    POS_RESOURCE,
     Glm52ModelConfig,
 )
 
@@ -55,6 +56,11 @@ def _ref_rmsnorm(x, weight, eps):
     x32 = x.float()
     x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
     return weight * x32.to(x.dtype)
+
+
+def rotate_gptj(x):
+    """Interleaved (GPT-J) rotate: pairs ``x[..., ::2]`` / ``x[..., 1::2]``."""
+    return torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(-2)
 
 
 def _ref_plain_rope(pos, q_pe, k_pe, cfg):
@@ -187,7 +193,9 @@ def test_rope_position_zero_is_identity():
     attn, cfg, _ = _build_attention_cpu(seed=4)
     q_pe = torch.randn(1, attn.num_heads, cfg.qk_rope_head_dim)
     k_pe = torch.randn(1, 1, cfg.qk_rope_head_dim)
-    q_rot, k_rot = attn.rotary(torch.zeros(1, dtype=torch.long), q_pe, k_pe)
+    resources, _ = build_cpu_resources(cfg)
+    attn.bind_resources(resources)
+    q_rot, k_rot = attn._rope(torch.zeros(1, dtype=torch.long), q_pe, k_pe)
     torch.testing.assert_close(q_rot, q_pe, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(k_rot, k_pe, rtol=1e-6, atol=1e-6)
 
@@ -292,7 +300,7 @@ def test_the_shared_mla_is_glm52s_dense_path(absorb):
 
     (naive, naive_cfg), (absorbed, absorbed_cfg) = _build_pair(seed=11)
     glm, cfg = (absorbed, absorbed_cfg) if absorb else (naive, naive_cfg)
-    base = MLAAttention(cfg, kv_key=KV_RESOURCE, attn_key=ATTN_RESOURCE)
+    base = MLAAttention(cfg, kv_key=KV_RESOURCE, attn_key=ATTN_RESOURCE, pos_key=POS_RESOURCE)
     base.load_state_dict(naive.state_dict())
     base.process_weights_after_loading()
     torch.manual_seed(12)
@@ -328,11 +336,11 @@ def test_absorbed_resource_path_matches_naive_and_dense_reference():
         torch.testing.assert_close(out_absorbed, reference[lo:hi], rtol=1e-2, atol=2e-3)
         torch.testing.assert_close(out_naive, reference[lo:hi], rtol=1e-2, atol=2e-3)
 
-    # what each cache holds: one 40-wide latent row per token on the
-    # absorbed path (32 ckv + 8 rope), padded per-head K/V on the naive one
+    # what each cache holds: one 48-wide latent row per token on the
+    # absorbed path (32 ckv + 16 rope), padded per-head K/V on the naive one
     kv_abs = absorbed_path.resources[KV_RESOURCE]
     kv_naive = naive_path.resources[KV_RESOURCE]
-    assert kv_abs.layer_view(0).shape[-1] == absorbed_cfg.cache_latent_dim == 40
+    assert kv_abs.layer_view(0).shape[-1] == absorbed_cfg.cache_latent_dim == 48
     assert kv_naive.layer_view(0).shape[1:] == (2, page, naive_cfg.num_attention_heads, 64)
     assert len(kv_abs._streams["r0"]["main"].page_indices) == 2
 
