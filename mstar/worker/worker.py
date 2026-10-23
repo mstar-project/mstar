@@ -2444,11 +2444,18 @@ class Worker:
             return
         with self._span("worker.await_admit_settled"):
             settled = event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S)
+            # A TP node's ranks diverge if this rank moves pages before the admit, however long it takes. A step
+            # that raised before the GPU thread's `try` never sets the event, but its future is done.
+            while not settled and pending.node_name in self.parallel_nodes and not pending.future.done():
+                logger.warning(
+                    "Worker %s: node=%s walk=%s has not admitted after %ss; holding page moves until it does",
+                    self.worker_id, pending.node_name, pending.graph_walk, _ADMIT_FENCE_TIMEOUT_S,
+                )
+                settled = event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S)
         if not settled:
             logger.warning(
-                "Worker %s: timed out waiting for node=%s walk=%s to admit "
-                "before scheduling; page moves may diverge across TP ranks",
-                self.worker_id, pending.node_name, pending.graph_walk,
+                "Worker %s: node=%s walk=%s has not admitted after %ss; scheduling the next step before its admit",
+                self.worker_id, pending.node_name, pending.graph_walk, _ADMIT_FENCE_TIMEOUT_S,
             )
 
     def _drop_rows_whose_loop_stopped(self, pending: PendingBatch) -> None:
