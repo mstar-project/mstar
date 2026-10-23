@@ -17,6 +17,7 @@ from mstar.engine.resources.base import (
     CachedPrefix,
     CGSlotSpec,
     EngineResourceInfo,
+    MoveKind,
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
@@ -579,10 +580,13 @@ class KVManager(AttentionResource):
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
-        # Only a deciding pool keeps allotments and a queue. With more than one rank none decides.
-        # Rank 0 would allot at readiness, after the step goes to the other ranks and before its
-        # admit, so a grant could pass on one rank and fail on another.
-        self._decides = self._world_size == 1 and leads
+        # Every rank of a leading pool keeps the allotments and earmarks and refuses a grant past the room.
+        # Rank 0 alone decides: it queues, allots and chooses victims, and the other ranks replay its moves,
+        # so each rank admits a step from the same counts.
+        self._counts = leads
+        self._decides = leads and self._rank == 0
+        # set by the engine on rank 0 of a TP node
+        self.journal: Callable[[MoveKind, str, int], None] | None = None
         # An allotment covers the labels `_nodes` open.
         # `_waiting` is the queue in arrival order, each request with the pages `_enqueue` counted, which its allotment
         #   is sized from.
@@ -892,8 +896,13 @@ class KVManager(AttentionResource):
                     f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: "
                     f"pages {matched[:4]}... here ({len(matched)}), {pages[:4]}... there ({len(pages)})"
                 )
+            if self._counts and not self._overrides[rid].guaranteed:
+                # lent as in rank 0's `_retain_cached`
+                evictable = self._index.evictable()
+                stream.lent.update(page for page in matched if page not in evictable)
             self._arena.retain(matched)
             stream.lease, stream.lease_len = matched, len(matched) * self.config.page_size
+            self._recount(rid)
             return True
 
     def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
@@ -905,6 +914,7 @@ class KVManager(AttentionResource):
             stream = self._streams.get(rid, {}).get(self._keyed_label(rid, node_name, graph_walk))
             if stream is not None and stream.chain is not None and not stream.span_cursor.done:
                 self._release_lease(rid, stream)
+                self._recount(rid)
 
     def page_trail(self) -> tuple[int, int] | None:
         with self._lock:
@@ -3463,8 +3473,7 @@ class KVManager(AttentionResource):
             need = self._waiting[rid] - whole
             if need + charged > self._room():
                 return _WAIT
-            self._allotments[rid] = Allotment(pages=need + charged, prompt=self._waiting.pop(rid))
-            self._recount(rid)
+            self._allot(rid, need + charged)
             return None
 
     def _enqueue(self, rid: str) -> AdmitOutcome | None:
@@ -3579,8 +3588,7 @@ class KVManager(AttentionResource):
             )
             if need > self._room():
                 return False
-            self._allotments[rid] = Allotment(pages=need, prompt=self._waiting.pop(rid))
-            self._recount(rid)
+            self._allot(rid, need)
             return True
 
     def is_victim(self, rid: str) -> bool:
@@ -3645,6 +3653,26 @@ class KVManager(AttentionResource):
             self._waiting[rid] = allotment.prompt
             # back to the front of `_waiting`, so no later request passes ``rid``
             self._waiting.move_to_end(rid, last=False)
+            if self.journal is not None:
+                self.journal(MoveKind.UNRESERVE, rid, 0)
+
+    def _allot(self, rid: str, pages: int) -> None:
+        self._allotments[rid] = Allotment(pages=pages, prompt=self._waiting.pop(rid))
+        self._recount(rid)
+        if self.journal is not None:
+            self.journal(MoveKind.RESERVE, rid, pages)
+
+    def replay(self, kind: MoveKind, rid: str, count: int) -> None:
+        """Make rank 0's ``kind`` move on ``rid`` in this rank's counts, or raise if the move doesn't fit them."""
+        with self._lock:
+            if kind == MoveKind.RESERVE:
+                if rid in self._allotments:
+                    raise RuntimeError(f"KV {self.name}: rank 0 reserved {rid}, which already holds an allotment here")
+                if rid not in self._waiting and (failed := self._enqueue(rid)) is not None:
+                    raise RuntimeError(failed.reason.message)
+                self._allot(rid, count)
+            elif kind == MoveKind.UNRESERVE:
+                self.requeue(rid)
 
     def _hit(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
@@ -3925,10 +3953,10 @@ class KVManager(AttentionResource):
 
     def _grant(self, rid: str, label: str, n: int, past: int) -> list[int] | None:
         """Take ``n`` free pages for ``rid``, of which ``past`` go beyond what its allotment has
-        left, evicting cached pages if too few are free. None when the pool is short, which on a deciding
+        left, evicting cached pages if too few are free. None when the pool is short, which on a leading
         pool means ``past`` is more than the room. The pages within the allotment need
         no check, since the allotments never count more than the pool has."""
-        if past and self._decides and past > self._room():
+        if past and self._counts and past > self._room():
             return None
         pages = self._arena.acquire(n)
         if pages is None and self._index is not None:
@@ -3936,7 +3964,7 @@ class KVManager(AttentionResource):
             # without failing a request that is already running
             self._index.evict(n - self._arena.num_free)
             pages = self._arena.acquire(n)
-        if pages is None and self._decides:
+        if pages is None and self._counts:
             raise RuntimeError(
                 f"KV {self.name}: {rid}/{label} could not take {n} pages that its allotment and the room "
                 f"covered, so the allotments count pages the pool can't reach: {self._arena.num_free} free, "

@@ -373,24 +373,26 @@ def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node
     assert decode.ok, "requests waiting on the cross pool kept the room the running request decodes into"
 
 
-def _cfg_parallel_pool(node: str, world_size: int = 1) -> KVManager:
+def _cfg_parallel_pool(node: str, world_size: int = 1, rank: int = 0) -> KVManager:
     spec = KVSpec(
         resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"}, leader="LLM",
         config=PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=9, page_size=16),
     )
-    group = None if world_size == 1 else SimpleNamespace(rank=0, world_size=world_size)
+    group = None if world_size == 1 else SimpleNamespace(rank=rank, world_size=world_size)
     return KVManager.build(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
     ))
 
 
-def test_only_the_leaders_pool_holds_a_request_back_and_none_above_one_rank():
-    for node, world_size, holds in (("LLM", 1, True), ("LLM_cfg_text", 1, False), ("LLM", 2, False)):
-        kv = _cfg_parallel_pool(node, world_size)
+def test_only_the_leaders_pool_on_rank_0_holds_a_request_back():
+    for node, world_size, rank, holds in (
+        ("LLM", 1, 0, True), ("LLM_cfg_text", 1, 0, False), ("LLM", 2, 0, True), ("LLM", 2, 1, False),
+    ):
+        kv = _cfg_parallel_pool(node, world_size, rank)
         for rid in ("a", "b"):
             _laid_out(kv, rid, list(range(80)))
 
-        assert _ready(kv, "a") and _ready(kv, "b") is not holds, f"{node}'s pool at world size {world_size} decided"
+        assert _ready(kv, "a") and _ready(kv, "b") is not holds, f"{node}'s pool on rank {rank} of {world_size}"
         assert holds or not (kv._allotments or kv._waiting), "a pool that doesn't decide kept admission state"
 
 

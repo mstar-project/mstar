@@ -100,6 +100,8 @@ class MoveKind(IntEnum):
     """A kind of move that rank 0 of a TP node makes on a request and each TP follower replays."""
     OFFLOAD = 0
     RELOAD = 1
+    RESERVE = 2
+    UNRESERVE = 3
 
 
 class Resource(ABC):

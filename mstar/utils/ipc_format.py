@@ -116,11 +116,15 @@ class StopLoops(MessageBody):
 class Move(NamedTuple):
     rid: str
     kind: MoveKind
+    # `pool` is the key of the KV resource the move applies to, or empty for a move on the node as a whole.
+    # `count` counts the pages of a RESERVE.
+    pool: str = ""
+    count: int = 0
 
 
 @dataclass
 class OffloadDelta:
-    """A rank's offloads and reloads, in the order it made them.
+    """A rank's moves, in the order it made them.
 
     Ordered so the follower replays the leader's decisions in the same order: a
     sequence that worked for the leader works for the followers too.
@@ -136,17 +140,34 @@ class OffloadDelta:
     lean on that.
     """
 
-    # parallel lists: rids[i] was moved as kinds[i]
+    # parallel lists, one entry per `Move`
     rids: list[str] = field(default_factory=list)
     kinds: list[MoveKind] = field(default_factory=list)
+    pools: list[str] = field(default_factory=list)
+    counts: list[int] = field(default_factory=list)
 
     @classmethod
     def new(cls) -> "OffloadDelta":
         return cls()
 
-    def add(self, kind: MoveKind, rid: str):
+    def add(self, kind: MoveKind, rid: str, pool: str = "", count: int = 0):
         self.rids.append(rid)
         self.kinds.append(kind)
+        self.pools.append(pool)
+        self.counts.append(count)
+
+    def discard(self, rid: str) -> None:
+        keep = [i for i, other in enumerate(self.rids) if other != rid]
+        for column in (self.rids, self.kinds, self.pools, self.counts):
+            column[:] = [column[i] for i in keep]
+
+    def cancel(self, rid: str, kind: MoveKind, pool: str) -> bool:
+        """Drop the last move if it is ``kind`` on ``rid`` in ``pool``, and return whether a move was dropped."""
+        if not (self.rids and (self.rids[-1], self.kinds[-1], self.pools[-1]) == (rid, kind, pool)):
+            return False
+        for column in (self.rids, self.kinds, self.pools, self.counts):
+            column.pop()
+        return True
 
     def __len__(self):
         return len(self.rids)
@@ -154,19 +175,19 @@ class OffloadDelta:
     def peek_left(self) -> Move | None:
         if not len(self):
             return
-        return Move(self.rids[0], self.kinds[0])
+        return Move(self.rids[0], self.kinds[0], self.pools[0], self.counts[0])
 
     def pop_left(self) -> Move | None:
         if not len(self):
             return None
-        return Move(self.rids.pop(0), self.kinds.pop(0))
+        return Move(self.rids.pop(0), self.kinds.pop(0), self.pools.pop(0), self.counts.pop(0))
 
     def copy(self) -> "OffloadDelta":
         """An independent queue holding the same moves.
 
         One per follower: each replays at its own pace, popping as it goes.
         """
-        return OffloadDelta(list(self.rids), list(self.kinds))
+        return OffloadDelta(list(self.rids), list(self.kinds), list(self.pools), list(self.counts))
 
     def take(self) -> "OffloadDelta":
         """Hand the queue over and leave this one empty.
@@ -175,13 +196,15 @@ class OffloadDelta:
         engine keeps its journal in a dict) sees it emptied.
         """
         taken = self.copy()
-        self.rids.clear()
-        self.kinds.clear()
+        for column in (self.rids, self.kinds, self.pools, self.counts):
+            column.clear()
         return taken
 
     def extend(self, other: "OffloadDelta") -> None:
         self.rids.extend(other.rids)
         self.kinds.extend(other.kinds)
+        self.pools.extend(other.pools)
+        self.counts.extend(other.counts)
 
 
 @dataclass

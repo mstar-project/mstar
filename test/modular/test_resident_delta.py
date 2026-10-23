@@ -29,6 +29,7 @@ from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
 from mstar.utils.ipc_format import (
+    Move,
     MoveKind,
     OffloadDelta,
     RemoveRequest,
@@ -61,9 +62,9 @@ def test_pop_left_takes_the_oldest_entry():
     delta.add(MoveKind.OFFLOAD, "a")
     delta.add(MoveKind.RELOAD, "b")
 
-    assert delta.pop_left() == ("a", MoveKind.OFFLOAD)
+    assert delta.pop_left() == Move("a", MoveKind.OFFLOAD)
     assert len(delta) == 1, "pop_left returned an entry without removing it"
-    assert delta.pop_left() == ("b", MoveKind.RELOAD)
+    assert delta.pop_left() == Move("b", MoveKind.RELOAD)
     assert len(delta) == 0
 
 
@@ -77,7 +78,7 @@ def test_peek_left_does_not_consume():
     delta = OffloadDelta.new()
     delta.add(MoveKind.OFFLOAD, "a")
 
-    assert delta.peek_left() == ("a", MoveKind.OFFLOAD)
+    assert delta.peek_left() == Move("a", MoveKind.OFFLOAD)
     assert len(delta) == 1
     assert OffloadDelta.new().peek_left() is None
 
@@ -189,6 +190,7 @@ class _Rids:
 class _Engine:
     """``Engine``'s eviction surface over one stub resource."""
 
+    _journal = Engine._journal
     apply_resident_delta = Engine.apply_resident_delta
     check_ready = Engine.check_ready
     is_offloaded = Engine.is_offloaded
@@ -434,23 +436,20 @@ def test_a_refused_entry_stops_the_replay_where_it_is():
     assert engine.is_offloaded("node", "a") and engine.is_offloaded("node", "b")
 
 
-def test_a_move_for_a_request_this_rank_no_longer_has_is_spent():
-    """``get_rid_handle`` answers None for a rid this rank has already removed --
-    a real race, since the conductor's REMOVE and rank 0's delta come from
-    different peers. Its pages went with the teardown, so the move is moot.
-
-    It must be POPPED, not retried, or the replay wedges on an entry that can
-    never land; and it must not reach the resources, which is what an unguarded
-    None did -- ``offload(None)`` logged a move of "request None"."""
+def test_a_move_for_a_request_this_rank_has_not_taken_in_waits_for_it():
+    """Nothing behind the move jumps ahead while it waits."""
     engine = _Engine("follower")
+    engine._graph_runtime._live.discard("a")
     delta = OffloadDelta.new()
-    delta.add(MoveKind.OFFLOAD, "wire-gone")     # _Rids answers None for unknown ids
-    delta.add(MoveKind.OFFLOAD, "wire-a")        # and the rest of the queue still lands
+    delta.add(MoveKind.OFFLOAD, "wire-a")
+    delta.add(MoveKind.OFFLOAD, "wire-b")
 
+    assert engine.apply_resident_delta("node", delta) is False
+    assert len(delta) == 2 and not engine.is_offloaded("node", "b"), "a move ran ahead of one still owed"
+
+    engine._graph_runtime._live.add("a")
     assert engine.apply_resident_delta("node", delta) is True
-    assert len(delta) == 0, "the moot entry was left to be retried for ever"
-    assert engine.is_offloaded("node", "a"), "it stopped short of the next move"
-    assert None not in engine.resource.offloaded, "None reached the resources"
+    assert engine.is_offloaded("node", "a"), "the move was lost while it waited"
 
 
 def test_a_request_holding_nothing_is_not_a_refusal():

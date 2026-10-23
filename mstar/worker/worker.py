@@ -695,7 +695,7 @@ class Worker:
         # persist until REMOVE_REQUEST (so no read can restart after READS_DONE);
         # _reads_done_sent tracks which have already ACKed. These three are keyed
         # by the wire string: a DRAIN can precede the NEW_REQUEST that mints the
-        # handle, and a draining rid has to refuse that late NEW_REQUEST.
+        # handle, and a draining rid's late NEW_REQUEST is taken in without reads.
         self._pending_drains: set[str] = set()
         self._draining_rids: set[str] = set()
         self._reads_done_sent: set[str] = set()
@@ -866,9 +866,10 @@ class Worker:
         return self._graph_runtime.get_rid_string(request_id)
 
     def _add_new_request(self, body: NewRequest) -> None:
-        if body.request_id in self._draining_rids:
-            # Being torn down (out-of-order NEW after DRAIN); don't start reads.
-            return
+        # Any worker can handle a DRAIN before the conductor's NEW_REQUEST, and a TP follower gets rank 0's. The
+        # worker still takes the request in, without reads, since on a follower rank 0's moves for the request wait
+        # until it holds the request.
+        drained = body.request_id in self._draining_rids
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         # The one place a handle is minted; a request with several partitions
         # on this worker gets the same one for each. Everything below keys on it.
@@ -903,6 +904,10 @@ class Worker:
         self._keep_ids(request_id, body.request_info.resource_configs)
         self._guarantee(request_id, body.request_info.resource_configs)
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
+        if drained:
+            self.scheduler.fail_rids({request_id})
+            self._process_unprocessed(body.request_id)
+            return
 
         # Create StreamBuffers for consumer connections on this worker. A request
         # with several partitions here arrives once per partition: keep the
@@ -1309,7 +1314,7 @@ class Worker:
     def _begin_drain(self, request_id: str) -> None:
         """Takes the wire string: a drain can arrive for a request this worker
         never admitted, and it still has to go into ``_draining_rids`` so a late
-        NEW_REQUEST is refused."""
+        NEW_REQUEST is taken in without reads."""
         handle = self._rid(request_id)
         # Fan the drain to TP followers so each rank drains and ACKs its own
         # READS_DONE (the conductor waits on every rank).
