@@ -9,6 +9,8 @@ handle only the gate_up GEMM, SwiGLU, down GEMM, and weighted sum over top-k.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import triton.language as tl
 
@@ -40,6 +42,7 @@ def fused_experts(
     activation: str = "silu",
     reduce_results: bool = True,
     skip_invalid: bool = False,
+    config: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -72,6 +75,10 @@ def fused_experts(
         Set when ``topk_ids`` may hold ids ``>= num_experts`` (the EP
         sentinel for experts another rank owns). Those slots skip both GEMMs
         and contribute zeros, at the cost of one memset of the output cache.
+    config : dict, optional
+        Kernel launch parameters (tile sizes, ``num_warps``, ``num_stages``
+        and any backend-specific compiler options), used for both GEMMs.
+        Defaults to :func:`get_default_config` for these sizes.
 
     Returns
     -------
@@ -98,7 +105,8 @@ def fused_experts(
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
 
-    config = get_default_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
+    if config is None:
+        config = get_default_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.

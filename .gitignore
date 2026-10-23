@@ -10,6 +10,8 @@ uv.lock
 *.prof
 *.json
 !examples/observability/grafana/dashboards/*.json
+# fused-MoE launch configs tuned per GPU model ship with the package
+!mstar/utils/fused_moe/configs/*.json
 profiler/
 traces/
 

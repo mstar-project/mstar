@@ -57,6 +57,9 @@ class ThinkerTextConfig:
     mlp_only_layers: list[int] = field(default_factory=list)
     decoder_sparse_step: int = 1
     rope_parameters: dict = field(default_factory=dict)
+    # Routed-expert kernels (see MoEBackend). Set by the deployment, not the
+    # HF checkpoint.
+    moe_backend: str = "auto"
 
     # Computed -- not stored in HF config
     head_dim: int | None = None
@@ -182,6 +185,7 @@ class TalkerTextConfig:
     num_experts_per_tok: int = 8
     norm_topk_prob: bool = False
     shared_expert_intermediate_size: int | None = None
+    moe_backend: str = "auto"  # as ThinkerTextConfig.moe_backend
 
     # Computed
     head_dim: int | None = None
