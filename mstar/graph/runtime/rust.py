@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import time as _time
 from copy import deepcopy
-from typing import get_args
+from typing import TYPE_CHECKING, get_args
 
 from mstar_rust import GraphRuntime as _RustGraphRuntime
 
 from mstar.communication import wire
-from mstar.communication.tensor_store import TensorBookkeeping
+from mstar.communication.tensor_store import TensorBookkeeping, _dtype_name
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import PublishedInfo
@@ -45,12 +45,16 @@ from mstar.graph.runtime.base import (
     RouteInput,
     RouteOutput,
     SendInput,
+    SpecRows,
     SpeculationOutput,
     SpeculationPrepInput,
     SpeculationPrepOutput,
 )
 from mstar.model.base import WorkerGraph
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
+
+if TYPE_CHECKING:
+    import torch
 
 # SendInput.profiling's (rx_info, tx_info, graph_timings), by declared type.
 _PROFILING_HINTS = get_args(Profiling)
@@ -576,6 +580,22 @@ class RustGraphRuntime(GraphRuntime):
             self._rust.prep_spec_rids(self._spec_prep_arg(input))
         )
 
+    def prep_spec_rows(
+        self, spec_node_name: str, curr_node_name: str, graph_walk: str,
+        rids: list[int], room_for_continuing: int | None = None,
+    ) -> SpecRows:
+        ready, wg_id, spec_id, edges = self._rust.prep_spec_rows(
+            spec_node_name, curr_node_name, graph_walk, rids, room_for_continuing,
+        )
+        return SpecRows(
+            ready_rids=ready, wg_id=wg_id, spec_id=spec_id,
+            input_edges=None if edges is None else ColumnarEdgeSpecs(
+                signal_names=edges[0], signal_name_idxs=edges[1], rids=edges[2],
+                tensors_per_edge=edges[3], is_final_streaming_chunk=edges[4],
+                uuids=edges[5],
+            ),
+        )
+
     def prep_follow_spec_rids(
         self, input: SpeculationPrepInput,
     ) -> SpeculationPrepOutput | None:
@@ -600,6 +620,10 @@ class RustGraphRuntime(GraphRuntime):
             "walks": input.walks,
             "rid_walk_idx": input.rid_walk_idx,
         })
+        return self._route_output(out)
+
+    @staticmethod
+    def _route_output(out) -> RouteOutput:
         return RouteOutput(
             completion_id=out.completion_id,
             register_uuids=out.register_uuids,
@@ -622,6 +646,35 @@ class RustGraphRuntime(GraphRuntime):
                 out.freed_input_uuids, out.freed_input_registered,
             ),
         )
+
+    supports_route_and_send_inline = True
+
+    def route_and_send_inline(
+        self, partition: str, graph_walk: str, node_name: str,
+        output_signals: list[str], rids: list[int],
+        inline_signal: str, inline_column: torch.Tensor,
+        row_rids: list[int],
+    ):
+        """``complete_and_route_batch`` + ``send_outputs`` for a device-loopback
+        step, one crossing with the GIL released (see the Rust side).
+
+        ``inline_column`` is a 1-D host view (row i for ``row_rids[i]``) the
+        caller keeps alive; Rust reads it in place. Returns
+        ``(status, completion_id, sent_rids, route_output)``: status 0 means
+        nothing was done, 2 means routed with ``route_output`` left for
+        ``send_outputs``, 1 means routed and sent.
+        """
+        out = self._rust.route_and_send_inline(
+            partition, graph_walk, node_name, list(output_signals), rids,
+            inline_signal, inline_column.data_ptr(), inline_column.shape[0],
+            inline_column.stride(0), _dtype_name(inline_column.dtype), row_rids,
+        )
+        route = None
+        if out.status == 2:
+            route = self._route_output(out.take_route())
+        if PHASE_PERIOD:
+            phase_record("rust.route_and_send_inline.nogil", out.nogil_ns * 1e-9)
+        return out.status, out.completion_id, out.sent_rids, route
 
     def stop_loops_batched(
         self, partition: str, graph_walk: str, last_node_run: str,

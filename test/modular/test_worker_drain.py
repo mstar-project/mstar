@@ -423,6 +423,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         per_request_info={}, add_request=_state_add,
     )
     w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         evictable_nodes=lambda: ["n"],
         add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
     )

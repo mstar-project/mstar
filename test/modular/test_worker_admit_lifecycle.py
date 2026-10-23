@@ -80,6 +80,7 @@ def _worker():
     )
     w.request_state = RequestStateManager(node_to_partition=node_to_partition)
     w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         evictable_nodes=lambda: [NODE],
         add_request=lambda rid, cfgs, info: None,
         remove_request=lambda rid: None,
