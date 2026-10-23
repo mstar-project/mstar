@@ -25,7 +25,7 @@ from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
 from mstar.utils.ipc_format import ScheduleTPNode
-from mstar.worker.micro_scheduler import MicroScheduler, TPDivergence
+from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
 
 WALKS = {"main": (WALK, "decode", IMAGE_WALK)}
@@ -317,7 +317,7 @@ def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
         raise _Stop
 
     worker._handle_main_loop_error = _caught
-    with pytest.raises(TPDivergence, match="diverged"):
+    with pytest.raises(SystemExit, match="diverged"):
         worker.run()
 
 
@@ -343,6 +343,16 @@ def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
 
     assert worker._try_follow_speculation(step_n) is None, "a page N could still index was called lost"
     step_n.node_batch.commit_done.set()
-    with pytest.raises(TPDivergence, match=r"here \(1\)"):
+    with pytest.raises(SystemExit, match=r"here \(1\)"):
         worker._try_follow_speculation(step_n)
 
+
+def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do():
+    leader = SimpleNamespace(parallel_nodes={NODE})
+
+    def spec(node, yield_away):
+        return SimpleNamespace(is_yield_away=yield_away, node_batch=SimpleNamespace(node_name=node))
+
+    assert not Worker._plans_ahead(leader, spec(NODE, True))
+    assert Worker._plans_ahead(leader, spec(NODE, False)), "the head is pre-planned on every rank"
+    assert Worker._plans_ahead(leader, spec("other", True)), "a node with no followers keeps its pre-plan"
