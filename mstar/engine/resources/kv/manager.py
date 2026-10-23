@@ -3409,6 +3409,28 @@ class KVManager(AttentionResource):
             self._earmarks[rid] = earmark
             return victims
 
+    def readmit(self, rid: str, history: int) -> bool:
+        """Allot dropped ``rid`` enough pages for its ``history`` kept tokens and one page more, at most its footprint.
+        False until ``rid`` is first in `_waiting` and those pages fit the room.
+
+        Every cache hit is charged as a fresh page, since nothing is leased here. When the rebuild's probe
+        hits a page another request holds, the hit costs nothing, so that page of the allotment is left for
+        the request's growth.
+        """
+        with self._lock:
+            if next(iter(self._waiting), None) != rid:
+                return False
+            pages = -(-history // self.config.page_size) + 1
+            need = sum(
+                pages if stream.footprint is None else min(pages, stream.footprint)
+                for stream in self._streams[rid].values()
+            )
+            if need > self._room():
+                return False
+            self._allotments[rid] = Allotment(pages=need, prompt=self._waiting.pop(rid))
+            self._recount(rid)
+            return True
+
     def waits(self, rid: str) -> bool:
         """Whether ``rid`` waits for room: no drop could cover its shortage, and the room hasn't grown since."""
         with self._lock:
