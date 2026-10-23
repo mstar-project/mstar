@@ -10,11 +10,11 @@ function of its inputs. Frame ``i`` of the request is:
     conditioning, then 6 + N_text + 6: silence / persona token / silence frames
     generate, j = i - conditioning:   user frame j; sample text and 16 depth codes
 
-Conditioning targets are fully provided (every channel is forced), so those frames skip
-the text head, depformer and samplers: NVIDIA runs them, but only to consume
-RNG, and the cache keeps the forced values either way. Whether a generate
-channel is forced is read from the cache every frame (the first one forces the
-agent acoustic codebooks).
+Conditioning targets are fully provided (every channel is forced), so those
+frames skip the text head, depformer and samplers: NVIDIA runs them, but only
+to consume RNG, and the cache keeps the forced values either way. Whether a
+generate channel is forced is read from the cache every frame (the first one
+forces the agent acoustic codebooks).
 """
 
 from __future__ import annotations
@@ -184,7 +184,7 @@ class LMSubmodule(ARNodeSubmodule):
         target = cache.target[:, :, 0].clone()
         provided = cache.target_provided[:, :, 0].clone()
         if conditioning:
-            if not bool(provided.all()):
+            if not cache.target_all_provided():
                 raise RuntimeError(f"conditioning frame {frame.frame} has an unprovided target")
             output = cache.commit(target[:, 0], target[:, 1:])
         else:

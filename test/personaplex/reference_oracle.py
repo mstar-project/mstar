@@ -2,12 +2,12 @@
 """Record NVIDIA reference fixtures with the pinned PersonaPlex source.
 
 Modes:
-  trace     LMGen integer trace with tiny random weights (Commit 1, T3).
-  manifest  state-dict keys/shapes of the full-size LMModel, built on meta (T5).
+  trace     LMGen integer trace with tiny random weights.
+  manifest  state-dict keys/shapes of the full-size LMModel, built on meta.
   lm        tiny random fp32 LMModel: its weights plus every forward's inputs,
-            hidden states, text/depth logits and greedy tokens (T13-LM).
+            hidden states, text/depth logits and greedy tokens.
   mimi      tiny random MimiModel run per 1920-sample frame in streaming mode,
-            as offline.py does: latents, codes, tie margins and decoded PCM (T13-Mimi).
+            as offline.py does: latents, codes, tie margins and decoded PCM.
   offline   the whole offline.py pipeline (warmup, .pt voice, persona, user WAV,
             per-frame encode/step/decode, trim) on the tiny LM and Mimi, greedy.
 

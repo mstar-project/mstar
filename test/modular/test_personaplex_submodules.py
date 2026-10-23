@@ -204,7 +204,7 @@ def test_conditioning_frames_are_fully_forced_and_generate_reads_the_mask_each_f
     gen, state = run.walk(cfg.GENERATE_WALK, state)
     assert len(gen) == meta["num_user_frames"] == len(masks)
     # First user step: agent acoustic (delay 1) still forced by the last conditioning frame,
-    # agent semantic sampled (R4a, R15). Later steps sample all agent channels.
+    # agent semantic sampled. Later steps sample all agent channels.
     acoustic = torch.zeros(16, dtype=torch.bool)
     acoustic[1:8] = True
     acoustic[8:] = True  # user channels are always provided

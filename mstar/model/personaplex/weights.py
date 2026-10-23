@@ -49,7 +49,7 @@ class PersonaPlexLM(nn.Module):
 
 
 def reference_manifest(lm: nn.Module) -> dict[str, list[int]]:
-    """NVIDIA key -> shape for every parameter (T5 compares this to the reference)."""
+    """NVIDIA key -> shape for every parameter, for comparison with the reference checkpoint."""
     return {reference_lm_key(name): list(param.shape) for name, param in lm.named_parameters()}
 
 

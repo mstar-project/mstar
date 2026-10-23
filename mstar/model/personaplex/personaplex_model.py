@@ -12,8 +12,9 @@ Walks, stepped through ``kwargs["walk_schedule"]`` (Wan2.2 pattern):
                         6 silence ([PP] models/lm.py:1110-1121); persists the
                         final ``lm_state`` (token cache, mask, offset, step)
     generate[_audio]  - Loop over LM, one iteration per user frame, then
-                        MimiDecoder; ``agent_frame`` (and, for ``generate``,
-                        ``text_frame``) accumulate across iterations
+                        MimiDecoder; ``agent_frame`` accumulates across
+                        iterations, and ``generate`` also sends each frame's
+                        ``text_frame`` to the client as it is produced
 
 The LM is one node name in two walks (``Sequential`` keys a walk's nodes by name).
 Its loop-backs are consumed and seeded empty at iteration 0, and async
@@ -55,7 +56,6 @@ LM_LOOP_BACKS = {
     cfg.CONDITIONING_WALK: ("lm_state",),
     cfg.GENERATE_WALK: ("lm_state", "agent_frame", "text_frame"),
 }
-SAMPLING_KWARGS = ("temp_text", "temp_audio", "topk_text", "topk_audio", "greedy")
 # 128 pages x 128 tokens x 512 KiB a token (32 layers x 32 heads x 128 dims, K+V, bf16) = 8 GiB
 DEFAULT_KV_PAGES = 128
 
@@ -161,8 +161,11 @@ class PersonaPlexModel(Model):
         accumulated = [GraphEdge(next_node=cfg.MIMI_DECODER_NODE, name="agent_frame")]
         lm = self._lm_node(cfg.GENERATE_WALK)
         if with_text:
-            # Text is ready per frame. Deferred SHM sends can outlive the
-            # worker's reused host staging copy; only the codec needs a sequence.
+            # Text goes to the client every frame instead of accumulating: an
+            # accumulated client output is sent only when the loop ends, and by
+            # then the worker has reused the pinned host buffers that staged the
+            # earlier frames, so every frame arrived as the last token. Only the
+            # Mimi decoder needs the agent codes as a sequence.
             lm.outputs.append(GraphEdge(next_node=EMIT_TO_CLIENT, name="text_frame", output_modality="text"))
         decode_loop = Loop(
             name=cfg.DECODE_LOOP, section=lm,
@@ -294,8 +297,9 @@ class PersonaPlexModel(Model):
     ) -> NameToTensorList:
         """Validate the request and build the conditioning tensors.
 
-        Every malformed-request check lives here: a ValueError on the data
-        worker becomes a 400, while one raised at the conductor is swallowed.
+        Request checks run on the data worker (here and in ``load_audio``),
+        where a ValueError becomes a 400; one raised at the conductor is
+        swallowed, so the conductor-side checks are only backstops.
         """
         if "audio" not in output_modalities or not set(output_modalities) <= {"audio", "text"}:
             raise ValueError(f"PersonaPlex outputs audio (optionally with text); got {output_modalities}")
