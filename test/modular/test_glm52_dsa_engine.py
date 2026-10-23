@@ -28,12 +28,13 @@ def _cpu_flashinfer() -> types.ModuleType:
 @pytest.fixture(autouse=True)
 def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+    install_cpu_rope(monkeypatch)
 
 
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports  # noqa: E402
 from mstar.engine.resources.dsa.manager import DSAManager  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
+from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.attention import Glm52MLAAttention  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
@@ -115,8 +116,7 @@ def test_guard_flag_off_holds_context_to_topk():
     cfg = Glm52ModelConfig()
     assert cfg.dsa_long_context is False
     sub = _make_submodule(cfg)
-    out = _preprocess(sub, {"r0": 2032}, seq_len=16)  # exactly topk: allowed
-    assert out["position_ids"].tolist() == list(range(2032, 2048))
+    _preprocess(sub, {"r0": 2032}, seq_len=16)  # exactly topk: allowed
     with pytest.raises(RuntimeError, match="dsa_long_context"):
         _preprocess(sub, {"r0": 2040}, seq_len=16)
 
@@ -128,8 +128,7 @@ def test_guard_flag_on_lifts_cap_to_max_seq_len():
     sub = _make_submodule(cfg)
 
     # Decode one past topk: allowed (the DSA resource selects for it).
-    out = _preprocess(sub, {"r0": cfg.index_topk}, seq_len=1)
-    assert out["position_ids"].tolist() == [cfg.index_topk]
+    _preprocess(sub, {"r0": cfg.index_topk}, seq_len=1)
 
     # The new cap is max_seq_len, not topk.
     with pytest.raises(RuntimeError, match="max_seq_len"):

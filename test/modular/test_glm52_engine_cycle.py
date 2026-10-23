@@ -30,12 +30,13 @@ def _force_cpu_flashinfer(monkeypatch):
     # forced per test: on a box with real flashinfer an earlier import would
     # otherwise route CPU tensors into GPU kernels
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
+    install_cpu_rope(monkeypatch)
 
 
 from request_walks import run_walks  # noqa: E402
 
 from mstar.engine.resources import StepContext  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources  # noqa: E402
+from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     KV_RESOURCE,

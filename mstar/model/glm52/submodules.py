@@ -442,11 +442,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         device = self.get_device()
         # Dense MLA equals the reference DSA computation only while every
         # context fits the top-k window; refuse beyond it unless the DSA
-        # engine path is on, where the cap is the serving window.
+        # engine path is on, where the cap is the serving window. The
+        # positions themselves are the position resource's (``_positions``).
         long_context = self.config.dsa_long_context
         limit = self._context_limit()
         topk = self.config.index_topk
-        pos_ids_list: list[int] = []
         for rid, sl in zip(request_ids, seq_lens, strict=True):
             start = pos.position(rid, _MAIN)  # where the step's first token lands
             if start + sl > limit:
@@ -471,22 +471,23 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     f"index_topk={topk}; sparse attention beyond topk is "
                     "decode-only."
                 )
-            pos_ids_list.extend(range(start, start + sl))
         # Every per-step index in one pinned H2D (a pageable torch.tensor(..., device=cuda)
-        # drains the stream before the step even starts): positions; on prefill each
-        # request's last row (for an eager prefill, when no plan buffer carries qo_indptr);
-        # under MTP the seed slots (padding and capture rows read and write the sink) and,
-        # on decode, the step's number.
-        fields = {"position_ids": pos_ids_list}
+        # drains the stream before the step even starts): on prefill each request's last row
+        # (for an eager prefill, when no plan buffer carries qo_indptr); under MTP the seed
+        # slots (padding and capture rows read and write the sink) and, on decode, the
+        # step's number.
+        fields = {}
         if graph_walk == "prefill":
             fields["last_token_indices"] = [end - 1 for end in itertools.accumulate(seq_lens)]
         if self.mtp_k > 0:
             fields["mtp_slots"] = [self._mtp_slot.get(rid, 0) for rid in request_ids]
             if graph_walk == "decode":
                 fields["mtp_seq"] = [self._mtp_stage_seq(engine_inputs)]
-        staged = self._index_stager.to_device(
-            [v for values in fields.values() for v in values], device)
-        out = dict(zip(fields, staged.split([len(v) for v in fields.values()]), strict=True))
+        out = {}
+        if fields:
+            staged = self._index_stager.to_device(
+                [v for values in fields.values() for v in values], device)
+            out = dict(zip(fields, staged.split([len(v) for v in fields.values()]), strict=True))
         out["input_ids"] = (
             inputs[0].input_ids if len(inputs) == 1 else torch.cat([inp.input_ids for inp in inputs]))
         return out
@@ -497,6 +498,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         which accepts markedly better, unless
         MSTAR_GLM52_MTP_PAIR_POSTNORM=0."""
         return normed if self._mtp_pair_postnorm else prenorm
+
+    def _positions(self, engine_inputs: ModelInputsFromEngine, num_tokens: int) -> torch.Tensor:
+        """The step's positions as the position resource planned them, in the KV plan's
+        order, which ``input_ids`` packs in; captured, a slice of the slot's buffer."""
+        return self._pos(engine_inputs).pos_ids(_MAIN)[:num_tokens]
 
     def _hidden(
         self,
@@ -540,10 +546,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        hidden = self._hidden(input_ids, position_ids)
+        hidden = self._hidden(input_ids, self._positions(engine_inputs, input_ids.shape[0]))
         return {"logits": [self.lm_head(hidden[-1:])]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
@@ -554,14 +559,16 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        if self.mtp_k > 0 and graph_walk == "prefill":
-            return self._mtp_prefill(engine_inputs, input_ids, position_ids, kwargs)
         if self.mtp_k > 0 and graph_walk == "decode":
+            # a verify step plans a block of rows per request around its one input token
+            position_ids = self._positions(engine_inputs, input_ids.shape[0] * self.mtp_block)
             return self._mtp_decode(
                 engine_inputs, input_ids, position_ids, kwargs["mtp_slots"], kwargs["mtp_seq"])
+        position_ids = self._positions(engine_inputs, input_ids.shape[0])
+        if self.mtp_k > 0 and graph_walk == "prefill":
+            return self._mtp_prefill(engine_inputs, input_ids, position_ids, kwargs)
         if graph_walk not in ("prefill", "decode"):
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
         rows = None

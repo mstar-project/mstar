@@ -7,7 +7,13 @@ import torch
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.mla import MLAAttention
 from mstar.model.glm52.components.indexer import Glm52Indexer, is_full_indexer_layer
-from mstar.model.glm52.config import ATTN_RESOURCE, DSA_RESOURCE, KV_RESOURCE, Glm52ModelConfig
+from mstar.model.glm52.config import (
+    ATTN_RESOURCE,
+    DSA_RESOURCE,
+    KV_RESOURCE,
+    POS_RESOURCE,
+    Glm52ModelConfig,
+)
 
 
 def dsa_selection_to_mask(
@@ -46,7 +52,8 @@ class Glm52MLAAttention(MLAAttention):
         comm_group: CommGroup | None = None,
         layer_idx: int | None = None,
     ) -> None:
-        super().__init__(config, comm_group, layer_idx, kv_key=KV_RESOURCE, attn_key=ATTN_RESOURCE)
+        super().__init__(config, comm_group, layer_idx, kv_key=KV_RESOURCE,
+                         attn_key=ATTN_RESOURCE, pos_key=POS_RESOURCE)
         # DSA indexer only on FULL layers — SHARED layers carry no indexer
         # weights in the checkpoint (they reuse the last FULL selection),
         # and a dormant module would sit uninitialized after ``to_empty``.
@@ -88,7 +95,6 @@ class Glm52MLAAttention(MLAAttention):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         dsa_selection: torch.Tensor | None = None,
-        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``dsa_selection``: optional ``(T, index_topk)`` int rows (-1 = padding) for the
         naive path's reference sparse attention."""
@@ -97,8 +103,7 @@ class Glm52MLAAttention(MLAAttention):
                 "dsa_selection is the naive-path reference hook; the "
                 "absorbed path selects through the DSA resource instead"
             )
-        return super().forward(hidden_states, position_ids, rope_cos_sin,
-                               dsa_selection=dsa_selection)
+        return super().forward(hidden_states, position_ids, dsa_selection=dsa_selection)
 
     def _attend_naive(self, q, k, v, dsa_selection=None) -> torch.Tensor:
         if dsa_selection is None:
