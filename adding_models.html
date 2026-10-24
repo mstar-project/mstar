@@ -673,6 +673,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tuning-resources-per-deployment">Tuning resources per deployment</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preprocessing-threads">Preprocessing threads</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallelism-moe">Expert parallelism (MoE)</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-orpheus">Worked example: Orpheus</a></li>
@@ -846,11 +847,14 @@ once, then repeats the decode walk until EOS.</p>
 <dt><code class="docutils literal notranslate"><span class="pre">postprocess(self,</span> <span class="pre">output,</span> <span class="pre">modality)</span> <span class="pre">-&gt;</span> <span class="pre">bytes</span></code></dt><dd><p>Encode a finished output tensor to bytes for the client: <code class="docutils literal notranslate"><span class="pre">utf-8</span></code> for text, PNG for
 images, raw PCM for audio, and so on.</p>
 </dd>
-<dt><code class="docutils literal notranslate"><span class="pre">get_submodule(self,</span> <span class="pre">node_name,</span> <span class="pre">device=&quot;cpu&quot;,</span> <span class="pre">tp_group=None,</span> <span class="pre">autocast_dtype=None,</span> <span class="pre">sp_group=None)</span> <span class="pre">-&gt;</span> <span class="pre">NodeSubmodule</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Build and return the <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> for <code class="docutils literal notranslate"><span class="pre">node_name</span></code>, and cache the result. Load
+<dt><code class="docutils literal notranslate"><span class="pre">get_submodule(self,</span> <span class="pre">node_name,</span> <span class="pre">device=&quot;cpu&quot;,</span> <span class="pre">tp_group=None,</span> <span class="pre">autocast_dtype=None,</span> <span class="pre">sp_group=None,</span> <span class="pre">moe_parallel=None)</span> <span class="pre">-&gt;</span> <span class="pre">NodeSubmodule</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Build and return the <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> for <code class="docutils literal notranslate"><span class="pre">node_name</span></code>, and cache the result. Load
 weights here, on <code class="docutils literal notranslate"><span class="pre">device</span></code>. Return <code class="docutils literal notranslate"><span class="pre">None</span></code> for dummy mode.</p>
 <p><code class="docutils literal notranslate"><span class="pre">tp_group</span></code> and <code class="docutils literal notranslate"><span class="pre">sp_group</span></code> are the node’s tensor-parallel and sequence-parallel
 communicators when the node is sharded. Pass <code class="docutils literal notranslate"><span class="pre">tp_group</span></code> to the parallel-linear
 constructors. See <a class="reference internal" href="#tensor-parallelism"><span class="std std-ref">Step 6</span></a>.</p>
+<p><code class="docutils literal notranslate"><span class="pre">moe_parallel</span></code> is the node group’s <code class="docutils literal notranslate"><span class="pre">ep_config</span></code>, parsed into a
+<code class="docutils literal notranslate"><span class="pre">MoeParallelConfig</span></code>. It is passed only to an EP-enabled node whose group sets one,
+so a model without MoE layers never receives it. See <a class="reference internal" href="#expert-parallelism-moe">Expert parallelism (MoE)</a>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">autocast_dtype</span></code> is the dtype in which the node’s parameters must be allocated. If
 you build the module on the <code class="docutils literal notranslate"><span class="pre">meta</span></code> device, cast it to this dtype before calling
 <code class="docutils literal notranslate"><span class="pre">to_empty(device)</span></code>. Casting after <code class="docutils literal notranslate"><span class="pre">to_empty</span></code> allocates every parameter in float32
@@ -1727,13 +1731,19 @@ directly.</p>
     <span class="k">return</span> <span class="n">sampler</span><span class="o">.</span><span class="n">sample</span><span class="p">(</span><span class="n">engine_inputs</span><span class="o">.</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">logits</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="p">(</span><span class="n">hidden</span><span class="p">))</span>
 </pre></div>
 </div>
-<p><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code> carries four other useful fields:</p>
+<p><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code> carries six other useful fields:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">step</span></code> is this step’s <code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code>. A forward that must match its own declaration
 reads it here instead of computing the same information again.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">captured</span></code> is true when this forward runs under a CUDA-graph capture or replay. This
 field replaces the old <code class="docutils literal notranslate"><span class="pre">cache_manager.is_captured</span></code>. It is useful when <code class="docutils literal notranslate"><span class="pre">preprocess</span></code>
 packs its inputs differently for the fixed capture shape.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">synthetic</span></code> is true when every row is a dummy request, during CUDA-graph capture or
+its warmup. Use it to keep statistics such as routing counts free of dummy traffic.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">real_seq_len</span></code> is the token count of the real requests. Their rows come first; any
+rows after them are padding that a replay adds to reach the bucket shape. It is
+<code class="docutils literal notranslate"><span class="pre">None</span></code> when nothing was padded, so every row is real. Read it instead of assuming
+anything about the padding rows’ own inputs.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">per_request_states</span></code> is a <code class="docutils literal notranslate"><span class="pre">Mapping</span></code> that is resolved on first read.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">piecewise_runners</span></code> holds the piecewise CUDA-graph runners, keyed by region name.</p></li>
 </ul>
@@ -2296,6 +2306,58 @@ activations, which needs no entry. You can also set <code class="docutils litera
 loading fails. See <code class="docutils literal notranslate"><span class="pre">configs/qwen3omni_thinker_tp2.yaml</span></code> for an example with several node
 types.</p>
 </section>
+<section id="expert-parallelism-moe">
+<span id="id6"></span><h3>Expert parallelism (MoE)<a class="headerlink" href="#expert-parallelism-moe" title="Link to this heading">#</a></h3>
+<p>A sharded MoE node can split its routed experts in two ways. Under TP, the default, every
+rank holds a slice of every expert. Under EP, each rank holds whole experts. A deployment
+picks one per node group with an <code class="docutils literal notranslate"><span class="pre">ep_config</span></code> block; see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a> for the keys. The
+shared pieces are in <code class="docutils literal notranslate"><span class="pre">mstar/model/components/moe_parallel.py</span></code>. The Qwen3-Omni Thinker
+(<code class="docutils literal notranslate"><span class="pre">mstar/model/qwen3_omni/components/thinker.py</span></code>) is the reference user.</p>
+<p>To support it in a model:</p>
+<ol class="arabic">
+<li><p><strong>Declare the node EP-enabled.</strong> Add it to <code class="docutils literal notranslate"><span class="pre">ep_enabled_nodes</span></code> in
+<code class="docutils literal notranslate"><span class="pre">get_default_sharding_config</span></code>. An <code class="docutils literal notranslate"><span class="pre">ep_config</span></code> on any other node fails at start-up.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">return</span> <span class="n">ShardingConfig</span><span class="p">(</span>
+    <span class="n">groups</span><span class="o">=</span><span class="p">[],</span> <span class="n">tp_enabled_nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span> <span class="n">shard_dim</span><span class="o">=</span><span class="p">{},</span> <span class="n">ep_enabled_nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</li>
+<li><p><strong>Build the MoE layers with</strong> <code class="docutils literal notranslate"><span class="pre">instantiate_moe_block</span></code>. Accept <code class="docutils literal notranslate"><span class="pre">moe_parallel</span></code> in
+<code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> and pass it, with the node’s <code class="docutils literal notranslate"><span class="pre">tp_group</span></code>, down to each MoE layer.
+The helper returns a <code class="docutils literal notranslate"><span class="pre">ParallelSparseMoeBlock</span></code> or an <code class="docutils literal notranslate"><span class="pre">ExpertParallelSparseMoeBlock</span></code>,
+whose weight loaders keep only the rank’s slice or its own experts. <code class="docutils literal notranslate"><span class="pre">moe_parallel=None</span></code>
+gives TP.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">instantiate_moe_block</span><span class="p">(</span>
+    <span class="n">hidden_size</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
+    <span class="n">moe_intermediate_size</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">moe_intermediate_size</span><span class="p">,</span>
+    <span class="n">num_experts</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">num_experts</span><span class="p">,</span>
+    <span class="n">num_experts_per_tok</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">num_experts_per_tok</span><span class="p">,</span>
+    <span class="n">norm_topk_prob</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">norm_topk_prob</span><span class="p">,</span>
+    <span class="n">comm_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">,</span>
+    <span class="n">moe_parallel</span><span class="o">=</span><span class="n">moe_parallel</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+</li>
+<li><p><strong>Optionally, mix in</strong> <code class="docutils literal notranslate"><span class="pre">MoeParallelMixin</span></code> on the model’s top-level module, and call
+<code class="docutils literal notranslate"><span class="pre">self.init_moe_parallel(moe_parallel)</span></code> at the end of its <code class="docutils literal notranslate"><span class="pre">__init__</span></code>. It provides:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">maybe_log_expert_load(synthetic)</span></code>, which implements <code class="docutils literal notranslate"><span class="pre">log_expert_load_every</span></code>.
+Call it from eager code before each forward, usually from <code class="docutils literal notranslate"><span class="pre">preprocess</span></code>, with
+<code class="docutils literal notranslate"><span class="pre">synthetic=engine_inputs.synthetic</span></code> so capture and warmup routing are discarded.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">moe_token_valid(hidden_states,</span> <span class="pre">num_valid_tokens)</span></code>, which implements
+<code class="docutils literal notranslate"><span class="pre">mask_padding</span></code>. It returns the <code class="docutils literal notranslate"><span class="pre">token_valid</span></code> mask for the MoE blocks, or
+<code class="docutils literal notranslate"><span class="pre">None</span></code> when masking is off. Pass the mask only to MoE layers, not dense MLPs.
+<code class="docutils literal notranslate"><span class="pre">num_valid_tokens</span></code> must be a <code class="docutils literal notranslate"><span class="pre">(1,)</span></code> device tensor that <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> returns
+as a static input, so a replay can update it; fill it from
+<code class="docutils literal notranslate"><span class="pre">engine_inputs.real_seq_len</span></code>. <code class="docutils literal notranslate"><span class="pre">ThinkerSubmodule.preprocess</span></code> shows the wiring.</p></li>
+</ul>
+</li>
+</ol>
+<p>The shared-expert block (<code class="docutils literal notranslate"><span class="pre">ParallelSparseMoeBlockWithSharedExpert</span></code>) has no EP variant, so
+a node built from it stays TP-only.</p>
+</section>
 </section>
 <section id="worked-example-orpheus">
 <h2>Worked example: Orpheus<a class="headerlink" href="#worked-example-orpheus" title="Link to this heading">#</a></h2>
@@ -2786,6 +2848,7 @@ for a full omni-modal model.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tuning-resources-per-deployment">Tuning resources per deployment</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preprocessing-threads">Preprocessing threads</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallelism-moe">Expert parallelism (MoE)</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-orpheus">Worked example: Orpheus</a></li>

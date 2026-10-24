@@ -230,8 +230,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - Maximum sequence length (sizes the KV cache).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. Each node of a
-       walk must be placed by exactly one entry for that walk.
+       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
+       ``ep_config`` block picks TP or EP for the group's MoE experts.
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -391,6 +391,48 @@ A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1
 weight loaders then shard parameters automatically, with no model-code changes. See
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
+
+**Expert parallelism.** By default a TP group shards every MoE expert along its
+intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
+whole experts. Attention and dense MLPs stay TP-sharded:
+
+.. code-block:: yaml
+
+   model: "qwen3_omni"
+   max_seq_len: 32768
+   node_groups:
+     - node_names: [Thinker]
+       ranks: [0, 1]
+       tp_size: 2
+       ep_config:
+         parallel: ep          # each rank holds 64 of the 128 experts at full width
+     - {node_names: [audio_encoder, vision_encoder], ranks: [0]}
+     - {node_names: [Talker], ranks: [2]}
+     - {node_names: [Code2Wav], ranks: [2]}
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``ep_config`` key
+     - Meaning
+   * - ``parallel``
+     - ``tp`` (default) or ``ep``.
+   * - ``ep_group``
+     - The ranks EP spans. Only ``tp``, the group's TP ranks, exists today.
+   * - ``debug_check_routing``
+     - Device-assert that every rank routes each token to the same experts. Costs one
+       all-gather per MoE layer; off by default. Needs ``parallel: ep``.
+   * - ``log_expert_load_every``
+     - Every N steps, log the per-rank and per-layer expert load. 0 (default) is off.
+       Needs ``parallel: ep``.
+   * - ``mask_padding``
+     - Skip CUDA-graph padding rows in the routed experts, TP or EP. Off by default;
+       it gave no throughput gain on Qwen3-Omni at 8 GPUs.
+
+The number of experts must divide evenly by the group size. A node must be declared
+EP-enabled by the model; an ``ep_config`` on any other node, an unknown key, or two
+per-walk groups giving one node different ``ep_config`` blocks fails at start-up. See
+``configs/qwen3omni_thinker_ep2.yaml``.
 
 model_kwargs
 ------------
