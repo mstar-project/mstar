@@ -98,6 +98,42 @@ class ShardingConfig:
                     "graph walks to different workers."
                 ))
 
+    def assert_streams_keep_tp_size(
+        self, stream_edges: list[tuple[str, str, str, str]],
+    ):
+        """Refuses a sharded streamed signal whose producer and consumer
+        differ in TP size, given (signal, producer node, the graph walk it
+        emits from, consumer node).
+
+        Between equal TP sizes each rank streams its own shard to its peer.
+        Across sizes the fanout gathers shards, which the consumer buffers per
+        (request, signal) rather than per chunk and emits under a uuid its
+        StreamBuffer never registered, or slices them, which local streaming
+        ignores.
+        """
+        def tp_size(node: str, walk: str | None) -> int:
+            # A streaming consumer's group covers every walk; a producer's
+            # may be walk-specific, and a node in no group is TP 1.
+            for group in self.groups:
+                if node in group.nodes and (
+                    walk is None or group.graph_walks is None or walk in group.graph_walks
+                ):
+                    return group.tp_size
+            return 1
+
+        for signal, producer, walk, consumer in stream_edges:
+            if self.shard_dim.get(signal) is None:
+                continue
+            producer_tp, consumer_tp = tp_size(producer, walk), tp_size(consumer, None)
+            if producer_tp != consumer_tp:
+                raise RuntimeError(
+                    f"Streamed signal {signal!r} has a shard_dim, but its producer {producer!r} "
+                    f"in graph walk {walk!r} (TP {producer_tp}) and consumer {consumer!r} "
+                    f"(TP {consumer_tp}) differ in TP size. A streamed signal can only be "
+                    "sharded between equal TP sizes: drop its sharding_config.shard_dim entry "
+                    "or give both nodes the same tp_size."
+                )
+
     def setup(
         self, node_to_workers: dict[NodeAndGraphWalk, list[str]]
     ):

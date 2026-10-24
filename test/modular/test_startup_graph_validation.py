@@ -37,7 +37,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.graph.runtime.python import PythonGraphRuntime
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model
 from mstar.model.registry import MODEL_REGISTRY, get_model_class, model_init_kwargs
 from mstar.streaming.chunk_policy import FixedChunkPolicy
@@ -183,11 +183,11 @@ def test_one_node_on_different_ranks_per_walk_is_accepted(tmp_path, monkeypatch)
 # -- stream-driven walks ------------------------------------------------------
 
 
-def _stream_model(chunk_walk, extra_walks=None, tp_enabled_nodes=()):
+def _stream_model(chunk_walk, extra_walks=None, tp_enabled_nodes=(), producer=None):
     """Producer partition P streams ``codes`` into consumer partition C."""
     def walks():
         out = {
-            "gen": GraphNode(name="producer", input_names=["prompt"], outputs=[
+            "gen": producer() if producer else GraphNode(name="producer", input_names=["prompt"], outputs=[
                 StreamingGraphEdge(next_node="vocoder", name="codes", target_partition="C"),
             ]),
             "chunk": chunk_walk(),
@@ -418,6 +418,85 @@ def test_single_node_consumer_walks_are_accepted(tmp_path, monkeypatch):
     ])
     c = _start_conductor(_stream_model(_vocoder, tp_enabled_nodes=["vocoder"]), cfg, tmp_path, monkeypatch)
     assert c.node_walk_to_wg[("vocoder", "chunk")].ranks == [1, 2]
+
+
+@pytest.mark.parametrize("producer_tp,vocoder_tp,shard_dim,accepted", [
+    # a gathered stream: the consumer emits each chunk under a uuid its
+    # StreamBuffer never registered, and no chunk is ever released
+    (2, 1, {"codes": 0}, False),
+    # a sliced stream: local streaming hands over the whole tensor
+    (1, 2, {"codes": 0}, False),
+    (2, 2, {"codes": 0}, True),
+    (2, 1, {}, True),
+], ids=["gathered", "sliced", "same_tp", "replicated"])
+def test_sharded_stream_across_tp_sizes_is_rejected(
+    producer_tp, vocoder_tp, shard_dim, accepted, tmp_path, monkeypatch,
+):
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump({
+        "max_seq_len": 64,
+        "node_groups": [
+            {"node_names": ["producer"], "ranks": list(range(producer_tp)), "tp_size": producer_tp},
+            {"node_names": ["vocoder"], "ranks": list(range(producer_tp, producer_tp + vocoder_tp)),
+             "tp_size": vocoder_tp},
+        ],
+        "sharding_config": {"shard_dim": shard_dim},
+    }))
+    model = _stream_model(_vocoder, tp_enabled_nodes=["producer", "vocoder"])
+    if accepted:
+        _start_conductor(model, str(path), tmp_path, monkeypatch)
+        return
+    with pytest.raises(RuntimeError, match=(
+        rf"Streamed signal 'codes' has a shard_dim, but its producer 'producer' in graph walk 'gen' "
+        rf"\(TP {producer_tp}\) and consumer 'vocoder' \(TP {vocoder_tp}\) differ in TP size"
+    )):
+        _start_conductor(model, str(path), tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("accumulated", [False, True], ids=["outputs", "accumulated_outputs"])
+def test_a_loop_streaming_a_sharded_signal_across_tp_sizes_is_rejected(accumulated, tmp_path, monkeypatch):
+    """The stream leaves through the Loop's own outputs, not the inner node's edge."""
+    def generate():
+        stream = StreamingGraphEdge(next_node="vocoder", name="codes", target_partition="C")
+        return Loop(
+            name="generate", max_iters=2,
+            section=GraphNode(name="producer", input_names=["prompt"], outputs=[
+                GraphEdge(next_node=EMPTY_DESTINATION, name="codes"),
+            ]),
+            outputs=[] if accumulated else [stream],
+            accumulated_outputs=[stream] if accumulated else [],
+        )
+
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump({
+        "max_seq_len": 64,
+        "node_groups": [
+            {"node_names": ["producer"], "ranks": [0, 1], "tp_size": 2},
+            {"node_names": ["vocoder"], "ranks": [2]},
+        ],
+        "sharding_config": {"shard_dim": {"codes": 0}},
+    }))
+    model = _stream_model(_vocoder, producer=generate, tp_enabled_nodes=["producer", "vocoder"])
+    match = r"producer 'producer' in graph walk 'gen' \(TP 2\) and consumer 'vocoder' \(TP 1\)"
+    with pytest.raises(RuntimeError, match=match):
+        _start_conductor(model, str(path), tmp_path, monkeypatch)
+
+
+def test_sharded_stream_check_uses_the_walk_that_emits_it():
+    """A producer's TP group can be walk-specific: only the emitting walk's
+    size counts, whichever way the other walk's size would tip it."""
+    from mstar.distributed.base import ShardingGroup
+
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes={"producer"}, tp_size=2, graph_walks={"warmup"}),
+            ShardingGroup(nodes={"vocoder"}, tp_size=2),
+        ],
+        tp_enabled_nodes={"producer", "vocoder"}, shard_dim={"codes": 0},
+    )
+    with pytest.raises(RuntimeError, match=r"in graph walk 'gen' \(TP 1\) and consumer 'vocoder' \(TP 2\)"):
+        cfg.assert_streams_keep_tp_size([("codes", "producer", "gen", "vocoder")])
+    cfg.assert_streams_keep_tp_size([("codes", "producer", "warmup", "vocoder")])
 
 
 def test_conductor_driven_walk_of_a_consumer_partition_is_accepted(tmp_path, monkeypatch):

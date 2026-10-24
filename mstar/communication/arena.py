@@ -878,13 +878,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         )
                         self.tensor_store.increment_ref(info.uuid, 1)
                         continue
-                    if self.tensor_store.check_uuid_presence(info.uuid):
-                        self.tensor_store.increment_ref(info.uuid, 1)
+                    producer_uuid = info.uuid
+                    if self._take_cached_read(request_id, info):
                         continue
                     if info.shm_segment is None:
                         # Spilled at the producer (arena saturated): read the
                         # per-uuid file, the old protocol's path.
-                        path = self._shm_path(info.source_entity, info.uuid)
+                        path = self._shm_path(info.source_entity, producer_uuid)
                         with open(path, "rb") as f:
                             f.seek(info.offset)
                             data = f.read(info.nbytes)
