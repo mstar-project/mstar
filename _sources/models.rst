@@ -788,18 +788,19 @@ own ``window_decoder`` partition; a request opts in per call:
      - Default
      - Meaning
    * - ``window_mode``
-     - —
+     - — (``chained`` with ``stream_video``)
      - ``chained``: every window is a full bidirectional denoise conditioned on
-       the previous window's tail (``overlap_frames`` pinned clean). ``kv``: the
-       finished window's clean K/V is committed to the cache and later windows
-       attend to it block-causally; no overlap, and frames older than
-       ``context_frames`` behind the frontier are released from the cache
-       (the persistent world state of a long rollout stays bounded).
+       the previous window's tail (``overlap_frames`` pinned clean). ``kv``
+       (experimental, see below): the finished window's clean K/V is committed
+       to the cache and later windows attend to it block-causally; no overlap,
+       and frames older than ``context_frames`` behind the frontier are
+       released from the cache (the persistent world state of a long rollout
+       stays bounded).
    * - ``window_frames``
-     - 29
+     - 61 on Edge, 29 elsewhere; ``kv``: 29
      - Pixel frames per window (quantized to latent frames).
    * - ``overlap_frames``
-     - 8
+     - 32 on Edge, 8 elsewhere
      - ``chained`` only: frames re-pinned from the previous window (at least two
        latent frames).
    * - ``context_frames``
@@ -837,7 +838,21 @@ own ``window_decoder`` partition; a request opts in per call:
    curl -sN http://localhost:8000/generate \
      -F 'text=a drone flies over a coastal town at dawn' \
      -F 'output_modalities=video' \
-     -F 'model_kwargs={"num_frames":241,"window_mode":"kv","window_frames":29,"context_frames":61,"stream_video":true}'
+     -F 'model_kwargs={"num_frames":241,"window_mode":"chained","stream_video":true}'
+
+.. warning::
+
+   ``window_mode: kv`` is experimental, and the server logs a warning at
+   startup when windowed video is enabled. The checkpoints were not trained
+   block-causally: committed K/V conditions the next window far more weakly
+   than frames pinned in the sequence, so an image-conditioned kv rollout
+   jumps away from the scene at the first window boundary and, unless the
+   prompt describes the image, can turn to texture noise within a few
+   windows. ``chained`` with Edge's 61/32 defaults holds the scene over 241
+   frames when the prompt describes the image; its first chunk arrives later,
+   since window 0 is 61 frames. A prompt that
+   contradicts the image still takes over within a few windows in every
+   windowed mode; non-windowed clips are not affected.
 
 The schedule is padded up to whole windows and the video trimmed back to
 ``num_frames``; a seeded request is deterministic end to end (later windows draw

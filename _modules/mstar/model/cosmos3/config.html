@@ -1196,6 +1196,9 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># cover-scale + center-crop image conditioning (the diffusers 0.40 pipeline</span>
 <span class="c1"># recipe), action modes at flow shift 10. Applied by ``from_pretrained`` where</span>
 <span class="c1"># a field still holds the Nano default, so a yaml overrides any of them.</span>
+<span class="c1"># Chained windows of 61 frames re-pinning 32 hold the conditioning scene over</span>
+<span class="c1"># a 241-frame rollout when the prompt describes the image; 29/8 windows smear</span>
+<span class="c1"># more at every boundary.</span>
 <span class="n">EDGE_BACKBONE_TYPE</span> <span class="o">=</span> <span class="s2">"cosmos3_edge_nemotron_dense"</span>
 <span class="n">EDGE_RECIPE_DEFAULTS</span> <span class="o">=</span> <span class="p">{</span>
     <span class="s2">"conditioning_resize"</span><span class="p">:</span> <span class="s2">"aspect_crop"</span><span class="p">,</span>
@@ -1205,6 +1208,8 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"num_inference_steps_video"</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
     <span class="s2">"flow_shift_video"</span><span class="p">:</span> <span class="mf">12.0</span><span class="p">,</span>
     <span class="s2">"flow_shift_action"</span><span class="p">:</span> <span class="mf">10.0</span><span class="p">,</span>
+    <span class="s2">"window_frames_default"</span><span class="p">:</span> <span class="mi">61</span><span class="p">,</span>
+    <span class="s2">"overlap_frames_default"</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span>
 <span class="p">}</span>
 
 
@@ -1293,6 +1298,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># one-frame conditioning visibly degrades the continuation.</span>
     <span class="n">window_frames_default</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">29</span>
     <span class="n">overlap_frames_default</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>
+    <span class="c1"># kv windows have their own default: a longer kv window cuts harder at the</span>
+    <span class="c1"># first boundary, so it does not follow the chained one.</span>
+    <span class="n">kv_window_frames_default</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">29</span>
     <span class="c1"># kv-mode committed-context horizon (61 px = 16 latent frames): frames</span>
     <span class="c1"># older than this behind the commit frontier are released from the cache.</span>
     <span class="c1"># A request may pass context_frames=0 to retain everything.</span>
@@ -1500,12 +1508,13 @@ window.runMermaid = runMermaid;</script>
             <span class="n">value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">or</span> <span class="n">value</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cosmos3 </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be an integer &gt;= 0, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
-        <span class="n">window</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">window_frames_default</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae</span><span class="o">.</span><span class="n">scale_factor_temporal</span>
+        <span class="n">default_frames</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">window_frames_default</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_window_frames_default</span><span class="p">)</span>
+        <span class="n">window</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="p">(</span><span class="n">default_frames</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae</span><span class="o">.</span><span class="n">scale_factor_temporal</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">windowed_decode_latents_per_call</span> <span class="o">&gt;</span> <span class="n">window</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"Cosmos3 windowed_decode_latents_per_call=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">windowed_decode_latents_per_call</span><span class="si">}</span><span class="s2"> is more "</span>
-                <span class="sa">f</span><span class="s2">"than the </span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2"> latent frames of the default window (window_frames_default="</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">window_frames_default</span><span class="si">}</span><span class="s2">); 0 decodes each window's new latents in one call."</span>
+                <span class="sa">f</span><span class="s2">"than the </span><span class="si">{</span><span class="n">window</span><span class="si">}</span><span class="s2"> latent frames of the smaller default window (</span><span class="si">{</span><span class="n">default_frames</span><span class="si">}</span><span class="s2"> frames); "</span>
+                <span class="s2">"0 decodes each window's new latents in one call."</span>
             <span class="p">)</span></div>
 
 

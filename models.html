@@ -1503,20 +1503,21 @@ own <code class="docutils literal notranslate"><span class="pre">window_decoder<
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">window_mode</span></code></p></td>
-<td><p>—</p></td>
+<td><p>— (<code class="docutils literal notranslate"><span class="pre">chained</span></code> with <code class="docutils literal notranslate"><span class="pre">stream_video</span></code>)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">chained</span></code>: every window is a full bidirectional denoise conditioned on
-the previous window’s tail (<code class="docutils literal notranslate"><span class="pre">overlap_frames</span></code> pinned clean). <code class="docutils literal notranslate"><span class="pre">kv</span></code>: the
-finished window’s clean K/V is committed to the cache and later windows
-attend to it block-causally; no overlap, and frames older than
-<code class="docutils literal notranslate"><span class="pre">context_frames</span></code> behind the frontier are released from the cache
-(the persistent world state of a long rollout stays bounded).</p></td>
+the previous window’s tail (<code class="docutils literal notranslate"><span class="pre">overlap_frames</span></code> pinned clean). <code class="docutils literal notranslate"><span class="pre">kv</span></code>
+(experimental, see below): the finished window’s clean K/V is committed
+to the cache and later windows attend to it block-causally; no overlap,
+and frames older than <code class="docutils literal notranslate"><span class="pre">context_frames</span></code> behind the frontier are
+released from the cache (the persistent world state of a long rollout
+stays bounded).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">window_frames</span></code></p></td>
-<td><p>29</p></td>
+<td><p>61 on Edge, 29 elsewhere; <code class="docutils literal notranslate"><span class="pre">kv</span></code>: 29</p></td>
 <td><p>Pixel frames per window (quantized to latent frames).</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">overlap_frames</span></code></p></td>
-<td><p>8</p></td>
+<td><p>32 on Edge, 8 elsewhere</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">chained</span></code> only: frames re-pinned from the previous window (at least two
 latent frames).</p></td>
 </tr>
@@ -1561,8 +1562,22 @@ like an unknown one: the request is rejected.</p></td>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-sN<span class="w"> </span>http://localhost:8000/generate<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-F<span class="w"> </span><span class="s1">'text=a drone flies over a coastal town at dawn'</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-F<span class="w"> </span><span class="s1">'output_modalities=video'</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-F<span class="w"> </span><span class="s1">'model_kwargs={"num_frames":241,"window_mode":"kv","window_frames":29,"context_frames":61,"stream_video":true}'</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s1">'model_kwargs={"num_frames":241,"window_mode":"chained","stream_video":true}'</span>
 </pre></div>
+</div>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p><code class="docutils literal notranslate"><span class="pre">window_mode:</span> <span class="pre">kv</span></code> is experimental, and the server logs a warning at
+startup when windowed video is enabled. The checkpoints were not trained
+block-causally: committed K/V conditions the next window far more weakly
+than frames pinned in the sequence, so an image-conditioned kv rollout
+jumps away from the scene at the first window boundary and, unless the
+prompt describes the image, can turn to texture noise within a few
+windows. <code class="docutils literal notranslate"><span class="pre">chained</span></code> with Edge’s 61/32 defaults holds the scene over 241
+frames when the prompt describes the image; its first chunk arrives later,
+since window 0 is 61 frames. A prompt that
+contradicts the image still takes over within a few windows in every
+windowed mode; non-windowed clips are not affected.</p>
 </div>
 <p>The schedule is padded up to whole windows and the video trimmed back to
 <code class="docutils literal notranslate"><span class="pre">num_frames</span></code>; a seeded request is deterministic end to end (later windows draw
