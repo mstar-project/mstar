@@ -336,9 +336,8 @@ moved to the host or dropped. A dropped request waits at its place in the queue 
 one more page fit, then recomputes its KV in one prefill row. A
 request that streams audio out, or holds KV made from media or another node's outputs,
 reserves its whole footprint in every pool, with every cache hit counted, and is never
-dropped. So does a request in the pools of a node that keeps no token ids to rebuild it.
-Voice requests then queue when the pool is short and are never dropped mid-stream. With
-``cpu_offload_pages`` set, a voice request can still be moved to the host.
+dropped or moved to the host. So does a request in the pools of a node that keeps no token ids to rebuild it.
+Voice requests then queue when the pool is short and are never preempted mid-stream.
 
 Above one rank, a decode step that finds no page and nothing to offload holds its requests until
 they time out. At one rank, a request that runs short and can't be dropped waits for room when

@@ -3239,9 +3239,13 @@ class KVManager(AttentionResource):
 
     def reclaimable(self, rid: str) -> int:
         """The device pages ``rid`` holds, or 0 when offloading it would free none
-        of them, when it is offloaded already, or when it is admitted but hasn't run."""
+        of them, when it is offloaded already, or when it is admitted but hasn't run.
+        Also 0 for a guaranteed request in a pool that decides, since a move to the host
+        preempts it too."""
         with self._lock:
             streams = self._streams.get(rid, {})
+            if self._decides and streams and self._overrides[rid].guaranteed:
+                return 0
             for stream in streams.values():
                 if any(self._reusable(page) for page in reversed(stream.page_indices)):
                     return sum(len(stream.page_indices) for stream in streams.values())
