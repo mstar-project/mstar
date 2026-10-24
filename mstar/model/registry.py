@@ -35,6 +35,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "qwen3_tts_voicedesign": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "qwen3_tts_base": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
+    "voxcpm2": ("mstar.model.voxcpm2.voxcpm2_model", "VoxCPM2Model"),
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
     "waypoint": ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
@@ -135,6 +136,10 @@ HF_MODELS: dict[str, dict] = {
     # ``download_vjepa2_ac_upstream_pt`` — the ``model_path_hf`` string is
     # kept as a logical identifier but isn't resolved against HuggingFace.
     "vjepa2_ac": {"model_path_hf": "vjepa2-ac-vitg"},
+    # VoxCPM2 (OpenBMB, Apache-2.0): tokenizer-free diffusion-autoregressive
+    # TTS, 30 languages, voice design and cloning. MiniCPM-4 base + residual
+    # LMs drive a local DiT over AudioVAE V2 latents, decoded to 48 kHz.
+    "voxcpm2": {"model_path_hf": "openbmb/VoxCPM2"},
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},

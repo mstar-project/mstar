@@ -672,6 +672,19 @@ def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size))
 
 
+def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
+    # __init__ reads only config.json and the tokenizer; the config defaults are the published geometry
+    import transformers
+
+    from mstar.model.voxcpm2 import voxcpm2_model
+    from mstar.model.voxcpm2.config import VoxCPM2Config
+    monkeypatch.setattr(voxcpm2_model, "_resolve_metadata", lambda repo_id, cache_dir: str(tmp_path))
+    monkeypatch.setattr(VoxCPM2Config, "from_pretrained", classmethod(lambda cls, path: cls()))
+    monkeypatch.setattr(transformers.LlamaTokenizerFast, "from_pretrained",
+                        classmethod(lambda cls, path: SimpleNamespace(get_vocab=dict)))
+    return _constructed(name, model_kwargs)
+
+
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
     return _bare(WhisperModel, config=WhisperModelConfig())
@@ -694,6 +707,7 @@ _FACTORIES = {
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
+    "VoxCPM2Model": _voxcpm2,
     "WhisperModel": _whisper,
     # constructed directly: NemotronDuplexModel, OmniVoiceModel, Pi05Model,
     # VJepa2Model, VJepa2ACModel, Wan22Model, WaypointModel
