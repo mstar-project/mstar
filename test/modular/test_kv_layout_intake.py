@@ -296,6 +296,21 @@ def test_only_the_new_request_carries_the_ids_of_a_lone_label_laid_out_as_ids(tm
     assert comm.conductor.requests["r"].resource_configs["kv"].prompt_ids is None, "later messages would carry them"
 
 
+def test_a_label_with_images_carries_the_ids_of_its_ids_spans_in_order():
+    spans = (Span("ids", "vision", 3, 3, "text_inputs"), Span("digest", "vision", 6, 4, ("image", 0)),
+             Span("ids", "vision", 2, 2, "text_inputs"))
+    texts = [torch.tensor([1, 2, 3]), torch.tensor([4, 5])]
+    # a video's frames are rows, so the conductor guarantees the request
+    video = (*spans, Span("rows", "vision", 4, 2, ("video", 0)))
+    layouts = {"kv": {"main": LabelLayout(spans=spans)}, "video_kv": {"main": LabelLayout(spans=video)}}
+
+    ids = PreprocessWorkerThread._prompt_ids({"text_inputs": texts}, layouts)
+
+    assert ids == {"kv": {"main": torch.arange(1, 6).int().numpy().tobytes()}}, (
+        "a rebuild would prefill other text, or a request no drop can take would keep host copies for its life"
+    )
+
+
 def test_requests_carry_their_arrival_on_every_kv_config(tmp_path, monkeypatch):
     model = _Model()
     groups = [{"node_names": ["llm"], "ranks": [0]}, {"node_names": ["talker"], "ranks": [1]}]
