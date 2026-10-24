@@ -1164,6 +1164,38 @@ class KVManager(AttentionResource):
                 return label
         return None
 
+    def keyed_label(self, rid: str, node_name: str, graph_walk: str) -> str | None:
+        with self._lock:
+            return self._keyed_label(rid, node_name, graph_walk)
+
+    def chain_key(self, rid: str, label: str, pages: int) -> bytes | None:
+        """The index key of the stream's first ``pages`` pages, or None until
+        its chain keys that many whole pages."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            chain = None if stream is None else stream.chain
+            if chain is None or not 0 < pages <= chain.keyed_pages:
+                return None
+            # The probe rooted the prompt's keys. The prompt's last key can name a
+            # page that was partial at the probe, so that key is hashed again.
+            if chain.rooted is not None and pages < len(chain.rooted):
+                return chain.rooted[pages - 1]
+            key = chain.keys[pages - 1]
+        return fingerprint(self._prefix_root, key)
+
+    def chain_keys(self, rid: str, label: str, pages: int) -> list[bytes]:
+        """`chain_key` for each of the stream's first ``pages`` pages, as many as
+        its chain keys whole, in one call."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            chain = None if stream is None else stream.chain
+            if chain is None:
+                return []
+            pages = min(pages, chain.keyed_pages)
+            rooted = [] if chain.rooted is None else list(chain.rooted[:min(pages, len(chain.rooted) - 1)])
+            rest = chain.keys[len(rooted):pages]
+        return rooted + [fingerprint(self._prefix_root, key) for key in rest]
+
     def _seed_keys(self, rid: str, label: str, stream: CacheStream) -> None:
         """Put this request's chain for ``label`` on its stream."""
         overrides = self._overrides.get(rid)

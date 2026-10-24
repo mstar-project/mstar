@@ -38,6 +38,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.recurrent.config import RecurrentStateSpec
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -873,6 +874,9 @@ class Engine:
         }
         # resources that aren't keyed but opened, such as a recurrent pool's snapshots
         restoring: set[str] = set()
+        for key, spec in specs_by_key.items():
+            if isinstance(spec, RecurrentStateSpec) and {key, spec.config.kv_cache} <= self._resources.keys():
+                self._resources[key].bind_kv(self._resources[spec.config.kv_cache])
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config

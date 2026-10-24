@@ -12,7 +12,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -40,6 +40,9 @@ from mstar.engine.resources.step import (
 )
 from mstar.utils.h2d import H2DMirror, PinnedStager
 
+if TYPE_CHECKING:
+    from mstar.engine.resources.kv.manager import KVManager
+
 logger = logging.getLogger(__name__)
 
 # Where a padding tail or zero-span row points. SINK_SLOT is held out of
@@ -63,11 +66,13 @@ class SlotState:
 class SnapshotLease(NamedTuple):
     """A probe's hold on the snapshot it restores, from the probe to its walk's admit.
 
-    ``slot`` is None when no snapshot fits.
+    ``slot`` is None when no snapshot fits, and ``hit`` is how much the KV
+    cache held before the pool capped it to the snapshot.
     """
     label: str
     slot: int | None
     tokens: int
+    hit: int
 
 
 @dataclass(frozen=True)
@@ -154,16 +159,20 @@ class RecurrentStatePool(Resource):
         self._cached_plan_output: dict[str, RecurrentAddressing] | None = None
 
         # Snapshots:
+        # `_kv` is the KV cache whose page keys name them, None while they are off.
         # `_snap_meta` maps a filed slot to its key, least recently filed or restored first.
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
+        self._kv: KVManager | None = None
         first = config.max_slots
         self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
         self._snap_by_key: dict[bytes, int] = {}
         self._snap_meta: OrderedDict[int, bytes] = OrderedDict()
         self._snap_refs: dict[int, int] = {}
         # Handle-keyed, purged by `remove_request`.
+        # `_keyed` holds the (rid, label) streams the KV cache keys.
         # `_leases` holds a probe's snapshot until admit, and `_restores` from
         # admit to plan.
+        self._keyed: set[tuple[str, str]] = set()
         self._leases: dict[str, SnapshotLease] = {}
         self._restores: dict[tuple[str, str], SnapshotLease] = {}
         # what admits took for prefix reuse, for `rollback_admit`, and the
@@ -211,6 +220,7 @@ class RecurrentStatePool(Resource):
             self._drop_lease(rid)
             for key in [k for k in self._restores if k[0] == rid]:
                 self._unref(self._restores.pop(key).slot)
+            self._keyed -= {k for k in self._keyed if k[0] == rid}
             self._forget_prefix_admit(lambda key: key[0] == rid)
 
     def reset_request(self, rid: str, free: bool = False):
@@ -463,13 +473,22 @@ class RecurrentStatePool(Resource):
 
     # Prefix reuse: a hit restores the state a snapshot holds at the agreed length
 
+    def bind_kv(self, kv: "KVManager") -> None:
+        """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names."""
+        self._kv = kv
+
     def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
         del root, walks
         if self._world_size > 1 and self.config.prefix_slots:
             logger.info(
                 "recurrent state: prefix snapshots off at world size %d", self._world_size,
             )
-        return self._world_size == 1 and bool(self.config.prefix_slots)
+        if self._world_size > 1 or not self.config.prefix_slots:
+            self._kv = None
+        return self._kv is not None
+
+    def close_prefix_cache(self) -> None:
+        self._kv = None
 
     def fingerprint(self) -> bytes:
         """The blocks' shapes and dtypes. The state's dtype changes what the
@@ -477,6 +496,55 @@ class RecurrentStatePool(Resource):
         return fingerprint(sorted(
             (name, block.shape, str(block.dtype)) for name, block in self.config.blocks.items()
         ))
+
+    def resolve_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+    ) -> CachedPrefix | None:
+        """Note which streams the KV cache keys, and return None.
+        `cap_cached_prefix` then fits the KV cache's answer to a snapshot."""
+        del inputs
+        kv = self._kv
+        if kv is None:
+            return None
+        label = kv.keyed_label(rid, node_name, graph_walk)
+        if label is not None:
+            with self._lock:
+                if rid in self._slots:
+                    self._keyed.add((rid, label))
+        return None
+
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, prefix: CachedPrefix,
+    ) -> CachedPrefix:
+        """Cut ``prefix`` to the longest snapshot at or under it, and lease that
+        snapshot until admit. A stream that already holds state restores nothing."""
+        del node_name, graph_walk
+        if self._kv is None:
+            return prefix
+        label, page = prefix.label, self._kv.config.page_size
+        keys = self._kv.chain_keys(rid, label, prefix.tokens // page)
+        with self._lock:
+            if rid not in self._slots:
+                return self._cut(prefix, 0)
+            slot = self._slots[rid].get(label)
+            if (slot is not None and slot.has_state) or (rid, label) in self._restores:
+                return self._cut(prefix, 0)
+            lease = self._leases.get(rid)
+            if lease is not None and lease.tokens <= prefix.tokens:
+                return self._cut(prefix, lease.tokens)
+            self._drop_lease(rid)
+            pages = next((n for n in range(len(keys), 0, -1) if keys[n - 1] in self._snap_by_key), 0)
+            snap = self._snap_by_key[keys[pages - 1]] if pages else None
+            if snap is not None:
+                self._snap_refs[snap] = self._snap_refs.get(snap, 0) + 1
+            self._leases[rid] = SnapshotLease(label, snap, pages * page, prefix.tokens)
+        return self._cut(prefix, pages * page)
+
+    @staticmethod
+    def _cut(prefix: CachedPrefix, tokens: int) -> CachedPrefix:
+        if tokens == prefix.tokens:
+            return prefix
+        return prefix._replace(tokens=tokens, position=prefix.position - prefix.tokens + tokens)
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,

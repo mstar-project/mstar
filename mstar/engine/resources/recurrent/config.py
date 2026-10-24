@@ -257,8 +257,9 @@ class RecurrentStateConfig:
     disable_sink_slot: bool = False
 
     # Snapshots kept for prefix reuse, in slots past max_slots: the state a
-    # prompt reached at a page boundary, under that page's key.
+    # prompt reached at a page boundary of `kv_cache`, under that page's key.
     prefix_slots: int = 0
+    kv_cache: str | None = None
 
     def __post_init__(self):
         if not self.blocks:
@@ -298,6 +299,9 @@ class RecurrentStateSpec(NodeResourceSpec):
         from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
         return RecurrentStatePool
+
+    def depends_on(self) -> set[str]:
+        return {self.config.kv_cache} if self.config.kv_cache else set()
 
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
