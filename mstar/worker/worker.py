@@ -1401,7 +1401,9 @@ class Worker:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
         # Every ready chunk is popped first and ingested in one call (and one
         # Python <> Rust roundtrip)
+        laps = PhaseLaps("worker.main.poll_stream_buffers.")
         polled = self.streams.poll()
+        laps.lap("scan_and_pop")
         if not polled:
             return
 
@@ -1423,6 +1425,7 @@ class Worker:
                 self.streams.return_edge(rid, se)
             else:
                 self.streams.mark_ingested(rid, se)
+        laps.lap("ingest")
 
 
     # ------------------------------------------------------------------
@@ -3679,6 +3682,7 @@ class Worker:
                 batch_N.node_batch.request_ids,
                 batch_N.node_batch.exec_timings,
             )
+        laps = PhaseLaps("worker.postprocess.stream_send.")
         # Before the local-streaming dereference below: numel() needs the
         # tensors, and a new_token whose only other destination is a local
         # stream holds a single reference, which that dereference drops to zero
@@ -3687,6 +3691,7 @@ class Worker:
             route_output.new_token_output_idxs,
             stored.flat_rids, stored.flat_uuids, signals, stored.signal_idxs,
         )
+        laps.lap("count_tokens")
 
         # Before the sends below: remote consumers read the walks off the
         # fwd_info that rides with the streamed edges.
@@ -3710,6 +3715,7 @@ class Worker:
         # After the loop: one crossing for the batch rather than one per
         # streamed tensor.
         self.tensor_manager.dereference_batch_uniform(streamed)
+        laps.lap("local_streams")
 
         send_rids = [rid for rid in rids if rid not in failed_rids] if failed_rids else list(rids)
         needs_info = route_output.rids_needing_request_info
@@ -3735,6 +3741,7 @@ class Worker:
                         rid, batch_N.partition, published,
                     )
                     buffered_publish.add(rid)
+        laps.lap("publish")
         # Only the rids with something to report cross: a decode step has no
         # new-token counts (the inline token is not counted) and no stream
         # buffers, and an empty entry per rid cost a dict each to build and to
@@ -3742,6 +3749,7 @@ class Worker:
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
         consumed = self.streams.consumption_batch(send_rids)
+        laps.lap("consumption")
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
