@@ -238,6 +238,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         lambda request_id, request_info: got.__setitem__("state", request_id)
     )
     w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
         add_request=lambda rid, cfgs: got.__setitem__("engine", rid),
         evictable_nodes=lambda: [],
     )
@@ -283,7 +284,10 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
     w.request_state.add_request = lambda request_id, request_info: None
     w.request_state.per_request_info = collections.defaultdict(lambda: req)
-    w.engine_manager = SimpleNamespace(add_request=lambda rid, cfgs: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+        add_request=lambda rid, cfgs: None, evictable_nodes=lambda: [],
+    )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )

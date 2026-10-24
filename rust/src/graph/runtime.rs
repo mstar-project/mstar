@@ -538,26 +538,7 @@ pub struct GraphRuntime {
         if g.node(source).outputs.is_empty() {
             return None; // nothing to feed a spec target
         }
-        // Structure only: readiness turns on WHICH slots fill, not on the
-        // tensors, and the real outputs do not exist until the step lands.
-        let edges: Vec<RoutedEdge> = g
-            .node(source)
-            .outputs
-            .iter()
-            .map(|e| RoutedEdge {
-                name: e.name,
-                dest: e.dest,
-                dest_sym: e.dest_sym,
-                persist: e.persist,
-                new_token: e.new_token,
-                streaming: e.streaming,
-                modality: e.modality,
-                tensors: vec![],
-                persist_for_loop: false,
-                declined_local: false,
-                worker: None,
-            })
-            .collect();
+        let edges = self.spec_source_edges(wg, source);
         let state = self.state_mut(wg, rid)?;
         let out = state.ingest_for_speculation(&g, source, &edges);
         state.clear_speculative_inputs();
@@ -669,6 +650,9 @@ pub struct GraphRuntime {
         let mut cols = EdgeColumns::default();
         let mut undo: Vec<(u32, NodeId, Vec<(u8, bool)>)> = Vec::new();
         let mut cursor = 0usize;
+        // The source's outputs as speculation feeds them: structure only, the
+        // same for every rid, so built once for the batch.
+        let source_edges = self.spec_source_edges(wg, curr_node);
 
         for (i, &rid) in input.rids.iter().enumerate() {
             let count = input.streaming_edges_per_rid[i];
@@ -693,7 +677,7 @@ pub struct GraphRuntime {
             match self.prep_one(
                 wg, rid, spec_node, curr_node, same_node,
                 &input.streaming_edges[slice.clone()],
-                &all_refs[slice.clone()], slice.start,
+                &all_refs[slice.clone()], slice.start, &source_edges,
             ) {
                 Some((kept, edges, ingested)) => {
                     undo.push((rid, spec_node, ingested));
@@ -741,6 +725,25 @@ pub struct GraphRuntime {
         self.spec_counter
     }
 
+    /// `source`'s output edges as a speculation feeds them: no tensors, since
+    /// readiness turns on which slots fill and the real outputs do not exist
+    /// until the step lands.
+    fn spec_source_edges(&self, wg: WgIndex, source: NodeId) -> Vec<RoutedEdge> {
+        self.graphs[wg as usize]
+            .node(source)
+            .outputs
+            .iter()
+            .map(|e| RoutedEdge {
+                name: e.name, dest: e.dest,
+                dest_sym: e.dest_sym, persist: e.persist,
+                new_token: e.new_token, streaming: e.streaming,
+                modality: e.modality, tensors: vec![],
+                persist_for_loop: false, declined_local: false,
+                worker: None,
+            })
+            .collect()
+    }
+
     /// False once this rid's loop has ended: a stop is already pending, or the
     /// next iteration would be past the last.
     fn can_continue_loop(
@@ -781,6 +784,8 @@ pub struct GraphRuntime {
         // rather than taking the bookkeeping lock per edge in here.
         refs: &[Vec<TensorRef>],
         base_idx: usize,
+        // `spec_source_edges(wg, curr_node)`, built once by the caller
+        source_edges: &[RoutedEdge],
     ) -> Option<(Vec<usize>, Vec<(Sym, Vec<u64>, bool)>, Vec<(u8, bool)>)> {
         let g = self.graphs[wg as usize].clone();
         let resolved: Vec<(usize, u8, &[TensorRef], bool)> = edges
@@ -819,20 +824,7 @@ pub struct GraphRuntime {
             }
         }
 
-        let source_edges: Vec<RoutedEdge> = g
-            .node(curr_node)
-            .outputs
-            .iter()
-            .map(|e| RoutedEdge {
-                name: e.name, dest: e.dest, 
-                dest_sym: e.dest_sym, persist: e.persist,
-                new_token: e.new_token, streaming: e.streaming,
-                modality: e.modality, tensors: vec![],
-                persist_for_loop: false, declined_local: false,
-                worker: None,
-            })
-            .collect();
-        state.ingest_for_speculation(&g, curr_node, &source_edges);
+        state.ingest_for_speculation(&g, curr_node, source_edges);
         let ready = state.ready_for_speculation(spec_node, same_node, false);
         state.clear_speculative_inputs();
         // Restore, not force-false: the node may still be in flight.
@@ -1283,6 +1275,27 @@ pub struct RouteOut {
     /// cached), and inside a loop on a single-worker deployment neither an
     /// INPUT_SIGNALS nor a WORKER_GRAPHS_DONE goes out on most passes.
     #[pyo3(get)] pub rids_needing_request_info: Vec<u32>,
+}
+
+/// `route_and_send_inline`'s result; see there.
+#[pyclass]
+#[derive(Default)]
+pub struct FusedRouteOut {
+    #[pyo3(get)] pub status: u8,
+    #[pyo3(get)] pub completion_id: u64,
+    #[pyo3(get)] pub sent_rids: Vec<u32>,
+    /// Wall time spent with the GIL released, for measuring the overlap.
+    #[pyo3(get)] pub nogil_ns: u64,
+    pub route: Option<RouteOut>,
+}
+
+#[pymethods]
+impl FusedRouteOut {
+    /// The parked route, for a status-2 caller to finish with send_outputs.
+    /// Taken, not cloned: it is read once.
+    fn take_route(&mut self) -> Option<RouteOut> {
+        self.route.take()
+    }
 }
 
 /// Routing parked between complete_and_route_batch and send_outputs.
@@ -2347,6 +2360,52 @@ impl GraphRuntime {
         self.prep_spec(input, false)
     }
 
+    /// `prep_spec_rids` for a speculation that ingests no stream chunks, as
+    /// columns in one crossing: the worker's common case, a loop's next
+    /// iteration on a worker with no streams.
+    ///
+    /// Returns `(ready_rids, wg_id, spec_id, edges)`. Every ready rid
+    /// speculates in the same worker graph (the target's owner), so one
+    /// `wg_id` stands for the column; -1 when no rid is ready. `edges` is
+    /// None when no ready rid has a prepped input edge -- every input comes
+    /// from the in-flight step -- else the six edge columns as
+    /// `prep_spec_rids` reports them. Runs holding the GIL: releasing it
+    /// around the body measured no faster on the GPU.
+    #[pyo3(signature = (
+        spec_node_name, curr_node_name, graph_walk, rids,
+        room_for_continuing = None,
+    ))]
+    #[allow(clippy::type_complexity)]
+    fn prep_spec_rows(
+        &mut self,
+        spec_node_name: String,
+        curr_node_name: String,
+        graph_walk: String,
+        rids: Vec<u32>,
+        room_for_continuing: Option<u32>,
+    ) -> PyResult<(
+        Vec<u32>, i64, u32,
+        Option<(Vec<String>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<bool>, Vec<u64>)>,
+    )> {
+        let n = rids.len();
+        let arg = SpecPrepArg {
+            spec_node_name,
+            curr_node_name,
+            graph_walk,
+            rids,
+            room_for_continuing,
+            streaming_edges: Vec::new(),
+            streaming_edges_per_rid: vec![0; n],
+        };
+        let out = self.prep_spec(arg, false)?;
+        let wg_id = out.wg_ids.first().map_or(-1, |&w| i64::from(w));
+        let edges = (!out.edge_rids.is_empty()).then(|| (
+            out.signal_names, out.signal_name_idxs, out.edge_rids,
+            out.tensors_per_edge, out.is_final_streaming_chunk, out.uuids,
+        ));
+        Ok((out.ready_rids, wg_id, out.spec_id, edges))
+    }
+
     /// Settle the streaming ingests a prep staged under `spec_id`.
     ///
     /// Every rid that will NOT run its speculative step -- all of them when
@@ -3035,6 +3094,133 @@ impl GraphRuntime {
         Ok(out)
     }
 
+    /// `complete_and_route_batch` then `send_outputs`, in one crossing and
+    /// with the GIL released throughout, for a step whose every output stays
+    /// on the device and whose client copy rides inline (a device-loopback
+    /// decode step). Exactly the two calls the worker would make, with the
+    /// arguments its device-loopback branch builds: no tensors, and the
+    /// inline values read here from the stop check's host rows rather than
+    /// handed over as a list.
+    ///
+    /// The inline column is ``inline_rows`` scalars of ``inline_dtype`` at
+    /// ``inline_ptr`` with ``inline_stride`` elements between rows, row i
+    /// belonging to ``row_rids[i]``. The caller keeps the tensor alive and
+    /// landed for the call (it has waited on the step's completion event).
+    ///
+    /// Returns ``status``:
+    ///   0 -- nothing done (a rid has no row, or an unsupported dtype): take
+    ///        the general path, exactly as ``_inline_emit_values`` falling
+    ///        back does;
+    ///   1 -- routed and sent; ``sent_rids`` are send_outputs' return;
+    ///   2 -- routed, but the send needs Python-side payloads (a frame
+    ///        carries ``per_request_info``, a tensor to register, new-token
+    ///        counts, local streaming, freed inputs): ``route`` holds the
+    ///        RouteOut and the caller finishes with ``send_outputs``.
+    #[pyo3(signature = (
+        partition, graph_walk, node_name, output_signals, rids,
+        inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
+        row_rids,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn route_and_send_inline(
+        &mut self,
+        py: Python<'_>,
+        partition: String,
+        graph_walk: String,
+        node_name: String,
+        output_signals: Vec<String>,
+        rids: Vec<u32>,
+        inline_signal: String,
+        inline_ptr: usize,
+        inline_rows: usize,
+        inline_stride: usize,
+        inline_dtype: &str,
+        row_rids: Vec<u32>,
+    ) -> PyResult<FusedRouteOut> {
+        let itemsize = match inline_dtype {
+            "int64" | "int32" => if inline_dtype == "int64" { 8 } else { 4 },
+            _ => return Ok(FusedRouteOut::default()),
+        };
+        if inline_ptr == 0 || row_rids.len() > inline_rows {
+            return Ok(FusedRouteOut::default());
+        }
+        let t_nogil = std::time::Instant::now();
+        let outcome = py.allow_threads(|| -> PyResult<FusedRouteOut> {
+            // The inline values in `rids` order: a slice when the rows are in
+            // the batch's order (the usual case), else looked up per rid.
+            let read = |row: usize| -> i64 {
+                // SAFETY: row < inline_rows, checked by the callers below;
+                // the caller holds the buffer for the duration of the call.
+                unsafe {
+                    let at = (inline_ptr as *const u8).add(row * inline_stride * itemsize);
+                    if itemsize == 8 {
+                        std::ptr::read_unaligned(at as *const i64)
+                    } else {
+                        i64::from(std::ptr::read_unaligned(at as *const i32))
+                    }
+                }
+            };
+            let n = rids.len();
+            let in_order = row_rids.len() >= n && row_rids[..n] == rids[..];
+            let values: Vec<i64> = if in_order {
+                (0..n).map(read).collect()
+            } else {
+                let row_of: FxHashMap<u32, usize> =
+                    row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+                let mut v = Vec::with_capacity(n);
+                for r in &rids {
+                    match row_of.get(r) {
+                        Some(&i) => v.push(read(i)),
+                        None => return Ok(FusedRouteOut::default()),
+                    }
+                }
+                v
+            };
+            let n_sig = output_signals.len();
+            let route = self.complete_and_route_batch(RouteArg {
+                partition,
+                graph_walk,
+                node_name,
+                output_signals,
+                rids,
+                tensors: Vec::new(),
+                num_tensors: vec![0; n * n_sig],
+                inline_signal: Some(inline_signal),
+                inline_values: values,
+                walks: None,
+                rid_walk_idx: None,
+            })?;
+            let completion_id = route.completion_id;
+            let needs_python = !route.register_uuids.is_empty()
+                || !route.new_token_output_idxs.is_empty()
+                || !route.local_streaming_signals.is_empty()
+                || !route.rids_needing_request_info.is_empty()
+                || !route.freed_input_uuids.is_empty();
+            if needs_python {
+                return Ok(FusedRouteOut {
+                    status: 2, completion_id, sent_rids: Vec::new(), nogil_ns: 0,
+                    route: Some(route),
+                });
+            }
+            // Nothing in the frames comes from Python: no rid carries
+            // per_request_info, so none completes a worker graph, and the
+            // count, consumption, profiling and publication payloads are all
+            // read only for those.
+            let (sent_rids, frames) = self.build_send_frames(
+                completion_id, vec![], vec![], vec![], vec![],
+                vec![], vec![], vec![], vec![], vec![], vec![],
+            )?;
+            self.dispatch_frames_nogil(frames)?;
+            Ok(FusedRouteOut {
+                status: 1, completion_id, sent_rids, nogil_ns: 0, route: None,
+            })
+        });
+        let nogil_ns = t_nogil.elapsed().as_nanos() as u64;
+        let mut outcome = outcome?;
+        outcome.nogil_ns = nogil_ns;
+        Ok(outcome)
+    }
+
     /// Stop loops, record the pending stops, notify peers, and return the rids
     /// whose loops were actually stopped.
     #[allow(clippy::type_complexity)]
@@ -3218,201 +3404,14 @@ impl GraphRuntime {
         // Encoding and bookkeeping run with the GIL held (tens of
         // microseconds); the frames go out through send_frames, which
         // releases the GIL only for a peer at its high-water mark.
-        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
         let t_body = std::time::Instant::now();
-        let out = (|| -> PyResult<Vec<u32>> {
-            let request_infos: Vec<(u32, Option<Vec<u8>>)> =
-                info_rids.into_iter().zip(request_infos).collect();
-            let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
-                .into_iter()
-                .zip(new_token_counts)
-                .map(|(r, m)| (r, m.into_iter().collect()))
-                .collect();
-            let stream_tokens_consumed: Vec<(u32, Vec<(String, i64)>)> = consumed_rids
-                .into_iter()
-                .zip(stream_tokens_consumed)
-                .map(|(r, m)| (r, m.into_iter().collect()))
-                .collect();
-            let profiling: Vec<(u32, Option<Vec<u8>>)> =
-                prof_rids.into_iter().zip(profiling).collect();
-            let spec_flags = self
-                .completions
-                .get(&completion_id)
-                .map(|c| c.speculative.clone())
-                .unwrap_or_default();
-            let mut plan = self.take_send_plan(completion_id)?;
-            let partition = plan.partition.clone();
-            let encoded: FxHashMap<u32, Option<Vec<u8>>> =
-                request_infos.into_iter().collect();
-            let profiling: FxHashMap<u32, Option<Vec<u8>>> =
-                profiling.into_iter().collect();
-            let consumed: FxHashMap<u32, Vec<(String, i64)>> =
-                stream_tokens_consumed.into_iter().collect();
-            let publications: FxHashMap<u32, Option<Vec<u8>>> =
-                publish_rids.into_iter().zip(publications).collect();
-            let mut sent_rids = Vec::new();
-            let nested = std::mem::take(&mut plan.nested);
-
-            // One frame per (request, worker): the plan is per edge, and a worker
-            // taking several of a request's signals should see one message.
-            //
-            // Indexed rather than scanned. A Vec probed with `find` is
-            // O(edges x groups) with a String compare per probe, and both grow
-            // with the batch; the Vec stays only to keep frame order stable.
-            let mut grouped: Vec<((u32, Sym), Vec<frames::OutEdge>)> = Vec::new();
-            let mut at: FxHashMap<(u32, Sym), usize> = FxHashMap::default();
-            // (rid, edge, worker, items): what each consumer will register, so
-            // counted from the descriptors that go out, not the refs.
-            let mut stream_items: Vec<(u32, String, Sym, i64)> = Vec::new();
-            {
-                // One acquisition for every descriptor lookup in the batch, not
-                // one per edge. Released before the sends -- holding it across
-                // zmq would park the GPU and plan threads on our I/O.
-                let bk = self.bookkeeping.lock().unwrap();
-                for w in plan.to_workers {
-                    let infos = Self::sliced_infos_locked(&bk, &w.tensors);
-                    if w.streaming && !infos.is_empty() {
-                        stream_items.push((
-                            w.rid, w.signal.clone(), w.worker, infos.len() as i64,
-                        ));
-                    }
-                    let key = (w.rid, w.worker);
-                    let edge = frames::OutEdge {
-                        name: w.signal, next_node: w.next_node,
-                        is_streaming: w.streaming, infos,
-                        shard_dim: w.shard_dim, total_fanin: w.total_fanin,
-                    };
-                    match at.get(&key) {
-                        Some(&i) => grouped[i].1.push(edge),
-                        None => {
-                            at.insert(key, grouped.len());
-                            grouped.push((key, vec![edge]));
-                        }
-                    }
-                }
-            }
-            for (rid, signal, worker, n) in stream_items {
-                let sig = self.interner.intern(&signal);
-                if let Some(info) = self.requests[rid as usize].as_mut() {
-                    info.pending.add_stream_items(sig, worker, n);
-                }
-            }
-            // Encoding is pure CPU, so it all happens under one more acquisition;
-            // the dispatches then run with nothing held.
-            let mut frames_out: Vec<(Sym, Vec<u8>)> = Vec::with_capacity(grouped.len());
-            {
-                let bk = self.bookkeeping.lock().unwrap();
-                for ((rid, worker), edges) in &grouped {
-                    let request_id = self.rids.name(*rid).ok_or_else(|| {
-                        PyValueError::new_err(format!("unknown rid handle {rid}"))
-                    })?;
-                    frames_out.push((
-                        *worker,
-                        frames::InputSignals {
-                            request_id,
-                            partition_name: &partition,
-                            edges,
-                            request_info_encoded: encoded
-                                .get(rid).and_then(|b| b.as_deref()),
-                        }
-                        .encode(bk.strings()),
-                    ));
-                }
-            }
-            for (worker, bytes) in frames_out {
-                frames.push((self.interner.name(worker).to_string(), bytes));
-            }
-
-            for (rid, signal, modality, refs) in plan.emit {
-                let request_id = self.rid_name(rid)?;
-                let sig = self.interner.intern(&signal);
-                let infos = self.sliced_infos(&refs);
-                let loop_indices = nested.get(&rid).cloned();
-                if let Some(info) = self.requests[rid as usize].as_mut() {
-                    info.pending.output_signals.push(sig);
-                }
-                let bytes = {
-                    let bk = self.bookkeeping.lock().unwrap();
-                    frames::ResultTensors {
-                        request_id: &request_id,
-                        modality: &modality,
-                        signal: &signal,
-                        infos,
-                        loop_indices,
-                    }
-                    .encode(&self.interner, bk.strings())
-                };
-                frames.push(("api_server".to_string(), bytes));
-            }
-
-            // Inline emits: one RESULT_TOKENS frame per (signal, modality)
-            // per step, with the same per-request bookkeeping as a tensor
-            // emit so the completion report counts the chunk. Usually one
-            // group.
-            if !plan.emit_inline.is_empty() {
-                let mut groups: Vec<((String, String), Vec<(u32, i64)>)> = Vec::new();
-                for (rid, signal, modality, value) in plan.emit_inline {
-                    let key = (signal, modality);
-                    match groups.iter_mut().find(|(k, _)| *k == key) {
-                        Some((_, items)) => items.push((rid, value)),
-                        None => groups.push((key, vec![(rid, value)])),
-                    }
-                }
-                for ((signal, modality), items) in groups {
-                    let sig = self.interner.intern(&signal);
-                    let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
-                    let mut values: Vec<i64> = Vec::with_capacity(items.len());
-                    let mut loop_indices = Vec::with_capacity(items.len());
-                    for (rid, value) in items {
-                        let request_id = self.rid_name(rid)?;
-                        let idx = nested.get(&rid).cloned();
-                        if let Some(info) = self.requests[rid as usize].as_mut() {
-                            info.pending.output_signals.push(sig);
-                        }
-                        request_ids.push(request_id);
-                        values.push(value);
-                        loop_indices.push(idx);
-                    }
-                    let bytes = frames::ResultTokens {
-                        request_ids: &request_ids,
-                        values: &values,
-                        loop_indices: &loop_indices,
-                        signal: &signal,
-                        modality: &modality,
-                    }
-                    .encode(&self.interner);
-                    frames.push(("api_server".to_string(), bytes));
-                }
-            }
-
-            for (rid, signal, uuids) in plan.persist {
-                let sig = self.interner.intern(&signal);
-                if let Some(info) = self.requests[rid as usize].as_mut() {
-                    info.pending.add_persist(sig, uuids);
-                }
-            }
-            let partition_sym = self.interner.intern(&partition);
-            for (rid, counts) in &new_token_counts {
-                if let Some(info) = self.requests[*rid as usize].as_mut() {
-                    info.pending.add_new_tokens(partition_sym, counts);
-                }
-            }
-
-            for (rid, wg_ids, is_first_tp_rank) in plan.completed {
-                let bytes = self.worker_graphs_done_frame(
-                    rid, &wg_ids, is_first_tp_rank, &partition,
-                    consumed.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]),
-                    publications.get(&rid).and_then(|b| b.as_deref()),
-                    profiling.get(&rid).and_then(|b| b.as_deref()),
-                    spec_flags.get(&rid).copied().unwrap_or(false),
-                )?;
-                frames.push(("conductor".to_string(), bytes));
-                sent_rids.push(rid);
-            }
-            Ok(sent_rids)
-        })();
+        let built = self.build_send_frames(
+            completion_id, info_rids, request_infos, ntc_rids, new_token_counts,
+            consumed_rids, stream_tokens_consumed, prof_rids, profiling,
+            publish_rids, publications,
+        );
         send_timing::record_body(t_body);
-        let out = out?;
+        let (out, frames) = built?;
         self.send_frames(py, frames)?;
         send_timing::record_total(t_call);
         Ok(out)
@@ -3701,6 +3700,240 @@ impl GraphRuntime {
             .unwrap_or(false))
     }
 }
+/// Python-free halves of the send path, so a caller that has released the
+/// GIL can run them.
+impl GraphRuntime {
+    /// `send_frames` for a caller that already released the GIL: the
+    /// same try-then-block order, all of it without Python.
+    pub(crate) fn dispatch_frames_nogil(
+        &self, frames: Vec<(String, Vec<u8>)>,
+    ) -> PyResult<()> {
+        let Some(comm) = &self.communicator else { return Ok(()) };
+        for (peer, bytes) in &frames {
+            let sent = comm
+                .try_send(peer, bytes)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            if !sent {
+                comm.send(peer, bytes)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `send_outputs` up to the dispatch: consumes the parked completion and
+    /// encodes its frames. Touches no Python object.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) fn build_send_frames(
+        &mut self,
+        completion_id: u64,
+        info_rids: Vec<u32>,
+        request_infos: Vec<Option<Vec<u8>>>,
+        ntc_rids: Vec<u32>,
+        new_token_counts: Vec<FxHashMap<String, i64>>,
+        consumed_rids: Vec<u32>,
+        stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
+        prof_rids: Vec<u32>,
+        profiling: Vec<Option<Vec<u8>>>,
+        publish_rids: Vec<u32>,
+        publications: Vec<Option<Vec<u8>>>,
+    ) -> PyResult<(Vec<u32>, Vec<(String, Vec<u8>)>)> {
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        let sent = (|| -> PyResult<Vec<u32>> {
+            let request_infos: Vec<(u32, Option<Vec<u8>>)> =
+                info_rids.into_iter().zip(request_infos).collect();
+            let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
+                .into_iter()
+                .zip(new_token_counts)
+                .map(|(r, m)| (r, m.into_iter().collect()))
+                .collect();
+            let stream_tokens_consumed: Vec<(u32, Vec<(String, i64)>)> = consumed_rids
+                .into_iter()
+                .zip(stream_tokens_consumed)
+                .map(|(r, m)| (r, m.into_iter().collect()))
+                .collect();
+            let profiling: Vec<(u32, Option<Vec<u8>>)> =
+                prof_rids.into_iter().zip(profiling).collect();
+            let spec_flags = self
+                .completions
+                .get(&completion_id)
+                .map(|c| c.speculative.clone())
+                .unwrap_or_default();
+            let mut plan = self.take_send_plan(completion_id)?;
+            let partition = plan.partition.clone();
+            let encoded: FxHashMap<u32, Option<Vec<u8>>> =
+                request_infos.into_iter().collect();
+            let profiling: FxHashMap<u32, Option<Vec<u8>>> =
+                profiling.into_iter().collect();
+            let consumed: FxHashMap<u32, Vec<(String, i64)>> =
+                stream_tokens_consumed.into_iter().collect();
+            let publications: FxHashMap<u32, Option<Vec<u8>>> =
+                publish_rids.into_iter().zip(publications).collect();
+            let mut sent_rids = Vec::new();
+            let nested = std::mem::take(&mut plan.nested);
+
+            // One frame per (request, worker): the plan is per edge, and a worker
+            // taking several of a request's signals should see one message.
+            //
+            // Indexed rather than scanned. A Vec probed with `find` is
+            // O(edges x groups) with a String compare per probe, and both grow
+            // with the batch; the Vec stays only to keep frame order stable.
+            let mut grouped: Vec<((u32, Sym), Vec<frames::OutEdge>)> = Vec::new();
+            let mut at: FxHashMap<(u32, Sym), usize> = FxHashMap::default();
+            // (rid, edge, worker, items): what each consumer will register, so
+            // counted from the descriptors that go out, not the refs.
+            let mut stream_items: Vec<(u32, String, Sym, i64)> = Vec::new();
+            {
+                // One acquisition for every descriptor lookup in the batch, not
+                // one per edge. Released before the sends -- holding it across
+                // zmq would park the GPU and plan threads on our I/O.
+                let bk = self.bookkeeping.lock().unwrap();
+                for w in plan.to_workers {
+                    let infos = Self::sliced_infos_locked(&bk, &w.tensors);
+                    if w.streaming && !infos.is_empty() {
+                        stream_items.push((
+                            w.rid, w.signal.clone(), w.worker, infos.len() as i64,
+                        ));
+                    }
+                    let key = (w.rid, w.worker);
+                    let edge = frames::OutEdge {
+                        name: w.signal, next_node: w.next_node,
+                        is_streaming: w.streaming, infos,
+                        shard_dim: w.shard_dim, total_fanin: w.total_fanin,
+                    };
+                    match at.get(&key) {
+                        Some(&i) => grouped[i].1.push(edge),
+                        None => {
+                            at.insert(key, grouped.len());
+                            grouped.push((key, vec![edge]));
+                        }
+                    }
+                }
+            }
+            for (rid, signal, worker, n) in stream_items {
+                let sig = self.interner.intern(&signal);
+                if let Some(info) = self.requests[rid as usize].as_mut() {
+                    info.pending.add_stream_items(sig, worker, n);
+                }
+            }
+            // Encoding is pure CPU, so it all happens under one more acquisition;
+            // the dispatches then run with nothing held.
+            let mut frames_out: Vec<(Sym, Vec<u8>)> = Vec::with_capacity(grouped.len());
+            {
+                let bk = self.bookkeeping.lock().unwrap();
+                for ((rid, worker), edges) in &grouped {
+                    let request_id = self.rids.name(*rid).ok_or_else(|| {
+                        PyValueError::new_err(format!("unknown rid handle {rid}"))
+                    })?;
+                    frames_out.push((
+                        *worker,
+                        frames::InputSignals {
+                            request_id,
+                            partition_name: &partition,
+                            edges,
+                            request_info_encoded: encoded
+                                .get(rid).and_then(|b| b.as_deref()),
+                        }
+                        .encode(bk.strings()),
+                    ));
+                }
+            }
+            for (worker, bytes) in frames_out {
+                frames.push((self.interner.name(worker).to_string(), bytes));
+            }
+
+            for (rid, signal, modality, refs) in plan.emit {
+                let request_id = self.rid_name(rid)?;
+                let sig = self.interner.intern(&signal);
+                let infos = self.sliced_infos(&refs);
+                let loop_indices = nested.get(&rid).cloned();
+                if let Some(info) = self.requests[rid as usize].as_mut() {
+                    info.pending.output_signals.push(sig);
+                }
+                let bytes = {
+                    let bk = self.bookkeeping.lock().unwrap();
+                    frames::ResultTensors {
+                        request_id: &request_id,
+                        modality: &modality,
+                        signal: &signal,
+                        infos,
+                        loop_indices,
+                    }
+                    .encode(&self.interner, bk.strings())
+                };
+                frames.push(("api_server".to_string(), bytes));
+            }
+
+            // Inline emits: one RESULT_TOKENS frame per (signal, modality)
+            // per step, with the same per-request bookkeeping as a tensor
+            // emit so the completion report counts the chunk. Usually one
+            // group.
+            if !plan.emit_inline.is_empty() {
+                let mut groups: Vec<((String, String), Vec<(u32, i64)>)> = Vec::new();
+                for (rid, signal, modality, value) in plan.emit_inline {
+                    let key = (signal, modality);
+                    match groups.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, items)) => items.push((rid, value)),
+                        None => groups.push((key, vec![(rid, value)])),
+                    }
+                }
+                for ((signal, modality), items) in groups {
+                    let sig = self.interner.intern(&signal);
+                    let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
+                    let mut values: Vec<i64> = Vec::with_capacity(items.len());
+                    let mut loop_indices = Vec::with_capacity(items.len());
+                    for (rid, value) in items {
+                        let request_id = self.rid_name(rid)?;
+                        let idx = nested.get(&rid).cloned();
+                        if let Some(info) = self.requests[rid as usize].as_mut() {
+                            info.pending.output_signals.push(sig);
+                        }
+                        request_ids.push(request_id);
+                        values.push(value);
+                        loop_indices.push(idx);
+                    }
+                    let bytes = frames::ResultTokens {
+                        request_ids: &request_ids,
+                        values: &values,
+                        loop_indices: &loop_indices,
+                        signal: &signal,
+                        modality: &modality,
+                    }
+                    .encode(&self.interner);
+                    frames.push(("api_server".to_string(), bytes));
+                }
+            }
+
+            for (rid, signal, uuids) in plan.persist {
+                let sig = self.interner.intern(&signal);
+                if let Some(info) = self.requests[rid as usize].as_mut() {
+                    info.pending.add_persist(sig, uuids);
+                }
+            }
+            let partition_sym = self.interner.intern(&partition);
+            for (rid, counts) in &new_token_counts {
+                if let Some(info) = self.requests[*rid as usize].as_mut() {
+                    info.pending.add_new_tokens(partition_sym, counts);
+                }
+            }
+
+            for (rid, wg_ids, is_first_tp_rank) in plan.completed {
+                let bytes = self.worker_graphs_done_frame(
+                    rid, &wg_ids, is_first_tp_rank, &partition,
+                    consumed.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]),
+                    publications.get(&rid).and_then(|b| b.as_deref()),
+                    profiling.get(&rid).and_then(|b| b.as_deref()),
+                    spec_flags.get(&rid).copied().unwrap_or(false),
+                )?;
+                frames.push(("conductor".to_string(), bytes));
+                sent_rids.push(rid);
+            }
+            Ok(sent_rids)
+        })()?;
+        Ok((sent, frames))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

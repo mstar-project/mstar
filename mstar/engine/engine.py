@@ -6,6 +6,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from itertools import repeat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
@@ -359,15 +360,14 @@ class ExecutingBatch:
     exec_timings: ExecTimings = field(default_factory=ExecTimings)
 
     def __post_init__(self):
-        self.per_request_info_wrapped = {
-            rid: ForwardPassInfoWrapper(
-                # Sparse: only rids with stream chunks or loop counters get an
-                # entry, so default like the .get() at prepare_inputs does.
-                info=info, metadata=self.per_request_input_metadata.get(
-                    rid, EMPTY_INPUT_METADATA,
-                ),
-            ) for rid, info in self.per_request_info.items()
-        }
+        # Sparse metadata: only rids with stream chunks or loop counters get
+        # an entry, so default like the .get() at prepare_inputs does. Built
+        # with C-level maps: this runs for every step, on every row.
+        rids = self.per_request_info.keys()
+        self.per_request_info_wrapped = dict(zip(rids, map(
+            ForwardPassInfoWrapper, self.per_request_info.values(),
+            map(self.per_request_input_metadata.get, rids, repeat(EMPTY_INPUT_METADATA)),
+        ), strict=True))
 
     @property
     def request_ids(self):
@@ -2654,6 +2654,15 @@ class Engine:
         overrides: Mapping[str, ResourceReqConfig] | None = None,
     ) -> None:
         self._runner.ingest_request(request_id, overrides)
+
+    @property
+    def publisher_nodes(self) -> Mapping[str, frozenset[str]]:
+        """Each publishing resource's declaring nodes."""
+        return self._runner.publisher_nodes
+
+    def skip_publish(self, request_id, keys) -> None:
+        """Never publish ``keys`` for this request (see ``StepRunner.skip_publish``)."""
+        self._runner.skip_publish(request_id, keys)
 
     def remove_request(self, request_id: str) -> None:
         self._loopback_steps.pop(request_id, None)
