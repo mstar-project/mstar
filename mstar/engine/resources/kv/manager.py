@@ -714,7 +714,10 @@ class KVManager(AttentionResource):
             return False
         self._prefix_root = root
         self._index = PrefixIndex(self._arena)
-        self._arena.index = self._index
+        if self._world_size == 1:
+            # The evictable set is counted only at one rank. When the arena reports to the index, `insert`
+            # reads owner counts to decide a page's parent, and those counts can differ between ranks.
+            self._arena.index = self._index
         return True
 
     def page_counts(self) -> KVPageCounts:
