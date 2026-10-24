@@ -16,23 +16,7 @@ from mstar.model.components.distributed.attention import ParallelAttention
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
 from mstar.model.components.moe import ParallelSparseMoeBlock
-
-
-class CommandAPlusLayerNorm(nn.Module):
-    """Bias-free LayerNorm with FP32 statistics and learned scaling."""
-
-    def __init__(self, hidden_size: int, eps: float) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        centered = x - x.mean(dim=-1, keepdim=True)
-        variance = centered.square().mean(dim=-1, keepdim=True)
-        normalized = centered * torch.rsqrt(variance + self.eps)
-        return (self.weight.float() * normalized).to(input_dtype)
+from mstar.model.components.norm import BiasFreeLayerNorm
 
 
 class CommandAPlusRouter(nn.Module):
@@ -170,7 +154,7 @@ class CommandAPlusDecoderLayer(nn.Module):
         comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__()
-        self.input_layernorm = CommandAPlusLayerNorm(
+        self.input_layernorm = BiasFreeLayerNorm(
             config.hidden_size, eps=config.layer_norm_eps,
         )
         self.self_attn = CommandAPlusAttention(config, layer_idx, comm_group)
@@ -205,6 +189,9 @@ class CommandAPlusDecoderLayer(nn.Module):
             w.data = self.output_weight[:, start:start + w.shape[1]]
             start += w.shape[1]
         self._attn_width = rows[0].shape[1]
+        # router_topk adds a per-expert bias before the top-k; this router has none.
+        self._router_bias = torch.zeros(moe.gate.weight.shape[0], dtype=torch.float32,
+                                        device=moe.gate.weight.device)
 
     def fused_branches(self, normalized: torch.Tensor) -> torch.Tensor:
         """This rank's unreduced ``attn + (routed + shared) / 2``, five GEMMs in two.
@@ -217,12 +204,12 @@ class CommandAPlusDecoderLayer(nn.Module):
             ROUTE_ALIGN_MAX_SLOTS,
             moe_combine,
             route_align,
-            sigmoid_topk,
             silu_mul_into,
             splitk_linear,
             splitk_supported,
         )
         from mstar.utils.fused_moe import fused_experts, moe_block_m
+        from mstar.utils.fused_moe.decode import router_topk
 
         attn, moe = self.self_attn, self.mlp
         tokens = normalized.shape[0]
@@ -252,7 +239,7 @@ class CommandAPlusDecoderLayer(nn.Module):
                 router_logits, top_k, moe_block_m(tokens, w1, top_k), normalized.dtype,
             )
         else:
-            weights, ids = sigmoid_topk(router_logits, top_k, normalized.dtype)
+            weights, ids = router_topk(router_logits.float(), self._router_bias, top_k, 1.0, True)
         routed = fused_experts(
             normalized, w1, moe.experts.down_proj, weights, ids,
             reduce_results=False, alignment=alignment,
@@ -297,7 +284,7 @@ class CommandAPlusLanguageModel(nn.Module):
             CommandAPlusDecoderLayer(config, layer_idx, self.comm_group)
             for layer_idx in range(config.num_hidden_layers)
         ])
-        self.norm = CommandAPlusLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm = BiasFreeLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.fused = False
         self._replicated_embedding: torch.Tensor | None = None
 
@@ -344,16 +331,13 @@ class CommandAPlusLanguageModel(nn.Module):
         """Same math as ``forward``, with one all-reduce per layer (attention and
         MoE partials summed on-rank first) and each layer's residual add fused
         into the next layer's LayerNorm."""
-        from mstar.model.command_a_plus.kernels import add_layernorm
-
         norms = [layer.input_layernorm for layer in self.layers] + [self.norm]
-        residual, normalized = add_layernorm(query_sequence, None, norms[0].weight, norms[0].eps)
+        residual, normalized = norms[0].add_forward(query_sequence, None)
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.bind_step(label)
             layer.self_attn.attend.set_layer_idx(layer_idx)
             delta = self.comm_group.all_reduce(layer.fused_branches(normalized))
-            norm = norms[layer_idx + 1]
-            residual, normalized = add_layernorm(residual, delta, norm.weight, norm.eps)
+            residual, normalized = norms[layer_idx + 1].add_forward(residual, delta)
         return normalized
 
 

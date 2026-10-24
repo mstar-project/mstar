@@ -8,18 +8,18 @@ import torch
 import torch.nn.functional as F
 
 from mstar.model.command_a_plus.components.language_model import (
-    CommandAPlusLayerNorm,
     CommandAPlusMoeBlock,
     CommandAPlusRouter,
 )
 from mstar.model.command_a_plus.config import CommandAPlusConfig
+from mstar.model.components.norm import BiasFreeLayerNorm
 
 
 class LayerNormTests(unittest.TestCase):
     def test_matches_pytorch_reference_and_preserves_dtype(self):
         for dtype in (torch.float32, torch.bfloat16):
             with self.subTest(dtype=dtype):
-                layer = CommandAPlusLayerNorm(4, eps=1e-5).to(dtype=dtype)
+                layer = BiasFreeLayerNorm(4, eps=1e-5).to(dtype=dtype)
                 with torch.no_grad():
                     layer.weight.copy_(torch.tensor([0.5, 2.0, -1.0, 1.5]))
                 x = torch.tensor(
