@@ -307,10 +307,12 @@ class T3Model(nn.Module):
             emb = emb + self.text_pos_emb(text_positions)
         return emb
 
-    def embed_speech(self, ids: torch.Tensor, speech_positions: torch.Tensor) -> torch.Tensor:
+    def embed_speech(self, ids: torch.Tensor, speech_position: int) -> torch.Tensor:
+        """Speech tokens that all sit at one speech position. The position row
+        is a view of the table, so no position index is staged on the device."""
         emb = self.speech_emb(ids)
         if self.speech_pos_emb is not None:
-            emb = emb + self.speech_pos_emb(speech_positions)
+            emb = emb + self.speech_pos_emb.weight[speech_position]
         return emb
 
     def build_prefill_embeds(
@@ -331,7 +333,7 @@ class T3Model(nn.Module):
         if self.text_pos_emb is not None:
             text = text + self.text_pos_emb(torch.arange(text_ids.shape[0], device=device))
         bos = torch.full((1,), self.config.start_speech_token, dtype=torch.long, device=device)
-        speech = self.embed_speech(bos, torch.zeros(1, dtype=torch.long, device=device))
+        speech = self.embed_speech(bos, 0)
         parts = [cond_emb.to(text.dtype), text, speech]
         if self.config.duplicate_bos_in_prefill:
             parts.append(speech)

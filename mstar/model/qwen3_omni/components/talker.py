@@ -23,8 +23,8 @@ from mstar.distributed.communication import CommGroup
 from mstar.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
+from mstar.model.qwen3_omni.components.cp_kernels import cp_attention, cp_qk_norm_rope_kv_write
 from mstar.model.qwen3_omni.config import TALKER_ATTN, TALKER_KV, TALKER_POS, Qwen3OmniModelConfig, TalkerTextConfig
-from mstar.utils.attention import decode_attn_nhd, fused_qk_norm_rope
 
 # ---------------------------------------------------------------------------
 # Projection MLP (Thinker -> Talker)
@@ -98,6 +98,7 @@ class Qwen3OmniTalkerLayer(nn.Module):
                 comm_group=comm_group,
             ),
             comm_group=comm_group,
+            fused_softmax_topk=True,
         )
 
     def forward(
@@ -492,59 +493,40 @@ class Qwen3OmniCodePredictor(nn.Module):
         # the KVCacheEngine.has_autocast=False invariant).
         flat_pos = position_ids.reshape(-1)
 
+        # Each residual add rides in the next RMSNorm (FlashInfer's fused
+        # add + norm, in place on the stream's own tensors), so the input
+        # embeddings, which the caller owns, are added out of place first.
+        residual = None
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
-            residual = hidden_states
+            if residual is None:
+                residual = hidden_states
+                hidden_states = layer.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
 
-            hidden_states = layer.input_layernorm(hidden_states)
-
-            total_tokens = bs * seq_len
             qkv = F.linear(hidden_states, layer.self_attn.qkv_proj.weight)
             q_size = n_q_heads * head_dim
-            kv_size = n_kv_heads * head_dim
-            q, k, v = qkv.split((q_size, kv_size, kv_size), dim=-1)
-            q = q.view(total_tokens, n_q_heads, head_dim)
-            k = k.view(total_tokens, n_kv_heads, head_dim)
-
-            rope_theta = float(attn.rope_theta)
-            q = fused_qk_norm_rope(
-                q, attn.q_norm.weight,
-                pos=flat_pos,
-                eps=attn.q_norm.variance_epsilon,
-                rope_theta=rope_theta
+            # q normed and roped in place; k (normed, roped) and v into the cache
+            # at cache_pos .. cache_pos + seq_len.
+            cp_qk_norm_rope_kv_write(
+                qkv.view(bs * seq_len, -1), attn.q_norm.weight, attn.k_norm.weight,
+                flat_pos, kv_cache[layer_idx], cache_pos, seq_len,
+                attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon,
+                float(attn.rope_theta), n_q_heads, n_kv_heads, head_dim,
             )
-            k = fused_qk_norm_rope(
-                k, attn.k_norm.weight,
-                pos=flat_pos,
-                eps=attn.k_norm.variance_epsilon,
-                rope_theta=rope_theta
-            )
+            q = qkv[..., :q_size].view(bs, seq_len, n_q_heads, head_dim)
 
-            q = q.view(bs, seq_len, n_q_heads, head_dim)
-            k = k.view(bs, seq_len, n_kv_heads, head_dim)
-            v = v.view(bs, seq_len, n_kv_heads, head_dim)
-
-            # Append K, V into dense cache at cache_pos .. cache_pos+seq_len.
-            kv_cache[layer_idx, :, 0, cache_pos:cache_pos + seq_len] = k
-            kv_cache[layer_idx, :, 1, cache_pos:cache_pos + seq_len] = v
-
-            # Read K, V for all positions up to and including the new tokens.
-            valid_len = cache_pos + seq_len
-            k_full = kv_cache[layer_idx, :, 0]
-            v_full = kv_cache[layer_idx, :, 1]
-
-            attn_out = decode_attn_nhd(
-                q, k_full, v_full, valid_len
-            )
-            attn_out = attn_out.reshape(bs, seq_len, -1)
-            hidden_states = residual + attn.o_proj(attn_out)
-
-            # Post-attention RMSNorm + dense MLP.
-            residual = hidden_states
-            hidden_states = layer.post_attention_layernorm(hidden_states)
+            # Each new token attends causally over the depth positions so far.
+            attn_out = cp_attention(q, kv_cache[layer_idx, :, 0], kv_cache[layer_idx, :, 1], cache_pos)
+            attn_out = attn.o_proj(attn_out.reshape(bs, seq_len, -1))
+            if layer_idx == 0:
+                residual = residual + attn_out
+                hidden_states = layer.post_attention_layernorm(residual)
+            else:
+                hidden_states, residual = layer.post_attention_layernorm.forward_residual(attn_out, residual)
             hidden_states = layer.mlp(hidden_states)
-            hidden_states = residual + hidden_states
 
         # Final norm.
-        hidden_states = self.model.norm(hidden_states)
+        hidden_states, _ = self.model.norm.forward_residual(hidden_states, residual)
         return hidden_states

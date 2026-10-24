@@ -14,10 +14,10 @@ Architecture (2 nodes, single partition):
     audio_encoder  (enc_dec) — audio_tower + projector (checkpoint code)
     LLM            (ar)      — dense Qwen3, paged KV cache
 
-Graph walks (sequential prefill schedule, qwen3_omni-style):
-    prefill_text  — text span -> LLM KV cache (the second/post-audio
-                    span is the last prefill: samples the first token)
-    prefill_audio — audio_encoder -> LLM KV cache
+Graph walks:
+    prefill_audio — audio_encoder -> LLM: the ChatML text around the audio
+                    and the audio embeddings, prefilled as one span that
+                    samples the first token
     decode        — LLM loop
 
 Not implemented from the reference pipeline: silero-VAD chunk
@@ -86,6 +86,8 @@ class HiggsAudioModel(Model):
     ):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
+        # ``model_kwargs: {encoder_graphs: false}`` runs the audio tower eagerly
+        self.encoder_graphs = bool(kwargs.get("encoder_graphs", True))
 
         self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = HiggsAudioModelConfig.from_pretrained(self.local_dir)
@@ -189,12 +191,6 @@ class HiggsAudioModel(Model):
             ),
         ]
 
-        prefill_text = GraphNode(
-            name="LLM",
-            input_names=["text_inputs"],
-            outputs=llm_prefill_outputs,
-        )
-
         prefill_audio = Sequential([
             GraphNode(
                 name="audio_encoder",
@@ -203,7 +199,7 @@ class HiggsAudioModel(Model):
             ),
             GraphNode(
                 name="LLM",
-                input_names=["audio_embeds"],
+                input_names=["text_pre", "audio_embeds", "text_post"],
                 outputs=[edge.clone() for edge in llm_prefill_outputs],
             ),
         ])
@@ -213,15 +209,17 @@ class HiggsAudioModel(Model):
             section=GraphNode(
                 name="LLM",
                 input_names=["text_inputs"],
+                # one signal to the client and back into the loop, so a step
+                # can keep it on the device and send the client's copy inline
                 outputs=[
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="new_token",
-                        output_modality="text",
-                    ),
                     GraphEdge(
                         next_node="LLM",
                         name="text_inputs",
+                    ),
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="text_inputs",
+                        output_modality="text",
                     ),
                 ],
             ),
@@ -230,7 +228,6 @@ class HiggsAudioModel(Model):
         )
 
         return dict(
-            prefill_text=prefill_text,
             prefill_audio=prefill_audio,
             decode=decode,
         )
@@ -243,7 +240,8 @@ class HiggsAudioModel(Model):
         self,
         input_signals: dict[str, list[TensorPointerInfo]],
     ) -> list[tuple[str, dict[str, TensorPointerInfo]]]:
-        """[text-before-audio] + [audio] + [text-after-audio].
+        """One ``prefill_audio`` step: the ChatML text before the audio, the
+        audio embeddings and the text after it, prefilled as one span.
 
         ``process_prompt`` emits two ``text_inputs`` tensors (the ChatML
         prompt split at the audio splice point) plus the per-chunk mel
@@ -252,29 +250,28 @@ class HiggsAudioModel(Model):
         texts = input_signals.get("text_inputs", [])
         audio_features = input_signals.get("audio_features", [])
         audio_feature_lens = input_signals.get("audio_feature_lens", [])
-
-        schedule: list[tuple[str, dict[str, TensorPointerInfo]]] = []
-        if texts:
-            schedule.append(("prefill_text", {"text_inputs": texts[0]}))
-        if audio_features:
-            entry = {"audio_features": audio_features[0]}
-            if audio_feature_lens:
-                entry["audio_feature_lens"] = audio_feature_lens[0]
-            schedule.append(("prefill_audio", entry))
-        for text in texts[1:]:
-            schedule.append(("prefill_text", {"text_inputs": text}))
-        return schedule
+        if len(texts) != 2 or not audio_features or not audio_feature_lens:
+            raise ValueError(
+                "Higgs-Audio expects the prompt split around one audio input; got "
+                f"{len(texts)} text spans and {len(audio_features)} audio inputs."
+            )
+        return [("prefill_audio", {
+            "text_pre": texts[0],
+            "audio_features": audio_features[0],
+            "audio_feature_lens": audio_feature_lens[0],
+            "text_post": texts[1],
+        })]
 
     def _prefill_inputs(
         self, metadata: CurrentForwardConductorMetadata,
     ) -> list[GraphEdge]:
         schedule = metadata.kwargs["prefill_schedule"]
         step = metadata.kwargs["prefill_step"]
-        walk_name, tensor_dict = schedule[step]
-        target_node = "audio_encoder" if walk_name == "prefill_audio" else "LLM"
+        _, tensor_dict = schedule[step]
 
         edges: list[GraphEdge] = []
         for input_name, tensor_info in tensor_dict.items():
+            target_node = "audio_encoder" if input_name.startswith("audio_") else "LLM"
             edge = GraphEdge(next_node=target_node, name=input_name)
             edge.tensor_info = [tensor_info]
             edges.append(edge)
@@ -434,12 +431,11 @@ class HiggsAudioModel(Model):
             post_ids += enc("<think>\n\n</think>\n\n")
 
         audio = sum(self.config.encoder_output_length(int(n)) for n in audio_feature_lens.tolist())
+        # One step writes the text around the audio and the audio together, so
+        # one span; it mixes text and audio, so nothing keys it.
+        prompt = len(pre_ids) + audio + len(post_ids)
         layout = LabelLayout(
-            spans=(
-                Span("ids", "prefill_text", len(pre_ids), len(pre_ids), "text_inputs"),
-                Span("digest", "prefill_audio", audio, audio, ("audio", 0)),
-                Span("ids", "prefill_text", len(post_ids), len(post_ids), "text_inputs"),
-            ),
+            spans=(Span("rows", "prefill_audio", prompt, prompt, "audio_features"),),
             growth=(("decode_loop", 1),),
         )
         return ProcessPromptOutput({
@@ -518,6 +514,7 @@ class HiggsAudioModel(Model):
         from mstar.model.higgs_audio.submodules import HiggsAudioEncoderSubmodule
         return HiggsAudioEncoderSubmodule(
             audio_tower=audio_tower, projector=projector, config=self.config,
+            graphs=self.encoder_graphs,
         )
 
     @staticmethod

@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
@@ -26,6 +27,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
 )
 from mstar.streaming.stream_buffer import StreamChunkInfo
 
@@ -51,6 +53,21 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.embed_tokens = language_model.model.embed_tokens
         self.lm_head = language_model.lm_head
         self.config = config
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token",
+            stop_ids=frozenset({config.stop_token_id}), sampler=SAMPLER,
+        )
+        # Orpheus only ever emits ``<custom_token_*>`` ids (SNAC codes and the
+        # speech/turn markers): the LM head computes the logits of rows
+        # ``[custom_token_base_id, vocab)`` alone, about 18% of the head, and
+        # pads the Llama text rows with -inf, so the sampler sees full-width
+        # logits and every token id stays in full-vocab space. Not under TP:
+        # the vocab-sharded head puts the custom rows on the last rank.
+        self._audio_vocab_start: int | None = None
+        if self.lm_head.tp_size == 1:
+            if config.stop_token_id < config.custom_token_base_id:
+                raise ValueError("Orpheus's stop token must be a custom token")
+            self._audio_vocab_start = config.custom_token_base_id
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
@@ -147,7 +164,11 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         if graph_walk != "decode":
             hidden = attn.select_last_hidden(hidden)
 
-        logits = self.lm_head(hidden)
+        if self._audio_vocab_start is not None:
+            start = self._audio_vocab_start
+            logits = F.pad(F.linear(hidden, self.lm_head.weight[start:]), (start, 0), value=float("-inf"))
+        else:
+            logits = self.lm_head(hidden)
         return sampler.sample(
             engine_inputs.request_ids,
             logits=logits
@@ -188,7 +209,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             text_inputs=text_inputs
         )
         # row i is request i; a per-rid dict here would guard the compiled frame on the ids
-        return BatchedModelOutput(row_outputs={"new_token": new_tokens})
+        return BatchedModelOutput(
+            row_outputs={"new_token": new_tokens},
+            check_stop_buffers={"new_token": new_tokens},
+        )
 
     def postprocess(
         self, request_id: str,
@@ -201,21 +225,6 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
-
-    def check_stop(
-        self, request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        eos_token_id = self.config.stop_token_id
-        ignore_eos= request_info.resource_configs[SAMPLER].ignore_eos
-        if (not ignore_eos and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
-            return {"decode_loop"}
-        return set()
 
 
 class SNACDecoderSubmodule(NodeSubmodule):

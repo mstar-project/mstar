@@ -56,7 +56,7 @@ METADATA_PATTERNS = ["config.json", "voices/*.pt"]
 SERVING_OVERRIDES = {
     "default_voice", "default_speed", "first_chunk_target_phonemes", "chunk_target_phonemes", "max_chunks",
     "text_buckets", "frame_buckets", "capture_batch_sizes", "max_batch_frames", "frame_grouping", "decoder_dtype",
-    "compile_decoder",
+    "compile_decoder", "fuse_lstm_directions", "decoder_cudnn_benchmark",
 }
 
 
@@ -284,5 +284,7 @@ class KokoroModel(Model):
         model = KokoroTTS(self.config)
         load_kokoro_weights(model, Path(local_dir) / self.config.weights_file)
         model = model.to(device).eval()
+        if self.config.fuse_lstm_directions:
+            model.fuse_lstm_directions()
         logger.info("Loaded Kokoro (%d voices) on %s", len(self.voices.names), device)
         return KokoroSynthSubmodule(model, self.config)

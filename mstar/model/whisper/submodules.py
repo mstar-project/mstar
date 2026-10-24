@@ -30,6 +30,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
 )
 from mstar.model.whisper.components.decoder import WhisperDecoderModel
 from mstar.model.whisper.config import (
@@ -124,6 +125,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         super().__init__()
         self.decoder = decoder
         self.config = config
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token", stop_ids=frozenset({config.eos_token_id}), sampler=SAMPLER,
+        )
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
 
@@ -339,19 +343,3 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        decoded_tokens = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-        if (not ignore_eos and token == self.config.eos_token_id) or \
-                decoded_tokens >= request_info.max_tokens:
-            return {"decode_loop"}
-        return set()

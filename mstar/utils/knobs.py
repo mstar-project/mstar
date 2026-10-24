@@ -28,14 +28,6 @@ def sampler_slots() -> int:
     return int(os.environ.get("MSTAR_SAMPLER_SLOTS", "4096"))
 
 
-
-def ingraph_decode_rope() -> bool:
-    """``MSTAR_INGRAPH_DECODE_ROPE`` (default 0): a captured decode step
-    builds its rotary tables inside the graph from the position resource's
-    planned positions instead of staging them before the replay."""
-    return os.environ.get("MSTAR_INGRAPH_DECODE_ROPE", "0") == "1"
-
-
 def kv_chain_lazy_steps() -> int:
     """``MSTAR_KV_CHAIN_LAZY_STEPS`` (default 16): how many decode steps of
     sampled tokens the KV manager batches before extending the requests'

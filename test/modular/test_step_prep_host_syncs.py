@@ -1,4 +1,5 @@
-"""Denoise step prep reads no tensor on the host (Cosmos3, Wan 2.2, OmniVoice).
+"""Denoise step prep reads no tensor on the host (Cosmos3, Wan 2.2, OmniVoice),
+and AR decode prep copies no pageable host data to the device (Higgs Audio).
 
 The loop-carried step counter (``time_index`` / ``step_index``) is the
 previous step's device output, so an ``.item()`` on it in ``prepare_inputs``
@@ -134,9 +135,9 @@ def _omnivoice():
     return sub, cfg
 
 
-def _omnivoice_meta(steps):
+def _omnivoice_meta(steps, target_len=6):
     return {
-        "num_step": steps, "t_shift": 0.1, "guidance_scale": 2.0, "class_temperature": 0.0,
+        "target_len": target_len, "num_step": steps, "t_shift": 0.1, "guidance_scale": 2.0, "class_temperature": 0.0,
         "layer_penalty_factor": 5.0, "position_temperature": 5.0,
     }
 
@@ -148,7 +149,6 @@ def _omnivoice_inputs(cfg, k, target_len=6, clone=False):
     inputs = {
         "prefix_ids": [torch.arange(c * 5).view(c, 5)],
         "prefix_audio_mask": [torch.zeros(5, dtype=torch.bool)],
-        "target_len": [torch.tensor([target_len])],
         "audio_tokens": [tokens],
         "step_index": [torch.tensor([k], dtype=torch.int64)],
     }
@@ -172,20 +172,32 @@ def test_omnivoice_step_prep_reads_no_tensor(clone):
     assert prepare(fwd(UNMASK_LOOP_NAME, steps), _omnivoice_inputs(cfg, steps)) is None
 
 
-def test_omnivoice_first_step_prep_unchanged():
-    # iteration 0 still reads target_len once to size the canvas
+def test_omnivoice_first_step_prep_reads_no_tensor():
+    # iteration 0 builds the all-MASK canvas on the device from the target
+    # length process_prompt settled, carried as step metadata, so nothing is
+    # read on the host
+    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
+
     sub, cfg = _omnivoice()
+    model = OmniVoiceModel.__new__(OmniVoiceModel)
+    model.config = cfg
+    first = model.get_initial_forward_pass_args(
+        "default", ["text"], ["audio"], {"prefix_ids": [None]}, model_kwargs={"target_len": 6},
+    )
+    assert {edge.name for edge in first.inputs} == {"prefix_ids", "prefix_audio_mask", "audio_tokens", "step_index"}
     inputs = _omnivoice_inputs(cfg, 0)
     del inputs["audio_tokens"], inputs["step_index"]
-    ni = sub.prepare_inputs("speech_gen", _fwd("r", "speech_gen", _omnivoice_meta(4)), inputs)
+    with _HostReads() as reads:
+        ni = sub.prepare_inputs("speech_gen", _fwd("r", "speech_gen", first.step_metadata), inputs)
+    assert reads.reads == [], reads.reads
     assert ni.tensor_inputs["audio_tokens"].shape == (cfg.num_audio_codebook, 6)
     assert (ni.tensor_inputs["audio_tokens"] == cfg.audio_mask_id).all()
     assert ni.input_seq_len == 5 + 2 * 6
 
 
 def test_omnivoice_postprocess_reads_no_tensor():
-    """The unmask step's postprocess takes the iteration from the loop counter:
-    same canvas as reading the step edge, and no host read."""
+    """The unmask step's postprocess takes the iteration prepare_inputs read off
+    the loop counter: same canvas as reading the step edge, and no host read."""
     from mstar.model.omnivoice.components.unmask import build_reveal_schedule
 
     sub, cfg = _omnivoice()
@@ -199,19 +211,18 @@ def test_omnivoice_postprocess_reads_no_tensor():
     for k in range(steps):
         inputs = _omnivoice_inputs(cfg, k, target_len)
         inputs["audio_tokens"] = [torch.full((cfg.num_audio_codebook, target_len), cfg.audio_mask_id)]
-        node_inputs = sub.prepare_inputs("speech_gen", _fwd("r", "speech_gen", _omnivoice_meta(steps)), inputs)
         logits = torch.randn(shape, generator=torch.Generator().manual_seed(100 + k))
         results = {}
         for name, info in (
             ("counter", _fwd("r", "speech_gen", _omnivoice_meta(steps), UNMASK_LOOP_NAME, k)),
             ("edge", _fwd("r", "speech_gen", _omnivoice_meta(steps))),
         ):
+            node_inputs = sub.prepare_inputs("speech_gen", info, inputs)
             outputs = {"c_logits": [logits.clone()], "u_logits": [logits.flip(-1)]}
             with _HostReads() as reads:
                 sub.postprocess("r", info, outputs, inputs=node_inputs)
             results[name] = (outputs, reads.reads)
-        assert results["counter"][1] == [], f"step {k}: host reads {results['counter'][1]}"
-        assert results["edge"][1], "the edge path should read the step on the host"
+            assert reads.reads == [], f"step {k} ({name}): host reads {reads.reads}"
         assert torch.equal(results["counter"][0]["audio_tokens"][0], results["edge"][0]["audio_tokens"][0])
         assert torch.equal(results["counter"][0]["step_index"][0], results["edge"][0]["step_index"][0])
 
@@ -326,3 +337,51 @@ def test_cosmos3_cfg_active_uses_host_timesteps():
         assert reads.reads == []
         want = k < len(sched.timesteps) and 400.0 <= float(sched.timesteps[k].item()) <= 1000.0
         assert active == want
+
+
+# ---------------------------------------------------------------- Higgs Audio
+
+
+class _PageableH2D(TorchFunctionMode):
+    """Records every copy of host data to another device that isn't a non-blocking
+    one (from pinned memory): each waits for the stream's queued work."""
+
+    def __init__(self):
+        super().__init__()
+        self.copies: list[str] = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        device = kwargs.get("device")
+        if func in (torch.tensor, torch.as_tensor) and device is not None and torch.device(device).type != "cpu":
+            self.copies.append(func.__name__)
+        if func is _T.to and args[0].device.type == "cpu" and not kwargs.get("non_blocking"):
+            target = next((a for a in (*args[1:], device) if isinstance(a, (str, torch.device))), None)
+            if target is not None and torch.device(target).type != "cpu":
+                self.copies.append("to")
+        return func(*args, **kwargs)
+
+
+def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
+    """A device loop-back decode step whose rows include one fresh off its prefill overlays
+    that row's token by index: the index goes up through pinned memory, not a blocking copy
+    (every request's first decode step takes this path). The meta device stands in for the
+    accelerator."""
+    from mstar.model.higgs_audio.config import SAMPLER, HiggsAudioModelConfig
+    from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+    from mstar.utils import h2d
+
+    monkeypatch.setattr(h2d.DeviceCapability, "of", staticmethod(lambda device: SimpleNamespace(pin_memory=True)))
+    monkeypatch.setattr(_T, "pin_memory", lambda self: self)
+    sub = HiggsAudioLLMSubmodule(None, HiggsAudioModelConfig())
+    sampler = SimpleNamespace(loopback_tokens=lambda rids: torch.zeros(len(rids), dtype=torch.long, device="meta"))
+    engine_inputs = SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["fresh", "looped"])
+    inputs = [
+        ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long, device="meta"), input_seq_len=1),
+        ARNodeInputs(input_seq_len=1),
+    ]
+    with _PageableH2D() as h2d_copies:
+        out = sub.preprocess("decode", engine_inputs, inputs)
+    assert h2d_copies.copies == []
+    assert out["input_ids"].shape == (2,)

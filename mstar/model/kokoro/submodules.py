@@ -22,6 +22,7 @@ per call, so no call needs more memory than a capture did.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -63,6 +64,18 @@ else:
     step_logger.setLevel(logging.WARNING)
 
 PCM16_SCALE = 32767
+
+
+@contextlib.contextmanager
+def cudnn_benchmark(enabled: bool):
+    """cuDNN times its conv algorithms per new shape inside the block (the frame
+    half runs on the worker's one GPU thread); the process flag is restored."""
+    previous = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = enabled or previous
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = previous
 
 
 def text_region(bucket: int) -> str:
@@ -256,6 +269,8 @@ class KokoroSynthSubmodule(NodeSubmodule):
                     real_bs=len(rows),
                 )["audio"]
             else:
+                # cuDNN's heuristic pick: autotuning here would search again
+                # for every new frame count the eager fallback sees
                 num_frames = max(sizes[r] for r in rows)
                 audio, _ = self.model.synthesize_frames(
                     d[index], t_en[index], pred_dur[index], style[index], num_frames
@@ -356,7 +371,9 @@ class KokoroSynthSubmodule(NodeSubmodule):
 
     def _frames_capture(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         si = inp.static_inputs
-        return {"audio": self.model.decode_frames(si["en"], si["asr"], si["frame_lengths"].clamp(min=1), si["style"])}
+        with cudnn_benchmark(self.config.decoder_cudnn_benchmark):
+            audio = self.model.decode_frames(si["en"], si["asr"], si["frame_lengths"].clamp(min=1), si["style"])
+        return {"audio": audio}
 
     def _text_static_inputs(self, shape: PiecewiseCaptureShape, bucket: int, device) -> dict[str, torch.Tensor]:
         return {

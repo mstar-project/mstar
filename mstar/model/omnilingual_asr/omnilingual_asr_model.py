@@ -38,6 +38,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.omnilingual_asr.audio import load_waveform, preprocess
 from mstar.model.omnilingual_asr.config import (
+    ENCODER_ATTN,
     ENCODER_NODE,
     MAX_AUDIO_SECONDS,
     SAMPLE_RATE,
@@ -120,8 +121,27 @@ class OmnilingualASRModel(Model):
     # -- graph -------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Not autoregressive: no KV cache, no sampler."""
-        return []
+        """Not autoregressive: no KV cache, no sampler. A half-precision encoder
+        attends through a varlen kernel over the step's packed rows; fp32 (the
+        reference's numerics) keeps the padded SDPA path."""
+        if self.dtype not in (torch.bfloat16, torch.float16):
+            return []
+        from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
+
+        return [
+            RaggedAttentionSpec(
+                resource_key=ENCODER_ATTN, nodes={ENCODER_NODE},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=self.config.num_heads,
+                    num_kv_heads=self.config.num_heads,
+                    head_dim=self.config.model_dim // self.config.num_heads,
+                    dtype=self.dtype,
+                    # one segment per request, and a captured step packs a
+                    # whole batch into one row
+                    max_segments_per_request=self.max_batch_size,
+                ),
+            ),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         return {
@@ -238,6 +258,12 @@ class OmnilingualASRModel(Model):
             model = Wav2Vec2CTC(self.config)
         load_into(model, convert_state_dict(read_checkpoint(path), self.dtype, device))
         model.eval()
+        pos = model.encoder_frontend.pos_encoder
+        # cuDNN's grouped kernels for the positional conv are erratic once its
+        # groups are wide (1b and up): 0.8-40 ms for one 2048-channel clip by
+        # length, against ~1.3 ms per 1000 frames as per-group GEMMs. At 300m's
+        # 64-channel groups cuDNN is the faster (0.4-1.5 ms a step).
+        pos.unfolded = torch.device(device).type != "cpu" and pos.conv.in_channels // pos.conv.groups >= 80
         logger.info(
             "Loaded Omnilingual ASR CTC %s (%s, %s) from %s on %s",
             self.size,
@@ -246,4 +272,6 @@ class OmnilingualASRModel(Model):
             Path(path).name,
             device,
         )
-        return OmniASRCTCSubmodule(model, self.max_batch_size, self.max_batch_seconds)
+        submodule = OmniASRCTCSubmodule(model, self.max_batch_size, self.max_batch_seconds)
+        submodule.warm_compile(device)
+        return submodule

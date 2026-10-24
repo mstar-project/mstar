@@ -106,6 +106,11 @@ def test_masked_bilstm_matches_packed_bidirectional():
     out = ours(x, lengths)
     assert torch.allclose(out, expected, atol=1e-6)
     assert out[1, 4:].abs().sum() == 0 and out[2, 1:].abs().sum() == 0
+    # both directions as one block-diagonal LSTM: the same function
+    ours.fuse()
+    fused = ours(x, lengths)
+    assert torch.allclose(fused, expected, atol=1e-6)
+    assert fused[1, 4:].abs().sum() == 0 and fused[2, 1:].abs().sum() == 0
 
 
 def test_real_stft_inverse_matches_torch_istft_per_row():

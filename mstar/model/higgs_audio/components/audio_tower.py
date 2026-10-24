@@ -59,17 +59,43 @@ class HiggsAudioTower(nn.Module):
         self.avg_pooler = nn.AvgPool1d(2, stride=2)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
-        """(batch, num_mel_bins, T_mel) -> (batch, ~T_mel/4, d_model)."""
+    def forward(self, input_features: torch.Tensor, valid_frames: torch.Tensor | None = None) -> torch.Tensor:
+        """(batch, num_mel_bins, T_mel) -> (batch, ~T_mel/4, d_model).
+
+        ``valid_frames`` ``[batch]``: rows are mel prefixes right-padded with
+        zeros, and each row comes out as its prefix alone would: the padded
+        tail is zeroed where a convolution would read it and kept out of
+        attention as keys. Rows past their valid outputs are left unspecified.
+        """
         hidden = F.gelu(self.conv1(input_features))
+        if valid_frames is not None:
+            # conv2 reads one frame past an odd-length prefix: it must be the zero
+            # the unpadded conv pads with
+            hidden = hidden * _prefix_mask(valid_frames, hidden.shape[-1])[:, None, :]
         hidden = F.gelu(self.conv2(hidden))
         hidden = hidden.permute(0, 2, 1)  # (B, T, D)
         hidden = hidden + self.embed_positions.weight[: hidden.shape[1]]
+        attn_mask = None
+        if valid_frames is not None:
+            keys = _prefix_mask((valid_frames - 1) // 2 + 1, hidden.shape[1])
+            attn_mask = torch.zeros(keys.shape, dtype=hidden.dtype, device=hidden.device).masked_fill(
+                ~keys, torch.finfo(hidden.dtype).min
+            )[:, None, None, :]
         for layer in self.layers:
-            out = layer(hidden, None, None) if _LAYER_TAKES_HEAD_MASK else layer(hidden, None)
+            out = layer(hidden, attn_mask, None) if _LAYER_TAKES_HEAD_MASK else layer(hidden, attn_mask)
             hidden = out[0] if isinstance(out, tuple) else out  # tf4 returns (hidden, attn)
         hidden = self.avg_pooler(hidden.permute(0, 2, 1)).permute(0, 2, 1)
-        return self.layer_norm(hidden)
+        hidden = self.layer_norm(hidden)
+        if valid_frames is not None:
+            # the projector's stride-2 conv reads one step past an odd-length row
+            pooled = ((valid_frames - 1) // 2 + 1) // 2
+            hidden = hidden * _prefix_mask(pooled, hidden.shape[1])[:, :, None]
+        return hidden
+
+
+def _prefix_mask(lengths: torch.Tensor, size: int) -> torch.Tensor:
+    """``[B, size]`` bool, True where ``t < lengths[b]``."""
+    return torch.arange(size, device=lengths.device)[None, :] < lengths[:, None]
 
 
 class HiggsAudioFeatureProjector(nn.Module):

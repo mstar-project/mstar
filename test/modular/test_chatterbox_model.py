@@ -710,8 +710,8 @@ class _TinyT3(torch.nn.Module):
         parts = [cond_emb, text, bos] + ([bos] if self.config.duplicate_bos_in_prefill else [])
         return torch.cat(parts)
 
-    def embed_speech(self, ids, positions):
-        return self.speech_emb(ids) + self.speech_pos_emb(positions)
+    def embed_speech(self, ids, position):
+        return self.speech_emb(ids) + self.speech_pos_emb.weight[position]
 
 
 def _t3_submodule(variant="chatterbox"):

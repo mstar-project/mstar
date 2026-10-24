@@ -484,6 +484,22 @@ def test_frame_lengths_follow_the_conv_arithmetic():
     assert real.frame_lengths([16000, 640000, 400, 399]) == [49, 1999, 1, 0]
 
 
+def test_unfolded_positional_conv_matches_the_grouped_conv():
+    """A wide-group deployment runs the positional conv as per-group GEMMs (in
+    chunks of frames): the same values as the grouped conv, padding masked."""
+    from mstar.model.omnilingual_asr.components.wav2vec2 import PositionEncoder
+
+    torch.manual_seed(0)
+    pos = PositionEncoder(model_dim=32, kernel_size=8, num_groups=4).double()
+    x = torch.randn(3, 37, 32, dtype=torch.float64)
+    mask = torch.arange(37)[None, :] < torch.tensor([37, 20, 5])[:, None]
+    ref = pos(x, mask)
+    pos.unfolded = True
+    torch.testing.assert_close(pos(x, mask), ref)
+    pos.UNFOLD_CHUNK_ELEMS = 3 * 32 * 8 * 5  # five frames a chunk
+    torch.testing.assert_close(pos(x, mask), ref)
+
+
 def test_padded_batch_matches_single_runs_and_needs_the_mask():
     model = _random_model(_tiny_config())
     torch.manual_seed(1)
@@ -677,6 +693,48 @@ def test_node_batches_and_matches_single_requests(tiny_model):
     for i, w in enumerate(short_waves):
         assert torch.equal(split[f"r{i}"], _run_node(sub, [w])["r0"])
     assert sub.max_batch_size(TRANSCRIBE_WALK) == 4
+
+
+def test_a_step_over_the_audio_budget_is_not_encoded_packed(tiny_model, monkeypatch):
+    """With the packed encoder bound, a step whose frames fit `max_batch_seconds`
+    encodes in one packed call (leased or planned whole); one over it plans and
+    leases nothing and encodes padded per sub-batch."""
+    from mstar.model.omnilingual_asr.config import ENCODER_ATTN
+    from mstar.model.omnilingual_asr.submodules import ENCODER_LOOP, OmniASRCTCSubmodule
+
+    sub = tiny_model.get_submodule(ENCODER_NODE, "cpu")
+    small = OmniASRCTCSubmodule(sub.model, max_batch_size=4, max_batch_seconds=0.5)  # 8000 samples
+    small.node_resources = {ENCODER_ATTN: object()}
+    packed_calls = []
+    monkeypatch.setattr(small, "_transcribe_packed", lambda waves, attn, ei: packed_calls.append(len(waves)) or [
+        torch.zeros(n, dtype=torch.long) for n in small.model.frame_lengths([w.shape[0] for w in waves])
+    ])
+    torch.manual_seed(6)
+    lease = small.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[ENCODER_LOOP].can_lease
+
+    def step(lengths):
+        waves = [audio.preprocess(torch.randn(n)) for n in lengths]
+        rids = [f"r{i}" for i in range(len(waves))]
+        inputs = [
+            small.prepare_inputs(TRANSCRIBE_WALK, types.SimpleNamespace(request_id=r), {WAVEFORM: [w]})
+            for r, w in zip(rids, waves, strict=True)
+        ]
+        declared = small.declare_step(TRANSCRIBE_WALK, rids, inputs)
+        engine_inputs = types.SimpleNamespace(request_ids=rids, resources={ENCODER_ATTN: object()})
+        pre = small.preprocess(TRANSCRIBE_WALK, engine_inputs, inputs)
+        with torch.no_grad():
+            out = small.forward_batched(TRANSCRIBE_WALK, engine_inputs, **pre)
+        return waves, inputs, declared, out
+
+    _, inputs, declared, _ = step((1000, 2000, 3000))
+    assert lease(inputs) and declared is not None and len(declared.segments) == 3
+    assert packed_calls == [3]
+
+    waves, inputs, declared, out = step((6000, 1000, 5000, 2000))
+    assert not lease(inputs) and declared is None
+    assert packed_calls == [3]
+    for i, w in enumerate(waves):
+        assert torch.equal(out[f"r{i}"][TOKEN_IDS][0], _run_node(sub, [w])["r0"])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

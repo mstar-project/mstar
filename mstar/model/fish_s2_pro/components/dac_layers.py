@@ -45,9 +45,38 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - CPU-only installs
+    triton = None
+
+
+if triton is not None:
+
+    @triton.jit
+    def _snake_kernel(x_ptr, out_ptr, alpha_ptr, inv_alpha_ptr, channels, length, BLOCK: tl.constexpr):
+        row = tl.program_id(0)  # one (batch, channel) row of a contiguous [B, C, T]
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < length
+        channel = row % channels
+        alpha = tl.load(alpha_ptr + channel)
+        inv_alpha = tl.load(inv_alpha_ptr + channel)
+        offsets = row.to(tl.int64) * length + cols
+        x = tl.load(x_ptr + offsets, mask=mask)
+        s = tl.sin(alpha * x)
+        tl.store(out_ptr + offsets, x + inv_alpha * (s * s), mask=mask)
+
 
 class Snake1d(nn.Module):
-    """``x + sin(alpha * x)^2 / alpha``, per channel."""
+    """``x + sin(alpha * x)^2 / alpha``, per channel.
+
+    On fp32 CUDA inputs one Triton pass replaces the five elementwise kernels
+    the expression launches over the decoder's audio-rate activations; every
+    intermediate stays fp32, as in the eager form.
+    """
+
+    BLOCK = 1024
 
     def __init__(self, channels: int):
         super().__init__()
@@ -56,8 +85,15 @@ class Snake1d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(shape[0], shape[1], -1)
-        x = x + (self.alpha + 1e-9).reciprocal() * torch.sin(self.alpha * x).pow(2)
-        return x.reshape(shape)
+        inv_alpha = (self.alpha + 1e-9).reciprocal()
+        if triton is None or not x.is_cuda or x.dtype != torch.float32 or self.alpha.dtype != torch.float32:
+            return (x + inv_alpha * torch.sin(self.alpha * x).pow(2)).reshape(shape)
+        x = x.contiguous()
+        out = torch.empty_like(x)
+        batch, channels, length = x.shape
+        grid = (batch * channels, triton.cdiv(length, self.BLOCK))
+        _snake_kernel[grid](x, out, self.alpha, inv_alpha, channels, length, BLOCK=self.BLOCK)
+        return out.reshape(shape)
 
 
 class VectorQuantize(nn.Module):

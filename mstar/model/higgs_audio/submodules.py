@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
@@ -23,6 +24,9 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
+    PiecewiseBatchedConfig,
+    PiecewiseCallInputs,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
@@ -32,10 +36,14 @@ from mstar.model.higgs_audio.config import ATTN, KV_CACHE, ROPE, SAMPLER, HiggsA
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    TokenStop,
+    device_loopback_enabled,
 )
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -55,19 +63,40 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
 
     Mirrors the reference pipeline: batch-encode padded chunks, run the
     projector on the padded batch, then slice each chunk to its valid
-    (downsampled) length and concatenate in order.
+    (downsampled) length and concatenate in order. Chunks attend only
+    within themselves, so requests whose chunks share a width are encoded
+    as one batch.
+
+    The chunk count and, for a clip under one chunk, the mel width change
+    per request; compiled, every new shape recompiled on the serving path
+    (tens of seconds with the worker blocked). So the tower runs eagerly,
+    and full-width chunks replay a CUDA graph by chunk count. A clip under
+    one chunk is padded to the full width and replays a second graph whose
+    tower masks the padding out (``HiggsAudioTower.forward``'s
+    ``valid_frames``), so short clips batch together too.
     """
+
+    disable_torch_compile = True
+    # requests per encoder step, and full-width chunks per captured replay
+    MAX_BATCH_SIZE = 16
+    CAPTURE_CHUNK_COUNTS = [1, 2, 4, 8, 16, 32, 64]
+    TOWER = "tower"
+    MASKED_TOWER = "tower_masked"
 
     def __init__(
         self,
         audio_tower: nn.Module,
         projector: nn.Module,
         config: HiggsAudioModelConfig,
+        graphs: bool = True,
     ):
         super().__init__()
         self.audio_tower = audio_tower
         self.projector = projector
         self.config = config
+        self.graphs = graphs
+        # mel frames of a full chunk: the feature extractor's 10 ms hop
+        self.chunk_frames = int(config.chunk_size_seconds * 100)
 
     def prepare_inputs(
         self,
@@ -76,37 +105,137 @@ class HiggsAudioEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
+        features = inputs["audio_features"][0]
+        if features.dim() == 2:
+            features = features.unsqueeze(0)  # (1, num_mel_bins, T)
+        # one host read per request: the valid embeddings of each chunk
+        valid = [
+            self.config.encoder_output_length(int(n))
+            for n in inputs["audio_feature_lens"][0].reshape(-1).tolist()
+        ]
         return NodeInputs(
-            tensor_inputs={
-                "audio_features": inputs["audio_features"][0],
-                "audio_feature_lens": inputs["audio_feature_lens"][0],
-            }
+            tensor_inputs={"audio_features": features},
+            kwargs={"valid_lengths": valid},
+            input_seq_len=features.shape[0],
         )
+
+    def _padded(self, width: int) -> bool:
+        """A clip under one chunk: run at the full width, its tail masked."""
+        return self.graphs and width < self.chunk_frames
+
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+        # chunks are padded to their own request's longest, so only requests of
+        # one mel width share a batch -- or, padded and masked, short clips
+        widths = {inp.tensor_inputs["audio_features"].shape[-1] for inp in model_inputs}
+        chunks = sum(inp.input_seq_len for inp in model_inputs)
+        same_kind = len(widths) == 1 or all(self._padded(w) for w in widths)
+        return same_kind and chunks <= self.CAPTURE_CHUNK_COUNTS[-1]
+
+    def max_batch_size(self, graph_walk: str) -> int:
+        return self.MAX_BATCH_SIZE
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> dict[str, Any]:
+        dtype = next(self.audio_tower.parameters()).dtype
+        features = [inp.tensor_inputs["audio_features"] for inp in inputs]
+        widths = [f.shape[-1] for f in features]
+        padded = self._padded(widths[0])
+        if padded:
+            features = [F.pad(f, (0, self.chunk_frames - f.shape[-1])) for f in features]
+        out = {
+            "audio_features": torch.cat(features, dim=0).to(device=self.get_device(), dtype=dtype),
+            "valid_lengths": [inp.kwargs["valid_lengths"] for inp in inputs],
+        }
+        if padded:
+            out["valid_frames"] = to_device_nonblocking(
+                torch.tensor(widths, dtype=torch.long), self.get_device(),
+            )
+        return out
+
+    def _encode(self, features: torch.Tensor, valid_frames: torch.Tensor | None = None) -> torch.Tensor:
+        return self.projector(self.audio_tower(features, valid_frames))
+
+    def _capture_tower(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        return {"projected": self._encode(inp.static_inputs["audio_features"])}
+
+    def _capture_masked_tower(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        s = inp.static_inputs
+        # padding rows replay zeroed: give them one valid frame
+        return {"projected": self._encode(s["audio_features"], s["valid_frames"].clamp(min=1))}
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any,
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """Tower + projector over full-width chunks, by chunk count."""
+        del autocast_dtype, tp_world_size, kwargs
+        if not self.graphs:
+            return {}
+        dtype = next(self.audio_tower.parameters()).dtype
+        mels, frames = self.config.audio_num_mel_bins, self.chunk_frames
+        return {
+            self.TOWER: PiecewiseBatchedConfig(
+                capture_fn=self._capture_tower,
+                make_static_inputs=lambda shape: {
+                    "audio_features": torch.zeros(shape.bs, mels, frames, dtype=dtype, device=device),
+                },
+                seq_len=frames,
+                capture_batch_sizes=list(self.CAPTURE_CHUNK_COUNTS),
+            ),
+            # clips under one chunk, one per row, padded to the full width
+            self.MASKED_TOWER: PiecewiseBatchedConfig(
+                capture_fn=self._capture_masked_tower,
+                make_static_inputs=lambda shape: {
+                    "audio_features": torch.zeros(shape.bs, mels, frames, dtype=dtype, device=device),
+                    "valid_frames": torch.full((shape.bs,), frames, dtype=torch.long, device=device),
+                },
+                seq_len=frames,
+                capture_batch_sizes=[bs for bs in self.CAPTURE_CHUNK_COUNTS if bs <= self.MAX_BATCH_SIZE],
+            ),
+        }
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        audio_features: torch.Tensor,
+        valid_lengths: list[list[int]],
+        valid_frames: torch.Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        num_chunks = audio_features.shape[0]
+        static_inputs = {"audio_features": audio_features}
+        if valid_frames is not None:
+            static_inputs["valid_frames"] = valid_frames
+        runner = engine_inputs.piecewise_runners.get(self.TOWER if valid_frames is None else self.MASKED_TOWER)
+        if (
+            runner is not None
+            and audio_features.shape[-1] == self.chunk_frames
+            and runner.can_run(num_chunks)
+        ):
+            projected = runner.run(static_inputs=static_inputs, real_bs=num_chunks).get_view("projected")
+        else:
+            projected = self._encode(audio_features, valid_frames)
+
+        outputs: dict[str, NameToTensorList] = {}
+        chunk = 0
+        for rid, valid in zip(engine_inputs.request_ids, valid_lengths, strict=True):
+            embeds = torch.cat([projected[chunk + i, :n] for i, n in enumerate(valid)], dim=0)
+            chunk += len(valid)
+            outputs[rid] = {"audio_embeds": [embeds]}
+        return outputs
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        audio_features: torch.Tensor,
-        audio_feature_lens: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        device = self.get_device()
-        dtype = next(self.audio_tower.parameters()).dtype
-        feats = audio_features.to(device=device, dtype=dtype)
-        if feats.dim() == 2:
-            feats = feats.unsqueeze(0)  # (1, num_mel_bins, T)
-
-        encoded = self.audio_tower(feats)         # (num_chunks, T_out, 1280)
-        projected = self.projector(encoded)       # (num_chunks, T', hidden)
-
-        chunks = []
-        for i, mel_len in enumerate(audio_feature_lens.tolist()):
-            valid = self.config.encoder_output_length(int(mel_len))
-            chunks.append(projected[i, :valid])
-        audio_embeds = torch.cat(chunks, dim=0)   # (total_audio_tokens, hidden)
-
-        return {"audio_embeds": [audio_embeds]}
+        rid = engine_inputs.request_ids[0]
+        return self.forward_batched(graph_walk, engine_inputs, **kwargs)[rid]
 
 
 # ===================================================================
@@ -118,17 +247,19 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
     """Dense Qwen3 LLM.
 
     Dispatches on graph_walk:
-      - prefill_text:  embed a text span, extend the KV cache.
-      - prefill_audio: splice the encoder's audio embeddings, extend the
-        KV cache.
+      - prefill_audio: the ChatML text around the encoder's audio
+        embeddings, one span into the KV cache.
       - decode:        embed the previous token, single-step decode.
 
-    Every walk samples a token; ``postprocess`` drops it for the prefill
-    steps that are not the last one, so the captured graph's output keys
-    stay the same whatever the step metadata says. The two prefill walks
-    share one packed capture — both hand the forward ``input_embeds`` —
-    while decode carries bare ``input_ids`` and embeds inside the graph.
+    Every walk samples a token; ``postprocess`` drops it for a prefill step
+    that is not the last one, so the captured graph's output keys stay the
+    same whatever the step metadata says. Prefill replays a packed capture
+    keyed on ``input_embeds``, while decode carries bare ``input_ids`` and
+    embeds inside the graph.
     """
+
+    # the decode walk reads its input ids off the sampler's slot masters
+    reads_device_loopback = True
 
     PREFILL_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
@@ -138,6 +269,10 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         super().__init__()
         self.model = llm
         self.config = config
+        self.token_stop = TokenStop(
+            loop="decode_loop", buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
+            sampler=SAMPLER, walk="decode",
+        )
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -152,8 +287,7 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
             PackedAcceleratorGraphConfig(
-                capture_graph_walk="prefill_text",
-                replay_graph_walks=["prefill_text", "prefill_audio"],
+                capture_graph_walk="prefill_audio",
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,
                     input_embeds=torch.zeros(
@@ -171,30 +305,49 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs,
     ) -> ARNodeInputs:
         device = self.get_device()
 
+        if graph_walk == "decode" and has_loopback and self._device_loopback():
+            # the token is read off the sampler's slot master in `preprocess`
+            return ARNodeInputs(input_seq_len=1)
+
         if graph_walk == "prefill_audio":
-            audio_embeds = inputs["audio_embeds"][0].to(device)
+            # the audio between the ChatML text around it, prefilled as one span
+            audio = inputs["audio_embeds"][0].to(device)
+            pre, post = (
+                self.model.embed_tokens(inputs[name][0].to(device).reshape(-1))
+                if inputs.get(name) else None
+                for name in ("text_pre", "text_post")
+            )
+            dtype = (pre if pre is not None else audio).dtype
+            embeds = torch.cat([t.to(dtype) for t in (pre, audio, post) if t is not None], dim=0)
             return ARNodeInputs(
-                input_seq_len=audio_embeds.shape[0],
-                input_embeds=audio_embeds,
+                input_seq_len=embeds.shape[0],
+                input_embeds=embeds,
             )
 
+        # decode: embedding happens inside the captured graph; a decode row
+        # is one id, so staging it costs 8 bytes instead of a hidden vector
         token_ids = inputs["text_inputs"][0].to(device).reshape(-1)
-        if graph_walk == "decode":
-            # embedding happens inside the captured graph; a decode row is
-            # one id, so staging it costs 8 bytes instead of a hidden vector
-            return ARNodeInputs(input_seq_len=1, input_ids=token_ids)
+        return ARNodeInputs(input_seq_len=1, input_ids=token_ids)
 
-        # prefill_text shares prefill_audio's capture, which is keyed on
-        # embeddings, so the text span is embedded here
-        return ARNodeInputs(
-            input_seq_len=token_ids.shape[0],
-            input_ids=token_ids,
-            input_embeds=self.model.embed_tokens(token_ids),
-        )
+    def uniform_row_inputs(
+        self, graph_walk: str, has_loopback: bool = False,
+    ) -> ARNodeInputs | None:
+        if graph_walk == "decode" and has_loopback and self._device_loopback():
+            return ARNodeInputs(input_seq_len=1)
+        return None
+
+    def _device_loopback(self) -> bool:
+        return device_loopback_enabled() and self.node_resources[SAMPLER].has_slot_masters
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        if graph_walk == "decode" and self._device_loopback():
+            return frozenset({"text_inputs"})
+        return frozenset()
 
     def declare_step(
         self,
@@ -237,9 +390,13 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         if graph_walk == "decode":
-            return {
-                "input_ids": torch.cat([inp.input_ids for inp in inputs]),
-            }
+            if all(inp.input_ids is not None for inp in inputs):
+                return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
+            # device loop-back: each row's last sampled token, read by slot;
+            # rows whose previous step was the prefill brought theirs
+            return {"input_ids": self.loopback_input_ids(
+                engine_inputs.resources[SAMPLER], engine_inputs.request_ids, inputs,
+            )}
         return {
             "input_embeds": torch.cat(
                 [inp.input_embeds for inp in inputs], dim=0
@@ -257,6 +414,8 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         attn: AttentionManager = engine_inputs.resources[ATTN]
 
+        if input_ids is None and input_embeds is None:
+            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
         hidden = self.model(input_embeds=input_embeds, label="main")
@@ -298,17 +457,18 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         new_tokens = self._forward(
             graph_walk=graph_walk,
             engine_inputs=engine_inputs,
             input_ids=input_ids,
             input_embeds=input_embeds,
         )
-        return {
-            rid: {"new_token": [new_tokens[i:i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        # row i is request i: one clone and one device-to-host copy per step
+        return BatchedModelOutput(
+            row_outputs={"new_token": new_tokens},
+            check_stop_buffers={"new_token": new_tokens},
+        )
 
     def postprocess(
         self,
@@ -327,18 +487,11 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
             return
         outputs["text_inputs"] = outputs["new_token"]
 
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if "new_token" not in outputs or request_info.graph_walk != "decode":
-            return set()
-        token = outputs["new_token"][0].item()
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        decoded_tokens = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-        if (not ignore_eos and token in self.config.stop_token_ids) or \
-                decoded_tokens >= request_info.max_tokens:
-            return {"decode_loop"}
-        return set()
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        # a decode row is one token, like the capture template's
+        return graph_walk == "decode"
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # the decode loop's client edge carries the token the stop check
+        # already has on the host; prefill's client edge is persisted
+        return {"text_inputs": "new_token"} if graph_walk == "decode" else {}

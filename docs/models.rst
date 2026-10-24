@@ -175,6 +175,35 @@ OmniVoice notes
 - The backbone is not autoregressive: it fills a fixed canvas of eight codebook
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
+- The backbone's layer stack replays CUDA graphs per (requests, packed-token
+  bucket up to 4096 tokens) with attention through a ragged attention resource;
+  larger steps are GPU-bound and run eagerly. The layer loop is mstar's own over
+  the reference's fused weights: q/k norms read the fused QKV output in place
+  and each residual add folds into the next RMSNorm (flashinfer
+  ``fused_add_rmsnorm``), so logits match the reference to half-precision
+  rounding rather than bit for bit. ``model_kwargs: {backbone_graphs: false}``
+  keeps the reference's eager packed path.
+- ``configs/omnivoice_split.yaml`` runs code2wav (codec decode and the
+  host-side silence trim) on a second worker sharing GPU 0, so the unmask loop
+  no longer stops for each finished request. With a CUDA MPS daemon it raised
+  concurrency-32 throughput on an H200 from ~153 to 176-184 audio-s/s and cut
+  TTFA p95 from ~9 s to ~3 s; concurrency 1 is ~10% slower.
+
+Higgs Audio notes
+~~~~~~~~~~~~~~~~~
+
+- The audio tower runs outside ``torch.compile`` (a clip's chunk count changes
+  its shape, and every new shape recompiled on the serving path). Requests
+  whose 4 s chunks share a mel width are encoded together, and full-width
+  chunks replay a CUDA graph per chunk count; a clip under one chunk is padded
+  to the full width and masked (``HiggsAudioTower``'s ``valid_frames``) so it
+  replays a graph too. ``model_kwargs: {encoder_graphs: false}`` runs the
+  tower eagerly.
+- One prefill step per request: the ChatML text around the audio and the audio
+  embeddings go into the KV cache as one span.
+- Decode keeps each request's last token in the sampler's slot master and
+  sends the client's copy inline (``MSTAR_DEVICE_LOOPBACK``, on by default),
+  as Qwen3.5 does: a decode step stores and routes no tensors.
 
 Omnilingual ASR notes
 ~~~~~~~~~~~~~~~~~~~~~
@@ -209,7 +238,10 @@ Omnilingual ASR notes
 - ``dtype`` defaults to ``bfloat16``, the reference's inference dtype; ``float32`` also
   turns off TF32 for the node's matmuls. ``max_batch_size`` (16) caps the requests in one
   step; the step sorts them by length and splits them so that each forward's padded audio
-  (rows times the longest clip) stays within ``max_batch_seconds`` (320). In bf16 a
+  (rows times the longest clip) stays within ``max_batch_seconds`` (320). In bf16 the
+  encoder packs a step's clips into one unpadded forward (a captured graph up to 16384
+  frames) when their total audio fits ``max_batch_seconds``; a step over it encodes padded,
+  per split. In bf16 a
   request batched with others can differ from the same request run alone where two
   characters nearly tie, as the reference's own batched ``transcribe`` does;
   ``max_batch_size: 1`` or ``dtype: float32`` give batch-invariant transcripts.
@@ -271,6 +303,12 @@ not the 256-slot default. The state defaults to the checkpoint's
 ``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
+A captured decode step builds its rotary tables inside the graph from the
+planned positions, rather than staging tables built eagerly before the replay
+(that build sat on the per-step critical path: +13% output tok/s at c=32 on
+0.8B, H200). Greedy output can differ from earlier releases at near-tie
+tokens; prefill and eager steps are unchanged.
+
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
@@ -315,8 +353,12 @@ Kokoro notes
   graphs captured at start-up (fewer buckets on a smaller GPU), ``compile_decoder: false``
   skips the ``torch.compile`` of the vocoder (start-up in seconds instead of minutes, about
   half the throughput on an H100) and ``decoder_dtype: bfloat16`` runs the vocoder trunk
-  in bf16 (about 13% more throughput at concurrency 32 in our runs, with the harmonic
-  source and the iSTFT kept in fp32; the parity test covers fp32 only).
+  in bf16 (about 13% more throughput at concurrency 32 on an H100 and 20-25% at
+  concurrency 32-64 on an H200, Whisper WER unchanged, with the harmonic source and the
+  iSTFT kept in fp32; the parity test covers fp32 only; ``configs/kokoro_bf16.yaml``).
+  ``fuse_lstm_directions`` (default on) runs each BiLSTM's two directions as one
+  block-diagonal recurrence, and ``decoder_cudnn_benchmark`` (default on) lets cuDNN
+  time the frame half's conv algorithms once per captured bucket.
 - Text is cut at sentence boundaries into chunks of at most 510 phonemes (the
   PL-BERT window); each chunk is emitted to the client as soon as it is
   synthesized, so ``stream=True`` on ``/v1/audio/speech`` returns audio sentence by
@@ -345,6 +387,14 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
+- Numerics: the code predictor's residual adds fold into the next RMSNorm
+  (FlashInfer's fused add + norm) and its attention is a Triton kernel
+  (``cp_attention``), neither bit-exact with the unfused ops. Its 15 depth
+  steps feed each sampled code into the next, so small differences can change
+  later codes at near-ties.
+- The MoE layers route through the fused softmax-top-k kernel
+  (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
+  the lower expert id where ``torch.topk`` may pick another.
 
 Qwen3-TTS notes
 ---------------
@@ -380,25 +430,29 @@ Qwen3-TTS notes
   transformer stacks 8 such layers, so a window still differs slightly from a
   whole-utterance decode once an utterance outgrows the context; 25 frames of
   context differed far more. Each window size is a CUDA-graph bucket captured
-  for batch sizes 1 to 32; the stream buffer reports how many leading frames of
-  a window are repeated context, and the codec trims their audio. A voice
-  clone's reference tail (its last 72 frames) is the first window's context.
+  for batch sizes 1 to 32 (densely: the codec's cost is per row, so a padding
+  row costs as much as a real one); the stream buffer reports how many leading
+  frames of a window are repeated context, and the codec trims their audio. The
+  scheduler batches each window size apart, so a stream's small first windows
+  are not padded to a full window's width or queued behind a batch of them. A
+  voice clone's reference tail (its last 72 frames) is the first window's context.
 - The codec runs its transformer over the whole window but its conv stack (all
   but a few percent of the codec's time) only over the new frames plus the
   stack's causal receptive field, derived from the decoder's modules at load
   (10 frames for the 12 Hz decoder; the new frames' audio equals the
   whole-window decode). It also fuses the SnakeBeta activations into one kernel.
-- Talker prefill replays a packed CUDA Graph for the smallest token bucket
-  (32 to 1024 tokens) that holds the batch; only the clone prefill, which also
-  pushes the reference clip's frames into the codec stream, runs eager. Decode
-  always uses the whole-walk CUDA Graph, with the 15-step
+- Talker prefill, the clone prefill included, replays a packed CUDA Graph for
+  the smallest token bucket (32 to 1024 tokens) that holds the batch; a clone's
+  reference frames join the codec stream in ``postprocess``. Decode
+  always uses the whole-walk CUDA Graph (up to 64 rows a step), with the 15-step
   CodePredictor loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
   request state. Residual ``subtalker_*`` sampling is per-request through the
   ``code_predictor`` aux sampler, so custom values neither block batching nor
   fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
-- ``configs/qwen3tts_1p7b_split.yaml`` runs the Codec on a second worker that
+- ``configs/qwen3tts_1p7b_split.yaml`` (and ``configs/qwen3tts_split.yaml``
+  for the 0.6B) runs the Codec on a second worker that
   shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
   On its own it lowers first-audio latency at high concurrency; with a
   user-level CUDA MPS daemon (``nvidia-cuda-mps-control -d`` before
@@ -495,9 +549,13 @@ Fish Audio S2-Pro notes
   probability carries the running total past top-p, while the reference drops
   it unless it is the most likely token. ``max_new_tokens`` (default 2048, at most
   4096 frames of 2048 samples at 44.1 kHz) and ``ignore_eos`` pass through.
-- Streamed audio matches the whole-utterance decode to within one int16 step:
-  each codec window carries the decoder's whole receptive field as context, and
-  the codec runs in fp32 with TF32 off.
+- Each codec window carries the decoder's whole receptive field as context.
+  With ``model_kwargs: {codec_exact_fp32: true}`` the codec runs in fp32 with
+  TF32 off and the streamed audio matches the whole-utterance decode to within
+  one int16 step. The shipped ``configs/fish_s2_pro.yaml`` sets it to ``false``:
+  TF32 halves the codec's conv stack, most of the GPU time under concurrency
+  (c=32 throughput +35% on an H200), and the audio stays within ~60 dB SNR of
+  the exact decode.
 
 Nemotron VoiceChat (``nemotron_duplex``) notes
 ----------------------------------------------
@@ -655,6 +713,16 @@ Chatterbox notes
   window stays as close to the whole-utterance decode as the full history
   does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose chunks
   are ready together share one padded flow solve (up to 8 per step).
+- ``configs/chatterbox_split.yaml`` (and ``chatterbox_turbo_split.yaml``,
+  ``chatterbox_multilingual_split.yaml``) runs S3Gen on a second worker that
+  shares GPU 0 (``rank_devices``), so T3's decode steps stop alternating with
+  S3Gen's flow solves on one worker loop. It only pays with a user-level CUDA
+  MPS daemon (``nvidia-cuda-mps-control -d`` before ``mstar serve``), which
+  lets the two workers' kernels overlap: on an H200 at concurrency 32 Chatterbox
+  went from 36-38 to 58-61 audio-s/s and Turbo from 69 to 94, at the cost of a
+  later first chunk (TTFA p50 1.6-1.8 s -> 1.9-2.1 s; Turbo 0.36 s -> 1.0 s);
+  concurrency 1 is unchanged, and WER held (1.22% -> 1.08%). Without MPS the
+  split measured the same as one worker.
 - S3Gen runs from CUDA graphs by default (``s3gen_graphs``): the flow solve
   (one graph per rows x frames x steps; the estimator's hundreds of tiny
   kernels per Euler step make the eager solve launch-bound, 170 ms vs 45 ms

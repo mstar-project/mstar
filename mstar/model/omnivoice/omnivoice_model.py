@@ -30,7 +30,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -40,10 +40,11 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
 from mstar.model.omnivoice.components.backbone import (
     OmniVoiceBackbone,
     assert_flashinfer_api,
+    assert_flashinfer_patched,
 )
 from mstar.model.omnivoice.components.codec import load_codec
 from mstar.model.omnivoice.components.text import (
@@ -53,6 +54,8 @@ from mstar.model.omnivoice.components.text import (
 )
 from mstar.model.omnivoice.config import OmniVoiceConfig
 from mstar.model.omnivoice.submodules import (
+    BACKBONE_ATTN,
+    TARGET_LEN,
     UNMASK_LOOP_NAME,
     OmniVoiceBackboneSubmodule,
     OmniVoiceCode2WavSubmodule,
@@ -71,6 +74,9 @@ class OmniVoiceModel(Model):
     SPEECH_GEN_CLONE_WALK = "speech_gen_clone"
 
     UNMASK_LOOP_NAME = UNMASK_LOOP_NAME
+    # The canvas length process_prompt settles (it needs the tokenizer and the
+    # duration estimator); it reaches the backbone as step metadata.
+    INTERNAL_KWARGS = (TARGET_LEN,)
 
     def __init__(
         self,
@@ -88,6 +94,10 @@ class OmniVoiceModel(Model):
         self.model_path_hf = os.environ.get("MSTAR_OMNIVOICE_MODEL_PATH") or model_path_hf
         self.cache_dir = cache_dir
         self.config = OmniVoiceConfig()
+        if "backbone_graphs" in kwargs:
+            self.config.backbone_graphs = bool(kwargs["backbone_graphs"])
+        if "backbone_token_buckets" in kwargs:
+            self.config.backbone_token_buckets = sorted(int(n) for n in kwargs["backbone_token_buckets"])
         self.skip_weight_loading = skip_weight_loading
 
         # Loaded lazily on the data worker so construction never hits the
@@ -104,7 +114,8 @@ class OmniVoiceModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """No engine-built resources: every node here is stateless.
+        """The backbone's ragged attention, when its layer stack is captured;
+        nothing else, since every node here is stateless.
 
         There is deliberately no KV cache.  The canvas is rewritten each
         iteration and attention is bidirectional, so the prefix attends *into*
@@ -113,7 +124,23 @@ class OmniVoiceModel(Model):
         resource either: the reveal picks cells by confidence rank across the
         whole canvas rather than drawing one token per position.
         """
-        return []
+        if not self.config.backbone_graphs:
+            return []
+        body = self.config.backbone
+        return [
+            RaggedAttentionSpec(
+                resource_key=BACKBONE_ATTN,
+                nodes={"backbone"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=body.num_attention_heads,
+                    num_kv_heads=body.num_key_value_heads,
+                    head_dim=body.head_dim,
+                    # the conditional and unconditional documents
+                    max_segments_per_request=2,
+                    dtype=getattr(torch, self.config.load_dtype),
+                ),
+            )
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_reference = GraphNode(
@@ -143,7 +170,6 @@ class OmniVoiceModel(Model):
         backbone_inputs = [
             "prefix_ids",
             "prefix_audio_mask",
-            "target_len",
             "audio_tokens",
             "step_index",
         ]
@@ -294,7 +320,7 @@ class OmniVoiceModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Validate, then build the canvas prefix on the data worker.
 
         Every malformed-request check lives here rather than in
@@ -384,7 +410,6 @@ class OmniVoiceModel(Model):
         out: NameToTensorList = {
             "prefix_ids": [prefix_ids],
             "prefix_audio_mask": [prefix_audio_mask],
-            "target_len": [torch.tensor([target_len], dtype=torch.long)],
         }
         if ref_audio:
             out["ref_audio_inputs"] = [ref_waveform]
@@ -392,7 +417,7 @@ class OmniVoiceModel(Model):
             # _prepare_reference: post_process uses it to put the clone back at
             # the source's loudness, so a quiet reference yields quiet speech.
             out["ref_rms"] = [torch.tensor([ref_rms], dtype=torch.float32)]
-        return out
+        return ProcessPromptOutput(out, {TARGET_LEN: target_len})
 
     def _prepare_reference(
         self, waveform: torch.Tensor, ref_text: str | None
@@ -466,8 +491,8 @@ class OmniVoiceModel(Model):
         # Backstops. process_prompt already rejected each of these on the data
         # worker where a ValueError becomes a 400; a raise here runs at the
         # conductor, whose loop swallows it and leaves the client hanging.
-        if not input_signals.get("prefix_ids"):
-            raise ValueError("OmniVoice requires a processed prompt (prefix_ids)")
+        if not input_signals.get("prefix_ids") or TARGET_LEN not in model_kwargs:
+            raise ValueError("OmniVoice requires a processed prompt (prefix_ids, target_len)")
         target_output = output_modalities[0] if output_modalities else "audio"
         if target_output != "audio":
             raise ValueError(
@@ -494,9 +519,8 @@ class OmniVoiceModel(Model):
         kwargs = {
             "walk_schedule": schedule,
             "walk_step": 0,
-            # target_len is NOT here: it is computed on the data worker (it
-            # needs the tokenizer and the duration estimator) and rides an edge
-            # to the backbone, rather than being re-derived at the conductor.
+            # from process_prompt, which settles it on the data worker
+            TARGET_LEN: int(model_kwargs[TARGET_LEN]),
             "num_step": num_step,
             "guidance_scale": float(
                 model_kwargs.get("guidance_scale", defaults.guidance_scale)
@@ -548,6 +572,7 @@ class OmniVoiceModel(Model):
         kw = metadata.kwargs
         return {
             "is_prefill": metadata.is_prefill,
+            TARGET_LEN: kw[TARGET_LEN],
             "num_step": kw["num_step"],
             "guidance_scale": kw["guidance_scale"],
             "t_shift": kw["t_shift"],
@@ -568,7 +593,7 @@ class OmniVoiceModel(Model):
         step counter at iteration 0.
         """
         inputs: list[GraphEdge] = []
-        for name in ("prefix_ids", "prefix_audio_mask", "target_len"):
+        for name in ("prefix_ids", "prefix_audio_mask"):
             edge = GraphEdge(next_node="backbone", name=name)
             edge.tensor_info = persist_signals.get(name, [])
             inputs.append(edge)
@@ -731,6 +756,7 @@ class OmniVoiceModel(Model):
             # After .to(device): apply_flashinfer sizes its attention workspace
             # against model.device, and patching on CPU would allocate it there.
             fi.apply_flashinfer(reference, enable_cuda_graph=False)
+            assert_flashinfer_patched(reference)
             backbone = OmniVoiceBackbone(reference, plan_dtype=dtype).eval()
             return OmniVoiceBackboneSubmodule(backbone, self.config)
 

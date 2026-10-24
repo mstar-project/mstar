@@ -91,6 +91,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
                 num_experts_per_tok=tc.num_experts_per_tok,
                 norm_topk_prob=tc.norm_topk_prob,
                 comm_group=comm_group,
+                fused_softmax_topk=True,
             )
         else:
             self.mlp = ParallelGatedMLP(

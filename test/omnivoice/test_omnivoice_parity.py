@@ -612,7 +612,7 @@ def test_postprocess_reveals_without_touching_the_loop_edge():
     inputs = NodeInputs(tensor_inputs={
         "audio_tokens": edge,
         "step_index": torch.zeros(1, dtype=torch.int64),
-    })
+    }, kwargs={"step": 0})
 
     sub.postprocess("a", _fwd_info("a", 0), outputs, inputs)
 

@@ -13,12 +13,22 @@ requests, which theirs cannot.
 """
 
 import logging
+from collections.abc import Mapping
+from functools import partial
+from typing import Any
 
 import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_config import (
+    PiecewiseAcceleratorGraphConfig,
+    PiecewiseCallInputs,
+    PiecewiseCaptureShape,
+    PiecewisePackedConfig,
+)
+from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.omnivoice.components.backbone import (
     CanvasItem,
     OmniVoiceBackbone,
@@ -41,6 +51,18 @@ from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSu
 logger = logging.getLogger(__name__)
 
 UNMASK_LOOP_NAME = "unmask_loop"
+# Step metadata: the canvas length, in frames
+TARGET_LEN = "target_len"
+# The backbone's ragged attention resource, and its captured layer stack.
+BACKBONE_ATTN = "backbone_attn"
+BACKBONE_LAYERS = "backbone_layers"
+
+
+def document_pairs(lengths: list[tuple[int, int]]) -> list[int]:
+    """Two documents per request, conditional then unconditional, in packing
+    order; a request with CFG off has a zero-length unconditional one, so every
+    request owns two segments whatever its guidance."""
+    return [n for pair in lengths for n in pair]
 
 
 def _loop_step(fwd_info: CurrentForwardPassInfo, step_index: torch.Tensor) -> int:
@@ -206,14 +228,11 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
             )
 
         if "audio_tokens" not in inputs or len(inputs["audio_tokens"]) == 0:
-            # Iteration 0: the loop-back edges arrive empty. Seed a fully
-            # masked canvas; there is no noise and no seed to honour, because
+            # Iteration 0: the loop-back edges arrive empty, and the loop starts
+            # from an all-MASK canvas. There is no noise and no seed to honour:
             # the stochastic part of this model is the reveal order, not the
-            # starting state. target_len rides an edge rather than
-            # step_metadata: computing it needs the tokenizer and the duration
-            # estimator, both data-worker assets. Later iterations read it off
-            # the canvas shape instead, which costs no host read.
-            target_len = int(inputs["target_len"][0].reshape(-1)[0].item())
+            # starting state.
+            target_len = int(meta[TARGET_LEN])
             tokens = torch.full(
                 (self.config.num_audio_codebook, target_len),
                 self.config.audio_mask_id,
@@ -223,6 +242,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
             # 1-D, not 0-dim: the worker's output fanout reads dims[0] of
             # every routed edge.
             step_index = torch.zeros(1, dtype=torch.int64, device=device)
+            k = 0
         else:
             step_index = inputs["step_index"][0]
             k = _loop_step(fwd_info, step_index)
@@ -239,6 +259,8 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
             tokens = inputs["audio_tokens"][0].to(device)
             target_len = tokens.shape[-1]
 
+        cond_len = prefix_ids.shape[-1] + target_len
+        uncond_len = target_len if float(meta["guidance_scale"]) != 0 else 0
         return NodeInputs(
             tensor_inputs={
                 "prefix_ids": prefix_ids,
@@ -246,11 +268,108 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
                 "audio_tokens": tokens,
                 "step_index": step_index,
             },
-            kwargs={"request_id": fwd_info.request_id},
-            # Both CFG documents are packed, so the row's real contribution
-            # is the conditional length plus the target again.
-            input_seq_len=prefix_ids.shape[-1] + 2 * target_len,
+            # the iteration, for postprocess: at iteration 0 the loop counter
+            # is not there yet, and reading the step edge would sync
+            kwargs={"request_id": fwd_info.request_id, "doc_lens": (cond_len, uncond_len), "step": k},
+            # The row's packed contribution: its conditional document plus,
+            # with CFG on, the target again as the unconditional one.
+            input_seq_len=cond_len + uncond_len,
         )
+
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep | None:
+        """The eager path's attention layout; a leased replay plans its own."""
+        if not self.config.backbone_graphs or (piecewise_leases or {}).get(BACKBONE_LAYERS):
+            return None
+        return self._attention_step(
+            request_ids, document_pairs([inp.kwargs["doc_lens"] for inp in inputs])
+        )
+
+    @staticmethod
+    def _attention_step(request_ids: list[str], doc_lens: list[int]) -> SubmoduleStep:
+        """Each document attends within itself. ``doc_lens`` holds two entries
+        per real request; a padded replay appends one zero per padding row, and
+        a capture one length per row, so documents are spread over the ids in
+        order -- the ragged plan reads only the spans."""
+        per_id = max(1, -(-len(doc_lens) // len(request_ids)))
+        return SubmoduleStep(
+            segments=[
+                Segment(request_id=request_ids[i // per_id], label="main", span=n)
+                for i, n in enumerate(doc_lens)
+            ],
+            steps={BACKBONE_ATTN: AttentionStep(causal=False)},
+        )
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """The layer stack (embeddings through the final norm), by request
+        count and packed-token bucket. The packed canvas is built eagerly before
+        it and the audio head runs after it, on the gathered target rows."""
+        del autocast_dtype, tp_world_size, kwargs
+        if not self.config.backbone_graphs:
+            return {}
+        return {
+            BACKBONE_LAYERS: PiecewisePackedConfig(
+                capture_fn=self._capture_layers,
+                make_static_inputs=partial(self._layer_static_inputs, device=device),
+                declare_step=self._attention_step,
+                lease_before_step=True,
+                total_tokens=list(self.config.backbone_token_buckets),
+                capture_batch_sizes=list(self.config.backbone_capture_batch_sizes),
+            )
+        }
+
+    def _layer_static_inputs(self, shape: PiecewiseCaptureShape, device) -> dict[str, torch.Tensor]:
+        n = shape.total_tokens
+        return {
+            "input_ids": torch.zeros(n, self.config.num_audio_codebook, dtype=torch.long, device=device),
+            "audio_mask": torch.zeros(n, dtype=torch.bool, device=device),
+            "pos_ids": torch.zeros(n, dtype=torch.int32, device=device),
+        }
+
+    def _capture_layers(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        s = inp.static_inputs
+        return {
+            "hidden": self.backbone.encode(
+                s["input_ids"], s["audio_mask"], s["pos_ids"],
+                self.node_resources[BACKBONE_ATTN],
+            )
+        }
+
+    @torch.inference_mode()
+    def _logits(self, engine_inputs: ModelInputsFromEngine, canvas: PackedCanvas) -> torch.Tensor:
+        """The step's target logits: from the captured layer stack when a
+        bucket fits, else eagerly through the same ragged attention."""
+        if not self.config.backbone_graphs:
+            return self.backbone(canvas)
+        position_ids = canvas.position_ids[0]
+        static_inputs = {
+            "input_ids": canvas.packed_ids[0].t(),
+            "audio_mask": canvas.audio_mask[0],
+            "pos_ids": position_ids.to(torch.int32),
+        }
+        num_requests = len(canvas.items)
+        runner = engine_inputs.piecewise_runners.get(BACKBONE_LAYERS)
+        if runner is not None and runner.can_run(num_requests, int(position_ids.shape[0])):
+            hidden = runner.run(
+                static_inputs=static_inputs,
+                request_ids=list(engine_inputs.request_ids),
+                seq_lens=document_pairs([
+                    (item.cond_len, item.target_len if item.does_cfg else 0) for item in canvas.items
+                ]),
+                real_bs=num_requests,
+            ).get_view("hidden")
+        else:
+            hidden = self.backbone.encode(**static_inputs, attn=engine_inputs.resources[BACKBONE_ATTN])
+        return self.backbone.head(hidden, canvas.tgt_index)
 
     def preprocess(
         self,
@@ -335,7 +454,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         assert items is not None and canvas is not None, (
             "OmniVoice backbone requires preprocess output"
         )
-        logits = self.backbone(canvas)
+        logits = self._logits(engine_inputs, canvas)
         outputs: dict[str, NameToTensorList] = {}
         for item in items:
             c_logits, u_logits = canvas.slice_logits(logits, item)
@@ -363,12 +482,12 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
 
         Scoring, the reveal schedule and the in-place write are per-request and
         data-dependent, which is what keeps them out of ``forward_batched``.
-        The iteration index is the engine's loop counter (see ``_loop_step``);
-        everything else comes from step metadata.
+        The iteration index is the one ``prepare_inputs`` took from the loop
+        counter (see ``_loop_step``); everything else comes from step metadata.
         """
         assert inputs is not None, "OmniVoice backbone postprocess needs its inputs"
         meta = request_info.step_metadata
-        k = _loop_step(request_info, inputs.tensor_inputs["step_index"])
+        k = inputs.kwargs["step"]
 
         # Cloned because apply_reveal writes in place and this tensor is the
         # edge the engine routed in from the previous iteration; mutating it

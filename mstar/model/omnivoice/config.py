@@ -117,6 +117,21 @@ class OmniVoiceConfig:
     # Set by _refresh_checkpoint_defaults; None until weights load.
     checkpoint_dtype: str | None = None
 
+    # Replay the backbone's layer stack from CUDA graphs, one per (requests,
+    # packed-token bucket), with attention through the engine's ragged
+    # resource. Eager, a step is launch-bound: ~400 kernels for ~2 ms of GPU
+    # work. ``model_kwargs: {backbone_graphs: false}`` runs the reference's
+    # own packed attention eagerly instead.
+    backbone_graphs: bool = True
+    backbone_capture_batch_sizes: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
+    # Packed tokens per step (both CFG documents of every request); a step
+    # above the largest bucket runs eagerly. Past a few thousand tokens the
+    # step is GPU-bound, eager launches hide behind it, and a bucket's padding
+    # would only add work.
+    backbone_token_buckets: list[int] = field(
+        default_factory=lambda: [256, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096]
+    )
+
     @property
     def audio_embedding_rows(self) -> int:
         """Rows in ``audio_embeddings`` — one codebook's vocab per row block."""

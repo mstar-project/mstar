@@ -18,6 +18,7 @@ from torch import nn
 
 from mstar.model.kokoro.components.albert import PLBert
 from mstar.model.kokoro.components.decoder import Decoder
+from mstar.model.kokoro.components.lstm import MaskedBiLSTM
 from mstar.model.kokoro.components.masking import length_mask, mask_channels, mask_features
 from mstar.model.kokoro.components.prosody import ProsodyPredictor, TextEncoder
 from mstar.model.kokoro.config import KokoroModelConfig
@@ -32,6 +33,11 @@ class KokoroTTS(nn.Module):
         self.predictor = ProsodyPredictor(config)
         self.text_encoder = TextEncoder(config)
         self.decoder = Decoder(config)
+
+    def fuse_lstm_directions(self) -> None:
+        for module in self.modules():
+            if isinstance(module, MaskedBiLSTM):
+                module.fuse()
 
     def _split_style(self, style: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """A pack row is [decoder style, predictor style]."""

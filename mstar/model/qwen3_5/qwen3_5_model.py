@@ -47,6 +47,7 @@ from mstar.model.base import (
     TensorAndMetadata,
     prompt_spans,
 )
+from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -154,6 +155,15 @@ class PrefillStep:
     # one list per name: a `prefill_vision` step carries every span and image
     input_tensors: dict[str, list[TensorPointerInfo]]
     order: tuple[int, ...] = ()
+    # each picked image's or video's (t, h, w) patch grid, as `image_grid_thw`
+    # holds it on the device; the nodes read these instead of syncing on it
+    image_grids: tuple[tuple[int, int, int], ...] = ()
+
+
+# model_kwargs keys: every image's / video's (t, h, w) patch grid, in attachment order
+IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY = "image_grids", "video_grids"
+# the step_metadata key the prefill_vision nodes read the picked grids from
+STEP_GRIDS_KEY = "image_grids"
 
 
 # TODO: implement MoE variants
@@ -164,6 +174,7 @@ class Qwen3_5DenseModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
+    INTERNAL_KWARGS = (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)
 
     def __init__(
         self,
@@ -418,6 +429,36 @@ class Qwen3_5DenseModel(Model):
             )
         return self._video_processor
 
+    def pixel_normalizer(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-column mean and std that turn `process_prompt`'s byte patches
+        into the processors' normalized pixels: their fused rescale-and-
+        normalize, ``(x - mean / rescale) / (std / rescale)``, element for
+        element. One for images and videos, whose processors share it."""
+        processor = self.image_processor
+        video = self.video_processor
+        for name in ("rescale_factor", "image_mean", "image_std", "temporal_patch_size", "patch_size"):
+            if getattr(video, name) != getattr(processor, name):
+                raise ValueError(f"image and video processors disagree on {name}")
+        scale = 1.0 / processor.rescale_factor
+        mean = torch.tensor(processor.image_mean) * scale
+        std = torch.tensor(processor.image_std) * scale
+        # a patch's columns are channel-major (C x T x P x P)
+        per_channel = processor.temporal_patch_size * processor.patch_size ** 2
+        return mean.repeat_interleave(per_channel), std.repeat_interleave(per_channel)
+
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
+        """The decoded image, left uint8 ``(C, H, W)``.
+
+        The base class hands out floats in [0, 1], which `_as_hwc_uint8` only
+        turns back into bytes for the processor: two full-image passes that
+        cost more than the processor itself on a large image.
+        """
+        try:
+            img = read_image(filepath, rgb=True)
+        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
+            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
+        return TensorAndMetadata(img.to(device))
+
     def load_video(self, filepath: str, device: str) -> TensorAndMetadata:
         """Only the frames the video processor samples, on the host whatever
         ``device`` is (see `sample_video`)."""
@@ -445,6 +486,9 @@ class Qwen3_5DenseModel(Model):
             videos=[frames.cpu()],
             video_metadata=[VideoMetadata(**metadata)],
             do_sample_frames=False,
+            # bytes, normalized on the device like images' (`pixel_normalizer`)
+            do_rescale=False,
+            do_normalize=False,
             return_tensors="pt",
         )
         (grid,) = out["video_grid_thw"]
@@ -536,8 +580,15 @@ class Qwen3_5DenseModel(Model):
         segments = split_around_spans(input_ids, spans)
         check_plan(prefill_plan(expand_video_parts(parts, groups)), spans, len(segments))
 
+        # Resized and patchified here, still bytes: the vision encoder
+        # rescales and normalizes on the device (`pixel_normalizer`). That is
+        # a quarter of the bytes to ship, and the float work was most of this
+        # call (43 of 52 ms for a 2560 px image).
         images = [
-            self.image_processor(images=[_as_hwc_uint8(image)], return_tensors="pt")
+            self.image_processor(
+                images=[_as_hwc_uint8(image)], return_tensors="pt",
+                do_rescale=False, do_normalize=False,
+            )
             for image in raw_images
         ]
         videos = [
@@ -549,6 +600,9 @@ class Qwen3_5DenseModel(Model):
         if images:
             result["pixel_values"] = [out["pixel_values"] for out in images]
             result["image_grid_thw"] = [g for out in images for g in out["image_grid_thw"]]
+            # the raw images are not a graph input (the encoder reads
+            # `pixel_values`), so do not ship them to the workers
+            result["image_inputs"] = []
         if videos:
             result["pixel_values_videos"] = [video.pixel_values for video in videos]
             result["video_grid_thw"] = [video.grid for video in videos]
@@ -572,8 +626,17 @@ class Qwen3_5DenseModel(Model):
 
         plan = prefill_plan(expand_video_parts(parts, groups))
         layout = LabelLayout(spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),))
-        # always set, so a `video_groups` the client sent never reaches the schedule
-        return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
+        def host(grids) -> list[tuple[int, ...]]:
+            return [tuple(int(v) for v in g.reshape(-1).tolist()) for g in grids]
+
+        # always set, so a `video_groups` the client sent never reaches the
+        # schedule; the grids ride to the nodes as step metadata
+        return ProcessPromptOutput(result, {
+            "video_groups": groups,
+            "kv_layout": {KV_CACHE: {"main": layout}},
+            IMAGE_GRIDS_KEY: host(result.get("image_grid_thw", [])),
+            VIDEO_GRIDS_KEY: host(result.get("video_grid_thw", [])),
+        })
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
@@ -615,6 +678,7 @@ class Qwen3_5DenseModel(Model):
         input_modalities: list[str],
         signals: dict[str, list[TensorPointerInfo]],
         video_groups: list[int] | None = None,
+        host_grids: dict[str, list] | None = None,
     ) -> list[PrefillStep]:
         """The prefill walks a request runs.
 
@@ -635,6 +699,12 @@ class Qwen3_5DenseModel(Model):
             "image": signals.get("image_grid_thw", []),
             VIDEO: signals.get("video_grid_thw", []),
         }
+        host_grids = host_grids or {}
+        host_pools = {
+            "image": host_grids.get(IMAGE_GRIDS_KEY) or [],
+            VIDEO: host_grids.get(VIDEO_GRIDS_KEY) or [],
+        }
+        picked_grids: list[tuple[int, int, int]] = []
         owners = group_owners(video_groups)
         if len(video_groups) != input_modalities.count(VIDEO):
             logger.warning(
@@ -680,6 +750,8 @@ class Qwen3_5DenseModel(Model):
             if first_group:
                 picked["pixel_values"].append(pool[index])
                 picked["image_grid_thw"].append(grid_pools[step.modality][index])
+                if index < len(host_pools[step.modality]):
+                    picked_grids.append(tuple(host_pools[step.modality][index]))
 
         if not order:
             return []
@@ -692,7 +764,10 @@ class Qwen3_5DenseModel(Model):
         # TODO: one walk holds every image and video, so a many-image prompt
         # makes one very wide step. Cap images per walk here and emit several
         # steps, each with its share of `order`.
-        return [PrefillStep("prefill_vision", picked, tuple(order))]
+        # all or nothing: the nodes fall back to the device grids without them
+        if len(picked_grids) != len(picked["image_grid_thw"]):
+            picked_grids = []
+        return [PrefillStep("prefill_vision", picked, tuple(order), tuple(picked_grids))]
 
     def get_initial_forward_pass_args(
         self,
@@ -702,9 +777,11 @@ class Qwen3_5DenseModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
+        model_kwargs = model_kwargs or {}
         schedule = self._prefill_schedule(
             input_modalities, input_signals,
-            (model_kwargs or {}).get("video_groups"),
+            model_kwargs.get("video_groups"),
+            {key: model_kwargs.get(key) for key in (IMAGE_GRIDS_KEY, VIDEO_GRIDS_KEY)},
         )
         if not schedule:
             # every step was skipped for want of a tensor
@@ -725,15 +802,18 @@ class Qwen3_5DenseModel(Model):
         metadata.kwargs["prefill_schedule"] = schedule[1:]
 
         inputs = self._walk_inputs(step)
+        step_metadata = {
+            "is_prefill": True,
+            "last_prefill": len(schedule) == 1,
+            "prefill_order": step.order,
+        }
+        if step.image_grids:
+            step_metadata[STEP_GRIDS_KEY] = step.image_grids
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
-            step_metadata={
-                "is_prefill": True,
-                "last_prefill": len(schedule) == 1,
-                "prefill_order": step.order,
-            },
+            step_metadata=step_metadata,
         )
 
     @classmethod
@@ -766,6 +846,7 @@ class Qwen3_5DenseModel(Model):
         last_prefill = len(remaining) == 1
 
         order: tuple[int, ...] = ()
+        image_grids: tuple[tuple[int, int, int], ...] = ()
         if metadata.is_prefill and remaining:
             # each prefill step carries its own tensors; only decode reads
             # back what the previous step emitted
@@ -773,6 +854,7 @@ class Qwen3_5DenseModel(Model):
             metadata.graph_walk = step.walk
             inputs = self._walk_inputs(step)
             order = step.order
+            image_grids = step.image_grids
         elif metadata.is_prefill:
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
@@ -790,15 +872,18 @@ class Qwen3_5DenseModel(Model):
                 request_done=True,
             )
 
+        step_metadata = {
+            "is_prefill": metadata.is_prefill,
+            "last_prefill": last_prefill,
+            "prefill_order": order,
+        }
+        if image_grids:
+            step_metadata[STEP_GRIDS_KEY] = image_grids
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
             unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
-            step_metadata={
-                "is_prefill": metadata.is_prefill,
-                "last_prefill": last_prefill,
-                "prefill_order": order,
-            },
+            step_metadata=step_metadata,
         )
 
     # ------------------------------------------------------------------
@@ -873,7 +958,7 @@ class Qwen3_5DenseModel(Model):
             load_qwen3_5_vision_weights(tower, weights_dir, device=device)
             tower.requires_grad_(False).eval()
             logger.info("Loaded Qwen3.5 vision tower onto %s", device)
-            return VisionEncoderSubmodule(tower, self.vision_config)
+            return VisionEncoderSubmodule(tower, self.vision_config, self.pixel_normalizer())
 
         from mstar.model.qwen3_5.weight_loader import load_qwen3_5_weights
 

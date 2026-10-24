@@ -33,7 +33,11 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -94,8 +98,15 @@ class ARSubmodule(ARNodeSubmodule):
     """
 
     disable_torch_compile = True
-    MAX_BATCH_SIZE = 32
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # The top decode bucket is also the cap on rows per AR step; a step
+    # costs about the same at 64 rows as at 32, so 64 streams do not run as
+    # two alternating batches.
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64]
+    MAX_BATCH_SIZE = DECODE_CAPTURE_BATCH_SIZES[-1]
+    # Plain prompts are short (the chat frame around one text). Eager, a
+    # prefill step took ~60 ms of mostly launch-bound stream time on an H200.
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
 
     def __init__(self, slow_ar: FishSlowAR, fast_ar: FishFastAR, config: FishS2ProConfig) -> None:
         super().__init__()
@@ -354,10 +365,29 @@ class ARSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
-        """Capture the whole one-token decode step (both ARs and sampling) per batch bucket."""
+        """Capture the whole one-token decode step (both ARs and sampling) per
+        batch bucket, and prefills packed into token buckets. A voice clone's
+        prefill is the same forward over a prompt that embeds the reference
+        frames, so it replays the same captures when it fits the buckets."""
         del tp_world_size
         dtype = self.slow_ar.semantic_head.dtype
+
+        def prefill_input(num_tokens: int) -> ARNodeInputs:
+            return ARNodeInputs(
+                input_embeds=torch.zeros(num_tokens, self.config.slow_ar.dim, dtype=dtype, device=device),
+                input_seq_len=num_tokens,
+                kwargs={"suppress_eos": True},
+            )
+
         return [
+            PackedAcceleratorGraphConfig(
+                capture_graph_walk="ar_prefill",
+                replay_graph_walks=["ar_prefill", "ar_prefill_clone"],
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=prefill_input,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                compile=False,
+            ),
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="ar_decode",
                 single_request_inputs=ARNodeInputs(
@@ -366,12 +396,14 @@ class ARSubmodule(ARNodeSubmodule):
                     kwargs={"suppress_eos": False},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-                compile=False,
+                compile=True,
             )
         ]
 
     def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        if batch.graph_walk != "ar_decode" or not self.can_batch(batch, model_inputs):
+        if batch.graph_walk not in ("ar_decode", "ar_prefill", "ar_prefill_clone") or not self.can_batch(
+            batch, model_inputs,
+        ):
             return False
         return super().can_use_accelerator_graphs(batch, model_inputs)
 
