@@ -25,6 +25,7 @@ from mstar.engine.resources.base import (
     Resource,
 )
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.resources.kv.manager import _DEBUG_ASSERTS
 from mstar.engine.resources.recurrent.config import (
     RecurrentStateConfig,
     RecurrentStateSpec,
@@ -53,6 +54,12 @@ SINK_SLOT = 0
 NO_SLOT = -1
 
 
+def checkpoint_rows(max_tokens: int, max_bs: int, every: int) -> int:
+    """The checkpoints a captured step of up to ``max_tokens`` tokens over
+    ``max_bs`` rows can write, one each ``every`` tokens of a row."""
+    return (max_tokens + max_bs) // every + 1
+
+
 @dataclass
 class SlotState:
     index: int
@@ -61,6 +68,8 @@ class SlotState:
     # Counts forks into this slot, like `CacheStream.generation`; nothing in
     # the engine reads it yet (the pre-plan tests use it to see a fork land).
     generation: int = 0
+    # tokens the state has taken in, which places its page boundaries
+    tokens: int = 0
 
 
 class SnapshotLease(NamedTuple):
@@ -73,6 +82,20 @@ class SnapshotLease(NamedTuple):
     slot: int | None
     tokens: int
     hit: int
+
+
+class SnapshotWrite(NamedTuple):
+    """A snapshot slot that admit reserved for a prefill row's state at
+    ``offset`` tokens into the row. Commit files it under ``key``."""
+    slot: int
+    offset: int
+    key: bytes
+
+
+class SnapshotTarget(NamedTuple):
+    row: int
+    offset: int
+    slot: int
 
 
 @dataclass(frozen=True)
@@ -89,6 +112,11 @@ class RecurrentAddressing:
     # kernels by them must not read the device copies back
     host_slot_indices: Sequence[int] | None = None
     host_has_state: Sequence[bool] | None = None
+    # The prefill states to save into snapshot slots, and the checkpoint
+    # interval they sit on: a page or a multiple of one, or 0 while the pool
+    # keeps no snapshots.
+    snapshots: Sequence[SnapshotTarget] = ()
+    snapshot_every: int = 0
 
 
 class RecurrentStatePool(Resource):
@@ -142,6 +170,7 @@ class RecurrentStatePool(Resource):
         self._admit_taken: dict[tuple[str, str], int] = {}
 
         self._cg_max_bs = 0
+        self._cg_max_tokens = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
         # (slot_indices, has_state) mirrors per captured buffer: a steady batch
         # addresses the same slots every step, so its copies are skipped
@@ -172,13 +201,17 @@ class RecurrentStatePool(Resource):
         # `_keyed` holds the (rid, label) streams the KV cache keys.
         # `_leases` holds a probe's snapshot until admit, and `_restores` from
         # admit to plan.
+        # `_snap_writes` holds the slots admit reserved for a prefill's states,
+        # by (rid, label, boundary), until commit files them.
         self._keyed: set[tuple[str, str]] = set()
         self._leases: dict[str, SnapshotLease] = {}
         self._restores: dict[tuple[str, str], SnapshotLease] = {}
+        self._snap_writes: dict[tuple[str, str, int], SnapshotWrite] = {}
         # what admits took for prefix reuse, for `rollback_admit`, and the
         # part of it the pre-plan pass took, for `clear_preplan`
         self._admit_restores: list[tuple[str, str]] = []
-        self._preplan_prefix: set[tuple[str, str]] = set()
+        self._admit_snaps: list[tuple[str, str, int]] = []
+        self._preplan_prefix: set[tuple] = set()
 
         logger.info(
             "recurrent state pool: %d usable slots (+%d sink, +%d snapshot) x "
@@ -220,6 +253,9 @@ class RecurrentStatePool(Resource):
             self._drop_lease(rid)
             for key in [k for k in self._restores if k[0] == rid]:
                 self._unref(self._restores.pop(key).slot)
+            # reserved by an admit whose step never committed (its forward raised)
+            for key in [k for k in self._snap_writes if k[0] == rid]:
+                self._snap_free.append(self._snap_writes.pop(key).slot)
             self._keyed -= {k for k in self._keyed if k[0] == rid}
             self._forget_prefix_admit(lambda key: key[0] == rid)
 
@@ -243,6 +279,7 @@ class RecurrentStatePool(Resource):
             else:
                 for slot in labels.values():
                     slot.has_state = False
+                    slot.tokens = 0
 
     def _zero_slot(self, index: int) -> None:
         for tensor in self._blocks.values():
@@ -281,18 +318,25 @@ class RecurrentStatePool(Resource):
         """
         if ctx.capture:
             return ADMIT_OK
-        if self._admit_taken or self._admit_restores:
+        if self._admit_taken or self._admit_restores or self._admit_snaps:
             with self._lock:
                 self._forget_taken(ctx.is_real_row)
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
+        page = self._kv.config.page_size if self._kv is not None else 0
+        every: dict[str, int] = {}
         for segment in step.segments or ():
             if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                 # reads its state without extending it, or a padding row
                 continue
             if self._alloc(segment.request_id, segment.label) is None:
                 return self._out_of_slots(segment.request_id, segment.label)
-            if self._leases:
-                self._admit_restore(segment.request_id, segment.label)
+            if page and (segment.request_id in self._leases or segment.span >= page):
+                label = segment.label
+                if label not in every:
+                    every[label] = self._checkpoint_every(
+                        [seg for seg in step.segments if seg.label == label], ctx,
+                    )
+                self._admit_prefix(segment.request_id, label, segment.span, every[label])
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -300,10 +344,11 @@ class RecurrentStatePool(Resource):
             for _, to_label in (*step.pre_forks, *step.post_forks):
                 if self._alloc(rid, to_label) is None:
                     return self._out_of_slots(rid, to_label)
-        if ctx.is_preplan:
+        if ctx.is_preplan and (self._admit_restores or self._admit_snaps):
             with self._lock:
                 self._preplan_prefix = {
-                    k for k in self._admit_restores if ctx.is_real_row(k[0])
+                    k for k in (*self._admit_restores, *self._admit_snaps)
+                    if ctx.is_real_row(k[0])
                 }
         return ADMIT_OK
 
@@ -313,7 +358,7 @@ class RecurrentStatePool(Resource):
         the slot the other's fork needs, and the pool has no eviction to break
         that."""
         del step
-        if ctx.capture or not (self._admit_taken or self._admit_restores):
+        if ctx.capture or not (self._admit_taken or self._admit_restores or self._admit_snaps):
             return
         with self._lock:
             self._undo_prefix_admit(lambda key: ctx.is_real_row(key[0]))
@@ -415,8 +460,8 @@ class RecurrentStatePool(Resource):
         return self._current
 
     def clear_preplan(self):
-        """Drop the staged plan, and hand back the restores its pre-plan pass
-        took. Staging touched no other live state."""
+        """Drop the staged plan, and give back the restores and snapshot slots
+        its pre-plan pass took. Staging touched no other live state."""
         self._drop_stage()
         with self._lock:
             self._undo_prefix_admit(self._preplan_prefix.__contains__)
@@ -432,7 +477,7 @@ class RecurrentStatePool(Resource):
             # committed, so there is nothing left to unwind
             if self._admit_taken:
                 self._forget_taken(ctx.is_real_row)
-            if self._admit_restores:
+            if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             for segment in step.segments or ():
                 if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
@@ -441,6 +486,9 @@ class RecurrentStatePool(Resource):
                 if slot is not None:
                     # the backend already wrote the pool; a later step resumes
                     slot.has_state = True
+                    slot.tokens += segment.span
+            if self._snap_writes:
+                self._file_writes(step)
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -469,6 +517,7 @@ class RecurrentStatePool(Resource):
             for tensor in self._blocks.values():
                 tensor[:, dst.index].copy_(tensor[:, src.index])
             dst.has_state = src.has_state
+            dst.tokens = src.tokens
             dst.generation += 1
 
     # Prefix reuse: a hit restores the state a snapshot holds at the agreed length
@@ -574,15 +623,68 @@ class RecurrentStatePool(Resource):
         if not self._snap_refs[snap]:
             del self._snap_refs[snap]
 
-    def _admit_restore(self, rid: str, label: str) -> None:
-        """A hit's first step: turn its lease into a restore for plan to copy in."""
+    def _checkpoint_every(self, segments: list[Segment], ctx: StepContext) -> int:
+        """The checkpoint interval of a step over ``segments``: a page, or for a
+        step past the largest captured bucket the smallest page multiple whose
+        checkpoints fit that bucket's shared buffer, so an eager step never
+        allocates more for them than a captured one holds."""
+        page = self._kv.config.page_size
+        if not self._cg_max_tokens:
+            return page
+        spans = [seg.span for seg in segments if seg.span > 0 and not ctx.is_padding_row(seg.request_id)]
+        rows = checkpoint_rows(self._cg_max_tokens, self._cg_max_bs, page)
+        every = page
+        while sum(span // every for span in spans) > rows:
+            every += page
+        return every
+
+    def _admit_prefix(self, rid: str, label: str, span: int, every: int) -> None:
+        """Turn a hit's lease into a restore for plan to copy in, and reserve
+        snapshot slots for the boundaries a prefill row keeps: the row's last
+        boundary, and the KV hit's last boundary when the hit runs past the
+        restored length, both on the step's checkpoint interval ``every``. A row
+        that starts past token 0 and restores nothing keeps none."""
+        page = self._kv.config.page_size
         with self._lock:
+            start = hit = 0
             lease = self._leases.get(rid)
-            if lease is None or lease.label != label or lease.slot is None:
+            if lease is not None and lease.label == label:
+                del self._leases[rid]
+                hit = lease.hit
+                if lease.slot is not None:
+                    self._restores[(rid, label)] = lease
+                    self._admit_restores.append((rid, label))
+                    start = lease.tokens
+            elif self._slots[rid][label].has_state:
                 return
-            del self._leases[rid]
-            self._restores[(rid, label)] = lease
-            self._admit_restores.append((rid, label))
+            if span < page or (rid, label) not in self._keyed:
+                return
+            for boundary in sorted({start + span // every * every, start + (hit - start) // every * every}):
+                if start < boundary <= start + span:
+                    self._reserve_write(rid, label, boundary, boundary - start)
+
+    def _reserve_write(self, rid: str, label: str, boundary: int, offset: int) -> None:
+        """Caller holds the lock."""
+        key = self._kv.chain_key(rid, label, boundary // self._kv.config.page_size)
+        if key is None or key in self._snap_by_key or (rid, label, boundary) in self._snap_writes:
+            return
+        snap = self._reserve_snapshot()
+        if snap is not None:
+            self._snap_writes[(rid, label, boundary)] = SnapshotWrite(snap, offset, key)
+            self._admit_snaps.append((rid, label, boundary))
+
+    def _file_writes(self, step: RecurrentStep) -> None:
+        """Index the states this step's forward saved. Caller holds the lock."""
+        rids = {seg.request_id for seg in step.segments or ()}
+        for key in [k for k in self._snap_writes if k[0] in rids]:
+            write = self._snap_writes.pop(key)
+            if _DEBUG_ASSERTS:
+                chained = self._kv.chain_key(key[0], key[1], key[2] // self._kv.config.page_size)
+                assert write.key == chained, (
+                    f"recurrent state: the snapshot of {key[0]}/{key[1]} at {key[2]} tokens is keyed "
+                    "apart from the KV chain's key there"
+                )
+            self._index(write.slot, write.key)
 
     def _apply_restores(self, step: RecurrentStep) -> None:
         """Copy each restore's snapshot into its slot before the step reads it,
@@ -600,6 +702,7 @@ class RecurrentStatePool(Resource):
                     for tensor in self._blocks.values():
                         tensor[:, slot.index].copy_(tensor[:, restore.slot])
                     slot.has_state = True
+                    slot.tokens = restore.tokens
                     self._snap_meta.move_to_end(restore.slot)
                 self._unref(restore.slot)
 
@@ -624,20 +727,25 @@ class RecurrentStatePool(Resource):
         return True
 
     def _undo_prefix_admit(self, is_mine) -> None:
-        """Turn the restores of the records ``is_mine`` accepts back into
-        leases. Caller holds the lock."""
+        """For each record ``is_mine`` accepts, turn its restore back into a
+        lease and free its reserved snapshot slot. Caller holds the lock."""
         for rid, label in [k for k in self._admit_restores if is_mine(k)]:
             restore = self._restores.pop((rid, label), None)
             if restore is not None:
                 self._leases[rid] = restore
+        for key in [k for k in self._admit_snaps if is_mine(k)]:
+            write = self._snap_writes.pop(key, None)
+            if write is not None:
+                self._snap_free.append(write.slot)
         self._forget_prefix_admit(is_mine)
 
     def _forget_prefix_admit(self, is_mine) -> None:
-        """Drop the rollback record of the restores ``is_mine`` accepts, as
-        `_forget_taken` does slots. Caller holds the lock."""
-        gone = {k for k in self._admit_restores if is_mine(k)}
+        """Drop the rollback record of the restores and snapshot slots
+        ``is_mine`` accepts, as `_forget_taken` does slots. Caller holds the lock."""
+        gone = {k for k in (*self._admit_restores, *self._admit_snaps) if is_mine(k)}
         if gone:
             self._admit_restores = [k for k in self._admit_restores if k not in gone]
+            self._admit_snaps = [k for k in self._admit_snaps if k not in gone]
             self._preplan_prefix -= gone
 
     # Addressing
@@ -673,6 +781,18 @@ class RecurrentStatePool(Resource):
                     pending_forks.get((seg.request_id, label), slot.has_state)
                 )
 
+        snapshots = ()
+        if self._snap_writes and not ctx.capture:
+            with self._lock:
+                by_rid: dict[str, list[SnapshotWrite]] = {}
+                for (rid, written, _), write in self._snap_writes.items():
+                    if written == label:
+                        by_rid.setdefault(rid, []).append(write)
+            snapshots = tuple(
+                SnapshotTarget(row, write.offset, write.slot)
+                for row, seg in enumerate(segments) for write in by_rid.get(seg.request_id, ())
+            )
+
         num_rows = len(indices)
         target, mirrors = self._addressing_buffers(label, ctx, num_rows)
         # Built on the host and copied in. The tail is cleared too: a recurrent
@@ -693,6 +813,11 @@ class RecurrentStatePool(Resource):
             # changes them after
             host_slot_indices=indices,
             host_has_state=has_state,
+            snapshots=snapshots,
+            snapshot_every=(
+                self._checkpoint_every(segments, ctx) if snapshots
+                else self._kv.config.page_size if self._kv is not None else 0
+            ),
         )
 
     def _addressing_buffers(
@@ -747,10 +872,11 @@ class RecurrentStatePool(Resource):
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
-        del slots, max_seq_len
+        del slots
         # per-key buffers are built on first plan; every runner calls in, so
         # keep the largest
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
+        self._cg_max_tokens = max(self._cg_max_tokens, max_seq_len)
 
     def cleanup(self):
         self._blocks.clear()
