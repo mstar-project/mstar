@@ -24,8 +24,12 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
+import http.client
+import logging
 import math
 import re
+import ssl
+import urllib.error
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,6 +37,8 @@ from typing import TYPE_CHECKING
 from mstar.api_server import media_io
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -622,19 +628,49 @@ class KokoroAdapter(OpenAIAdapter):
         )
 
 
+# A ref_audio URL that did not deliver: an HTTP error status or a refused
+# redirect (HTTPError), DNS or connect failures (URLError), a timeout, a dropped
+# connection, a TLS failure or a body cut short. These are the request's fault.
+_REF_AUDIO_FETCH_ERRORS = (
+    urllib.error.URLError,
+    http.client.HTTPException,
+    TimeoutError,
+    ConnectionError,
+    ssl.SSLError,
+)
+
+
+def _ref_audio_fetch_failure(exc: BaseException) -> str:
+    """What went wrong with a ref_audio fetch, in words that name no server path."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    return type(exc).__name__
+
+
 def _resolve_ref_audio(ref: str, upload_dir: Path, decoder: str) -> str:
     """A reference voice clip from the request: a data URL, an http(s) URL (only
     when the server allows remote fetch), or bare base64 that ``decoder`` (the
     model's audio loader) can open. Returns its path. Every form gets the same
     ``check_ref_audio``, so a clip the data worker would fail on, or one longer
-    than ``MAX_REF_AUDIO_SECONDS``, is a 400 here."""
+    than ``MAX_REF_AUDIO_SECONDS``, is a 400 here.
+
+    A clip that is not audio, malformed base64 and a failed fetch are 400s.
+    Failing to store the clip (a full disk, ``upload_dir`` permissions) is the
+    server's fault: a 500 whose text, like the 400s, names no server path."""
     if not isinstance(ref, str):
         raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
-    if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
-        path = media_io.resolve_media_ref(ref, upload_dir)[1]
-        media_io.check_ref_audio(path, decoder)
-        return path
-    path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    try:
+        if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+            try:
+                path = media_io.resolve_media_ref(ref, upload_dir)[1]
+            except _REF_AUDIO_FETCH_ERRORS as exc:
+                raise ValueError(f"could not fetch ref_audio ({_ref_audio_fetch_failure(exc)})") from exc
+            media_io.check_ref_audio(path, decoder)
+            return path
+        path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    except OSError as exc:
+        logger.error("could not store a ref_audio upload under %s: %r", upload_dir, exc)
+        raise RuntimeError("the server could not store ref_audio") from None
     if path:
         return path
     raise ValueError(
@@ -720,6 +756,45 @@ class FishS2ProAdapter(OpenAIAdapter):
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
+class VoxCPM2Adapter(OpenAIAdapter):
+    """VoxCPM2: multilingual TTS at 48 kHz, with voice design and cloning.
+
+    The mode follows from what the caller sends, as in the reference:
+    ``instructions`` (or ``instruct``) designs a voice from a description,
+    ``ref_audio`` clones one, and ``ref_audio`` + ``ref_text`` continues the
+    clip ("ultimate cloning"). ``ref_audio`` is a data URL, bare base64 audio
+    that soundfile (the model's loader) opens, or, when the server allows
+    remote media, an http(s) URL. A request cannot name a file on the server,
+    not even one under ``upload_dir``. ``voice`` is required by the OpenAI
+    schema but VoxCPM2 has no named voices, so it is dropped, as is ``speed``.
+    ``seed`` fixes the diffusion noise; ``cfg_value``, ``min_len`` and
+    ``max_new_tokens`` (patches of 160 ms) pass through ``extra_body``.
+    """
+
+    supports_speech = True
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        file_paths = None
+        input_modalities = ["text"]
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            file_paths = {"audio": [_resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")]}
+            input_modalities = ["text", "audio"]
+        return SubmitArgs(
+            text=req.input,
+            file_paths=file_paths,
+            input_modalities=input_modalities,
             output_modalities=["audio"],
             model_kwargs=mk,
         )
@@ -1187,6 +1262,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "qwen3_tts_voicedesign": Qwen3TTSAdapter(),
     "qwen3_tts_base": Qwen3TTSAdapter(),
     "kokoro": KokoroAdapter(),
+    "voxcpm2": VoxCPM2Adapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_edge": Cosmos3EdgeAdapter(),

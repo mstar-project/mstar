@@ -280,6 +280,110 @@ def test_speech_maps_adapter_errors(client_and_stub, monkeypatch, exc, status):
     assert stub.last_submit is None
 
 
+def _wav_data(seconds: float = 1.0, rate: int = 16000) -> bytes:
+    import math
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        n = int(seconds * rate)
+        wf.writeframes(np.array([int(8000 * math.sin(i * 0.05)) for i in range(n)], dtype="<i2").tobytes())
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "voxcpm2"])
+@pytest.mark.parametrize("form", ["data URL", "base64", "URL"])
+@pytest.mark.parametrize("error", ["full disk", "permissions"])
+def test_voice_clone_upload_the_server_cannot_store_is_a_500_without_its_path(
+    client_and_stub, monkeypatch, model, form, error
+):
+    """A full disk or an unwritable upload_dir is the server's fault, not the
+    request's: a 500, and its text does not name where uploads go. Every form
+    is written before it is decoded, so this needs no audio library."""
+    import errno
+
+    from mstar.api_server import media_io
+
+    client, stub = client_and_stub
+    stub.model_name = model
+    wav = _wav_data()
+    if form == "URL":
+        monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+
+        class _Response(io.BytesIO):
+            headers = None
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout: _Response(wav))
+    tried = []
+
+    def refuse(self, data):
+        tried.append(str(self))
+        if error == "full disk":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        raise PermissionError(errno.EACCES, "Permission denied", str(self))
+
+    monkeypatch.setattr(media_io.Path, "write_bytes", refuse)
+    ref = {
+        "data URL": "data:audio/wav;base64," + base64.b64encode(wav).decode(),
+        "base64": base64.b64encode(wav).decode(),
+        "URL": "https://example.test/voice.wav",
+    }[form]
+    r = client.post("/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": ref})
+    assert tried, "the upload was never written"
+    assert r.status_code == 500, r.text
+    message = r.json()["error"]["message"]
+    assert message == "the server could not store ref_audio"
+    assert str(stub.upload_dir) not in r.text
+    assert stub.last_submit is None
+
+
+@pytest.mark.parametrize("model", ["qwen3_tts_base", "voxcpm2"])
+@pytest.mark.parametrize(
+    "error, shown",
+    [
+        ("HTTPError", "HTTP 404"),
+        ("URLError", "URLError"),
+        ("TimeoutError", "TimeoutError"),
+        ("ConnectionResetError", "ConnectionResetError"),
+        ("IncompleteRead", "IncompleteRead"),
+        ("SSLError", "SSLError"),
+    ],
+)
+def test_voice_clone_failed_fetch_is_a_400_without_details(client_and_stub, monkeypatch, model, error, shown):
+    """A ref_audio URL that does not deliver is the request's fault; the 400
+    names the kind of failure only, not the exception's text."""
+    import http.client
+    import ssl
+    import urllib.error
+
+    client, stub = client_and_stub
+    stub.model_name = model
+    secret = f"{stub.upload_dir}/leak.wav"
+    exc = {
+        "HTTPError": urllib.error.HTTPError("https://example.test/v.wav", 404, secret, None, None),
+        "URLError": urllib.error.URLError(OSError(2, "No such file", secret)),
+        "TimeoutError": TimeoutError(secret),
+        "ConnectionResetError": ConnectionResetError(104, secret),
+        "IncompleteRead": http.client.IncompleteRead(secret.encode(), 99),
+        "SSLError": ssl.SSLError(1, secret),
+    }[error]
+
+    def fail(url, timeout):
+        raise exc
+
+    monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    r = client.post(
+        "/v1/audio/speech", json={"model": model, "input": "hi", "ref_audio": "https://example.test/v.wav"}
+    )
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["message"] == f"could not fetch ref_audio ({shown})"
+    assert str(stub.upload_dir) not in r.text and "leak" not in r.text
+    assert stub.last_submit is None
+
+
 @pytest.mark.parametrize("seed,status", [(2**63 - 1, 200), (-(2**63), 200), (2**63, 422), (-(2**63) - 1, 422)])
 def test_speech_seed_is_an_int64(client_and_stub, seed, status):
     client, stub = client_and_stub
