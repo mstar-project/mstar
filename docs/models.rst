@@ -296,71 +296,34 @@ client sends.
 Command A+ (``command_a_plus``)
 -------------------------------
 
-Text chat on Command A+: 32 layers, 128 routed experts (top-8) plus an
-always-on shared expert, and three sliding-window (4096) layers for every
-global one. Only the text backbone is loaded; the vision tower is skipped.
-Served on ``POST /generate`` (there is no OpenAI adapter yet)::
+Text chat on Command A+: 32 MoE layers (128 routed experts, top-8, plus an
+always-on shared expert), with three sliding-window (4096) layers for every
+global one. Only the text backbone is loaded. Served on ``POST /generate``
+(there is no OpenAI adapter yet)::
 
     mstar serve command_a_plus --gpus 0,1,2,3
 
-The ~437 GB of BF16 weights are never downloaded automatically. Download the
-checkpoint, set ``model_kwargs.checkpoint_dir`` in
-``configs/command_a_plus_tp4.yaml``, and launch; without it, workers stop
-with a missing-weights error before allocating parameters. Tokenizer and
-config metadata are pinned to one checkpoint revision. The default config is
-TP4 with a 65536-token ``max_seq_len``. ``configs/command_a_plus_tp8.yaml``
-targets 8x 80 GB GPUs and has not been run with the fused decode path below.
-
-Install the ``command_a_plus`` extra (FlashInfer >= 0.6.18). The fused-MoE
-alignment op JIT-builds against the local CUDA toolkit, so point ``CUDA_HOME``
-at a toolkit matching PyTorch's CUDA version; otherwise it falls back to a
-slower torch implementation.
+Install the ``command_a_plus`` extra, and point ``CUDA_HOME`` at a toolkit
+matching PyTorch's CUDA version so the fused-MoE alignment op can JIT-build.
+The ~437 GB of BF16 weights are never downloaded automatically: download the
+checkpoint and set ``model_kwargs.checkpoint_dir`` in
+``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
+``max_seq_len``). Tokenizer and config metadata are pinned to one checkpoint
+revision. ``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs.
 
 ``model_kwargs={"messages": [{"role": ..., "content": ...}, ...]}`` with
 ``system`` / ``user`` / ``assistant`` turns goes through the chat template; a
 plain ``text`` prompt is one user turn. Sampling defaults to temperature 0.9,
-top-p 0.95 and repetition penalty 1.04. The model reasons before answering
-(``<|START_THINKING|>...<|END_THINKING|><|START_TEXT|>...<|END_TEXT|>``), so
-give it a generous ``max_output_tokens``. A prompt plus ``max_output_tokens``
+top-p 0.95 and repetition penalty 1.04. The model reasons before answering, so
+give it a generous ``max_output_tokens``; a prompt plus ``max_output_tokens``
 (2048 when unset) longer than ``max_seq_len`` is rejected.
 
-Decode runs in CUDA graphs over a fused path that concatenates each layer's
-projections into two GEMMs, all-reduces once per layer, and uses Triton
-kernels for the norms, routing, SwiGLU and output projection. The all-reduce
-is FlashInfer's one-kernel all-reduce (``tp_allreduce: flashinfer`` in the
-configs) up to 2048 tokens, and NCCL when that workspace can't be set up. On 4x GB200 at TP4 with
-``MSTAR_TP_ASYNC_SCHED=1`` and the Rust graph runtime, ``bench_http.py`` with
-256-token replies measures:
-
-.. list-table::
-   :header-rows: 1
-
-   * - Concurrent requests
-     - Total tok/s
-     - Time to first token
-     - Time per output token
-   * - 1
-     - 287
-     - 40 ms
-     - 3.3 ms
-   * - 8
-     - 1557
-     - 115 ms
-     - 4.7 ms
-   * - 32
-     - 3173
-     - 169 ms
-     - 9.4 ms
-   * - 64
-     - 3647
-     - 262 ms
-     - 16.4 ms
-
-Against the Hugging Face reference (``benchmark/command_a_plus/validate_checkpoint.py``,
-three prompts x 32 steps), the argmax matches at 96/96 steps and greedy output
-matches on all three prompts. ``bench_http.py`` in the same directory benchmarks
-a running deployment. Not supported yet: image input, FP8 weights,
-prefill CUDA graphs, and reclaiming the KV pages that fall outside the sliding
+On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
+Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer``).
+On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
+64 (``benchmark/command_a_plus/bench_http.py``); ``validate_checkpoint.py``
+there checks parity against Hugging Face. Not supported yet: image input, FP8
+weights, prefill CUDA graphs, and reclaiming KV pages outside the sliding
 window.
 
 Kokoro notes
