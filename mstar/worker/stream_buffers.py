@@ -154,9 +154,13 @@ class StreamBufferManager:
         consumer_walk = (
             self._partition_walk(request_id, partition) if partition else None
         )
-        if not sbuf.has_chunk_ready(consumer_walk) or not self._enter_chunk_walk(
-            sbuf, edge_name, request_id, allow_walk_change,
-        ):
+        if not sbuf.has_chunk_ready(consumer_walk):
+            # a walk-driven buffer's readiness also moves with its consumer's
+            # walk, which no buffer event reports, so it is never skipped
+            if partition is None:
+                sbuf.maybe_ready = False
+            return None
+        if not self._enter_chunk_walk(sbuf, edge_name, request_id, allow_walk_change):
             return None
         chunk = sbuf.pop_chunk()
         # The chunk's items as the buffer holds them: their tensor infos, or
@@ -179,10 +183,13 @@ class StreamBufferManager:
         return StreamingEdge(edge, chunk.info)
 
     def poll(self) -> list[tuple[int, StreamingEdge]]:
-        """Every request's ready chunks, popped."""
+        """Every request's ready chunks, popped. A buffer nothing has touched
+        since a poll found it empty is skipped (``StreamBuffer.maybe_ready``)."""
         polled: list[tuple[int, StreamingEdge]] = []
         for request_id, req_info in list(self._request_state.per_request_info.items()):
             for edge_name, sbuf in req_info.stream_buffers.items():
+                if not sbuf.maybe_ready:
+                    continue
                 streaming_edge = self.pop_edge(sbuf, edge_name, request_id)
                 if streaming_edge is not None:
                     polled.append((request_id, streaming_edge))
