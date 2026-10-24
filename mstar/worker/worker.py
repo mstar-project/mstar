@@ -1440,6 +1440,13 @@ class Worker:
         """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
         self.wakeup_event.drain()
         ready = self.tensor_manager.get_ready_tensors()
+        failed = {
+            f.request_id: f"Error in worker: input tensor read failed: {type(f.error).__name__}: {f.error}"
+            for f in self.tensor_manager.take_failed_reads()
+            if f.request_id not in self.scheduler.failed_rids
+        }
+        if failed:
+            self._fail_requests(failed)
         for request_id, edges in ready.items():
             # Separate streaming edges from normal edges
             streaming = [e for e in edges if e.is_streaming]
