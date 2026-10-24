@@ -30,6 +30,8 @@ import torch.nn.functional as F
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
     PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
@@ -42,7 +44,7 @@ from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInput
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
 from mstar.model.vjepa2.components.vit_encoder import VJEPA2Encoder
-from mstar.model.vjepa2.config import ATTN, KV_CACHE, VJepa2Config
+from mstar.model.vjepa2.config import AC_ROLLOUT_NUM_FRAMES, ATTN, KV_CACHE, VJepa2Config
 
 # the AC predictor's transformer block loop, as a piecewise capture region
 BLOCK_LOOP_REGION = "block_loop"
@@ -143,11 +145,53 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        return NodeInputs(
-            tensor_inputs={
-                "video_frames": _normalize_video_frames(inputs["video_frames"][0])
-            }
-        )
+        frames = _normalize_video_frames(inputs["video_frames"][0])
+        return NodeInputs(tensor_inputs={"video_frames": frames}, input_seq_len=frames.size(1))
+
+    # AC rollout clips: 8 frames, each encoded as a 2-frame self-tubelet of 256
+    # tokens, which leaves the ViT-g forward launch-bound (about the same time
+    # at 1 clip as at 16), so it replays a captured graph.
+    _AC_ROLLOUT_WALKS = ("prefill_video_rollout", "prefill_video_rollout_streaming")
+
+    def _ac_rollout_key(self) -> tuple[int, int]:
+        return (AC_ROLLOUT_NUM_FRAMES, self.config.crop_size)
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1
+    ) -> list[AcceleratorGraphConfig]:
+        del tp_world_size
+        if self.config.predictor_kind != "ac":
+            return []
+        frames, size = self._ac_rollout_key()
+        clip = torch.zeros((1, frames, self.config.in_chans, size, size), dtype=torch.float32, device=device)
+        return [BatchedAcceleratorGraphConfig(
+            capture_graph_walk=self._AC_ROLLOUT_WALKS[0],
+            replay_graph_walks=list(self._AC_ROLLOUT_WALKS),
+            single_request_inputs=NodeInputs(tensor_inputs={"video_frames": clip}, input_seq_len=frames),
+            capture_batch_sizes=[1, 2, 4],
+            capture_forward_method="forward_batched",
+            additional_key_info=self._ac_rollout_key(),
+            input_seq_dims={"pixel_values_videos": 0},
+            # The engine's own compile of the eager forward; max-autotune's
+            # kernels move this encoder's output by ~4% (relative L2).
+            compile_mode="default",
+        )]
+
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None, **kwargs,
+    ) -> tuple[int, int] | None:
+        """The AC rollout capture for a batch of full 8-frame clips at the crop
+        size, else None (eager): a shorter clip encodes a different shape."""
+        del per_request_input_metadata, kwargs
+        if self.config.predictor_kind != "ac" or graph_walk not in self._AC_ROLLOUT_WALKS:
+            return None
+        frames, size = self._ac_rollout_key()
+        want = (frames, self.config.in_chans, size, size)
+        for info in per_request_info.values():
+            if tuple(info.step_metadata.get("video_shape") or ()) != want:
+                return None
+        return self._ac_rollout_key()
 
     def preprocess(
         self,

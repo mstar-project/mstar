@@ -3,6 +3,7 @@
 # ---------------------------------------------------------------------------
 
 
+import functools
 import logging
 import os
 from collections.abc import Mapping
@@ -46,6 +47,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StackingMethod,
 )
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,137 @@ def vit_patches(
     height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)
     height, width = _VIT_TRANSFORM.resize_transform.target_size(height, width)
     return (height // patch_size) * (width // patch_size)
+
+
+# The image_gen denoise Loop. Named so its iteration count reaches the LLM
+# node through ``fwd_info.dynamic_loop_iter_counts`` (an unnamed Loop gets a
+# random uuid), which is how the step knows its timestep on the host.
+IMAGE_GEN_LOOP = "image_gen_loop"
+
+# Rides on ``NodeInputs.kwargs`` from ``prepare_inputs`` to ``declare_step`` and
+# the forward: how many CFG branches (1, 2 or 3) this image_gen step runs.
+# Absent means the old behaviour, all three whenever guidance is on.
+CFG_BRANCHES = "cfg_branches"
+
+# Output sizes whose image_gen shape inputs an LLM node keeps on the device: above
+# the shipped configs' concurrency (16), so concurrent sizes don't evict each other.
+# An entry is the size's position ids and indexes, tens of KB at 1024x1024.
+_IMAGE_GEN_SHAPES_CACHED = 64
+
+
+def _f32(x: float) -> float:
+    """``x`` rounded to float32, as a device compare against a Python scalar sees it."""
+    return float(torch.tensor(float(x), dtype=torch.float32))
+
+
+@functools.lru_cache(maxsize=4096)
+def image_gen_timestep(time_index: int, num_timesteps: int, shift: float) -> float:
+    """Host copy of the shifted timestep ``_forward_image_gen`` computes on the
+    device for iteration ``time_index``, with the same float32 ops in the same
+    order so the CFG-interval test agrees with the one the old code ran there.
+    Memoized: a request's schedule is a handful of distinct values."""
+    t_uniform = 1.0 - torch.tensor([float(time_index)], dtype=torch.float32) / (num_timesteps - 1)
+    return float(LLMSubmodule._apply_timestep_shift(t=t_uniform, shift=shift)[0])
+
+
+@functools.lru_cache(maxsize=4096)
+def cfg_branches(
+    t_value: float, cfg_interval: tuple[float, float], text_scale: float, img_scale: float,
+) -> int:
+    """How many CFG branches an image_gen step has to run at timestep ``t_value``.
+
+    1 (main only): guidance off, or ``t_value`` outside ``(lo, hi]``. The old
+       combine then ran with both effective scales at exactly 1.0, which is
+       ``v_main`` up to float rounding (``a + 1 * (b - a)``, and a renorm ratio
+       ``|v_main| / (|v_main| + 1e-8)`` clamped to <= 1).
+    2 (main, cfg_text): in the interval with ``img_scale <= 1``; the old combine
+       never read ``v_cfg_img`` then (``effective_img_scale > 1.0`` was False).
+    3 (main, cfg_text, cfg_img): in the interval with image guidance on.
+
+    The bounds are compared at float32, as the old device-side compare did.
+    ``cfg_interval`` must be hashable (a tuple); callers convert a list.
+    """
+    if not (text_scale > 1.0 or img_scale > 1.0):
+        return 1
+    lo, hi = cfg_interval
+    if not (_f32(lo) < t_value <= _f32(hi)):
+        return 1
+    return 3 if img_scale > 1.0 else 2
+
+
+def image_gen_branches(inputs: list) -> int:
+    """The CFG branch count a guidance-on image_gen batch declares and runs:
+    what ``prepare_inputs`` stamped, or 3 (every branch) where it stamped
+    nothing — pruning off, or the old callers that predate it. The walk is
+    never batched; ``max`` keeps a hypothetical batch on the superset."""
+    return max(inp.kwargs.get(CFG_BRANCHES, 3) for inp in inputs)
+
+
+# The CFG branches in the order `cfg_branches` counts them: a step running n branches runs the first n.
+CFG_BRANCH_LABELS = ("main", "cfg_text", "cfg_img")
+
+
+def cfg_branch_skipped(label: str, n_branches: int | None) -> bool:
+    """Whether the parallel-CFG node owning ``label`` sits out a step that runs ``n_branches``
+    (None: no count was stamped, so every branch runs)."""
+    return n_branches is not None and CFG_BRANCH_LABELS.index(label) >= n_branches
+
+
+def sat_out_velocity(latents: torch.Tensor) -> torch.Tensor:
+    """What a parallel-CFG node sends for a step it sits out: a zero-row velocity.
+
+    Each node counts the step's branches from its own worker's loop counter, so
+    ``combine_cfg`` checks this on the host rather than trusting the counts agree;
+    a placeholder of the velocity's shape would pass for a computed one.
+    """
+    return latents.new_empty((0, latents.shape[-1]))
+
+
+def combine_cfg_velocity(
+    v_main: torch.Tensor,
+    v_cfg_text: torch.Tensor,
+    v_cfg_img: torch.Tensor | None,
+    text_scale,
+    img_scale,
+    renorm_type: str,
+    renorm_min: float,
+) -> torch.Tensor:
+    """BAGEL's two-node CFG velocity combine plus renormalization.
+
+    ``v_cfg_img=None`` means the image branch did not run; that is only valid
+    where ``img_scale <= 1``, when the image term is skipped anyway. The scales
+    may be Python floats (pruned path, decided on the host) or 0-dim device
+    tensors (the old path, where ``img_scale > 1.0`` is a host sync).
+    """
+    apply_img = v_cfg_img is not None and img_scale > 1.0
+    if renorm_type == "text_channel":
+        # text_channel: renorm AFTER text CFG, THEN apply image CFG
+        v_text_guided = v_cfg_text + text_scale * (v_main - v_cfg_text)
+        norm_v = torch.norm(v_main, dim=-1, keepdim=True)
+        norm_v_text = torch.norm(v_text_guided, dim=-1, keepdim=True)
+        scale = (norm_v / (norm_v_text + 1e-8)).clamp(min=renorm_min, max=1.0)
+        v_text_renormed = v_text_guided * scale
+        if apply_img:
+            return v_cfg_img + img_scale * (v_text_renormed - v_cfg_img)
+        return v_text_renormed
+
+    # global / channel: apply both text+image CFG, THEN renorm
+    v_text_guided = v_cfg_text + text_scale * (v_main - v_cfg_text)
+    if apply_img:
+        v_combined = v_cfg_img + img_scale * (v_text_guided - v_cfg_img)
+    else:
+        v_combined = v_text_guided
+
+    if renorm_type == "channel":
+        renorm_scale = (
+            v_main.norm(dim=-1, keepdim=True) /
+            (v_combined.norm(dim=-1, keepdim=True) + 1e-8)
+        ).clamp(min=renorm_min, max=1.0)
+    else:
+        renorm_scale = (
+            v_main.norm() / (v_combined.norm() + 1e-8)
+        ).clamp(min=renorm_min, max=1.0)
+    return v_combined * renorm_scale
 
 
 def vae_latents(
@@ -232,9 +365,9 @@ class ViTEncoderSubmodule(NodeSubmodule):
             "not the count `vit_patches` gives a layout to key it by"
         )
 
-        cu_seqlens = torch.tensor(
-            [0, num_tokens], dtype=torch.int32, device=device
-        )
+        # not `torch.tensor(..., device=)`: that syncs the stream, which held this request's
+        # prepare until the in-flight decode steps of others had finished
+        cu_seqlens = to_device_nonblocking(torch.tensor([0, num_tokens], dtype=torch.int32), device)
 
         return NodeInputs(
             tensor_inputs={
@@ -754,6 +887,44 @@ class LLMSubmodule(ARNodeSubmodule):
         self.eoi_token_id = eoi_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+        # image_gen runs only the CFG branches a step needs (`cfg_branches`)
+        self._cfg_prune = config.cfg_prune
+        # least recently used first; bounded, since the output size is the client's
+        self._image_gen_shape_cache: dict[tuple, dict[str, torch.Tensor]] = {}
+        self._sentinel_ids: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._warned_loop_counter = False
+
+    def _image_gen_cfg_branches(
+        self, fwd_info: CurrentForwardPassInfo, first_iter: bool,
+    ) -> int | None:
+        """The branch count for this request's image_gen step, decided on the
+        host from the loop counter, or None for the old always-three behaviour.
+
+        The counter is the step's ``time_index`` (0 on the iteration that
+        seeds the latents, +1 per Euler step). If it disagrees with whether
+        the latents were seeded here, the counter is not tracking this loop,
+        and guessing the timestep would change the output, so fall back.
+        """
+        meta = fwd_info.step_metadata
+        if not (self._cfg_prune and meta.get("requires_cfg", False)):
+            return None
+        k = fwd_info.dynamic_loop_iter_counts.get(IMAGE_GEN_LOOP, 0)
+        if (k == 0) != first_iter:
+            if not self._warned_loop_counter:
+                self._warned_loop_counter = True
+                logger.warning(
+                    "BAGEL image_gen: loop counter %r reads %d on a %s iteration; "
+                    "running all CFG branches", IMAGE_GEN_LOOP, k,
+                    "first" if first_iter else "later",
+                )
+            return None
+        t = image_gen_timestep(k, self.config.num_timesteps, self.config.timestep_shift)
+        return cfg_branches(
+            t,
+            tuple(meta.get("cfg_interval", self.config.cfg_interval)),
+            meta.get("cfg_text_scale", self.config.cfg_text_scale),
+            meta.get("cfg_img_scale", self.config.cfg_img_scale),
+        )
 
     def _get_image_pos_ids(
         self, labels: list[str],
@@ -778,8 +949,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self, seq_len: int, device: str
     ):
         tensor_inputs = {}
-        tensor_inputs["text_indexes"] = torch.tensor(
-            [0, seq_len-1], dtype=torch.long, device=device
+        tensor_inputs["text_indexes"] = to_device_nonblocking(
+            torch.tensor([0, seq_len-1], dtype=torch.long), device
         )
         tensor_inputs["vae_token_indexes"] = torch.arange(
             1, seq_len-1,
@@ -909,22 +1080,23 @@ class LLMSubmodule(ARNodeSubmodule):
             node_inputs.tensor_inputs = self._get_text_vae_idxs(seq_len, device)
 
         if graph_walk in ("image_gen", "image_gen_cfg"):
-            tensor_inputs = {}
             H = fwd_info.step_metadata.get("height", 1024)
             W = fwd_info.step_metadata.get("width", 1024)
-
-            tensor_inputs["vae_position_ids"] = get_flattened_position_ids_extrapolate(
-                H, W,
-                self.config.latent_downsample,
-                max_num_patches_per_side=self.config.max_latent_size
-            )
-            if "latents" not in inputs or len(inputs["latents"]) == 0:
+            shape_inputs = self._image_gen_shape_inputs(H, W, device)
+            tensor_inputs = {"vae_position_ids": shape_inputs["vae_position_ids"]}
+            first_iter = "latents" not in inputs or len(inputs["latents"]) == 0
+            if first_iter:
                 node_inputs.input_embeds, tensor_inputs["time_index"] = _init_latents_and_time_index(
                     self.config, device, seed=fwd_info.random_seed, H=H, W=W
                 )
             else:
                node_inputs.input_embeds = inputs["latents"][0]
                tensor_inputs["time_index"] = inputs["time_index"][0]
+
+            if graph_walk in ("image_gen", "image_gen_cfg"):
+                n_branches = self._image_gen_cfg_branches(fwd_info, first_iter)
+                if n_branches is not None:
+                    node_inputs.kwargs[CFG_BRANCHES] = n_branches
 
             tensor_inputs["empty_combined_emb"] = self._wrap_with_boi_eoi(
                 torch.empty(
@@ -941,10 +1113,36 @@ class LLMSubmodule(ARNodeSubmodule):
             )
             node_inputs.tensor_inputs = {
                 **tensor_inputs,
-                **self._get_text_vae_idxs(seq_len, device)
+                "text_indexes": shape_inputs["text_indexes"],
+                "vae_token_indexes": shape_inputs["vae_token_indexes"],
+                "text_mask": shape_inputs["text_mask"],
             }
 
         return node_inputs
+
+    def _image_gen_shape_inputs(self, H: int, W: int, device) -> dict[str, torch.Tensor]:
+        """The image_gen inputs that depend only on the output size, on the device, built once.
+
+        Building them per step copied host data to the device (``torch.tensor(..., device=)`` and
+        a CPU ``vae_position_ids`` indexing a device table), each a stream sync that held the next
+        step's ``prepare_inputs`` until the current step had finished. Read-only downstream.
+        """
+        key = (H, W, str(device))
+        cache = self._image_gen_shape_cache
+        cached = cache.pop(key, None)
+        if cached is None:
+            pos = get_flattened_position_ids_extrapolate(
+                H, W, self.config.latent_downsample, max_num_patches_per_side=self.config.max_latent_size,
+                device=device,
+            )
+            cached = {
+                "vae_position_ids": pos,
+                **self._get_text_vae_idxs(pos.shape[0] + IMAGE_SENTINELS, device),
+            }
+        cache[key] = cached
+        if len(cache) > _IMAGE_GEN_SHAPES_CACHED:
+            del cache[next(iter(cache))]
+        return cached
 
     def declare_step(
         self,
@@ -963,8 +1161,19 @@ class LLMSubmodule(ARNodeSubmodule):
         the batch runs them rides in on ``NodeInputs.resource_step_info`` from
         ``prepare_inputs``.
         """
+        if graph_walk == "image_gen_cfg" and all(
+            cfg_branch_skipped(NODE_TO_CFG_LABEL.get(self.node_name, "main"), inp.kwargs.get(CFG_BRANCHES))
+            for inp in inputs
+        ):
+            # this branch sits the step out (`cfg_branches`): no plan, no attention
+            return None
         requires_cfg = requires_cfg_for_inputs(inputs)
         labels = self._get_active_labels(graph_walk, requires_cfg)
+        if graph_walk == "image_gen" and requires_cfg:
+            # Only the branches this step runs (`cfg_branches`): labels are
+            # ordered main, cfg_text, cfg_img, so the first n. One branch is
+            # the plain "main" step below; the forward reads the same count.
+            labels = labels[:image_gen_branches(inputs)]
         spans = tuple(inp.input_seq_len for inp in inputs)
 
         # Label-major, matching how a combined plan concatenates its sources;
@@ -981,9 +1190,9 @@ class LLMSubmodule(ARNodeSubmodule):
             ] for label in labels
         }
 
-        if graph_walk == "image_gen" and requires_cfg:
-            # Batched CFG: one combined plan across all three labels so
-            # image_gen runs one forward instead of three. The frozen caches
+        if graph_walk == "image_gen" and len(labels) > 1:
+            # Batched CFG: one combined plan across the active branch labels
+            # so image_gen runs one forward instead of n. The frozen caches
             # never grow during flow matching, so nothing commits.
             pos_ids = [
                 tensor for label in labels for tensor in per_label_pos_ids[label]
@@ -1123,6 +1332,13 @@ class LLMSubmodule(ARNodeSubmodule):
         # and the step it was declared under cannot disagree during capture, which
         # passes in dummy metadata
         result["requires_cfg"] = requires_cfg_for_inputs(inputs)
+        # collate hands NodeInputs.kwargs over as per-row lists (and the dict
+        # itself under "kwargs"); the branch count goes in as the one int
+        # `declare_step` planned for, or not at all (the old 3-branch step).
+        result.pop("kwargs", None)
+        result.pop(CFG_BRANCHES, None)
+        if graph_walk in ("image_gen", "image_gen_cfg") and CFG_BRANCHES in inputs[0].kwargs:
+            result[CFG_BRANCHES] = image_gen_branches(inputs)
         result["sample_token"] = any([
             info.step_metadata.get("sample_prefill_token", True) \
                 for info in engine_inputs.per_request_info.values()
@@ -1319,17 +1535,19 @@ class LLMSubmodule(ARNodeSubmodule):
         text_mask: torch.Tensor,
         time_index: torch.Tensor,
         requires_cfg: bool = True,
+        cfg_branches: int | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Flow matching Euler step with optional 3-pass CFG.
+        """Flow matching Euler step with optional batched CFG.
 
-        Runs against the 3 frozen KV caches (main, cfg_text, cfg_img)
-        through one combined plan; the declared step writes no store and
-        commits nothing since the caches are frozen during flow
-        matching.
+        Runs against the frozen KV caches (main, cfg_text, cfg_img) through
+        one combined plan; the declared step writes no store and commits
+        nothing since the caches are frozen during flow matching.
 
-        When requires_cfg is False, runs a single forward pass (main only)
-        without CFG, saving 2/3 of the compute.
+        ``cfg_branches`` (from ``prepare_inputs`` via ``declare_step``) is how
+        many of those branches this step runs: 3, 2 (no image guidance) or 1
+        (outside the CFG interval: main only, like requires_cfg=False). None
+        is the old behaviour, all three whenever requires_cfg.
 
         Renormalization modes (cfg_renorm_type in config):
           - "global": single scalar renorm over all dimensions (default)
@@ -1370,7 +1588,10 @@ class LLMSubmodule(ARNodeSubmodule):
         empty_combined_emb[1:-1] = latents_
         logger.debug("packed_seq = %s", empty_combined_emb)  # tensor repr: keep lazy
 
-        if requires_cfg:
+        if requires_cfg and cfg_branches is None:
+            # cfg_prune: false (or a step that never stamped a branch
+            # count): every guidance-on step runs all three branches, and the
+            # interval acts through the effective scales.
             cfg_text_scale = kwargs.pop("cfg_text_scale", self.config.cfg_text_scale)
             cfg_img_scale = kwargs.pop("cfg_img_scale", self.config.cfg_img_scale)
             renorm_type = kwargs.pop("cfg_renorm_type", self.config.cfg_renorm_type)
@@ -1385,69 +1606,41 @@ class LLMSubmodule(ARNodeSubmodule):
             effective_text_scale = cfg_text_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
             effective_img_scale = cfg_img_scale * in_cfg_interval + 1.0 * (1 - in_cfg_interval)
 
-            # Batched CFG: run all 3 branches in a single LLM forward.
-            # plan_attention_batched_cfg created a single FlashInfer plan
-            # treating (main, cfg_text, cfg_img) as 3 "virtual requests".
-            S = empty_combined_emb.shape[0]
-            batched_emb = empty_combined_emb.repeat(3, 1)  # [3S, hidden]
-
-            # Expand MoT indexes with absolute offsets for each copy
-            batched_text_indexes = torch.cat([
-                text_indexes + i * S for i in range(3)
-            ])
-            batched_vae_indexes = torch.cat([
-                vae_token_indexes + i * S for i in range(3)
-            ])
-            batched_text_mask = text_mask.repeat(3)
-
-            hidden = self.language_model(
-                batched_emb, mode="gen",
-                label=self.CFG_BATCHED_LABEL,
-                vae_token_indexes=batched_vae_indexes,
-                text_indexes=batched_text_indexes,
-                text_mask=batched_text_mask,
-                **kwargs,
+            v_main, v_cfg_text, v_cfg_img = self._image_gen_branches_forward(
+                3, empty_combined_emb, text_indexes, vae_token_indexes, text_mask, kwargs,
             )
-
-            # Split output back to 3 branches and project to VAE space
-            v_main = self.llm2vae(hidden[:S])[1:-1]
-            v_cfg_text = self.llm2vae(hidden[S:2*S])[1:-1]
-            v_cfg_img = self.llm2vae(hidden[2*S:])[1:-1]
 
             # Two-node CFG velocity combination + renormalization
             cfg_renorm_min = kwargs.pop("cfg_renorm_min", self.config.cfg_renorm_min)
+            # the scales are device tensors here, so the `img_scale > 1.0`
+            # test inside is a host sync (the pruned path decides it on the host)
+            v_final = combine_cfg_velocity(
+                v_main, v_cfg_text, v_cfg_img,
+                effective_text_scale, effective_img_scale,
+                renorm_type, cfg_renorm_min,
+            )
+        elif requires_cfg and cfg_branches > 1:
+            # In the CFG interval (`cfg_branches`, decided on the host): the
+            # scales apply as given. Two branches when image guidance is off
+            # (img scale <= 1), where the combine never reads v_cfg_img.
+            cfg_text_scale = kwargs.pop("cfg_text_scale", self.config.cfg_text_scale)
+            cfg_img_scale = kwargs.pop("cfg_img_scale", self.config.cfg_img_scale)
+            renorm_type = kwargs.pop("cfg_renorm_type", self.config.cfg_renorm_type)
+            kwargs.pop("cfg_interval", None)
+            cfg_renorm_min = kwargs.pop("cfg_renorm_min", self.config.cfg_renorm_min)
 
-            if renorm_type == "text_channel":
-                # text_channel: renorm AFTER text CFG, THEN apply image CFG
-                v_text_guided = v_cfg_text + effective_text_scale * (v_main - v_cfg_text)
-                norm_v = torch.norm(v_main, dim=-1, keepdim=True)
-                norm_v_text = torch.norm(v_text_guided, dim=-1, keepdim=True)
-                scale = (norm_v / (norm_v_text + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
-                v_text_renormed = v_text_guided * scale
-                if effective_img_scale > 1.0:
-                    v_final = v_cfg_img + effective_img_scale * (v_text_renormed - v_cfg_img)
-                else:
-                    v_final = v_text_renormed
-            else:
-                # global / channel: apply both text+image CFG, THEN renorm
-                v_text_guided = v_cfg_text + effective_text_scale * (v_main - v_cfg_text)
-                if effective_img_scale > 1.0:
-                    v_combined = v_cfg_img + effective_img_scale * (v_text_guided - v_cfg_img)
-                else:
-                    v_combined = v_text_guided
-
-                if renorm_type == "channel":
-                    renorm_scale = (
-                        v_main.norm(dim=-1, keepdim=True) /
-                        (v_combined.norm(dim=-1, keepdim=True) + 1e-8)
-                    ).clamp(min=cfg_renorm_min, max=1.0)
-                else:
-                    renorm_scale = (
-                        v_main.norm() / (v_combined.norm() + 1e-8)
-                    ).clamp(min=cfg_renorm_min, max=1.0)
-                v_final = v_combined * renorm_scale
+            v_main, v_cfg_text, v_cfg_img = self._image_gen_branches_forward(
+                cfg_branches, empty_combined_emb, text_indexes, vae_token_indexes, text_mask, kwargs,
+            )
+            v_final = combine_cfg_velocity(
+                v_main, v_cfg_text, v_cfg_img,
+                cfg_text_scale, cfg_img_scale,
+                renorm_type, cfg_renorm_min,
+            )
         else:
-            # No CFG: single forward pass over the declared plan
+            # No CFG, or a guidance-on step outside the CFG interval
+            # (cfg_branches == 1), where the combine reduces to v_main: a
+            # single forward pass over the declared "main" plan.
             hidden = self.language_model(
                 empty_combined_emb, mode="gen",
                 label="main",
@@ -1466,6 +1659,47 @@ class LLMSubmodule(ARNodeSubmodule):
             "latents": [latents],
             "time_index": [time_index + 1]
         }
+
+    def _image_gen_branches_forward(
+        self,
+        n: int,
+        empty_combined_emb: torch.Tensor,
+        text_indexes: torch.Tensor,
+        vae_token_indexes: torch.Tensor,
+        text_mask: torch.Tensor,
+        kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """The first ``n`` CFG branches (main, cfg_text[, cfg_img]) in one LLM
+        forward over the combined plan `declare_step` made of the same ``n``
+        labels: the plan treats each branch as a "virtual request" over its
+        own cache. Returns their VAE-space velocities, cfg_img None if n < 3.
+        """
+        S = empty_combined_emb.shape[0]
+        batched_emb = empty_combined_emb.repeat(n, 1)  # [nS, hidden]
+
+        # Expand MoT indexes with absolute offsets for each copy
+        batched_text_indexes = torch.cat([
+            text_indexes + i * S for i in range(n)
+        ])
+        batched_vae_indexes = torch.cat([
+            vae_token_indexes + i * S for i in range(n)
+        ])
+        batched_text_mask = text_mask.repeat(n)
+
+        hidden = self.language_model(
+            batched_emb, mode="gen",
+            label=self.CFG_BATCHED_LABEL,
+            vae_token_indexes=batched_vae_indexes,
+            text_indexes=batched_text_indexes,
+            text_mask=batched_text_mask,
+            **kwargs,
+        )
+
+        # Split output back per branch and project to VAE space
+        v_main = self.llm2vae(hidden[:S])[1:-1]
+        v_cfg_text = self.llm2vae(hidden[S:2*S])[1:-1]
+        v_cfg_img = self.llm2vae(hidden[2*S:3*S])[1:-1] if n >= 3 else None
+        return v_main, v_cfg_text, v_cfg_img
 
     def _forward_image_gen_single_branch(
         self,
@@ -1493,8 +1727,17 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("cfg_renorm_type", None)
         kwargs.pop("cfg_interval", None)
         kwargs.pop("cfg_renorm_min", None)
+        n_branches = kwargs.pop(CFG_BRANCHES, None)
 
         latents = input_embeds
+        output_name = {
+            "LLM": "v_main",
+            "LLM_cfg_text": "v_cfg_text",
+            "LLM_cfg_img": "v_cfg_img",
+        }.get(self.node_name, "v_main")
+        if cfg_branch_skipped(self._NODE_TO_CFG_LABEL.get(self.node_name, "main"), n_branches):
+            # sits this step out (`cfg_branches`); the edge still carries a tensor
+            return {output_name: [sat_out_velocity(latents)]}
 
         # See _forward_image_gen: tie the separately-passed sequence dims so
         # torch.compile's dynamic shapes can prove the adds below line up.
@@ -1528,12 +1771,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
         # Output velocity. Main LLM also passes through latents/time_index
         # for the combine_cfg node.
-        output_name = {
-            "LLM": "v_main",
-            "LLM_cfg_text": "v_cfg_text",
-            "LLM_cfg_img": "v_cfg_img",
-        }.get(self.node_name, "v_main")
-
         result: NameToTensorList = {output_name: [projected]}
         if self.node_name == "LLM":
             result["time_index"] = [time_index]
@@ -1630,8 +1867,16 @@ class LLMSubmodule(ARNodeSubmodule):
         assert self.boi_token_id is not None and self.eoi_token_id is not None
 
         device = emb.device
-        boi_ids = torch.tensor([self.boi_token_id], device=device)
-        eoi_ids = torch.tensor([self.eoi_token_id], device=device)
+        # built once per device: `torch.tensor(..., device=)` is a host copy that syncs the
+        # stream, which held every image_gen step's prepare_inputs until the step before it
+        # had finished (no speculation across denoising steps)
+        ids = self._sentinel_ids.get(device)
+        if ids is None:
+            ids = self._sentinel_ids[device] = (
+                torch.tensor([self.boi_token_id], device=device),
+                torch.tensor([self.eoi_token_id], device=device),
+            )
+        boi_ids, eoi_ids = ids
         with torch.no_grad():
             boi_emb = self.embed_tokens(boi_ids).to(emb.dtype)
             eoi_emb = self.embed_tokens(eoi_ids).to(emb.dtype)
@@ -1778,12 +2023,28 @@ class CombineCFGSubmodule(NodeSubmodule):
         # worker device without loading an otherwise-unused model component.
         device = inputs["v_main"][0].device
 
+        first_iter = "latents" not in inputs or not inputs["latents"]
+        n_branches = self._cfg_branches(fwd_info, first_iter)
+        # Branches run as a prefix of CFG_BRANCH_LABELS, so the leading non-empty ones ran
+        n_arrived = next(
+            (i for i, label in enumerate(CFG_BRANCH_LABELS) if inputs[f"v_{label}"][0].shape[0] == 0),
+            len(CFG_BRANCH_LABELS),
+        )
+        if n_branches is None:
+            if n_arrived < len(CFG_BRANCH_LABELS):
+                # this node's counter isn't tracking the loop; the branch nodes counted from theirs
+                n_branches = n_arrived
+        elif n_branches > n_arrived:
+            raise ValueError(
+                f"BAGEL parallel CFG: LLM_{CFG_BRANCH_LABELS[n_arrived]} sat out a step whose "
+                f"combine reads {list(CFG_BRANCH_LABELS[:n_branches])}; the nodes' loop counters disagree"
+            )
         result = {
-            "v_main": inputs["v_main"][0],
-            "v_cfg_text": inputs["v_cfg_text"][0],
-            "v_cfg_img": inputs["v_cfg_img"][0],
+            f"v_{label}": inputs[f"v_{label}"][0]
+            for label in CFG_BRANCH_LABELS
+            if inputs[f"v_{label}"][0].shape[0] > 0
         }
-        if "latents" not in inputs or len(inputs["latents"]) == 0:
+        if first_iter:
             H = fwd_info.step_metadata.get("height", 1024)
             W = fwd_info.step_metadata.get("width", 1024)
             result["latents"], result["time_index"] = _init_latents_and_time_index(
@@ -1795,9 +2056,27 @@ class CombineCFGSubmodule(NodeSubmodule):
                 "time_index": inputs["time_index"][0],
                 **result,
             }
-        return NodeInputs(
-            tensor_inputs=result,
-            kwargs=fwd_info.step_metadata
+        kwargs = dict(fwd_info.step_metadata)
+        if n_branches is not None:
+            kwargs[CFG_BRANCHES] = n_branches
+        return NodeInputs(tensor_inputs=result, kwargs=kwargs)
+
+    def _cfg_branches(self, fwd_info: CurrentForwardPassInfo, first_iter: bool) -> int | None:
+        """The step's CFG branch count (`cfg_branches`), as the LLM nodes stamp it, or None to
+        combine all three branches as before (pruning off, or a counter that is not tracking
+        this loop)."""
+        meta = fwd_info.step_metadata
+        if not (self.config.cfg_prune and meta.get("requires_cfg", False)):
+            return None
+        k = fwd_info.dynamic_loop_iter_counts.get(IMAGE_GEN_LOOP, 0)
+        if (k == 0) != first_iter:
+            return None
+        t = image_gen_timestep(k, self.config.num_timesteps, self.config.timestep_shift)
+        return cfg_branches(
+            t,
+            tuple(meta.get("cfg_interval", self.config.cfg_interval)),
+            meta.get("cfg_text_scale", self.config.cfg_text_scale),
+            meta.get("cfg_img_scale", self.config.cfg_img_scale),
         )
 
     def forward(
@@ -1805,15 +2084,16 @@ class CombineCFGSubmodule(NodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         v_main: torch.Tensor,
-        v_cfg_text: torch.Tensor,
-        v_cfg_img: torch.Tensor,
         latents: torch.Tensor,
         time_index: torch.Tensor,
+        v_cfg_text: torch.Tensor | None = None,
+        v_cfg_img: torch.Tensor | None = None,
         cfg_text_scale: float = None,
         cfg_img_scale: float = None,
         cfg_renorm_type: str = None,
         cfg_renorm_min: float = None,
         cfg_interval: tuple = None,
+        cfg_branches: int | None = None,
         **kwargs,
     ) -> NameToTensorList:
         if cfg_text_scale is None:
@@ -1836,8 +2116,9 @@ class CombineCFGSubmodule(NodeSubmodule):
         # below line up under dynamic shapes.
         n_latent = latents.shape[0]
         torch._check(v_main.shape[0] == n_latent)
-        torch._check(v_cfg_text.shape[0] == n_latent)
-        torch._check(v_cfg_img.shape[0] == n_latent)
+        for v in (v_cfg_text, v_cfg_img):  # None: that branch sat the step out
+            if v is not None:
+                torch._check(v.shape[0] == n_latent)
         torch._check(time_index.shape[0] == n_latent)
 
         # Compute timestep and step size
@@ -1851,6 +2132,21 @@ class CombineCFGSubmodule(NodeSubmodule):
         v_m = v_main
         v_ct = v_cfg_text
         v_ci = v_cfg_img
+
+        if cfg_branches is not None:
+            # decided on the host (`cfg_branches`): outside the interval the combine is v_main,
+            # and the image branch is read only with image guidance on; no device-side test
+            if cfg_branches == 1:
+                v_final = v_m
+            else:
+                v_final = combine_cfg_velocity(
+                    v_m, v_ct, v_ci if cfg_branches == 3 else None,
+                    cfg_text_scale, cfg_img_scale, cfg_renorm_type, cfg_renorm_min,
+                )
+            new_latents = latents - v_final * dt
+            if torch.is_autocast_enabled():
+                new_latents = new_latents.to(torch.get_autocast_gpu_dtype())
+            return {"latents": [new_latents], "time_index": [time_index + 1]}
 
         # CFG interval
         cfg_lo, cfg_hi = cfg_interval

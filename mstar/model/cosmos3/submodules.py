@@ -327,6 +327,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             self.transformer.denoise_step_batched_cfg = torch.compile(
                 self.transformer.denoise_step_batched_cfg, fullgraph=False, dynamic=False,
             )
+            # One graph per batch size: dynamo unrolls the per-request loop, so
+            # the first batch of each size compiles (seconds with a warm cache).
+            self.transformer.denoise_step_action_batched = torch.compile(
+                self.transformer.denoise_step_action_batched, fullgraph=False, dynamic=False,
+            )
             logger.info("Cosmos3 denoise compute torch.compile enabled")
 
     def to(self, *args, **kwargs):
@@ -2698,6 +2703,9 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     # One-shot decode per request; CUDA-graph capture (not torch.compile) is the
     # speedup path.
     disable_torch_compile = True
+    # Whole-clip decodes through the shared Wan VAE decoder (config.vae_decode_fast);
+    # the streaming subclass sets up its own decoder step.
+    _whole_clip_fast = True
 
     def __init__(self, vae, config):
         super().__init__()
@@ -2705,6 +2713,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         self.config = config
         self._decode_dtype_cached = None
         self._channels_last = False
+        self._fast_step = None
         # The decode is 3D-conv bound, one-shot per request at request-specific
         # shapes, and not graph-captured; torch.compile fuses its pointwise
         # epilogues (~20-30% off the 189-frame video decode, neutral for
@@ -2714,15 +2723,26 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         self._decode = vae.decode if vae is not None else None
         self._decode_compiled = False
         self._warmed_decode_shapes: set[tuple[int, ...]] = set()
+        fast = vae is not None and self._whole_clip_fast and config.vae_decode_fast
         if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
             "0", "false", "no", "off",
         ):
-            self._decode = _wan_vae().compile_decode(vae.decode)
             self._decode_compiled = True
+            # The fast path compiles its own DecoderStep; the stock decode is unused there.
+            if not fast:
+                self._decode = _wan_vae().compile_decode(vae.decode)
             logger.info("Cosmos3 VAE decode torch.compile enabled")
         # Resolve + log the decode dtype now (a cheap cuDNN-version read) so the
         # choice is fixed at startup, not on the first request.
         self._decode_dtype()
+        if fast:
+            # Cast before the layout switch and the compile trace, so both see the
+            # weights the decode runs with (this instance is the node's own).
+            self.vae = vae = vae.to(self._decode_dtype())
+            _wan_vae().to_channels_last(vae)
+            self._channels_last = True
+            self._fast_step = _wan_vae().DecoderStep(vae, compile=self._decode_compiled, deterministic=True)
+            logger.info("Cosmos3 VAE decode: whole clips on the shared Wan VAE decoder (channels-last)")
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
@@ -2777,6 +2797,13 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         """Latents -> uint8 pixel frames ``[1, 3, T, H, W]``."""
         vae_dtype = self._decode_dtype()
         z = self._vae_input(latents)
+        if self._fast_step is not None:
+            wan_vae = _wan_vae()
+            with torch.autocast(device_type="cuda", enabled=False):
+                decoded = wan_vae.decode_causal(
+                    self.vae, z, wan_vae.new_feat_cache(self.vae), self._fast_step, clip_start=True,
+                )
+            return self._to_uint8(decoded)
         with torch.autocast(device_type="cuda", enabled=False):
             if (
                 self._decode_compiled
@@ -2835,6 +2862,8 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
     forward: the pass must complete normally for the partition to report
     done, so it is not vetoed.
     """
+
+    _whole_clip_fast = False
 
     def __init__(self, vae, config):
         super().__init__(vae, config)

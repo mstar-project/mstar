@@ -299,8 +299,12 @@ class ZImageModel(Model):
         from mstar.model.z_image.weight_loader import build_text_encoder, build_transformer, build_vae
 
         if node_name == "text_encoder":
-            return ZImageTextEncoderSubmodule(build_text_encoder(self.config, self.snapshot, device), self.config,
-                                              max_batch_size=self.max_batch_size)
+            return ZImageTextEncoderSubmodule(
+                build_text_encoder(self.config, self.snapshot, device), self.config,
+                max_batch_size=self.max_batch_size,
+                capture_walk=ENCODE_TEXT_WALK if self.accelerator_graph else None,
+                capture_batch_sizes=self.capture_batch_sizes,
+            )
         if node_name == "vae_decoder":
             return ZImageVaeDecoderSubmodule(
                 build_vae(self.config, self.snapshot, device), self.config, max_batch_size=self.max_batch_size,

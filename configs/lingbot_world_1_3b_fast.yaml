@@ -1,0 +1,22 @@
+model: "lingbot_world_1_3b"
+
+# Speed over closeness to the reference (~1.5x at 480x832 on an H200):
+# flash-attn-4 attention, compiled block pointwise ops, an autotuned condition
+# encoder and a bf16 decode. Rollouts drift from the reference's about as far as
+# under any other attention kernel. Needs flash-attn-4.
+model_kwargs:
+  reference_numerics: false
+
+# No node holds an engine KV cache (the rolling K/V is per-request state in
+# the dit); max_seq_len only satisfies the conductor's config check and matches
+# the UMT5 text length.
+max_seq_len: 512
+
+# One rollout per GPU: the dense K/V and the VAE caches are per request, so the
+# model refuses any other value (LingBotWorldModel.validate_config_yaml).
+max_concurrent_requests: 1
+
+# Single-GPU colocated; the Wan VAE encode and decode are fused into the dit forward.
+node_groups:
+  - node_names: [text_encoder, dit]
+    ranks: [0]

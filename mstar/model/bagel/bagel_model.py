@@ -29,14 +29,12 @@ field (no BOI token detection). Prefill is sequential: text tokens are
 processed causally, then each image is processed bidirectionally.
 """
 
-import io
 import json
 import logging
 from pathlib import Path
 
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
-from PIL import Image
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
@@ -75,6 +73,7 @@ from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
 from mstar.model.bagel.config import MIXED_TEXT, load_bagel_config
 from mstar.model.bagel.submodules import (
     IMAGE_ADVANCE,
+    IMAGE_GEN_LOOP,
     IMAGE_SENTINELS,
     CombineCFGSubmodule,
     LLMSubmodule,
@@ -96,6 +95,7 @@ from mstar.model.base import (
     Span,
     prompt_spans,
 )
+from mstar.model.components.diffusion.image_io import encode_image, image_output_format
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
@@ -278,10 +278,13 @@ class BagelModel(Model):
         model_path_hf: str,
         cache_dir: str | None = None,
         accelerator_graph: bool | None = None,
+        cfg_prune: bool | None = None,
         **kwargs
     ):
         if accelerator_graph is not None and not isinstance(accelerator_graph, bool):
             raise ValueError("accelerator_graph must be a boolean")
+        if cfg_prune is not None and not isinstance(cfg_prune, bool):
+            raise ValueError("cfg_prune must be a boolean")
         self.cache_dir = cache_dir
 
         config_path = hf_hub_download(
@@ -292,6 +295,8 @@ class BagelModel(Model):
             self.config = load_bagel_config(json.load(f))
         if accelerator_graph is not None:
             self.config.accelerator_graph = accelerator_graph
+        if cfg_prune is not None:
+            self.config.cfg_prune = cfg_prune
 
         self.model_path_hf = model_path_hf
 
@@ -628,6 +633,8 @@ class BagelModel(Model):
 
         Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
         """
+        if "image" in output_modalities:
+            image_output_format(kwargs)  # fail a bad output_format now, not after the denoise
         result: NameToTensorList = {}
 
         if prompt is not None:
@@ -823,11 +830,9 @@ class BagelModel(Model):
             logger.debug("OUTPUT TEXT %s", detok)
             return detok.encode("utf-8")
         if modality == "image":
-            output = output[0].permute(1, 2, 0) * 255
-            img = Image.fromarray((output).to(torch.uint8).cpu().numpy())
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='PNG')
-            return img_byte_arr.getvalue()
+            # the same truncated pixels as before, through the shared writer: PIL's default PNG
+            # encode (adaptive filters, zlib 6) took ~0.4 s of every 1024^2 request
+            return encode_image((output[0] * 255).to(torch.uint8), request_kwargs)
         raise ValueError(f"Unsupported modality: {modality!r}")
 
     # CFG-parallel deployments add the two guidance branches. Ordinary
@@ -1121,6 +1126,9 @@ class BagelModel(Model):
         # there are N-1 intervals, so N-1 Euler steps are needed.
         image_gen = Sequential([
             Loop(
+                # named: LLMSubmodule reads this loop's iteration count to
+                # pick the step's CFG branches on the host (cfg_branches)
+                name=IMAGE_GEN_LOOP,
                 section=GraphNode(
                     name="LLM",
                     input_names=["latents", "time_index"],
@@ -1157,6 +1165,8 @@ class BagelModel(Model):
         # combine_cfg applies the CFG formula + Euler step after each iteration.
         image_gen_cfg = Sequential([
             Loop(
+                # named, as image_gen's: every node of the step reads the counter (cfg_branches)
+                name=IMAGE_GEN_LOOP,
                 section=Sequential([
                     Parallel([
                         GraphNode(

@@ -25,17 +25,14 @@ model_kwargs:
   # be padded up into a wider bucket without changing the image. A cap_len with no
   # captured graph falls back to the eager batched path.
   #
-  # The capture budget is len(capture_caption_lengths) x len(capture_batch_sizes),
-  # so all 16 lengths would be 128 graphs. Spend the budget on caption lengths
-  # instead of batch sizes: a captured bucket already serves SHORTER batches by
-  # padding them with dummy rows (CudaGraphRunner.DummyRowPool), so 1/2/4/8 covers
-  # every batch up to 8, where extra cap_lens cover nothing but themselves.
-  # 4 x 4 = 16 graphs, the same count as the [32, 64] x [1..8] this replaced, with
-  # twice the caption coverage. Widen if the measured startup and VRAM allow.
+  # The capture budget is len(capture_caption_lengths) x len(capture_batch_sizes) graphs.
+  # Every batch size up to max_batch_size is captured: with only [1, 2, 4, 8], a step of
+  # 3 / 5-7 rows replayed the next size with dummy rows, and under concurrency (requests at
+  # different steps, one or two outside the dit) that padding cost more than batching saved.
+  # H200, 1024^2, 8 steps, 2 rounds: c=4 1.05-1.08 -> 1.22 images/s, c=8 1.12-1.14 -> 1.21-1.22,
+  # c=16 1.17-1.19 -> 1.23, c=1 unchanged, same peak VRAM; ~100 s more warm startup (32 graphs).
   capture_caption_lengths: [32, 64, 96, 128]
-  # The scaffold default; 3/5/6/7 replay the next captured size with dummy rows.
-  # Costs some padded compute at those sizes, buys half the graphs.
-  capture_batch_sizes: [1, 2, 4, 8]
+  capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
   max_batch_size: 8
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output

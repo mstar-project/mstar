@@ -366,6 +366,11 @@ default. That backend needs the **flash-attn-4** package, which provides
 ``flash_attn.cute`` — the CuTe DSL rewrite of flash-attn; on H100 it runs the
 FA3-style sm90 kernel with TMA and warpgroup specialisation. It is **not on
 PyPI** as of 2026-09-17, and it is **not** pulled in by any extra.
+LingBot-World's ``configs/lingbot_world_1_3b_fast.yaml`` (``reference_numerics:
+false``) also calls flash-attn-4 directly.
+
+Install it after ``flash-attn`` (FA2): the FA2 package ships an older
+``flash_attn/cute`` that overwrites flash-attn-4's.
 
 FLASH needs **torch 2.11 or newer**: older torch does not pass flash-attn-4 the
 block-sparse block size, and capture fails with ``Block sparse tensors ...

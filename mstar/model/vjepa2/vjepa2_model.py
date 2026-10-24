@@ -62,12 +62,18 @@ from mstar.model.base import (
     TensorAndMetadata,
     video_metadata_dict,
 )
-from mstar.model.media_limits import VideoBudget
+from mstar.model.media_limits import VIDEO_DECODE_THREADS, VideoBudget
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
 from mstar.model.vjepa2.components.vit_encoder import VJEPA2Encoder
-from mstar.model.vjepa2.config import ATTN, KV_CACHE, VJepa2ACPredictorConfig, VJepa2Config
+from mstar.model.vjepa2.config import (
+    AC_ROLLOUT_NUM_FRAMES,
+    ATTN,
+    KV_CACHE,
+    VJepa2ACPredictorConfig,
+    VJepa2Config,
+)
 from mstar.model.vjepa2.submodules import (
     VJepa2ACPredictorSubmodule,
     VJepa2ACRolloutPredictorSubmodule,
@@ -588,7 +594,7 @@ class VJepa2Model(Model):
 
         target_frames = self.config.frames_per_clip
         logger.info("load_video: opening %s", filepath)
-        decoder = VideoDecoder(filepath)
+        decoder = VideoDecoder(filepath, num_ffmpeg_threads=VIDEO_DECODE_THREADS)
         logger.info("load_video: decoder opened; reading metadata")
 
         metadata_obj = getattr(decoder, "metadata", None)
@@ -642,7 +648,7 @@ class VJepa2Model(Model):
             frames = torch.stack([decoder[i] for i in indices])
         logger.info("load_video: decoded frames shape=%s", tuple(frames.shape))
 
-        video = frames.float() / 255.0
+        video = frames.float().div_(255.0)
 
         try:
             metadata = video_metadata_dict(metadata_obj) if metadata_obj is not None else {}
@@ -739,7 +745,6 @@ class VJepa2Model(Model):
                 # (per notebook Cell 5: z_hat = z[:, :tokens_per_frame]); the
                 # other 7 frames' tokens are computed and discarded — matched
                 # FLOPs to upstream's reference inference path.
-                AC_ROLLOUT_NUM_FRAMES = 8
                 if "video_frames" in out:
                     out["video_frames"] = [frames[:AC_ROLLOUT_NUM_FRAMES] for frames in out["video_frames"]]
 
@@ -925,6 +930,10 @@ class VJepa2Model(Model):
                 inputs.append(edge)
 
         step_metadata: dict = {"is_prefill": True}
+        if input_signals.get("video_frames"):
+            # The encoder's capture bucket is chosen before its inputs exist
+            # (VJepa2EncoderSubmodule.cg_key_info), so the clip shape rides here.
+            step_metadata["video_shape"] = tuple(int(d) for d in input_signals["video_frames"][0].dims)
         if walk in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING):
             # Per-request horizon enforced by ``VJepa2RolloutPredictorSubmodule``
             # via ``check_stop`` once iter_idx + 1 reaches it.  The

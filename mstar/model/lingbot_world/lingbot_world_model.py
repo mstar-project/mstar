@@ -61,11 +61,16 @@ class LingBotWorldModel(Model):
         cache_dir: str | None = None,
         variant: str = LINGBOT_VARIANT_1_3B,
         skip_weight_loading: bool = False,
+        reference_numerics: bool = True,
         **kwargs,
     ):
         if variant != LINGBOT_VARIANT_1_3B:
             raise NotImplementedError(f"LingBot-World variant {variant!r} is not implemented yet.")
         self.config = LINGBOT_CONFIGS[variant]()
+        self.config.reference_numerics = bool(reference_numerics)
+        if not reference_numerics:
+            self.config.vae_decode_fp32 = False
+            self.config.vae_decode_cudnn_benchmark = True
         self.model_path_hf = model_path_hf or LINGBOT_HF_REPOS[variant]
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
@@ -378,6 +383,8 @@ class LingBotWorldModel(Model):
             from mstar.model.lingbot_world.weight_loader import build_lingbot_dit
 
             require_flash_attn()
+            if not self.config.reference_numerics:
+                import flash_attn.cute  # noqa: F401  (flash-attn-4; docs/installation.rst)
             dit = build_lingbot_dit(self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir)
             return LingBotDitSubmodule(
                 dit, self._load_vae().to(device), self.config, encoder_vae=self._load_vae().to(device),

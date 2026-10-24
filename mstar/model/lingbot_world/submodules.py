@@ -150,8 +150,8 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
     At the first iteration the request's state is seeded: the K/V cache, the
     generator (seeded with the request seed) and the full rollout's initial
     noise drawn from it in one call. The reference draws the initial noise the
-    same way, which is what makes the rollout reproducible bit for bit; it
-    requires the rollout length up front.
+    same way, which is what makes the rollout follow the reference's from the
+    same seed; it requires the rollout length up front.
 
     ``image`` arrives resized and normalized to [-1, 1] by
     ``LingBotWorldModel.process_prompt``, which runs the reference's CPU bicubic
@@ -169,9 +169,15 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         self.encoder_vae = encoder_vae
         self.config = config
         self.schedule = make_fast_schedule(config.sample_shift, config.timesteps_index, config.num_train_timesteps)
+        if vae is not None and not config.vae_decode_fp32:
+            # The latents are cast to bf16 for the decode, so the weights must be too.
+            vae.to(torch.bfloat16)
         if vae is not None and config.vae_decode_channels_last:
             wan_vae.to_channels_last(vae)
-        self._decode_step = wan_vae.DecoderStep(vae, compile=False) if vae is not None else None
+        self._decode_step = (
+            wan_vae.DecoderStep(vae, compile=config.vae_decode_compile, deterministic=True)
+            if vae is not None else None
+        )
         # Debug hook for the parity harness: keep the last chunk's latents and
         # float frames in the request state.
         self.keep_chunk_outputs = False
@@ -228,7 +234,10 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         cs = cfg.chunk_size
         frames = slice(chunk * cs, (chunk + 1) * cs)
         latent = state["noise"][:, frames]
-        y = encode_condition_chunk(self.encoder_vae, image, state["encoder_stream"], chunk * cs, cs, cfg)
+        # Autotuned convs pick other algorithms than the reference's, which a
+        # rollout amplifies; only off reference numerics.
+        with wan_vae.cudnn_benchmark(not cfg.reference_numerics):
+            y = encode_condition_chunk(self.encoder_vae, image, state["encoder_stream"], chunk * cs, cs, cfg)
         _, height, width = image.shape
         plucker = plucker_embedding(
             camera_poses[frames].float().to(device), intrinsics.float(), height, width,
@@ -271,7 +280,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         mean = torch.tensor(self.vae.config.latents_mean).view(1, cfg.vae_z_dim, 1, 1, 1).to(z)
         inv_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, cfg.vae_z_dim, 1, 1, 1).to(z)
         z = z / inv_std + mean
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast("cuda", enabled=False), wan_vae.cudnn_benchmark(cfg.vae_decode_cudnn_benchmark):
             return wan_vae.decode_causal(
                 self.vae, z, state["feat_cache"], self._decode_step, clip_start=clip_start, latents_per_call=1,
             )

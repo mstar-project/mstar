@@ -1,6 +1,6 @@
 """Wan22Model: Wan2.2-TI2V-5B text/image-to-video generation.
 
-Architecture (4 nodes, no engine resources — nothing here is cached):
+Architecture (4 nodes; nothing here is cached, the dit's self-attention is a ragged resource):
     text_encoder - UMT5-XXL prompt encoder (thin HF wrapper)
     vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V)
     dit          - dense 5B video DiT; CFG as one batch-2 forward,
@@ -39,7 +39,9 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -89,6 +91,7 @@ class Wan22Model(Model):
         skip_weight_loading: bool = False,
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
+        attention_backend: str = "flashinfer",
         **kwargs,
     ):
         if variant != WAN22_VARIANT_TI2V_5B:
@@ -102,6 +105,7 @@ class Wan22Model(Model):
             variant=variant, compile_dit_sizes=compile_dit_sizes,
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
+            attention_backend=attention_backend,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
         # Dummy mode: get_submodule returns None for every node, so engines run
@@ -123,7 +127,8 @@ class Wan22Model(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """No engine-built resources: every node here is stateless.
+        """The DiT's self-attention as a cacheless ragged resource (with
+        ``attention_backend: flashinfer``); nothing here keeps state.
 
         Nothing in this model reads K/V back across steps. The text encoder
         and both VAE passes are one-shot forwards, and the DiT recomputes
@@ -131,7 +136,39 @@ class Wan22Model(Model):
         the only state that crosses a step is the UniPC solver's, which
         rides the loop-back edges as ordinary tensors rather than a cache.
         """
-        return []
+        if self.config.attention_backend != "flashinfer":
+            return []
+        cfg = self.config
+        # Self-attention only: the cross-attention over the 512 text tokens runs
+        # SDPA (cuDNN), which measured faster than FlashInfer's ragged kernel at
+        # that shape (0.46 vs 0.59 ms per layer at 1280x704x81 on an H200), while
+        # FA3 beats it on the self-attention (12.4 vs 14.8 ms).
+        return [
+            RaggedAttentionSpec(
+                resource_key=Wan22DitSubmodule.SELF_ATTN, nodes={"dit"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=cfg.num_attention_heads,
+                    num_kv_heads=cfg.num_attention_heads,
+                    head_dim=cfg.attention_head_dim,
+                    # one segment per guidance branch
+                    max_segments_per_request=2,
+                    # CFG-parallel: the dit's two ranks split guidance branches, not heads
+                    shard_heads=False,
+                    # the DiT is compiled, not captured: keep attention in its graph
+                    compile_op=True,
+                    dtype=torch.bfloat16,
+                ),
+            ),
+        ]
+
+    def get_default_sharding_config(self) -> ShardingConfig:
+        # CFG-parallel, through the sp slot: the dit's lockstep group (sp_size) is
+        # used for guidance, each of two ranks running one CFG branch and
+        # all-gathering the two noise predictions (see Wan22DitSubmodule). Nothing
+        # splits the sequence, and signals stay replicated: no shard_dim entries.
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes=set(), shard_dim={}, sp_enabled_nodes={"dit"},
+        )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the
@@ -467,7 +504,10 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        frames = output[0].permute(1, 2, 3, 0).cpu().numpy()
+        # One multithreaded torch copy into frame-major layout: handed the
+        # permuted view, PyAV copies each frame out of it single-threaded
+        # (~290 ms of a ~600 ms mux for 1280x704x81).
+        frames = output[0].permute(1, 2, 3, 0).contiguous().cpu().numpy()
         buffer = io.BytesIO()
         container = av.open(buffer, mode="w", format="mp4")
         # PyAV rejects float rates, so the rate is handed over as an exact
@@ -683,18 +723,17 @@ class Wan22Model(Model):
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
     ) -> torch.nn.Module | None:
-        # ``autocast_dtype`` and ``sp_group`` exist for interface parity only.
-        # Weights load in the checkpoint's own dtypes, and wan22 declares no
-        # sp-enabled nodes.
+        # ``autocast_dtype`` exists for interface parity only: weights load in the
+        # checkpoint's own dtypes. ``sp_group`` reaches the dit only.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, sp_group=sp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Wan2.2 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str = "cpu") -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device: str = "cpu", sp_group=None) -> NodeSubmodule | None:
         """Construct one node's submodule from the checkpoint.
 
         The wrapped components load on CPU and the EngineManager moves them; the
@@ -731,7 +770,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            return Wan22DitSubmodule(transformer, self.config)
+            return Wan22DitSubmodule(transformer, self.config, sp_group=sp_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 

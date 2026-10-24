@@ -45,6 +45,14 @@ def _sdpa_varlen(
     # q/k/v: (total_seq_len, num_heads, head_dim). Build a block-diagonal mask
     # so packed images don't attend across boundaries, then run SDPA.
     total_len, num_heads, head_dim = q.shape
+    if cu_seqlens.numel() == 2 and not causal:
+        # One image (the unbatched ViT path): nothing to isolate, and without a mask SDPA can
+        # take its flash / cuDNN kernels instead of the masked memory-efficient one.
+        out = scaled_dot_product_attention(
+            q.transpose(0, 1).unsqueeze(0), k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0), scale=scale,
+        )
+        return out.squeeze(0).transpose(0, 1).contiguous()
     seg_ids = torch.zeros(total_len, dtype=torch.int32, device=q.device)
     seg_ids[cu_seqlens[1:-1].long()] = 1
     seg_ids = torch.cumsum(seg_ids, dim=0)

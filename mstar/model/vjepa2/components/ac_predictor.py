@@ -141,6 +141,7 @@ class ACRoPEAttention(nn.Module):
         h_pos: torch.Tensor | None = None,
         w_pos: torch.Tensor | None = None,
         time_pos: torch.Tensor | None = None,
+        rope_tables: dict | None = None,
     ) -> torch.Tensor:
         if label is not None and self.attn is not None:
             if d_pos is None:
@@ -150,7 +151,7 @@ class ACRoPEAttention(nn.Module):
             return self.forward_cached(
                 x=x,
                 d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
-                action_tokens=action_tokens,
+                action_tokens=action_tokens, rope_tables=rope_tables,
             )
         b, n, c = x.size()
 
@@ -231,6 +232,7 @@ class ACRoPEAttention(nn.Module):
         w_pos: torch.Tensor,               # [H*W]  — width positions
         time_pos: torch.Tensor | None,     # [action_tokens] or None
         action_tokens: int,
+        rope_tables: dict | None = None,   # see rotate_queries_or_keys_BNHD
     ) -> torch.Tensor:
         """Single-frame cached attention with pre-computed position tensors.
 
@@ -261,14 +263,14 @@ class ACRoPEAttention(nn.Module):
 
         # 3-axis RoPE for spatial tokens
         s = 0
-        qd = rotate_queries_or_keys_BNHD(q_spatial[..., s:s + self.d_dim], d_pos)
-        kd = rotate_queries_or_keys_BNHD(k_spatial[..., s:s + self.d_dim], d_pos)
+        qd = rotate_queries_or_keys_BNHD(q_spatial[..., s:s + self.d_dim], d_pos, rope_tables)
+        kd = rotate_queries_or_keys_BNHD(k_spatial[..., s:s + self.d_dim], d_pos, rope_tables)
         s += self.d_dim
-        qh = rotate_queries_or_keys_BNHD(q_spatial[..., s:s + self.h_dim], h_pos)
-        kh = rotate_queries_or_keys_BNHD(k_spatial[..., s:s + self.h_dim], h_pos)
+        qh = rotate_queries_or_keys_BNHD(q_spatial[..., s:s + self.h_dim], h_pos, rope_tables)
+        kh = rotate_queries_or_keys_BNHD(k_spatial[..., s:s + self.h_dim], h_pos, rope_tables)
         s += self.h_dim
-        qw = rotate_queries_or_keys_BNHD(q_spatial[..., s:s + self.w_dim], w_pos)
-        kw = rotate_queries_or_keys_BNHD(k_spatial[..., s:s + self.w_dim], w_pos)
+        qw = rotate_queries_or_keys_BNHD(q_spatial[..., s:s + self.w_dim], w_pos, rope_tables)
+        kw = rotate_queries_or_keys_BNHD(k_spatial[..., s:s + self.w_dim], w_pos, rope_tables)
         s += self.w_dim
         if s < hd:
             q_spatial = torch.cat([qd, qh, qw, q_spatial[..., s:]], dim=-1)
@@ -279,8 +281,8 @@ class ACRoPEAttention(nn.Module):
 
         # Temporal RoPE for action tokens
         if action_tokens > 0 and time_pos is not None:
-            qd = rotate_queries_or_keys_BNHD(q_action[..., :self.d_dim], time_pos)
-            kd = rotate_queries_or_keys_BNHD(k_action[..., :self.d_dim], time_pos)
+            qd = rotate_queries_or_keys_BNHD(q_action[..., :self.d_dim], time_pos, rope_tables)
+            kd = rotate_queries_or_keys_BNHD(k_action[..., :self.d_dim], time_pos, rope_tables)
             q_action = torch.cat([qd, q_action[..., self.d_dim:]], dim=-1)
             k_action = torch.cat([kd, k_action[..., self.d_dim:]], dim=-1)
             q = torch.cat([q_action, q_spatial], dim=1)
@@ -340,11 +342,13 @@ class ACBlock(nn.Module):
         h_pos: torch.Tensor | None = None,
         w_pos: torch.Tensor | None = None,
         time_pos: torch.Tensor | None = None,
+        rope_tables: dict | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x), attn_mask=attn_mask, t=t, h=h, w=w,
             action_tokens=action_tokens, t_0=t_0, label=label,
             d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
+            rope_tables=rope_tables,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -514,6 +518,8 @@ class VisionTransformerPredictorAC(nn.Module):
             if label is not None:
                 # cursors on the shared resources; see AttentionCallable
                 blocks[0].attn.attend.bind_step(label)
+            # every block rotates by this step's positions: one sin/cos table each
+            rope_tables: dict = {}
             for blk_num, blk in enumerate(blocks):
                 if label is not None:
                     blk.attn.attend.set_layer_idx(blk_num)
@@ -525,6 +531,7 @@ class VisionTransformerPredictorAC(nn.Module):
                     action_tokens=cond_tokens,
                     label=label,
                     d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
+                    rope_tables=rope_tables,
                 )
             return x
 
@@ -568,6 +575,7 @@ class VisionTransformerPredictorAC(nn.Module):
         if label is not None:
             # cursors on the shared resources; see AttentionCallable
             self.predictor_blocks[0].attn.attend.bind_step(label)
+        rope_tables: dict | None = {} if label is not None else None
         for blk_num, blk in enumerate(self.predictor_blocks):
             if label is not None:
                 blk.attn.attend.set_layer_idx(blk_num)
@@ -581,6 +589,7 @@ class VisionTransformerPredictorAC(nn.Module):
                 t_0=t_0,
                 label=label,
                 d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
+                rope_tables=rope_tables,
             )
 
         # the advance is the runner's now, off the step declaration

@@ -37,7 +37,10 @@ class _TinyTransformer(nn.Module):
     def dtype(self) -> torch.dtype:
         return torch.float32
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states):
+    def set_fuse_ffn_gelu(self, enabled: bool) -> None:
+        pass
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states, attn_fns=None):
         text = self.text(encoder_hidden_states).mean(1)[:, :, None, None, None]
         t = timestep.float().mean(1)[:, None, None, None, None] * 1e-3
         return self.proj(hidden_states) + text + t
@@ -72,12 +75,15 @@ def _stub_compile(monkeypatch) -> tuple[list[tuple], list[int]]:
     compiles, calls = [], []
 
     def compile(fn, **kwargs):
-        def run(*, hidden_states, timestep, encoder_hidden_states):
+        def run(*, hidden_states, timestep, encoder_hidden_states, attn_fns=None):
             key = (tuple(hidden_states.shape), tuple(timestep.shape), tuple(encoder_hidden_states.shape))
             calls.append(1)
             if key not in compiles:
                 compiles.append(key)
-            return fn(hidden_states=hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states)
+            return fn(
+                hidden_states=hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states,
+                attn_fns=attn_fns,
+            )
 
         return run
 
@@ -222,16 +228,17 @@ def test_the_largest_side_the_mp4_encoder_takes_passes() -> None:
 
 
 def test_the_config_examples_uncomment_into_one_model_kwargs_block() -> None:
-    """configs/wan22.yaml documents its knobs as a commented ``model_kwargs``
-    example; with two such blocks, uncommenting both keeps only the second."""
+    """configs/wan22.yaml documents its knobs as commented lines of one
+    ``model_kwargs`` block; with two such blocks, uncommenting both keeps only
+    the second."""
     from pathlib import Path
 
     import yaml
 
     out, inside = [], False
     for line in (Path(__file__).resolve().parents[2] / "configs" / "wan22.yaml").read_text().splitlines():
-        inside = line == "# model_kwargs:" or (inside and line.startswith("#   "))
-        out.append(line[2:] if inside else line)
+        inside = line in ("# model_kwargs:", "model_kwargs:") or (inside and line.startswith(("#   ", "  ")))
+        out.append(line[2:] if inside and line.startswith("#") else line)
     text = "\n".join(out)
     assert text.count("\nmodel_kwargs:") == 1
     kwargs = yaml.safe_load(text)["model_kwargs"]

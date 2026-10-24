@@ -29,3 +29,13 @@ node_groups:
   # (the only consumer of that node) is never built.
   - node_names: ["vae_encoder", "vae_decoder"]
     ranks: [0]
+# The first policy request of a fresh server compiles the action denoise step,
+# and concurrent policy requests batch into a step that compiles once per batch
+# size: warm the single step and each batch size up to the cap, at the
+# documented 32-step chunk.
+warmup_requests:
+  - text: warmup
+    files: [hf://nvidia/Cosmos3-Nano/assets/example_i2v_input.jpg]
+    output_modalities: [action]
+    model_kwargs: {action_mode: policy, domain_name: droid_lerobot, raw_action_dim: 10, action_chunk_size: 32}
+    concurrency: [1, 2, 3, 4, 5, 6, 7, 8]

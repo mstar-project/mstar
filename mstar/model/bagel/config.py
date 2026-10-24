@@ -68,6 +68,9 @@ class BagelModelConfig:
     cfg_renorm_min: float = 0.0
     think_mode: bool = False
     accelerator_graph: bool = True
+    # image_gen runs only the CFG branches a denoising step reads (see
+    # submodules.cfg_branches); False runs all three on every guidance-on step
+    cfg_prune: bool = True
 
     # Sampling defaults (per-request overridable via model_kwargs)
     temperature: float = 0.6  # 0 = greedy (argmax), >0 = sampling

@@ -27,7 +27,7 @@ def _no_transfer(monkeypatch):
 def _llm() -> LLMSubmodule:
     return LLMSubmodule(
         language_model=SimpleNamespace(model=SimpleNamespace(embed_tokens=None), lm_head=None), llm2vae=None,
-        vae2llm=None, time_embedder=None, latent_pos_embed=None, config=SimpleNamespace(),
+        vae2llm=None, time_embedder=None, latent_pos_embed=None, config=SimpleNamespace(cfg_prune=True),
         boi_token_id=1, eoi_token_id=2, bos_token_id=3, eos_token_id=4,
     )
 

@@ -2,8 +2,9 @@
 
 Exact port of diffusers 0.39.0 ``WanTransformer3DModel``, restricted to the
 TI2V-5B checkpoint's configuration: no image-conditioning branch, and the
-per-token timestep path (the dit submodule always feeds a ``[batch, seq]``
-timestep grid).
+per-token timestep path (``expand_timesteps``; the dit submodule feeds one
+timestep per latent frame, which is the same thing since it is constant within
+a frame).
 
 Numerics contract (bf16 weights with fp32 islands):
 
@@ -29,11 +30,13 @@ two-linear MLPs ARE the shared ``components.mlp.MLP``.
 """
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
 from mstar.model.components.mlp import MLP
 from mstar.model.wan22.config import Wan22Config
 
@@ -148,6 +151,14 @@ def _apply_rotary_emb(
     return out.type_as(hidden_states)
 
 
+class Wan22AttentionFns(NamedTuple):
+    """The engine's ragged attention callables for one step, per attention; a
+    None (or no ``Wan22AttentionFns`` at all) runs SDPA, the reference kernel."""
+
+    self_attn: RaggedAttentionFn | None
+    cross_attn: RaggedAttentionFn | None
+
+
 class Wan22DiTAttention(nn.Module):
     """Multi-head attention with across-heads RMSNorm on q/k (the
     checkpoint's ``rms_norm_across_heads``: one 3072-wide norm before the
@@ -170,6 +181,7 @@ class Wan22DiTAttention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attn_fn: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
         kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
         query = self.q_norm(self.q_proj(hidden_states))
@@ -184,13 +196,9 @@ class Wan22DiTAttention(nn.Module):
             query = _apply_rotary_emb(query, *rotary_emb)
             key = _apply_rotary_emb(key, *rotary_emb)
 
-        # [B, S, H, D] -> [B, H, S, D] SDPA -> back (the reference's
-        # dispatch_attention_fn native path; bidirectional, no mask).
-        out = F.scaled_dot_product_attention(
-            query.permute(0, 2, 1, 3),
-            key.permute(0, 2, 1, 3),
-            value.permute(0, 2, 1, 3),
-        ).permute(0, 2, 1, 3)
+        # Bidirectional, no mask: SDPA (the reference's dispatch_attention_fn
+        # native path) without a ragged callable, one segment per row with one.
+        out = joint_attention(query, key, value, ragged=attn_fn)
         return self.o_proj(out.flatten(2, 3))
 
 
@@ -225,6 +233,26 @@ class Wan22TimeTextEmbedding(nn.Module):
         return temb, timestep_proj, self.text_embedder(encoder_hidden_states)
 
 
+def _groups(tokens: torch.Tensor, groups: int) -> torch.Tensor:
+    """``[B, seq, dim]`` viewed as ``[B, groups, seq / groups, dim]``: the token
+    groups that share one timestep, hence one adaLN modulation row. Per-token
+    timesteps are ``groups == seq``; the serving path passes one per latent frame
+    (``expand_timesteps`` is constant within a frame), which embeds and projects
+    the timestep once per frame instead of once per token, with the same
+    elementwise math on every token."""
+    return tokens.unflatten(1, (groups, -1))
+
+
+def _ffn_gelu_epilogue(mlp: MLP, x: torch.Tensor) -> torch.Tensor:
+    """``mlp(x)`` with the tanh-GELU in the up-projection's cuBLASLt epilogue: one
+    kernel instead of a GEMM plus a pass over its [tokens, 14336] output. The GELU
+    reads the fp32 accumulator, so this rounds once fewer than the reference."""
+    hidden = torch._addmm_activation(
+        mlp.linear_in.bias, x.flatten(0, -2), mlp.linear_in.weight.t(), use_gelu=True,
+    )
+    return mlp.linear_out(hidden.unflatten(0, x.shape[:-1]))
+
+
 class Wan22DiTBlock(nn.Module):
     """One transformer block: adaLN-modulated self-attention, cross-attention
     to the text stream, adaLN-modulated FFN (reference ``WanTransformerBlock``,
@@ -244,6 +272,9 @@ class Wan22DiTBlock(nn.Module):
         self.ffn = MLP(dim, ffn_dim, dim, activation="gelu_tanh", bias=True)
         self.norm3 = WanFP32LayerNorm(dim, eps, elementwise_affine=False)
         self.scale_shift_table = nn.Parameter(torch.empty(1, 6, dim))
+        # Serving sets this (Wan22DiT.fuse_ffn_gelu); the reference path keeps
+        # the separate GELU.
+        self.fuse_ffn_gelu = False
 
     def forward(
         self,
@@ -251,25 +282,39 @@ class Wan22DiTBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         timestep_proj: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        attn_fns: Wan22AttentionFns | None = None,
     ) -> torch.Tensor:
-        # [1, 1, 6, dim] + [B, seq, 6, dim] -> six [B, seq, dim] fp32 tensors.
+        # [1, 1, 6, dim] + [B, G, 6, dim] -> six [B, G, 1, dim] fp32 tensors, one
+        # row per group of seq / G consecutive tokens (see _groups).
+        groups = timestep_proj.shape[1]
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             (self.scale_shift_table.unsqueeze(0) + timestep_proj.float()).chunk(6, dim=2)
         )
-        shift_msa, scale_msa, gate_msa = shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2)
-        c_shift_msa, c_scale_msa, c_gate_msa = c_shift_msa.squeeze(2), c_scale_msa.squeeze(2), c_gate_msa.squeeze(2)
 
-        norm_hidden = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb)
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+        grouped = _groups(hidden_states, groups)
+        norm_hidden = (self.norm1(grouped.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        attn_output = self.self_attn(
+            norm_hidden.flatten(1, 2), rotary_emb=rotary_emb, attn_fn=attn_fns.self_attn if attn_fns else None,
+        )
+        hidden_states = (
+            (grouped.float() + _groups(attn_output, groups) * gate_msa).type_as(hidden_states).flatten(1, 2)
+        )
 
         norm_hidden = self.norm2(hidden_states.float()).type_as(hidden_states)
-        attn_output = self.cross_attn(norm_hidden, encoder_hidden_states=encoder_hidden_states)
+        attn_output = self.cross_attn(
+            norm_hidden, encoder_hidden_states=encoder_hidden_states,
+            attn_fn=attn_fns.cross_attn if attn_fns else None,
+        )
         hidden_states = hidden_states + attn_output
 
-        norm_hidden = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(hidden_states)
-        ff_output = self.ffn(norm_hidden)
-        return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        grouped = _groups(hidden_states, groups)
+        norm_hidden = (
+            (self.norm3(grouped.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(hidden_states).flatten(1, 2)
+        )
+        ff_output = _ffn_gelu_epilogue(self.ffn, norm_hidden) if self.fuse_ffn_gelu else self.ffn(norm_hidden)
+        return (
+            (grouped.float() + _groups(ff_output, groups).float() * c_gate_msa).type_as(hidden_states).flatten(1, 2)
+        )
 
 
 class Wan22DiT(nn.Module):
@@ -304,6 +349,13 @@ class Wan22DiT(nn.Module):
         self.proj_out = nn.Linear(dim, config.out_channels * math.prod(config.patch_size))
         self.scale_shift_table = nn.Parameter(torch.empty(1, 2, dim))
 
+    def set_fuse_ffn_gelu(self, enabled: bool) -> None:
+        """Run every block's FFN GELU in the GEMM epilogue (see
+        ``_ffn_gelu_epilogue``); off by default, so the module alone stays the
+        reference port."""
+        for block in self.blocks:
+            block.fuse_ffn_gelu = enabled
+
     @property
     def dtype(self) -> torch.dtype:
         """Bulk compute dtype (the non-island weights); callers cast inputs
@@ -328,17 +380,21 @@ class Wan22DiT(nn.Module):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        attn_fns: Wan22AttentionFns | None = None,
     ) -> torch.Tensor:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
         ``[B, post-patch seq]`` per-token grid (``expand_timesteps`` — the
         only timestep form mstar's dit submodule produces), text embeds
-        ``[B, 512, text_dim]`` bf16. Returns ``[B, C_out, F, H, W]`` bf16."""
+        ``[B, 512, text_dim]`` bf16. Returns ``[B, C_out, F, H, W]`` bf16.
+        ``attn_fns`` routes attention through the engine's ragged resources."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
-        if timestep.ndim != 2:
+        seq_len = math.prod(grid)
+        if timestep.ndim != 2 or seq_len % timestep.shape[1]:
             raise ValueError(
-                f"Wan22DiT requires a per-token [batch, seq] timestep grid; got ndim={timestep.ndim}."
+                "Wan22DiT requires a [batch, groups] timestep, one per group of consecutive "
+                f"tokens (per token or per latent frame); got {tuple(timestep.shape)} for {seq_len} tokens."
             )
 
         rotary_emb = self.rope(grid, hidden_states.device)
@@ -350,14 +406,14 @@ class Wan22DiT(nn.Module):
         )
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, attn_fns)
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
         # bf16 temb promotes), then project and unpatchify.
         shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
-        shift, scale = shift.squeeze(2), scale.squeeze(2)
-        hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
-        hidden_states = self.proj_out(hidden_states)
+        grouped = _groups(hidden_states, temb.shape[1])
+        hidden_states = (self.norm_out(grouped.float()) * (1 + scale) + shift).type_as(hidden_states)
+        hidden_states = self.proj_out(hidden_states.flatten(1, 2))
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)

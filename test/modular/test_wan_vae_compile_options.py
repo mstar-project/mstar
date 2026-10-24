@@ -23,13 +23,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(scope="module")
-def vae():
+def _tiny_vae():
     return AutoencoderKLWan(
         base_dim=8, decoder_base_dim=16, z_dim=8, dim_mult=[1, 2, 2, 2], num_res_blocks=1, is_residual=True,
         in_channels=12, out_channels=12, patch_size=2, scale_factor_spatial=16,
         latents_mean=[0.0] * 8, latents_std=[1.0] * 8,
     ).eval()
+
+
+@pytest.fixture(scope="module")
+def vae():
+    return _tiny_vae()
 
 
 @pytest.fixture
@@ -64,6 +68,7 @@ def test_eager_decoder_step_compiles_nothing(vae, compiles):
 def test_cosmos3_vae_decode_nodes_compile_without_comprehensive_padding(vae, compiles, monkeypatch, warm):
     monkeypatch.delenv("COSMOS3_COMPILE_VAE", raising=False)
     cfg = Cosmos3Config()
+    cfg.vae_decode_fast = False  # the stock compiled decode; the fast path is tested below
     cfg.windowed_decode_warm_cache = warm
     cfg.vae_decode_channels_last = False
     Cosmos3VAEDecoderSubmodule(vae, cfg)
@@ -71,3 +76,11 @@ def test_cosmos3_vae_decode_nodes_compile_without_comprehensive_padding(vae, com
     # the stateless node, then the AR node's stateless decode and, when warm, its DecoderStep
     assert len(compiles) == (3 if warm else 2)
     assert all(_padding_off(kw) for kw in compiles)
+
+
+def test_cosmos3_fast_decode_compiles_only_its_decoder_step(compiles, monkeypatch):
+    monkeypatch.delenv("COSMOS3_COMPILE_VAE", raising=False)
+    # Its own VAE: the fast path casts and converts the node's instance in place.
+    sub = Cosmos3VAEDecoderSubmodule(_tiny_vae(), Cosmos3Config(vae_decode_fast=True))
+    assert sub._fast_step is not None
+    assert len(compiles) == 1 and _padding_off(compiles[0])

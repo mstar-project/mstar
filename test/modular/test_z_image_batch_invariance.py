@@ -122,7 +122,9 @@ def _encode(subs, prompts, batched: bool) -> list[torch.Tensor]:
     rids = [f"t{i}" for i in range(len(prompts))]
     with torch.inference_mode():
         if batched:
-            out = text.forward_batched(IMAGE_GEN_WALK, _eng(rids), **text.preprocess(IMAGE_GEN_WALK, _eng(rids), rows))
+            kwargs = text.preprocess(IMAGE_GEN_WALK, _eng(rids), rows)
+            packed = text.forward_batched(IMAGE_GEN_WALK, _eng(rids), **kwargs)
+            out = text.unpack_packed_outputs(packed, rids, [], rows, {})
             return [out[rid][TEXT_EMBEDS][0] for rid in rids]
         return [text.forward(IMAGE_GEN_WALK, _eng([rid]), **text.preprocess(IMAGE_GEN_WALK, _eng([rid]), [row]))
                 [TEXT_EMBEDS][0] for rid, row in zip(rids, rows, strict=True)]

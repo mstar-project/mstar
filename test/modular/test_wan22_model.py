@@ -108,9 +108,15 @@ def test_wan22_declares_expected_nodes():
     assert walk_nodes == {"text_encoder", "vae_encoder", "dit", "vae_decoder"}
 
 
-def test_wan22_declares_no_engine_resources():
-    """Nothing here is cached across steps, so the engine builds nothing."""
+def test_wan22_declares_only_dit_attention_resources():
+    """Nothing here is cached across steps: the only resource is the dit's
+    cacheless self-attention, and the sdpa backend declares none."""
     model = _make_model()
+    specs = model.get_node_resources()
+    assert [spec.resource_key for spec in specs] == [Wan22DitSubmodule.SELF_ATTN]
+    assert all(spec.nodes == {"dit"} for spec in specs)
+    assert all(not spec.config.shard_heads for spec in specs)
+    model.config = Wan22Config(attention_backend="sdpa")
     assert model.get_node_resources() == []
     assert model.get_request_resource_configs(partition_fwd_args={}) == {}
 
@@ -967,3 +973,51 @@ def test_wan22_config_echo_normalizes_bogus_decode_override(monkeypatch, caplog)
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("Wan2.2 request:"))
     assert "decode=auto" in line
     assert "banana" not in line
+
+
+# ----------------------------------------------------------------------
+# dit attention layout and guidance-branch split
+# ----------------------------------------------------------------------
+
+
+class _FakeSPGroup:
+    def __init__(self, world_size: int, rank: int = 0):
+        self.world_size = world_size
+        self.rank = rank
+
+
+def _dit_info(guidance: float) -> CurrentForwardPassInfo:
+    info = _fwd_info(requested_steps=2, iter_count=1)
+    info.step_metadata["guidance_scale"] = guidance
+    return info
+
+
+@pytest.mark.parametrize("world_size,guidance,branches", [
+    (None, 5.0, 2),  # one GPU: both guidance branches in one batch-2 forward
+    (None, 1.0, 1),  # guidance off: the conditional branch alone
+    (2, 5.0, 1),     # two ranks split the branches
+    (2, 1.0, 1),     # nothing to split: both ranks run the one branch
+    (4, 5.0, 2),     # more ranks than branches: every rank runs both
+])
+def test_wan22_dit_branches_per_rank(world_size, guidance, branches):
+    group = _FakeSPGroup(world_size) if world_size else None
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config(), sp_group=group)
+    node_inputs = submodule.prepare_inputs(
+        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(guidance), inputs=_dit_loop_inputs(k=1),
+    )
+    layout = node_inputs.resource_step_info
+    # latents [1, 4, 2, 2, 2] patchify (1, 2, 2) to 2 * 1 * 1 tokens
+    assert layout.video_tokens == 2 and node_inputs.input_seq_len == 2
+    assert layout.branches == branches
+
+
+def test_wan22_dit_declares_one_segment_per_branch():
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    node_inputs = submodule.prepare_inputs(
+        graph_walk=Wan22Model.VIDEO_GEN_WALK, fwd_info=_dit_info(5.0), inputs=_dit_loop_inputs(k=1),
+    )
+    step = submodule.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs])
+    self_step = step.get(Wan22DitSubmodule.SELF_ATTN)
+    assert [(s.label, s.span) for s in self_step.segments] == [("video", 2), ("video", 2)]
+    sdpa = Wan22DitSubmodule(transformer=None, config=Wan22Config(attention_backend="sdpa"))
+    assert sdpa.declare_step(Wan22Model.VIDEO_GEN_WALK, ["r0"], [node_inputs]) is None

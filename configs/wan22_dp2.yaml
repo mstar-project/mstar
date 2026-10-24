@@ -1,0 +1,16 @@
+model: "wan22"
+
+# See wan22.yaml. Two GPUs, throughput-oriented: every node is replicated on
+# both, and each request runs end to end on one of them.
+max_seq_len: 512
+
+model_kwargs:
+  vae_decode_fast_sizes: ["1280x704", "832x480"]
+
+node_groups:
+  - node_names:
+      - text_encoder
+      - vae_encoder
+      - vae_decoder
+      - dit
+    ranks: [0, 1]

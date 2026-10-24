@@ -38,3 +38,11 @@ warmup_requests:
     files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
     output_modalities: [action]
     model_kwargs: {action_mode: policy, domain_name: droid_lerobot, raw_action_dim: 10}
+  # Concurrent policy requests batch, and the batched step compiles once per
+  # batch size and shape: warm each size up to the batch cap at the documented
+  # 32-step chunk.
+  - text: warmup
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
+    output_modalities: [action]
+    model_kwargs: {action_mode: policy, domain_name: droid_lerobot, raw_action_dim: 10, action_chunk_size: 32}
+    concurrency: [2, 3, 4, 5, 6, 7, 8]

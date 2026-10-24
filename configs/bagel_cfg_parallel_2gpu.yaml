@@ -1,0 +1,36 @@
+model: "bagel"
+max_seq_len: 32768
+max_concurrent_requests: 16
+
+resources:
+  kv:
+    cpu_offload_pages: 2048
+
+# CFG-parallel text-to-image on two GPUs: the main branch (and the combine) on rank 0,
+# both guidance branches on rank 1. With the default t2i settings (cfg_img_scale 1.0) the
+# image branch never contributes, so the step is bounded by one branch per GPU.
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - LLM
+      - combine_cfg
+    ranks:
+      - 0
+
+  - node_names:
+      - LLM_cfg_text
+      - LLM_cfg_img
+    ranks:
+      - 1
+    graph_walks:
+      - image_gen_cfg

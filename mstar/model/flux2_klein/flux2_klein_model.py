@@ -43,7 +43,7 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata, Stream
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.diffusion.decode_utils import VAE_DECODE_BATCH_SIZES
 from mstar.model.components.diffusion.image_io import encode_image
 from mstar.model.components.diffusion.lora import LoraSpec
@@ -61,6 +61,7 @@ from mstar.model.flux2_klein.submodules import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
     TEXT_MASK,
+    TEXT_PADDED,
     KleinDenoiseSubmodule,
     KleinShape,
     KleinTextEncoderSubmodule,
@@ -83,6 +84,9 @@ ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
 class Flux2KleinModel(Model):
     """FLUX.2 [klein] (4B by default; the 9B checkpoint loads through the same class)."""
+
+    # settled by process_prompt (tokenization); a client cannot set it
+    INTERNAL_KWARGS = (TEXT_PADDED,)
 
     def __init__(
         self,
@@ -334,7 +338,11 @@ class Flux2KleinModel(Model):
         if float(kwargs.get("guidance_scale", 1.0)) != 1.0:
             logger.warning("guidance_scale is ignored: FLUX.2 klein is step-distilled and runs without CFG")
         ids, mask = self.tokenize(prompt)
-        return {TEXT_INPUTS: [ids], TEXT_MASK: [mask]}
+        # right padded: the last position is padding unless the prompt fills the context
+        return ProcessPromptOutput(
+            new_input_tensors={TEXT_INPUTS: [ids], TEXT_MASK: [mask]},
+            metadata={TEXT_PADDED: not bool(mask[-1])},
+        )
 
     # --------------------------------------------------------- state machine
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
@@ -344,6 +352,7 @@ class Flux2KleinModel(Model):
             "height": kw["height"], "width": kw["width"],
             "num_inference_steps": kw["num_inference_steps"],
             "ref_grids": kw["ref_grids"],
+            TEXT_PADDED: kw.get(TEXT_PADDED),
         }
 
     def get_initial_forward_pass_args(
@@ -365,6 +374,7 @@ class Flux2KleinModel(Model):
             "width": width,
             "num_inference_steps": self._resolve_steps(model_kwargs),
             "ref_grids": [list(self.config.latent_grid(h, w)) for h, w in ref_dims],
+            TEXT_PADDED: model_kwargs.get(TEXT_PADDED),
         }
         logger.info(
             "FLUX.2 klein request: %dx%d steps=%d refs=%s seed=%s", width, height, kwargs["num_inference_steps"],
@@ -470,7 +480,11 @@ class Flux2KleinModel(Model):
 
         if node_name == "text_encoder":
             encoder = build_text_encoder(self.config.text_encoder, self.snapshot, device)
-            return KleinTextEncoderSubmodule(encoder, self.config, max_batch_size=self.max_batch_size)
+            return KleinTextEncoderSubmodule(
+                encoder, self.config, max_batch_size=self.max_batch_size,
+                capture_walk=ENCODE_TEXT_WALK if self.accelerator_graph else None,
+                capture_batch_sizes=self.capture_batch_sizes,
+            )
         if node_name == "vae_encoder":
             return KleinVaeEncoderSubmodule(self._vae_module(device), self.config)
         if node_name == "vae_decoder":

@@ -133,11 +133,14 @@ def test_dummy_mode_returns_no_submodules():
 def test_process_prompt_tokenizes_with_chat_template_to_fixed_length():
     model = _make_model()
     out = model.process_prompt("a cat", ["text"], ["image"])
-    ids, mask = out["text_inputs"][0], out["text_mask"][0]
+    ids, mask = out.new_input_tensors["text_inputs"][0], out.new_input_tensors["text_mask"][0]
     assert ids.shape == (512,) and mask.shape == (512,) and ids.dtype == torch.long
     n = int(mask.sum())
     assert bytes(ids[:n].tolist()) == b"<u>a cat<a>"
     assert int(mask[n:].sum()) == 0
+    # the text encoder's attention path is settled here, on the host
+    assert out.metadata == {"text_padded": True}
+    assert "text_padded" in model.INTERNAL_KWARGS
 
 
 @pytest.mark.parametrize("kwargs,message", [
