@@ -2343,8 +2343,11 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># ---- shared: polling &amp; ACKs ----</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_collect_and_send_acks</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
+        <span class="n">wire_request_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
+<span class="w">        </span><span class="sd">"""``wire_request_id`` overrides ``rid_to_str(request_id)``, for a</span>
+<span class="sd">        request that no longer has a handle."""</span>
         <span class="n">acks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">graph_edges</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
@@ -2355,12 +2358,14 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">source_entity</span><span class="p">,</span> <span class="n">tensors</span> <span class="ow">in</span> <span class="n">acks</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">source_entity</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">:</span>
                 <span class="k">continue</span>
+            <span class="k">if</span> <span class="n">wire_request_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">wire_request_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rid_to_str</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">communicator</span><span class="o">.</span><span class="n">send</span><span class="p">(</span>
                 <span class="n">source_entity</span><span class="p">,</span>
                 <span class="n">WorkerMessage</span><span class="p">(</span>
                     <span class="n">message_type</span><span class="o">=</span><span class="n">WorkerMessageType</span><span class="o">.</span><span class="n">TENSOR_RECEIVED</span><span class="p">,</span>
                     <span class="n">body</span><span class="o">=</span><span class="n">TensorReceived</span><span class="p">(</span>
-                        <span class="n">request_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rid_to_str</span><span class="p">(</span><span class="n">request_id</span><span class="p">),</span>
+                        <span class="n">request_id</span><span class="o">=</span><span class="n">wire_request_id</span><span class="p">,</span>
                         <span class="n">successful_tensors</span><span class="o">=</span><span class="n">tensors</span><span class="p">,</span>
                         <span class="n">failed_tensor_ids</span><span class="o">=</span><span class="p">[],</span>
                     <span class="p">),</span>
@@ -2370,14 +2375,15 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="TensorCommunicationManager.ack_unread_tensors">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.ack_unread_tensors">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ack_unread_tensors</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
     <span class="p">):</span>
-<span class="w">        </span><span class="sd">"""Ack result tensors for an already-removed request without reading them.</span>
+<span class="w">        </span><span class="sd">"""Ack tensors for an already-removed request without reading them.</span>
 
-<span class="sd">        The producer holds these output buffers until it gets the</span>
-<span class="sd">        TENSOR_RECEIVED ack; emit it here so it can reclaim them.</span>
+<span class="sd">        The producer holds these buffers until it gets the TENSOR_RECEIVED ack;</span>
+<span class="sd">        emit it here so it can reclaim them. ``request_id`` is the wire string:</span>
+<span class="sd">        a removed request has no handle on a worker.</span>
 <span class="sd">        """</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">,</span> <span class="n">wire_request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="TensorCommunicationManager.enable_transfer_metrics">

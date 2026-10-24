@@ -1380,13 +1380,14 @@ identity on strings.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.ack_unread_tensors">
 <span class="sig-name descname"><span class="pre">ack_unread_tensors</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_edges</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.ack_unread_tensors"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.ack_unread_tensors" title="Link to this definition">#</a></dt>
-<dd><p>Ack result tensors for an already-removed request without reading them.</p>
-<p>The producer holds these output buffers until it gets the
-TENSOR_RECEIVED ack; emit it here so it can reclaim them.</p>
+<dd><p>Ack tensors for an already-removed request without reading them.</p>
+<p>The producer holds these buffers until it gets the TENSOR_RECEIVED ack;
+emit it here so it can reclaim them. <code class="docutils literal notranslate"><span class="pre">request_id</span></code> is the wire string:
+a removed request has no handle on a worker.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>graph_edges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
