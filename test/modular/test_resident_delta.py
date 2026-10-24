@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -191,6 +192,12 @@ class _Engine:
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
     take_resident_delta = Engine.take_resident_delta
+
+    def decide_cached_prefix(self, batch):
+        return {}
+
+    def page_trails(self, node_name):
+        return {}
 
     def __init__(self, role: str = "leader"):
         """``role`` is this rank's part for ``"node"``: ``leader`` (rank 0 of a
@@ -1098,6 +1105,7 @@ class _SpecParent:
                 return {"r0": 0}
 
         self.batch = _Batch()
+        self.node_batch = SimpleNamespace(commit_done=threading.Event())
 
 
 def test_the_async_follow_path_will_not_build_mid_replay():

@@ -302,7 +302,7 @@ them by that name:
    resources:
      kv_cache:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                                # prefix_cache, prefix_cache_salt
+                                # prefix_cache, prefix_cache_salt, prefix_cache_tp
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense)
      vit_attn:                  # a cacheless (ragged) attention resource
@@ -317,7 +317,11 @@ no longer read. It raises an error with a message describing the migration.
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
 cached pages. A single request opts out by sending ``prefix_cache=False``, which
-travels with its other ``model_kwargs``.
+travels with its other ``model_kwargs``. Above one rank the cache stays off unless
+``prefix_cache_tp: true`` is set as well: rank 0 then decides each hit and the other
+ranks adopt it. ``prefix_cache_tp`` can't be combined with ``cpu_offload_pages``, and the
+cache's nodes must run on one TP group, with no replicas and no walks placed on other
+ranks. Loading fails otherwise.
 
 On a single rank, a request waits at the head of its pool's queue until its prompt fits
 beside the prompts already admitted, and no request behind it starts first. A cache hit on
@@ -629,7 +633,7 @@ or ``increase()``.
   ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt
   tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
   tokens found there. Only models that key their prompts for prefix reuse (BAGEL and
-  Orpheus) count; the cache is off under tensor parallelism.
+  Orpheus) count, and above one rank only with ``prefix_cache_tp`` set.
 - ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next
   step on the node is ready (its inputs arrived) and not running: waiting for room in a
   step or for the worker to pick the node.

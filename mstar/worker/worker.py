@@ -1665,6 +1665,8 @@ class Worker:
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
         resident_delta = engine.take_resident_delta(node_batch.node_name)
+        prefix_hits = engine.decide_cached_prefix(node_batch)
+        page_trails = engine.page_trails(node_batch.node_name)
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -1693,6 +1695,8 @@ class Worker:
                         resident_delta=resident_delta.copy(),
                         walks=walks,
                         walk_idx=walk_idx,
+                        prefix_hits=prefix_hits,
+                        page_trails=page_trails,
                     )
                 )
             )
@@ -2310,6 +2314,16 @@ class Worker:
             )
         return True
 
+    def _plans_ahead(self, spec: Speculation) -> bool:
+        """With the prefix cache open, a TP leader admits a yield-away step at exec, as its followers
+        do. A pre-plan refused on rank 0 alone puts its pages back at the end of rank 0's free list,
+        and the ranks then hand out different page ids, which only the cache reads."""
+        node = spec.node_batch.node_name
+        return not (spec.is_yield_away and node in self.parallel_nodes and self._prefix_cache_open(node))
+
+    def _prefix_cache_open(self, node_name: str) -> bool:
+        return self.engine_manager.get_engine(node_name).prefix_cache_open(node_name)
+
     def _is_tp_follower_node(self, node_name: str) -> bool:
         """This rank follows ``node_name``: rank 0 of its instance decides both
         what runs on it and what gets evicted from it. Mirrors the engine's
@@ -2499,6 +2513,8 @@ class Worker:
         # The kept rids' chunks now belong to the step; nothing is left to undo.
         speculation.spec_id = 0
         speculation.consumed_streaming_edges.clear()
+        if not success:
+            self.engine_manager.get_engine(batch.node_name).release_cached_prefix(speculation.node_batch)
 
     @staticmethod
     def _speculated_rids(speculation: Speculation | None) -> frozenset[int]:
@@ -2804,7 +2820,10 @@ class Worker:
         # state that is still mid-replay. Every poll retries the owed moves, so
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
-        if not self.scheduler.settle_tp_follow_delta():
+        if not self.scheduler.settle_tp_follow_delta(
+            # Of the steps before the head, only N may still index a page of the head's hit
+            caught_up=pending.node_batch.commit_done.is_set(),
+        ):
             return None
 
         batch_N = pending.batch
@@ -2968,6 +2987,8 @@ class Worker:
         head = self.scheduler.peek_tp_follow()
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
             self.scheduler.pop_tp_follow_head()
+            # settle may have adopted some of the head's hit, and the leader releases the whole lease
+            self.engine_manager.get_engine(head.node_name).drop_cached_prefix(head)
 
     @staticmethod
     def _step_voids_head(pending: PendingBatch) -> str | None:
@@ -2997,7 +3018,7 @@ class Worker:
             head = self.scheduler.peek_tp_follow()
             if head is not None and head.speculative and head.spec_from_seq == s:
                 void = self._step_voids_head(pending) if outputs is not None else None
-                if void is not None:
+                if void is not None and not self._prefix_cache_open(head.node_name):
                     # The leader clears its speculation on this verdict too.
                     self.scheduler.pop_tp_follow_head()
                     logger.debug(
@@ -3005,6 +3026,8 @@ class Worker:
                         self.worker_id, head.spec_seq, s, void,
                     )
                     return outputs, None
+                # With the prefix cache open, build the head even when N's verdict voids it, since the
+                # leader pre-plans every head it sends and this rank's pages must move as the leader's do.
                 spec = self._try_follow_speculation(pending)
                 if spec is not None:
                     arm(spec)
@@ -3306,6 +3329,8 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
         self._register_outputs(route_output)
+        # Those sends were the last readers of this step's host copies.
+        self.tensor_manager.drop_host_copies()
         _pp_stage("register_outputs")
 
         # send outputs
@@ -3365,7 +3390,7 @@ class Worker:
         # share one (refuse_combined_walks_across_tp_groups).
         # Pass the stop check's host copies so a host-memory transport needn't
         # copy the rows again. They are views of pinned buffers the next step
-        # reuses; safe because the sends below are their last reader.
+        # reuses, so they are dropped once this step's sends are done.
         # Row views of one batch clone (a decode step) are described from one
         # row; anything else goes through the general per-tensor path. Both
         # take the real walk, not the combined label: the runtime keys the
@@ -3809,7 +3834,7 @@ class Worker:
         The host tensors are views of pinned buffers the next step reuses. Their
         one other reader, a ``needs_cpu_tensor`` transport, gets them through
         the store and sends in ``_register_outputs`` later in the same
-        ``_postprocess_batch``, never reading them after.
+        ``_postprocess_batch``, which then drops them from the store.
         """
         source = outputs.get_check_stop_input()
         # Rows are in forward order, which the engine stamped on the output.
@@ -4296,7 +4321,7 @@ class Worker:
             # commit event, then reserves a slot and pre-plans —
             # while the main thread sits in await_gpu with the GIL
             # released and N's kernels are still running.
-            if plan_executor is not None:
+            if plan_executor is not None and self._plans_ahead(spec):
                 spec.plan_future = plan_executor.submit(
                     self._preplan_spec, pending, spec,
                 )
