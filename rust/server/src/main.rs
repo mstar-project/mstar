@@ -1797,7 +1797,7 @@ mod tests {
             assert_eq!((status, body["error"]["message"].as_str()), (StatusCode::BAD_REQUEST, Some(detail)), "{adapter}");
             left.push((adapter, std::fs::read_dir(&st.upload_dir).unwrap().count()));
             let _ = std::fs::remove_dir_all(&st.upload_dir);
-            std::fs::create_dir_all(&st.upload_dir).unwrap();
+            runtime_dir::ensure_private_dir(&st.upload_dir).unwrap();
         }
         let _ = std::fs::remove_dir_all(&st.upload_dir);
         assert_eq!(left, [("Qwen3_5Adapter", 0), ("Qwen3OmniAdapter", 0), ("Cosmos3EdgeAdapter", 0)]);
