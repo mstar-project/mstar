@@ -3240,6 +3240,8 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
         compile_decode = (env == "1") if env is not None else bool(self.config.compile_reasoner_decode)
         return [
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk=REASONER_DECODE_WALK,
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
