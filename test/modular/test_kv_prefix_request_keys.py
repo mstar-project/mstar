@@ -382,8 +382,8 @@ class _Talking(_ToyModel):
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
         ))]
 
-    def prefix_key_streams(self):
-        return {"kv": {"main": PrefixStream("text_inputs", "ids", "prefill", None, ("prefill_image",))}}
+    def kv_labels(self):
+        return {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill", "prefill_image")))}}
 
     def get_initial_forward_pass_args(
         self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None,
@@ -402,11 +402,13 @@ class _Talking(_ToyModel):
 def test_a_request_whose_talker_runs_is_not_cached(tmp_path, monkeypatch):
     conductor = _conductor(_Talking(), [{"node_names": ["vit", "LLM", "talker"], "ranks": [0]}], tmp_path, monkeypatch)
 
+    layout = LabelLayout(spans=(Span("ids", "prefill", 4, 4, "text_inputs"),))
     cached = {}
     for out in ("audio", "text"):
         conductor._do_ingest_request(NewRequestConductor(
             request_id=out, initial_signals={}, initial_input_modalities=["text"],
-            initial_output_modalities=[out], input_metadata={}, model_kwargs={},
+            initial_output_modalities=[out], input_metadata={},
+            model_kwargs={"kv_layout": {"kv": {"main": layout.row()}}},
         ))
         cached[out] = conductor.requests[out].resource_configs["kv"].prefix_cache
 

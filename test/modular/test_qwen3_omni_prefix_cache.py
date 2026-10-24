@@ -24,7 +24,7 @@ from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
-from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_POS
+from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel, image_span
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
 
@@ -210,9 +210,7 @@ def model():
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
     model.tokenizer = _Tokenizer()
     model._processor = _Processor()
-    model.config = SimpleNamespace(
-        vision=SimpleNamespace(spatial_merge_size=2), audio_encoder=SimpleNamespace(n_window=50),
-    )
+    model.config = Qwen3OmniModelConfig()
     return model
 
 
@@ -234,7 +232,7 @@ _PROMPTS = {
 @pytest.mark.parametrize(("modalities", "tensors", "items"), _PROMPTS.values(), ids=_PROMPTS.keys())
 def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(model, modalities, tensors, items):
     out = _prompt(model, modalities, tensors)
-    layout = out.metadata["prefix_layout"][THINKER_KV]["main"]
+    layout = out.metadata["kv_layout"][THINKER_KV]["main"].spans
     signals = {name: [object()] * len(value) for name, value in out.new_input_tensors.items()}
 
     walks = [walk for walk, _ in model._build_thinker_prefill_schedule(modalities, signals)]
