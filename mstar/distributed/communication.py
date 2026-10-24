@@ -44,6 +44,15 @@ def rendezvous_store(init_method: str, rank: int, world_size: int, timeout: time
     )
 
 
+@torch.compiler.disable
+def _all_to_all_single(
+    group: dist.ProcessGroup, send: torch.Tensor, recv: torch.Tensor,
+    recv_splits: list[int] | None = None, send_splits: list[int] | None = None,
+) -> torch.Tensor:
+    dist.all_to_all_single(recv, send, recv_splits, send_splits, group=group)
+    return recv
+
+
 class CommGroup:
     """A communication group over one axis of the worker device mesh.
 
@@ -230,34 +239,43 @@ class CommGroup:
         uneven split / gather (e.g. a sequence length not divisible by the
         group size); when ``None`` the respective dimension is split evenly
         (and ``scatter_dim`` must then be divisible by ``world_size``).
+
+        One ``all_to_all_single`` over a packed buffer, which replays from a
+        CUDA graph. Only the collective is hidden from torch.compile: the
+        packing and unpacking stay in the caller's graph, where inductor
+        writes the send buffer from the producing kernel and folds the
+        received layout into the consumer.
         """
         if self.world_size == 1:
             return input_
         world_size = self.world_size
+        even_scatter = scatter_sizes is None or len(set(scatter_sizes)) == 1
+        even_gather = gather_sizes is None or len(set(gather_sizes)) == 1
+        if even_scatter and even_gather:
+            # [.., N, ..] -> [P, .., N/P, ..]: piece r goes to rank r, and the
+            # piece received from rank r has the same shape
+            send = input_.unflatten(scatter_dim, (world_size, -1))
+            send = send.movedim(scatter_dim, 0).contiguous()
+            recv = _all_to_all_single(self.device_group, send, torch.empty_like(send))
+            return recv.movedim(0, gather_dim).flatten(gather_dim, gather_dim + 1)
         if scatter_sizes is None:
-            assert input_.size(scatter_dim) % world_size == 0, (
-                f"all_to_all: scatter_dim {scatter_dim} size "
-                f"{input_.size(scatter_dim)} not divisible by world_size "
-                f"{world_size}; pass scatter_sizes for an uneven split"
-            )
-            chunk = input_.size(scatter_dim) // world_size
-            scatter_sizes = [chunk] * world_size
-        send = [
-            t.contiguous()
-            for t in torch.split(input_, scatter_sizes, dim=scatter_dim)
-        ]
+            scatter_sizes = [input_.size(scatter_dim) // world_size] * world_size
+        chunks = input_.split(scatter_sizes, dim=scatter_dim)
+        send = torch.cat([chunk.contiguous().flatten() for chunk in chunks])
+        mine = list(chunks[self.rank].shape)
         if gather_sizes is None:
-            gather_sizes = [send[self.rank].size(gather_dim)] * world_size
-        base_shape = list(send[self.rank].shape)
-        recv = []
-        for r in range(world_size):
-            shape = list(base_shape)
-            shape[gather_dim] = gather_sizes[r]
-            recv.append(
-                torch.empty(shape, dtype=input_.dtype, device=input_.device)
-            )
-        dist.all_to_all(recv, send, group=self.device_group)
-        return torch.cat(recv, dim=gather_dim).contiguous()
+            gather_sizes = [mine[gather_dim]] * world_size
+        shapes = [mine[:gather_dim] + [n] + mine[gather_dim + 1:] for n in gather_sizes]
+        numels = [int(torch.Size(shape).numel()) for shape in shapes]
+        recv = _all_to_all_single(
+            self.device_group, send, input_.new_empty(sum(numels)),
+            numels, [chunk.numel() for chunk in chunks],
+        )
+        pieces = [
+            piece.view(shape)
+            for piece, shape in zip(recv.split(numels), shapes, strict=True)
+        ]
+        return torch.cat(pieces, dim=gather_dim)
 
 
 @dataclass

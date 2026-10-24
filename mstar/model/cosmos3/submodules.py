@@ -2187,9 +2187,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             capture_batch_sizes = list(self.gen_capture_batch_sizes)
         dtype = self.transformer.proj_in.weight.dtype
-        # The 2D (TP x SP) captured denoise graph hits a CUDA illegal access at
-        # 480p+ in the combined Ulysses all-gather + TP all-reduce path (pure-TP and
-        # pure-SP capture cleanly; only the combination at this scale). For 2D,
+        # The 2D (TP x SP) captured denoise graph hit a CUDA illegal access at
+        # 480p+ when the Ulysses exchange was an all-gather, composed with the TP
+        # all-reduce (pure-TP and pure-SP capture cleanly; only the combination at
+        # this scale). Not yet re-checked on the all-to-all exchange. For 2D,
         # capture only the smallest tier; 480p+ runs eager (correct, just no graph).
         two_d = self.transformer.sp_group.world_size > 1 and self.transformer.comm_group.world_size > 1
         self._capture_layout: dict[tuple, dict] = {}
@@ -2389,15 +2390,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         layout = self._capture_layout[tuple(latents.shape[1:])]
         rids = engine_inputs.request_ids
         if latents.shape[0] == 1:
-            # Captured into the denoise CUDA graph. Under SP the Ulysses
-            # exchange must be all-gather (all-to-all is grouped p2p send/recv —
-            # not graph-replayable); the flag holds across warmup/capture/replay
-            # so those kernels compile during eager warmup. No-op without SP.
+            # Captured into the denoise CUDA graph.
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents[0], vision_timesteps[0], position_ids_cond[0], position_ids_uncond[0],
                 layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
                 layout["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
-                prefer_all_gather=True, noisy_token_mask=noisy_token_mask[0],
+                noisy_token_mask=noisy_token_mask[0],
             )
             return {rids[0]: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
         reqs = [
