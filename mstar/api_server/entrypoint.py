@@ -19,7 +19,7 @@ from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, NamedTuple, Optional, Protocol
 
 import msgpack
 import uvicorn
@@ -315,6 +315,14 @@ class ChunkSink(Protocol):
 
     def relay(self, tags: list, chunks: list[ResultChunk]) -> None:
         """Forward ``chunks``, in order; ``tags[i]`` names ``chunks[i]``'s request."""
+
+
+class _SinkBatch(NamedTuple):
+    """One sink's requests with chunks to relay in a message pass."""
+
+    sink: ChunkSink
+    # by ``id``, so a request with several chunks in the pass is relayed once
+    reqs: dict[int, PendingRequest]
 
 
 def _set_events(wakes: list) -> None:
@@ -1117,7 +1125,7 @@ class APIServer:
                 # the handlers are woken once per pass, after every chunk of
                 # the pass has been appended, not once per chunk
                 to_wake: dict[int, PendingRequest] = {}
-                to_relay: dict[int, tuple[ChunkSink, dict[int, PendingRequest]]] = {}
+                to_relay: dict[int, _SinkBatch] = {}
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(
                         "Got result chunk of %s modality for request %s",
@@ -1157,10 +1165,10 @@ class APIServer:
                             info.total_bytes += len(result_chunk.data)
                         sink = req.sink
                         if sink is not None and result_chunk.modality != "error":
-                            entry = to_relay.get(id(sink))
-                            if entry is None:
-                                entry = to_relay[id(sink)] = (sink, {})
-                            entry[1][id(req)] = req
+                            batch = to_relay.get(id(sink))
+                            if batch is None:
+                                batch = to_relay[id(sink)] = _SinkBatch(sink, {})
+                            batch.reqs[id(req)] = req
                         else:
                             to_wake[id(req)] = req
 
