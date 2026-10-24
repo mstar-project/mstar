@@ -271,7 +271,10 @@ def _time(match: re.Match) -> str:
 
 
 def _fraction(written_numerator: str, written_denominator: str) -> str | None:
-    if len(written_denominator.lstrip("0")) > 3 or len(written_numerator.lstrip("0")) > 3:
+    # leading zeros stripped before int(), which refuses over 4,300 digits
+    written_numerator = written_numerator.lstrip("0") or "0"
+    written_denominator = written_denominator.lstrip("0") or "0"
+    if len(written_denominator) > 3 or len(written_numerator) > 3:
         return None
     numerator, denominator = int(written_numerator), int(written_denominator)
     if not 0 < numerator < denominator <= 100:
@@ -286,7 +289,7 @@ def _mixed_fraction(match: re.Match) -> str:
     words = _fraction(match["n"], match["dd"])
     if words is None:
         return match[0]
-    if int(match["n"]) == 1:
+    if match["n"].lstrip("0") == "1":
         words = "a " + words.split(" ", 1)[1]
     return f"{cardinal(match['w'])} and {words}"
 

@@ -358,6 +358,14 @@ def test_a_run_too_long_for_int_is_read_digit_by_digit(text, end):
     assert spoken.count("one ") >= 4999
 
 
+@pytest.mark.parametrize("text", ["0" * 5000 + "1/2", "1/" + "0" * 5000 + "2", "3 " + "0" * 5000 + "1/2"])
+def test_a_fraction_with_thousands_of_leading_zeros_does_not_raise(text):
+    """Leading zeros were counted off before the length check but not before int()."""
+    assert normalize_english(text)
+    assert CosyVoice3TextFrontend().normalize(text)
+
+
+
 def test_a_long_run_of_thousands_groups_or_commas_takes_linear_time():
     """Each took over 5 s at this size: a rule could start after every comma and rescan the rest."""
     frontend = CosyVoice3TextFrontend()
