@@ -29,7 +29,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
     RecurrentStep,
 )
-from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool, SnapshotTarget
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, StepContext
@@ -354,3 +354,209 @@ def test_a_keyed_node_still_refuses_a_resource_that_cant_skip_a_prefix(depends_o
     specs = [*_specs(prefix_slots=2).values(), _Unskippable(resource_key="other", nodes={"LLM"})]
     with pytest.raises(ValueError, match="'other' cannot serve a request"):
         _refuse_unskippable_resources(specs, _Keyed())
+
+
+def _prefill(pool: RecurrentStatePool, rid: str, tokens: list[int], hit: int | None) -> RecurrentStep:
+    """Probe and admit a prompt's prefill: a KV cache holding ``hit`` tokens, or none."""
+    if hit is None:
+        pool.ingest_request(rid)
+        pool._kv.add(rid, tokens)
+        pool.resolve_cached_prefix(rid, NODE, WALK, None)
+        restored = 0
+    else:
+        restored = _probe(pool, rid, tokens, hit).tokens
+    step = _step(rid, len(tokens) - restored)
+    assert pool.admit(step, _ctx(rid)).ok
+    return step
+
+
+def _kept(pool: RecurrentStatePool) -> dict[int, int]:
+    """Boundary -> offset into the row, for every snapshot slot admit reserved."""
+    return {key[2]: write.offset for key, write in pool._snap_writes.items()}
+
+
+def test_a_prefill_from_token_0_keeps_its_last_boundary():
+    pool = _pool()
+    _prefill(pool, "a", A[:19], hit=None)
+    assert _kept(pool) == {16: 16}
+
+
+def test_a_prefill_from_a_restored_boundary_keeps_its_last():
+    pool = _pool(prefix_slots=3)
+    _snapshot(pool, "a", A, 8, 1.0)
+    _prefill(pool, "b", A[:19], hit=8)
+    assert _kept(pool) == {16: 8}
+
+
+@pytest.mark.parametrize("hit", [12, 14])
+def test_a_prefill_whose_kv_hit_runs_past_its_snapshot_keeps_the_hit_end_too(hit):
+    """Without the KV hit's end, a prefix that many prompts share is never restored, since
+    each prompt's last boundary lies past the shared prefix. A hit can end inside a page, at
+    an image's end, where no page's key names the state, so the prefill keeps the page boundary
+    under the hit's end."""
+    pool = _pool(prefix_slots=3)
+    _snapshot(pool, "a", A, 4, 1.0)
+    _prefill(pool, "b", A[:19], hit=hit)
+    assert _kept(pool) == {12: 8, 16: 12}
+
+
+def test_a_prefill_past_the_largest_bucket_keeps_its_boundaries_on_a_wider_checkpoint_interval():
+    """An eager step allocates its own checkpoints, and one per page would outgrow the buffer a
+    captured step shares (512 MiB per GDN layer call at 32K tokens on Qwen3.5-9B)."""
+    pool = _pool(prefix_slots=3)
+    pool.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=8)
+    _snapshot(pool, "a", list(range(30)), 4, 1.0)
+    step = _prefill(pool, "b", list(range(30)), hit=26)
+    pool.plan(step, _ctx("b"))
+    assert pool.addressing().snapshot_every == 8, "the step checkpoints more often than the shared buffer holds"
+    assert _kept(pool) == {20: 16, 28: 24}
+
+
+def test_a_prefill_keeps_no_boundary_a_snapshot_already_holds():
+    pool = _pool(prefix_slots=3)
+    _snapshot(pool, "a", A, 16, 1.0)
+    free = len(pool._snap_free)
+    _prefill(pool, "b", A[:19], hit=None)
+    assert not pool._snap_writes and len(pool._snap_free) == free, "a duplicate evicted a snapshot"
+
+
+def test_a_prefill_hands_its_kept_states_to_the_backend_and_commit_files_them():
+    pool = _pool()
+    step = _prefill(pool, "a", A[:19], hit=None)
+    pool.plan(step, _ctx("a"))
+    slot = pool._snap_writes[("a", "main", 16)].slot
+    assert pool.addressing().snapshots == (SnapshotTarget(0, 16, slot),)
+    assert pool.addressing().snapshot_every == PAGE
+    pool.commit(step, _ctx("a"))
+    assert pool._snap_by_key[pool._kv.chain_key("a", "main", 4)] == slot
+    assert pool._slots["a"]["main"].tokens == 19, "later boundaries would be placed from the wrong length"
+
+
+@pytest.mark.parametrize("release", ["rollback", "clear_preplan", "removal"])
+def test_a_prefill_that_never_commits_gives_its_snapshot_slots_back(release):
+    """A forward that raises gets neither commit nor rollback, only the request's removal.
+    Each path returns what admit reserved, or prefix reuse stops once every slot is gone."""
+    pool = _pool()
+    pool.ingest_request("a")
+    pool._kv.add("a", A[:19])
+    pool.resolve_cached_prefix("a", NODE, WALK, None)
+    step, ctx = _step("a", 19), _ctx("a", preplan=release == "clear_preplan")
+    assert pool.admit(step, ctx).ok
+    if release == "rollback":
+        pool.rollback_admit(step, ctx)
+    elif release == "clear_preplan":
+        pool.plan(step, ctx)
+        pool.clear_preplan()
+    else:
+        pool.plan(step, ctx)
+        pool.remove_request("a")
+    assert not pool._snap_writes and len(pool._snap_free) == 2
+
+
+def _decode(pool: RecurrentStatePool, rid: str, steps: int, value: float = 0.0) -> None:
+    """Run ``steps`` one-token steps, each leaving ``value`` in the request's state."""
+    for _ in range(steps):
+        step, ctx = _step(rid, 1), _ctx(rid)
+        assert pool.admit(step, ctx).ok
+        pool.plan(step, ctx)
+        _state(pool, rid).fill_(value)
+        pool.commit(step, ctx)
+
+
+def _reply(pool: RecurrentStatePool, rid: str = "a") -> None:
+    """Prefill a 3-token prompt, then have the KV chain key the reply's ids up to token 16."""
+    step = _prefill(pool, rid, A[:3], hit=None)
+    pool.commit(step, _ctx(rid))
+    pool._kv.add(rid, A[:16])
+
+
+def test_a_decode_step_onto_a_page_boundary_saves_its_state():
+    pool = _pool()
+    _reply(pool)
+    _decode(pool, "a", 1, value=3.0)
+    decode = pool._decode[("a", "main")]
+    assert decode.tokens == 4 and decode.key == pool._kv.chain_key("a", "main", 1)
+    assert pool._snap_by_key[decode.key] == decode.slot
+    assert bool((pool._blocks["state"][:, decode.slot] == 3.0).all()), "the snapshot is not the state at 4"
+
+
+def test_a_decode_snapshot_is_filed_once_the_chain_keys_its_page():
+    pool = _pool()
+    _reply(pool)
+    pool._kv.add("a", A[:3])  # the reply's ids haven't reached the chain
+    _decode(pool, "a", 1)
+    assert ("a", "main") in pool._unkeyed and not pool._snap_by_key
+    pool._kv.add("a", A[:16])
+    _decode(pool, "a", 1)
+    assert not pool._unkeyed and pool._decode[("a", "main")].key in pool._snap_by_key
+
+
+def test_a_decode_that_crosses_a_boundary_replaces_the_previous_decode_snapshot():
+    pool = _pool()
+    _reply(pool)
+    _decode(pool, "a", 1)
+    previous = pool._decode[("a", "main")]
+    _decode(pool, "a", 4)
+    assert previous.key not in pool._snap_by_key, "a reply keeps a snapshot per page and fills the pool"
+    assert pool._decode[("a", "main")].tokens == 8
+    assert len(pool._snap_free) == 1
+
+
+def test_a_replaced_decode_snapshot_a_probe_holds_stays_filed():
+    pool = _pool()
+    _reply(pool)
+    _decode(pool, "a", 1)
+    previous = pool._decode[("a", "main")]
+    assert _probe(pool, "b", A[:8], hit=4).tokens == 4
+    _decode(pool, "a", 4)
+    assert pool._snap_by_key[previous.key] == previous.slot, "a lease lost the snapshot it holds"
+
+
+def test_removal_frees_an_unfiled_decode_snapshot_and_keeps_a_filed_one():
+    pool = _pool()
+    for rid in ("a", "b"):
+        _reply(pool, rid)
+    pool._kv.add("b", A[:3])
+    _decode(pool, "a", 1)
+    _decode(pool, "b", 1)
+    filed = pool._decode[("a", "main")].key
+    pool.remove_request("a")
+    pool.remove_request("b")
+    assert pool._snap_by_key.keys() == {filed}, "a finished reply left no snapshot for its next turn"
+    assert not pool._decode and not pool._unkeyed and len(pool._snap_free) == 1
+
+
+def test_a_restored_request_places_its_decode_boundaries_from_the_restored_length():
+    pool = _pool(prefix_slots=3)
+    _snapshot(pool, "a", A, 8, 1.0)
+    step = _prefill(pool, "b", A[:10], hit=8)
+    pool.plan(step, _ctx("b"))
+    pool.commit(step, _ctx("b"))
+    _decode(pool, "b", 2)
+    decode = pool._decode[("b", "main")]
+    assert decode.tokens == 12 and decode.key == pool._kv.chain_key("b", "main", 3), "keyed by a page it never reached"
+
+
+def test_a_restore_makes_its_snapshot_the_newest_to_evict():
+    pool = _pool(prefix_slots=3)
+    restored = _snapshot(pool, "a", A, 8, 1.0)
+    older = _snapshot(pool, "c", [5] * 20, 8, 2.0)
+    _snapshot(pool, "d", [6] * 20, 8, 3.0)
+    step = _prefill(pool, "b", A[:10], hit=8)
+    pool.plan(step, _ctx("b"))
+    pool.commit(step, _ctx("b"))
+    assert pool._reserve_snapshot() == older, "eviction took a snapshot a request just restored"
+
+
+def test_a_decode_never_evicts_the_snapshot_a_prompt_restored_in_the_same_step():
+    pool = _pool(prefix_slots=2)
+    _reply(pool, "r")
+    restored = _snapshot(pool, "a", A, 8, 1.0)
+    _snapshot(pool, "c", [5] * 20, 8, 2.0)
+    _probe(pool, "b", A[:10], hit=8)
+    step = RecurrentStep(segments=(Segment("b", "main", 2), Segment("r", "main", 1)))
+    ctx = StepContext(request_ids=("b", "r"), graph_walk=WALK, slot=0, capture=False)
+    assert pool.admit(step, ctx).ok
+    pool.plan(step, ctx)
+    pool.commit(step, ctx)
+    assert pool._snap_meta.get(restored) == pool._kv.chain_key("a", "main", 2), "r's decode evicted b's restore"
