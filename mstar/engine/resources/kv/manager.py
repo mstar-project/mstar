@@ -4018,7 +4018,7 @@ class KVManager(AttentionResource):
 
     def _held(self, rid: str) -> int:
         return sum(
-            len(stream.page_indices) + len(stream.lease or ()) - len(stream.lent)
+            len(stream.page_indices) + len(stream.lease or ()) + len(stream.hold or ()) - len(stream.lent)
             for stream in self._streams.get(rid, {}).values()
         )
 
