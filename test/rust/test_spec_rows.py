@@ -21,7 +21,7 @@ from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStor
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, GraphNode, Loop
+from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RouteInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
@@ -33,6 +33,8 @@ from mstar.worker.spec_rows import LoopbackRowInputs
 from mstar.worker.worker import PendingBatch, Worker
 
 WG, WALK, NODE, LOOP, SIG, PART, ME = 0, "decode", "LLM", "decode_loop", "text_inputs", "default", "w0"
+# the second node of a two-node loop (``pair=True``): NODE -> NODE_B -> NODE
+NODE_B, SIG_B = "head", "hidden"
 
 def _have_rust() -> bool:
     try:
@@ -95,20 +97,23 @@ class _Scheduler:
         return batch
 
 
-def _runtime(kind: str, max_iters: int):
-    section = Loop(
-        name=LOOP,
-        section=GraphNode(
-            name=NODE, input_names=[SIG],
-            outputs=[GraphEdge(next_node=NODE, name=SIG)],
-        ),
-        max_iters=max_iters, outputs=[],
+def _runtime(kind: str, max_iters: int, pair: bool = False):
+    body = GraphNode(
+        name=NODE, input_names=[SIG],
+        outputs=[GraphEdge(next_node=NODE, name=SIG)],
     )
+    if pair:
+        body = Sequential([
+            GraphNode(name=NODE, input_names=[SIG], outputs=[GraphEdge(next_node=NODE_B, name=SIG_B)]),
+            GraphNode(name=NODE_B, input_names=[SIG_B], outputs=[GraphEdge(next_node=NODE, name=SIG)]),
+        ])
+    nodes = {NODE, NODE_B} if pair else {NODE}
+    section = Loop(name=LOOP, section=body, max_iters=max_iters, outputs=[])
     wg = WorkerGraph(section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG)
     common = dict(
         my_worker_id=ME, my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG: {WALK}}, all_wg_ids_to_dyn_loops={WG: {LOOP}},
-        all_wg_ids_to_nodes={WG: {NODE}}, node_to_partition={NODE: PART},
+        all_wg_ids_to_nodes={WG: nodes}, node_to_partition=dict.fromkeys(nodes, PART),
         sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
     )
     if kind == "python":
@@ -120,12 +125,12 @@ def _runtime(kind: str, max_iters: int):
     return rust_runtime.RustGraphRuntime(**common, bookkeeping=book), _StubTM(book)
 
 
-def _worker(kind: str, max_iters: int = 1 << 20) -> Worker:
-    rt, tm = _runtime(kind, max_iters)
+def _worker(kind: str, max_iters: int = 1 << 20, pair: bool = False) -> Worker:
+    rt, tm = _runtime(kind, max_iters, pair)
     w = Worker.__new__(Worker)
     w._graph_runtime = rt
     w.tensor_manager = tm
-    w.request_state = RequestStateManager(node_to_partition={NODE: PART})
+    w.request_state = RequestStateManager(node_to_partition={NODE: PART, NODE_B: PART})
     w.scheduler = _Scheduler()
     w._phase_period = 0
     w.enable_prof = False
@@ -247,13 +252,13 @@ def _route(w: Worker, pending: PendingBatch) -> None:
     """N's postprocess as far as graph state goes: consumed inputs cleared,
     the loop-back routed with no tensor (it stays on the device), the shared
     loop counters refreshed."""
-    rt, b = w._graph_runtime, pending.batch
+    rt, b, node = w._graph_runtime, pending.batch, pending.node_name
     rids = list(b.request_to_worker_graph)
     wg_ids = [b.request_to_worker_graph[r] for r in rids]
-    w.tensor_manager.cleanup_collectable(*rt.cleanup_consumed_inputs(NODE, rids, wg_ids))
+    w.tensor_manager.cleanup_collectable(*rt.cleanup_consumed_inputs(node, rids, wg_ids))
     rt.clear_pending_loop_stops()
     rt.complete_and_route_batch(RouteInput(
-        partition=PART, graph_walk=WALK, node_name=NODE,
+        partition=PART, graph_walk=WALK, node_name=node,
         output_signals=list(b.output_signals), wg_ids=ParallelList(rids, wg_ids),
         tensors=[], num_tensors=[0] * (len(rids) * len(b.output_signals)),
     ))
@@ -266,7 +271,8 @@ def _advance(w: Worker, pending: PendingBatch, spec) -> PendingBatch:
     w._settle_speculation(spec, success=True, dropped_rids=spec.dropped)
     _route(w, pending)
     return PendingBatch(
-        batch=spec.scheduled_batch, node_batch=spec.node_batch, node_name=NODE,
+        batch=spec.scheduled_batch, node_batch=spec.node_batch,
+        node_name=spec.scheduled_batch.node_name,
         partition=PART, graph_walk=WALK, future=None,
         speculative_new_iter=spec.is_new_iter, loop_name=spec.loop_name,
     )
@@ -309,6 +315,22 @@ def test_a_decode_loop_builds_the_same_steps(kind, monkeypatch):
         # routing N moved the shared counters; the step's own copy did not
         assert w.request_state.get_fwd_info(rids[0], PART).dynamic_loop_iter_counts[LOOP] == k + 1
         assert dict(spec.node_batch.per_request_info_wrapped[rids[0]].dynamic_loop_iter_counts)[LOOP] == k + 1
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_two_node_loop_builds_the_same_steps(kind, monkeypatch):
+    # every step hops to the other node: NODE -> NODE_B within an iteration,
+    # NODE_B -> NODE into the next one
+    w = _worker(kind, pair=True)
+    rids = _admit(w, 5)
+    pending = _first_step(w, rids)
+    hops = []
+    for _ in range(6):
+        spec = _step_both(w, pending, monkeypatch)
+        assert spec is not None
+        hops.append((spec.scheduled_batch.node_name, spec.is_new_iter))
+        pending = _advance(w, pending, spec)
+    assert hops == [(NODE_B, False), (NODE, True)] * 3
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -369,17 +391,19 @@ def test_a_row_without_its_loop_back_drops_on_both_paths(kind, monkeypatch):
     _advance(w, pending, spec)
 
 
+@pytest.mark.parametrize("pair", [False, True])
 @pytest.mark.parametrize("kind", KINDS)
-def test_routed_outputs_are_threaded_row_by_row(kind, monkeypatch):
+def test_routed_outputs_are_threaded_row_by_row(kind, pair, monkeypatch):
     # N kept its outputs per request (not rows-only): the rows path hands over
     # to the per-row splice, which takes N's tensor lists
-    w = _worker(kind)
+    w = _worker(kind, pair=pair)
     rids = _admit(w, 3)
     pending = _first_step(w, rids)
+    sig = SIG_B if pair else SIG
     toks = {r: torch.tensor([r]) for r in rids}
-    outputs = BatchedModelOutput(per_rid_outputs={r: {SIG: [toks[r]]} for r in rids})
+    outputs = BatchedModelOutput(per_rid_outputs={r: {sig: [toks[r]]} for r in rids})
     spec = _step_both(w, pending, monkeypatch, outputs=outputs)
-    assert {r: spec.node_batch.per_request_input_tensors[r][SIG][0] for r in rids} == toks
+    assert {r: spec.node_batch.per_request_input_tensors[r][sig][0] for r in rids} == toks
 
 
 def _engine_facing_types(spec) -> dict:

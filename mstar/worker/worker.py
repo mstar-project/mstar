@@ -411,6 +411,7 @@ class Worker:
         tcp_transfer_device="",
         dist_init_method=None,
         status_interval_s: float | None = None,
+        all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
     ):
         # before anything below builds a resource or a submodule that reads one
         knobs.configure((model_config or {}).get("knobs"))
@@ -553,6 +554,7 @@ class Worker:
             enable_prof=self.enable_prof,
             device_capability=self.device_capability,
         )
+        self._never_publish_unshared(all_worker_graph_ids_to_instances)
 
         self.request_state = RequestStateManager(
             node_to_partition=node_to_partition,
@@ -849,6 +851,28 @@ class Worker:
     def _rid_str(self, request_id: int) -> str:
         """The wire identity, for a message about to leave this process."""
         return self._graph_runtime.get_rid_string(request_id)
+
+    def _never_publish_unshared(
+        self, wg_instances: dict[int, list[list[str]]] | None,
+    ) -> None:
+        """Turn off publication for good of each resource whose declaring
+        nodes have one lockstep instance between them in this deployment:
+        ``_skip_unshared_publish`` would skip it for every request."""
+        if wg_instances is None:
+            return
+        engine = self.engine_manager.engine
+        keys = []
+        for key, nodes in engine.publisher_nodes.items():
+            instances = {
+                frozenset(instance)
+                for wg_id, wg_nodes in self._all_wg_nodes.items()
+                if not nodes.isdisjoint(wg_nodes)
+                for instance in wg_instances.get(wg_id, ())
+            }
+            if len(instances) == 1 and self.worker_id in next(iter(instances)):
+                keys.append(key)
+        if keys:
+            engine.never_publish(keys)
 
     def _skip_unshared_publish(
         self, request_id: int, wg_to_workers: dict[int, list[str]],
@@ -2977,11 +3001,11 @@ class Worker:
         fresh_request_to_worker_graph: dict[int, int],
         fresh_inputs: dict[int, NameToTensorList],
     ) -> Speculation:
-        """``_assemble_speculation`` for a loop's next iteration prepped as
-        columns (``prep_spec_rows``): the continuing rows' inputs all come
-        back from the in-flight step on the device, so they need no per-row
-        work beyond the loop-counter snapshot. Fresh rows of the same walk
-        follow them with the inputs their pop gathered.
+        """``_assemble_speculation`` for a step prepped as columns
+        (``prep_spec_rows``): the continuing rows' inputs all come from the
+        in-flight step, so they need no per-row work beyond the loop-counter
+        snapshot until N's outputs are threaded in. Fresh rows of the same
+        walk follow them with the inputs their pop gathered.
 
         Builds the same batch as the general assembly, with C-level maps:
         every rid's ``per_request_info``, ``per_request_input_metadata`` (its
@@ -3129,20 +3153,12 @@ class Worker:
             or self._pending_drains or self._draining_rids
         )
 
-    def _spec_rows_eligible(
-        self, batch_N: ScheduledBatch, target: SpeculationOutput,
-    ) -> bool:
+    def _spec_rows_eligible(self, batch_N: ScheduledBatch) -> bool:
         """Whether the step after ``batch_N`` can be prepped and built as
-        columns (``prep_spec_rows``, ``_assemble_speculation_rows``): the
-        same node's next step, one walk, no streams to poll, and not a
-        lockstep-parallel node, whose leader and followers keep to the one
-        path they share."""
-        return (
-            target.node_name == batch_N.node_name
-            and not batch_N.request_walks
-            and target.node_name not in self.parallel_nodes
-            and not self._streams_possible()
-        )
+        columns (``prep_spec_rows``, ``_assemble_speculation_rows``): one
+        walk and no streams to poll. A TP follower never comes here; it
+        rebuilds whatever rows the leader's head names."""
+        return not batch_N.request_walks and not self._streams_possible()
 
     def _prep_spec_dicts(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
@@ -3261,10 +3277,10 @@ class Worker:
                     spec_node_name, r, self.request_state.get_fwd_info(r, partition),
                 )
             ]
-        # The common case, a loop's next iteration with no streams, is prepped
-        # as columns, and its rows built from them (`_assemble_speculation_rows`).
+        # The common case, one walk with no streams, is prepped as columns,
+        # and its rows built from them (`_assemble_speculation_rows`).
         rows = None
-        if self._spec_rows_eligible(batch_N, spec_target_info):
+        if self._spec_rows_eligible(batch_N):
             rows = self._graph_runtime.prep_spec_rows(
                 spec_node_name, batch_N.node_name, graph_walk, candidates,
                 max_continuing,

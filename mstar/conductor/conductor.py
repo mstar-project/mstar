@@ -242,6 +242,7 @@ def _worker_process_target(
     all_worker_graph_ids_to_graph_walks: dict[int, set[str]],
     all_worker_graph_ids_to_nodes: dict[int, set[str]],
     all_worker_graph_ids_to_dyn_loops: dict[int, set[str]],
+    all_worker_graph_ids_to_instances: dict[int, list[list[str]]],
     sharding_config: ShardingConfig,
     parallel_groups: WorkerParallelGroups,
     hostname: str,
@@ -301,6 +302,7 @@ def _worker_process_target(
             all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
             all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
+            all_worker_graph_ids_to_instances=all_worker_graph_ids_to_instances,
             sharding_config=sharding_config,
             parallel_groups=parallel_groups,
             hostname=hostname,
@@ -758,6 +760,15 @@ class Conductor:
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
+        # each worker graph's lockstep instances, as worker ids; a request of
+        # the worker graph runs on one of them
+        self._all_worker_graph_ids_to_instances: dict[int, list[list[str]]] = {
+            worker_graph_id: [
+                [f"worker_{rank}" for rank in instance]
+                for instance in (worker_graph._instance_ranks or [[r] for r in worker_graph.ranks])
+            ]
+            for worker_graph_id, worker_graph in self.worker_graphs.items()
+        }
         self._loop_max_iters: dict[str, int] = {}
         for worker_graph in self.worker_graphs.values():
             for name, loop in worker_graph.section.get_loops().items():
@@ -816,6 +827,7 @@ class Conductor:
                     "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
                     "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
+                    "all_worker_graph_ids_to_instances": self._all_worker_graph_ids_to_instances,
                     "sharding_config": self.per_worker_sharding_config[worker_id],
                     "parallel_groups": self.parallel_config.per_worker_config[worker_id],
                     "hostname": self.hostname,

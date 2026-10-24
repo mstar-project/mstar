@@ -114,15 +114,16 @@ class StepRunner:
         ]
         self._node_cap_order = self._per_node(node_resources, self._cap_order)
         self._node_trail_order = self._per_node(node_resources, self._trail_order)
-        # publisher key -> the nodes that declare it, and the requests whose
-        # every such node runs on this lockstep instance: no other instance
-        # can retrieve their state, so publishing it is pure overhead
+        # publisher key -> the nodes that declare it
         self._publisher_nodes: dict[str, frozenset[str]] = {
             key: frozenset(
                 node for node, keys in (node_resources or {}).items() if key in keys
             )
             for key in self._publish_order
         }
+        # publisher key -> the rids not to publish it for: those whose every
+        # declaring node runs on this lockstep instance, so no other instance
+        # can retrieve their state (``skip_publish``)
         self._unpublished: dict[str, set] = {key: set() for key in self._publish_order}
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
@@ -373,10 +374,24 @@ class StepRunner:
         for key in keys:
             self._unpublished[key].add(rid)
 
+    def never_publish(self, keys) -> None:
+        """``skip_publish`` for every request: ``keys`` leave the publish
+        order, so a step pays nothing for them."""
+        keys = set(keys)
+        self._publish_order = [k for k in self._publish_order if k not in keys]
+        if self._node_publish_order is not None:
+            self._node_publish_order = {
+                node: [k for k in order if k not in keys]
+                for node, order in self._node_publish_order.items()
+            }
+        for key in keys:
+            self._publisher_nodes.pop(key, None)
+            self._unpublished.pop(key, None)
+
     def _publishing(self, order: list[str], request_ids) -> list[str]:
         """``order`` minus the resources none of ``request_ids`` publishes."""
         skip = self._unpublished
-        return [key for key in order if not skip[key].issuperset(request_ids)]
+        return [key for key in order if not (skip[key] and skip[key].issuperset(request_ids))]
 
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,

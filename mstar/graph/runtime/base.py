@@ -857,10 +857,10 @@ class GraphRuntime(ABC):
     ) -> "SpecRows":
         """``prep_spec_rids`` with no stream chunks to ingest, as columns.
 
-        The worker's common speculation -- a loop's next iteration on a
-        worker with no streams -- in a form a runtime can serve in one
-        crossing. This default is that composition over ``prep_spec_rids``;
-        a runtime with a cheaper form overrides it and must return the same.
+        The worker's common speculation -- one walk on a worker with no
+        streams -- in a form a runtime can serve in one crossing. This default
+        is that composition over ``prep_spec_rids``; a runtime with a cheaper
+        form overrides it and must return the same.
         """
         prep = self.prep_spec_rids(SpeculationPrepInput(
             spec_node_name=spec_node_name, curr_node_name=curr_node_name,

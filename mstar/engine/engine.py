@@ -2796,6 +2796,10 @@ class Engine:
         """Never publish ``keys`` for this request (see ``StepRunner.skip_publish``)."""
         self._runner.skip_publish(request_id, keys)
 
+    def never_publish(self, keys) -> None:
+        """Never publish ``keys`` for any request (see ``StepRunner.never_publish``)."""
+        self._runner.never_publish(keys)
+
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down on every resource. Returns the resources it
         held pages of that the teardown hands back, which `reclaimable` counts:

@@ -53,6 +53,16 @@ def test_a_batch_skipping_every_publisher_never_reaches_the_resources():
     assert kv.calls == [] and pos.calls == []
 
 
+def test_a_key_never_published_leaves_every_step():
+    runner, kv, _ = _runner()
+    runner.never_publish(["kv"])
+    assert runner.publisher_nodes == {"pos": frozenset({"LLM", "enc"})}
+    assert runner.publish([1, 2], node_name="LLM") == {1: {"pos": "pos-info"}, 2: {"pos": "pos-info"}}
+    assert runner.publish_after_stop([1], node_name="LLM", graph_walk="decode") == {1: {}}
+    assert set(runner.publish_snapshot([1], node_name="LLM", graph_walk="decode")[1]) == {"pos"}
+    assert not any(c.startswith("publish") for c in kv.calls)
+
+
 def test_removal_purges_the_handle_so_a_recycled_one_publishes_again():
     runner, _, _ = _runner()
     runner.skip_publish(1, ["kv"])
@@ -64,9 +74,13 @@ class _Engine:
     def __init__(self, publisher_nodes):
         self.publisher_nodes = publisher_nodes
         self.skipped = {}
+        self.never = []
 
     def skip_publish(self, rid, keys):
         self.skipped[rid] = list(keys)
+
+    def never_publish(self, keys):
+        self.never = list(keys)
 
 
 def _worker(worker_id, wg_nodes, publisher_nodes):
@@ -107,3 +121,23 @@ def test_a_resource_no_worker_graph_declares_is_left_alone():
     worker, engine = _worker("worker_0", {0: {"other"}}, PUBLISHERS)
     worker._skip_unshared_publish(7, {0: ["worker_0"]})
     assert engine.skipped == {}
+
+
+def test_declaring_nodes_with_one_instance_between_them_never_publish():
+    worker, engine = _worker("worker_0", WG_NODES, PUBLISHERS)
+    worker._never_publish_unshared({0: [["worker_0"]], 1: [["worker_0"]], 2: [["worker_0"]]})
+    assert engine.never == ["kv", "vision_kv"]
+
+
+def test_a_tp_instance_is_one_instance_but_replicas_are_several():
+    worker, engine = _worker("worker_1", WG_NODES, PUBLISHERS)
+    tp = [["worker_0", "worker_1"]]
+    # the vision encoder has a replica per rank: a request may run it on either
+    worker._never_publish_unshared({0: tp, 1: tp, 2: [["worker_0"], ["worker_1"]]})
+    assert engine.never == ["kv"]
+
+
+def test_without_the_instance_map_publication_is_decided_per_request():
+    worker, engine = _worker("worker_0", WG_NODES, PUBLISHERS)
+    worker._never_publish_unshared(None)
+    assert engine.never == []
