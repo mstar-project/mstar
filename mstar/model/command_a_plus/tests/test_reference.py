@@ -1,7 +1,7 @@
 """Opt-in checks against Transformers 5.17 and actual GPU engine resources.
 
-MSTAR_TEST_HF=1 enables the CPU reference; MSTAR_TEST_CUDA=1 also enables
-the tiny GPU model. No checkpoint weights or metadata are downloaded here.
+MSTAR_TEST_HF=1 enables the CPU reference, plus the tiny GPU model when CUDA
+is available. No checkpoint weights or metadata are downloaded here.
 """
 
 import json
@@ -118,7 +118,7 @@ class ReferenceTests(unittest.TestCase):
             torch.testing.assert_close(observed["logits"].argmax(-1), expected["logits"].argmax(-1))
         print("HF FP32 maximum absolute errors:", json.dumps(errors, sort_keys=True), flush=True)
 
-    @unittest.skipUnless(os.environ.get("MSTAR_TEST_CUDA") == "1", "set MSTAR_TEST_CUDA=1")
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     @torch.inference_mode()
     def test_bf16_paged_gpu_batched_prefill_decode_and_cleanup(self):
         from mstar.communication.tensors import LocalTransferEngine

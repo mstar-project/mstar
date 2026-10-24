@@ -309,7 +309,8 @@ The ~437 GB of BF16 weights are never downloaded automatically: download the
 checkpoint and set ``model_kwargs.checkpoint_dir`` in
 ``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
 ``max_seq_len``). Tokenizer and config metadata are pinned to one checkpoint
-revision. ``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs.
+revision. ``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs
+and keeps NCCL's all-reduce until FlashInfer's is measured there.
 
 ``model_kwargs={"messages": [{"role": ..., "content": ...}, ...]}`` with
 ``system`` / ``user`` / ``assistant`` turns goes through the chat template; a
@@ -319,7 +320,7 @@ give it a generous ``max_output_tokens``; a prompt plus ``max_output_tokens``
 (2048 when unset) longer than ``max_seq_len`` is rejected.
 
 On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
-Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer``).
+Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer`` at TP4).
 On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
 64 (``benchmark/command_a_plus/bench_http.py``); ``validate_checkpoint.py``
 there checks parity against Hugging Face. Not supported yet: image input, FP8
