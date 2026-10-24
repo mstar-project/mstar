@@ -21,6 +21,7 @@ class _TM:
     """The tensor-manager surface the stream path touches, over a real store."""
 
     get_tensor = TensorCommunicationManager.get_tensor
+    get_tensors = TensorCommunicationManager.get_tensors
     dereference_batch_uniform = TensorCommunicationManager.dereference_batch_uniform
     cleanup_collectable = TensorCommunicationManager.cleanup_collectable
     increment_ref_batch_uniform = TensorCommunicationManager.increment_ref_batch_uniform

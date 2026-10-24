@@ -75,8 +75,8 @@ def test_row_store_matches_the_general_path(tmp_path):
         assert (info_f.dims, info_f.stride, info_f.nbytes, info_f.dtype, info_f.address) == (
             info_s.dims, info_s.stride, info_s.nbytes, info_s.dtype, info_s.address
         )
-        cf = fast_mgr.tensor_store._tensors_cpu.get(uf)
-        cs = slow_mgr.tensor_store._tensors_cpu.get(us)
+        cf = fast_mgr.tensor_store.get_cpu_tensor(uf)
+        cs = slow_mgr.tensor_store.get_cpu_tensor(us)
         assert cf is not None and cs is not None
         assert torch.equal(cf, cs) and cf.data_ptr() == cs.data_ptr()
     for rid in rids:
@@ -127,4 +127,4 @@ def test_row_store_without_host_rows_stores_no_host_copy(tmp_path):
         rids, outputs, SIGNALS, outputs.row_views, outputs.row_request_ids,
     )
     assert fast is not None and len(fast.flat_uuids) == 4
-    assert not mgr.tensor_store._tensors_cpu
+    assert all(mgr.tensor_store.get_cpu_tensor(u) is None for u in fast.flat_uuids)
