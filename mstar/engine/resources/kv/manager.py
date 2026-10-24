@@ -677,6 +677,9 @@ class KVManager(AttentionResource):
         self._index = PrefixIndex(self._arena)
         return True
 
+    def close_prefix_cache(self) -> None:
+        self._index = None
+
     def page_counts(self) -> KVPageCounts:
         """The pool's pages right now, without the manager lock: each count is
         read whole, though the three may straddle an allocation."""

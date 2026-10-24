@@ -871,6 +871,8 @@ class Engine:
             key for key in declared
             if key not in self._resources and specs_by_key[key].config.prefix_cache
         }
+        # resources that aren't keyed but opened, such as a recurrent pool's snapshots
+        restoring: set[str] = set()
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config
@@ -897,9 +899,11 @@ class Engine:
                 )
                 for label, kv_label in declared.get(key, {}).items()
             })
-            if not opened or not declared.get(key):
-                continue
-            opened_keys.add(key)
+            if opened:
+                (opened_keys if declared.get(key) else restoring).add(key)
+        self._close_unservable_nodes(specs_by_key, opened_keys, restoring)
+        for key in sorted(opened_keys & self._resources.keys()):
+            resource = self._resources[key]
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
@@ -923,6 +927,36 @@ class Engine:
                 for walk in label.keys.walks:
                     nodes = model.get_graph_walk_graphs()[walk].get_nodes()
                     self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
+
+    def _close_unservable_nodes(
+        self, specs_by_key: dict[str, NodeResourceSpec], opened_keys: set[str], restoring: set[str],
+    ) -> None:
+        """Close every prefix cache on a keyed node with a resource that can't
+        serve a cached prefix.
+
+        A resource that opened but isn't keyed serves a hit only when every cache
+        it depends on opened, and so does a resource that depends only on such
+        resources.
+        """
+        restorers = {key for key in restoring if specs_by_key[key].depends_on() <= opened_keys}
+        serving = opened_keys | restorers | {
+            key for key, resource in self._resources.items() if resource.prefix_skip_safe
+        } | {
+            key for key, spec in specs_by_key.items()
+            if spec.depends_on() and spec.depends_on() <= restorers
+        }
+        for node in sorted(self._keyed_walks):
+            on_node = {key for key, spec in specs_by_key.items() if node in spec.nodes and key in self._resources}
+            if on_node <= serving:
+                continue
+            del self._keyed_walks[node]
+            for key in sorted(on_node - serving):
+                logger.info("%s on %s can't serve a cached prefix: the prefix caches on %s stay off",
+                            key, node, node)
+            for key in sorted(on_node & (opened_keys | restoring)):
+                self._resources[key].close_prefix_cache()
+                opened_keys.discard(key)
+                restoring.discard(key)
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.

@@ -122,6 +122,10 @@ class Resource(ABC):
         True if anything opened."""
         return False
 
+    def close_prefix_cache(self) -> None:
+        """Undo `enable_prefix_cache`. Called before any request."""
+        return
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs: Any,
     ) -> CachedPrefix | None:

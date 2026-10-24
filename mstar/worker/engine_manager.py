@@ -14,6 +14,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
+from mstar.engine.resources.recurrent.config import RecurrentStateSpec
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
 from mstar.model.base import Model, keyed_labels
@@ -56,6 +57,9 @@ def _refuse_unskippable_resources(
     A hit takes the front of a request away from every resource on the node,
     not just the ones that answered the probe, so one that cannot account for
     tokens it never saw would plan its step against a sequence that never ran.
+    A recurrent pool restores its state from snapshots instead, and a resource
+    that depends only on pools plans against what they restore. The engine
+    keeps the node's caches shut where a pool keeps no snapshots.
     """
     declared = set(keyed_labels(model))
     if not declared:
@@ -64,9 +68,12 @@ def _refuse_unskippable_resources(
         node for spec in specs if spec.resource_key in declared
         for node in spec.nodes
     }
+    pools = {spec.resource_key for spec in specs if isinstance(spec, RecurrentStateSpec)}
     for spec in specs:
         shared = spec.nodes & cached_nodes
-        if not shared or spec.resource_class.prefix_skip_safe:
+        if not shared or spec.resource_class.prefix_skip_safe or spec.resource_key in pools:
+            continue
+        if spec.depends_on() and spec.depends_on() <= pools:
             continue
         raise ValueError(
             f"resource {spec.resource_key!r} cannot serve a request whose "
