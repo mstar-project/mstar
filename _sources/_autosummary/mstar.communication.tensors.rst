@@ -20,6 +20,7 @@ mstar.communication.tensors
    .. autosummary::
    
       create_tensor_communication_manager
+      ensure_deployment_token
    
    
 

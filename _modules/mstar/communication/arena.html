@@ -1149,6 +1149,8 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">ArenaShmCommunicationManager</span><span class="p">(</span><span class="n">SharedMemoryCommunicationManager</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""</span>
 
+    <span class="n">_namespace_file_dirs</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"/dev/shm"</span><span class="p">,)</span>
+
     <span class="c1"># Staging writes the segment and offset onto the descriptor the store</span>
     <span class="c1"># holds, which routing may already have copied -- so every outgoing edge</span>
     <span class="c1"># has to be refreshed from the store before it is sent. See</span>
@@ -1271,12 +1273,17 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># and across users (permission-denied at startup). pid + random</span>
         <span class="c1"># token makes each instance's names unique; wire-compatibility is</span>
         <span class="c1"># free because consumers open whatever segment name the descriptor</span>
-        <span class="c1"># carries. The pid embedded in the name also enables the orphan</span>
-        <span class="c1"># sweep below.</span>
+        <span class="c1"># carries. Under a deployment namespace the segments are named like</span>
+        <span class="c1"># its tensor files, so its lock marks them live and the dead-</span>
+        <span class="c1"># namespace sweep reclaims them; a pid cannot, since /proc is per</span>
+        <span class="c1"># PID namespace and containers can share /dev/shm. Without one, the</span>
+        <span class="c1"># pid in the name drives the orphan sweep below.</span>
         <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_sweep_orphans</span><span class="p">()</span>
-        <span class="n">base</span> <span class="o">=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"mstar_arena_</span><span class="si">{</span><span class="n">my_entity_id</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">os</span><span class="o">.</span><span class="n">getpid</span><span class="p">()</span><span class="si">}</span><span class="s2">_"</span>
+        <span class="n">ns</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_namespace</span>
+        <span class="n">base</span> <span class="o">=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"mstar_</span><span class="si">{</span><span class="n">ns</span><span class="si">}</span><span class="s2">_arena_</span><span class="si">{</span><span class="n">my_entity_id</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_hex</span><span class="p">(</span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+                <span class="k">if</span> <span class="n">ns</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"mstar_arena_</span><span class="si">{</span><span class="n">my_entity_id</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">os</span><span class="o">.</span><span class="n">getpid</span><span class="p">()</span><span class="si">}</span><span class="s2">_"</span>
                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_hex</span><span class="p">(</span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span> <span class="o">=</span> <span class="n">SegmentedShmArena</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
             <span class="n">base</span><span class="p">,</span> <span class="n">segment_mb</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">max_segments</span><span class="p">)</span>

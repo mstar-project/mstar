@@ -951,6 +951,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">parent</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="n">poll_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.5</span><span class="p">,</span>
     <span class="n">grace_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">5.0</span><span class="p">,</span>
+    <span class="n">before_hard_exit</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Exit this process once ``parent`` dies, so nothing outlives its parent</span>
 <span class="sd">    holding GPU memory or IPC handles.</span>
@@ -958,7 +959,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    Each parent terminates its children on every exit path it controls; this</span>
 <span class="sd">    covers the one it cannot (killed outright). ``stop_signal`` is the graceful</span>
 <span class="sd">    stop for this process, but a main thread stuck in a C call cannot service</span>
-<span class="sd">    it, so exit hard after ``grace_s``.</span>
+<span class="sd">    it, so exit hard after ``grace_s``, running ``before_hard_exit`` first</span>
+<span class="sd">    (the hard exit skips every ``finally`` and ``atexit``).</span>
 <span class="sd">    """</span>
     <span class="n">parent</span> <span class="o">=</span> <span class="n">mp</span><span class="o">.</span><span class="n">parent_process</span><span class="p">()</span> <span class="k">if</span> <span class="n">parent</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">parent</span>
     <span class="k">if</span> <span class="n">parent</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -968,6 +970,11 @@ window.runMermaid = runMermaid;</script>
     <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="s2">: the </span><span class="si">%s</span><span class="s2"> process is gone, exiting"</span><span class="p">,</span> <span class="n">who</span><span class="p">,</span> <span class="n">parent_name</span><span class="p">)</span>
     <span class="n">os</span><span class="o">.</span><span class="n">kill</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getpid</span><span class="p">(),</span> <span class="n">stop_signal</span><span class="p">)</span>
     <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="n">grace_s</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">before_hard_exit</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">before_hard_exit</span><span class="p">()</span>
+        <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="s2">: cleanup before the hard exit failed"</span><span class="p">,</span> <span class="n">who</span><span class="p">)</span>
     <span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span></div>
 
 

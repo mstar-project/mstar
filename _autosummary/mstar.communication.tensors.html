@@ -720,6 +720,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.has_inflight_reads()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref_batch_uniform"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref_batch_uniform()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.names_unique_per_launch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.names_unique_per_launch</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.needs_cpu_tensor"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.needs_cpu_tensor</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.needs_flat_layout"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.needs_flat_layout</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.pending"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.pending</span></code></a></li>
@@ -762,6 +763,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.create_tensor_communication_manager"><code class="docutils literal notranslate"><span class="pre">create_tensor_communication_manager()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.ensure_deployment_token"><code class="docutils literal notranslate"><span class="pre">ensure_deployment_token()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -789,6 +791,9 @@
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.create_tensor_communication_manager" title="mstar.communication.tensors.create_tensor_communication_manager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">create_tensor_communication_manager</span></code></a>(...[, ...])</p></td>
 <td><p>Select tensor transport backend based on protocol.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.ensure_deployment_token" title="mstar.communication.tensors.ensure_deployment_token"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ensure_deployment_token</span></code></a>()</p></td>
+<td><p>Mint this launch's token unless a launcher set one.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1618,6 +1623,14 @@ safety hold on a stored output batch always is.</p>
 </dl>
 </dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.names_unique_per_launch">
+<span class="sig-name descname"><span class="pre">names_unique_per_launch</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.names_unique_per_launch" title="Link to this definition">#</a></dt>
+<dd><p>True when no other launch can write a file under this manager’s names
+(see <code class="docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager</span></code>); irrelevant to transports
+that write no files.</p>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.needs_cpu_tensor">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">needs_cpu_tensor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.needs_cpu_tensor" title="Link to this definition">#</a></dt>
@@ -2081,6 +2094,23 @@ file-transport consumer cannot read an arena producer.</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.communication.tensors.ensure_deployment_token">
+<span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">ensure_deployment_token</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#ensure_deployment_token"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.ensure_deployment_token" title="Link to this definition">#</a></dt>
+<dd><p>Mint this launch’s token unless a launcher set one. Called by the API
+server, which every other process of the deployment descends from
+(<code class="docutils literal notranslate"><span class="pre">spawn</span></code> children inherit the environment).</p>
+<p>A token an API server minted is never kept by the next launch that finds
+it, a server built again in this process or started by one that holds
+it: on the same endpoint that launch would write the names a stopping
+worker of the old one may still unlink.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -2211,6 +2241,7 @@ file-transport consumer cannot read an arena producer.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.has_inflight_reads()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref_batch_uniform"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref_batch_uniform()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.names_unique_per_launch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.names_unique_per_launch</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.needs_cpu_tensor"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.needs_cpu_tensor</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.needs_flat_layout"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.needs_flat_layout</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.pending"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.pending</span></code></a></li>
@@ -2253,6 +2284,7 @@ file-transport consumer cannot read an arena producer.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.create_tensor_communication_manager"><code class="docutils literal notranslate"><span class="pre">create_tensor_communication_manager()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.ensure_deployment_token"><code class="docutils literal notranslate"><span class="pre">ensure_deployment_token()</span></code></a></li>
 </ul>
   </nav></div>
 

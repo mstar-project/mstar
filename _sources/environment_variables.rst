@@ -71,6 +71,20 @@ Communication
        extension; raises if missing). ``AUTO``: the arena when the
        extension imports, files otherwise. Must match across the
        deployment — arena locations ride in the tensor descriptors.
+   * - ``MSTAR_DEPLOYMENT_TOKEN``
+     - random per launch
+     - Mixed into the namespace of the SHM tensor files and arena segments,
+       so no two launches share names: not a restart on the same socket
+       prefix, and not two deployments that share ``/dev/shm`` from different
+       containers (``--ipc=host``, hostIPC) with the same socket prefix and
+       ports. The API server mints a new one at every launch unless a
+       launcher set it (one an API server minted is replaced, also when
+       inherited), and the conductor and workers inherit it. Set it only
+       when a launcher starts a deployment's processes separately: the same
+       value in all of them, and a new value per launch (a dead run's files
+       are swept only once no process holds its namespace, and a stopping
+       worker unlinks its own files even after its conductor is gone, which
+       a reused value would let it do to the next launch's files).
    * - ``MSTAR_KV_SHM_DIR``
      - ``/dev/shm`` (or ``/tmp`` if unavailable)
      - Base directory for host-staged KV snapshots when remote KV transfer
