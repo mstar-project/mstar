@@ -8,6 +8,16 @@ node_groups:
     ranks: [0, 1]
     tp_size: 2
 
+# Decode all-reduces on the compute stream through NVLS multicast, where NCCL's
+# ring all-reduces took 1.1-2.1 ms a step: +15% text throughput at c=32 (2x H200,
+# MSTAR_TP_ASYNC_SCHED=1 MSTAR_SHM_ARENA=1, 2026-10-24). Falls back to NCCL, with a
+# warning, where multicast isn't available.
+tp_allreduce: symm_multimem
+# 13 KiB a token (6656 bf16): the default 512 KiB sent every step past 39 tokens
+# to NCCL. 4096 covers the 128-row decode bucket and short prompt chunks: +14%
+# text and +10% image throughput at c=64 (2x H200, 2026-10-28).
+tp_allreduce_max_kb: 4096
+
 warmup_requests:
   - text: What is in this image?
     files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
