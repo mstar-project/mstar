@@ -4,7 +4,7 @@ import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, is_dataclass, replace
-from functools import partial
+from functools import cache, partial
 from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
@@ -36,18 +36,48 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
-# torch.compile mode for a captured forward whose config's ``compile_mode`` is None
-_DEFAULT_COMPILE_MODE = "max-autotune-no-cudagraphs"
+# torch.compile arguments per compile level (``mstar serve -O``), for a captured
+# forward whose config names no ``compile_mode``. Qwen3.5-0.8B on H200 with an
+# empty Inductor cache started in 170 s / 320 s / 1,294 s at levels 0 / 1 / 2.
+# Coordinate descent alone got all of max-autotune's GPU time per decode step
+# (it fuses the decode GEMMs with their epilogues); the GEMM template search on
+# top bought nothing measurable.
+COMPILE_LEVELS: dict[int, dict[str, Any]] = {
+    0: {},  # torch.compile's default: Inductor fusion, cuBLAS GEMMs, no tuning
+    1: {"options": {"coordinate_descent_tuning": True}},
+    2: {"mode": "max-autotune-no-cudagraphs"},
+}
+DEFAULT_COMPILE_LEVEL = 1
+
+
+@cache
+def compile_level() -> int:
+    """How much tuning a captured forward's compile does: ``MSTAR_COMPILE_LEVEL``
+    (``mstar serve -O``), one of ``COMPILE_LEVELS``."""
+    raw = os.environ.get("MSTAR_COMPILE_LEVEL") or str(DEFAULT_COMPILE_LEVEL)
+    try:
+        level = int(raw)
+    except ValueError:
+        level = -1
+    if level not in COMPILE_LEVELS:
+        logger.warning(
+            "MSTAR_COMPILE_LEVEL=%r is not one of %s; using %d",
+            raw, sorted(COMPILE_LEVELS), DEFAULT_COMPILE_LEVEL,
+        )
+        return DEFAULT_COMPILE_LEVEL
+    return level
 
 
 def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
     """``torch.compile``'s arguments for a capture config whose ``compile_mode``
-    is ``config_mode``, which the config checked when it was built."""
+    is ``config_mode``, which the config checked when it was built. None takes
+    the compile level's arguments."""
     kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": False}
-    mode = _DEFAULT_COMPILE_MODE if config_mode is None else config_mode
+    if config_mode is None:
+        return {**kwargs, **COMPILE_LEVELS[compile_level()]}
     # "default" is torch.compile's own: Inductor fusion, cuBLAS GEMMs, no autotuning
-    if mode != "default":
-        kwargs["mode"] = mode
+    if config_mode != "default":
+        kwargs["mode"] = config_mode
     return kwargs
 
 
