@@ -61,7 +61,7 @@ def _worker(fresh: ScheduledBatch | None = None):
     w.engine_manager = SimpleNamespace(get_engine=lambda node: eng)
     w.asked, w.held, w.pushed, w.failed = [], [], [], {}
     w.scheduler = SimpleNamespace(held_until={}, backlog={}, failed_rids=set(), hold_requests=w.held.extend,
-                                  get_next_batch=lambda state, **kw: w.asked.append(kw) or fresh)
+                                  get_next_batch=lambda state, **kw: w.asked.append(kw) or fresh, combined_walk_of={})
     w.infos = {rid: CurrentForwardPassInfo(str(rid), DECODE, 0, 0, 8) for rid in (R, A)}
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p", get_fwd_info=lambda r, p: w.infos[r])
     w.tensor_manager = SimpleNamespace(get_tensor=None, cleanup_collectable=lambda *a: None)
@@ -163,7 +163,8 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids(build):
     eng = _engine(_Sub())
     eng.land_rebuild = lambda node, rid: None
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
-    w._kept_ids = {node: {rid: KeptIds(b"", array("i"), []) for rid in (R, 1)}}
+    # R's rebuild runs once every copy of its prefill is taken
+    w._kept_ids = {node: {R: KeptIds(b"", array("i"), [PrefillCopies({}, {})], 1), 1: KeptIds(b"", array("i"), [], 1)}}
     w._copied_inputs, w._rebuild_rows = {(walk, node): {"embeds"}}, {R: deque([RebuildRow(node, walk, {}, None)])}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
@@ -176,6 +177,7 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids(build):
         w._thread_outputs_to_speculative(spec, BatchedModelOutput({rid: {"embeds": [t]} for rid, t in embeds.items()}))
     for rid, info in batch.per_request_info.items():
         info.step_metadata = {"prefill_order": (rid,)}
+    w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p", get_fwd_info=batch.per_request_info.get)
     eng.prepare_inputs(batch)
     pending = PendingBatch(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, node, "p", walk, Future())
     outputs = BatchedModelOutput(per_rid_outputs={rid: {"new_token": [torch.tensor([rid + 4])]} for rid in (1, 2)})
@@ -186,14 +188,14 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids(build):
     assert copies.inputs == {"embeds": [embeds[1]]}, "a rebuild would need the encoder to run again"
     assert copies.step_metadata == {"prefill_order": (1,)}, "the rebuild row would run under decode's metadata"
     assert copies.step_metadata is not batch.per_request_info[1].step_metadata, "a later step could rewrite the copy"
-    assert not w._kept_ids[node][R].copies, "a rebuild row's inputs would stand in for the request's copy"
+    assert len(w._kept_ids[node][R].copies) == 1, "a rebuild row's inputs would stand in for the request's copy"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     w, _ = _worker()
     w.device, w.device_capability, w._d2h_stream = torch.device("cuda"), SimpleNamespace(is_accelerator=True), None
-    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), [])
+    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), [], 1)
     rows = 1 << 22
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
     expected = embeds.cpu()
@@ -201,11 +203,11 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
         # a cached block for the copy back, since allocating a block waits for the device
         torch.full((rows,), -1.0, device="cuda")
     batch = _step((R,), "vision", rebuild=A, per_request_input_tensors={R: {"embeds": [embeds]}})
-    batch.per_request_info[R].step_metadata = {}
+    w._copied_inputs[("vision", NODE)] = {"embeds"}
     # a busy side stream keeps the copy queued past the point where the worker lets go of the step's tensors
     with w._side_stream():
         torch.cuda._sleep(1 << 30)
-    w._copy_inputs(batch, {"embeds"})
+    w._copy_inputs(batch)
 
     assert not w._rebuildable(R, NODE), "the request could be dropped before its copy has landed"
     del batch, embeds
@@ -290,7 +292,7 @@ def test_only_an_image_prompt_on_one_walk_at_one_rank_is_preemptible(request_, g
 def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w, eng = _worker()
     copies = {"copy not taken": [], "copy not landed": [PrefillCopies({}, {}, SimpleNamespace(query=bool))]}
-    w._kept_ids[NODE].update({} if why == "no ids" else {R: KeptIds(b"", array("i", [5]), copies.get(why))})
+    w._kept_ids[NODE].update({} if why == "no ids" else {R: KeptIds(b"", array("i", [5]), copies.get(why), 1)})
     w._in_flight_rids.update({R} if why == "in flight" else ())
     w.scheduler.backlog.update({(NODE, DECODE): ScheduledBatch(NODE, DECODE, {R: 0})} if why == "backlog" else {})
     w._rebuild_rows.update({R: deque([RebuildRow(NODE, PREFILL, {}, None)])} if why == "rebuild queued" else {})
@@ -304,7 +306,8 @@ def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
 
 def test_an_image_request_is_dropped_once_its_copy_has_landed():
     w, eng = _worker()
-    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), [PrefillCopies({}, {}, SimpleNamespace(query=lambda: True))])
+    landed = PrefillCopies({}, {}, SimpleNamespace(query=lambda: True))
+    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), [landed], 1)
 
     w._drop(R, NODE)
 

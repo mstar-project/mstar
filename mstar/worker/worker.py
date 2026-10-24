@@ -288,10 +288,11 @@ class PrefillCopies:
 @dataclass(slots=True)
 class KeptIds:
     """A request's token ids on one node as int32: its prompt, then each sample it kept. A prompt with digest spans
-    is rebuilt from ``copies`` as well, one for each of its prefill steps on a walk that reads more than ids."""
+    is rebuilt from ``copies`` as well, one copy for each prefill step that writes a digest span, ``steps`` in all."""
     prompt: bytes
     sampled: array
     copies: list[PrefillCopies] | None = None
+    steps: int = 0
 
 
 @dataclass(slots=True)
@@ -1123,18 +1124,23 @@ class Worker:
             reads = self._walk_inputs.get((*walks, node_name), set()) - copied
             grows = [walk for (walk, node), name in self._growth_loops.items() if node == node_name and name == loop]
             if len(reads) == 1 and grows and all(self._walk_inputs.get((walk, node_name)) == reads for walk in grows):
-                kept[request_id] = KeptIds(ids, array("i"), [] if media else None)
+                steps = sum(any(span.kind == "digest" for span in run) for run in _prefill_steps(layout.spans))
+                kept[request_id] = KeptIds(ids, array("i"), [] if media else None, steps)
 
     def _set_copied_inputs(self) -> None:
         """Map (walk, node) to what a node that keeps ids reads in that walk and in none of its growth walks.
         These inputs, such as an encoder's output, are freed after a step, so a rebuild row takes them from host
-        copies. A node that shares a paged KV cache but runs none of the walks that grow it keeps no ids."""
+        copies. A node that shares a paged KV cache but runs none of the walks that grow it keeps no ids. A
+        combined walk maps to what its walks copy, since their rows can run in a mixed step."""
         self._copied_inputs: dict[tuple[str, str], set[str]] = {}
         for node_name in self._kept_ids:
             grown = set().union(*(self._walk_inputs.get(key, ()) for key in self._growth_loops if key[1] == node_name))
             for (walk_name, node), names in self._walk_inputs.items():
                 if node == node_name and grown and names - grown:
                     self._copied_inputs[(walk_name, node)] = names - grown
+        for (node, walk_name), combined in self.scheduler.combined_walk_of.items():
+            if (walk_name, node) in self._copied_inputs:
+                self._copied_inputs.setdefault((combined, node), set()).update(self._copied_inputs[(walk_name, node)])
 
     def _set_local_loops(self, my_walks: set[tuple[str, str]]) -> None:
         """Give each paged KV cache the loops that grow in a walk this worker runs on one of the cache's nodes."""
@@ -1182,13 +1188,16 @@ class Worker:
 
         The request must be in the walk that grows its KV. The prefill and each iteration of the growth
         loop sample once, and the KV holds all but the last sample. A prompt with digest spans also needs
-        its host copies landed. They queue on one stream, so the last one's event covers them all.
+        a landed host copy of each step that writes a digest span. The copies queue on one stream, so the
+        last copy's ``landed`` event covers them all.
         """
         kept = self._kept_ids.get(node_name, {}).get(request_id)
         if kept is None:
             return False
         copies = kept.copies
-        if copies is not None and (not copies or copies[-1].landed is not None and not copies[-1].landed.query()):
+        if copies is not None and (
+            len(copies) < kept.steps or copies[-1].landed is not None and not copies[-1].landed.query()
+        ):
             return False
         info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
         loop = self._growth_loops.get((info.graph_walk, node_name))
@@ -3612,9 +3621,8 @@ class Worker:
             request_ids=batch_N.node_batch.request_ids,
         )
         _pp_stage("prematerialize")
-        copied = self._copied_inputs.get((batch_N.batch.graph_walk, batch_N.node_name))
-        if copied:
-            self._copy_inputs(batch_N.node_batch, copied)
+        if (batch_N.batch.graph_walk, batch_N.node_name) in self._copied_inputs:
+            self._copy_inputs(batch_N.node_batch)
         stops = engine.check_stop_for_batch(
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
         )
@@ -3784,19 +3792,25 @@ class Worker:
                 del self._rebuild_rows[rid]
                 engine.land_rebuild(node_batch.node_name, rid)
 
-    def _copy_inputs(self, node_batch: ExecutingBatch, names: set[str]) -> None:
-        """Copy to the host each prefill row's inputs under ``names``, as the step received them, and its step
-        metadata. The host has waited on the step, so the copies need no wait and queue behind the step's own
-        output copy."""
-        kept_ids, taken = self._kept_ids[node_batch.node_name], []
-        for rid in node_batch.request_ids:
+    def _copy_inputs(self, node_batch: ExecutingBatch) -> None:
+        """Copy to the host the inputs each prefill row read that its node's growth walks don't, as the step received
+        them, and its step metadata, until its request has a copy of each step that writes a digest span. A row the
+        cache served whole is copied too. The host has waited on the step, so the copies need no wait and queue behind
+        the step's own output copy."""
+        node, ctx = node_batch.node_name, node_batch.step_context
+        kept_ids, partition, taken = self._kept_ids[node], self.request_state.get_partition_for_node(node), []
+        for rid in (*node_batch.request_ids, *node_batch.cached_rids):
             kept = kept_ids.get(rid)
-            if kept is None or kept.copies is None or rid in node_batch.rebuild_rids:
+            if kept is None or kept.copies is None or len(kept.copies) == kept.steps:
+                continue
+            names = self._copied_inputs.get((ctx.walk_of(rid), node))
+            if not names:
                 continue
             inputs = node_batch.per_request_input_tensors[rid]
+            # from the request, since a row the cache served whole has left the step's `per_request_info`
+            info = self.request_state.get_fwd_info(rid, partition)
             copies = PrefillCopies(
-                {name: [self._to_host(t) for t in inputs[name]] for name in names},
-                dict(node_batch.per_request_info[rid].step_metadata),
+                {name: [self._to_host(t) for t in inputs[name]] for name in names}, dict(info.step_metadata),
             )
             kept.copies.append(copies)
             taken.append(copies)
