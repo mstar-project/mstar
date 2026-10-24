@@ -334,18 +334,6 @@ Kokoro notes
   voices for a picker: the bundled voices whose G2P extra is installed on the server
   (a request for one of the others gets a 400 with the ``pip install`` hint).
 
-Qwen3-Omni notes
-----------------
-
-- Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
-  25-frame chunks behind 25 frames of left context. Playback stays gapless
-  while the Talker produces frames at about 1.5x real time over the first 50
-  frames (about 19 frames/s per request); the Talker batches at most 32
-  requests, so requests past that queue and can fall below it and pause. Set
-  ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
-  start with a 25-frame chunk instead: first audio comes later, and the
-  Talker needs only about 1.0 to 1.3x real time.
-
 Qwen3-TTS notes
 ---------------
 
