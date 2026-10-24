@@ -584,14 +584,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
 
     MAX_BATCH_TOKENS = 1024
-    # vision runs alone (bs=1 captures), so a larger chunk costs no decode rows a step
-    MAX_VISION_BATCH_TOKENS = 2048
 
     def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
-        if graph_walk in ("prefill_text", "prefill_audio"):
+        if graph_walk in ("prefill_text", "prefill_audio", "prefill_vision"):
             return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
-        if graph_walk == "prefill_vision":
-            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_VISION_BATCH_TOKENS)
         if graph_walk == THINKER_MIXED:
             return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
         return NO_CHUNKING
