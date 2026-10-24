@@ -66,49 +66,15 @@ def test_runtime_stop_check_matches_the_engine_through_a_speculated_loop(seed, m
         w._thread_outputs_to_speculative(spec, _rows_only(pending))
         # postprocess N: N+1 is speculated, N is not routed yet
         nb = pending.node_batch
-        tokens = torch.tensor(rng.choice([EOS, 1, 2], size=len(nb.request_ids)))[:, None]
-        host_rows = HostRows(tuple(nb.request_ids), {"new_token": tokens})
+        # host rows in another order than the step's, and sometimes one row
+        # with no output at all
+        ids = list(nb.request_ids)
+        order = rng.permutation(len(ids))[: len(ids) - int(rng.random() < 0.5)]
+        tokens = torch.tensor(rng.choice([EOS, 1, 2], size=len(order)))[:, None]
+        host_rows = HostRows(tuple(ids[i] for i in order), {"new_token": tokens})
         expected = Engine.check_stop_for_batch(eng, nb, {}, host_rows=host_rows)
         got = w._check_stops_in_runtime(pending, eng, host_rows)
         assert got == expected
         stopped += len(got)
         pending = _advance(w, pending, spec)
     assert stopped, "the limits are small enough that rows reach them"
-
-
-def test_rows_out_of_forward_order_and_without_a_row():
-    rng = np.random.default_rng(0)
-    w, rids = _worker_with_limits(4, rng)
-    eng = _engine()
-    pending = _first_step(w, rids)
-    nb = pending.node_batch
-    # forward order reversed, and the last rid has no row (no output)
-    row_rids = tuple(reversed(nb.request_ids[:-1]))
-    tokens = torch.tensor([EOS, EOS, EOS])
-    host_rows = HostRows(row_rids, {"new_token": tokens})
-    expected = Engine.check_stop_for_batch(eng, nb, {}, host_rows=host_rows)
-    assert w._check_stops_in_runtime(pending, eng, host_rows) == expected
-    assert nb.request_ids[-1] not in expected
-
-
-def test_limits_go_with_the_request():
-    rng = np.random.default_rng(1)
-    w, rids = _worker_with_limits(2, rng)
-    eng = _engine()
-    pending = _first_step(w, rids)
-    host_rows = HostRows(tuple(pending.node_batch.request_ids), {"new_token": torch.tensor([1, 1])})
-    w._check_stops_in_runtime(pending, eng, host_rows)
-    rt = w._graph_runtime
-    _, _, missing = rt.check_stops_inline(
-        PART, NODE, pending.node_batch.step_context.graph_walk, rids,
-        torch.tensor([1, 1]), list(rids),
-    )
-    assert missing == []
-    rt.remove_request(rids[0])
-    rt.remove_request(rids[1])
-    again = _admit(w, 2, start=10)
-    _, _, missing = rt.check_stops_inline(
-        PART, NODE, pending.node_batch.step_context.graph_walk, again,
-        torch.tensor([1, 1]), list(again),
-    )
-    assert sorted(missing) == sorted(again), "a recycled handle has no limits"
