@@ -256,6 +256,10 @@ class RecurrentStateConfig:
     # TODO: derive this from (backend, dtype, ...) automatically.
     disable_sink_slot: bool = False
 
+    # Snapshots kept for prefix reuse, in slots past max_slots: the state a
+    # prompt reached at a page boundary, under that page's key.
+    prefix_slots: int = 0
+
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
@@ -282,7 +286,7 @@ class RecurrentStateConfig:
 
     @property
     def total_bytes(self) -> int:
-        return self.slot_bytes * self.max_slots
+        return self.slot_bytes * (self.max_slots + self.prefix_slots)
 
 
 @dataclass
@@ -297,8 +301,10 @@ class RecurrentStateSpec(NodeResourceSpec):
 
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
+        prefix_slots: int | None = None,
     ):
-        """How many slots this deployment gets, and the state's dtype.
+        """How many slots this deployment gets, the state's dtype, and how
+        many snapshots it keeps for prefix reuse.
 
         Block shapes are the model's and not tunable. The dtype trades
         accumulated precision against bandwidth and decides which kernels the
@@ -306,6 +312,8 @@ class RecurrentStateSpec(NodeResourceSpec):
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
+        if prefix_slots is not None:
+            self.config.prefix_slots = prefix_slots
         if state_dtype is not None:
             try:
                 dtype = getattr(torch, state_dtype)
