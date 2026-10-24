@@ -297,6 +297,30 @@ def test_group_timestamps_match_processor(n):
     assert group_timestamps(indices, 29.97, 2) == ref
 
 
+@pytest.mark.parametrize("grid", [[(1, 6, 10)], [(1, 4, 4), (2, 8, 2)], [(1, 2, 2)]], ids=str)
+def test_the_position_resample_matches_interpolate(grid):
+    """The learned table resampled onto each frame's grid, as upstream's
+    ``F.interpolate(align_corners=True)`` (edge reads, no zero padding),
+    in the merger's block order."""
+    import torch.nn.functional as F
+
+    from mstar.model.qwen3_5.components.vision import vision_interpolation
+
+    side, merge, dim = 4, 2, 3
+    table = torch.randn(side * side, dim, dtype=torch.float64)
+    idx, w = vision_interpolation(grid, side, merge, torch.device("cpu"))
+    ours = (table[idx] * w[:, :, None].double()).sum(1)
+    refs = []
+    for t, h, wd in grid:
+        img = F.interpolate(
+            table.T.reshape(1, dim, side, side), size=(h, wd), mode="bilinear", align_corners=True,
+        )[0]
+        # raster -> merge blocks: (block row, block col, row in block, col in block)
+        blocks = img.reshape(dim, h // merge, merge, wd // merge, merge).permute(1, 3, 2, 4, 0)
+        refs.append(blocks.reshape(-1, dim).repeat(t, 1))
+    assert torch.allclose(ours, torch.cat(refs), atol=1e-6)
+
+
 def test_expand_video_pads_writes_a_triple_per_group():
     text = "a<|vision_start|><|video_pad|><|vision_end|>b<|video_pad|>c"
     out = expand_video_pads(

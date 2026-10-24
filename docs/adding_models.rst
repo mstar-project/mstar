@@ -2304,6 +2304,11 @@ tower's tensors in ``tensor_inputs`` and, in ``resource_step_info``, each of
 provides ``embed(**tensors) -> (hidden, cos, sin)``, ``encode(hidden, cos, sin)`` and
 ``project(encoded, **tensors)``. A prompt whose spans under some label exceed the
 ragged resource's ``max_segments_per_request`` takes no lease and runs eagerly.
+A tower builds on the pieces in ``mstar/model/components/vit.py``:
+``bilinear_table_taps`` (the learned position table resampled onto a patch grid),
+``AxialVisionRope`` and ``RaggedVisionAttention`` (attention over the packed patches
+through the ragged resource, rope in fp32), which a tower subclasses with its q/k/v
+projections.
 
 Advanced: async partitions and streaming
 ----------------------------------------
