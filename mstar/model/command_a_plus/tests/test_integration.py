@@ -31,6 +31,7 @@ from mstar.model.command_a_plus.config import (
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
 from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
 from mstar.model.command_a_plus.tests.test_weight_loading import checkpoint
+from mstar.model.multimodal import PromptPart
 from mstar.model.submodule_base import ModelInputsFromEngine
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
@@ -61,8 +62,11 @@ class ToyLM(nn.Module):
 
 class NodeTests(unittest.TestCase):
     def setUp(self):
-        self.config = CommandAPlusConfig.from_json(FIXTURE).text_config
-        self.node = CommandAPlusLLMSubmodule(ToyLM(self.config.vocab_size), self.config)
+        config = CommandAPlusConfig.from_json(FIXTURE)
+        self.config = config.text_config
+        self.node = CommandAPlusLLMSubmodule(
+            ToyLM(self.config.vocab_size), self.config, config.vision_config.image_token_id,
+        )
 
     def test_packed_prefill_selects_each_requests_last_token_and_decode_routes_rows(self):
         sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
@@ -125,6 +129,31 @@ class NodeTests(unittest.TestCase):
         self.node.cleanup_request("a")
         self.assertNotIn("a", self.node.request_states)
 
+    def test_image_prefill_places_encoder_output_at_image_tokens(self):
+        image = self.node.image_token_id
+        ids = torch.tensor([2, image, image, 5])
+        image_embeds = torch.stack([torch.arange(128.0), -torch.arange(128.0)]) / 128
+        inputs = self.node.prepare_inputs(
+            "prefill_image", info("prefill_image"), {"text_inputs": [ids], "image_embeds": [image_embeds]},
+        )
+        eye = torch.eye(self.config.vocab_size)
+        torch.testing.assert_close(inputs.input_embeds[[0, 3]], eye[[2, 5]])
+        torch.testing.assert_close(inputs.input_embeds[[1, 2]], image_embeds)
+        # a chunked prefill cuts the embeddings with the ids
+        cut = self.node.split_inputs("prefill_image", info("prefill_image"), inputs, 1, 3)
+        torch.testing.assert_close(cut.input_embeds, image_embeds)
+        self.assertEqual(cut.input_ids.tolist(), [image, image])
+
+        sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
+        attention = SimpleNamespace(select_last_hidden=lambda x, label: x[-1:])
+        engine = ModelInputsFromEngine(["a"], {}, {LOCAL_ATTN: attention, SAMPLER: sampler})
+        step = self.node.declare_step("prefill_image", ["a"], [inputs])
+        self.assertEqual(step.steps[SAMPLER].prefill_tracked_tokens["a"].tolist(), ids.tolist())
+        output = self.node.forward_batched(
+            "prefill_image", engine, **self.node.preprocess("prefill_image", engine, [inputs]),
+        )
+        self.assertEqual(output["a"]["new_token"][0].item(), 5)
+
     def test_invalid_inputs_fail_before_cache_planning(self):
         for walk, tensor in (
             ("other", torch.tensor([2])), ("decode", torch.tensor([2, 3])),
@@ -153,7 +182,7 @@ class ModelIntegrationTests(unittest.TestCase):
         self.assertTrue(resources[ROPE].config.interleave)
         self.assertEqual(resources[ROPE].config.rotary_dim, 8)
         walks = model.get_graph_walk_graphs()
-        self.assertEqual(model.nodes, ["LLM"])
+        self.assertEqual(model.nodes, ["LLM", "vision_encoder"])
         self.assertEqual(len(model.get_partitions()), 1)
         output_edges = walks["prefill"].outputs
         self.assertTrue(any(e.name == "new_token" and e.next_node == EMIT_TO_CLIENT and e.conductor_new_token
@@ -201,6 +230,33 @@ class ModelIntegrationTests(unittest.TestCase):
         self.assertTrue(all(len(k) == 9 for k, v in kv.cache.values()))
         self.assertEqual(len(kv.writes), 20)
 
+    def test_image_requests_take_the_image_walk(self):
+        text, pixels = object(), object()
+        first = self.model.get_initial_forward_pass_args(
+            DEFAULT_PARTITION, ["text", "image"], ["text"], {"text_inputs": [text], "pixel_values": [pixels]},
+        )
+        self.assertEqual(first.full_metadata.graph_walk, "prefill_image")
+        self.assertEqual({(e.next_node, e.name) for e in first.inputs},
+                         {("LLM", "text_inputs"), ("vision_encoder", "pixel_values")})
+        self.assertEqual(first.unpersist_tensors, [text, pixels])
+        next_ = self.model.get_partition_forward_pass_args(
+            DEFAULT_PARTITION, first.full_metadata, {"decode_input": [text]},
+        )
+        self.assertEqual(next_.full_metadata.graph_walk, "decode")
+
+    def test_vision_node_loads_from_the_checkpoint_and_encodes_tiles(self):
+        from mstar.model.command_a_plus.tests.test_vision import checkpoint_name, tiny_encoder
+
+        torch.manual_seed(0)
+        vision = {checkpoint_name(n): torch.randn_like(p) for n, p in tiny_encoder().named_parameters()}
+        save_file({**checkpoint(self.model.config), **vision}, Path(self.directory) / "model.safetensors")
+        node = self.model.get_submodule("vision_encoder", autocast_dtype=torch.float32)
+        tiles = [torch.rand(2, 3, 32, 32), torch.rand(1, 3, 32, 32)]
+        inputs = node.prepare_inputs("prefill_image", info("prefill_image"), {"pixel_values": tiles})
+        with torch.inference_mode():
+            outputs = node.forward("prefill_image", None, **node.preprocess("prefill_image", None, [inputs]))
+        self.assertEqual(tuple(outputs["image_embeds"][0].shape), (3 * 4, self.model.config.hidden_size))
+
     def test_load_dtype_and_reject_sequence_parallelism(self):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")
         node = self.model.get_submodule("LLM", autocast_dtype=torch.bfloat16)
@@ -213,7 +269,9 @@ class ModelIntegrationTests(unittest.TestCase):
 
     def test_real_graph_loop_stops_after_total_token_budget(self):
         graph = WorkerGraphIO(self.model.get_graph_walk_graphs()["decode"])
-        node = CommandAPlusLLMSubmodule(ToyLM(self.model.config.vocab_size), self.model.config)
+        node = CommandAPlusLLMSubmodule(
+            ToyLM(self.model.config.vocab_size), self.model.config, self.model.vision_config.image_token_id,
+        )
         graph.ingest_input(GraphEdge(name="text_inputs", next_node="LLM"))
         iterations = 0
         while not graph.wg_state_registry.is_done and iterations < 10:
@@ -234,14 +292,15 @@ class ModelIntegrationTests(unittest.TestCase):
         import yaml
 
         path = Path(self.directory) / "deployment.yaml"
-        path.write_text(yaml.safe_dump({"node_groups": [{
-            "node_names": ["LLM"], "ranks": list(range(8)), "tp_size": 8,
-            "graph_walks": ["prefill", "decode"],
-        }]}))
+        path.write_text(yaml.safe_dump({"node_groups": [
+            {"node_names": ["vision_encoder"], "ranks": [0]},
+            {"node_names": ["LLM"], "ranks": list(range(8)), "tp_size": 8,
+             "graph_walks": ["prefill", "prefill_image", "decode"]},
+        ]}))
         graphs = self.model.get_worker_graphs(str(path))
-        self.assertEqual(len(graphs), 2)
-        self.assertEqual({next(iter(g.graph_walks)) for g in graphs}, {"prefill", "decode"})
-        self.assertTrue(all(g.tp_size == 8 and g.sp_size == 1 for g in graphs))
+        self.assertEqual({next(iter(g.graph_walks)) for g in graphs}, {"prefill", "prefill_image", "decode"})
+        llm = [g for g in graphs if "LLM" in g.section.get_nodes()]
+        self.assertTrue(llm and all(g.tp_size == 8 and g.sp_size == 1 for g in llm))
         self.assertEqual(len(self.model.get_sharding_config(str(path)).groups), 1)
 
     def test_prompt_adapter_and_byte_stream_preserve_unicode_and_markers(self):
@@ -287,11 +346,42 @@ class ModelIntegrationTests(unittest.TestCase):
         for bad in ([], [{"role": "tool", "content": "x"}], [{"role": "user"}], "hi"):
             with self.assertRaisesRegex(ValueError, "messages"):
                 self.model.process_prompt("hi", ["text"], ["text"], messages=bad)
-        with self.assertRaisesRegex(ValueError, "text input"):
-            self.model.process_prompt("hi", ["image"], ["text"])
+        with self.assertRaisesRegex(ValueError, "text and image input"):
+            self.model.process_prompt("hi", ["audio"], ["text"])
         for ids in (torch.tensor([]), torch.tensor([128]), torch.tensor([-1]), torch.tensor([2.0])):
             with self.assertRaises(ValueError):
                 self.model.process_prompt(None, ["text"], ["text"], tensors={"text_inputs": [ids]})
+
+
+    def test_images_widen_their_placeholders_in_the_order_sent(self):
+        image, start, end, line_break = 120, 117, 118, 119
+        tokenizer = SimpleNamespace(
+            apply_chat_template=Mock(return_value=[2, image, 11, image]),
+            convert_tokens_to_ids=Mock(return_value=[start, end, line_break]),
+        )
+        tiles = [torch.rand(2, 3, 32, 32), torch.rand(1, 3, 32, 32)]
+        processor = Mock(side_effect=lambda images, return_tensors: {"pixel_values": tiles[processor.call_count - 1]})
+        self.model._tokenizer, self.model._image_processor = tokenizer, processor
+        self.model.max_seq_len = MAX_OUTPUT_TOKENS + 64
+        photos = [torch.rand(3, 40, 60), torch.rand(3, 20, 20)]
+        parts = [PromptPart(modality="image", index=0), PromptPart(modality="text", text="hi"),
+                 PromptPart(modality="image", index=1)]
+        result, metadata = self.model.process_prompt(
+            None, ["image", "text", "image"], ["text"], tensors={"image_inputs": photos}, prompt_parts=parts,
+        )
+        self.assertEqual(tokenizer.apply_chat_template.call_args.args[0], [{"role": "user", "content": [
+            {"type": "image", "image": ""}, {"type": "text", "text": "hi"}, {"type": "image", "image": ""},
+        ]}])
+        tile = [image] * 4 + [line_break]
+        self.assertEqual(result["text_inputs"][0].tolist(), [2, start, *tile * 2, end, 11, start, *tile, end])
+        torch.testing.assert_close(result["pixel_values"], [t.to(torch.bfloat16) for t in tiles])
+        (span,) = metadata["kv_layout"]["kv_cache"]["main"].spans
+        self.assertEqual((span.kind, span.walk, span.length), ("rows", "prefill_image", len(result["text_inputs"][0])))
+        torch.testing.assert_close(processor.call_args_list[0].kwargs["images"][0],
+                                   (photos[0] * 255).round().to(torch.uint8))
+        with self.assertRaisesRegex(ValueError, "2 image placeholders for 1 images"):
+            self.model.process_prompt(None, ["image"], ["text"], tensors={"image_inputs": photos[:1]},
+                                      messages=[{"role": "user", "content": [{"type": "image"}] * 2}])
 
 
 if __name__ == "__main__":
