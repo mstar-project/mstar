@@ -2649,8 +2649,6 @@ class Worker:
 
         if self._is_tp_follower_node(batch.node_name):
             return
-        if self._preempt(node_batch):
-            return
 
         # scope the eviction to whichever resource actually ran out, when the
         # admit named one
