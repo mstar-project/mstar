@@ -17,10 +17,16 @@ import inspect
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch import nn
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    _get_feat_extract_output_lengths,
+    chunk_and_pad_features,
+    get_audio_cu_seqlens,
+    get_valid_indices,
+)
 from transformers.vision_utils import (
     get_vision_cu_seqlens,
     get_vision_interpolation_indices_and_weights,
@@ -103,9 +109,7 @@ class AudioEncoderSubmodule(NodeSubmodule):
     Runs once per request (not batched across requests).
     """
 
-    # A dynamic=True compile takes minutes on the first clip, and marking the frame
-    # dimension dynamic still recompiles for each length.
-    eager_item_encoder = True
+    marks_dynamic_dims = True
 
     def __init__(self, audio_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
@@ -113,6 +117,11 @@ class AudioEncoderSubmodule(NodeSubmodule):
         self.config = config
         # Older transformers take return_dict; newer ones dropped it.
         self._encoder_takes_return_dict = _accepts_kwarg(audio_encoder.forward, "return_dict")
+        n_window = audio_encoder.n_window
+        # the length of a full attention window, since no clip's window is longer
+        self._max_seqlen = _get_feat_extract_output_lengths(2 * n_window, n_window) * (
+            audio_encoder.n_window_infer // (2 * n_window)
+        )
 
     def prepare_inputs(
         self,
@@ -123,21 +132,31 @@ class AudioEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         # Edge name from graph walk is "audio_features"
         audio_features = inputs["audio_features"][0]
-        audio_seqlens = inputs.get("audio_seqlens", [None])[0]
+        audio_seqlens = inputs["audio_seqlens"][0]
 
-        return NodeInputs(
-            tensor_inputs={
-                "audio_features": audio_features,
-                "audio_seqlens": audio_seqlens,
-            }
-        )
+        # Built outside the compiled forward, since these helpers read the clip's length on the
+        # host, which would compile a graph for every length.
+        encoder = self.audio_encoder
+        padded_feature, chunk_lengths = chunk_and_pad_features(audio_features, audio_seqlens, encoder.n_window)
+        tensor_inputs = {
+            "padded_feature": padded_feature,
+            "chunk_lengths": chunk_lengths,
+            "valid_indices": get_valid_indices(chunk_lengths, encoder.n_window),
+            "cu_seqlens": get_audio_cu_seqlens(chunk_lengths, audio_seqlens, encoder.n_window_infer, encoder.n_window),
+        }
+        for name in ("chunk_lengths", "valid_indices", "cu_seqlens"):
+            torch._dynamo.mark_dynamic(tensor_inputs[name], 0)
+        # A clip shorter than one chunk is padded only to its own length, so the frame dimension of
+        # `padded_feature` varies too. Some clips give a dimension of size 1 inside the encoder, which torch
+        # specializes, so `mark_dynamic` would raise for them.
+        torch._dynamo.maybe_mark_dynamic(padded_feature, 0)
+        torch._dynamo.maybe_mark_dynamic(padded_feature, 2)
+        return NodeInputs(tensor_inputs=tensor_inputs)
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        audio_features: torch.Tensor,
-        audio_seqlens: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> NameToTensorList:
         """Run the audio encoder and return embeddings.
@@ -145,14 +164,10 @@ class AudioEncoderSubmodule(NodeSubmodule):
         Returns:
             {"audio_embeds": [tensor of shape (audio_tokens, hidden_size)]}
         """
-        logger.debug(
-            "Running AudioEncoder with audio_features shape=%s",
-            audio_features.shape,
-        )
         extra_kwargs = {"return_dict": True} if self._encoder_takes_return_dict else {}
         audio_out = self.audio_encoder(
-            audio_features,
-            feature_lens=audio_seqlens,
+            max_seqlen=self._max_seqlen,
+            **kwargs,
             **extra_kwargs,
         )
         audio_embeds = getattr(audio_out, "last_hidden_state", audio_out)
