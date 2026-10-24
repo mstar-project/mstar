@@ -1088,43 +1088,50 @@ class Worker:
         )
 
     def _keep_ids(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
-        """Keep the prompt's ids on each node where one prefill row can recompute the request's KV
-        from them. The node's paged KV caches must lay out one label, written by one walk and grown
-        by one loop. The node must also read a single input, with the same name in that walk and in
-        every walk the loop grows in, since the rebuild row's ids go under that name. For an unkeyed label
-        with digest spans, on a node at one rank, that walk can read more inputs, and the node keeps host copies
-        of them for the rebuild row. Such a label must end on an ids span for the samples to extend, since the
-        rebuild row runs under the prefill row's step metadata, which covers only the prompt's spans. The prompt ids
-        must fill the label's ids spans exactly, since the rebuild row splits them by those spans."""
+        """Keep the prompt's ids on each node where rebuild rows, one per prefill step, can recompute the
+        request's KV from them and from host copies. The node's paged KV caches must lay out one label grown
+        by one loop whose walks all read one input, under which a row's ids go. A row's walk must read that input
+        when the row writes ids, and nothing else but what the node copies for the row. A label of ids alone
+        must be on one walk. A label with digest spans needs a node at one rank, keys that cover every span if it
+        has keys, a last span of ids for the samples to extend, and prompt ids that fill its ids spans, since the
+        rows split them by those spans. A request the conductor guaranteed is never dropped, so it keeps no copies."""
         for node_name, kept in self._kept_ids.items():
             keys = self._kv_keys[node_name]
             if request_id in kept:
                 continue  # its other partition's NewRequest
             prompts = [
-                (layout, (config.prompt_ids or {}).get(label), bool((config.prefix_keys or {}).get(label)))
+                (layout, (config.prompt_ids or {}).get(label), config, bool((config.prefix_keys or {}).get(label)))
                 for key in keys if isinstance(config := configs.get(key), KVReqConfig)
                 for label, layout in (config.kv_layout or {}).items()
             ]
             if len(prompts) != 1 or prompts[0][1] is None:
                 continue
-            layout, ids, keyed = prompts[0]
-            walks = {span.walk for span in layout.spans}
-            if len(layout.growth) != 1 or len(walks) != 1:
-                continue
-            ((loop, _),) = layout.growth
+            layout, ids, config, keyed = prompts[0]
             media = any(span.kind == "digest" for span in layout.spans)
-            copied = self._copied_inputs.get((*walks, node_name), set())
-            if bool(copied) != media:
+            if len(layout.growth) != 1 or not media and len({span.walk for span in layout.spans}) != 1:
                 continue
             if media and (
-                keyed or node_name in self.parallel_nodes or layout.spans[-1].kind != "ids"
+                config.guaranteed or keyed and layout.keyed_spans != len(layout.spans)
+                or node_name in self.parallel_nodes or layout.spans[-1].kind != "ids"
                 or len(ids) // 4 != sum(span.length for span in layout.spans if span.kind == "ids")
             ):
                 continue
-            reads = self._walk_inputs.get((*walks, node_name), set()) - copied
+            ((loop, _),) = layout.growth
             grows = [walk for (walk, node), name in self._growth_loops.items() if node == node_name and name == loop]
-            if len(reads) == 1 and grows and all(self._walk_inputs.get((walk, node_name)) == reads for walk in grows):
-                steps = sum(any(span.kind == "digest" for span in run) for run in _prefill_steps(layout.spans))
+            reads = self._walk_inputs.get((grows[0], node_name), set()) if grows else set()
+            if len(reads) != 1 or any(self._walk_inputs.get((walk, node_name)) != reads for walk in grows):
+                continue
+            runs = _prefill_steps(layout.spans)
+            for run in runs:
+                walk = run[0].walk
+                copied = self._copied_inputs.get((walk, node_name), set())
+                written = reads if any(span.kind == "ids" for span in run) else set()
+                if bool(copied) != any(span.kind == "digest" for span in run) or (
+                    self._walk_inputs.get((walk, node_name), set()) - copied != written
+                ):
+                    break
+            else:
+                steps = sum(any(span.kind == "digest" for span in run) for run in runs)
                 kept[request_id] = KeptIds(ids, array("i"), [] if media else None, steps)
 
     def _set_copied_inputs(self) -> None:
