@@ -293,8 +293,9 @@ def test_health_findings_name_exited_processes_leftover_shm_and_crash_lines(tmp_
         p.wait()
 
 
-def test_the_deployment_token_matches_the_one_mstar_names_tensor_files_with(tmp_path):
+def test_the_deployment_token_matches_the_one_mstar_names_tensor_files_with(tmp_path, monkeypatch):
     tensors = pytest.importorskip("mstar.communication.tensors")
+    monkeypatch.delenv("MSTAR_DEPLOYMENT_TOKEN", raising=False)
     from mstar.communication.communicator import BaseCommunicator, CommProtocol
 
     sock = tmp_path / "sock"

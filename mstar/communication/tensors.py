@@ -1,10 +1,12 @@
 import errno
+import fcntl
 import hashlib
 import logging
 import math
 import os
 import platform
 import re
+import secrets
 import shutil
 import stat
 import sys
@@ -1307,8 +1309,11 @@ class TensorCommunicationManager(ABC):
     # ---- shared: polling & ACKs ----
 
     def _collect_and_send_acks(
-        self, request_id: Rid, graph_edges: list[GraphEdge],
+        self, request_id: Rid | None, graph_edges: list[GraphEdge],
+        wire_request_id: str | None = None,
     ):
+        """``wire_request_id`` overrides ``rid_to_str(request_id)``, for a
+        request that no longer has a handle."""
         acks: dict[str, dict[int, int]] = {}
         for edge in graph_edges:
             for info in edge.tensor_info:
@@ -1319,12 +1324,14 @@ class TensorCommunicationManager(ABC):
         for source_entity, tensors in acks.items():
             if source_entity == self.my_entity_id:
                 continue
+            if wire_request_id is None:
+                wire_request_id = self.rid_to_str(request_id)
             self.communicator.send(
                 source_entity,
                 WorkerMessage(
                     message_type=WorkerMessageType.TENSOR_RECEIVED,
                     body=TensorReceived(
-                        request_id=self.rid_to_str(request_id),
+                        request_id=wire_request_id,
                         successful_tensors=tensors,
                         failed_tensor_ids=[],
                     ),
@@ -1332,14 +1339,15 @@ class TensorCommunicationManager(ABC):
             )
 
     def ack_unread_tensors(
-        self, request_id: Rid, graph_edges: list[GraphEdge],
+        self, request_id: str, graph_edges: list[GraphEdge],
     ):
-        """Ack result tensors for an already-removed request without reading them.
+        """Ack tensors for an already-removed request without reading them.
 
-        The producer holds these output buffers until it gets the
-        TENSOR_RECEIVED ack; emit it here so it can reclaim them.
+        The producer holds these buffers until it gets the TENSOR_RECEIVED ack;
+        emit it here so it can reclaim them. ``request_id`` is the wire string:
+        a removed request has no handle on a worker.
         """
-        self._collect_and_send_acks(request_id, graph_edges)
+        self._collect_and_send_acks(None, graph_edges, wire_request_id=request_id)
 
     def enable_transfer_metrics(self) -> EdgeTransfers:
         """Count what this manager reads from now on (see ``EdgeTransfers``).
@@ -1654,6 +1662,11 @@ class TensorCommunicationManager(ABC):
         """
         self.cleanup_request(request_id, force=True)
 
+    #: True when no other launch can write a file under this manager's names
+    #: (see ``SharedMemoryCommunicationManager``); irrelevant to transports
+    #: that write no files.
+    names_unique_per_launch = False
+
     def unlink_owned_files(self) -> None:  # noqa: B027
         """Unlink the shared-memory files this process wrote for its peers and
         still owns. A no-op here: only the SHM file transport (and the arena's
@@ -1889,17 +1902,40 @@ def _default_shm_dir() -> str:
     return "/tmp/mstar_shm"
 
 
+DEPLOYMENT_TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN"
+#: The token the last API server in this environment minted.
+_MINTED_TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN_MINTED"
+
+
+def ensure_deployment_token() -> str:
+    """Mint this launch's token unless a launcher set one. Called by the API
+    server, which every other process of the deployment descends from
+    (``spawn`` children inherit the environment).
+
+    A token an API server minted is never kept by the next launch that finds
+    it, a server built again in this process or started by one that holds
+    it: on the same endpoint that launch would write the names a stopping
+    worker of the old one may still unlink."""
+    token = os.environ.get(DEPLOYMENT_TOKEN_ENV)
+    if not token or token == os.environ.get(_MINTED_TOKEN_ENV):
+        token = secrets.token_hex(8)
+        os.environ[DEPLOYMENT_TOKEN_ENV] = os.environ[_MINTED_TOKEN_ENV] = token
+    return token
+
+
 def _deployment_namespace(communicator) -> str:
     """A token every process of ONE deployment derives identically, and two
-    deployments on the same host never share.
+    deployments that share a tmpfs never share.
 
     Tensor uuids are per-entity counters, so ``worker_0``'s uuid 5 exists in
     every deployment at once; a file named by entity and uuid alone is written
     and unlinked by every server on the host. The conductor's endpoint
-    disambiguates them because it is unique per concurrent deployment: over
-    TCP a second deployment on the same port fails to bind, and over IPC --
-    where libzmq would happily unlink and replace the socket file -- the
-    conductor's ``_lock_deployment`` refuses to start.
+    separates deployments on one host: over TCP a second deployment on the
+    same port fails to bind, and over IPC -- where libzmq would happily
+    unlink and replace the socket file -- the conductor's ``_lock_deployment``
+    refuses to start. Containers that share ``/dev/shm`` but not the network
+    namespace or ``/tmp`` can both run the same endpoint, so the launch token
+    (``ensure_deployment_token``) is mixed in when set.
     """
     if getattr(communicator, "protocol", None) not in (
         CommProtocol.IPC, CommProtocol.TCP
@@ -1909,7 +1945,88 @@ def _deployment_namespace(communicator) -> str:
     if endpoint.startswith("ipc://"):
         # realpath: "/tmp/mstar_x/" and "/tmp/mstar_x" are one deployment.
         endpoint = "ipc://" + os.path.realpath(endpoint.removeprefix("ipc://"))
-    return hashlib.sha1(endpoint.encode()).hexdigest()[:12]
+    token = os.environ.get(DEPLOYMENT_TOKEN_ENV)
+    key = f"{token}\0{endpoint}" if token else endpoint
+    return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+_NAMESPACE_LOCK_RE = re.compile(r"mstar_([0-9a-f]{12})\.lock")
+
+#: Lock path -> fd, held (never closed) for the life of the process.
+_held_namespace_locks: dict[str, int] = {}
+
+
+def _hold_namespace_lock(shm_dir: str, namespace: str) -> None:
+    """Hold a shared ``flock`` on ``mstar_<namespace>.lock`` before this
+    process writes any file under the namespace, so a namespace whose lock
+    nobody holds belongs to a deployment that is gone."""
+    path = os.path.join(shm_dir, f"mstar_{namespace}.lock")
+    if path in _held_namespace_locks:
+        return
+    while True:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        # Waits only while a sweeper deletes the namespace; it unlinks the
+        # lock file before letting go, so recheck that we hold the named one.
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        try:
+            named = os.lstat(path)
+        except FileNotFoundError:
+            named = None
+        held = os.fstat(fd)
+        if named is not None and (held.st_dev, held.st_ino) == (
+            named.st_dev, named.st_ino
+        ):
+            _held_namespace_locks[path] = fd
+            return
+        os.close(fd)
+
+
+def _sweep_dead_namespaces(shm_dir: str, own_namespace: str) -> None:
+    """Delete every ``mstar_<ns>_*`` file in ``shm_dir`` of each of this
+    uid's namespaces whose lock there this process can take exclusively,
+    then the lock file. A per-launch namespace never collides with a dead
+    run's files, so nothing else reclaims them."""
+    try:
+        names = os.listdir(shm_dir)
+    except OSError:
+        return
+    uid = os.getuid()
+    for name in names:
+        m = _NAMESPACE_LOCK_RE.fullmatch(name)
+        if m is None or m[1] == own_namespace:
+            continue
+        path = os.path.join(shm_dir, name)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            held = os.fstat(fd)
+            if held.st_uid != uid:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue   # a process of that deployment is alive
+            named = os.lstat(path)
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                continue
+            prefix = f"mstar_{m[1]}_"
+            swept = 0
+            for stale in os.listdir(shm_dir):
+                if stale.startswith(prefix):
+                    try:
+                        os.unlink(os.path.join(shm_dir, stale))
+                        swept += 1
+                    except OSError:
+                        pass
+            os.unlink(path)
+            logger.info("SHM: swept %d file(s) of dead deployment namespace "
+                        "%s", swept, m[1])
+        except OSError as e:
+            logger.debug("SHM: cannot sweep %s: %s", name, e)
+        finally:
+            os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -1918,6 +2035,10 @@ def _deployment_namespace(communicator) -> str:
 
 class SharedMemoryCommunicationManager(TensorCommunicationManager):
     """Tensor transport via file I/O to a tmpfs directory (``/dev/shm``)."""
+
+    #: Directories besides ``shm_dir`` that hold this transport's
+    #: ``mstar_<namespace>_*`` files; each gets its own namespace lock.
+    _namespace_file_dirs: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -1955,6 +2076,18 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         # uuid → file path for sender-side cleanup
         self._shm_files: dict[int, str] = {}
         self._shm_namespace = _deployment_namespace(communicator)
+        # The launch token is in the namespace, so a later launch on the same
+        # endpoint (uuid counters back at 1) never writes these names.
+        self.names_unique_per_launch = bool(
+            self._shm_namespace and os.environ.get(DEPLOYMENT_TOKEN_ENV))
+        if self._shm_namespace:
+            # A lock guards only the files in its own directory.
+            dirs = [d for d in dict.fromkeys(
+                (self.shm_dir, *self._namespace_file_dirs)) if os.path.isdir(d)]
+            for d in dirs:
+                _hold_namespace_lock(d, self._shm_namespace)
+            for d in dirs:
+                _sweep_dead_namespaces(d, self._shm_namespace)
 
         # Dedicated copy streams: D2H/H2D run here so they don't serialize
         # behind the next GPU step queued on the default stream.
@@ -1990,12 +2123,13 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         PermissionError; creating it is what makes the uuid a claim.
 
         Residue we DO own is a different case and is reclaimed rather than
-        raised on: a deployment that died leaves files under its namespace,
-        and the namespace is derived from the conductor endpoint, so a restart
-        on the same ports collides with every one of them (uuid counters
-        restart at 1 too). Concurrent same-namespace deployments cannot reach
-        here -- over TCP the ports differ, and over IPC the conductor's
-        deployment lock refuses the second one at startup.
+        raised on: without a launch token the namespace is derived from the
+        conductor endpoint alone, so a restart on the same ports collides with
+        every file the dead run left (uuid counters restart at 1 too).
+        Concurrent same-namespace deployments cannot reach here -- the launch
+        token separates deployments that share a tmpfs across containers, and
+        on one host the ports differ over TCP and the conductor's deployment
+        lock refuses a second one over IPC.
         """
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         try:
@@ -2189,14 +2323,23 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         for its TENSOR_RECEIVED or REMOVE_REQUEST, for a process that is
         stopping. A second call finds nothing left."""
         files = self._shm_files
-        while files:
-            _, path = files.popitem()
+        # The orphan watchdog's thread can run this at the same time, so each
+        # path is taken by one caller, and put back for the retry if a stop
+        # cuts its unlink.
+        while True:
+            try:
+                uuid, path = files.popitem()
+            except KeyError:
+                break
             try:
                 os.unlink(path)
             except OSError:
                 # Already gone (FileNotFoundError) or not removable: either
                 # way, keep going so the rest are still reclaimed.
                 pass
+            except BaseException:
+                files[uuid] = path
+                raise
 
 
 # ---------------------------------------------------------------------------
