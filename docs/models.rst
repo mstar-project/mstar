@@ -245,8 +245,8 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   - ``canary``: ``language`` (the speech's, default ``en``; one of Parakeet's 25),
     ``target_language`` (a translation to or from English; the OpenAI route also takes
     ``task="translate"``) and ``punctuation`` (default on).
-  - ``canary_qwen``: English only (checked on the OpenAI route). On ``/generate`` a
-    ``prompt`` replaces the trained instruction, "Transcribe the following:".
+  - ``canary_qwen``: English only (checked on the OpenAI route). ``instruction``
+    replaces the trained one, "Transcribe the following:"; ``/generate``'s text is unused.
 
 - A request holds up to 610 s on Parakeet and Nemotron, and 40.96 s on Canary and
   Canary-Qwen. ``/v1/audio/transcriptions`` cuts longer uploads (up to 30 min) into windows

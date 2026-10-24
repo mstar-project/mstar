@@ -287,12 +287,16 @@ class CanaryQwenModel(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """The clip's samples and the chat prompt; ``prompt`` replaces the
-        default instruction ("Transcribe the following:"). The OpenAI route
-        sends none: its ``prompt`` is context, not an instruction."""
+        """The clip's samples and the chat prompt. The text ``prompt`` is
+        unused: the ASR harnesses send a generic one, which would replace the
+        trained instruction. ``instruction`` replaces it on purpose (default
+        "Transcribe the following:")."""
         samples = clip_samples(tensors, self.MAX_AUDIO_SECONDS, "Canary-Qwen")
+        instruction = kwargs.get("instruction") or DEFAULT_INSTRUCTION
+        if not isinstance(instruction, str):
+            raise ValueError(f"instruction must be a string; got {instruction!r}")
         frames = self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH)
-        ids = self.prompt_ids(frames, (prompt or "").strip() or DEFAULT_INSTRUCTION)
+        ids = self.prompt_ids(frames, instruction.strip() or DEFAULT_INSTRUCTION)
         return {"audio": [samples], "text_inputs": [torch.tensor(ids, dtype=torch.long)]}
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:

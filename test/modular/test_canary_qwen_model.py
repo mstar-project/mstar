@@ -157,6 +157,17 @@ def test_prompt_ids():
     for bad in ("say <|audio|> twice", "word " * CanaryQwenModel.MAX_TEXT_TOKENS):
         with pytest.raises(ValueError):
             model.prompt_ids(3, bad)
+    # /generate's text (the ASR harnesses send a generic one) leaves the
+    # trained instruction alone; model_kwargs' ``instruction`` replaces it
+    model.config.encoder = SimpleNamespace(output_lengths=lambda n: 3)
+    tensors = {"audio_inputs": [torch.zeros(16000)]}
+    generic = "Transcribe the speech in this audio clip."
+
+    def ids(**kwargs):
+        return model.process_prompt(generic, ["audio", "text"], ["text"], tensors=tensors, **kwargs)["text_inputs"][0]
+
+    assert ids().tolist() == model.prompt_ids(3)
+    assert ids(instruction="Write down what is said:").tolist() == model.prompt_ids(3, "Write down what is said:")
 
 
 def test_output_and_request_limits():
