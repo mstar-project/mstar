@@ -1307,7 +1307,6 @@ class Qwen3OmniModel(Model):
         from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_text_mask
 
         merge = self.config.vision.spatial_merge_size
-        grids = {"image": tensors["image_grid_thw"], "video": tensors["video_grid_thw"]}
         thinker, talker, position = [], [], 0
         for step in plan:
             if step.modality == TEXT:
@@ -1319,9 +1318,13 @@ class Qwen3OmniModel(Model):
                 rows = int(self._audio_frames(tensors["audio_seqlens"][step.index])) + 2
                 span = Span("digest", "prefill_audio", rows, rows, ("audio", step.index))
                 kept = rows
+            elif step.modality == "image":
+                image = image_span(tensors["image_grid_thw"][step.index], merge)
+                span = Span("digest", "prefill_vision", image.length, image.advance, ("image", step.index))
+                kept = image.length
             else:
-                grid = grids[step.modality][step.index]
-                per_grid = tensors["video_second_per_grid"][step.index].item() if step.modality == "video" else None
+                grid = tensors["video_grid_thw"][step.index]
+                per_grid = tensors["video_second_per_grid"][step.index].item()
                 rows = int(grid.prod()) // merge ** 2 + 2
                 # the walk moves the counter one past its end sentinel, which follows the grid's largest position
                 positions = get_rope_index_vision(
@@ -1329,7 +1332,7 @@ class Qwen3OmniModel(Model):
                     spatial_merge_size=merge, seconds_per_grid=per_grid,
                 )
                 advance = int(positions.max()) + 2 - position
-                span = Span("digest", "prefill_vision", rows, advance, (step.modality, step.index))
+                span = Span("digest", "prefill_vision", rows, advance, ("video", step.index))
                 kept = rows
             thinker.append(span)
             talker.append(Span("rows", "talker_prefill", kept, kept, "thinker_states"))
