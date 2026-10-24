@@ -2532,7 +2532,7 @@ class Worker:
         """Put the step's rebuild rows back on their queue, and return whether the refusal named
         one. A named row is held after an ``AllocationFailed``, or fails its request when the
         refusal is terminal, and the step's other rows go back to their queues untouched. A row
-        whose `prepare_inputs` failed has left the step, and its request has failed already."""
+        whose `prepare_inputs` failed has left the step, and the main loop fails its request."""
         prepared = node_batch.rebuild_rids & set(node_batch.request_ids)
         for rid in prepared:
             self._rebuild_rows[rid] = RebuildRow(
@@ -3583,8 +3583,7 @@ class Worker:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
-        if batch_N.batch.request_to_worker_graph:
-            self._wait_for_step(batch_N)
+        self._wait_for_step(batch_N)
         self._land_rebuilds(batch_N.node_batch)
 
         if self.enable_prof:
@@ -4778,6 +4777,8 @@ class Worker:
             if p is not None and p.node_batch.rebuild_rids:
                 # a REMOVE waits for the step instead of freeing pages under it
                 self._in_flight_rids |= p.node_batch.rebuild_rids
+                for rid in p.node_batch.rebuild_rids:
+                    del self._rebuild_rows[rid]
 
         # Per-phase wall-clock instrumentation, gated by MSTAR_PHASE_TIMING.
         # When enabled, every Nth speculative iter logs a histogram so we can

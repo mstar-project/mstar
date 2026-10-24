@@ -2933,21 +2933,22 @@ class KVManager(AttentionResource):
         the one at intake. The decode step that samples an id keys it, so a label that keys
         generation also extends its chain by the last id.
         """
+        overrides = self._overrides[rid]
+        (label,) = overrides.prompt_ids
+        prompt, page_size = ids[:-1], self.config.page_size
+        length = len(prompt)
+        pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
+        keyed = bool((overrides.prefix_keys or {}).get(label))
+        # hashed before the lock, as `resolve_cached_prefix` hashes outside it
+        keys = chain(pages) if keyed else None
         with self._lock:
-            overrides = self._overrides[rid]
-            (label,) = overrides.prompt_ids
             layout = overrides.kv_layout[label]
             (walk,) = {span.walk for span in layout.spans}
             ((loop, slots),) = layout.growth
-            prompt = ids[:-1]
-            length = len(prompt)
             grown = length - sum(span.length for span in layout.spans)
-            keyed = bool((overrides.prefix_keys or {}).get(label))
             changes = {}
             if keyed:
-                page_size = self.config.page_size
-                pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
-                changes["prefix_keys"] = {**overrides.prefix_keys, label: chain(pages)}
+                changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
                 changes["prefix_tail"] = {
                     **(overrides.prefix_tail or {}), label: list(pages[-1]) if length % page_size else [],
                 }
@@ -2965,7 +2966,7 @@ class KVManager(AttentionResource):
             self._lay_out(rid, label, stream)
             self._seed_keys(rid, label, stream)
             if stream.chain is not None and (overrides.prefix_decode or {}).get(label):
-                stream.chain.extend([ids[-1]], self.config.page_size)
+                stream.chain.extend([ids[-1]], page_size)
             return walk
 
     def land_rebuild(self, rid: str) -> None:

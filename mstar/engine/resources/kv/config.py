@@ -418,8 +418,8 @@ def refuse_undeclared_labels(
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
-    """Only the ingest reads the layouts, caps and prompt ids, so they are dropped
-    before the configs go out with every frame between workers."""
+    """Only the worker reads the layouts, caps and prompt ids, when it ingests the NewRequest, so
+    they are dropped before the configs go out with every frame between workers."""
     return {
         key: replace(config, kv_layout=None, loop_caps=None, prompt_ids=None) if isinstance(config, KVReqConfig)
         else config

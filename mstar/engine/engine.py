@@ -2236,7 +2236,7 @@ class Engine:
         rather than scan it again forever.
         """
         if not self.is_resident(node_name, request_id):
-            if not allow_reload:
+            if not allow_reload or not self.is_offloaded(node_name, request_id):
                 return FULL_ADMIT_NOT_READY
             if not self.reload_request(node_name, request_id):
                 return FULL_ADMIT_NOT_READY
