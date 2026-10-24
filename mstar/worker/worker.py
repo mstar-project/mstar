@@ -587,8 +587,6 @@ class Worker:
         # worker; the runtime holds the table where the two meet.
         self.scheduler.runtime = self._graph_runtime
         self.scheduler.rid_of = self._rid
-        # a lockstep worker keeps the Python scheduler core (MicroScheduler._rust_core)
-        self.scheduler.lockstep_nodes = frozenset(self.parallel_nodes)
         self.tensor_manager.rid_to_str = self._rid_str
 
         # wire request id -> messages for requests that are not in the queue.

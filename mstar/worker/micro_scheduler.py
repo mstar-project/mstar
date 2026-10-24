@@ -316,9 +316,6 @@ class MicroScheduler:
         # exactly the one the drain must wait for. Purged by ``clear_wire_rid``.
         self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
 
-        # Nodes this worker runs in lockstep with other ranks (TP/SP); the
-        # worker sets it. Such a worker keeps the Python core.
-        self.lockstep_nodes: frozenset[str] = frozenset()
         # The Rust core, chosen at the first pass (see ``_rust_core``)
         self._core: RustSchedCore | None = None
         self._core_chosen = False
@@ -846,15 +843,17 @@ class MicroScheduler:
     def _rust_core(self) -> RustSchedCore | None:
         """The Rust core, for a worker whose scheduling it covers: a Rust
         graph runtime, no node that splits batches by capture key, no mixing
-        speculation chain, no lockstep (TP/SP) node. Decided once, before the
-        first pass, so the backlog never has to move between cores."""
+        speculation chain. Decided once, before the first pass, so the backlog
+        never has to move between cores. A lockstep (TP/SP) node is covered:
+        only its leader schedules it, and a follower's TP-follow FIFO is taken
+        before either core runs."""
         if self._core_chosen:
             return self._core
         self._core_chosen = True
         runtime = self.runtime
         if (
             not getattr(runtime, "supports_sched_core", False)
-            or self._mixing_chains or self.lockstep_nodes
+            or self._mixing_chains
         ):
             return None
         assert not self.backlog, "the core is chosen before anything is scheduled"

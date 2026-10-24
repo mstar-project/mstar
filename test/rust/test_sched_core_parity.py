@@ -127,7 +127,7 @@ class _Clock:
 
 
 class World:
-    def __init__(self, rust_core: bool, caps, row_caps, seed, clock):
+    def __init__(self, rust_core: bool, caps, row_caps, seed, clock, leaders=(LLM, ENC)):
         book = RustTensorBookkeeping()
         self.store = TensorStore(bookkeeping=book)
         graphs = _graphs()
@@ -143,7 +143,7 @@ class World:
         self.engine = _Engine(caps, row_caps, seed)
         manager = SimpleNamespace(get_engine=lambda node: self.engine)
         self.sched = MicroScheduler(
-            manager, parallel_leader_nodes={LLM, ENC}, combined_walk_of=dict(COMBINED),
+            manager, parallel_leader_nodes=set(leaders), combined_walk_of=dict(COMBINED),
         )
         self.sched.runtime = self.rt
         if not rust_core:
@@ -259,13 +259,21 @@ CONFIGS = {
 }
 
 
+# the nodes this worker initiates: all of them, or (a TP follower of LLM) the
+# encoder only, with LLM's rows left to the leader
+LEADERS = {"leader": (LLM, ENC), "follower": (ENC,)}
+
+
+@pytest.mark.parametrize("leaders", sorted(LEADERS))
 @pytest.mark.parametrize("config", sorted(CONFIGS))
 @pytest.mark.parametrize("seed", range(12))
-def test_both_cores_schedule_the_same(config, seed, monkeypatch):
+def test_both_cores_schedule_the_same(config, seed, leaders, monkeypatch):
     caps, row_caps = CONFIGS[config]
     clock = _Clock()
     monkeypatch.setattr(ms, "time", clock)
-    worlds = [World(False, caps, row_caps, seed, clock), World(True, caps, row_caps, seed, clock)]
+    worlds = [
+        World(rust, caps, row_caps, seed, clock, leaders=LEADERS[leaders]) for rust in (False, True)
+    ]
     rng = random.Random(seed)
     idle: set[int] = set()
     n_admitted = 0
@@ -348,9 +356,6 @@ def test_the_rust_core_is_chosen_only_where_it_covers_the_worker(monkeypatch):
     caps, row_caps = CONFIGS["capped"]
     clock = _Clock()
     monkeypatch.setattr(ms, "time", clock)
-    w = World(True, caps, row_caps, 0, clock)
-    w.sched.lockstep_nodes = frozenset({LLM})
-    assert w.sched._rust_core() is None
     w = World(True, caps, row_caps, 0, clock)
     w.engine.splits_by_capture_key = lambda node, walk: node == ENC
     assert w.sched._rust_core() is None
