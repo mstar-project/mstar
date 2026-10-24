@@ -48,6 +48,7 @@ def _worker(fresh: ScheduledBatch | None = None):
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")
     w._in_flight_rids, w._last_active, w._stream_buffer_rids = set(), {}, set()
     w._kv_keys, w._kept_ids, w._rebuild_rows = {NODE: ["kv"]}, {NODE: {}}, {}
+    w._copied_inputs = {}
     w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
     w._walk_inputs = {(PREFILL, NODE): {"text_inputs"}, (DECODE, NODE): {"text_inputs"}, ("embeds", NODE): {"embeds"},
                       ("pair", NODE): {"a", "b"}, ("pair_decode", NODE): {"a", "b"}}

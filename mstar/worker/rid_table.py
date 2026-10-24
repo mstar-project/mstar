@@ -11,8 +11,9 @@ harmless -- the string never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
 MicroScheduler.{failed_rids, admit_errors, held_until, backlog} (purged by
 clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,
-streaming_buffers, _kept_ids, _rebuild_rows, _dropped, _victims, _preempted}, the engine's and
-tensor manager's per-request state, and WorkerProfileInfo.
+streaming_buffers, _kept_ids (with each request's host copies and step metadata),
+_rebuild_rows, _dropped, _victims, _preempted}, the engine's and tensor manager's
+per-request state, and WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
