@@ -3174,11 +3174,13 @@ impl GraphRuntime {
     /// -- because that is the shape `ParallelList` already holds it in.
     /// Zipping them into tuples on the Python side just to unzip here is a
     /// per-rid interpreted loop per argument, every forward pass.
+    ///
+    /// `skip_rids` failed after routing: none of their frames go out.
     #[pyo3(signature = (
         completion_id, info_rids, request_infos,
         ntc_rids, new_token_counts,
         consumed_rids, stream_tokens_consumed, prof_rids, profiling,
-        publish_rids, publications,
+        publish_rids, publications, skip_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send_outputs(
@@ -3197,6 +3199,7 @@ impl GraphRuntime {
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
         publications: Vec<Option<Vec<u8>>>,
+        skip_rids: Vec<u32>,
     ) -> PyResult<Vec<u32>> {
         // Released for the whole frame phase rather than around each send.
         // Nothing below touches Python: the arguments arrive already
@@ -3241,6 +3244,14 @@ impl GraphRuntime {
                 .map(|c| c.speculative.clone())
                 .unwrap_or_default();
             let mut plan = self.take_send_plan(completion_id)?;
+            if !skip_rids.is_empty() {
+                let skip: FxHashSet<u32> = skip_rids.into_iter().collect();
+                plan.to_workers.retain(|w| !skip.contains(&w.rid));
+                plan.persist.retain(|(rid, ..)| !skip.contains(rid));
+                plan.emit.retain(|(rid, ..)| !skip.contains(rid));
+                plan.emit_inline.retain(|(rid, ..)| !skip.contains(rid));
+                plan.completed.retain(|(rid, ..)| !skip.contains(rid));
+            }
             let partition = plan.partition.clone();
             let encoded: FxHashMap<u32, Option<Vec<u8>>> =
                 request_infos.into_iter().collect();
