@@ -110,14 +110,13 @@ def test_a_removed_request_leaves_nothing_held():
 def _engine_with(submodule):
     from types import SimpleNamespace
 
+    from mstar.engine.chunking import ChunkingManagement
     from mstar.engine.engine import Engine
 
     engine = Engine.__new__(Engine)
     engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={})}
-    engine._chunk_inputs = {}
     engine._keyed_walks = {}
-    engine._chunking_policies = {}
-    engine._combined_walk_of = {}
+    engine._chunking = ChunkingManagement(engine._submodules)
     return engine
 
 
@@ -172,7 +171,7 @@ def test_the_whole_input_is_kept_until_the_last_chunk_lands():
     assert sub.prepares == 1
 
     engine.release_chunk_inputs(0, "LLM")
-    assert not engine._chunk_inputs
+    assert not engine._chunking.prepared
 
 
 def test_a_request_removed_mid_prompt_drops_its_prepared_input():
@@ -190,7 +189,7 @@ def test_a_request_removed_mid_prompt_drops_its_prepared_input():
 
     engine.remove_request(0)
 
-    assert not engine._chunk_inputs
+    assert not engine._chunking.prepared
 
 
 # ── engine: a chunked row starts past its cached prefix ────────────────
@@ -300,7 +299,7 @@ def test_a_row_prepared_at_another_length_than_it_was_cut_by_fails():
 
     with pytest.raises(RuntimeError, match="measured at 12 tokens .* prepared inputs hold 10"):
         engine._prepare_chunk(_batch(), 0, "prefill", (0, 4, 12))
-    assert not engine._chunk_inputs, "a failed row keeps no prepared input"
+    assert not engine._chunking.prepared, "a failed row keeps no prepared input"
 
 
 def test_the_mismatched_row_fails_and_the_rest_of_the_step_runs():
@@ -327,7 +326,6 @@ def test_the_mismatched_row_fails_and_the_rest_of_the_step_runs():
     engine = _engine_with(_Sub(10))
     engine._enable_nvtx = False
     engine._loopback_steps = {}
-    engine._token_budget_overrides = {}
     batch = ExecutingBatch(
         node_name="LLM",
         per_request_info={1: 1, 2: 2},
@@ -344,26 +342,21 @@ def test_the_mismatched_row_fails_and_the_rest_of_the_step_runs():
 def test_a_step_over_its_token_budget_is_reported(caplog):
     from types import SimpleNamespace
 
-    from mstar.engine.engine import Engine
+    from mstar.engine.chunking import ChunkingManagement
     from mstar.model.submodule_base import ChunkingPolicy
 
-    engine = Engine.__new__(Engine)
-    engine._token_budget_overruns = {}
-    engine._token_budget_overrides = {}
-    engine._chunking_policies = {}
-    engine._combined_walk_of = {}
-    engine._submodules = {"LLM": SimpleNamespace(
+    chunking = ChunkingManagement({"LLM": SimpleNamespace(
         submodule=SimpleNamespace(get_chunking_policy=lambda walk: ChunkingPolicy(max_batch_tokens=4)),
-    )}
+    )})
     batch = SimpleNamespace(node_name="LLM", step_context=SimpleNamespace(graph_walk="mixed"))
     over = [SimpleNamespace(input_seq_len=3), SimpleNamespace(input_seq_len=2)]
 
     with caplog.at_level("WARNING"):
         for _ in range(3):
-            engine._check_token_budget(batch, over)
-        engine._check_token_budget(batch, over[:1])
+            chunking.check_budget(batch, over)
+        chunking.check_budget(batch, over[:1])
 
-    assert engine._token_budget_overruns == {("LLM", "mixed"): 3}
+    assert chunking._overruns == {("LLM", "mixed"): 3}
     assert len(caplog.records) == 2  # the 1st and 2nd overrun; the 4th would be next
 
 
@@ -410,6 +403,7 @@ def test_final_keeps_only_the_last_chunk_and_holds_nothing_before():
 def _budgeted_engine():
     from types import SimpleNamespace
 
+    from mstar.engine.chunking import ChunkingManagement
     from mstar.engine.engine import Engine
     from mstar.model.submodule_base import ChunkingPolicy
 
@@ -417,9 +411,7 @@ def _budgeted_engine():
     sub = SimpleNamespace(get_chunking_policy=lambda walk: ChunkingPolicy(max_batch_tokens=budgets.get(walk)))
     engine = Engine.__new__(Engine)
     engine._submodules = {"LLM": SimpleNamespace(submodule=sub)}
-    engine._token_budget_overrides = {}
-    engine._chunking_policies = {}
-    engine._combined_walk_of = {}
+    engine._chunking = ChunkingManagement(engine._submodules)
     return engine
 
 
@@ -525,16 +517,15 @@ def test_a_step_relabelled_to_one_walk_is_checked_against_its_combined_budget(ca
     from types import SimpleNamespace
 
     engine = _mixed_engine()
-    engine._token_budget_overruns = {}
     engine.set_token_budgets({"LLM": {"prefill": 64}}, WALKS, COMBINED, override_mixed={"LLM"})
     batch = SimpleNamespace(node_name="LLM", step_context=SimpleNamespace(graph_walk="prefill"))
 
     with caplog.at_level("WARNING"):
-        engine._check_token_budget(batch, [SimpleNamespace(input_seq_len=600)])
+        engine._chunking.check_budget(batch, [SimpleNamespace(input_seq_len=600)])
         assert not caplog.records
-        engine._check_token_budget(batch, [SimpleNamespace(input_seq_len=2000)])
+        engine._chunking.check_budget(batch, [SimpleNamespace(input_seq_len=2000)])
 
-    assert engine._token_budget_overruns == {("LLM", "mixed"): 1}
+    assert engine._chunking._overruns == {("LLM", "mixed"): 1}
     assert "over its budget of 1024" in caplog.records[0].getMessage()
 
 

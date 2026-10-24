@@ -21,6 +21,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
@@ -93,8 +94,7 @@ def _engine(sub):
     eng._submodules = {NODE: SimpleNamespace(submodule=sub, resources={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
-    eng._chunking_policies = {}
-    eng._combined_walk_of = {}
+    eng._chunking = ChunkingManagement(eng._submodules)
     eng._runner = StepRunner({})
     return eng
 

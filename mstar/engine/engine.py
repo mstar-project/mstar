@@ -23,6 +23,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
+from mstar.engine.chunking import ChunkingManagement
 from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
@@ -51,7 +52,6 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     BatchedModelOutput,
     ChunkedPrefillOutputPolicy,
-    ChunkingPolicy,
     HostRows,
     InputMetadata,
     InputSeqLenInfo,
@@ -497,8 +497,8 @@ class Engine:
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
-        # (rid, node) -> a chunked row's whole input, prepared on its first chunk
-        self._chunk_inputs: dict[tuple[int, str], NodeInputs] = {}
+        # chunked prefill: per-walk policies and budgets, and rows mid-prefill
+        self._chunking = ChunkingManagement(self._submodules)
 
         # node -> (offloaded, reloaded) since the last ``take_resident_delta``.
         # Only a TP leader drains this, to replicate its resident set onto the
@@ -512,19 +512,6 @@ class Engine:
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
-        # (node, walk) -> steps that ran over the walk's token budget
-        self._token_budget_overruns: dict[tuple[str, str], int] = {}
-        # (node, walk) -> the submodule's chunking policy, asked once
-        self._chunking_policies: dict[tuple[str, str], ChunkingPolicy] = {}
-        # the serving config's max_batch_tokens: node -> budget, (node, walk) -> budget; None is off
-        self._token_budget_overrides: dict[str | tuple[str, str], int | None] = {}
-        # (node, real walk) -> the combined walk the scheduler batches it under
-        self._combined_walk_of: dict[tuple[str, str], str] = {}
-        # nodes whose walks' budgets also cap their rows inside a combined step
-        # (the serving config's can_override_mixed_max_tokens)
-        self._override_mixed: frozenset[str] = frozenset()
-        # (node, combined walk) -> walk -> the cap on that walk's rows in a step
-        self._walk_caps_cache: dict[tuple[str, str], dict[str, int] | None] = {}
 
     def load_model(
         self,
@@ -983,32 +970,6 @@ class Engine:
             if self._enable_nvtx:
                 range_pop()
 
-    def _check_token_budget(
-        self, batch: ExecutingBatch, node_inputs: list[NodeInputs],
-    ) -> None:
-        """Warn when a step runs over the budget it was scheduled under: that of
-        the combined walk it ran in, if any, which a step relabelled to one
-        walk still did. A row too long to cut runs whole, and a speculation
-        merge sizes its continuing rows by estimate, before their inputs
-        exist. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
-        walk = batch.step_context.graph_walk
-        walk = self._combined_walk_of.get((batch.node_name, walk), walk)
-        budget = self.get_max_batch_tokens(batch.node_name, walk)
-        if budget is None:
-            return
-        total = sum(inp.input_seq_len for inp in node_inputs)
-        if total <= budget:
-            return
-        key = (batch.node_name, walk)
-        count = self._token_budget_overruns[key] = self._token_budget_overruns.get(key, 0) + 1
-        if count & (count - 1) == 0:
-            logger.warning(
-                "%s/%s: step of %d tokens over its budget of %d (%d overruns so far): "
-                "a row too long to cut ran whole, or continuing rows ran more tokens "
-                "than estimated",
-                batch.node_name, walk, total, budget, count,
-            )
-
     def _prepare_inputs(self, batch: ExecutingBatch) -> None:
         mgmt = self._submodules[batch.node_name]
         submodule = mgmt.submodule
@@ -1093,7 +1054,7 @@ class Engine:
                 node_inputs.append(req_inputs)
 
         batch.register_prepare_batch(node_inputs)
-        self._check_token_budget(batch, node_inputs)
+        self._chunking.check_budget(batch, node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
         batch.prepared_rids = tuple(batch.request_ids)
         batch.running_batched = submodule.can_batch(
@@ -1157,7 +1118,7 @@ class Engine:
         its chunks would miss tokens or run past the end, so the row fails."""
         submodule = self._submodules[batch.node_name].submodule
         key = (rid, batch.node_name)
-        full = self._chunk_inputs.get(key)
+        full = self._chunking.prepared.get(key)
         start, end, total = chunk
         if full is None:
             full = submodule.prepare_inputs(
@@ -1191,7 +1152,7 @@ class Engine:
                     # chunked from 0 (its policy declines the prefix): write it all
                     prefix = None
                 self._runner.apply_cached_prefix(rid, batch.node_name, walk, full, prefix)
-            self._chunk_inputs[key] = full
+            self._chunking.prepared[key] = full
         part = submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], full, start, end,
         )
@@ -1201,7 +1162,7 @@ class Engine:
         return part
 
     def release_chunk_inputs(self, rid: int, node_name: str) -> None:
-        self._chunk_inputs.pop((rid, node_name), None)
+        self._chunking.release(rid, node_name)
 
     def device_loopback_signals(
         self, node_name: str, graph_walk: str,
@@ -2352,99 +2313,26 @@ class Engine:
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
 
-    def chunking_policy(self, node_name: str, graph_walk: str) -> ChunkingPolicy:
-        """The submodule's, asked once per (node, walk)."""
-        key = (node_name, graph_walk)
-        policy = self._chunking_policies.get(key)
-        if policy is None:
-            submodule = self._submodules[node_name].submodule
-            policy = self._chunking_policies[key] = submodule.get_chunking_policy(graph_walk)
-        return policy
-
     def get_max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
-        """The walk's budget, unless the serving config overrides it."""
-        budget = self.chunking_policy(node_name, graph_walk).max_batch_tokens
-        if budget is None or not self._token_budget_overrides:
-            return budget
-        for key in ((node_name, graph_walk), node_name):
-            if key in self._token_budget_overrides:
-                return self._token_budget_overrides[key]
-        return budget
+        return self._chunking.max_batch_tokens(node_name, graph_walk)
 
     def set_token_budgets(
         self, overrides: Mapping[str, Any], walks: set[str],
         combined_walk_of: Mapping[tuple[str, str], str] | None = None,
         override_mixed: Collection[str] = (),
     ) -> None:
-        """Apply a serving config's ``max_batch_tokens`` to this engine's nodes.
-
-        Per node, one budget for every walk the model budgets, or a mapping of
-        walk -> budget; null turns chunking off. Only walks the submodule
-        budgets can be overridden: elsewhere the setting would do nothing.
-
-        A walk inside a combined walk runs in the combined walk's steps, under
-        the combined walk's budget, so its own budget applies there only on a
-        node in ``override_mixed`` (``can_override_mixed_max_tokens``), where
-        it caps that walk's rows within the step. Elsewhere a per-walk override
-        of such a walk would do nothing, so it is refused; the combined walk
-        itself can be named instead.
-        """
-        self._combined_walk_of = dict(combined_walk_of or {})
-        self._override_mixed = frozenset(override_mixed)
-        self._walk_caps_cache = {}
-        combined_walks = {(node, combined) for (node, _), combined in self._combined_walk_of.items()}
-        for node, setting in overrides.items():
-            if node not in self._submodules:
-                continue
-            per_walk = setting if isinstance(setting, Mapping) else None
-            for walk, budget in (per_walk or {None: setting}).items():
-                if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 1):
-                    raise ValueError(f"max_batch_tokens for {node}: {budget!r} is not a positive int or null")
-                if walk is None:
-                    self._token_budget_overrides[node] = budget
-                    continue
-                if walk not in walks and (node, walk) not in combined_walks:
-                    raise ValueError(f"max_batch_tokens names walk {walk!r} of {node}, which the model never runs")
-                combined = self._combined_walk_of.get((node, walk))
-                if combined is not None and node not in self._override_mixed:
-                    raise ValueError(
-                        f"max_batch_tokens for {node}/{walk}: {walk} runs in {combined!r} steps, "
-                        f"under {combined!r}'s budget, so this would do nothing; set "
-                        f"can_override_mixed_max_tokens for {node} to cap {walk}'s rows within "
-                        f"those steps, or budget {node} (or {node}/{combined}) instead"
-                    )
-                if self.chunking_policy(node, walk).max_batch_tokens is None:
-                    raise ValueError(f"max_batch_tokens for {node}/{walk}: the model sets no budget there to override")
-                self._token_budget_overrides[(node, walk)] = budget
+        self._chunking.set_budgets(overrides, walks, combined_walk_of, override_mixed)
 
     def walk_token_caps(self, node_name: str, graph_walk: str) -> dict[str, int] | None:
-        """Under a combined walk on a node with ``can_override_mixed_max_tokens``:
-        walk -> the most tokens that walk's rows may run in one step, for the
-        walks with a budget of their own. None otherwise."""
-        key = (node_name, graph_walk)
-        if key not in self._walk_caps_cache:
-            caps = None
-            if node_name in self._override_mixed:
-                caps = {
-                    walk: budget
-                    for (node, walk), combined in self._combined_walk_of.items()
-                    if node == node_name and combined == graph_walk
-                    and (budget := self.get_max_batch_tokens(node, walk)) is not None
-                } or None
-            self._walk_caps_cache[key] = caps
-        return self._walk_caps_cache[key]
+        return self._chunking.walk_caps(node_name, graph_walk)
 
     def supports_chunked_prefill(self, node_name: str, graph_walk: str) -> bool:
-        """The submodule's say, unless the serving config turned the walk's
-        chunking off (a null budget)."""
-        if self._token_budget_overrides.get((node_name, graph_walk), 0) is None:
-            return False
-        return self.chunking_policy(node_name, graph_walk).chunkable
+        return self._chunking.chunkable(node_name, graph_walk)
 
     def chunked_prefill_output_policies(
         self, node_name: str, graph_walk: str,
     ) -> Mapping[str, ChunkedPrefillOutputPolicy]:
-        return self.chunking_policy(node_name, graph_walk).output_policies
+        return self._chunking.output_policies(node_name, graph_walk)
 
     def declares_input_sequence_len(self, node_name: str) -> bool:
         """Whether the node's submodule reports row lengths before prepare."""
@@ -2460,7 +2348,7 @@ class Engine:
         cache holds, which ``rid``'s lease keeps until its first chunk applies it."""
         submodule = self._submodules[node_name].submodule
         info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
-        policy = self.chunking_policy(node_name, graph_walk)
+        policy = self._chunking.policy(node_name, graph_walk)
         if (
             info is None or rid is None
             or graph_walk not in self._keyed_walks.get(node_name, ())
@@ -2935,8 +2823,7 @@ class Engine:
     def remove_request(self, request_id: str) -> None:
         self._loopback_steps.pop(request_id, None)
         self._runner.remove_request(request_id)
-        for key in [key for key in self._chunk_inputs if key[0] == request_id]:
-            del self._chunk_inputs[key]
+        self._chunking.forget_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
 

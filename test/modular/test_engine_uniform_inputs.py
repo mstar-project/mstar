@@ -67,7 +67,7 @@ def _engine(sub):
     eng._enable_nvtx = False
     eng._loopback_steps = {}
     # no token budget: these steps are not chunked
-    eng._check_token_budget = lambda batch, inputs: None
+    eng._chunking = SimpleNamespace(check_budget=lambda batch, inputs: None)
     return eng
 
 
