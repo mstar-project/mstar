@@ -66,11 +66,16 @@ name: Claude Review
 # execution file, and that summary is posted. A review that stopped before it
 # finished gets a "didn't complete" comment with what it had so far (the inline
 # comments it made, which the action posts even when the run fails, and its
-# latest notes), and its Claude Code session is saved as an artifact for 7
-# days. `/review continue` resumes that session with a fresh turn budget
-# instead of starting over. Only artifacts made by this workflow on
-# issue_comment or pull_request_target are trusted, since a fork's own
-# `pull_request` workflow can upload an artifact with any name.
+# latest notes), and a handoff is saved as an artifact for 7 days: its progress
+# note, the inline comments it made and the files it read (session.py).
+# `/review continue` starts a fresh session from that handoff with a fresh turn
+# budget, rather than resuming the old session, which would replay the whole
+# transcript, usually after its prompt cache has expired. Only artifacts made
+# by this workflow on issue_comment or pull_request_target are trusted, since a
+# fork's own `pull_request` workflow can upload an artifact with any name.
+#
+# Every run that reaches Claude records its API calls, tokens, turns and cost
+# in the job summary, the log and a review-usage-* artifact, never on the PR.
 
 on:
   pull_request_target:
@@ -116,7 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 50
     permissions:
-      # actions: read lists and downloads the saved session for /review continue.
+      # actions: read lists and downloads the saved handoff for /review continue.
       actions: read
       contents: read
       pull-requests: write
@@ -238,15 +243,16 @@ jobs:
             echo "title<<$delim"; jq -r .title pr.json; echo "$delim"
           } >> "$GITHUB_OUTPUT"
 
-      # /review continue: fetch the session a stopped review saved (see "Save the
-      # session" below) and put it back where Claude Code looks for it. The
-      # newest unexpired artifact for this PR wins, and only from this workflow
-      # on a trigger that runs the base repository's copy of it. The session's
-      # mode is kept; a thorough one needs write access to continue, like
-      # `/review thorough`. Values from meta.json are checked before use. A
-      # stopped review is resumable only while its "didn't complete" comment is
+      # /review continue: fetch the handoff a stopped review saved (see "Write
+      # the handoff" below); the next step's checkout would delete it from the
+      # workspace, so it waits in $RUNNER_TEMP until the diff step. The newest
+      # unexpired artifact for this PR wins, and only from this workflow on a
+      # trigger that runs the base repository's copy of it. The handoff's mode
+      # is kept; a thorough one needs write access to continue, like `/review
+      # thorough`. Values from handoff.json are checked before use. A stopped
+      # review can be continued only while its "didn't complete" comment is
       # still open: any later run that finishes rewrites that comment as
-      # resolved, so a session it superseded is never resumed.
+      # resolved, so a handoff it superseded is never used.
       - name: Restore the stopped review
         if: steps.pr.outcome == 'success' && steps.pr.outputs.continue == 'true'
         id: prev
@@ -255,13 +261,13 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           NON_WRITE: ${{ steps.pre.outputs.non_write_user }}
         run: |
-          name="claude-review-session-$PR"
+          name="claude-review-handoff-$PR"
           fail() { echo "why=$1" >> "$GITHUB_OUTPUT"; echo "::notice::$1"; exit 1; }
           open_ids=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
               select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
                 (.body | startswith("<!-- claude-review-incomplete -->"))) | .id') \
             || fail "the PR's comments couldn't be read; try \`/review continue\` again"
-          [ -n "$open_ids" ] || fail "there is no stopped review of this PR to continue: none stopped part-way, or a later run already finished (sessions are kept for 7 days); comment \`/review\` for a new one"
+          [ -n "$open_ids" ] || fail "there is no stopped review of this PR to continue: none stopped part-way, or a later run already finished (handoffs are kept for 7 days); comment \`/review\` for a new one"
           found=""
           for run_id in $(gh api "repos/$REPO/actions/artifacts?name=$name&per_page=30" --jq '
               [.artifacts[] | select(.expired | not)] | sort_by(.created_at) | reverse | .[].workflow_run.id'); do
@@ -271,14 +277,14 @@ jobs:
                 found=$run_id; break ;;
             esac
           done
-          [ -n "$found" ] || fail "there is no stopped review of this PR to continue (sessions are kept for 7 days); comment \`/review\` for a new one"
-          gh run download "$found" --repo "$REPO" -n "$name" -D "$RUNNER_TEMP/prev" \
-            || fail "the saved session couldn't be downloaded; try \`/review continue\` again"
-          meta="$RUNNER_TEMP/prev/meta.json"
-          sid=$(jq -r '.session_id // empty' "$meta")
-          mode=$(jq -r '.mode // empty' "$meta")
-          [[ "$sid" =~ ^[0-9a-f-]{36}$ ]] || fail "the saved session is malformed"
-          [ "$(jq -r '.pr' "$meta")" = "$PR" ] || fail "the saved session is for another PR"
+          [ -n "$found" ] || fail "there is no stopped review of this PR to continue (handoffs are kept for 7 days); comment \`/review\` for a new one"
+          dir="$RUNNER_TEMP/prev"
+          gh run download "$found" --repo "$REPO" -n "$name" -D "$dir" \
+            || fail "the saved handoff couldn't be downloaded; try \`/review continue\` again"
+          meta="$dir/handoff.json"
+          mode=$(jq -r '.mode // empty' "$meta" 2> /dev/null) || fail "the saved handoff is malformed"
+          [ -s "$dir/handoff.md" ] || fail "the saved handoff is malformed"
+          [ "$(jq -r '.pr' "$meta")" = "$PR" ] || fail "the saved handoff is for another PR"
           [ "$(jq -r '.head_sha' "$meta")" = "$HEAD_SHA" ] \
             || fail "the PR has new commits since that review stopped; comment \`/review\` for a review of the current head"
           case "$mode" in
@@ -286,12 +292,10 @@ jobs:
             thorough)
               [ -z "$NON_WRITE" ] || fail "continuing a thorough review takes write access, like \`/review thorough\`"
               effort=xhigh; timeout=45 ;;
-            *) fail "the saved session is malformed" ;;
+            *) fail "the saved handoff is malformed" ;;
           esac
-          mkdir -p "$HOME/.claude/projects"
-          cp -R "$RUNNER_TEMP/prev/projects/." "$HOME/.claude/projects/"
           {
-            echo "session_id=$sid"
+            echo "dir=$dir"
             echo "mode=$mode"; echo "effort=$effort"; echo "timeout=$timeout"
           } >> "$GITHUB_OUTPUT"
 
@@ -332,7 +336,10 @@ jobs:
         if: steps.head.outcome == 'success'
         id: diff
         continue-on-error: true
+        env:
+          PREV: ${{ steps.prev.outputs.dir }}
         run: |
+          if [ -n "$PREV" ]; then cp "$PREV/handoff.md" handoff.md; fi
           # GitHub refuses `gh pr diff` past 20,000 lines or 300 files. Fall back
           # to the files API (up to 3,000 files; it omits the patch of a file
           # that is too large on its own).
@@ -398,7 +405,8 @@ jobs:
             PR #${{ env.PR }}: ${{ steps.pr.outputs.title }}
             Head commit (pass as commit_id on every inline comment): ${{ steps.pr.outputs.head_sha }}
             pr.diff is ${{ steps.diff.outputs.lines }} lines.
-            ${{ steps.prev.outputs.session_id && 'This run continues your review of this PR from the conversation above, which stopped before it finished. Pick up where you stopped, post only inline comments you have not posted already, and return the summary.' || '' }}
+            Turn cap: ${{ vars.CLAUDE_REVIEW_MAX_TURNS || '40' }}.
+            ${{ steps.prev.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
           # No shell, no edits, no network. The only write tool is the inline-
           # comment tool, which the action loads only when it is listed here and
           # which redacts secrets. The summary comes back as structured output.
@@ -408,7 +416,6 @@ jobs:
             --model claude-opus-5-5
             --effort ${{ steps.prev.outputs.effort || steps.pr.outputs.effort }}
             --max-turns ${{ vars.CLAUDE_REVIEW_MAX_TURNS || '40' }}
-            ${{ steps.prev.outputs.session_id && format('--resume {0}', steps.prev.outputs.session_id) || '' }}
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
             --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch
             --json-schema '${{ steps.diff.outputs.schema }}'
@@ -416,8 +423,7 @@ jobs:
       # The action fails a run that went past --max-turns even when Claude
       # finished and returned its summary, and on a real failure it still
       # writes everything Claude said to its execution file. Read the result
-      # from there: post a finished summary anyway, or say why it stopped and
-      # keep what it had so far (partial.md) for the "didn't complete" comment.
+      # from there: post a finished summary anyway, or say why it stopped.
       - name: Read what a failed review left
         if: steps.review.outcome == 'failure'
         id: salvage
@@ -450,20 +456,6 @@ jobs:
           subtype=$(jq -r '.subtype // empty' <<< "$res")
           output=$(jq -c 'select(.subtype == "success" and (.is_error | not) and (.structured_output | type == "object"))
             | .structured_output' <<< "$res")
-          if [ -z "$output" ]; then
-            jq -r '[.[] | select(.type == "assistant") | .message.content[]?
-                | select(.type == "tool_use" and (.name | endswith("create_inline_comment"))) | .input]
-              | select(length > 0)
-              | "**Inline comments it made (\(length)):**\n"
-                + (map("- `\(.path):\(.line // .startLine)` \(.body | split("\n")[0] | .[0:160])") | join("\n"))' "$f" > partial.md
-            jq -r '[.[] | select(.type == "assistant")
-                | [.message.content[]? | select(.type == "text") | .text] | join("\n") | select(. != "")] | last // empty' "$f" \
-              | tail -c 3000 > notes.txt
-            if [ -s notes.txt ]; then
-              { printf '\n**Its latest notes:**\n\n'; sed 's/^/> /' notes.txt; } >> partial.md
-            fi
-            sed -E "$REDACT" partial.md > partial.tmp && mv partial.tmp partial.md
-          fi
           {
             echo "detail=$turns turns"
             if [ -n "$output" ]; then
@@ -478,6 +470,34 @@ jobs:
               esac
             fi
           } >> "$GITHUB_OUTPUT"
+
+      # What the run used, from the execution file or, after a timeout, the
+      # session transcript: a table in the job summary, one JSON line in the
+      # log, and a small artifact to compare runs by. Never posted on the PR.
+      - name: Record usage
+        if: always() && steps.diff.outcome == 'success'
+        id: usage
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+          CONTINUE: ${{ steps.prev.outputs.dir != '' }}
+          OUTCOME: ${{ steps.review.outcome }}
+        run: |
+          python3 .github/review/session.py usage --pr "$PR" --head "$HEAD_SHA" --mode "$MODE" \
+            --continue "$CONTINUE" --outcome "$OUTCOME" --summary "$GITHUB_STEP_SUMMARY" \
+            --out "$RUNNER_TEMP/usage/review-usage-$PR-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json" \
+            "$RUNNER_TEMP/claude-execution-output.json" "$HOME/.claude/projects"
+
+      - name: Upload the usage record
+        if: always() && steps.usage.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: review-usage-${{ env.PR }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/usage
+          retention-days: 30
+          if-no-files-found: ignore
 
       # The summary is model output from untrusted input. It reaches the shell
       # only through an env var, is rendered by main's render_summary.py, and
@@ -581,12 +601,14 @@ jobs:
             gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$label" > /dev/null
           done
 
-      # A review that stopped before it finished: keep its Claude Code session
-      # (the transcript Claude Code writes as it goes, so this works after a
-      # timeout too) for `/review continue`. The transcript holds the PR's own
-      # content and the model's notes on it; credential-shaped strings are
-      # redacted as for the summary. Artifacts are public on a public repo.
-      - name: Save the session for /review continue
+      # A review that stopped before it finished: write the handoff a
+      # `/review continue` starts from, from the execution file or, after a
+      # timeout, the transcript Claude Code writes as it goes. A continued run
+      # that stops too merges its handoff onto the one it started from. Also
+      # writes partial.md, what the "didn't complete" comment shows. Model
+      # notes on the PR's own content; credential-shaped strings are redacted
+      # as for the summary. Artifacts are public on a public repo.
+      - name: Write the handoff for /review continue
         if: >-
           always() && steps.review.outcome == 'failure' &&
           steps.salvage.outputs.structured_output == '' && steps.salvage.outputs.billing != 'true'
@@ -595,36 +617,24 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+          PREV: ${{ steps.prev.outputs.dir }}
         run: |
-          dir="$HOME/.claude/projects"
-          # Sessions are $dir/<project>/<id>.jsonl; subagents' sit deeper, under <id>/.
-          newest=""
-          for f in "$dir"/*/*.jsonl; do
-            [ -f "$f" ] || continue
-            if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest=$f; fi
-          done
-          [ -n "$newest" ] || { echo "::notice::No Claude Code session on disk; nothing to save."; exit 1; }
-          sid=$(basename "$newest" .jsonl)
-          rel="${newest#"$dir"/}"
-          out="$RUNNER_TEMP/session"
-          # The session's transcript, and its subagents' beside it if any.
-          while IFS= read -r -d '' file; do
-            # (Project folders start with "-", e.g. -home-runner-work-mstar-mstar.)
-            dest="$out/projects/${file#"$dir"/}"
-            mkdir -p "${dest%/*}"
-            sed -E "$REDACT" < "$file" > "$dest"
-          done < <(find "$newest" "${newest%.jsonl}" -type f -print0 2> /dev/null)
-          jq -n --arg pr "$PR" --arg sha "$HEAD_SHA" --arg mode "$MODE" --arg sid "$sid" --arg rel "$rel" \
-            '{pr: $pr, head_sha: $sha, mode: $mode, session_id: $sid, transcript: $rel}' > "$out/meta.json"
+          out="$RUNNER_TEMP/handoff"
+          prev=()
+          [ -z "$PREV" ] || prev=(--previous "$PREV/handoff.json")
+          python3 .github/review/session.py handoff --pr "$PR" --head "$HEAD_SHA" --mode "$MODE" \
+            --diff pr.diff --out "$out" --comment partial.md "${prev[@]}" \
+            "$RUNNER_TEMP/claude-execution-output.json" "$HOME/.claude/projects"
+          sed -E -i "$REDACT" "$out/handoff.json" "$out/handoff.md" partial.md
           echo "dir=$out" >> "$GITHUB_OUTPUT"
 
-      - name: Upload the session
+      - name: Upload the handoff
         if: always() && steps.save.outcome == 'success'
         id: upload
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: claude-review-session-${{ env.PR }}
+          name: claude-review-handoff-${{ env.PR }}
           path: ${{ steps.save.outputs.dir }}
           retention-days: 7
           if-no-files-found: error
@@ -634,7 +644,7 @@ jobs:
       # one comment, found by its marker, so retries don't stack up comments.
       # A refused /review continue has a marker of its own, so it never writes
       # over a stopped review's comment (its partial results, and that it can
-      # still be resumed by someone else).
+      # still be continued by someone else).
       - name: Report a review that didn't complete
         if: >-
           always() && steps.pre.outputs.run == 'true' && steps.salvage.outputs.billing != 'true' &&
@@ -652,11 +662,11 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ "$REFUSED" = "true" ]; then
-            # /review continue that had nothing usable to resume; WHY says what to do.
+            # /review continue that had nothing usable to continue from; WHY says what to do.
             marker='<!-- claude-review-continue-refused -->'
             printf '%s\n`/review continue` didn'"'"'t run: %s. [Log](%s).\n' "$marker" "$WHY" "$RUN_URL" > failed.md
           elif [ "$CAN_CONTINUE" = "true" ]; then
-            next='Comment `/review continue` to pick up where it stopped (kept for 7 days), or `/review` to start over.'
+            next='Comment `/review continue` to continue from its notes in a fresh session (kept for 7 days), or `/review` to start over.'
           else
             next='Comment `/review` to retry.'
           fi
