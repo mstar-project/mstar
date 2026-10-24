@@ -146,7 +146,7 @@ class PrefixChain:
     # `unkeyed_items` are the items on the page `unkeyed` fills.
     spans: list[PrefixSpan]
     unkeyed_items: list[PageItem]
-    # The prompt's keys hashed under the root, kept from `_hold_back` or the first probe, so a repeated
+    # The prompt's keys hashed under the root, kept from whichever call hashes them first, so a repeated
     # probe hashes nothing.
     # `rooted` has one key per page.
     # `rooted_ends` has one key per image that ends inside a page, with the token the image ends at.
@@ -1708,10 +1708,7 @@ class KVManager(AttentionResource):
                 # The chain is marked looked up, so later readiness checks return before taking the lock.
                 chain.looked_up = True
                 return None
-            keys, rooted = list(chain.keys), chain.rooted
-            spans, ends = chain.spans, chain.rooted_ends
-        if rooted is None:
-            rooted, ends = self._root(keys, spans)
+        self._root_chain(chain)
         with self._lock:
             # a probe on the GPU thread may have looked the prompt up or taken a lease while the lock was dropped
             if (
@@ -1719,8 +1716,7 @@ class KVManager(AttentionResource):
                 or chain.looked_up or stream.lease is not None
             ):
                 return None
-            chain.rooted = rooted
-            chain.rooted_ends = ends
+            rooted = chain.rooted
             chain.looked_up = True
             # one page short of the whole prompt, as the probe matches
             cap = len(rooted) - 1
@@ -3569,17 +3565,15 @@ class KVManager(AttentionResource):
                 return failed
             if next(iter(self._waiting)) != rid:
                 return _WAIT
-            todo = [] if self._index is None else [
-                (stream.chain, list(stream.chain.keys), stream.chain.spans) for stream in self._streams[rid].values()
+            chains = [] if self._index is None else [
+                stream.chain for stream in self._streams[rid].values()
                 if stream.chain is not None and stream.chain.rooted is None
             ]
-        # hashed outside the lock, similar to `resolve_cached_prefix`, so other threads don't wait on it.
         # Requests are queued and removed on one thread only, so ``rid`` is still first in `_waiting`
         # once the lock is taken again.
-        hashed = [self._root(keys, spans) for _, keys, spans in todo]
+        for chain in chains:
+            self._root_chain(chain)
         with self._lock:
-            for (chain, _, _), (rooted, ends) in zip(todo, hashed, strict=True):
-                chain.rooted, chain.rooted_ends = rooted, ends
             whole, charged = self._hit(rid, node_name, graph_walk, published)
             need = self._waiting[rid] - whole
             if need + charged > self._room():
