@@ -14,7 +14,8 @@ clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,
 streaming_buffers}, RequestStateManager.{per_request_info, _fwd_by_partition}
 (purged by remove_request), the Rust graph runtime's scheduler backlog (purged
 by its remove_request, and by clear_rid through MicroScheduler), the engine's and tensor manager's per-request
-state, and WorkerProfileInfo.
+state (including the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under
+RustTensorStore; purged by force_cleanup_request), and WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it

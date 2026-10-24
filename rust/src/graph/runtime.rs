@@ -7,7 +7,7 @@ use crate::graph::shard::{FanoutDest, GroupTemplate, ShardingTemplate};
 use crate::graph::spec::*;
 use crate::graph::request::{LoopStopTime, RequestInfo, WgIndex, WorkerGraphMeta};
 use crate::graph::state::{RequestState, RoutedEdge, SpecNode, TensorRef};
-use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
+use crate::tensors::{SharedBookkeeping, StoredTensor, TensorBookkeeping};
 use crate::communicator::RawZmqCommunicator;
 use crate::PyZmqCommunicator;
 use std::sync::Arc;
@@ -2226,12 +2226,13 @@ impl GraphRuntime {
     /// Release the inputs the just-executed node consumed, dereferencing them
     /// in the bookkeeper the store shares.
     ///
-    /// Returns the ones that hit zero, with each one's `mem_registered` flag,
-    /// because the rest of their teardown -- the shm file, the arena slot,
-    /// the memory unregistration -- lives on the tensor manager, which is
-    /// Python. Dropping them here and saying nothing is what left a consumed
-    /// input's shm file sitting until the request was torn down: the Python
-    /// runtime dereferences through the manager and reclaims as it goes.
+    /// Returns the ones that hit zero and still need the tensor manager's
+    /// teardown -- the shm file, the arena slot, the memory unregistration,
+    /// which are Python's -- with each one's `mem_registered` flag. Dropping
+    /// those here and saying nothing is what left a consumed input's shm file
+    /// sitting until the request was torn down. The rest, when the store
+    /// keeps its tensors in the bookkeeper, are freed in this call (see
+    /// `Bookkeeping::drop_refs`).
     fn cleanup_consumed_inputs(
         &mut self, node_name: &str, rids: Vec<u32>, wg_ids: Vec<u32>,
     ) -> PyResult<(Vec<u64>, Vec<bool>)> {
@@ -2252,8 +2253,12 @@ impl GraphRuntime {
         if freed.is_empty() {
             return Ok((vec![], vec![]));
         }
-        let mut bk = self.bookkeeping.lock().unwrap();
-        Ok(bk.drop_refs(freed.into_iter().map(|u| (u, 1)), true))
+        let released = self
+            .bookkeeping
+            .lock()
+            .unwrap()
+            .drop_refs(freed.into_iter().map(|u| (u, 1)), true);
+        Ok(released.report())
     }
 
     // --------- Scheduling ----------
@@ -2582,6 +2587,12 @@ impl GraphRuntime {
     fn complete_and_route_batch(
         &mut self, input: RouteArg,
     ) -> PyResult<RouteOut> {
+        // Tensors freed outright below, dropped when this returns -- after
+        // every bookkeeping guard, since it is declared before them. Under
+        // `route_and_send_inline` that is inside `allow_threads`, where pyo3
+        // defers the decrefs to its pool and drains it when the GIL comes back
+        // at the end of that call.
+        let mut freed_objects: Vec<StoredTensor> = Vec::new();
         let n_sig = input.output_signals.len();
         if input.rids.len() * n_sig != input.num_tensors.len() {
             return Err(PyValueError::new_err(
@@ -3058,10 +3069,11 @@ impl GraphRuntime {
             // this side cannot reach it.
             if !freed_inputs.is_empty() {
                 let mut bk = self.bookkeeping.lock().unwrap();
-                let (uuids, registered) =
+                let released =
                     bk.drop_refs(freed_inputs.into_iter().map(|u| (u, 1)), true);
-                out.freed_input_uuids.extend(uuids);
-                out.freed_input_registered.extend(registered);
+                out.freed_input_uuids.extend(released.uuids);
+                out.freed_input_registered.extend(released.registered);
+                freed_objects.extend(released.dropped);
             }
 
             // How many references each edge really represents. Python counts
@@ -3152,10 +3164,11 @@ impl GraphRuntime {
                         // tensor manager can tear it down, so it has to be
                         // reported -- otherwise it is held until the request
                         // ends.
-                        let (uuids, registered) =
+                        let released =
                             bk.drop_refs(std::iter::once((uuid, -delta)), true);
-                        out.freed_input_uuids.extend(uuids);
-                        out.freed_input_registered.extend(registered);
+                        out.freed_input_uuids.extend(released.uuids);
+                        out.freed_input_registered.extend(released.registered);
+                        freed_objects.extend(released.dropped);
                     }
                 }
             }

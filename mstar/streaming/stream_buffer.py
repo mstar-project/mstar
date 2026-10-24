@@ -21,6 +21,9 @@ class StreamChunk:
     # items in this chunk (context included); lets a consumer pick its
     # capture bucket before the chunk tensor is unpacked
     num_items: int = 0
+    # items this pop took out of the buffer for good (the stride it advanced
+    # by, or everything on a flush); the buffer no longer holds them
+    released: list = field(default_factory=list)
 
     @property
     def info(self) -> "StreamChunkInfo":
@@ -47,9 +50,11 @@ class StreamingEdge(NamedTuple):
 class StreamBuffer:
     """Per-request, per-edge buffer on the CONSUMER worker.
 
-    Tensors arrive one-by-one via normal RDMA routing.
-    The buffer accumulates them and applies a ChunkPolicy to decide
-    when the consuming node has enough data to proceed.
+    Items arrive one-by-one via normal routing: tensors, or handles to them
+    (the worker puts each item's ``TensorPointerInfo`` and collates the
+    tensors when the consuming batch is built). The buffer accumulates them
+    and applies a ChunkPolicy to decide when the consuming node has enough
+    data to proceed.
 
     For sliding-window policies the buffer keeps old items so that
     pop_chunk can return the full window while only advancing by stride.
@@ -77,6 +82,12 @@ class StreamBuffer:
     # once and ``has_chunk_ready`` doesn't spin returning True forever.
     _final_chunk_emitted: bool = False
 
+    # Whether a chunk may be ready: set by everything that can make one ready
+    # (an item arriving, the producer's done signal, a refused edge coming
+    # back, a pop that may leave another chunk), cleared by a poll that found
+    # nothing. Lets the poll skip a buffer without asking its policy.
+    maybe_ready: bool = True
+
     _num_tensors_registered = 0
     _num_buffer_writes = 0
     # Items the producer sent this worker in total, as the done signal reports
@@ -95,9 +106,10 @@ class StreamBuffer:
         self._num_tensors_registered += 1
         self._tensor_ids_in_order.append(tensor_id)
 
-    def put(self, tensor_id: str, item: torch.Tensor) -> None:
-        """Called when a tensor arrives via normal RDMA routing."""
+    def put(self, tensor_id: str, item) -> None:
+        """Called when an item arrives via normal routing."""
         self._id_to_tensor[tensor_id] = item
+        self.maybe_ready = True
 
     def _update_buffer(self):
         while len(self._tensor_ids_in_order) > 0:
@@ -114,6 +126,7 @@ class StreamBuffer:
         it sent in total."""
         self.producer_done = True
         self._num_items_expected = num_items
+        self.maybe_ready = True
 
     def _producer_done_and_all_read(self) -> bool:
         return (
@@ -162,6 +175,7 @@ class StreamBuffer:
         if self._producer_done_and_all_read() and not self.policy.is_ready(buf_len):
             # Flush remainder — return whatever is left (may be empty)
             items = list(self._buffer)
+            released = items
             self._buffer.clear()
             self._consumed += len(items)
             stride = len(items)
@@ -169,6 +183,7 @@ class StreamBuffer:
             stride = self.policy.next_chunk_size(buf_len)
             # Return the first `window` items (overlapping sliding window)
             items = self._buffer[:window]
+            released = self._buffer[:stride]
             # Advance by stride — discard items that fell out of the window
             self._buffer = self._buffer[stride:]
             self._consumed += stride
@@ -189,6 +204,7 @@ class StreamBuffer:
             is_final=is_final,
             context_items=min(max(self._delivered_end - offset, 0), len(items)),
             num_items=len(items),
+            released=released,
         )
         self._delivered_end = max(self._delivered_end, offset + len(items))
         self._chunks_popped += 1
@@ -196,6 +212,7 @@ class StreamBuffer:
 
     def store_uningested_edge(self, streaming_edge: StreamingEdge):
         self._waiting_graph_edges.append(streaming_edge)
+        self.maybe_ready = True
 
     def _collate(self, items: list) -> dict[str, torch.Tensor | None]:
         if not items:
