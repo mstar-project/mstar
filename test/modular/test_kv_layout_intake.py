@@ -243,7 +243,7 @@ def test_a_request_that_asks_no_length_decodes_to_the_context(tmp_path, monkeypa
 
 @pytest.mark.parametrize("streaming, outputs, kinds, guaranteed", [
     (True, ["text", "audio"], ("ids", "ids"), True), (False, ["text", "audio"], ("ids", "ids"), False),
-    (True, ["text"], ("ids", "ids"), False), (False, ["text"], ("digest", "ids"), True),
+    (True, ["text"], ("ids", "ids"), False), (False, ["text"], ("digest", "ids"), False),
     (False, ["text"], ("ids", "rows"), True),
 ])
 def test_every_kv_config_gets_the_class_of_the_whole_request(streaming, outputs, kinds, guaranteed):
