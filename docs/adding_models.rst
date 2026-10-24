@@ -797,8 +797,7 @@ methods are:
    every submodule. It also captures CUDA graphs for them when you declare capture
    configs (see :ref:`Step 5 <step-5>`). To disable compilation for a submodule, set the
    class attribute ``disable_torch_compile = True``. An encoder whose output feeds a
-   prefix cache layout walk compiles with dynamic shapes instead, and one that sets
-   ``eager_item_encoder = True`` runs eager while the cache is open. One that marks every
+   prefix cache layout walk compiles with dynamic shapes instead. One that marks every
    dimension that varies with ``torch._dynamo.mark_dynamic`` in ``prepare_inputs`` sets
    ``marks_dynamic_dims = True`` and compiles as any other submodule. Keep the compiled
    paths compile-friendly. If a helper must not be traced, because it uses
