@@ -1,8 +1,5 @@
-"""Window plumbing on CPU, plus opt-in single-GPU numerical and replay tests.
-
-Run with pytest test/modular/test_sliding_window_attention.py. Set MSTAR_TEST_CUDA=1 to also
-exercise FlashInfer against an explicit FP32 PyTorch attention reference.
-"""
+"""Window plumbing on CPU, plus single-GPU numerical and replay tests that check FlashInfer
+against an explicit FP32 PyTorch attention reference."""
 
 import importlib.util
 import os
@@ -20,6 +17,9 @@ from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, SequenceView, build_paged_indptrs
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext, SubmoduleStep
+
+# A captured plan stages its host arrays behind a CUDA event.
+CAPTURED = (False, True) if torch.cuda.is_available() else (False,)
 
 
 def geometry():
@@ -84,7 +84,7 @@ class SlidingWindowTests(unittest.TestCase):
 
     def test_both_wrappers_receive_window_and_reuse_plans(self):
         for window, expected in ((None, -1), (1, 0), (4, 3)):
-            for captured in (False, True):
+            for captured in CAPTURED:
                 for query_lengths in ([7, 5], [1, 1]):
                     with self.subTest(window=window, captured=captured, queries=query_lengths):
                         manager = build_manager(window)
@@ -153,7 +153,6 @@ class SlidingWindowTests(unittest.TestCase):
             self.assertIs(args["paged_kv_indices"], kv_output["main"].cpu_indptrs.paged_kv_indices)
 
 
-@unittest.skipUnless(os.environ.get("MSTAR_TEST_CUDA") == "1", "set MSTAR_TEST_CUDA=1 for GPU tests")
 class SlidingWindowGPU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
