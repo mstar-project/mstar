@@ -87,7 +87,7 @@ def test_a_dropped_request_rejoins_the_queue_at_its_arrival():
 
 
 def _short(kv, rid: str) -> int:
-    """``rid``'s next token, which needs a page past its allotment. Returns the pages it is short."""
+    """Step ``rid``'s next token, which needs a page past its allotment, and return how many pages ``rid`` is short."""
     outcome = _step(kv, rid, 1)
     assert not outcome.ok
     return outcome.reason.pages_short
@@ -121,7 +121,7 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     assert kv.waits("r") == (then != "drops itself"), "r waits only when it can't drop itself"
     if then == "waits, then is dropped":
         kv.drop("r")
-        # readmitting r takes the rest of the room, so the room is no larger than when r first waited
+        # readmitting r takes the rest of the room, so only the drop can end r's wait
         assert kv.readmit("r", 4 * PAGE_SIZE) and not kv.waits("r"), "r's wait for room outlived its drop"
     elif then == "waits":
         kv.remove_request("older")

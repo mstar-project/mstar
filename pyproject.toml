@@ -419,7 +419,7 @@ exclude = ["tests*", "benchmark*", "examples*"]
 # mstar/default_configs/ at build time; see setup.py) so `mstar serve <model>`
 # works from a pip install.
 [tool.setuptools.package-data]
-"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp", "configs/*.json"]
 "mstar.default_configs" = ["*.yaml"]
 
 [tool.ruff]

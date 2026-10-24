@@ -102,6 +102,15 @@ _HOLD_LOG_INTERVAL = 5.0
 # releases the event on every exit, so this only fires if that thread died.
 _ADMIT_FENCE_TIMEOUT_S = 10.0
 
+# How many torn-down request keys a worker remembers, so that a message landing
+# after the teardown (a duplicate REMOVE, a peer's late stream chunk or
+# STOP_LOOPS) is dropped rather than parked for a NEW_REQUEST that never comes.
+# Such a message trails its teardown by about a loop iteration and a socket hop,
+# far fewer teardowns than this; a count, not a time, so a stalled worker that
+# reads both late still matches them. Every submission has its own key, so a
+# remembered key never gets another NEW_REQUEST.
+_REMOVED_RIDS_KEEP = 4096
+
 
 def _make_graph_runtime(
     communicator,
@@ -629,6 +638,10 @@ class Worker:
         # Keyed by the string: these arrive before the NEW_REQUEST that mints
         # the handle.
         self._unprocessed_messages: dict[str, list[WorkerMessage]] = {}
+        # Wire ids of requests torn down here (or that the conductor removed
+        # without this worker admitting them): a message for one of these is
+        # dropped instead of parked. Keyed by the string: the handle is gone.
+        self._removed_rids: RecentSet[str] = RecentSet(_REMOVED_RIDS_KEEP)
 
         # CPU offloading: LRU tracking and eviction policy
         self._last_active: dict[tuple[int, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
@@ -642,8 +655,8 @@ class Worker:
         #   of another partition samples tokens of its own.
         # `_rebuild_rows`: handle -> its row waiting for a rebuild step.
         # `_dropped`: handle -> the node it was dropped on, until its rebuild row is queued.
-        # `_victims`: handle -> the shortage that chose it, until it is dropped.
-        # `_preempted`: handle -> how often it was preempted. `_preemptions`: node -> its counts for the metrics.
+        # `_victims`: handle -> its `Victim`, until the request is dropped.
+        # `_preempted`: handle -> its `Preempted`. `_preemptions`: node -> its counts for the metrics.
         # `_walk_inputs`: (walk, node) -> the node's inputs in that walk. A rebuild row's ids go under the
         #   prefill walk's single input, such as `text_inputs`.
         # `_growth_loops`: (walk, node) -> the loop that grows the node's KV in that walk.
@@ -946,12 +959,49 @@ class Worker:
 
     def _process_unprocessed(self, wire_rid: str) -> None:
         """Process messages for ``wire_rid`` that came in before its NEW_REQUEST."""
-        if wire_rid in self._unprocessed_messages:
-            self._process_message_list(self._unprocessed_messages[wire_rid])
-            del self._unprocessed_messages[wire_rid]
+        # Popped first: a REMOVE among them purges whatever is still parked
+        # for the id, which must not include the messages replayed here.
+        messages = self._unprocessed_messages.pop(wire_rid, None)
+        if messages:
+            self._process_message_list(messages)
+
+    def _mark_removed(self, wire_rid: str) -> None:
+        """Remember a request that will not be admitted here again, and drop
+        what was parked for it. Clears the wire-keyed drain state too: a
+        request drained before its NEW_REQUEST (which was then refused) is
+        never admitted, so no later teardown would."""
+        self._draining_rids.discard(wire_rid)
+        self._pending_drains.discard(wire_rid)
+        self._reads_done_sent.discard(wire_rid)
+        self._removed_rids.add(wire_rid)
+        for message in self._unprocessed_messages.pop(wire_rid, ()):
+            self._drop_for_removed(message)
+
+    def _drop_for_removed(self, message: WorkerMessage) -> None:
+        """Drop a message for a removed request. Inputs are ACKed unread so the
+        producer can free its source buffers."""
+        logger.debug(
+            "Worker %s: dropping %s for removed request %s",
+            self.worker_id, message.message_type.value, message.body.request_id,
+        )
+        if message.message_type == WorkerMessageType.INPUT_SIGNALS:
+            self.tensor_manager.ack_unread_tensors(
+                message.body.request_id, message.body.inputs,
+            )
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
+        request_id = self._rid(body.request_id)
+        if request_id is None:
+            # Never admitted here, or already removed: no handle-keyed state to
+            # clear. Before the follower guard: the conductor sends a request's
+            # NEW_REQUESTs and its REMOVE down one FIFO socket and forgets it
+            # after, so on any rank no NEW_REQUEST follows. The wire-string-keyed
+            # TP-follow count can be non-empty for a rid that never got a
+            # handle, and no later message would ever pop it.
+            self._mark_removed(body.request_id)
+            self.scheduler.clear_wire_rid(body.request_id)
+            return
         if self.is_tp_follower:
             if body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
                 return # wait for rank 0's forward, to avoid race conditions
@@ -977,14 +1027,6 @@ class Worker:
         # / KV pages. Queue the remove and apply it once no in-flight step
         # references the rid (see _apply_pending_removes_safe_to_drop in
         # the run loop).
-        request_id = self._rid(body.request_id)
-        if request_id is None:
-            # Never admitted here, or already removed: no handle-keyed state to
-            # clear. The wire-string-keyed TP-follow count is the exception --
-            # it can be non-empty for a rid that never got a handle, and no
-            # later message would ever pop it.
-            self.scheduler.clear_wire_rid(body.request_id)
-            return
         # A follower tears down in rank 0's order, so never ahead of one it deferred
         # earlier.
         behind = (
@@ -1027,9 +1069,7 @@ class Worker:
         # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
         # on the abort/fail path via a prior DrainRequest, on the happy path
         # once the api server finished reading the outputs.
-        self._draining_rids.discard(body.request_id)
-        self._pending_drains.discard(body.request_id)
-        self._reads_done_sent.discard(body.request_id)
+        self._mark_removed(body.request_id)
         self.engine_manager.remove_request(request_id)
         if self._stream_buffer_rids:
             self._stream_buffer_rids.discard(request_id)
@@ -1054,8 +1094,7 @@ class Worker:
         self._graph_runtime.remove_request(request_id)
 
     def _can_rebuild_on(self, node_name: str, my_walks: set[tuple[str, str]]) -> bool:
-        """Whether a rebuild could recompute a request's KV on ``node_name``. Only such a node keeps ids
-        and drops requests, and every other node keeps the offload and the hold.
+        """Only a node where a rebuild can recompute a request's KV keeps ids and drops requests.
 
         A node whose walks this worker doesn't all run, such as a disaggregated decode node, can't run the
         prefill walk a rebuild needs. A rebuild row recomputes one label, so a node with a second paged KV
@@ -1148,9 +1187,9 @@ class Worker:
         return loop is not None and len(kept.sampled) == info.dynamic_loop_iter_counts.get(loop, 0) + 1
 
     def _preempt(self, node_batch: ExecutingBatch) -> bool:
-        """Drop newer requests for the one whose grant ran short, or mark them to drop once their step
-        lands, and return True. False where preemption is off, or while no request on the node keeps ids
-        and so nothing there can be dropped, which leaves the offload and the hold to run."""
+        """Drop the requests `KVManager.preempt` chooses for the request that hit KV OOM, or mark them to drop
+        once their step lands, and return True. Return False, so the hold runs, when the failed resource
+        isn't a paged KV cache, `KVManager.preempt` returns None, or no request on the node keeps ids."""
         kv = self._kv_caches.get(node_batch.failed_resource)
         if kv is None or not self._kept_ids.get(node_batch.node_name):
             return False
@@ -1406,8 +1445,9 @@ class Worker:
         )
         request_id = self._rid(body.request_id)
         if request_id is None:
-            # _process_message_list parks signals for an unknown request, so
-            # this only happens if that changes; there is nothing to route into.
+            # _process_message_list parks or drops signals for an unknown
+            # request, so this only happens if that changes; there is nothing
+            # to route into.
             logger.warning(
                 "Worker %s: dropping input signals for unknown request %s",
                 self.worker_id, body.request_id,
@@ -1512,15 +1552,25 @@ class Worker:
         for message in list(messages):
             # per_request_info is handle-keyed, so resolve the wire string
             # first; an unknown one has no handle and is parked the same way.
+            # The conductor's REMOVE is never parked: ``_remove_request``
+            # handles an id this worker does not hold.
             if (
                 message.message_type in msg_types_needing_active_request and \
+                not (
+                    message.message_type == WorkerMessageType.REMOVE_REQUEST
+                    and message.body.source == MessageSource.CONDUCTOR
+                ) and \
                 self._rid(message.body.request_id)
                 not in self.request_state.per_request_info
             ):
-                # got an out-of-order request
-                self._unprocessed_messages.setdefault(
-                    message.body.request_id, []
-                ).append(message)
+                wire_rid = message.body.request_id
+                if wire_rid in self._removed_rids:
+                    self._drop_for_removed(message)
+                else:
+                    # got an out-of-order request
+                    self._unprocessed_messages.setdefault(
+                        wire_rid, []
+                    ).append(message)
                 continue
             if message.message_type == WorkerMessageType.NEW_REQUEST:
                 self._add_new_request(message.body)
@@ -1752,7 +1802,7 @@ class Worker:
         if not engine.evictable(node_name):
             return None
 
-        candidates = [
+        active = [
             rid for (rid, node) in self._last_active
             if node == node_name and not engine.is_offloaded(node_name, rid)
         ]
@@ -1760,20 +1810,16 @@ class Worker:
         # a request admitted but not yet run holds no pages: offloading it
         # frees nothing and the retry would re-pick it
         candidates = [
-            rid for rid in candidates if engine.reclaimable(node_name, rid, affected_resources)
+            rid for rid in active if engine.reclaimable(node_name, rid, affected_resources)
         ]
 
         if not candidates:
-            # Nothing holds pages of the resource that ran out. Eviction is the
-            # wrong tool here — the working set does not fit — and saying so
-            # separates it from the host pool being full, which looks identical
-            # from the caller and wants the opposite response.
             logger.warning(
-                "No eviction candidate on %s for %s: nothing holds reclaimable "
-                "pages of it. The working set does not fit; eviction cannot "
-                "help.", node_name,
+                "No eviction candidate on %s for %s: %d active requests, none "
+                "with pages of it to reclaim now.", node_name,
                 "any resource" if affected_resources is None
                 else ", ".join(sorted(affected_resources)),
+                len(active),
             )
             return None
 
@@ -1783,7 +1829,7 @@ class Worker:
         freed = engine.offload_request(node_name, victim_id)
         if freed <= 0:
             # A victim was found and would not move. The usual cause is the host
-            # pool being full (see ``CPUPagePool.offload_stream``) — different
+            # pool being full (see ``CPUPagePool.place``) - different
             # from having no candidate, and fixed by a larger
             # ``cpu_offload_pages`` rather than by scheduling less.
             logger.warning(
@@ -2003,6 +2049,8 @@ class Worker:
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
         resident_delta = engine.take_resident_delta(node_batch.node_name)
+        prefix_hits = engine.decide_cached_prefix(node_batch)
+        page_trails = engine.page_trails(node_batch.node_name)
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -2031,6 +2079,8 @@ class Worker:
                         resident_delta=resident_delta.copy(),
                         walks=walks,
                         walk_idx=walk_idx,
+                        prefix_hits=prefix_hits,
+                        page_trails=page_trails,
                     )
                 )
             )
@@ -2504,7 +2554,7 @@ class Worker:
         """Put the step's rebuild rows back on their queue, and return whether the refusal named
         one. A named row is held after an ``AllocationFailed``, or fails its request when the
         refusal is terminal, and the step's other rows go back to their queues untouched. A row
-        whose `prepare_inputs` failed has left the step, and its request has failed already."""
+        whose `prepare_inputs` failed has left the step, and the main loop fails its request."""
         prepared = node_batch.rebuild_rids & set(node_batch.request_ids)
         for rid in prepared:
             self._rebuild_rows[rid] = RebuildRow(
@@ -2611,6 +2661,10 @@ class Worker:
         )
 
         if victim_id is not None:
+            kv, reason = self._kv_caches.get(failed), node_batch.admit_error
+            if kv is not None and victim_id != reason.request_id:
+                # otherwise the victim's reload can take the pages back before the step that ran short fits
+                kv.cache.allot_released(reason.request_id, reason.pages_short)
             self.scheduler.hold_requests([victim_id])
             logger.warning(
                 "OOM on node=%s walk=%s: offloaded victim=%s, "
@@ -2618,8 +2672,9 @@ class Worker:
                 batch.node_name, batch.graph_walk, victim_id,
                 len(batch_ids) - (1 if victim_id in batch_ids else 0),
             )
-        else:
-            # Nothing could be evicted, so the batch has to get smaller or it will
+        # A drop costs its victims a prefill, so a pool drops requests only when nothing can be offloaded.
+        elif not self._preempt(node_batch):
+            # Nothing could be evicted or dropped, so the batch has to get smaller or it will
             # refuse identically for ever. Hold the one request the admit named,
             # not the whole batch, so the retry is immediate. Symmetric without
             # coordinating: both ranks refuse the same batch for the same request.
@@ -2674,6 +2729,16 @@ class Worker:
                 and batch.node_name in self.parallel_leader_nodes
             )
         return True
+
+    def _plans_ahead(self, spec: Speculation) -> bool:
+        """With the prefix cache open, a TP leader admits a yield-away step at exec, as its followers
+        do. A pre-plan refused on rank 0 alone puts its pages back at the end of rank 0's free list,
+        and the ranks then hand out different page ids, which only the cache reads."""
+        node = spec.node_batch.node_name
+        return not (spec.is_yield_away and node in self.parallel_nodes and self._prefix_cache_open(node))
+
+    def _prefix_cache_open(self, node_name: str) -> bool:
+        return self.engine_manager.get_engine(node_name).prefix_cache_open(node_name)
 
     def _is_tp_follower_node(self, node_name: str) -> bool:
         """This rank follows ``node_name``: rank 0 of its instance decides both
@@ -2864,6 +2929,8 @@ class Worker:
         # The kept rids' chunks now belong to the step; nothing is left to undo.
         speculation.spec_id = 0
         speculation.consumed_streaming_edges.clear()
+        if not success:
+            self.engine_manager.get_engine(batch.node_name).release_cached_prefix(speculation.node_batch)
 
     @staticmethod
     def _speculated_rids(speculation: Speculation | None) -> frozenset[int]:
@@ -3169,7 +3236,10 @@ class Worker:
         # state that is still mid-replay. Every poll retries the owed moves, so
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
-        if not self.scheduler.settle_tp_follow_delta():
+        if not self.scheduler.settle_tp_follow_delta(
+            # Of the steps before the head, only N may still index a page of the head's hit
+            caught_up=pending.node_batch.commit_done.is_set(),
+        ):
             return None
 
         batch_N = pending.batch
@@ -3333,6 +3403,8 @@ class Worker:
         head = self.scheduler.peek_tp_follow()
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
             self.scheduler.pop_tp_follow_head()
+            # settle may have adopted some of the head's hit, and the leader releases the whole lease
+            self.engine_manager.get_engine(head.node_name).drop_cached_prefix(head)
 
     @staticmethod
     def _step_voids_head(pending: PendingBatch) -> str | None:
@@ -3362,7 +3434,7 @@ class Worker:
             head = self.scheduler.peek_tp_follow()
             if head is not None and head.speculative and head.spec_from_seq == s:
                 void = self._step_voids_head(pending) if outputs is not None else None
-                if void is not None:
+                if void is not None and not self._prefix_cache_open(head.node_name):
                     # The leader clears its speculation on this verdict too.
                     self.scheduler.pop_tp_follow_head()
                     logger.debug(
@@ -3370,6 +3442,8 @@ class Worker:
                         self.worker_id, head.spec_seq, s, void,
                     )
                     return outputs, None
+                # With the prefix cache open, build the head even when N's verdict voids it, since the
+                # leader pre-plans every head it sends and this rank's pages must move as the leader's do.
                 spec = self._try_follow_speculation(pending)
                 if spec is not None:
                     arm(spec)
@@ -3533,8 +3607,7 @@ class Worker:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
-        if batch_N.batch.request_to_worker_graph:
-            self._wait_for_step(batch_N)
+        self._wait_for_step(batch_N)
         self._land_rebuilds(batch_N.node_batch)
 
         if self.enable_prof:
@@ -3680,6 +3753,8 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
         self._register_outputs(route_output)
+        # Those sends were the last readers of this step's host copies.
+        self.tensor_manager.drop_host_copies()
         _pp_stage("register_outputs")
 
         # send outputs
@@ -3780,7 +3855,7 @@ class Worker:
         # share one (refuse_combined_walks_across_tp_groups).
         # Pass the stop check's host copies so a host-memory transport needn't
         # copy the rows again. They are views of pinned buffers the next step
-        # reuses; safe because the sends below are their last reader.
+        # reuses, so they are dropped once this step's sends are done.
         # Row views of one batch clone (a decode step) are described from one
         # row; anything else goes through the general per-tensor path. Both
         # take the real walk, not the combined label: the runtime keys the
@@ -4224,7 +4299,7 @@ class Worker:
         The host tensors are views of pinned buffers the next step reuses. Their
         one other reader, a ``needs_cpu_tensor`` transport, gets them through
         the store and sends in ``_register_outputs`` later in the same
-        ``_postprocess_batch``, never reading them after.
+        ``_postprocess_batch``, which then drops them from the store.
         """
         source = outputs.get_check_stop_input()
         # Rows are in forward order, which the engine stamped on the output.
@@ -4714,7 +4789,7 @@ class Worker:
             # commit event, then reserves a slot and pre-plans —
             # while the main thread sits in await_gpu with the GIL
             # released and N's kernels are still running.
-            if plan_executor is not None:
+            if plan_executor is not None and self._plans_ahead(spec):
                 spec.plan_future = plan_executor.submit(
                     self._preplan_spec, pending, spec,
                 )
@@ -4726,6 +4801,8 @@ class Worker:
             if p is not None and p.node_batch.rebuild_rids:
                 # a REMOVE waits for the step instead of freeing pages under it
                 self._in_flight_rids |= p.node_batch.rebuild_rids
+                for rid in p.node_batch.rebuild_rids:
+                    del self._rebuild_rows[rid]
 
         # Per-phase wall-clock instrumentation, gated by MSTAR_PHASE_TIMING.
         # When enabled, every Nth speculative iter logs a histogram so we can
@@ -5112,9 +5189,6 @@ class Worker:
                     tp_seq=fallthrough_tp_seq,
                     submitted_at=submitted_at,
                 ))
-                # only now, so a raise before the step is pending leaves them queued
-                for rid in node_batch.rebuild_rids:
-                    del self._rebuild_rows[rid]
                 # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)
