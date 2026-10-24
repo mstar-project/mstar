@@ -24,10 +24,12 @@ from torch.distributed import ReduceOp
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType, PiecewiseConfigType
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CaptureCost,
+    PiecewiseAcceleratorGraphRunner,
+    PiecewiseGraphData,
     capture_into_graph,
     fail_if_graphs_required,
 )
@@ -455,3 +457,49 @@ def test_a_recompile_during_capture_fails_with_the_guard_that_broke():
     graph.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [1.0] * 4
+
+
+@pytest.mark.parametrize(
+    ("value_dtype", "buffer_dtype", "eager"),
+    [
+        (torch.float32, torch.bfloat16, True),
+        (torch.int64, torch.float32, True),
+        (torch.int32, torch.int64, False),
+    ],
+    ids=["narrowing", "int_into_float", "widening"],
+)
+def test_piecewise_replay_runs_eagerly_for_an_input_its_buffer_may_round(
+    value_dtype, buffer_dtype, eager, caplog,
+):
+    """The replay copies each input into its buffer, which casts silently: an
+    fp32 residual stream into a bf16 buffer, or int64 ids above 2**24 into an
+    fp32 one, would be rounded. Such an input runs the region eagerly in its
+    own dtype instead, said once; a widening copy (an eager sampler's int32
+    tokens into an int64 buffer) loses nothing and replays."""
+    runner = object.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._label, runner._current_slot, runner._eager_logged = "region", 0, False
+    replays = []
+    runner._config = SimpleNamespace(
+        get_config_type=lambda: PiecewiseConfigType.BATCHED,
+        capture_fn=lambda call: {"y": call.static_inputs["x"] * 1},
+        forward_kwargs={},
+    )
+    runner._resources = {}
+    runner._dummy_rows = SimpleNamespace(reset=lambda rids: None)
+    buffer = torch.zeros(2, dtype=buffer_dtype)
+    runner._resolve = lambda bs, total_tokens: PiecewiseGraphData(
+        graph=SimpleNamespace(replay=lambda: replays.append(1)), static_inputs={"x": buffer},
+        static_outputs={"y": buffer}, dummy_rids=[], shape=SimpleNamespace(bs=2), bucket=None,
+    )
+    # a value each narrowing would round
+    value = torch.full((2,), 1 + 2**-10 if value_dtype.is_floating_point else 2**24 + 1, dtype=value_dtype)
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            out = runner.run(static_inputs={"x": value}, real_bs=2)
+    if eager:
+        assert not replays
+        assert torch.equal(out["y"], value), "the eager run rounded its input"
+        assert sum("runs eagerly" in r.getMessage() for r in caplog.records) == 1
+    else:
+        assert len(replays) == 2 and not caplog.records
+        assert torch.equal(buffer, value.to(buffer_dtype))

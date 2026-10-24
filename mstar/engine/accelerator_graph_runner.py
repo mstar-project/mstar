@@ -1677,6 +1677,8 @@ class PiecewiseAcceleratorGraphRunner:
         self._max_slots = num_slots
         self._num_slots = 1
         self._current_slot = 0
+        # whether `run` has said it runs eagerly for an input its buffer may round
+        self._eager_logged = False
 
     def _size_slots(self) -> None:
         """A region has no pre-plan path, so a second slot buys nothing unless a
@@ -2166,6 +2168,9 @@ class PiecewiseAcceleratorGraphRunner:
         Copies each real input into the runner-owned buffer of the same name,
         declares and plans the region's step over the padded batch, replays,
         then commits and returns the padded buffers behind a real-length view.
+        An input its buffer may round runs the region eagerly instead, over a
+        padded copy in the input's own dtype, through the same step (logged
+        once per runner).
 
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
@@ -2204,22 +2209,42 @@ class PiecewiseAcceleratorGraphRunner:
                 f"total_tokens={real_total_tokens}"
             )
 
+        # an eager run's inputs, built only when a buffer would round one
+        inputs, rounds = None, []
         for name, value in static_inputs.items():
             buffer = data.static_inputs.get(name)
             if buffer is None or not isinstance(value, torch.Tensor):
                 continue
+            # the copy casts silently: into a wider float or a wider int it is
+            # exact, but narrowing, or an integer into a float or complex, can round
+            if torch.promote_types(value.dtype, buffer.dtype) != buffer.dtype or (
+                (buffer.dtype.is_floating_point or buffer.dtype.is_complex)
+                and not (value.dtype.is_floating_point or value.dtype.is_complex)
+                and value.dtype != torch.bool
+            ):
+                rounds.append(f"{name} ({value.dtype} into {buffer.dtype})")
+                inputs = inputs or dict(data.static_inputs)
+                buffer = inputs[name] = buffer.new_zeros(buffer.shape, dtype=value.dtype)
             n = value.shape[0]
             buffer[:n].copy_(value)
             if n < buffer.shape[0]:
                 # the padded tail is real compute for a BATCHED capture, so it
                 # reads whatever is here; zero rather than last step's values
                 buffer[n:].zero_()
+        if rounds and not self._eager_logged:
+            self._eager_logged = True
+            logger.warning(
+                "piecewise %r runs eagerly: its buffers would round %s; allocate "
+                "each buffer in its input's dtype to replay it",
+                self._label, ", ".join(rounds),
+            )
 
         step = None
+        step_ids = [
+            *(request_ids if request_ids is not None else data.dummy_rids[:real_bs]),
+            *data.dummy_rids[real_bs:data.shape.bs],
+        ]
         if request_ids is not None:
-            step_ids = [
-                *request_ids, *data.dummy_rids[real_bs:data.shape.bs]
-            ]
             step = self._declare(
                 step_ids,
                 self._config.replay_seq_lens(data.shape, seq_lens, real_bs),
@@ -2231,12 +2256,16 @@ class PiecewiseAcceleratorGraphRunner:
             )
         try:
             self._plan(step, data.shape)
-            data.graph.replay()
+            if inputs is not None:
+                outputs = self._normalize_output(
+                    self._config.capture_fn(self._call_inputs(inputs, step_ids, step))
+                )
+            else:
+                data.graph.replay()
+                outputs = data.static_outputs
             if step is not None:
                 self._step_runner.commit(step)
         finally:
             self._dummy_rows.reset(data.dummy_rids[real_bs:data.shape.bs])
 
-        return PiecewiseOutput(
-            data.static_outputs, real_total_tokens if is_packed else real_bs
-        )
+        return PiecewiseOutput(outputs, real_total_tokens if is_packed else real_bs)
