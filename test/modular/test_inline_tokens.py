@@ -168,10 +168,14 @@ def test_the_facade_accounts_an_inline_token_like_a_tensor():
     facade.result_tensor_input_queue = queue.Queue()
     facade.per_request_reading_tensors = {"r1": 0, "r2": 0}
     facade.received_chunk_counts = {"r1": {}, "r2": {}}
-    facade._signal = lambda: None
+    wakes = []
+    facade._signal = lambda: wakes.append(1)
     facade.new_result_tokens(["r1", "r2"], [42, 52], "text_inputs", "text")
     # a request already cleaned up is dropped from its frame, without raising
     facade.new_result_tokens(["r1", "unknown"], [43, 1], "text_inputs", "text")
+    # a frame with nothing known queues nothing and wakes no one
+    facade.new_result_tokens(["gone"], [7], "text_inputs", "text")
+    assert len(wakes) == 2, "one wake per frame that queued an item"
     assert facade.per_request_reading_tensors == {"r1": 2, "r2": 1}
     assert facade.received_chunk_counts == {"r1": {"text_inputs": 2}, "r2": {"text_inputs": 1}}
     items = [facade.result_tensor_input_queue.get_nowait() for _ in range(2)]

@@ -179,7 +179,6 @@ def test_batched_chunks_and_split_characters_reach_the_client(stack):
         lines = r.read().decode().splitlines()
     deltas = [json.loads(ln[6:])["choices"][0]["delta"] for ln in lines if ln.startswith("data: {")]
     assert "".join(d.get("content", "") for d in deltas) == "café 🙂"
-    assert "\ufffd" not in "".join(d.get("content", "") for d in deltas)
 
 
 def test_only_a_frontend_that_accepts_chunks_messages_gets_them():
