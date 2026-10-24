@@ -1131,6 +1131,56 @@ class HiggsAudioAdapter(OpenAIAdapter):
         )
 
 
+class TextChatAdapter(OpenAIAdapter):
+    """Text-only LLMs: chat messages in, text out. The model's ``process_prompt``
+    applies its own chat template; sampling fields reach it as model_kwargs."""
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
+        text, _, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
+        # an image or audio part was decoded to disk and then dropped: the model
+        # answered as if it had seen it
+        other = sorted(set(modalities) - {"text"})
+        if other:
+            raise ValueError(f"this model takes text only; the messages carry {other}")
+        if not text:
+            raise ValueError("messages carry no text content")
+        for name in ("max_tokens", "max_completion_tokens"):
+            value = getattr(req, name, None)
+            if value is not None and value < 1:
+                raise ValueError(f"{name} must be at least 1, got {value}")
+        # what the model cannot serve is refused, not dropped: off, a field passes
+        if req.n not in (None, 1):
+            raise ValueError(f"n={req.n}: this model returns one choice")
+        if req.stop:
+            raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
+        mk = _passthrough(req)
+        for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
+                     "stop_token_ids"):
+            if mk.get(name):
+                raise ValueError(f"{name} is not supported; got {mk[name]!r}")
+            mk.pop(name, None)
+        if mk.pop("best_of", None) not in (None, 1):
+            raise ValueError("best_of is not supported; this model returns one choice")
+        if mk.pop("response_format", None) not in (None, {"type": "text"}):
+            raise ValueError("response_format needs constrained decoding; only {'type': 'text'} is served")
+        _apply_sampling(req, mk)
+        # extra_body can override max_tokens with anything; a string reached the
+        # conductor's min() and took its whole message batch down
+        _check_numeric_kwargs(mk)
+        if mk.get("max_output_tokens") is not None and mk["max_output_tokens"] < 1:
+            raise ValueError(f"max_output_tokens must be at least 1, got {mk['max_output_tokens']}")
+        return SubmitArgs(
+            text=text,
+            input_modalities=["text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+            prompt_parts=parts,
+        )
+
+
 class OmnilingualASRAdapter(OpenAIAdapter):
     """Omnilingual ASR CTC: speech-to-text in 1,600+ languages, no language code.
 
@@ -1205,6 +1255,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
+    "glm52": TextChatAdapter(),
 }
 
 # One key per size; every size takes the same adapter.

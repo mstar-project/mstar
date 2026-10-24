@@ -24,7 +24,8 @@ Router contract
 ---------------
 
 Each block computes its expert assignment with a router. The block keeps
-the router in ``self.gate``. The default router is :class:`TopKRouter`.
+the router in ``self.gate``. The default router is :class:`TopKRouter`;
+:class:`NoAuxTcRouter` is DeepSeek-V3's sigmoid ``noaux_tc`` one (GLM-5.x).
 
 A router is an ``nn.Module``. A router does not extend a base class. The
 ``forward`` method of the router must obey this contract::
@@ -64,8 +65,12 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
+from mstar.utils.fp8_block import FP8_DTYPE
 
 logger = logging.getLogger(__name__)
+
+# bf16 x bf16 -> fp32 mm (aten::mm.dtype); older torch lacks the overload
+_MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 
 
 # Optional fused Triton MoE path. Imports succeed wherever triton is
@@ -138,6 +143,72 @@ class TopKRouter(nn.Module):
 
         routing_weights = router_top_value.to(router_logits.dtype)
         return routing_weights, router_indices, None
+
+
+class NoAuxTcRouter(nn.Module):
+    """DeepSeek-V3's ``noaux_tc`` router, groupless (``n_group=1``), as GLM-5.x routes.
+
+    Sigmoid scores in fp32; each token's top-k by score + ``e_score_correction_bias``; weights
+    are the unbiased scores of those experts, renormalized if ``norm_topk_prob``, times
+    ``routed_scaling_factor``. Stateless (see the router contract above).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        n_routed_experts: int,
+        num_experts_per_tok: int,
+        routed_scaling_factor: float,
+        norm_topk_prob: bool = True,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.n_routed_experts = n_routed_experts
+        self.top_k = num_experts_per_tok
+        self.routed_scaling_factor = routed_scaling_factor
+        self.norm_topk_prob = norm_topk_prob
+
+        self.weight = nn.Parameter(torch.zeros(n_routed_experts, hidden_size))
+        self.e_score_correction_bias = nn.Parameter(
+            torch.zeros(n_routed_experts, dtype=torch.float32)
+        )
+        # fp32 copy of ``weight``, built once by ``finalize_weights``: the
+        # forward needs fp32 and the router never changes, so casting it once
+        # per layer per step is pure waste. A plain attribute, not a buffer,
+        # so model.to(bf16) cannot downcast it.
+        self._weight_fp32: torch.Tensor | None = None
+
+    def finalize_weights(self) -> None:
+        """Cache the fp32 router weight; call after the weights are loaded."""
+        self._weight_fp32 = self.weight.detach().float()
+
+    def forward(
+        self, hidden_states: torch.Tensor, router_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        flat = hidden_states.reshape(-1, self.hidden_size)
+        # the engine's bf16 autocast would run F.linear in bf16 and round the logits
+        with torch.autocast(flat.device.type, enabled=False):
+            if _MM_OUT_DTYPE and flat.is_cuda and flat.dtype == self.weight.dtype == torch.bfloat16:
+                # bf16 x bf16 products are exact in fp32: the fp32 router in another
+                # summation order, without an fp32 copy of the tokens
+                logits = torch.mm(flat, self.weight.t(), out_dtype=torch.float32)
+            else:
+                w = self._weight_fp32
+                if w is None or w.device != self.weight.device:
+                    w = self.weight.float()
+                logits = F.linear(flat.float(), w)
+        scores = logits.sigmoid()  # (T, E)
+
+        biased = scores + self.e_score_correction_bias.unsqueeze(0)
+        topk_ids = torch.topk(biased, k=self.top_k, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_ids)
+
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if self.routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * self.routed_scaling_factor
+
+        return topk_weights, topk_ids, None
 
 
 def dispatch_experts_fused(
@@ -373,6 +444,58 @@ def _down_proj_weight_loader(
     shard_inter = divide(full_inter, tp_size)
     start = tp_rank * shard_inter
     param.data[expert_idx, :, :] = loaded_weight[:, start:start + shard_inter]
+
+
+def _gate_up_fp8_weight_loader(
+    tp_rank: int, tp_size: int, full_inter: int, row_unit: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: str | int | None = None,
+):
+    """:func:`_gate_up_weight_loader` for an fp8 block-scale checkpoint's experts (a stacked
+    ``(E, 2 * rows, cols)`` uint8 param): one expert's gate or up weight, ``row_unit`` = 1, or its
+    ``weight_scale_inv``, ``row_unit`` = the scale block's rows. The full tensor or this rank's slice."""
+    assert loaded_shard_id is not None
+    kind, expert_str = str(loaded_shard_id).split(":")
+    expert_idx = int(expert_str)
+    rows = divide(divide(full_inter, tp_size), row_unit)
+    full_rows = divide(full_inter, row_unit)
+    if loaded_weight.dtype == FP8_DTYPE:
+        loaded_weight = loaded_weight.view(torch.uint8)
+    if loaded_weight.shape[0] == full_rows:
+        start = tp_rank * rows
+        loaded_weight = loaded_weight[start:start + rows, :]
+    elif loaded_weight.shape[0] != rows:
+        raise ValueError(
+            f"expert gate/up tensor has {loaded_weight.shape[0]} rows; expected "
+            f"the full {full_rows} or the per-rank {rows}"
+        )
+    if kind == "gate":
+        param.data[expert_idx, :rows, :] = loaded_weight
+    else:
+        param.data[expert_idx, rows:2 * rows, :] = loaded_weight
+
+
+def _down_proj_fp8_weight_loader(
+    tp_rank: int, tp_size: int, full_inter: int, col_unit: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: str | int | None = None,
+):
+    """Column (contraction-dim) sharding twin of :func:`_gate_up_fp8_weight_loader`."""
+    assert loaded_shard_id is not None
+    expert_idx = int(str(loaded_shard_id).split(":")[1])
+    cols = divide(divide(full_inter, tp_size), col_unit)
+    full_cols = divide(full_inter, col_unit)
+    if loaded_weight.dtype == FP8_DTYPE:
+        loaded_weight = loaded_weight.view(torch.uint8)
+    if loaded_weight.shape[1] == full_cols:
+        start = tp_rank * cols
+        loaded_weight = loaded_weight[:, start:start + cols]
+    elif loaded_weight.shape[1] != cols:
+        raise ValueError(
+            f"expert down tensor has {loaded_weight.shape[1]} cols; expected "
+            f"the full {full_cols} or the per-rank {cols}"
+        )
+    param.data[expert_idx, :, :] = loaded_weight
 
 
 class ParallelSparseMoeBlock(nn.Module):

@@ -140,6 +140,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
+   * - ``.[glm]``
+     - GLM runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
+       (speeds up the JIT build of the vendored MoE align kernel).
    * - ``.[waypoint]``
      - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
        and ``tensordict`` for reference validation. The pinned TAEHV implementation
