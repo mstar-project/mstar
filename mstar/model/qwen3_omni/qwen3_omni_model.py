@@ -1338,13 +1338,11 @@ class Qwen3OmniModel(Model):
             talker.append(Span("rows", "talker_prefill", kept, kept, "thinker_states"))
             position += span.advance
         prefix = TalkerSubmodule.TALKER_LAST_PREFILL_TOKENS_PER_REQ
-        # A video's temporal positions aren't offset by where it starts, so its advance depends on where it
-        # lands. A prompt with a video keys only its leading text.
+        # A prompt with a video keys only its leading text, since keying past it has never been run or tested.
         video = any(step.modality == "video" for step in plan)
         return {
             THINKER_KV: {"main": LabelLayout(
-                spans=tuple(thinker), growth=(("thinker_decode_loop", 1),),
-                keyed_spans=int(thinker[0].kind == "ids") if video else None,
+                spans=tuple(thinker), growth=(("thinker_decode_loop", 1),), keyed_spans=1 if video else None,
             )},
             TALKER_KV: {"main": LabelLayout(
                 spans=(*talker, Span("rows", "talker_last_prefill", prefix, prefix, "thinker_states")),
