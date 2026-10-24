@@ -4,7 +4,7 @@
 Two runtimes are driven through the same decode steps, one per path, and
 everything observable is compared: the frames each sends (read off real
 inboxes), the next pop, and the loop counters. The loop is short, so the last
-step completes the worker graph and exercises the fallback (status 2) where a
+step completes the worker graph and exercises the fallback (``ROUTED``) where a
 frame needs Python's per-request payloads.
 """
 import sys
@@ -25,7 +25,7 @@ from mstar.communication.wire import decode
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.runtime import rust as rust_runtime
-from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, InlineRouteStatus, RouteInput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
@@ -101,12 +101,12 @@ def _fused_step(rt, rids, column, row_rids):
     status, _cid, sent, route = rt.route_and_send_inline(
         PART, WALK, NODE, [SIG], rids, SIG, column, row_rids,
     )
-    assert status in (1, 2)
-    if status == 1:
+    assert status in (InlineRouteStatus.SENT, InlineRouteStatus.ROUTED)
+    if status is InlineRouteStatus.SENT:
         assert route is None
         return sent
     info = sorted(route.rids_needing_request_info)
-    assert info, "status 2 only when a frame needs Python's payloads"
+    assert info, "ROUTED only when a frame needs Python's payloads"
     return rt.send_outputs(SendInput(
         completion_id=route.completion_id,
         per_request_info=ParallelList(info, [None] * len(info)),
@@ -162,7 +162,7 @@ def test_a_rid_without_a_row_does_nothing(tmp_path):
     status, _cid, sent, route = rt.route_and_send_inline(
         PART, WALK, NODE, [SIG], rids, SIG, column, rids[:2],
     )
-    assert (status, sent, route) == (0, [], None)
+    assert (status, sent, route) == (InlineRouteStatus.NOT_ROUTED, [], None)
     # nothing was routed: the general path still completes this step
     assert rt._rust.num_parked_completions() == 0
     assert _general_step(rt, rids, [1, 2, 3]) == []

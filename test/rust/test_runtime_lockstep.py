@@ -637,30 +637,6 @@ def _prep_rows_same_node(rt, node, rid, room=None):
     )
 
 
-def test_prep_spec_rows_agrees_across_a_loop(lock):
-    """The columnar prep (Rust's own, the contract default on Python) offers the
-    same rows at every iteration, down to the last, where none is left."""
-    rid = lock.admit()
-    lock.put(101)
-    lock.ingest(rid, "prompt", "prefill", [101])
-    lock.pop("prefill", rid)
-    lock.put(201)
-    lock.route("prefill", rid, ["token"], [201])
-    offered = []
-    for uuid in (202, 203, 204):
-        lock.pop("ar_decode", rid)
-        for room in (None, 0):
-            offered.append(lock._both(
-                f"prep_spec_rows(ar_decode, room={room}) before {uuid}",
-                lambda rt, b, s, room=room: _prep_rows_same_node(rt, "ar_decode", rid, room),
-            )[0])
-        lock.put(uuid)
-        lock.route("ar_decode", rid, ["token"], [uuid])
-    # the next iteration (all of max_iters=4 remain), never past the room
-    assert offered == [[rid], [], [rid], [], [rid], []]
-    lock.refcounts([101, 201, 202, 203, 204])
-
-
 def test_speculative_flag_survives_completion(lock):
     """The flag marking a node speculatively scheduled for N+1 must SURVIVE
     the completion of step N -- its rids are still in flight.

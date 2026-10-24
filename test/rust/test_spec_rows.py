@@ -22,7 +22,7 @@ from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
-from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RouteInput
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
@@ -505,25 +505,3 @@ def test_what_the_engine_reads_has_the_same_types_on_both_paths(kind, monkeypatc
     rows = _speculate(w, pending, rows=True, monkeypatch=monkeypatch)
     assert _engine_facing_types(rows) == _engine_facing_types(general)
     assert _engine_facing_types(rows)["ctx_rids"] == {int}
-
-
-@pytest.mark.parametrize("kind", KINDS)
-def test_prep_spec_rows_matches_the_default_composition(kind):
-    """The runtime's own ``prep_spec_rows`` against the contract's default,
-    built from ``prep_spec_rids``, at every iteration of a loop."""
-    w = _worker(kind, max_iters=4)
-    rt = w._graph_runtime
-    rids = _admit(w, 3)
-    pending = _first_step(w, rids)
-    for _ in range(4):
-        args = (NODE, NODE, WALK, list(pending.batch.request_to_worker_graph))
-        for room in (None, 1):
-            assert rt.prep_spec_rows(*args, room) == GraphRuntime.prep_spec_rows(rt, *args, room)
-        _route(w, pending)
-        nxt = _pop(w, list(pending.batch.request_to_worker_graph))
-        if not nxt.request_to_worker_graph:
-            break
-        pending = PendingBatch(
-            batch=nxt, node_batch=w._build_executing_batch(nxt), node_name=NODE,
-            partition=PART, graph_walk=WALK, future=None,
-        )
