@@ -106,12 +106,12 @@ KV_PREEMPTIONS = Family(
 )
 KV_DROPS = Family(
     "mstar_kv_drops_total", COUNTER,
-    "Preempted requests whose KV was dropped, to be rebuilt from their token ids.",
+    "Preempted requests whose KV was dropped, to be rebuilt from their token ids and any host copies.",
     ("component",),
 )
 KV_REBUILD_TOKENS = Family(
     "mstar_kv_rebuild_tokens_total", COUNTER,
-    "Tokens of kept history the rebuild rows prefilled, cache hits included.",
+    "KV slots the rebuild rows prefilled from kept history, image slots and cache hits included.",
     ("component",),
 )
 KV_REBUILD_CACHED_PAGES = Family(

@@ -68,13 +68,17 @@ def _config(tokens: list[int], cap: int = 50, kind: str = "ids") -> KVReqConfig:
     )
 
 
-def _prefill(kv: KVManager, rid: str, length: int, kind: str = "ids") -> None:
-    """Ingest a keyed prompt of ``length`` ids and write it."""
-    kv.ingest_request(rid, _config(list(range(length)), kind=kind))
-    step, ctx = _step(rid, length)
+def _write(kv: KVManager, rid: str, span: int) -> None:
+    step, ctx = _step(rid, span)
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
     kv.commit(step, ctx)
+
+
+def _prefill(kv: KVManager, rid: str, length: int, kind: str = "ids") -> None:
+    """Ingest a keyed prompt of ``length`` ids and write it."""
+    kv.ingest_request(rid, _config(list(range(length)), kind=kind))
+    _write(kv, rid, length)
 
 
 def _engine(resources: dict) -> Engine:
@@ -221,6 +225,7 @@ def test_removing_a_dropped_or_relaid_request_leaks_no_page():
         _prefill(kv, rid, 20)
         kv.drop(rid)
     kv.lay_out_again("relaid", array("i", range(21)))
+    _write(kv, "relaid", 20)
     kv.land_rebuild("relaid")
     assert kv.is_resident("relaid"), "a rebuilt request would never be ready again"
 

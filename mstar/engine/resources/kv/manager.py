@@ -2965,6 +2965,15 @@ class KVManager(AttentionResource):
 
     def land_rebuild(self, rid: str) -> None:
         self._dropped.pop(rid, None)
+        if _DEBUG_ASSERTS:
+            overrides = self._overrides[rid]
+            (label,) = overrides.prompt_ids
+            stream, spans = self._streams[rid][label], overrides.kv_layout[label].spans
+            assert stream.stored_len + stream.released == sum(span.length for span in spans), (
+                f"KV {self.name}: {rid}'s rebuild wrote {stream.stored_len + stream.released} slots of {label!r}, "
+                f"where its layout gives {sum(span.length for span in spans)}, so an input it was rebuilt from is "
+                "the wrong size"
+            )
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns the device pages

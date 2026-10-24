@@ -162,7 +162,7 @@ def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w._kept_ids[NODE].update({} if why == "no ids" else {R: KeptIds(b"", array("i", [5]))})
     w._in_flight_rids.update({R} if why == "in flight" else ())
     w.scheduler.backlog.update({(NODE, DECODE): ScheduledBatch(NODE, DECODE, {R: 0})} if why == "backlog" else {})
-    w._rebuild_rows.update({R: RebuildRow(NODE, PREFILL, {})} if why == "rebuild queued" else {})
+    w._rebuild_rows.update({R: RebuildRow(NODE, PREFILL, {}, None)} if why == "rebuild queued" else {})
     w.infos[R].graph_walk = PREFILL if why == "prefill walk" else DECODE
     w.infos[R].dynamic_loop_iter_counts["loop"] = 1 if why == "samples short" else 0
 
@@ -176,7 +176,7 @@ def test_a_request_is_rebuilt_only_once_per_drop(state):
     w, eng = _worker()
     w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]))
     eng.dropped += [] if state == "resident" else [R]
-    w._rebuild_rows.update(queued := {R: RebuildRow(NODE, PREFILL, {})} if state == "queued" else {})
+    w._rebuild_rows.update(queued := {R: RebuildRow(NODE, PREFILL, {}, None)} if state == "queued" else {})
     w._in_flight_rids.update({R} if state == "in its step" else ())
     with pytest.raises(RuntimeError):
         w._rebuild(R, NODE)
@@ -209,7 +209,8 @@ def test_the_run_loop_runs_a_queued_rebuild_row_once_and_a_remove_waits_for_its_
     from test_worker_metrics import _looping_worker, _StopLoopError
 
     w, _, postprocessed, _ = _looping_worker(monkeypatch, schedule=[None, None], speculate={}, refuse=set())
-    w._rebuild_rows, w._pending_removes, w._rid = {R: RebuildRow(NODE, "rebuild", {})}, {}, lambda wire_rid: wire_rid
+    w._rebuild_rows, w._pending_removes = {R: RebuildRow(NODE, "rebuild", {}, None)}, {}
+    w._rid = lambda wire_rid: wire_rid
     w._graph_runtime = SimpleNamespace(get_sharding_config=lambda rid: pytest.fail("removed under its rebuild step"))
     calls, build, step = [], w._build_executing_batch, (ScheduledBatch(NODE, "rebuild"), dict(w._rebuild_rows))
     # the loop asks only while a row is queued, and this answers twice at most so the loop ends
@@ -255,7 +256,7 @@ def test_a_refused_admit_puts_the_rebuild_row_back_or_fails_only_its_request(rea
 @pytest.mark.parametrize("why", ["failed", "removed", "mixed merge", "cap"])
 def test_a_rebuild_step_holds_nothing_the_scheduler_wouldnt_run(why):
     w, _ = _worker(fresh=ScheduledBatch(NODE, "mixed", {A: 0}, request_walks={A: DECODE}))
-    w._rebuild_rows.update(dict.fromkeys((R, 11) if why == "cap" else (R,), RebuildRow(NODE, PREFILL, {})))
+    w._rebuild_rows.update(dict.fromkeys((R, 11) if why == "cap" else (R,), RebuildRow(NODE, PREFILL, {}, None)))
     w.scheduler.failed_rids.update({R} if why == "failed" else ())
     w._pending_removes.update({R: None} if why == "removed" else {})
 
@@ -271,7 +272,7 @@ def test_a_rebuild_step_holds_nothing_the_scheduler_wouldnt_run(why):
 @pytest.mark.parametrize("held", [False, True])
 def test_nothing_is_speculated_while_a_rebuild_row_could_run(held):
     w, _ = _worker()
-    w._rebuild_rows[R] = RebuildRow(NODE, PREFILL, {})
+    w._rebuild_rows[R] = RebuildRow(NODE, PREFILL, {}, None)
     w.scheduler.held_until[R] = float("inf") if held else 0.0
     w._can_speculate, w._tp_lead_needs_marker = lambda batch: True, lambda pending, speculation: False
     w._choose_spec_target = lambda batch: SimpleNamespace(info=SimpleNamespace(node_name=NODE, graph_walk=DECODE))
