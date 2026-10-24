@@ -61,6 +61,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
+from mstar.validation import validate_deployment
 
 logger = logging.getLogger(__name__)
 
@@ -434,6 +435,9 @@ class Conductor:
 
         with open(model_config_file, "r") as f:
             self.model_config = yaml.safe_load(f)
+        # Every check that needs only the model, this YAML and the environment,
+        # before any worker exists; raises listing every problem found.
+        deployment = validate_deployment(model, self.model_config, model_config_file)
         accelerator = torch.accelerator.current_accelerator(check_available=True)
         self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
@@ -441,8 +445,6 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
-        assert "max_seq_len" in self.model_config
-        assert "node_groups" in self.model_config
         # Optional ``rank_devices: {rank: device_index}`` places a worker rank
         # on a device other than the one its number implies, e.g. two workers
         # sharing one GPU so a light node's steps stop interleaving with a
@@ -451,13 +453,11 @@ class Conductor:
             int(rank): int(index)
             for rank, index in (self.model_config.get("rank_devices") or {}).items()
         }
-        model.validate_config_yaml(self.model_config, model_config_file)
-
-        self.default_sharding_config = model.get_sharding_config(model_config_file)
+        self.default_sharding_config = deployment.sharding_config
         # The conductor is the only process that sees every worker graph, so it
         # owns the numbering. Workers receive their graphs (and these ids) at
         # spawn, so everyone agrees without the ids having to be negotiated.
-        worker_graphs = model.get_worker_graphs(model_config_file)
+        worker_graphs = deployment.worker_graphs
         for index, worker_graph in enumerate(worker_graphs):
             worker_graph.worker_graph_id = index
         self.worker_graphs = {
@@ -465,8 +465,8 @@ class Conductor:
             for worker_graph in worker_graphs
         }
 
-        # (1) Set up worker graph TP ranks
-        # (2) Assert that streaming consumers don't have graph-walk-specific sharding config
+        # Set up worker graph TP ranks; validate_deployment checked each worker
+        # graph belongs to one sharding group of its tp_size.
         self.streaming_consumers = set()
         self.node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
 
@@ -483,20 +483,7 @@ class Conductor:
                 if node.consumes_stream:
                     self.streaming_consumers.add(name)
 
-        # v1: one sharding group per worker graph. Track which group "owns"
-        # each wg so we can assert single-group-per-wg.
-        wg_to_owning_group: dict[int, str] = {}
-
         for group in self.default_sharding_config.groups:
-            if group.graph_walks is not None and any([
-                node in self.streaming_consumers for node in group.nodes
-            ]):
-                raise RuntimeError((
-                    f"Sharding group with nodes {group.nodes} includes a streaming consumer but "
-                    f"has custom graph walk configuration {group.graph_walks}. It is currently "
-                    "disallowed to set custom graph walks for TP groups that include streaming "
-                    "consumer nodes."
-                ))
             group_graph_walks = group.graph_walks or graph_walks
             group_key = group.key_str()
             for walk in group_graph_walks:
@@ -504,22 +491,6 @@ class Conductor:
                     if (node, walk) not in self.node_walk_to_wg:
                         continue
                     wg = self.node_walk_to_wg[(node, walk)]
-                    # v1: a worker graph belongs to at most one sharding group.
-                    # Construct worker graphs so this holds; revisit if we
-                    # need multiple TP groups colocated in one wg.
-                    prior = wg_to_owning_group.setdefault(wg.worker_graph_id, group_key)
-                    assert prior == group_key, (
-                        f"Worker graph {wg.worker_graph_id} is claimed by two sharding "
-                        f"groups ({prior!r} and {group_key!r}). v1 requires one TP group "
-                        f"per worker graph; split the wg or merge the groups."
-                    )
-                    # wg._tp_ranks is computed in WorkerGraph.__post_init__
-                    # from wg.tp_size (which came from the node_group entry).
-                    assert wg.tp_size == group.tp_size, (
-                        f"Worker graph {wg.worker_graph_id} has tp_size {wg.tp_size}, "
-                        f"but its sharding group has tp_size {group.tp_size}. "
-                        f"node_groups and sharding_config disagree."
-                    )
                     # The instance rank is the worker's index within the
                     # lockstep instance (0..tp*sp-1), used by the
                     # replicated-signal fanout (so exactly one rank — index 0

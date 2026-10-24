@@ -510,24 +510,10 @@ class Engine:
             if len(relevant_nodes) == 0:
                 continue # resource not needed
 
-            if not parallel_groups.all_have_compatible_parallel_shape(
-                spec.nodes
-            ):
-                raise ValueError(
-                    f"Resource spec {spec.resource_key} nodes {spec.nodes} "
-                    "must use the same TP x SP shape across replicas"
-                )
-
             # A spec is a logical resource identity and may span replicas on
             # different workers (for example BAGEL's three CFG branches).
-            # This Engine constructs only the local instance, so require only
-            # the locally hosted consumers to share one parallel group.
-            if not parallel_groups.all_in_same_group(relevant_nodes):
-                raise ValueError(
-                    f"Resource spec {spec.resource_key} local nodes "
-                    f"{relevant_nodes} "
-                    f"must all be in the same parallel (tp x sp) group"
-                )
+            # This Engine constructs only the local instance, whose consumers
+            # validate_deployment checked share one parallel group.
             joint_comm_group = parallel_groups.get_joint_group_for_node(
                 next(iter(relevant_nodes))
             )

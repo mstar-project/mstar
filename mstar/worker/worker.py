@@ -527,21 +527,15 @@ class Worker:
             if self.parallel_groups.get_instance_rank_for_node(node) == 0
         ])
 
-        # v1: disallow multiple lockstep-scheduled nodes in the same worker.
         # A node is lockstep-scheduled when its instance spans more than one rank,
         # i.e. tp_size * sp_size > 1. Pure sequence-parallel nodes (tp_size 1,
-        # sp_size > 1) need this too: their attention all-to-all requires the
-        # whole instance to step together. Without SP this is just tp_size > 1.
+        # sp_size > 1) count too: their attention all-to-all requires the whole
+        # instance to step together. v1 allows at most one per worker, which
+        # validate_deployment checks in the conductor.
         self.parallel_nodes = set([
             node for node in node_names
             if self.parallel_groups.get_instance_world_size_for_node(node) > 1
         ])
-        if len(self.parallel_nodes) > 1:
-            raise NotImplementedError(
-                f"Multiple parallel nodes {self.parallel_nodes} found in worker "
-                f"{worker_id}; current implementation requires at most one "
-                "lockstep-parallel node per worker."
-            )
 
         self.is_tp_follower = len(self.parallel_nodes - self.parallel_leader_nodes) > 0
 

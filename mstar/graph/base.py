@@ -701,6 +701,18 @@ def top_level_entities(section: GraphSection) -> dict[str, "GraphNode | Loop"]:
     return entities
 
 
+def self_triggered(entity: "GraphNode | Loop") -> bool:
+    """Whether the stream alone can re-run a top-level entity once it completes:
+    it is, or (a Loop) holds, a consumer with every input streamed. Completion
+    reseeds streaming readiness only for such nodes (see
+    ``WorkerGraphStateRegistry.reseed_streaming_ready``); a consumer with a
+    non-streamed input has to receive it again first."""
+    return any(
+        node.consumes_stream and node.input_names <= node._streaming_inputs
+        for node in entity.get_nodes().values()
+    )
+
+
 class GraphStateRegistry(ABC):
     def __init__(
         self, graph_section: GraphSection,
