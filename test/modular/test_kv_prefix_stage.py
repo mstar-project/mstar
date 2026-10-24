@@ -21,6 +21,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.chunking import ChunkingManagement
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import Resource, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
@@ -70,6 +71,11 @@ class _Submodule:
         """The span a step would declare from these inputs."""
         return inputs.input_seq_len
 
+    def get_chunking_policy(self, graph_walk):
+        from mstar.model.submodule_base import NO_CHUNKING
+
+        return NO_CHUNKING  # NodeSubmodule's default
+
 
 def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]):
     engine = Engine.__new__(Engine)
@@ -81,6 +87,7 @@ def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]
     }
     # every node keys WALK, as a declaration would name it
     engine._keyed_walks = {node: {WALK} for node in node_resources}
+    engine._chunking = ChunkingManagement(engine._submodules)
     engine._prefix_model = "_Model"
     engine._loopback_steps = {}
     return engine

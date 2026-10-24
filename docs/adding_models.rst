@@ -911,7 +911,13 @@ methods are:
    ``declare_step`` needs a value that ``forward`` does not use, put that value in
    ``resource_step_info``.
 
-``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, **kwargs) -> SubmoduleStep | None``
+``get_input_sequence_len(self, graph_walk, fwd_info, inputs, **kwargs) -> InputSeqLenInfo | None`` (optional)
+   Return the length of the row's whole input, before any cached prefix is cut --
+   the engine subtracts what the prefix cache already holds. Return ``None`` for a
+   walk that declares no length, or when the inputs it would measure are absent.
+   Read off input shapes alone: this runs before ``prepare_inputs``.
+
+``declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None, per_request_info=None, **kwargs) -> SubmoduleStep | None``
    Declare what this batch's step does to the node's resources. See
    `Step 4a — Declare the step`_ below.
 
@@ -969,6 +975,40 @@ methods are:
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.
+
+**Chunked prefill (optional).** A walk with long prompts can run each across several steps,
+at most a token budget per step, so the decode rows batched beside it keep running. Three
+methods opt a walk in:
+
+- ``get_chunking_policy(graph_walk)`` returns a ``ChunkingPolicy``: ``chunkable=True``;
+  ``max_batch_tokens``, the step's budget (a combined walk that carries chunked rows sets
+  one too, since its steps run under it); ``output_policies`` for an output edge whose
+  chunks are not joined by concatenating on dim 0 (``ChunkedPrefillOutputMode.CONCAT``,
+  ``LIST`` or ``FINAL``); and ``reuses_cached_prefix`` when a row may have to write a
+  cached prefix again rather than start past it.
+- ``get_input_sequence_len(graph_walk, fwd_info, inputs)`` gives a row's length from its
+  input shapes, before ``prepare_inputs`` runs. The scheduler cuts the row by it, and a
+  row whose prepared input turns out another length fails.
+- ``split_inputs(graph_walk, fwd_info, inputs, start, end)`` cuts the whole prepared input
+  to tokens ``[start, end)``. It is prepared once and cut per chunk. ``ARNodeSubmodule``'s
+  default cuts the token ids or embeddings and any custom position ids, and refuses inputs it
+  cannot see into (``tensor_inputs``, ``kwargs``, ``resource_step_info``).
+
+The engine holds a non-final chunk's outputs and routes them once, joined, with the final
+chunk. Each chunk is still a full forward, though, which samples a token. An autoregressive
+node that chunks must therefore do two things itself:
+
+- In ``declare_step``, wrap its sampler step in ``keep_final_chunk_samples(step,
+  request_ids, inputs)``, so a non-final chunk's sample commits no RNG offset and marks no
+  token as seen.
+- Drop a non-final chunk's sampled token in ``postprocess`` (when
+  ``inputs.is_final_chunk`` is false), or mark its output edge ``FINAL``. Otherwise the
+  token is routed as the prompt's first.
+
+``LLMSubmodule`` in ``mstar/model/qwen3_5/submodules.py`` does both. Nothing checks them at
+load, so cover them with a test: ``test/modular/test_chunked_prefill.py`` and
+``test/modular/test_bagel_chunked_prefill.py`` show how. A deployment can change the
+budgets (see *Chunked prefill budgets* in :doc:`serving`).
 
 .. _Step 4a — Declare the step:
 

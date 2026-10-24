@@ -28,6 +28,8 @@ class _Batch:
         self.running_batched = None
         self.rows_only = False
         self.loopback_rids = frozenset()
+        self.chunk_ranges = {}
+        self.input_seq_lens = {}
 
     def register_prepare_batch(self, inputs):
         self.inputs = inputs
@@ -53,7 +55,7 @@ class _Sub:
     def prepare_inputs(self, **kw):
         self.calls.append(kw["graph_walk"])
         self.row_loopback.append(kw["has_loopback"])
-        return object()
+        return SimpleNamespace(input_seq_len=1)
 
     def can_batch(self, batch, model_inputs):
         return len(model_inputs) > 0
@@ -64,6 +66,8 @@ def _engine(sub):
     eng._submodules = {"llm": SimpleNamespace(submodule=sub, resources={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
+    # no token budget: these steps are not chunked
+    eng._chunking = SimpleNamespace(check_budget=lambda batch, inputs: None)
     return eng
 
 

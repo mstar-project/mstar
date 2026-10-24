@@ -9,6 +9,7 @@ request, so no consumer has to infer the end of its stream from the data.
 
 from types import SimpleNamespace
 
+from mstar.engine.chunking import ChunkingManagement
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
@@ -32,6 +33,7 @@ def _engine_with(submodule) -> Engine:
     engine._submodules = {"vocoder": SimpleNamespace(submodule=submodule, resources={})}
     engine._enable_nvtx = False
     engine._loopback_steps = {}
+    engine._chunking = ChunkingManagement(engine._submodules)
     return engine
 
 
