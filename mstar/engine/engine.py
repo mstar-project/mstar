@@ -2524,10 +2524,6 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction and resource.is_offloaded(request_id)
         ]
-        if not offloaded:
-            # A dropped request, which `check_ready` sends here, has nothing offloaded, and `all()` over
-            # nothing would report it reloaded.
-            return False
         # check every resource fits first, so a refusal doesn't reload and re-offload whatever did
         if not all(resource.can_reload(request_id) for resource in offloaded):
             return False
