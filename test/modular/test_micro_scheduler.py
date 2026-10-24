@@ -41,7 +41,7 @@ from mstar.worker.batch_builder import (
     BatchBuildResult,
     FIFOBatchBuilder,
 )
-from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, MidPrefillRow, ScheduledBatch
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -1880,3 +1880,76 @@ def test_a_merge_with_no_rows_to_size_never_estimates_its_own():
         sched, _Manager([]), target=(NODE, "prefill"),
         pre_existing_batch_size=1, pre_existing_seq_lens=estimate,
     ) is None
+
+
+# --- a row mid-prefill takes its next chunk in the speculation merge
+
+
+def _mid(rid, start, walk="prefill"):
+    return MidPrefillRow(rid, "wg0", walk, start)
+
+
+def test_a_mixing_merge_runs_the_next_chunk_of_a_row_whose_chunk_is_in_flight():
+    """Its node is off the ready queue until the chunk lands, so the merge is
+    handed it, and cuts from where the chunk in flight ends."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8), {NODE: True})
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 4, 10)}
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=1,
+        pre_existing_seq_lens=lambda: [1], mid_prefill=[_mid("p0", 4)],
+    )
+
+    assert merged.chunk_ranges == {"p0": (4, 8, 10)}
+    assert merged.incomplete_node_rids == {"p0"}
+    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(0, 10), "nothing landed yet"
+    assert not manager.pops[1:], "nothing popped: the row's node is in flight"
+
+
+def test_a_merge_that_keeps_to_its_walk_leaves_a_row_mid_prefill_to_its_chunk_landing():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    _next_batch(sched, manager)
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=1,
+        pre_existing_seq_lens=lambda: [1], mid_prefill=[_mid("p0", 4)],
+    )
+
+    assert merged is None
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_row_mid_prefill_the_merge_leaves_out_is_neither_parked_nor_readied():
+    """Left out by the cap, it waits for its chunk to land, which readies it."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs={MIXED: 2, WALK: 8, "prefill": 8}), {NODE: True})
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10), "p1": (0, 2, 10)}
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=1,
+        pre_existing_seq_lens=lambda: [1], mid_prefill=[_mid("p0", 2), _mid("p1", 2)],
+    )
+
+    assert list(merged.request_to_worker_graph) == ["p0"]
+    assert not sched.backlog
+    assert not manager.queues["wg0"].get_ready_node_names()
+
+
+def test_the_last_chunk_of_a_row_mid_prefill_runs_whole_in_the_merge():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8), {NODE: True})
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    _next_batch(sched, manager)
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=1,
+        pre_existing_seq_lens=lambda: [1], mid_prefill=[_mid("p0", 8)],
+    )
+
+    assert merged.chunk_ranges == {"p0": (8, 10, 10)}
+    assert not merged.incomplete_node_rids

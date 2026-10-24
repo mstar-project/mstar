@@ -27,6 +27,10 @@ class BatchBuildRequest:
     fresh: "ScheduledBatch | None" = None
     # Rows of `backlog` that cannot run this step; they stay parked.
     blocked_rids: set[int] = field(default_factory=set)
+    # The caller's rows whose current chunk is still in flight (not popped):
+    # first in line for their next chunk. One left out of the step is neither
+    # parked nor returned; it goes back to its queue when its chunk lands.
+    continuing: "ScheduledBatch | None" = None
     # The rid whose capture group the step must share, else its first row's.
     capture_group_of: int | None = None
     # Each real walk's cap (None or absent: uncapped); under `graph_walk`, the
@@ -126,8 +130,8 @@ class BaseBatchBuilder(ABC):
 
 
 class FIFOBatchBuilder(BaseBatchBuilder):
-    """Backlog first, then fresh rows, in arrival order, up to the cap; one
-    capture group per step.
+    """The caller's continuing rows, then the backlog, then fresh rows, in
+    arrival order, up to the cap; one capture group per step.
 
     Under a combined walk a step of one walk takes that walk's cap and a mixed
     step the combined walk's own, or with none the smallest of the caps of the
@@ -162,7 +166,7 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         fresh_rids = (
             set(request.fresh.request_to_worker_graph) if request.fresh else set()
         )
-        batch = _merged(request.backlog, request.fresh)
+        batch = _merged(_merged(request.continuing, request.backlog), request.fresh)
         if batch is None:
             return BatchBuildResult(None)
 

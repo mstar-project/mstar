@@ -80,7 +80,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import MicroScheduler, MidPrefillRow, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.worker_metrics import WorkerMetrics
 
@@ -227,6 +227,9 @@ class PendingBatch:
     # speculated step is handed off before the step it follows finishes, so
     # its step time starts at that finish anyway (see WorkerMetrics.step_done)
     submitted_at: float = 0.0
+    # Rows mid-prefill whose next chunk runs in the step launched after this
+    # one; the rest go back to their ready queue when this step's chunk lands.
+    next_chunk_launched: frozenset[int] = frozenset()
 
 
 @dataclass
@@ -2632,7 +2635,7 @@ class Worker:
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
         # assumes that.
-        # a row mid-prefill takes its next chunk after this one lands, never speculatively
+        # a row mid-prefill loops back on nothing of N's; it joins the merge below as `mid_prefill`
         held = batch_N.incomplete_node_rids
         candidates = [r for r in walk_rids if not self._is_tearing_down(r)]
         if held:
@@ -2688,6 +2691,12 @@ class Worker:
             return None
         # fresh rows of another walk (a mixing chain): rid -> walk
         other_walks: dict[int, str] = {}
+        # N's rows whose node needs another chunk take it in this step, not the
+        # one after: their nodes stay off the ready queue until N's chunk lands
+        mid_prefill = [
+            MidPrefillRow(r, batch_N.request_to_worker_graph[r], batch_N.walk_of(r), batch_N.chunk_ranges[r][1])
+            for r in held if r in batch_N.request_to_worker_graph and not self._is_tearing_down(r)
+        ] if held and speculating_same_node else ()
 
         # Merge in fresh rids whose spec-target node is ready right now
         # Speculation only consumes work compatible with the spec target. In
@@ -2703,6 +2712,7 @@ class Worker:
                 pending, spec_node_name, graph_walk, continuing,
                 speculating_same_node,
             ),
+            mid_prefill=mid_prefill,
         )
 
         if fresh_batch is not None:
@@ -2731,7 +2741,8 @@ class Worker:
                     )
                     continue
 
-                per_request_inputs[rid] = fresh_inputs[rid]
+                # a row mid-prefill has no popped inputs: its chunk is cut from what the engine holds
+                per_request_inputs[rid] = fresh_inputs.get(rid, {})
                 new_request_to_worker_graph[rid] = (
                     fresh_batch.request_to_worker_graph[rid]
                 )
@@ -2740,7 +2751,7 @@ class Worker:
                     other_walks[rid] = walk
 
         logger.debug("Speculating: %s %s", spec_node_name, continuing)
-        return self._assemble_speculation(
+        speculation = self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
@@ -2752,6 +2763,12 @@ class Worker:
             chunk_ranges=None if fresh_batch is None else fresh_batch.chunk_ranges,
             incomplete_node_rids=None if fresh_batch is None else fresh_batch.incomplete_node_rids,
         )
+        # N's rows, not fresh ones: a cleared speculation must not ready their
+        # nodes while N's chunk is in flight; N's settle does that
+        speculation.continuing_rids.update(
+            row.request_id for row in mid_prefill if row.request_id in new_request_to_worker_graph
+        )
+        return speculation
 
     def _thread_outputs_to_speculative(
         self, speculation: Speculation,
@@ -2773,9 +2790,14 @@ class Worker:
         ran = frozenset(outputs_N.row_request_ids or ()) if rows_only else None
         # a mixed N's rows that looped back on the device arrive empty too
         loopback = getattr(outputs_N, "loopback_rids", frozenset())
+        chunked = speculation.scheduled_batch.chunk_ranges
         for rid in list(speculation.node_batch.request_ids):
             if rid not in speculation.continuing_rids:
                 continue  # fresh rid — inputs already gathered.
+            if rid in chunked:
+                # mid-prefill: its chunk is cut from the input the engine holds, not N's outputs
+                threaded_continuing.add(rid)
+                continue
             if rid in loopback:
                 inputs = speculation.node_batch.per_request_input_tensors[rid]
                 for input_name, _ in speculation.consumed_edges:
@@ -3427,7 +3449,8 @@ class Worker:
                 self.scheduler.chunk_outputs.hold(rid, node, outputs.pop(rid, {}), policies)
                 wg_id = batch.request_to_worker_graph[rid]
                 batch.discard_rid(rid)
-                self._graph_runtime.push_back_node(node, [rid], [wg_id])
+                if rid not in batch_N.next_chunk_launched:
+                    self._graph_runtime.push_back_node(node, [rid], [wg_id])
             else:
                 engine = self.engine_manager.get_engine(node)
                 engine.release_chunk_inputs(rid, node)
@@ -4711,6 +4734,12 @@ class Worker:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
+                            if pending.batch.incomplete_node_rids:
+                                pending.next_chunk_launched = frozenset(
+                                    rid for rid in pending.batch.incomplete_node_rids
+                                    if rid in spec_batch.request_to_worker_graph
+                                    and rid in spec_batch.chunk_ranges
+                                )
                             spec_pending = PendingBatch(
                                 batch=spec_batch,
                                 node_batch=spec_node_batch,

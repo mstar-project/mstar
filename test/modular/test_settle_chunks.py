@@ -56,7 +56,7 @@ def _worker():
     return w
 
 
-def _pending(ranges: dict, incomplete: set, ran: list[int], cached=(), event=None):
+def _pending(ranges: dict, incomplete: set, ran: list[int], cached=(), event=None, next_launched=()):
     batch = ScheduledBatch(
         node_name=NODE, graph_walk=WALK,
         request_to_worker_graph={rid: 7 for rid in ran},
@@ -66,7 +66,9 @@ def _pending(ranges: dict, incomplete: set, ran: list[int], cached=(), event=Non
         request_ids=list(ran), per_request_info={rid: object() for rid in ran},
         cached_rids=set(cached), completion_event=event,
     )
-    return SimpleNamespace(batch=batch, node_name=NODE, node_batch=node_batch)
+    return SimpleNamespace(
+        batch=batch, node_name=NODE, node_batch=node_batch, next_chunk_launched=frozenset(next_launched),
+    )
 
 
 def _outputs(**per_rid):
@@ -88,6 +90,19 @@ def test_a_non_final_chunk_is_held_and_its_node_readied_again():
     assert w._graph_runtime.pushed_back == [(NODE, [1], [7])]
     assert w.scheduler.advanced == [(1, NODE, 4)]
     assert w._engine.released == []
+
+
+def test_a_row_whose_next_chunk_already_launched_is_held_but_not_readied():
+    """The speculative step after N took the row's next chunk, so its node
+    stays off the ready queue; readied, a scan would schedule that chunk twice."""
+    w = _worker()
+    pending = _pending({1: (0, 4, 10)}, incomplete={1}, ran=[1, 2], next_launched={1})
+
+    assert w._settle_chunks(pending, _outputs(r1=[1.0], r2=[9.0]))
+
+    assert w.scheduler.chunk_outputs.holds(1, NODE)
+    assert w._graph_runtime.pushed_back == []
+    assert w.scheduler.advanced == [(1, NODE, 4)]
 
 
 def test_the_final_chunk_routes_every_chunk_joined_and_releases_the_input():
