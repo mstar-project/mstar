@@ -110,7 +110,7 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import drop_stop_tokens
+from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +272,8 @@ class BagelModel(Model):
     Prefill steps are constructed as a sequential schedule that walks
     through interleaved text and image inputs.
     """
+
+    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -819,9 +821,9 @@ class BagelModel(Model):
     ) -> bytes:
         if modality == "text":
             ids = drop_stop_tokens(output, (self.eos_token_id,), request_kwargs)
-            detok = self.tokenizer.decode(ids)
-            logger.debug("OUTPUT TEXT %s", detok)
-            return detok.encode("utf-8")
+            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
+                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
+            return self._text_detokenizer.to_bytes(ids)
         if modality == "image":
             output = output[0].permute(1, 2, 0) * 255
             img = Image.fromarray((output).to(torch.uint8).cpu().numpy())
