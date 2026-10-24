@@ -33,12 +33,16 @@ class PrefixIndex:
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
         pages = self.pages_for(keys)
+        self.touch(pages)
+        return pages
+
+    def touch(self, pages: Sequence[int]) -> None:
+        pages = [page for page in pages if self._key[page] is not None]
         if pages:
             # one stamp for the whole run, so recency stays monotone along it
             self._clock += 1
             for page in pages:
                 self._stamp[page] = self._clock
-        return pages
 
     def insert(self, key: bytes, page: int, parent: int | None = None) -> bool:
         """Name ``page`` by ``key`` under ``parent``; the first writer wins."""

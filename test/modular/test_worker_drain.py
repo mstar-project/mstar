@@ -193,6 +193,7 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
     )
     tensors.cleanup_collectable = lambda *freed: None
     tensors.increment_ref_batch_uniform = tensors.dereference_batch_uniform = lambda *args: None
+    tensors.drop_host_copies = lambda: None
     # counts each rid's outputs and stores none of them
     tensors.store_and_return_tensor_info_batch = lambda rids, outputs, signals, **kwargs: StoredOutputs(
         flat_uuids=[], flat_rids=[], signal_idxs=[],

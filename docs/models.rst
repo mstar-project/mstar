@@ -154,6 +154,10 @@ Notes
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
+- Models on the fused MoE kernel (Qwen3-Omni, Command A+) use a tuned tile table
+  from ``mstar/utils/fused_moe/configs/`` when one matches the expert shape and
+  GPU, and default tiles otherwise. ``python -m mstar.utils.fused_moe.tune``
+  writes a table for the local GPU.
 - To add a new family, see :doc:`adding_models`.
 
 OmniVoice notes
