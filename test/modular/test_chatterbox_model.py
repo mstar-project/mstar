@@ -296,10 +296,10 @@ def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
 
 def test_process_prompt_builtin_voice_emits_text_only():
     model = _make_model()
-    out = model.process_prompt("hello", ["text"], ["audio"], voice="default")
+    out = model.process_prompt("hello", ["text"], ["audio"], voice="default").new_input_tensors
     assert set(out) == {TEXT_INPUTS}
     assert out[TEXT_INPUTS][0].tolist() == [1, 2, 3, 4, 5]
-    out = model.process_prompt("hello", ["text"], ["audio"])
+    out = model.process_prompt("hello", ["text"], ["audio"]).new_input_tensors
     assert set(out) == {TEXT_INPUTS}
 
 
@@ -308,7 +308,7 @@ def test_process_prompt_reference_audio_is_keyed_and_capped():
     wav = torch.rand(40 * 24000) - 0.5
     out = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [wav]},
-    )
+    ).new_input_tensors
     assert set(out) == {TEXT_INPUTS, REF_AUDIO, VOICE_KEY}
     assert out[REF_AUDIO][0].numel() == 30 * 24000  # capped at 30 s
     assert out[VOICE_KEY][0].dtype == torch.long
@@ -353,7 +353,7 @@ def test_process_prompt_rejects_unusable_reference(wav, message):
 def test_process_prompt_accepts_short_but_usable_reference():
     out = _make_model().process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_tone(0.6)]},
-    )
+    ).new_input_tensors
     assert out[REF_AUDIO][0].numel() == int(0.6 * 24000)
 
 
@@ -522,7 +522,7 @@ def test_generation_kwargs_accept_boundary_values():
     assert top_ks == [vocab - 1, vocab, vocab]
     # other request fields ride along in the same kwargs and are left alone
     out = model.process_prompt("hello", ["text"], ["audio"], voice="default", language_id=None, seed=7)
-    assert set(out) == {TEXT_INPUTS}
+    assert set(out.new_input_tensors) == {TEXT_INPUTS}
 
 
 def test_max_new_tokens_limit_bounds_requests_and_the_default():
@@ -589,7 +589,6 @@ def test_initial_args_builtin_voice():
     assert [e.name for e in t3.inputs] == [TEXT_INPUTS]
     assert t3.unpersist_tensors == signals[TEXT_INPUTS]
     assert t3.step_metadata["cfg_weight"] == 0.4 and t3.step_metadata["is_prefill"] is True
-    assert t3.full_metadata.kwargs["max_new_tokens"] == 1000
 
     s3 = model.get_initial_forward_pass_args("S3Gen", ["text"], ["audio"], signals, {})
     assert s3.full_metadata.graph_walk == "s3gen_chunk" and s3.inputs == []
@@ -619,7 +618,7 @@ def test_t3_prefill_transitions_to_decode_then_done():
     metadata = CurrentForwardConductorMetadata(
         input_modalities=["text"], output_modalities=["audio"],
         graph_walk="prefill_voice", is_prefill=True,
-        kwargs={"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05, "max_new_tokens": 10},
+        kwargs={"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05},
     )
     persist = {SPEECH_TOKENS: [SimpleNamespace(name=SPEECH_TOKENS)]}
     result = model.get_partition_forward_pass_args("T3", metadata, persist)
@@ -627,7 +626,7 @@ def test_t3_prefill_transitions_to_decode_then_done():
     assert result.inputs[0].name == PREV_TOKEN and result.inputs[0].next_node == "T3"
     assert result.inputs[0].tensor_info == persist[SPEECH_TOKENS]
     assert result.unpersist_tensors == persist[SPEECH_TOKENS]
-    assert result.step_metadata["is_prefill"] is False and result.step_metadata["max_new_tokens"] == 10
+    assert result.step_metadata == {"cfg_weight": 0.5, "exaggeration": 0.5, "min_p": 0.05, "is_prefill": False}
     assert result.request_done is False
 
     result = model.get_partition_forward_pass_args("T3", metadata, {})
@@ -727,10 +726,9 @@ def _fwd_info(rid, cfg_weight=0.5, temperature=0.8, max_new=1000):
     # the wire id differs from the handle, so state keyed by the wrong one shows
     return SimpleNamespace(
         request_id=f"wire-{rid}", rid_handle=rid,
-        step_metadata={"cfg_weight": cfg_weight, "exaggeration": 0.5, "min_p": 0.05,
-                       "max_new_tokens": max_new, "is_prefill": True},
+        step_metadata={"cfg_weight": cfg_weight, "exaggeration": 0.5, "min_p": 0.05, "is_prefill": True},
         resource_configs={T3_SAMPLER: SimpleNamespace(temperature=temperature, ignore_eos=False)},
-        max_tokens=4096, random_seed=0,
+        max_tokens=max_new, random_seed=0,
     )
 
 

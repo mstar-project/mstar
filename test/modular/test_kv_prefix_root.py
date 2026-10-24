@@ -31,13 +31,13 @@ from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Resource
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import PrefixStream
+from mstar.model.base import KVLabel, PrefixKeys
 from mstar.streaming.topology import StreamingGraphEdge
 from mstar.worker.engine_manager import _refuse_unservable_walks
 
@@ -90,15 +90,20 @@ class _Model:
     def preprocess_fingerprint(self):
         return self._name
 
-    def prefix_key_streams(self):
+    def kv_labels(self):
         return {}
 
 
 class _Declaring(_Model):
     """Keys ``main`` on the KV resource from its text walk."""
 
-    def prefix_key_streams(self):
-        return {KV: {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}}
+    def kv_labels(self):
+        return {KV: {"main": KVLabel(growth=(("decode", "decode_loop"),), keys=PrefixKeys(
+            "text_inputs", ("prefill_text",), growth=True,
+        ))}}
+
+    def get_graph_walk_graphs(self):
+        return {"prefill_text": GraphNode(name="LLM", input_names=["text_inputs"], outputs=[])}
 
 
 def _checkpoint(root, config: bytes) -> str:
@@ -314,13 +319,13 @@ def test_an_uncached_node_says_nothing_at_load(caplog, overrides, model):
 # ── the keys the request brought ────────────────────────────────────────
 
 
-_LAYOUT = {"main": [PrefixSpan(32, 32, "prefill_text")]}
+_LAYOUT = {"main": StreamLayout(spans=(PrefixSpan(32, 32, "prefill_text"),), keyed_spans=1)}
 
 
 def test_ingest_puts_the_requests_keys_on_the_stream():
     kv = _kv()
 
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}, prefix_layout=_LAYOUT))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}, kv_layout=_LAYOUT))
 
     assert kv._streams["r0"]["main"].chain.keys == [b"k0", b"k1"], (
         "the chain the request brought never reached its stream"
@@ -329,7 +334,7 @@ def test_ingest_puts_the_requests_keys_on_the_stream():
 
 def test_a_label_the_request_did_not_key_carries_none():
     kv = _kv()
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0"]}, prefix_layout=_LAYOUT))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0"]}, kv_layout=_LAYOUT))
 
     stream = kv._ensure_label("r0", "cfg_text")
 
@@ -340,7 +345,7 @@ def test_a_request_can_opt_out_of_the_cache():
     kv = _kv()
 
     kv.ingest_request("r0", KVReqConfig(
-        prefix_keys={"main": [b"k0"]}, prefix_layout=_LAYOUT, prefix_cache=False,
+        prefix_keys={"main": [b"k0"]}, kv_layout=_LAYOUT, prefix_cache=False,
     ))
 
     assert kv._streams["r0"]["main"].chain is None, (
@@ -430,10 +435,11 @@ def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_
         "prefill_image": Sequential([node("vit", "LLM"), node("LLM", image_feeds)])
         if image_walk_runs_llm else node("vit", EMIT_TO_CLIENT),
     }
-    stream = PrefixStream("text_inputs", "ids", "prefill", None, ("prefill_image",))
+    walks = ("prefill", "prefill_image")
+    label = KVLabel(keys=PrefixKeys("text_inputs", walks))
     partition = PartitionDefinition(name="LLM", graph_walks=set(graphs), initial_walk="prefill", producer_partitions=[])
     return SimpleNamespace(
-        prefix_key_streams=lambda: {KV: {"main": stream}}, get_graph_walk_graphs=lambda: graphs,
+        kv_labels=lambda: {KV: {"main": label}}, get_graph_walk_graphs=lambda: graphs,
         get_partitions=lambda: [partition],
         checkpoint_path=lambda: None, preprocess_fingerprint=lambda: "laid out",
     )

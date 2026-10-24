@@ -66,6 +66,7 @@ def add_both_partitions(rt):
         rid = rt.add_request(
             request_id="rid", partition=part, graph_walk=walk, partition_worker_graph_ids=[wg],
             worker_graph_to_workers=ParallelList([0, 1], [["worker_0"], ["worker_0"]]),
+            loop_caps={},
         )
     return rid
 

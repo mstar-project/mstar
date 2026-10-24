@@ -35,7 +35,7 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -45,6 +45,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.graph.runtime.base import GraphRuntime
+from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
@@ -60,7 +61,7 @@ from mstar.model.submodule_base import (
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils.device import DeviceCapability
-from mstar.utils.ipc_format import OffloadDelta
+from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
     PHASE_PERIOD,
     mark,
@@ -860,16 +861,14 @@ class Engine:
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
             model.preprocess_fingerprint() if model is not None else "",
         ]
-        declared = model.prefix_key_streams() if model is not None else {}
+        declared = keyed_labels(model) if model is not None else {}
         self._prefix_model = type(model).__name__
-        # node -> the walks a probe may run on: the keyed walk and the layout walks
-        # of every stream declared on a cache the node uses
+        # node -> the walks a probe may run on, from the keys of every label on a cache the node uses
         self._keyed_walks: dict[str, set[str]] = {}
         for key, by_label in declared.items():
             for node in specs_by_key[key].nodes:
                 self._keyed_walks.setdefault(node, set()).update(
-                    walk for stream in by_label.values()
-                    for walk in (stream.walk, *stream.layout_walks)
+                    walk for label in by_label.values() for walk in label.keys.walks
                 )
         # a cache another engine holds is taken as open when its config says so
         opened_keys = {
@@ -897,8 +896,10 @@ class Engine:
                     if mark is not None:
                         parts.append(mark)
             opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
-                label: (stream.walk, stream.decode_walk, *stream.layout_walks)
-                for label, stream in declared.get(key, {}).items()
+                label: KeyedWalks(
+                    kv_label.keys.walks, tuple(walk for walk, _ in kv_label.growth if kv_label.keys.growth),
+                )
+                for label, kv_label in declared.get(key, {}).items()
             })
             if not opened or not declared.get(key):
                 continue
@@ -918,12 +919,12 @@ class Engine:
                     "prompt frees little",
                     key,
                 )
-        # the nodes of a layout walk that don't use the stream's cache, such as an image
+        # the nodes of a keyed walk that don't use the label's cache, such as an image
         # encoder. The KV computed from their output is cached under their input's digest.
         self._item_encoders: set[str] = set()
         for key in opened_keys:
-            for stream in declared[key].values():
-                for walk in stream.layout_walks:
+            for label in declared[key].values():
+                for walk in label.keys.walks:
                     nodes = model.get_graph_walk_graphs()[walk].get_nodes()
                     self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
 
@@ -1100,6 +1101,72 @@ class Engine:
                 self._runner.extend_prefix_chains(
                     rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
                     keys=keys,
+                )
+
+    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, list[int]]]:
+        """Rank 0's cached-prefix leases for the step it is sending, by wire id, taken now so the
+        followers can take the same pages before they build it."""
+        keyed = self._keyed_walks.get(batch.node_name)
+        ctx = batch.step_context
+        if (
+            not keyed or (not ctx.request_walks and ctx.graph_walk not in keyed)
+            or not self._runner.prefix_chain_keys(batch.node_name)
+        ):
+            return {}
+        hits = {}
+        for rid in batch.request_ids:
+            walk = ctx.walk_of(rid)
+            if walk not in keyed:
+                continue
+            leases = self._runner.lease_cached_prefix(rid, batch.node_name, walk)
+            if leases:
+                hits[self._graph_runtime.get_rid_string(rid)] = leases
+        return hits
+
+    def prefix_cache_open(self, node_name: str) -> bool:
+        return bool(self._runner.prefix_chain_keys(node_name))
+
+    def adopt_cached_prefix(self, head: ScheduleTPNode, caught_up: bool) -> bool:
+        """On a TP follower, take rank 0's leases before building the step. False until this rank holds them all."""
+        ready = True
+        for rid, walk, leases in self._resolve_hits(head):
+            ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases, caught_up)
+        return ready
+
+    def release_cached_prefix(self, batch: ExecutingBatch) -> None:
+        """Give back the leases of a step this rank built and won't run."""
+        ctx = batch.step_context
+        for rid in batch.request_ids:
+            self._runner.release_cached_prefix(rid, batch.node_name, ctx.walk_of(rid))
+
+    def drop_cached_prefix(self, head: ScheduleTPNode) -> None:
+        """On a TP follower, give back the leases of a head it drops without building."""
+        for rid, walk, _ in self._resolve_hits(head):
+            self._runner.release_cached_prefix(rid, head.node_name, walk)
+
+    def _resolve_hits(self, head: ScheduleTPNode):
+        """Yield (handle, walk, leases) per request in ``head``'s hits, skipping a request this rank
+        hasn't ingested or has removed."""
+        walk_idx = dict(zip(head.request_ids, head.walk_idx, strict=True)) if head.walks else None
+        for wire_rid, leases in head.prefix_hits.items():
+            rid = self._graph_runtime.get_rid_handle(wire_rid)
+            if rid is not None:
+                walk = head.walks[walk_idx[wire_rid]] if walk_idx else head.graph_walk
+                yield rid, walk, leases
+
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+        return self._runner.page_trails(node_name)
+
+    def check_page_trails(
+        self, node_name: str, graph_walk: str, tp_seq: int, trails: dict[str, tuple[int, int]],
+    ) -> None:
+        """On a TP follower, raise if a resource's page allocations differ from rank 0's when it
+        sent this step."""
+        for pool, mine in self._runner.page_trails(node_name).items():
+            if trails.get(pool, mine) != mine:
+                raise RuntimeError(
+                    f"KV {pool}: this rank's page allocations {mine} (count, hash) differ from "
+                    f"rank 0's {trails[pool]} before {node_name}/{graph_walk}, tp seq {tp_seq}"
                 )
 
     def _skip_cached_prefix(
