@@ -62,6 +62,9 @@ def _worker(*, follower=False):
     w._kv_caches = {}
     w.parallel_nodes = {NODE} if follower else set()
     w.parallel_leader_nodes = set()
+    w.engine_manager = SimpleNamespace(
+        get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
+    )
     return w
 
 

@@ -83,6 +83,7 @@ class PageArena:
     num_owners: list[int] = field(init=False, repr=False)
     sealed: list[bool] = field(init=False, repr=False)
     index: PrefixIndex | None = field(default=None, init=False, repr=False)
+    trail: tuple[int, int] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         self.num_owners = [0] * self.allocator.max_num_pages
@@ -93,6 +94,8 @@ class PageArena:
         if pages is not None:
             for page in pages:
                 self.num_owners[page] = 1
+            if self.trail is not None:
+                self.trail = (self.trail[0] + 1, hash((self.trail, *pages)))
         return pages
 
     def retain(self, pages: list[int]) -> None:
@@ -495,9 +498,25 @@ class KVManager(AttentionResource):
         nodes: Collection[str] | None = None,
     ):
         self.config = cfg
+        tp_cache = False
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
             cfg.shard(joint_comm_group.world_size)
+            tp_cache = joint_comm_group.world_size > 1 and cfg.prefix_cache and cfg.prefix_cache_tp
+            if tp_cache and cfg.cpu_offload_pages > 0:
+                raise ValueError(
+                    f"KV {name}: prefix_cache_tp can't be combined with cpu_offload_pages="
+                    f"{cfg.cpu_offload_pages}. Every rank has to take and evict pages in rank 0's "
+                    "order, and a reload isn't ordered against cache hits. Set cpu_offload_pages "
+                    "to 0 or prefix_cache_tp to false."
+                )
+            if tp_cache and needs_remote_transfer:
+                raise ValueError(
+                    f"KV {name}: prefix_cache_tp needs this pool's nodes on one TP group. With more "
+                    "than one (replicas, or walks placed on other ranks) the pool counts as shared, "
+                    "and a read from another group would take pages outside rank 0's order. Serve "
+                    "the nodes from one group or set prefix_cache_tp to false."
+                )
         self.kv_cache = KVCache(
             cfg, device, dtype
         )
@@ -583,6 +602,8 @@ class KVManager(AttentionResource):
         self._victims: dict[str, Earmark | None] = {}
         self._short: dict[str, int] = {}
         self._ran_short: dict[str, int] = {}
+        if _DEBUG_ASSERTS and tp_cache:
+            self._arena.trail = (0, 0)
         self._device = device
         self._lock = threading.RLock()
 
@@ -672,16 +693,20 @@ class KVManager(AttentionResource):
         self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
     ) -> bool:
         """Open the index under ``root``, the identity every key hangs from."""
+        # Above one rank the decode walk, `named[1]`, isn't keyed, since each rank reads its sampled ids
+        # at a different step.
         self._keyed_walks = {
-            label: frozenset(walk for walk in named if walk is not None)
+            label: frozenset(
+                walk for walk in (named[:1] + named[2:] if self._world_size > 1 else named)
+                if walk is not None
+            )
             for label, named in (walks or {}).items()
         }
         if not self.config.prefix_cache:
             return False
-        if self._world_size > 1:
+        if self._world_size > 1 and not self.config.prefix_cache_tp:
             logger.info(
-                "KV %s: prefix cache off at world size %d: the ranks index "
-                "independently and would match different lengths",
+                "KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)",
                 self.name, self._world_size,
             )
             return False
@@ -732,20 +757,32 @@ class KVManager(AttentionResource):
                 return self._answer(label, cursor, stream.lease_len)
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
-            keys, rooted = list(chain.keys), chain.rooted
-            spans, ends = chain.spans, chain.rooted_ends
-        total = sum(span.length for span in spans)
-        if rooted is None:
-            rooted, ends = self._hash_chain(keys, spans)
+            if self._world_size > 1:
+                # Above one rank, use only the lease taken when rank 0 sent the step. A lookup now
+                # would also see this rank's later commits.
+                return self._answer(label, cursor, 0)
+        if not self._lease(rid, node_name, label, stream, chain):
+            return None
+        with self._lock:
+            if stream.lease is None:
+                return None
+            return self._answer(label, cursor, stream.lease_len)
+
+    def _lease(self, rid: str, node_name: str, label: str, stream: CacheStream, chain: PrefixChain) -> bool:
+        """Lease what the index holds of the stream's prompt, unless the stream holds a lease already.
+        False if the stream was removed while its keys were hashed."""
+        self._root(chain)
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
-                return None
-            chain.rooted = rooted
-            chain.rooted_ends = ends
+                return False
+            rooted, ends = chain.rooted, chain.rooted_ends
+            total = sum(span.length for span in chain.spans)
             # The lock was dropped to hash, so another thread's probe may have taken the lease already.
             if stream.lease is None:
                 # Matching the whole prompt would leave the walk an empty input, since it skips every matched page.
-                matched = self._retain_cached(rid, stream, self._index.lookup(rooted)[:len(rooted) - 1])
+                matched = self._retain_cached(
+                    rid, stream, self._index.lookup(rooted, stamp=self._world_size == 1)[:len(rooted) - 1],
+                )
                 held = len(matched) * self.config.page_size
                 # If an image ends inside the next page, look up its cached partial page.
                 image_end = self._image_end(ends, held, total)
@@ -767,11 +804,10 @@ class KVManager(AttentionResource):
                     self.prefix_tokens[node_name] = (queried + total, hit + held)
                 if rid in self._dropped:
                     self.rebuild_pages[node_name] = self.rebuild_pages.get(node_name, 0) + len(matched)
-                if not matched:
-                    return None
-                stream.lease, stream.lease_len = matched, held
-                self._recount(rid)
-            return self._answer(label, cursor, stream.lease_len)
+                if matched:
+                    stream.lease, stream.lease_len = matched, held
+                    self._recount(rid)
+            return True
 
     def _image_end(self, ends: list[tuple[int, bytes]], held: int, total: int) -> tuple[int, bytes] | None:
         """The last image in ``ends`` that finishes inside the page after ``held`` slots, if any."""
@@ -779,6 +815,16 @@ class KVManager(AttentionResource):
             if held < end < min(held + self.config.page_size, total):
                 return end, key
         return None
+
+    def _root(self, chain: PrefixChain) -> None:
+        """Fill `chain.rooted` and `chain.rooted_ends` once. Called without the lock held."""
+        with self._lock:
+            if chain.rooted is not None:
+                return
+            keys, spans = list(chain.keys), chain.spans
+        rooted, ends = self._hash_chain(keys, spans)
+        with self._lock:
+            chain.rooted, chain.rooted_ends = rooted, ends
 
     def _hash_chain(
         self, keys: list[bytes], spans: list[PrefixSpan],
@@ -792,6 +838,77 @@ class KVManager(AttentionResource):
             if span.end_key is not None:
                 ends.append((at, fingerprint(self._prefix_root, span.end_key)))
         return rooted, ends
+
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+        """Returns the same lease with every step until `admit` converts it."""
+        with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            if label is None:
+                return None
+            stream = self._ensure_label(rid, label)
+            chain, cursor = stream.chain, stream.span_cursor
+            if stream.lease is not None:
+                return stream.lease
+            if (
+                chain is None or cursor.done >= len(chain.spans)
+                or chain.spans[cursor.done].walk != graph_walk
+                or stream.converted or stream.stored_len or stream.offloaded or stream.read_pending
+            ):
+                return None
+        if not self._lease(rid, node_name, label, stream, chain):
+            return None
+        with self._lock:
+            return stream.lease
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
+    ) -> bool:
+        """False while some pages are missing and ``caught_up`` is False, since this rank's commit of
+        the step that wrote them can lag rank 0's. Once ``caught_up`` nothing will index a missing
+        page, so it raises. It raises too if the index holds other pages under those keys,
+        since a sharded prefill gathers cache slots across ranks."""
+        with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            if label is None:
+                return True
+            stream = self._ensure_label(rid, label)
+            chain = stream.chain
+            if stream.converted or stream.lease is not None:
+                return True
+            if chain is None or stream.stored_len:
+                raise RuntimeError(
+                    f"KV {self.name}: rank 0 leased {len(pages)} cached pages for {rid}/{label}, "
+                    "whose stream here already holds tokens or has no keys"
+                )
+        self._root(chain)
+        with self._lock:
+            if self._streams.get(rid, {}).get(label) is not stream:
+                return True
+            matched = self._index.lookup(chain.rooted[:len(pages)], stamp=False)
+            if len(matched) < len(pages) and not caught_up:
+                return False
+            if matched != pages:
+                raise RuntimeError(
+                    f"KV {self.name}: prefix index diverged from rank 0 for {rid}/{label}: "
+                    f"pages {matched[:4]}... here ({len(matched)}), {pages[:4]}... there ({len(pages)})"
+                )
+            self._arena.retain(matched)
+            stream.lease, stream.lease_len = matched, len(matched) * self.config.page_size
+            return True
+
+    def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Does nothing at one rank, where preparing the step again reuses the lease. A lease also
+        stays once the cache has served one of the stream's walks, whose KV lives only in the lease."""
+        if self._world_size == 1:
+            return
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(self._keyed_label(rid, node_name, graph_walk))
+            if stream is not None and stream.chain is not None and not stream.span_cursor.done:
+                self._release_lease(rid, stream)
+
+    def page_trail(self) -> tuple[int, int] | None:
+        with self._lock:
+            return self._arena.trail
 
     def _check_positions(self, span: PrefixSpan, graph_walk: str, inputs) -> None:
         assert span.digest is not None or inputs.custom_pos_ids is None, (
@@ -969,6 +1086,9 @@ class KVManager(AttentionResource):
     def _cache_image_end(self, stream: CacheStream, chain: PrefixChain, end: int, key: bytes) -> None:
         """Cache the page up to the image's end. When the text after the image changes,
         a repeat can still reuse it instead of running the walk again."""
+        if self._world_size > 1:
+            # Serving a cached image end takes a page on rank 0 alone, so the ranks' pages would differ.
+            return
         page = end // self.config.page_size
         rooted = fingerprint(self._prefix_root, key)
         parent = self._index.page_for(fingerprint(self._prefix_root, chain.keys[page - 1])) if page else None
@@ -1433,7 +1553,9 @@ class KVManager(AttentionResource):
         overrides = self._overrides[rid]
         needed_labels = overrides.get_labels(node_name, graph_walk)
         rooted: dict[str, list[bytes]] = {}
-        if self._index is not None and overrides.prefix_cache:
+        # Above one rank each rank runs this check at a different step, so it must not stamp or take
+        # cached pages.
+        if self._index is not None and overrides.prefix_cache and self._world_size == 1:
             # hashed here, as `resolve_cached_prefix` hashes outside its lock
             for label, keys in (overrides.prefix_keys or {}).items():
                 if label in needed_labels and keys:
@@ -2392,6 +2514,10 @@ class KVManager(AttentionResource):
                         self._plan_epoch += 1
                         continue
                     stream.stored_len += segment.span
+                    if stream.converted and self._world_size > 1 and stream.chain is not None:
+                        # Above one rank a hit is stamped at commit, which every rank runs in step order,
+                        # so every rank evicts the same pages.
+                        self._index.touch(stream.page_indices[:stream.chain.cursor])
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
                     policy = (
