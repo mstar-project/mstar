@@ -193,14 +193,19 @@ class World:
                 self.walk[rid] = DEC
                 self.rt.set_walk(rid, PART, DEC)
 
+    def remove(self, rid):
+        """The worker's teardown of a request: the scheduler's state, then the
+        runtime's (which holds the Rust core's backlog)."""
+        self.sched.clear_rid(rid, f"r{rid}")
+        self.rt.remove_request(rid)
+        self.rs.remove_request(rid)
+        del self.walk[rid]
+
     def fail_cleanup(self):
         """Failed rows leave the world, as the worker's teardown would."""
         for rid in sorted(self.sched.failed_rids):
             if rid in self.walk:
-                self.sched.clear_rid(rid, f"r{rid}")
-                self.rt.remove_request(rid)
-                self.rs.remove_request(rid)
-                del self.walk[rid]
+                self.remove(rid)
         self.sched.take_admit_errors()
 
     # -- observation ------------------------------------------------------
@@ -337,7 +342,12 @@ def test_both_cores_schedule_the_same(config, seed, leaders, monkeypatch):
                 both(f"undefer {rid}", lambda w, rid=rid: w.sched.pending_removes.pop(rid))
             else:
                 both(f"defer {rid}", lambda w, rid=rid: w.sched.pending_removes.update({rid: None}))
-        elif op < 0.92:
+        elif op < 0.90 and live:
+            # a live request cancelled wherever it is: queued, backlogged or idle
+            rid = rng.choice(live)
+            idle.discard(rid)
+            both(f"cancel {rid}", lambda w, rid=rid: w.remove(rid))
+        elif op < 0.93:
             clock.t += 0.03
         else:
             both("peek", lambda w: w.sched.has_ready_excluding(w.rs, (LLM, DEC)))
@@ -352,27 +362,10 @@ def test_both_cores_schedule_the_same(config, seed, leaders, monkeypatch):
     assert worlds[1].sched._core is not None, "the Rust world must have run the Rust core"
 
 
-def test_the_rust_core_is_chosen_only_where_it_covers_the_worker(monkeypatch):
+def test_a_node_split_by_capture_key_keeps_the_python_core(monkeypatch):
     caps, row_caps = CONFIGS["capped"]
     clock = _Clock()
     monkeypatch.setattr(ms, "time", clock)
     w = World(True, caps, row_caps, 0, clock)
     w.engine.splits_by_capture_key = lambda node, walk: node == ENC
     assert w.sched._rust_core() is None
-    w = World(True, caps, row_caps, 0, clock)
-    assert w.sched._rust_core() is not None
-
-
-def test_a_removed_rid_leaves_the_rust_backlog(monkeypatch):
-    clock = _Clock()
-    monkeypatch.setattr(ms, "time", clock)
-    w = World(True, *CONFIGS["tight"], 0, clock)
-    w.engine.check_ready = lambda *a, **k: FULL_ADMIT_OK
-    rids = [w.admit(i, DEC) for i in range(5)]
-    w.make_ready(rids)
-    batch = w.sched.get_next_batch(w.rs)
-    assert len(batch.request_to_worker_graph) == 2
-    parked = w.backlog()[0][2]
-    assert parked == rids[2:]
-    w.rt.remove_request(parked[0])
-    assert w.backlog()[0][2] == parked[1:]
