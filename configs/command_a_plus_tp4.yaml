@@ -4,6 +4,10 @@ model_kwargs:
   max_seq_len: 65536
   # Optional: checkpoint_dir: /path/to/an/already-downloaded/checkpoint
 
+# FlashInfer's one-kernel all-reduce for up to 2048 tokens of hidden size 4096
+tp_allreduce: flashinfer
+tp_allreduce_max_kb: 16384
+
 resources:
   kv_cache:
     max_num_pages: 8192  # 1M cached tokens shared by all requests, ~32 GB per GPU
