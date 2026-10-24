@@ -940,26 +940,6 @@ class KVManager(AttentionResource):
         with self._lock:
             return self._arena.trail
 
-    def _image_end(self, ends: list[tuple[int, bytes]], held: int, total: int) -> tuple[int, bytes] | None:
-        """The last image in ``ends`` that finishes inside the page after ``held`` slots, if any."""
-        for end, key in reversed(ends):
-            if held < end < min(held + self.config.page_size, total):
-                return end, key
-        return None
-
-    def _hash_chain(
-        self, keys: list[bytes], spans: list[PrefixSpan],
-    ) -> tuple[list[bytes], list[tuple[int, bytes]]]:
-        """A chain's ``rooted`` and ``rooted_ends``. Called outside the lock: one SHA-256 per
-        page, and admit, commit and remove would wait on it."""
-        rooted = [fingerprint(self._prefix_root, key) for key in keys]
-        ends, at = [], 0
-        for span in spans:
-            at += span.length
-            if span.end_key is not None:
-                ends.append((at, fingerprint(self._prefix_root, span.end_key)))
-        return rooted, ends
-
     def _check_positions(self, span: PrefixSpan, graph_walk: str, inputs) -> None:
         assert span.digest is not None or inputs.custom_pos_ids is None, (
             f"KV {self.name}: {graph_walk} places positions of its own, but "
@@ -1120,10 +1100,6 @@ class KVManager(AttentionResource):
         while chain.cursor < filled:
             key = fingerprint(self._prefix_root, chain.keys[chain.cursor])
             page = stream.page_indices[chain.cursor]
-            # Don't index a page under a parent only the index holds. A held child would keep `evict`
-            # from reaching that parent, which the pool counts as evictable.
-            if parent is not None and self._arena.num_owners[parent] == 1:
-                parent = None
             if not self._index.insert(key, page, parent):
                 # another request filled this page first and its copy is the
                 # one the index names; ours stays private to this stream
