@@ -221,3 +221,14 @@ def test_a_guaranteed_lease_of_pages_another_request_holds_gives_their_charge_ba
     kv.apply_cached_prefix("g", NODE, WALK, inputs, kv.resolve_cached_prefix("g", NODE, WALK, inputs))
     leased = len(kv._streams["g"]["main"].lease or ())
     assert leased and kv._room() == room + leased, "g's charge for the pages it leases stayed out of the room"
+
+
+@pytest.mark.parametrize("decides", [True, False])
+def test_only_a_deciding_pool_keeps_a_guaranteed_request_from_the_offload(decides):
+    kv = _pool()
+    _running(kv, "p", 2, arrival=0)
+    _running(kv, "g", 2, arrival=1, guaranteed=True)
+    kv._decides = decides
+    # Only a deciding pool reserves a guaranteed request's pages and drops requests to free room.
+    # Any other pool frees room only through the offload, which has to be able to take any request.
+    assert kv.reclaimable("p") and bool(kv.reclaimable("g")) is not decides, "the offload saw the wrong class"
