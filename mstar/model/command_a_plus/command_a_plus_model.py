@@ -18,7 +18,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.command_a_plus.assets import resolve_metadata
 from mstar.model.command_a_plus.config import (
     GLOBAL_ATTN,
@@ -129,6 +129,13 @@ class CommandAPlusModel(Model):
         supplied = model_kwargs or {}
         return {SAMPLER: SamplingReqConfig(**{key: supplied.get(key, val) for key, val in defaults.items()})}
 
+    def get_loop_caps(self, **model_kwargs):
+        # Prefill samples the first token, so decode runs one fewer.
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def kv_labels(self):
+        return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
+
     def get_default_sharding_config(self):
         return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
 
@@ -218,7 +225,12 @@ class CommandAPlusModel(Model):
             )
         if ids.dtype not in (torch.int32, torch.int64) or bool(((ids < 0) | (ids >= self.config.vocab_size)).any()):
             raise ValueError("Prompt token IDs must be integers within the vocabulary")
-        return {"text_inputs": [ids.to(dtype=torch.long)]}
+        layout = LabelLayout(
+            spans=(Span("ids", "prefill", ids.numel(), ids.numel(), "text_inputs"),), growth=(("decode_loop", 1),),
+        )
+        return ProcessPromptOutput(
+            {"text_inputs": [ids.to(dtype=torch.long)]}, {"kv_layout": {KV_CACHE: {"main": layout}}},
+        )
 
     def postprocess(self, output, modality, request_kwargs=None):
         if modality != "text":

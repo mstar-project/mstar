@@ -259,8 +259,11 @@ class ModelIntegrationTests(unittest.TestCase):
         self.model._tokenizer = tokenizer
         # Room for the default output cap, which counts toward max_seq_len.
         self.model.max_seq_len = MAX_OUTPUT_TOKENS + 8
-        result = self.model.process_prompt("hello", ["text"], ["text"])
-        self.assertEqual(result["text_inputs"][0].tolist(), [2, 10, 11])
+        tensors, metadata = self.model.process_prompt("hello", ["text"], ["text"])
+        self.assertEqual(tensors["text_inputs"][0].tolist(), [2, 10, 11])
+        layout = metadata["kv_layout"]["kv_cache"]["main"]
+        self.assertEqual([span.length for span in layout.spans], [3])
+        self.assertEqual(layout.growth, (("decode_loop", 1),))
         tokenizer.apply_chat_template.assert_called_once_with(
             [{"role": "user", "content": "hello"}], tokenize=True,
             add_generation_prompt=True, return_dict=False,
