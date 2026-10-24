@@ -17,6 +17,8 @@ from __future__ import annotations
 import ctypes
 import functools
 import logging
+import weakref
+from typing import NamedTuple
 
 import torch
 
@@ -55,27 +57,53 @@ class TorchCopier(PageCopier):
                 dst[:, dst_idx].copy_(src[:, src_idx], non_blocking=True)
 
 
+class _Layout(NamedTuple):
+    dst: weakref.ref
+    src: weakref.ref
+    width: int
+    height: int
+    dst_ptr: int
+    dst_pitch: int
+    dst_page: int
+    src_ptr: int
+    src_pitch: int
+    src_page: int
+
+
 class _Memcpy2DCopier(PageCopier):
     """One ``cudaMemcpy2DAsync`` per page; subclasses supply the call."""
+
+    def __init__(self):
+        # Each pair of caches is checked once, keyed by the two tensors' ids. The tensors are held weakly, so
+        # this process-wide copier doesn't keep a freed cache alive, and a later tensor with the same id is
+        # checked again.
+        self._layouts: dict[tuple[int, int], _Layout] = {}
 
     def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream) -> int:
         raise NotImplementedError
 
-    def copy(self, dst, dst_pages, src, src_pages, stream):
+    def _check(self, dst: torch.Tensor, src: torch.Tensor) -> _Layout:
         assert dst[0, 0].is_contiguous() and src[0, 0].is_contiguous()
         assert dst.dtype == src.dtype and dst.shape[0] == src.shape[0]
         assert dst.shape[2:] == src.shape[2:]
         elt = dst.element_size()
-        width = dst[0, 0].numel() * elt
-        dst_pitch, dst_page = dst.stride(0) * elt, dst.stride(1) * elt
-        src_pitch, src_page = src.stride(0) * elt, src.stride(1) * elt
-        dst_ptr, src_ptr = dst.data_ptr(), src.data_ptr()
+        return _Layout(
+            weakref.ref(dst), weakref.ref(src), dst[0, 0].numel() * elt, dst.shape[0],
+            dst.data_ptr(), dst.stride(0) * elt, dst.stride(1) * elt,
+            src.data_ptr(), src.stride(0) * elt, src.stride(1) * elt,
+        )
+
+    def copy(self, dst, dst_pages, src, src_pages, stream):
+        layout = self._layouts.get((id(dst), id(src)))
+        if layout is None or layout.dst() is not dst or layout.src() is not src:
+            layout = self._layouts[id(dst), id(src)] = self._check(dst, src)
+        _, _, width, height, dst_ptr, dst_pitch, dst_page, src_ptr, src_pitch, src_page = layout
         handle = stream.cuda_stream
         for dst_idx, src_idx in zip(dst_pages, src_pages, strict=True):
             err = self._memcpy_2d(
                 dst_ptr + dst_idx * dst_page, dst_pitch,
                 src_ptr + src_idx * src_page, src_pitch,
-                width, dst.shape[0], handle,
+                width, height, handle,
             )
             if err != 0:
                 raise RuntimeError(f"cudaMemcpy2DAsync failed with error {err}")
@@ -89,6 +117,7 @@ class CudaBindingsCopier(_Memcpy2DCopier):
     def __init__(self):
         from cuda.bindings import runtime
 
+        super().__init__()
         self._runtime = runtime
         self._default = runtime.cudaMemcpyKind.cudaMemcpyDefault
 
@@ -107,6 +136,7 @@ class _MappedRuntimeCopier(_Memcpy2DCopier):
     _lib = _symbol = ""
 
     def __init__(self):
+        super().__init__()
         torch.cuda.init()
         with open("/proc/self/maps") as maps:
             paths = {
