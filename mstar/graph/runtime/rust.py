@@ -655,6 +655,44 @@ class RustGraphRuntime(GraphRuntime):
             ),
         )
 
+    supports_check_stops_inline = True
+
+    def set_stop_rules(
+        self, node_name: str, graph_walk: str,
+        loops: list[str], ar: list[bool], eos: list[list[int]],
+    ) -> None:
+        """(node, walk)'s declared stop rules, one entry per policy."""
+        self._rust.set_stop_rules(node_name, graph_walk, loops, ar, eos)
+
+    def set_stop_limits(
+        self, graph_walk: str, rids: list[int], limits: list[tuple[tuple[int, bool], ...]],
+    ) -> None:
+        """Per rid, its (max_iters, ignore_eos) for each of the walk's rules."""
+        n_rules = len(limits[0]) if limits else 0
+        cap = (1 << 32) - 1
+        self._rust.set_stop_limits(
+            graph_walk, rids,
+            [[min(row[k][0], cap) for row in limits] for k in range(n_rules)],
+            [[row[k][1] for row in limits] for k in range(n_rules)],
+        )
+
+    def check_stops_inline(
+        self, partition: str, node_name: str, graph_walk: str, rids: list[int],
+        tokens: torch.Tensor | None, row_rids: list[int],
+    ) -> tuple[list[int], list[int], list[int]]:
+        """The declared stop rules over a step's rows; see the Rust side.
+        ``tokens`` is a 1-D host view (row i for ``row_rids[i]``) the caller
+        keeps alive, or None when no rule reads a token."""
+        if tokens is None:
+            ptr = rows = stride = 0
+            dtype = ""
+        else:
+            ptr, rows, stride = tokens.data_ptr(), tokens.shape[0], tokens.stride(0)
+            dtype = _dtype_name(tokens.dtype)
+        return self._rust.check_stops_inline(
+            partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids,
+        )
+
     supports_route_and_send_inline = True
 
     def route_and_send_inline(
