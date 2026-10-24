@@ -21,11 +21,14 @@ class StreamChunk:
     # items in this chunk (context included); lets a consumer pick its
     # capture bucket before the chunk tensor is unpacked
     num_items: int = 0
+    # whether an item of this chunk finished the producer's graph walk
+    finished_graph_walk: bool = True
 
     @property
     def info(self) -> "StreamChunkInfo":
         return StreamChunkInfo(
             self.start_offset, self.context_items, self.num_items, self.is_final,
+            self.finished_graph_walk,
         )
 
 
@@ -35,6 +38,7 @@ class StreamChunkInfo(NamedTuple):
     context_items: int
     num_items: int
     is_final: bool
+    finished_graph_walk: bool = True
 
 
 class StreamingEdge(NamedTuple):
@@ -64,7 +68,11 @@ class StreamBuffer:
     ingested_chunk: StreamChunkInfo | None = None
 
     _buffer: list = field(default_factory=list)
+    # parallel to _buffer: whether each item finished the producer's walk
+    _finished_walk: list = field(default_factory=list)
     _tensor_ids_in_order: deque = field(default_factory=deque)
+    # parallel to _tensor_ids_in_order
+    _finished_walk_in_order: deque = field(default_factory=deque)
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
     _chunks_popped: int = 0
@@ -91,9 +99,10 @@ class StreamBuffer:
         self.policy.prime(context_items)
         self._delivered_end = context_items
 
-    def pre_read_register(self, tensor_id: str):
+    def pre_read_register(self, tensor_id: str, finished_graph_walk: bool = True):
         self._num_tensors_registered += 1
         self._tensor_ids_in_order.append(tensor_id)
+        self._finished_walk_in_order.append(finished_graph_walk)
 
     def put(self, tensor_id: str, item: torch.Tensor) -> None:
         """Called when a tensor arrives via normal RDMA routing."""
@@ -106,6 +115,7 @@ class StreamBuffer:
                 return
             self._tensor_ids_in_order.popleft()
             self._buffer.append(self._id_to_tensor[tensor_id])
+            self._finished_walk.append(self._finished_walk_in_order.popleft())
             self._num_buffer_writes += 1
             del self._id_to_tensor[tensor_id]
 
@@ -162,15 +172,19 @@ class StreamBuffer:
         if self._producer_done_and_all_read() and not self.policy.is_ready(buf_len):
             # Flush remainder — return whatever is left (may be empty)
             items = list(self._buffer)
+            finished = list(self._finished_walk)
             self._buffer.clear()
+            self._finished_walk.clear()
             self._consumed += len(items)
             stride = len(items)
         else:
             stride = self.policy.next_chunk_size(buf_len)
             # Return the first `window` items (overlapping sliding window)
             items = self._buffer[:window]
+            finished = self._finished_walk[:len(items)]
             # Advance by stride — discard items that fell out of the window
             self._buffer = self._buffer[stride:]
+            self._finished_walk = self._finished_walk[stride:]
             self._consumed += stride
         self.policy.register_chunk(stride)
 
@@ -189,6 +203,7 @@ class StreamBuffer:
             is_final=is_final,
             context_items=min(max(self._delivered_end - offset, 0), len(items)),
             num_items=len(items),
+            finished_graph_walk=any(finished) or not items,
         )
         self._delivered_end = max(self._delivered_end, offset + len(items))
         self._chunks_popped += 1

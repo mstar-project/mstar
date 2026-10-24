@@ -19,7 +19,7 @@ Build: ``maturin develop --release`` in ``rust/`` (see ``docs/installation.rst``
 from __future__ import annotations
 
 import time as _time
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from copy import deepcopy
 from typing import get_args
 
@@ -440,10 +440,13 @@ class RustGraphRuntime(GraphRuntime):
 
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
+        incomplete_node_rids: Collection[int] = (),
+        incomplete_walk_rids: Collection[int] = (),
     ) -> FreedTensors:
-        return FreedTensors(
-            *self._rust.cleanup_consumed_inputs(node_name, rids, wg_ids)
-        )
+        return FreedTensors(*self._rust.cleanup_consumed_inputs(
+            node_name, rids, wg_ids,
+            list(incomplete_node_rids), list(incomplete_walk_rids),
+        ))
 
     # --------- Scheduling ----------
 
@@ -599,6 +602,8 @@ class RustGraphRuntime(GraphRuntime):
             "inline_values": list(input.inline_values),
             "walks": input.walks,
             "rid_walk_idx": input.rid_walk_idx,
+            "incomplete_node_rids": list(input.incomplete_node_rids),
+            "incomplete_walk_rids": list(input.incomplete_walk_rids),
         })
         return RouteOutput(
             completion_id=out.completion_id,

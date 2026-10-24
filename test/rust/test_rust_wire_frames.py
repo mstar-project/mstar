@@ -62,8 +62,9 @@ def _node(name, inputs, outs, modality="", streaming=False):
         "streaming_inputs": [],
         "outputs": [
             {"name": sig, "dest": dest, "persist": persist,
-             "new_token": False, "streaming": streaming, "modality": modality}
-            for sig, dest, persist in outs
+             "new_token": False, "streaming": edge[0] if edge else streaming, "modality": modality}
+            # an optional fourth field makes that one edge streaming
+            for sig, dest, persist, *edge in outs
         ],
     }
 
@@ -99,13 +100,15 @@ class _Mesh:
             [], [],
         )
 
-    def run(self, rid, uuids, **send_kwargs):
+    def run(self, rid, uuids, incomplete_node_rids=(), incomplete_walk_rids=(), **send_kwargs):
         """Ingest, pop, complete and send. Returns the frames each peer got."""
         self.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
         self.rt.pop_rids("only", WALK, [rid])
         signals = self.rt.get_output_signals("only", WALK)
         out = self.rt.complete_and_route_batch({
             "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
+            "incomplete_node_rids": list(incomplete_node_rids),
+            "incomplete_walk_rids": list(incomplete_walk_rids),
             "output_signals": signals, "rids": [rid], "wg_ids": [WG_ID],
             "tensors": list(uuids),
             "num_tensors": [
@@ -293,6 +296,30 @@ def test_data_extensions_survive_rust_frame_splicing(tmp_path):
     assert got["tags"] == {"a", "b"}
     assert got["mapping"] == {(1, "x"): frozenset({2, 3})}
     np.testing.assert_array_equal(got["mask"], fwd.step_metadata["mask"])
+
+
+@pytest.mark.parametrize("node_done, walk_done", [(True, True), (False, False), (True, False)])
+def test_only_a_non_final_chunks_stream_is_marked_partial(tmp_path, node_done, walk_done):
+    """A non-final chunk's streamed output goes out marked; a step that
+    finished its node but not its walk streams whole items. Neither reports
+    a worker graph done."""
+    mesh = _Mesh(
+        tmp_path, outs=[("states", "remote", False, True)],
+        remote=[{"wg_id": 1, "graph_walks": [WALK],
+                 "nodes": ["remote"], "dyn_loops": []}],
+    )
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    info = _put(mesh, 1)
+    got = mesh.run(
+        rid, uuids=[1], incomplete_node_rids=[] if node_done else [rid],
+        incomplete_walk_rids=[] if walk_done else [rid],
+    )
+
+    [frame] = got[PEER]
+    [edge] = frame.body.inputs
+    assert (edge.name, edge.tensor_info) == ("states", [info])
+    assert edge.finished_graph_walk == node_done
+    assert bool(got["conductor"]) == walk_done
 
 
 def test_a_persist_signal_rides_the_worker_graphs_done(tmp_path):
@@ -529,6 +556,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
     rt.pop_rids("only", WALK, [rid])
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
+        "incomplete_node_rids": [], "incomplete_walk_rids": [],
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -574,6 +602,7 @@ def _persist_mesh(tmp_path, tp_rank):
     rt.pop_rids("only", WALK, [rid])
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
+        "incomplete_node_rids": [], "incomplete_walk_rids": [],
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -675,6 +704,7 @@ def _fanout_mesh(tmp_path, shard_dim=None, dims=(4, 3), nbytes=24, stride=None):
     rt.pop_rids("src", WALK, [rid])
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "src",
+        "incomplete_node_rids": [], "incomplete_walk_rids": [],
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -804,6 +834,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0,
     rt.pop_rids("src", WALK, [rid])
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "src",
+        "incomplete_node_rids": [], "incomplete_walk_rids": [],
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -908,6 +939,7 @@ def _iterate(rt, book, rid, uuid, stop_first=False):
         rt.stop_loops_batched("default", WALK, "ar_decode", [rid], [["ar_loop"]])
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "ar_decode",
+        "incomplete_node_rids": [], "incomplete_walk_rids": [],
         "output_signals": ["out", "token"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [uuid], "num_tensors": [1, 0],
     })
@@ -975,6 +1007,7 @@ def test_an_output_nobody_runs_is_an_error(tmp_path):
     mesh.rt.pop_rids("only", WALK, [rid])
     out = mesh.rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
+        "incomplete_node_rids": [], "incomplete_walk_rids": [],
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
@@ -1007,6 +1040,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
     mesh.rt.pop_rids("only", WALK, [keep, doomed])
     out = mesh.rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None, "node_name": "only",
+        "incomplete_node_rids": [], "incomplete_walk_rids": [],
         "output_signals": ["kv"], "rids": [keep, doomed],
         "wg_ids": [WG_ID, WG_ID], "tensors": [1, 2], "num_tensors": [1, 1],
     })
@@ -1065,7 +1099,7 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": "prefill", "node_name": "only",
         "output_signals": ["out"], "rids": rids, "tensors": [], "num_tensors": [0, 0],
-        "walks": ["prefill", "decode"], "rid_walk_idx": [0, 1],
+        "walks": ["prefill", "decode"], "rid_walk_idx": [0, 1], "incomplete_node_rids": [], "incomplete_walk_rids": [],
     })
     _send(rt, out.completion_id, request_infos=[(rid, None) for rid in rids],
           new_token_counts=[], stream_tokens_consumed=[], profiling=[])

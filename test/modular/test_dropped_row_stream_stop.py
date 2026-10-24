@@ -77,7 +77,7 @@ class _Runtime:
     def pending_loop_stop_rids(self, graph_walk, loop_name):
         return set(self.pending_stops)
 
-    def cleanup_consumed_inputs(self, node, rids, wgs):
+    def cleanup_consumed_inputs(self, node, rids, wgs, incomplete_node_rids=(), incomplete_walk_rids=()):
         return [], []
 
     def clear_pending_loop_stops(self):
