@@ -69,6 +69,11 @@ def _rollout_capture_batch_sizes(step_batch_size: int) -> list[int]:
     return sizes
 
 
+# The prime-walk capture and the decode compile share this mode. max-autotune
+# until the default compile level (mstar serve -O) is measured on Waypoint.
+_COMPILE_MODE = "max-autotune-no-cudagraphs"
+
+
 class _SingleRequestMixin:
     """Serve one request per step, through the engine's batched entry point.
 
@@ -145,12 +150,11 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         self.dit = dit
         self.taehv = taehv
         self.config = config
-        # The engine's own capture arguments at the deployment's compile level
-        # (``mstar serve -O``), so Inductor picks the same kernels bit-for-bit.
-        # Wrapping just the decode call keeps the engine from compiling across
-        # the denoise/decode boundary.
+        # The prime-walk capture's own arguments, so Inductor picks the same
+        # kernels bit-for-bit. Wrapping just the decode call keeps the engine
+        # from compiling across the denoise/decode boundary.
         self._decode_latent = (
-            torch.compile(decode_latent, **compile_kwargs(None))
+            torch.compile(decode_latent, **compile_kwargs(_COMPILE_MODE))
             if config.accelerator_graph else decode_latent
         )
 
@@ -710,6 +714,7 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
                 dtype=self.ae_dtype, device=device,
             )
             configs.append(BatchedAcceleratorGraphConfig(
+                compile_mode=_COMPILE_MODE,
                 capture_graph_walk=PRIME_WALK,
                 single_request_inputs=NodeInputs(
                     tensor_inputs={"image": image},
