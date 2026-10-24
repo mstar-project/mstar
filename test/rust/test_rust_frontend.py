@@ -514,6 +514,71 @@ def test_generate_accepts_both_content_types(stack):
     assert all(s["mk"] == {"foo": 1} for s in stub.submitted)
 
 
+_REQUEST_ID_ERROR = "request_id must be at most 128 characters from [A-Za-z0-9._:-]"
+
+
+def _post_generate(port, fields, urlencoded, upload=None):
+    """POST /generate with ``fields`` and, multipart only, an ``upload``
+    ``(filename, bytes)`` sent first; returns (status, body)."""
+    import urllib.parse
+
+    if urlencoded:
+        data = urllib.parse.urlencode(fields).encode()
+        ctype = "application/x-www-form-urlencoded"
+    else:
+        boundary = "----ridboundary"
+        head = f"--{boundary}\r\nContent-Disposition: form-data; "
+        parts = [f'{head}name="files"; filename="{upload[0]}"\r\n\r\n'.encode() + upload[1] + b"\r\n"] if upload else []
+        parts += [f'{head}name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields.items()]
+        data = b"".join(parts) + f"--{boundary}--\r\n".encode()
+        ctype = f"multipart/form-data; boundary={boundary}"
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/generate",
+                                 data=data, headers={"Content-Type": ctype})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+@pytest.mark.parametrize("urlencoded", [False, True])
+def test_generate_limits_a_client_request_id(stack, urlencoded):
+    """Same 400 and message as the Python /generate (``REQUEST_ID_ERROR``, which
+    test_request_id_limit.py pins to the same text); a 128-character id is served."""
+    port, stub, _bridge, _proc = stack
+    for request_id in ("a" * 129, "caf\u00e9", "a b"):
+        for streaming in ("true", "false"):
+            fields = {"text": "hi", "streaming": streaming, "request_id": request_id}
+            status, body = _post_generate(port, fields, urlencoded)
+            assert (status, json.loads(body)) == (400, {"detail": _REQUEST_ID_ERROR}), (request_id, streaming)
+    assert stub.submitted == []
+    for streaming in ("true", "false"):
+        fields = {"text": "hi", "streaming": streaming, "request_id": "a" * 128}
+        assert _post_generate(port, fields, urlencoded)[0] == 200
+    assert [s["rid"] for s in stub.submitted] == ["a" * 128] * 2
+
+
+@pytest.mark.parametrize("urlencoded", [False, True])
+def test_generate_treats_an_empty_request_id_as_none(stack, urlencoded):
+    """Like the Python /generate: each request gets a fresh id, so two with
+    ``request_id=""`` never collide on ``""``."""
+    port, stub, _bridge, _proc = stack
+    for streaming in ("true", "false"):
+        fields = {"text": "hi", "streaming": streaming, "request_id": ""}
+        assert _post_generate(port, fields, urlencoded)[0] == 200
+    rids = [s["rid"] for s in stub.submitted]
+    assert len(rids) == 2 and "" not in rids and rids[0] != rids[1]
+
+
+def test_generate_refusing_a_request_id_removes_its_uploads():
+    import os
+
+    with _model_stack("qwen3_omni", _StubAPIServer()) as (port, upload_dir):
+        status, _ = _post_generate(port, {"request_id": "a b"}, urlencoded=False, upload=("obs.png", b"PNG"))
+        assert status == 400
+        assert os.listdir(upload_dir) == []
+
+
 _FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42FAKE-MP4-BYTES"
 _TINY_PNG_DATA_URI = "data:image/png;base64,iVBORw0KGgo="
 

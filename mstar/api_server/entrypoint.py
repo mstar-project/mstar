@@ -8,6 +8,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import re
 import signal
 import sys
 import threading
@@ -70,6 +71,20 @@ NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
 # rather than shared with ``mstar.client.media`` so the SDK keeps its stdlib-only
 # import contract; ``test_binary_framing.py`` asserts the two stay equal.
 BINARY_STREAM_MEDIA_TYPE = "application/vnd.mstar.frames"
+
+# A request's id rides in every control message about it, so a client-pinned
+# one is kept short. The Rust frontend (rust/server/src/main.rs) mirrors this.
+MAX_REQUEST_ID_LEN = 128
+_REQUEST_ID_RE = re.compile(rf"[A-Za-z0-9._:-]{{0,{MAX_REQUEST_ID_LEN}}}")
+REQUEST_ID_ERROR = f"request_id must be at most {MAX_REQUEST_ID_LEN} characters from [A-Za-z0-9._:-]"
+
+
+def check_request_id(request_id: str | None) -> None:
+    """Raise ``ValueError`` unless ``request_id`` is None or fits :data:`_REQUEST_ID_RE`."""
+    if request_id is not None and (
+        not isinstance(request_id, str) or _REQUEST_ID_RE.fullmatch(request_id) is None
+    ):
+        raise ValueError(REQUEST_ID_ERROR)
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -562,6 +577,7 @@ class APIServer:
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
+        check_request_id(request_id)
 
         for m in input_modalities + output_modalities:
             if m not in SUPPORTED_MODALITIES:
@@ -1633,6 +1649,10 @@ async def generate_ws(websocket: WebSocket):
         try:
             if request_id is not None and not isinstance(request_id, str):
                 raise ValueError("request_id must be a string")
+            if request_id == "":
+                # An empty form field reaches /generate as None; same here.
+                request_id = None
+            check_request_id(request_id)
             out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
             text = message.get("text")
             if text is not None and not isinstance(text, str):
@@ -1776,6 +1796,10 @@ async def generate(
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
+    try:
+        check_request_id(request_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
 
     # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
     # HTML checkbox) instead of its declared default, for Optional[bool] too.
