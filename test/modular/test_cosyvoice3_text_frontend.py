@@ -365,6 +365,8 @@ def test_a_long_run_of_thousands_groups_or_commas_takes_linear_time():
         (normalize_english, "1" + ",234" * 10_000),
         (normalize_english, "1,23" * 10_000),
         (lambda t: frontend.normalize(t, chinese=True), "好" + "，" * 40_000),
+        # each closing quote used to copy the whole sentence before it
+        (frontend.normalize, "a" * 200_000 + '."' * 200_000),
     ]:
         start = time.perf_counter()
         normalize(text)

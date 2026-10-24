@@ -117,20 +117,22 @@ def close_sentences(text: str, lang: str) -> str:
         return ""
     if text[-1] not in stops:
         text += "。" if lang == "zh" else "."
-    sentences: list[str] = []
+    # fragments, joined once at the end: appending each closing quote to the
+    # previous sentence's string copies it, quadratic on a run of '."'
+    sentences: list[list[str]] = []
     start = 0
     for i, c in enumerate(text):
         if c not in stops:
             continue
         if i > start:
-            sentences.append(text[start:i] + c)
+            sentences.append([text[start:i], c])
         if i + 1 < len(text) and text[i + 1] in _CLOSING_QUOTES:
             if sentences:
-                sentences[-1] += text[i + 1]
+                sentences[-1].append(text[i + 1])
             start = i + 2
         else:
             start = i + 1
-    joined = "".join(sentences)
+    joined = "".join(part for sentence in sentences for part in sentence)
     if all(unicodedata.category(c)[0] in "PSZ" for c in joined):
         return ""
     return joined
