@@ -56,6 +56,9 @@ class _Sub:
     def can_batch(self, batch, model_inputs):
         return True
 
+    def get_stop_policies(self, graph_walk):
+        return None  # check_stop decides
+
     def check_stop(self, rid, info, outputs):
         if self.stage == "check_stop" and rid in self.bad:
             raise RuntimeError("bad stop check")
@@ -90,6 +93,8 @@ def _engine(sub):
     eng._submodules = {NODE: SimpleNamespace(submodule=sub, resources={})}
     eng._enable_nvtx = False
     eng._loopback_steps = {}
+    eng._stop_policies = {}
+    eng._stop_limits = {}
     eng._runner = StepRunner({})
     return eng
 

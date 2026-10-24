@@ -30,6 +30,8 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopKind,
+    StopPolicy,
 )
 from mstar.model.whisper.components.decoder import WhisperDecoderModel
 from mstar.model.whisper.config import (
@@ -339,6 +341,13 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
+
+    def get_stop_policies(self, graph_walk: str) -> tuple[StopPolicy, ...]:
+        # check_stop's EOS / token-budget test, on every walk
+        return (StopPolicy(
+            StopKind.AR, "decode_loop", token_signal="new_token",
+            eos_tokens=(self.config.eos_token_id,), sampler=SAMPLER,
+        ),)
 
     def check_stop(
         self,
