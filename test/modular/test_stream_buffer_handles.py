@@ -109,3 +109,23 @@ def test_an_empty_final_chunk_carries_no_items():
     buf.signal_done(2)
     se = w._pop_streaming_edge(buf, EDGE, RID)
     assert se.chunk.is_final and se.edge.tensor_info == []
+
+
+def test_maybe_ready_is_set_by_whatever_can_ready_a_chunk_and_cleared_by_an_empty_poll():
+    w, tm, buf = _consumer(window=2, stride=2)
+    assert w._pop_streaming_edge(buf, EDGE, RID) is None
+    assert not buf.maybe_ready, "an empty poll clears it"
+    _produce(tm, buf, [1])
+    assert buf.maybe_ready, "an arriving item sets it"
+    assert w._pop_streaming_edge(buf, EDGE, RID) is None and not buf.maybe_ready
+    _produce(tm, buf, [2], first_uuid=200)
+    se = w._pop_streaming_edge(buf, EDGE, RID)
+    assert se is not None and buf.maybe_ready, "a pop may leave another chunk"
+    assert w._pop_streaming_edge(buf, EDGE, RID) is None and not buf.maybe_ready
+    buf.store_uningested_edge(se)
+    assert buf.maybe_ready, "a refused edge coming back sets it"
+    assert w._pop_streaming_edge(buf, EDGE, RID) is se
+    assert w._pop_streaming_edge(buf, EDGE, RID) is None and not buf.maybe_ready
+    buf.signal_done(2)
+    assert buf.maybe_ready, "the producer's done signal sets it"
+    assert w._pop_streaming_edge(buf, EDGE, RID).chunk.is_final
