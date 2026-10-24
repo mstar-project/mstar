@@ -12,7 +12,8 @@ to whichever request gets that handle next. Known handle-keyed state:
 MicroScheduler.{failed_rids, admit_errors, held_until, backlog} (purged by
 clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,
 streaming_buffers}, the engine's and tensor manager's per-request state,
-RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes} (purged by
+RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode,
+_unkeyed, _admit_restores, _admit_snaps, _preplan_prefix} (purged by
 remove_request), and WorkerProfileInfo.
 
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a

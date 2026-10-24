@@ -98,6 +98,13 @@ class SnapshotTarget(NamedTuple):
     slot: int
 
 
+class DecodeSnapshot(NamedTuple):
+    slot: int
+    tokens: int
+    # None until the KV chain keys its page
+    key: bytes | None = None
+
+
 @dataclass(frozen=True)
 class RecurrentAddressing:
     """Where one label's rows live this step: the pool's whole plan output.
@@ -203,10 +210,14 @@ class RecurrentStatePool(Resource):
         # admit to plan.
         # `_snap_writes` holds the slots admit reserved for a prefill's states,
         # by (rid, label, boundary), until commit files them.
+        # `_decode` holds each stream's newest decode snapshot, and `_unkeyed`
+        # those whose page the KV chain doesn't key yet.
         self._keyed: set[tuple[str, str]] = set()
         self._leases: dict[str, SnapshotLease] = {}
         self._restores: dict[tuple[str, str], SnapshotLease] = {}
         self._snap_writes: dict[tuple[str, str, int], SnapshotWrite] = {}
+        self._decode: dict[tuple[str, str], DecodeSnapshot] = {}
+        self._unkeyed: set[tuple[str, str]] = set()
         # what admits took for prefix reuse, for `rollback_admit`, and the
         # part of it the pre-plan pass took, for `clear_preplan`
         self._admit_restores: list[tuple[str, str]] = []
@@ -256,6 +267,12 @@ class RecurrentStatePool(Resource):
             # reserved by an admit whose step never committed (its forward raised)
             for key in [k for k in self._snap_writes if k[0] == rid]:
                 self._snap_free.append(self._snap_writes.pop(key).slot)
+            # a filed decode snapshot stays, for the next turn of the chat
+            for key in [k for k in self._decode if k[0] == rid]:
+                decode = self._decode.pop(key)
+                if key in self._unkeyed:
+                    self._unkeyed.discard(key)
+                    self._snap_free.append(decode.slot)
             self._keyed -= {k for k in self._keyed if k[0] == rid}
             self._forget_prefix_admit(lambda key: key[0] == rid)
 
@@ -479,6 +496,7 @@ class RecurrentStatePool(Resource):
                 self._forget_taken(ctx.is_real_row)
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
+            page = self._kv.config.page_size if self._kv is not None else 0
             for segment in step.segments or ():
                 if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                     continue
@@ -487,8 +505,13 @@ class RecurrentStatePool(Resource):
                     # the backend already wrote the pool; a later step resumes
                     slot.has_state = True
                     slot.tokens += segment.span
+                    # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its forward
+                    if page and segment.span < page and not slot.tokens % page:
+                        self._save_decode(segment.request_id, segment.label, slot)
             if self._snap_writes:
                 self._file_writes(step)
+            if self._unkeyed:
+                self._file_decodes()
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -725,6 +748,50 @@ class RecurrentStatePool(Resource):
         self._snap_by_key[key] = snap
         self._snap_meta[snap] = key
         return True
+
+    def _save_decode(self, rid: str, label: str, slot: SlotState) -> None:
+        """Copy ``slot`` into a snapshot that replaces the stream's previous
+        decode snapshot. Caller holds the lock."""
+        if (rid, label) not in self._keyed:
+            return
+        previous = self._decode.pop((rid, label), None)
+        if previous is not None:
+            self._drop_decode((rid, label), previous)
+        snap = self._reserve_snapshot()
+        if snap is None:
+            return
+        for tensor in self._blocks.values():
+            tensor[:, snap].copy_(tensor[:, slot.index])
+        self._decode[(rid, label)] = DecodeSnapshot(snap, slot.tokens)
+        self._unkeyed.add((rid, label))
+
+    def _drop_decode(self, key: tuple[str, str], decode: DecodeSnapshot) -> None:
+        """Put a decode snapshot's slot back on the free list. One that eviction
+        already took is left alone, and one a lease or restore holds is left for
+        eviction. Caller holds the lock."""
+        if key in self._unkeyed:
+            self._unkeyed.discard(key)
+        elif self._snap_by_key.get(decode.key) != decode.slot or decode.slot in self._snap_refs:
+            return
+        else:
+            del self._snap_by_key[decode.key]
+            del self._snap_meta[decode.slot]
+        self._snap_free.append(decode.slot)
+
+    def _file_decodes(self) -> None:
+        """File each decode snapshot whose page the KV chain keys by now: its
+        ids reach the chain after the step that wrote them. Caller holds the lock."""
+        page = self._kv.config.page_size
+        for key in list(self._unkeyed):
+            decode = self._decode[key]
+            name = self._kv.chain_key(*key, decode.tokens // page)
+            if name is None:
+                continue
+            self._unkeyed.discard(key)
+            if self._index(decode.slot, name):
+                self._decode[key] = decode._replace(key=name)
+            else:
+                del self._decode[key]
 
     def _undo_prefix_admit(self, is_mine) -> None:
         """For each record ``is_mine`` accepts, turn its restore back into a
