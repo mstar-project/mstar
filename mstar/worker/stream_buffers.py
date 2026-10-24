@@ -247,8 +247,9 @@ class StreamBufferManager:
         collated: a chunk's edge carries one uuid per item, and the items are
         stacked here, when the consuming batch is built. A one-item chunk is
         that item, unstacked."""
+        tm = self._tensor_manager
         out = edges.to_input_tensors(
-            self._tensor_manager.get_tensor, rids, skip_missing=skip_missing,
+            tm.get_tensor, rids, skip_missing=skip_missing, get_tensors=tm.get_tensors,
         )
         signals = [e for e, n in self.consumer_node.items() if n == node_name]
         if signals:
