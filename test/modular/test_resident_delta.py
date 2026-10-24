@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,7 @@ sys.path.insert(0, ".")
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     OffloadDelta,
     RemoveRequest,
@@ -195,6 +197,12 @@ class _Engine:
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
     take_resident_delta = Engine.take_resident_delta
+
+    def decide_cached_prefix(self, batch):
+        return {}
+
+    def page_trails(self, node_name):
+        return {}
 
     def __init__(self, role: str = "leader"):
         """``role`` is this rank's part for ``"node"``: ``leader`` (rank 0 of a
@@ -917,6 +925,7 @@ class _ForwardingLeader:
     _remove_request = Worker._remove_request
     _removal_step_reached = Worker._removal_step_reached
     _rid = Worker._rid
+    _mark_removed = Worker._mark_removed
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False
@@ -935,6 +944,8 @@ class _ForwardingLeader:
         self._draining_rids: set[str] = set()
         self._pending_drains: set[str] = set()
         self._reads_done_sent: set[str] = set()
+        self._removed_rids: RecentSet[str] = RecentSet(16)
+        self._unprocessed_messages: dict = {}
         group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
         # The runtime owns the handle table and the sharding config now, and
         # ``remove_request`` there is what frees the handle.
@@ -1106,6 +1117,7 @@ class _SpecParent:
                 return {"r0": 0}
 
         self.batch = _Batch()
+        self.node_batch = SimpleNamespace(commit_done=threading.Event())
 
 
 def test_the_async_follow_path_will_not_build_mid_replay():

@@ -25,6 +25,7 @@ from test_kv_prefix_correctness import _Node as _TextNode
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.engine.resources import StepContext
+from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep
 from mstar.engine.resources.position.config import PositionStep
@@ -91,7 +92,7 @@ class _Node(_TextNode):
 
     def __init__(self, seeded: list = PARTS, parts: list | None = None, decode: int = 0):
         super().__init__()
-        self.kv.enable_prefix_cache(ROOT, {"main": (TEXT_WALK, "decode", IMAGE_WALK)})
+        self.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((TEXT_WALK, IMAGE_WALK), ("decode",))})
         self.runner.ingest_request("seed", {"kv": _config(seeded, decode=decode)})
         for walk, length in _walks(seeded):
             self.step("seed", length, walk)

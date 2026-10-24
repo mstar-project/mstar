@@ -272,7 +272,7 @@ tensor or sequence parallel instance count once: the instance's first rank repor
 ``mstar_prefix_cache_query_tokens_total{model_name, component}``
    Counter. Prompt tokens looked up in the prefix cache, once per request (its whole
    keyed prompt). Only models that key their prompts for prefix reuse count (BAGEL and
-   Orpheus); the cache is off under tensor parallelism.
+   Orpheus). Under tensor parallelism only rank 0 counts a lookup.
 
 ``mstar_prefix_cache_hit_tokens_total{model_name, component}``
    Counter. Tokens the prefix cache already held at that lookup. The hit rate is

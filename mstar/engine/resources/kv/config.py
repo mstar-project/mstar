@@ -89,6 +89,7 @@ class PagedKVConfig(KVConfig):
     # folded into the root, not checked at match time
     prefix_cache_salt: str = ""
     prefix_cache: bool = True
+    prefix_cache_tp: bool = False
     # MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``
     kv_lora_rank: int | None = None
     qk_rope_head_dim: int | None = None
@@ -126,6 +127,7 @@ class PagedKVConfig(KVConfig):
         cpu_offload_pages: int | None = None,
         prefix_cache_salt: str | None = None,
         prefix_cache: bool | None = None,
+        prefix_cache_tp: bool | None = None,
     ) -> None:
         """How much cache this deployment gets, and how it is cut up."""
         for name, value in (
@@ -135,6 +137,7 @@ class PagedKVConfig(KVConfig):
             ("cpu_offload_pages", cpu_offload_pages),
             ("prefix_cache_salt", prefix_cache_salt),
             ("prefix_cache", prefix_cache),
+            ("prefix_cache_tp", prefix_cache_tp),
         ):
             if value is not None:
                 setattr(self, name, value)
@@ -362,7 +365,7 @@ class KVReqConfig(ResourceReqConfig):
         return ["main"]
 
     def opened_labels(self, nodes: Collection[str] | None = None) -> set[str]:
-        """The labels the request opens on ``nodes``, or on any node."""
+        """The labels the request opens on ``nodes``, or on every node when ``nodes`` is None."""
         labels = set(self.needed_labels or ["main"])
         for node, named in self.needed_labels_per_node.items():
             if nodes is None or node in nodes:
@@ -427,7 +430,7 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
 class KVSpec(NodeResourceSpec):
     config: KVConfig
     # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
-    # more per request than the leader's pool, as long as the leader offloads nothing.
+    # more pages per request than the leader's, as long as the leader offloads nothing.
     leader: str | None = None
 
     @property
