@@ -108,9 +108,12 @@ audioseal = [
 
 # Optional: server_vad turn detection on /v1/realtime. Silero VAD (MIT) ships
 # its 2 MB ONNX weights in the wheel; onnxruntime (MIT) runs them on one thread.
+# semantic_vad also runs Pipecat's Smart Turn v3 (BSD-2 weights, fetched
+# separately) with onnxruntime on Whisper features from transformers (Apache-2.0).
 vad = [
     "silero-vad>=5.1",
     "onnxruntime>=1.17",
+    "transformers",
 ]
 
 # Optional: serve a deployment as a NVIDIA Dynamo backend

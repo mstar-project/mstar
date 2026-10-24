@@ -2079,6 +2079,11 @@ def main(argv: list[str] | None = None):
         enable_nvtx=args.enable_nvtx,
     )
 
+    from mstar.api_server.openai.adapters import get_adapter
+    if getattr(get_adapter(model_name), "supports_realtime_transcription", False):
+        from mstar.api_server.openai import realtime_vad
+        realtime_vad.report_availability()   # warns now if server_vad or semantic_vad cannot run
+
     # Spawn conductor in a separate process
     ctx = mp.get_context("spawn")
     conductor_proc = ctx.Process(
