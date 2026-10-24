@@ -1275,7 +1275,7 @@ class Worker:
         kept = self._kept_ids[node_name][request_id]
         ids = array("i", kept.prompt)
         ids.extend(kept.sampled)
-        walk = engine.lay_out_rebuild(node_name, request_id, ids)
+        walk = engine.lay_out_rebuild(node_name, request_id, ids)[0].walk
         (name,) = self._walk_inputs[(walk, node_name)]
         tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(self.device, dtype=torch.long)
         self._rebuild_rows[request_id] = RebuildRow(node_name, walk, {name: [tokens]})
@@ -1283,8 +1283,8 @@ class Worker:
         self._preemptions[node_name].rebuild_tokens += len(tokens)
 
     def _readmit_dropped(self) -> None:
-        """Rebuild each dropped request that is first in its node's queue, once its kept history and
-        one more page fit there. A node drops requests only when it has one paged KV cache."""
+        """Rebuild each dropped request that is first in its node's queue, once the layout its rebuild
+        writes and one more page fit there. A node drops requests only when it has one paged KV cache."""
         for rid, node_name in list(self._dropped.items()):
             if self._is_tearing_down(rid):
                 continue

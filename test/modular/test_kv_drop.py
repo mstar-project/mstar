@@ -173,7 +173,7 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     footprint = kv._streams["r"]["main"].footprint
     kv.drop("r")
 
-    assert kv.lay_out_again("r", array("i", prompt + sampled)) == WALK
+    assert kv.lay_out_again("r", array("i", prompt + sampled)) == (PrefixSpan(49, 49, WALK),)
     fresh.ingest_request("f", _config(prompt + sampled[:-1], cap=50 - 29))
     fresh._streams["f"]["main"].chain.extend(sampled[-1:], PAGE_SIZE)
     rebuilt, want = kv._streams["r"]["main"], fresh._streams["f"]["main"]
