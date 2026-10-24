@@ -82,7 +82,7 @@ from mstar.model.qwen3_5.video import (
     sample_video,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import drop_stop_tokens
+from mstar.model.utils import TokenBytes, drop_stop_tokens
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -188,6 +188,7 @@ class Qwen3_5DenseModel(Model):
         # which only the tokenizer knows. See `Qwen3_5Config.stop_token_ids`.
         if self.tokenizer.eos_token_id is not None:
             self.config.extra_stop_token_ids = (self.tokenizer.eos_token_id,)
+        self._token_bytes = TokenBytes(self.tokenizer)
 
         # so weights are materialized at most once per node
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -592,9 +593,24 @@ class Qwen3_5DenseModel(Model):
         ) -> bytes:
             if modality == "text":
                 ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
-                detok = self.tokenizer.decode(ids)
-                return detok.encode("utf-8")
+                return self._token_bytes.join(ids)
             raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
+
+    def postprocess_inline(
+        self,
+        values: list[int],
+        modality: str,
+        request_kwargs: list[dict | None],
+    ) -> list[bytes]:
+        # `postprocess` per value, without a tensor per value
+        if modality != "text":
+            raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
+        stop = self.config.stop_token_ids
+        token_bytes = self._token_bytes
+        return [
+            b"" if v in stop and not (kw or {}).get("ignore_eos") else token_bytes(v)
+            for v, kw in zip(values, request_kwargs, strict=True)
+        ]
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass args

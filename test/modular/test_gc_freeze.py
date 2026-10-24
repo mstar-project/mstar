@@ -22,7 +22,7 @@ def test_freeze_after_setup_moves_the_heap():
     assert keep_ids <= {id(obj) for obj in gc.get_objects()}
 
 
-def test_a_frame_of_tokens_wakes_the_thread_once():
+def test_a_frame_of_tokens_is_one_item_and_one_wake():
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.received_chunk_counts = {"r1": {}, "r2": {}}
     facade.per_request_reading_tensors = {"r1": 0, "r2": 0}
@@ -37,10 +37,10 @@ def test_a_frame_of_tokens_wakes_the_thread_once():
     facade.result_tensor_input_queue = _Q()
     signals = []
     facade._signal = lambda: signals.append(1)
-    facade.new_result_token("r1", 5, None, "text_inputs", "text", wake=False)
-    facade.new_result_token("r2", 6, None, "text_inputs", "text", wake=False)
-    assert len(facade.result_tensor_input_queue.items) == 2 and signals == []
-    facade.wake()
+    facade.new_result_tokens(["r1", "r2"], [5, 6], "text_inputs", "text")
+    [item] = facade.result_tensor_input_queue.items
+    assert item.request_ids == ["r1", "r2"] and item.values == [5, 6]
     assert signals == [1]
-    facade.new_result_token("r1", 7, None, "text_inputs", "text")
-    assert signals == [1, 1]
+    # nothing known: nothing queued, no wake
+    facade.new_result_tokens(["gone"], [7], "text_inputs", "text")
+    assert len(facade.result_tensor_input_queue.items) == 1 and signals == [1]

@@ -16,7 +16,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import msgpack
 import uvicorn
@@ -256,6 +256,10 @@ class PendingRequest:
     request_id: str | None = None
     # Output modality -> perf_counter of its first chunk; kept only with metrics on.
     first_chunk_times: dict[str, float] = field(default_factory=dict)
+    # A ChunkSink that relays this request's chunks in batches (see
+    # APIServer.relay_chunks_to), and the tag it knows the request by.
+    sink: "ChunkSink | None" = None
+    sink_tag: Any = None
 
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
@@ -266,6 +270,15 @@ class PendingRequest:
             loop.call_soon_threadsafe(wake.set)
         except RuntimeError:
             pass  # the loop is closed: the client is gone
+
+
+class ChunkSink(Protocol):
+    """Takes many requests' result chunks at once, on its event loop."""
+
+    loop: asyncio.AbstractEventLoop
+
+    def relay(self, tags: list, chunks: list[ResultChunk]) -> None:
+        """Forward ``chunks``, in order; ``tags[i]`` names ``chunks[i]``'s request."""
 
 
 def _set_events(wakes: list) -> None:
@@ -740,27 +753,28 @@ class APIServer:
                         continue
 
                     if message.message_type == "result_tokens":
-                        # One frame for the step: every request's value.
-                        # A request that is gone needs nothing acked back.
+                        # One frame for the step: every request's value,
+                        # handed to the data worker as one item. A request
+                        # that is gone needs nothing acked back.
                         body = message.body
-                        queued = False
                         with self.request_lock:
-                            for i, rid in enumerate(body.request_ids):
-                                if rid in self.pending_requests:
-                                    # one wake-up for the frame, after every
-                                    # request's value is queued
-                                    self.preprocess_worker.new_result_token(
-                                        rid, body.values[i],
-                                        body.loop_indices[i],
-                                        body.signal, body.modality, wake=False,
-                                    )
-                                    queued = True
-                                elif rid not in self.recently_completed:
-                                    logger.warning(
-                                        "Token for unknown request %s dropped", rid,
-                                    )
-                        if queued:
-                            self.preprocess_worker.wake()
+                            pending = self.pending_requests
+                            if all(rid in pending for rid in body.request_ids):
+                                rids, values = body.request_ids, body.values
+                            else:
+                                rids, values = [], []
+                                for rid, value in zip(body.request_ids, body.values, strict=True):
+                                    if rid in pending:
+                                        rids.append(rid)
+                                        values.append(value)
+                                    elif rid not in self.recently_completed:
+                                        logger.warning(
+                                            "Token for unknown request %s dropped", rid,
+                                        )
+                            if rids:
+                                self.preprocess_worker.new_result_tokens(
+                                    rids, values, body.signal, body.modality,
+                                )
                         continue
 
                     if message.message_type == "conductor_status":
@@ -872,6 +886,7 @@ class APIServer:
                 # the handlers are woken once per pass, after every chunk of
                 # the pass has been appended, not once per chunk
                 to_wake: dict[int, PendingRequest] = {}
+                to_relay: dict[int, tuple[ChunkSink, dict[int, PendingRequest]]] = {}
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(
                         "Got result chunk of %s modality for request %s",
@@ -902,7 +917,14 @@ class APIServer:
                                 rid, req.request_id,
                             ).encode("utf-8")
                         req.chunks.append(result_chunk)
-                        to_wake[id(req)] = req
+                        sink = req.sink
+                        if sink is not None and result_chunk.modality != "error":
+                            entry = to_relay.get(id(sink))
+                            if entry is None:
+                                entry = to_relay[id(sink)] = (sink, {})
+                            entry[1][id(req)] = req
+                        else:
+                            to_wake[id(req)] = req
 
                         if result_chunk.modality == "error":
                             # The data worker failed this request (preprocess,
@@ -925,6 +947,11 @@ class APIServer:
                         )
                 if to_wake:
                     notify_many(to_wake.values())
+                for sink, reqs in to_relay.values():
+                    try:
+                        sink.loop.call_soon_threadsafe(self._relay_chunks, sink, reqs.values())
+                    except RuntimeError:
+                        pass  # the loop is closed: its clients are gone
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
@@ -934,6 +961,34 @@ class APIServer:
     # ----------------------------------------------------------
     # Streaming helper
     # ----------------------------------------------------------
+
+    def relay_chunks_to(self, key: str | None, sink: ChunkSink, tag) -> None:
+        """Have ``sink`` take submission ``key``'s chunks: once per message
+        pass, every such request's new chunks go to ``sink.relay`` in one
+        call on its loop, instead of waking each request's handler per chunk.
+        The handler (``iter_result_chunks``) still owns completion, errors and
+        the timeout, and yields what the sink has not taken: an error chunk,
+        anything after it, and chunks drained before the sink was attached."""
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is not None:
+                req.sink, req.sink_tag = sink, tag
+
+    def _relay_chunks(self, sink: ChunkSink, reqs) -> None:
+        """On ``sink``'s loop: hand it the chunks its requests have not yet
+        consumed, up to an error chunk, which stays for the handler."""
+        tags: list = []
+        chunks: list[ResultChunk] = []
+        with self.request_lock:
+            for req in reqs:
+                pending, i, end = req.chunks, req.consumed_chunks, len(req.chunks)
+                while i < end and pending[i].modality != "error":
+                    tags.append(req.sink_tag)
+                    chunks.append(pending[i])
+                    i += 1
+                req.consumed_chunks = i
+        if chunks:
+            sink.relay(tags, chunks)
 
     def iter_result_chunks(self, request_id: str):
         """Yield raw :class:`ResultChunk` objects as they arrive, one at a time.

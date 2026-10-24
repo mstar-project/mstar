@@ -329,6 +329,56 @@ def load_weights_from_hf_shards(
             raise KeyError(f"Missing keys when loading state_dict with prefix {mod.prefix!r}: {missing_keys}")
 
 
+def _byte_level_alphabet() -> dict[str, int]:
+    """GPT-2's ``bytes_to_unicode``, inverted: the printable character a
+    byte-level BPE vocab entry uses for each byte -> that byte."""
+    bs = [*range(ord("!"), ord("~") + 1), *range(ord("¡"), ord("¬") + 1), *range(ord("®"), ord("ÿ") + 1)]
+    cs = list(bs)
+    extra = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + extra)
+            extra += 1
+    return {chr(c): b for b, c in zip(bs, cs, strict=True)}
+
+
+class TokenBytes:
+    """Each token id's raw bytes under a byte-level BPE tokenizer.
+
+    ``tokenizer.decode([id])`` turns a token that ends inside a multi-byte
+    character into U+FFFD, so decoding token by token garbles any character
+    split across tokens. Raw bytes joined in order are the reply's UTF-8, and
+    the API server decodes a request's text chunks only after joining them.
+    Added tokens (``<think>``, ``<|im_end|>``) are their text, as in
+    ``decode(skip_special_tokens=False)``. Filled lazily per id.
+    """
+
+    def __init__(self, tokenizer):
+        decoder = getattr(getattr(tokenizer, "backend_tokenizer", None), "decoder", None)
+        if type(decoder).__name__ != "ByteLevel":
+            raise ValueError(f"TokenBytes needs a ByteLevel decoder; got {type(decoder).__name__}")
+        self._tokenizer = tokenizer
+        self._alphabet = _byte_level_alphabet()
+        self._added = {i: t.content.encode("utf-8") for i, t in tokenizer.added_tokens_decoder.items()}
+        self._cache: dict[int, bytes] = {}
+
+    def __call__(self, token_id: int) -> bytes:
+        out = self._cache.get(token_id)
+        if out is None:
+            out = self._added.get(token_id)
+            if out is None:
+                piece = self._tokenizer.convert_ids_to_tokens(token_id)
+                # an id past the tokenizer's vocab (the model's padded rows)
+                # has no piece; `decode` gives it no text either
+                out = b"" if piece is None else bytes(self._alphabet[c] for c in piece)
+            self._cache[token_id] = out
+        return out
+
+    def join(self, ids) -> bytes:
+        return b"".join(map(self, ids))
+
+
 class ByteLevelDetokenizer:
     """Byte-faithful per-token detokenization for byte-level BPE tokenizers
     (GPT-2 / Whisper / Qwen).
@@ -342,20 +392,7 @@ class ByteLevelDetokenizer:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.special_ids = set(tokenizer.all_special_ids)
-        # GPT-2's bytes_to_unicode: printable unicode char <-> raw byte.
-        printable = (
-            list(range(ord("!"), ord("~") + 1))
-            + list(range(ord("\xa1"), ord("\xac") + 1))
-            + list(range(ord("\xae"), ord("\xff") + 1))
-        )
-        chars = printable[:]
-        n = 0
-        for b in range(256):
-            if b not in printable:
-                printable.append(b)
-                chars.append(256 + n)
-                n += 1
-        self.byte_decoder = {chr(c): b for b, c in zip(printable, chars, strict=True)}
+        self.byte_decoder = _byte_level_alphabet()
 
     def to_bytes(self, token_ids: list[int]) -> bytes:
         raw = bytearray()

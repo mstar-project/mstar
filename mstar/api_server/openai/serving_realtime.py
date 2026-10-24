@@ -469,7 +469,8 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
             raise StepError(str(exc.detail), exc.status_code) from exc
     finally:
         Path(path).unlink(missing_ok=True)
-    text = "".join(c.data.decode("utf-8", "replace") for c in chunks if c.modality == "text")
+    # joined before decoding: a chunk can end inside a character
+    text = b"".join(c.data for c in chunks if c.modality == "text").decode("utf-8", "replace")
     errors = [c for c in chunks if c.modality == "error"]
     if errors:
         raise StepError(
