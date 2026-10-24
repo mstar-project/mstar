@@ -81,6 +81,7 @@ def _worker(tmp_path):
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
     w._last_active = {}
+    w._kept_ids = {}
     w._innermost_loop_by_node = {}
     w._graph_runtime = _AccumulatingRuntime()
     w.tensor_manager = _manager(tmp_path, "worker_0")
