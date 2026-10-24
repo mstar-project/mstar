@@ -8,7 +8,8 @@
 All four set ``disable_torch_compile``, so the engine never wraps their forwards: the
 three wrapped nodes run once per request with no graph to amortize, and the dit's whole
 forward trips Inductor on the CPU-resident UniPC sigma. Instead the dit compiles its inner
-transformer region alone (``config.compile_dit``), leaving the solver eager.
+transformer region alone (``config.compile_dit``) for the shapes in
+``config.compile_dit_sizes``, leaving the solver and every other shape eager.
 
 Numerics are governed by the checkpoint dtypes, not by the engine.
 ``Wan22Model.get_autocast_dtype`` returns None so the engine neither autocasts
@@ -374,16 +375,24 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         # identity — fp32 islands, ``.dtype``, the tests' transformer swap.
         # dynamic=False traces one graph per shape (first request at a new
         # resolution pauses; logged in ``_noise_prediction``); fullgraph=False
-        # allows the SDPA graph break, matching cosmos3.
+        # allows the SDPA graph break, matching cosmos3. Only the latent grids
+        # of ``config.compile_dit_sizes`` reach the compiled forward; every
+        # other grid runs ``_eager_forward``, the transformer's own forward.
         self._compile_dit = bool(config.compile_dit)
+        self._compile_grids = config.compile_dit_grids()
         self._compiled_shapes: set[tuple[int, ...]] = set()
+        self._eager_forward = None
         if self._compile_dit and transformer is not None:
+            # with the transformer it belongs to: one swapped in later runs its own forward
+            self._eager_forward = (transformer, transformer.forward)
             transformer.forward = torch.compile(
                 transformer.forward, fullgraph=False, dynamic=False,
             )
             logger.info(
                 "Wan2.2 DiT: torch.compile enabled on the transformer region "
-                "(fullgraph=False, dynamic=False); UniPC solver stays eager."
+                "(fullgraph=False, dynamic=False) for latent (frames, height, width) %s; other "
+                "shapes and the UniPC solver run eager.",
+                sorted(self._compile_grids),
             )
 
     def prepare_inputs(
@@ -528,7 +537,8 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         # included, so CFG and no-CFG are distinct graphs). Announce the one-time
         # compile pause the first time a shape is seen, so an operator watching the
         # log knows why the first request at a new resolution is slow.
-        if self._compile_dit:
+        compiled = self._compile_dit and tuple(hidden_states.shape[2:]) in self._compile_grids
+        if compiled:
             shape_key = tuple(hidden_states.shape)
             if shape_key not in self._compiled_shapes:
                 self._compiled_shapes.add(shape_key)
@@ -540,7 +550,10 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         encoder_hidden_states = (
             torch.cat([text_embeds_pos, text_embeds_neg], dim=0) if do_cfg else text_embeds_pos
         ).to(self.transformer.dtype)
-        out = self.transformer(
+        transformer = self.transformer
+        if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
+            transformer = self._eager_forward[1]
+        out = transformer(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,

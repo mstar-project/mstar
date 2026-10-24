@@ -669,6 +669,8 @@ def test_the_worker_process_hands_the_interval_to_the_worker(monkeypatch):
     built = []
 
     class _Worker:
+        tensor_manager = SimpleNamespace(names_unique_per_launch=False)  # owns no files
+
         def __init__(self, **kwargs):
             built.append(kwargs)
 
@@ -677,7 +679,7 @@ def test_the_worker_process_hands_the_interval_to_the_worker(monkeypatch):
 
     monkeypatch.setattr(worker_mod, "Worker", _Worker)
     monkeypatch.setattr(conductor_mod, "apply_process_env_defaults", lambda: None)
-    monkeypatch.setattr(conductor_mod, "_exit_when_orphaned", lambda worker_id: None)
+    monkeypatch.setattr(conductor_mod, "_exit_when_orphaned", lambda *a, **k: None)
     monkeypatch.setattr(conductor_mod.signal, "signal", lambda *a: None)
     monkeypatch.setattr(conductor_mod.logging, "basicConfig", lambda **k: None)
     conductor_mod._worker_process_target(

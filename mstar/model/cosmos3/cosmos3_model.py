@@ -200,6 +200,12 @@ class Cosmos3Model(Model):
         self._detokenizer = None
         self.config: Cosmos3Config = self._load_config()
         self.tokenizer = self._load_tokenizer()
+        if self._windowed_serving_enabled() and not self.config.is_distilled:
+            logger.warning(
+                "Cosmos3 window_mode='kv' is experimental: the checkpoint was not trained "
+                "block-causally, and a kv rollout can leave the conditioning image within a "
+                "few windows. Prefer window_mode='chained', the default for stream_video."
+            )
 
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
         # The Wan VAE is shared between the DiT submodule (conditioning encode)
@@ -1414,7 +1420,8 @@ class Cosmos3Model(Model):
                 "This Cosmos3 checkpoint is distilled: classifier-free guidance is baked into the "
                 f"weights, guidance_scale must be 1.0 (got {mk['guidance_scale']}); leave it unset."
             )
-        if action_mode is not None or mk.get("generate_sound") or mk.get("sound_gen") or mk.get("window_mode"):
+        if (action_mode is not None or mk.get("generate_sound") or mk.get("sound_gen")
+                or mk.get("window_mode") or mk.get("stream_video")):
             raise ValueError(
                 "This Cosmos3 checkpoint is distilled for text/image-to-video generation; action, "
                 "sound and windowed modes are not available on it."
@@ -1434,13 +1441,11 @@ class Cosmos3Model(Model):
         submission."""
         window_mode = mk.get("window_mode")
         if window_mode is None:
-            if mk.get("stream_video"):
-                # The non-windowed walks emit one video at the very end; there
-                # is nothing to deliver incrementally.
-                raise ValueError(
-                    "Cosmos3 stream_video requires a windowed request (set window_mode)."
-                )
-            return
+            if not mk.get("stream_video"):
+                return
+            # The non-windowed walks emit one video at the very end, so a
+            # streamed request runs windowed, in the mode that holds the scene.
+            window_mode = "chained"
         window_mode = str(window_mode).strip().lower()
         if window_mode not in ("chained", "kv"):
             raise ValueError(
@@ -1460,7 +1465,8 @@ class Cosmos3Model(Model):
         if not is_kv and mk.get("context_frames") is not None:
             raise ValueError("Cosmos3 context_frames applies to window_mode='kv' only.")
         tf = self.config.vae.scale_factor_temporal
-        window_frames = int(mk.get("window_frames", self.config.window_frames_default))
+        default_window = self.config.kv_window_frames_default if is_kv else self.config.window_frames_default
+        window_frames = int(mk.get("window_frames", default_window))
         if window_frames < 1 + tf:
             raise ValueError(f"Cosmos3 window_frames must be at least {1 + tf}, got {window_frames}.")
         window_units = 1 + (window_frames - 1) // tf
@@ -1498,7 +1504,9 @@ class Cosmos3Model(Model):
             # 0 retains all committed frames (no release).
             if context_frames:
                 context_units = 1 + (context_frames - 1) // tf
-        total_units = 1 + (num_frames - 1) // tf
+        # rounded up: the decoder trims the assembled video back to num_frames,
+        # but cannot add frames a short schedule never generated
+        total_units = 1 + -(-(num_frames - 1) // tf)
         # Sessions: a request may name a session (its last window is kept for
         # a follow-up) and resume one — the stored tail then re-pins the head
         # of window 0 as clean conditioning (the chained overlap, at least the

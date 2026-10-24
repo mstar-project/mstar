@@ -33,20 +33,25 @@ class PrefixIndex:
         self._leaves: list[tuple[int, int]] = []
         self._clock = 0
         self._evictable: set[int] = set()
-        arena.index = self
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
         pages = self.pages_for(keys)
+        self.touch(pages)
+        return pages
+
+    def touch(self, pages: Sequence[int]) -> None:
+        pages = [page for page in pages if self._key[page] is not None]
         if pages:
             # one stamp for the whole run, so recency stays monotone along it
             self._clock += 1
             for page in pages:
                 self._stamp[page] = self._clock
-        return pages
 
     def insert(self, key: bytes, page: int, parent: int | None = None) -> bool:
-        """Name ``page`` by ``key`` under ``parent``; the first writer wins."""
+        """Name ``page`` by ``key`` under ``parent``; the first writer wins. When the arena reports to this
+        index and the index alone holds ``parent``, ``page`` is filed with no parent. Filed under ``parent``,
+        a held ``page`` would keep `evict` from freeing ``parent``, which the pool counts as evictable."""
         assert parent is None or self._key[parent] is not None, (
             f"page {page} indexed under parent page {parent}, which the index "
             "does not hold; a parent must outlive its children"
@@ -58,6 +63,8 @@ class PrefixIndex:
             f"indexed under {self._key[page].hex()[:16]}; evicting one entry "
             "would free a page the other still names"
         )
+        if parent is not None and self._arena.index is self and self._arena.num_owners[parent] == 1:
+            parent = None
         self._clock += 1
         self._by_key[key] = page
         self._key[page] = key
@@ -67,8 +74,9 @@ class PrefixIndex:
         self._stamp[page] = self._clock
         self._arena.seal([page])
         self._arena.retain([page])
-        if self._arena.num_owners[page] > 2:
-            # `retain` calls `set_shared` only on the step from one owner to two
+        if self._arena.index is self and self._arena.num_owners[page] > 2:
+            # `PageArena.retain` calls `set_shared` only when a page goes from one owner to two, so a page
+            # that was already shared before the index named it is marked here
             self.set_shared(page, True)
         if parent is not None:
             self._children[parent] += 1
@@ -81,9 +89,6 @@ class PrefixIndex:
         goes under that page. Returns how many pages were inserted."""
         inserted = 0
         for key, page in zip(keys, pages, strict=True):
-            # A held page under a parent only the index holds would keep `evict` from reaching that parent.
-            if parent is not None and self._arena.num_owners[parent] == 1:
-                parent = None
             if self.insert(key, page, parent):
                 inserted += 1
             else:
@@ -116,7 +121,7 @@ class PrefixIndex:
         return None if parent is None else self._key[parent]
 
     def evictable(self) -> set[int]:
-        """Return the live set of pages `evict` could free, cascading from the leaves.
+        """Return the live set of pages `evict` could free.
         Callers read it and don't keep it.
 
         A page only the index holds is out of reach while a page below it is held,
