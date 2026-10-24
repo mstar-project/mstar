@@ -134,7 +134,10 @@ def test_accumulated_outputs_are_sent_with_their_own_values(tmp_path):
     w = _worker(tmp_path)
     for step in range(STEPS):
         _step(w, float(step))
-        assert not w.tensor_manager.tensor_store._tensors_cpu, "a step left host copies behind"
+        store = w.tensor_manager.tensor_store
+        assert all(store.get_cpu_tensor(u) is None for u in w._graph_runtime.held), (
+            "a step left host copies behind"
+        )
 
     uuids = w._graph_runtime.held
     infos = [w.tensor_manager.tensor_store.get_info(uuid) for uuid in uuids]

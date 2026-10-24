@@ -892,6 +892,7 @@ class TensorCommunicationManager(ABC):
         out_infos: list[TensorPointerInfo] | None = None,
         cpu_tensors: NameToTensorList | None = None,
         out_cpu: list[torch.Tensor | None] | None = None,
+        out_side: list[int] | None = None,
     ) -> dict[str, list[TensorPointerInfo]]:
         """Mint uuids and descriptors for one request's outputs.
 
@@ -899,6 +900,8 @@ class TensorCommunicationManager(ABC):
         appended to the caller's lists, so the caller decides how wide a batch
         to hand ``put_tensor_batch_multi``. Minting order is name then tensor,
         which is what makes the caller's flat columns index-parallel.
+        ``out_side`` collects the uuids this manager keeps per-uuid state for,
+        which the caller flags once they are stored (``_flag_side_state``).
         """
         cfg = self.sharding_configs.get(request_id)
         source_tp_size, source_tp_rank = self._source_tp(
@@ -950,10 +953,12 @@ class TensorCommunicationManager(ABC):
                     out_cpu.append(self._cpu_counterpart(
                         by_tensor, tensor, canonical, shard_dim,
                     ))
-                if cfg is not None:
+                if shard_dim:
                     self.uuid_to_shard_dim[tensor_uuid] = shard_dim
                 if self.enable_prof:
                     self.uuid_to_edge_name[tensor_uuid] = name
+                if (shard_dim or self.enable_prof) and out_side is not None:
+                    out_side.append(tensor_uuid)
 
                 logger.debug("Storing tensor name %s uuid %s", name, tensor_uuid)
                 tensor_info[name].append(info)
@@ -988,14 +993,17 @@ class TensorCommunicationManager(ABC):
         infos: list[TensorPointerInfo] = []
         want_cpu = cpu_tensors is not None and self.needs_cpu_tensor
         cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
+        side: list[int] = []
         tensor_info = self._mint_tensor_infos(
             request_id, tensors, node_name, graph_walk,
             request_ids, uuids, canonicals, infos,
             cpu_tensors=cpu_tensors if want_cpu else None, out_cpu=cpus,
+            out_side=side,
         )
         self.tensor_store.put_tensor_batch_multi(
             request_ids, uuids, canonicals, infos, cpu_tensors=cpus,
         )
+        self._flag_side_state(side)
         if self._flat_copy_pending:
             self._wait_flat_copies()
         return tensor_info
@@ -1053,7 +1061,6 @@ class TensorCommunicationManager(ABC):
         num_tensors: list[int] = []
         canonicals: list[torch.Tensor] = []
         cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
-        sharded_uuids: list[int] = []
         mint = self._uuid_minter.mint
         add_row = columns.add_row
         try:
@@ -1114,16 +1121,12 @@ class TensorCommunicationManager(ABC):
                     add_row(uuid, base + i * step, nbytes, ndims, dims, stride, dtype_idx)
                     if want_cpu:
                         cpus.append(host[i] if host is not None else None)
-                    if cfg is not None:
-                        sharded_uuids.append(uuid)
         except IndexError:
             # a row index past the views or the host rows: not this batch's rows
             return None
         # nothing above touched shared state; from here the general path's
-        # guarantees apply
-        shard_dims = self.uuid_to_shard_dim
-        for uuid in sharded_uuids:
-            shard_dims[uuid] = None
+        # guarantees apply. No shard dim is recorded: a row is never permuted
+        # (a sharded signal returned None above).
         edge_names = self.uuid_to_edge_name
         if self.enable_prof:
             for uuid, s in zip(flat_uuids, signal_idxs, strict=True):
@@ -1134,9 +1137,10 @@ class TensorCommunicationManager(ABC):
             )
         except Exception:
             for uuid in flat_uuids:
-                shard_dims.pop(uuid, None)
                 edge_names.pop(uuid, None)
             raise
+        if self.enable_prof:
+            self._flag_side_state(flat_uuids)
         return StoredOutputs(flat_uuids, flat_rids, signal_idxs, num_tensors)
 
     @staticmethod
@@ -1218,6 +1222,7 @@ class TensorCommunicationManager(ABC):
         columnar = self.tensor_store.has_put_tensor_batch_columns
         infos: list[TensorPointerInfo] = []
         columns: ColumnarTensorInfo | None = None
+        side: list[int] = []
 
         if columnar:
             # Invariant across one node's output batch, so carried once for
@@ -1289,8 +1294,9 @@ class TensorCommunicationManager(ABC):
                                 canonical, tensor_uuid, source_tp_size,
                                 source_tp_rank, node_name, graph_walk,
                             ))
-                        if cfg is not None:
+                        if shard_dim:
                             self.uuid_to_shard_dim[tensor_uuid] = shard_dim
+                            side.append(tensor_uuid)
                         if self.enable_prof:
                             self.uuid_to_edge_name[tensor_uuid] = signal
                     num_tensors.append(len(tensor_list))
@@ -1304,6 +1310,7 @@ class TensorCommunicationManager(ABC):
                 self.tensor_store.put_tensor_batch_multi(
                     flat_rids, flat_uuids, canonicals, infos, cpu_tensors=cpus,
                 )
+            self._flag_side_state(flat_uuids if self.enable_prof else side)
         except Exception:
             # The per-tensor bookkeeping above is written before the store
             # put lands, so on any raise those uuids would sit in the maps
@@ -1500,7 +1507,8 @@ class TensorCommunicationManager(ABC):
                 end = start + info.nbytes // bytes_per_row
             slice_view = canonical_tensor[start:end]
             new_uuid = self._uuid_minter.mint()
-            self.uuid_to_shard_dim[new_uuid] = shard_dim
+            if shard_dim:
+                self.uuid_to_shard_dim[new_uuid] = shard_dim
             # Release this edge's stake on the producer's UUID — the slice now
             # owns it. The slice view keeps the underlying storage alive even
             # if the producer's UUID GCs.
@@ -1509,6 +1517,8 @@ class TensorCommunicationManager(ABC):
             # After the re-point, so the descriptor the store keeps already
             # names the slice rather than the producer's tensor.
             self.tensor_store.put_tensor(request_id, new_uuid, slice_view, info)
+            if shard_dim:
+                self._flag_side_state([new_uuid])
 
     def _take_cached_read(self, request_id: Rid, info: TensorPointerInfo) -> bool:
         """Whether an earlier edge already read the bytes ``info`` names, in
@@ -1864,8 +1874,13 @@ class TensorCommunicationManager(ABC):
                         # a first read holds a transit ref; a reused one does not
                         self.tensor_store.dereference(info.uuid, 1)
                         seen_uuids.add(info.uuid)
-                    self.uuid_to_shard_dim[info.uuid] = shard_dim
+                    if shard_dim:
+                        self.uuid_to_shard_dim[info.uuid] = shard_dim
+                    else:
+                        self.uuid_to_shard_dim.pop(info.uuid, None)
                     tensors.append(self.get_tensor(info.uuid))
+                if shard_dim:
+                    self._flag_side_state([info.uuid for info in edge.tensor_info])
 
                 if buf_key in self.buffered_shards.get(req_id, {}):
                     buf = self.buffered_shards[req_id][buf_key]
@@ -1898,10 +1913,10 @@ class TensorCommunicationManager(ABC):
                             # +1 for graph-node usage (released by the
                             # downstream consumer via _cleanup_consumed_inputs)
                             self.tensor_store.increment_ref(uuid_, 1)
-                            # consolidated tensor is in its original layout
-                            # (cat happened along the real shard_dim); record
-                            # None so get_tensor doesn't try to un-rearrange.
-                            self.uuid_to_shard_dim[uuid_] = None
+                            # The consolidated tensor is in its original
+                            # layout (cat happened along the real shard_dim),
+                            # so no shard dim is recorded for get_tensor to
+                            # undo.
                             new_infos.append(info)
                         edge.tensor_info = new_infos
                         del self.buffered_shards[req_id][buf_key]
@@ -1958,6 +1973,30 @@ class TensorCommunicationManager(ABC):
         stored it (a loop's accumulated output is sent when the loop ends)."""
         self.tensor_store.drop_cpu_tensors()
 
+    def get_tensors(self, uuids: list[int]) -> list[torch.Tensor | None]:
+        """``get_tensor`` over a column in one store call, None for a uuid the
+        store does not hold."""
+        out = self.tensor_store.get_tensors(uuids)
+        shard_dims = self.uuid_to_shard_dim
+        if shard_dims:
+            for i, uuid in enumerate(uuids):
+                shard_dim = shard_dims.get(uuid)
+                if shard_dim is not None and out[i] is not None:
+                    out[i] = self._undo_leading_shard_dim(shard_dim, out[i])
+        return out
+
+    def _flag_side_state(self, uuids: list[int]) -> None:
+        """Tell the store these uuids have per-uuid state here (a shard dim to
+        undo on read, a profiling edge name), so releasing one reaches
+        ``_cleanup_by_uuid`` even when nothing is registered for it.
+
+        Only the non-default entries are kept for that reason: every entry
+        costs its uuid a report back to Python on release, which is the
+        per-uuid Python a store that frees in place exists to avoid.
+        """
+        if uuids:
+            self.tensor_store.mark_teardown(uuids)
+
     def set_persist(self, uuid: int, persist: bool):
         self.tensor_store.set_metadata(uuid, persist=persist)
         if self.tensor_store.can_gc(uuid):
@@ -1993,7 +2032,9 @@ class TensorCommunicationManager(ABC):
     ):
         """Transport-side teardown for tensors the bookkeeper has already
         dereferenced to zero and forgotten -- what a batched dereference, or
-        the graph runtime releasing a node's consumed inputs, hands back."""
+        the graph runtime releasing a node's consumed inputs, hands back.
+        Under a store that ``frees_in_place`` that is only the ones with
+        something to tear down here; the rest are already gone."""
         if not collectable:
             return
         self.tensor_store.mark_forgotten(collectable)
@@ -2064,15 +2105,28 @@ class TensorCommunicationManager(ABC):
         self.sharding_configs.pop(request_id, None)
         self.req_rx_info.pop(request_id, None)
         self.req_tx_info.pop(request_id, None)
-        for uuid in self.tensor_store.get_all_uuids(request_id):
-            self.uuid_to_shard_dim.pop(uuid, None)
-            if not self.tensor_store.can_gc(uuid) and not force:
+        if self.tensor_store.frees_in_place:
+            # One crossing: what needs no teardown here is freed in it.
+            collectable, registered, deferred = self.tensor_store.release_request(
+                request_id, force,
+            )
+            for uuid in deferred:
+                self.uuid_to_shard_dim.pop(uuid, None)
                 logger.warning(
                     "Deferring cleanup of tensor uuid %s "
                     "(awaiting TENSOR_RECEIVED ACK or unpersist)", uuid
                 )
-                continue
-            self._cleanup_by_uuid(uuid)
+            self.cleanup_collectable(collectable, registered)
+        else:
+            for uuid in self.tensor_store.get_all_uuids(request_id):
+                self.uuid_to_shard_dim.pop(uuid, None)
+                if not self.tensor_store.can_gc(uuid) and not force:
+                    logger.warning(
+                        "Deferring cleanup of tensor uuid %s "
+                        "(awaiting TENSOR_RECEIVED ACK or unpersist)", uuid
+                    )
+                    continue
+                self._cleanup_by_uuid(uuid)
 
         self._collect_and_send_acks(request_id, ack_edges)
         self.slice_uuids.pop(request_id, None)
