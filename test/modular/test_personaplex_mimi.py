@@ -204,13 +204,19 @@ def test_real_mimi_kwargs_map_to_hf_defaults(reference):
     with _without_triton_stub():
         from transformers import MimiConfig
 
+    def rope_theta(config):
+        # transformers 5 keeps the RoPE base in rope_parameters rather than rope_theta
+        return config.get("rope_theta") or (config.get("rope_parameters") or {}).get("rope_theta")
+
     real = reference["mimi_kwargs"]["real"]
     mapped = mimi_mod.mimi_config_kwargs(real["seanet"], real["transformer"], real["quantizer"])
     defaults = MimiConfig().to_dict()
+    defaults["rope_theta"] = rope_theta(defaults)
     differing = {k: (v, defaults.get(k)) for k, v in mapped.items()
                  if k not in ("frame_rate",) and defaults.get(k) != v}
     assert differing == {}
-    assert MimiConfig(**mapped).frame_rate == 12.5
+    config = MimiConfig(**mapped)
+    assert config.frame_rate == 12.5 and rope_theta(config.to_dict()) == mapped["rope_theta"]
 
 
 def test_conversion_covers_full_size_nvidia_mimi_keys(reference):
