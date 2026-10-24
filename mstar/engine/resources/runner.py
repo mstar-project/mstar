@@ -103,6 +103,11 @@ class StepRunner:
         self._trail_order = [
             key for key in self._order if self._resources[key].page_trail() is not None
         ]
+        self._cap_order = [
+            key for key in self._order
+            if type(self._resources[key]).cap_cached_prefix is not Resource.cap_cached_prefix
+        ]
+        self._node_cap_order = self._per_node(node_resources, self._cap_order)
         self._node_trail_order = self._per_node(node_resources, self._trail_order)
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
@@ -120,7 +125,8 @@ class StepRunner:
 
         The smallest answer wins, because a step is one span: a resource that
         holds less than another has to be caught up by the tokens that run.
-        A resource with no opinion is not an answer of zero.
+        A resource with no opinion is not an answer of zero. A resource that
+        holds only some lengths then caps the agreed prefix.
         """
         agreed = None
         for key in self._sweep(self._node_order, self._order, node_name):
@@ -129,6 +135,9 @@ class StepRunner:
             )
             if answer is not None and (agreed is None or answer.tokens < agreed.tokens):
                 agreed = answer
+        if agreed is not None:
+            for key in self._sweep(self._node_cap_order, self._cap_order, node_name):
+                agreed = self._resources[key].cap_cached_prefix(rid, node_name, graph_walk, agreed)
         return agreed
 
     def apply_cached_prefix(

@@ -131,6 +131,13 @@ class Resource(ABC):
         """
         return None
 
+    def cap_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, prefix: CachedPrefix,
+    ) -> CachedPrefix:
+        """The longest prefix up to ``prefix`` this resource can serve, for a
+        resource that holds only some lengths."""
+        return prefix
+
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
         inputs: Any, prefix: CachedPrefix | None,
