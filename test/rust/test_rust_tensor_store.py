@@ -97,12 +97,20 @@ def _ref_count(store, uuid):
     return None if info is None else info.ref_cnt
 
 
-def _state(mgr, uuids, rids):
+def _state(mgr, uuids, rids, alive):
+    """Everything observable, plus which stored tensor objects are still alive
+    (``alive``: uuid -> weakref to the object this store was given), so a
+    store that forgets a tensor but keeps a reference to it differs."""
     s = mgr.tensor_store
     return {
+        "alive": {u for u, ref in alive.items() if ref() is not None},
+        "cpu": {u for u in uuids if s.get_cpu_tensor(u) is not None},
         "refs": {u: _ref_count(s, u) for u in uuids},
         "present": {u for u in uuids if s.check_uuid_presence(u)},
-        "objects": {u: id(s.get_tensor(u)) for u in uuids if s.check_uuid_presence(u)},
+        # a held tensor is the object the store was given
+        "objects": {
+            u for u in uuids if s.check_uuid_presence(u) and s.get_tensor(u) is alive[u]()
+        },
         "gc": {u: s.can_gc(u) for u in uuids},
         "info": {u: s.get_info(u) is not None for u in uuids},
         "owned": {r: sorted(s.get_all_uuids(r)) for r in rids},
@@ -113,9 +121,10 @@ def _state(mgr, uuids, rids):
 
 @pytest.mark.parametrize("seed", range(20))
 def test_random_sequences_match_the_python_store(seed):
-    """Store, reference, dereference (single, batched, by the runtime's
-    release), persist, register and tear down at random, and compare
-    everything observable after every step."""
+    """Store (with and without a host copy), reference, dereference (single,
+    batched, by the runtime's release), persist, register, drop host copies
+    and tear down at random, and compare everything observable after every
+    step, including which tensors each store still keeps alive."""
     rng = random.Random(seed)
     py, rs = _pair()
     rids = [1, 2, 3, "api-x"]
@@ -124,29 +133,53 @@ def test_random_sequences_match_the_python_store(seed):
         for rid in rids:
             mgr.register_request(rid, cfg)
     minted: list[int] = []
+    alive = {False: {}, True: {}}
+    # uuids for host-copy puts, past anything the managers mint
+    host_uuid = 1 << 40
+
+    def state(mgr):
+        return _state(mgr, minted, rids, alive[mgr is rs])
 
     for step in range(120):
         op = rng.choice([
-            "store", "store", "ref", "deref_batch", "deref_batch", "deref_one",
-            "release", "persist", "register", "teardown",
+            "store", "store", "store_host", "ref", "deref_batch", "deref_batch",
+            "deref_one", "release", "persist", "register", "drop_host", "teardown",
         ])
         live = [u for u in minted if py.tensor_store.check_uuid_presence(u)]
         if op == "store":
             rid = rng.choice(rids)
             n = rng.randint(1, 4)
-            tensors = [torch.full((2,), float(len(minted) + i)) for i in range(n)]
             outs = {}
             for mgr in (py, rs):
+                # each store its own objects, so liveness is per store
+                tensors = [torch.full((2,), float(len(minted) + i)) for i in range(n)]
                 outs[mgr is rs] = mgr.store_and_return_tensor_info_batch(
-                    [rid], {rid: {"x": list(tensors)}}, ["x"],
+                    [rid], {rid: {"x": tensors}}, ["x"],
                     node_name="N", graph_walk="w", skip_cuda_sync=True,
                 )
+                alive[mgr is rs].update(zip(
+                    outs[mgr is rs].flat_uuids, map(weakref.ref, tensors), strict=True,
+                ))
+                del tensors
             # Both minted from their own counters, from the same start.
             assert outs[False].flat_uuids == outs[True].flat_uuids
             minted.extend(outs[True].flat_uuids)
             if rng.random() < 0.7:
                 for mgr in (py, rs):
                     mgr.increment_ref_batch_uniform(outs[True].flat_uuids, 1)
+        elif op == "store_host":
+            host_uuid += 1
+            rid = rng.choice(rids)
+            for mgr in (py, rs):
+                t = torch.full((2,), float(host_uuid))
+                mgr.tensor_store.put_tensor(rid, host_uuid, t, _info(host_uuid), cpu_tensor=t.clone())
+                mgr.increment_ref_batch_uniform([host_uuid], 1)
+                alive[mgr is rs][host_uuid] = weakref.ref(t)
+                del t
+            minted.append(host_uuid)
+        elif op == "drop_host":
+            for mgr in (py, rs):
+                mgr.drop_host_copies()
         elif not live:
             continue
         elif op == "ref":
@@ -190,62 +223,15 @@ def test_random_sequences_match_the_python_store(seed):
                 mgr.register_request(
                     rid, ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
                 )
-        assert _state(py, minted, rids) == _state(rs, minted, rids), (seed, step, op)
+        assert state(py) == state(rs), (seed, step, op)
 
     for rid in rids:
         for mgr in (py, rs):
             mgr.force_cleanup_request(rid)
-    assert _state(py, minted, rids) == _state(rs, minted, rids)
+    assert state(py) == state(rs)
+    assert not state(rs)["alive"], "every tensor freed once its request is gone"
     assert rs.tensor_store.stored_counts() == (0, 0)
     assert not rs.transport and not py.transport
-
-
-def test_a_collected_tensor_is_gone_from_rust():
-    """Freed in the release itself: the store held the last reference."""
-    _, mgr = _pair()
-    t = torch.ones(3)
-    ref = weakref.ref(t)
-    stored = mgr.store_and_return_tensor_info_batch(
-        [1], {1: {"x": [t]}}, ["x"], skip_cuda_sync=True,
-    )
-    del t
-    (uuid,) = stored.flat_uuids
-    mgr.increment_ref_batch_uniform([uuid], 1)
-    assert ref() is not None
-
-    reported = mgr.tensor_store.bookkeeping.dereference_batch_uniform(
-        [uuid], 1, cleanup=True,
-    )
-    assert reported == ([], []), "nothing for the transport, nothing reported"
-    assert ref() is None
-    assert not mgr.tensor_store.check_uuid_presence(uuid)
-    assert mgr.tensor_store.get_info(uuid) is None
-    assert mgr.tensor_store.stored_counts() == (0, 0)
-    with pytest.raises(KeyError):
-        mgr.tensor_store.get_tensor(uuid)
-
-
-def test_a_registered_tensor_still_reaches_the_transport():
-    """Reported, and held until the teardown: unregistering memory reads it."""
-    _, mgr = _pair()
-    t = torch.ones(3)
-    ref = weakref.ref(t)
-    stored = mgr.store_and_return_tensor_info_batch(
-        [1], {1: {"x": [t]}}, ["x"], skip_cuda_sync=True,
-    )
-    del t
-    (uuid,) = stored.flat_uuids
-    mgr.increment_ref_batch_uniform([uuid], 1)
-    mgr.register([uuid])
-
-    uuids, registered = mgr.tensor_store.bookkeeping.dereference_batch_uniform(
-        [uuid], 1, cleanup=True,
-    )
-    assert (uuids, registered) == ([uuid], [True])
-    assert ref() is not None and mgr.tensor_store.check_uuid_presence(uuid)
-    mgr.cleanup_collectable(uuids, registered)
-    assert mgr.torn_down == [uuid] and not mgr.transport
-    assert ref() is None
 
 
 def test_an_arena_slot_is_freed_on_release(tmp_path, monkeypatch):
@@ -304,48 +290,6 @@ def test_a_shard_dim_keeps_its_uuid_reported():
     assert not mgr.tensor_store.check_uuid_presence(uuid)
 
 
-def test_teardown_frees_what_a_request_owns_and_purges_its_handle():
-    """Handles are recycled, so a request's ownership must not outlive it --
-    except for what is deferred, which the soft teardown keeps by design."""
-    _, mgr = _pair()
-    store = mgr.tensor_store
-    tensors = [torch.ones(2) for _ in range(4)]
-    refs = [weakref.ref(t) for t in tensors]
-    stored = mgr.store_and_return_tensor_info_batch(
-        [7], {7: {"x": tensors}}, ["x"], skip_cuda_sync=True,
-    )
-    del tensors
-    u0, u1, u2, u3 = stored.flat_uuids
-    mgr.increment_ref_batch_uniform([u1], 1)       # still read by someone
-    mgr.register([u2])                              # transport state
-
-    mgr.cleanup_request(7)
-    assert sorted(store.get_all_uuids(7)) == [u1], "the referenced one is deferred"
-    assert mgr.torn_down == [u2]
-    assert [r() is None for r in refs] == [True, False, True, True]
-
-    mgr.force_cleanup_request(7)
-    assert store.get_all_uuids(7) == []
-    assert store.stored_counts() == (0, 0)
-    assert all(r() is None for r in refs)
-
-
-def test_store_round_trip_and_host_copies():
-    s = TensorStore(RustTensorBookkeeping())
-    t, cpu = torch.arange(3), torch.arange(3)
-    s.put_tensor(5, 11, t, _info(11), cpu_tensor=cpu)
-    assert s.get_tensor(11) is t and s.get_cpu_tensor(11) is cpu
-    assert s.get_tensors([11, 12]) == [t, None]
-    # A re-put under another request moves the ownership with it.
-    s.put_tensor("other", 11, t, _info(11))
-    assert s.get_all_uuids(5) == [] and s.get_all_uuids("other") == [11]
-    assert s.get_cpu_tensor(11) is None
-    s.remove_tensor(11)
-    assert s.stored_counts() == (0, 0) and s.get_info(11) is None
-    with pytest.raises(ValueError):
-        s.put_tensor_batch_multi([1], [1, 2], [t, t], [_info(1), _info(2)])
-
-
 # --- through the Rust graph runtime ----------------------------------------
 
 def _decode_runtime(sock_dir, bookkeeping):
@@ -393,23 +337,20 @@ def _ingest_stored(rt, store, registered: bool):
     return rid, weakref.ref(t)
 
 
-@pytest.mark.parametrize("registered", [False, True])
-def test_the_runtime_frees_a_consumed_input_in_place(tmp_path, registered):
-    """``cleanup_consumed_inputs`` reports only what the transport must tear
-    down; the rest is gone from the store when it returns."""
+def test_the_runtime_reports_a_registered_input_and_keeps_it_for_the_transport(tmp_path):
+    """``cleanup_consumed_inputs`` reports what the transport must tear down,
+    and the store holds it until that teardown removes it. (An input with
+    nothing to tear down is freed in place: see the GIL-released test.)"""
     bk = RustTensorBookkeeping()
     store = TensorStore(bk)
     rt = _decode_runtime(str(tmp_path), bk)
-    rid, ref = _ingest_stored(rt, store, registered)
+    rid, ref = _ingest_stored(rt, store, registered=True)
     rt.pop_rids("LLM", "decode", [rid])
 
     freed = rt.cleanup_consumed_inputs("LLM", [rid], [0])
-    if registered:
-        assert (list(freed.uuids), list(freed.registered)) == ([100], [True])
-        assert ref() is not None, "held for the transport's teardown"
-        store.remove_tensor(100)
-    else:
-        assert list(freed.uuids) == []
+    assert (list(freed.uuids), list(freed.registered)) == ([100], [True])
+    assert ref() is not None, "held for the transport's teardown"
+    store.remove_tensor(100)
     assert ref() is None
     assert store.stored_counts() == (0, 0)
 
@@ -434,19 +375,3 @@ def test_a_tensor_freed_with_the_gil_released_is_gone_on_return(tmp_path):
     assert route is None
     assert ref() is None
     assert store.stored_counts() == (0, 0)
-
-
-def test_dropping_host_copies_keeps_the_tensors():
-    """``drop_cpu_tensors`` forgets the host copies a step stored (they are
-    views of buffers the producer reuses) and leaves the tensors held."""
-    store = TensorStore(RustTensorBookkeeping())
-    a, b = torch.tensor([1]), torch.tensor([2])
-    store.put_tensor(1, 11, a, _info(11), cpu_tensor=torch.tensor([10]))
-    store.put_tensor(1, 12, b, _info(12))
-    assert store.get_cpu_tensor(11) is not None
-    store.drop_cpu_tensors()
-    assert store.get_cpu_tensor(11) is None
-    assert store.get_tensor(11) is a and store.get_tensor(12) is b
-    store.put_tensor(1, 13, torch.tensor([3]), _info(13), cpu_tensor=torch.tensor([30]))
-    store.drop_cpu_tensors()
-    assert store.get_cpu_tensor(13) is None

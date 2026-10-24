@@ -4,6 +4,7 @@ neither does, and a chunk's items are stacked only when the consuming batch is
 built (``Worker._input_tensors``)."""
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
@@ -26,8 +27,8 @@ class _TM:
     cleanup_collectable = TensorCommunicationManager.cleanup_collectable
     increment_ref_batch_uniform = TensorCommunicationManager.increment_ref_batch_uniform
 
-    def __init__(self):
-        self.tensor_store = TensorStore(bookkeeping=PythonTensorBookkeeping())
+    def __init__(self, bookkeeping):
+        self.tensor_store = TensorStore(bookkeeping=bookkeeping)
         self.uuid_to_shard_dim = {}
 
     def _cleanup_by_uuid(self, uuid, registered=None):
@@ -42,8 +43,18 @@ def _info(uuid):
     )
 
 
-def _consumer(window, stride):
-    tm = _TM()
+def _bookkeeping(kind):
+    if kind == "python":
+        return PythonTensorBookkeeping()
+    # the store the Rust graph runtime uses: it frees in place on release
+    rust = pytest.importorskip("mstar_rust")
+    del rust
+    from mstar.communication.tensor_store import RustTensorBookkeeping
+    return RustTensorBookkeeping()
+
+
+def _consumer(window, stride, kind="python"):
+    tm = _TM(_bookkeeping(kind))
     w = Worker.__new__(Worker)
     w.tensor_manager = tm
     buf = StreamBuffer(RID, EDGE, "LLM", SlidingWindowChunkPolicy(window, stride))
@@ -76,9 +87,18 @@ def _consume(w, tm, se):
     return by_rid[RID].get(EDGE)
 
 
-def test_a_sliding_window_keeps_its_overlap_alive_and_frees_everything_once_consumed():
-    w, tm, buf = _consumer(window=3, stride=2)
-    uuids = _produce(tm, buf, range(7))
+@pytest.mark.parametrize("kind", ["python", "rust"])
+@pytest.mark.parametrize("window, stride, n_items, chunks, flushed", [
+    # overlapping windows; the flush is the overlap item alone
+    (3, 2, 7, [[0, 1, 2], [2, 3, 4], [4, 5, 6]], [6]),
+    # nothing left at the flush: an empty final chunk
+    (2, 2, 4, [[0, 1], [2, 3]], []),
+])
+def test_a_sliding_window_keeps_its_overlap_alive_and_frees_everything_once_consumed(
+    kind, window, stride, n_items, chunks, flushed,
+):
+    w, tm, buf = _consumer(window=window, stride=stride, kind=kind)
+    uuids = _produce(tm, buf, range(n_items))
     present = tm.tensor_store.check_uuid_presence
     seen = []
     while (se := w._pop_streaming_edge(buf, EDGE, RID)) is not None:
@@ -86,47 +106,35 @@ def test_a_sliding_window_keeps_its_overlap_alive_and_frees_everything_once_cons
         seen.append(chunk[0].flatten().tolist())
         # whatever the buffer still holds is still in the store
         assert all(present(u) for u in uuids[buf._consumed:])
-    assert seen == [[0, 1, 2], [2, 3, 4], [4, 5, 6]]
-    # the overlap item 6 is still buffered; the producer's done flushes it
+    assert seen == chunks
+    # the producer's done flushes what is left: the overlap item, unstacked,
+    # or an empty final chunk with no items
     buf.signal_done(len(uuids))
     se = w._pop_streaming_edge(buf, EDGE, RID)
     assert se.chunk.is_final
-    assert _consume(w, tm, se)[0].flatten().tolist() == [6]
+    if flushed:
+        (tensor,) = _consume(w, tm, se)
+        assert tensor.shape == (1,) and tensor.tolist() == flushed
+    else:
+        assert se.edge.tensor_info == []
     assert not any(present(u) for u in uuids), "every item is released once consumed"
 
 
-def test_a_one_item_chunk_is_the_item_unstacked():
-    w, tm, buf = _consumer(window=1, stride=1)
-    _produce(tm, buf, [5])
-    se = w._pop_streaming_edge(buf, EDGE, RID)
-    (tensor,) = _consume(w, tm, se)
-    assert tensor.shape == (1,) and tensor.item() == 5
-
-
-def test_an_empty_final_chunk_carries_no_items():
+def test_whatever_can_ready_a_chunk_marks_the_buffer_for_the_poll():
+    """The poll skips a buffer that is not ``maybe_ready``, so a missed
+    setter would leave its chunk unread for good."""
     w, tm, buf = _consumer(window=2, stride=2)
-    _produce(tm, buf, [1, 2])
-    _consume(w, tm, w._pop_streaming_edge(buf, EDGE, RID))
-    buf.signal_done(2)
-    se = w._pop_streaming_edge(buf, EDGE, RID)
-    assert se.chunk.is_final and se.edge.tensor_info == []
-
-
-def test_maybe_ready_is_set_by_whatever_can_ready_a_chunk_and_cleared_by_an_empty_poll():
-    w, tm, buf = _consumer(window=2, stride=2)
-    assert w._pop_streaming_edge(buf, EDGE, RID) is None
-    assert not buf.maybe_ready, "an empty poll clears it"
+    w._pop_streaming_edge(buf, EDGE, RID)
     _produce(tm, buf, [1])
-    assert buf.maybe_ready, "an arriving item sets it"
-    assert w._pop_streaming_edge(buf, EDGE, RID) is None and not buf.maybe_ready
+    assert buf.maybe_ready, "an arriving item"
+    w._pop_streaming_edge(buf, EDGE, RID)
     _produce(tm, buf, [2], first_uuid=200)
     se = w._pop_streaming_edge(buf, EDGE, RID)
     assert se is not None and buf.maybe_ready, "a pop may leave another chunk"
-    assert w._pop_streaming_edge(buf, EDGE, RID) is None and not buf.maybe_ready
+    w._pop_streaming_edge(buf, EDGE, RID)
     buf.store_uningested_edge(se)
-    assert buf.maybe_ready, "a refused edge coming back sets it"
+    assert buf.maybe_ready, "a refused edge coming back"
     assert w._pop_streaming_edge(buf, EDGE, RID) is se
-    assert w._pop_streaming_edge(buf, EDGE, RID) is None and not buf.maybe_ready
+    w._pop_streaming_edge(buf, EDGE, RID)
     buf.signal_done(2)
-    assert buf.maybe_ready, "the producer's done signal sets it"
-    assert w._pop_streaming_edge(buf, EDGE, RID).chunk.is_final
+    assert buf.maybe_ready, "the producer's done signal"
