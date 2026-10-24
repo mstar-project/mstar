@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
@@ -49,6 +49,53 @@ class InputMetadata(NamedTuple):
 
 
 EMPTY_INPUT_METADATA = InputMetadata()
+
+
+class StopKind(Enum):
+    """How a loop's stop is decided after each step (``StopPolicy``)."""
+    # the sampled token is one of the policy's EOS ids (unless the request
+    # ignores EOS), or the loop reached the request's iteration limit
+    AR = "ar"
+    # only the iteration limit
+    ITER = "iter"
+
+
+@dataclass(frozen=True)
+class StopPolicy:
+    """A stop check the engine can run without calling ``check_stop``.
+
+    ``NodeSubmodule.get_stop_policies`` returns these for a walk. With
+    ``count`` the loop's iteration count as of the step (what ``check_stop``
+    reads as ``dynamic_loop_iter_counts.get(loop, 0)``), a row stops
+    ``loop`` when ``count + 1 >= max_iters(info)``, or, for ``AR``, when the
+    row's ``token_signal`` value is in ``eos_tokens`` and its ``sampler``
+    resource's config does not set ``ignore_eos``.
+    """
+    kind: StopKind
+    loop: str
+    # AR: the output signal carrying the sampled token, read off the host
+    # rows; the first value of the row
+    token_signal: str | None = None
+    eos_tokens: tuple[int, ...] = ()
+    # AR: the resource label whose request config carries ``ignore_eos``;
+    # None means EOS is never ignored
+    sampler: str | None = None
+    # the request's iteration limit for this loop; evaluated once per request
+    # and walk, not per step. None is ``info.max_tokens``.
+    max_iters: Callable[[CurrentForwardPassInfo], int] | None = None
+
+    def __post_init__(self):
+        if self.kind is StopKind.AR and self.token_signal is None:
+            raise ValueError("an AR StopPolicy needs a token_signal")
+
+    def limits(self, info: CurrentForwardPassInfo) -> tuple[int, bool]:
+        """(max_iters, ignore_eos) for one request."""
+        max_iters = info.max_tokens if self.max_iters is None else self.max_iters(info)
+        ignore_eos = False
+        if self.kind is StopKind.AR and self.sampler is not None:
+            config = info.resource_configs.get(self.sampler)
+            ignore_eos = bool(getattr(config, "ignore_eos", False))
+        return int(max_iters), ignore_eos
 
 
 @dataclass
@@ -954,6 +1001,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         Default: no stops.
         """
         return set()
+
+    def get_stop_policies(self, graph_walk: str) -> tuple[StopPolicy, ...] | None:
+        """The stop checks ``check_stop`` amounts to on ``graph_walk``, if it
+        is only these, so the engine can run them without calling it.
+
+        None (the default) means ``check_stop`` decides; an empty tuple means
+        it never stops a loop on this walk. The engine asks once per walk.
+        Every policy must agree with ``check_stop`` for every row.
+        """
+        return None
 
     def check_stop_batched(
         self, request_ids: list[str],

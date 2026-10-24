@@ -96,6 +96,11 @@ pub struct RequestInfo {
     /// persist signals and token counts to whichever request draws that
     /// integer next. Here, remove_request frees them with everything else.
     pub pending: PendingOutputs,
+
+    /// Per walk, this request's limits for the walk's declared stop rules
+    /// (`GraphRuntime.stop_rules`): (max_iters, ignore_eos) per rule. Set by
+    /// `set_stop_limits` the first time the request is checked on the walk.
+    pub stop_limits: Vec<(Sym, Vec<(u32, bool)>)>,
 }
 
 /// What a request has accumulated since its last WORKER_GRAPHS_DONE.

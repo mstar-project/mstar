@@ -73,6 +73,8 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
+    StopKind,
+    StopPolicy,
     device_loopback_enabled,
 )
 from mstar.utils.knobs import ingraph_decode_rope
@@ -665,6 +667,15 @@ class LLMSubmodule(ARNodeSubmodule):
         return request_info.graph_walk == "decode" or request_info.step_metadata.get(
             "last_prefill", False,
         )
+
+    def get_stop_policies(self, graph_walk: str) -> tuple[StopPolicy, ...]:
+        # as check_stop: only a decode row's stop can end decode_loop
+        if graph_walk != "decode":
+            return ()
+        return (StopPolicy(
+            StopKind.AR, "decode_loop", token_signal="new_token",
+            eos_tokens=tuple(self.config.stop_token_ids), sampler=SAMPLER,
+        ),)
 
     def check_stop(
         self,
