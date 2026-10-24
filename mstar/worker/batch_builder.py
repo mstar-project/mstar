@@ -46,6 +46,9 @@ class BatchBuildRequest:
     walk_max_tokens: dict[str, int] | None = None
     row_tokens: dict[int, int] = field(default_factory=dict)
     chunkable: set[int] = field(default_factory=set)
+    # The fewest tokens a cut row runs (the node's floor for its configured
+    # budget; ``max_batch_tokens`` above is what is left of that budget).
+    min_chunk_tokens: int = 1
     # `Engine.capture_group` for one rid of this (node, walk).
     capture_group: Callable[[int], Any] = lambda _: None
 
@@ -198,10 +201,13 @@ class FIFOBatchBuilder(BaseBatchBuilder):
 
         take, dropped = fill_token_budget(
             list(scheduled.request_to_worker_graph), request.row_tokens,
-            request.chunkable, request.max_batch_tokens,
+            request.chunkable, request.max_batch_tokens, request.min_chunk_tokens,
         )
         if request.walk_max_tokens:
-            _cap_walks(scheduled, take, dropped, request.chunkable, request.walk_max_tokens)
+            _cap_walks(
+                scheduled, take, dropped, request.chunkable, request.walk_max_tokens,
+                request.min_chunk_tokens,
+            )
         chunk_tokens = {
             rid: n for rid, n in take.items() if n < request.row_tokens.get(rid, n)
         }
@@ -224,9 +230,13 @@ class FIFOBatchBuilder(BaseBatchBuilder):
 
 def fill_token_budget(
     rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
+    min_chunk: int = 1,
 ) -> tuple[dict[int, int], set[int]]:
     """Max-min fair share of ``budget`` over ``rids``: rows under an equal share
     go in whole, the rest split what is left (chunkable rows) or sit out.
+    A cut row takes at least ``min_chunk`` tokens, or all it has left if that
+    is fewer: when the share is smaller, only as many rows as what is left
+    holds are cut, and if it holds none, the first runs over budget.
     Never empty while a row exists: the first row runs over budget if it must.
     Returns (rid -> tokens taken, rids left out)."""
     take: dict[int, int] = {}
@@ -241,24 +251,32 @@ def fill_token_budget(
             take[rid] = tokens.get(rid, 0)
             left -= take[rid]
         pending = [rid for rid in pending if rid not in take]
-    dropped: set[int] = set()
+    dropped = {rid for rid in pending if rid not in chunkable}
+    cut = [rid for rid in pending if rid in chunkable]
     share = left // len(pending) if pending else 0
-    for rid in pending:
-        if rid in chunkable and share >= 1:
-            take[rid] = share
+    if cut and share < min_chunk:
+        n = min(len(cut), max(left, 0) // min_chunk)
+        if n == 0 and (take or cut[0] == rids[0]):
+            n = 1  # the one row over budget, unless that is the head's place below
+        share = max(left // n, min_chunk) if n else 0
+        dropped.update(cut[n:])
+        cut = cut[:n]
+    for rid in cut:
+        if share >= 1:
+            take[rid] = min(tokens.get(rid, 0), share)
         else:
             dropped.add(rid)
     if not take and rids:
         head = rids[0]
         need = tokens.get(head, 0)
-        take[head] = min(need, max(budget, 1)) if head in chunkable else need
+        take[head] = min(need, max(budget, min_chunk, 1)) if head in chunkable else need
         dropped.discard(head)
     return take, dropped
 
 
 def _cap_walks(
     batch: "ScheduledBatch", take: dict[int, int], dropped: set[int],
-    chunkable: set[int], caps: dict[str, int],
+    chunkable: set[int], caps: dict[str, int], min_chunk: int = 1,
 ) -> None:
     """Hold each capped walk's rows to its cap as well as the step's budget:
     those rows share the cap as ``fill_token_budget`` shares a budget, from
@@ -268,7 +286,9 @@ def _cap_walks(
         rids = [rid for rid in batch.request_to_worker_graph if rid in take and batch.walk_of(rid) == walk]
         if sum(take[rid] for rid in rids) <= cap:
             continue
-        walk_take, walk_dropped = fill_token_budget(rids, {rid: take[rid] for rid in rids}, chunkable, cap)
+        walk_take, walk_dropped = fill_token_budget(
+            rids, {rid: take[rid] for rid in rids}, chunkable, cap, min(min_chunk, cap),
+        )
         for rid in rids:
             del take[rid]
         take.update(walk_take)

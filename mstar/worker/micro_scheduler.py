@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.chunking import min_chunk_tokens
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWalks
 from mstar.model.submodule_base import InputMetadata
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
@@ -844,7 +845,9 @@ class MicroScheduler:
             chunkable |= chunks
         if backlogged is None and not fresh:
             return None
+        min_chunk = 1
         if max_tokens is not None and row_tokens:
+            min_chunk = min_chunk_tokens(max_tokens)
             seq_lens = pre_existing_seq_lens() if pre_existing_seq_lens is not None else ()
             max_tokens -= _pre_existing_tokens(seq_lens, pre_existing_batch_size)
         return self._build_and_schedule(request_state, BatchBuildRequest(
@@ -862,6 +865,7 @@ class MicroScheduler:
             ),
             row_tokens=row_tokens,
             chunkable=chunkable,
+            min_chunk_tokens=min_chunk,
         ))
 
     def _room_left(

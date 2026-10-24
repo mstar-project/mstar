@@ -17,6 +17,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The fewest tokens the scheduler cuts a row to (one KV page at the default
+# page size), or the whole budget when that is smaller. Without it, decode rows
+# that fill the budget leave a prompt a token or two a step.
+MIN_CHUNK_TOKENS = 128
+
+
+def min_chunk_tokens(budget: int) -> int:
+    return min(MIN_CHUNK_TOKENS, budget)
+
 
 class ChunkingManagement:
     def __init__(self, submodules: Mapping[str, "SubmoduleManagement"]):
@@ -144,7 +153,8 @@ class ChunkingManagement:
         if budget is None:
             return
         total = sum(inp.input_seq_len for inp in node_inputs)
-        if total <= budget:
+        # a row cut to the chunk floor may run the step over by up to that floor
+        if total <= budget + min_chunk_tokens(budget):
             return
         key = (batch.node_name, walk)
         count = self._overruns[key] = self._overruns.get(key, 0) + 1

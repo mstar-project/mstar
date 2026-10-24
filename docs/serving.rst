@@ -336,7 +336,9 @@ It doesn't replace the cap.
 **Chunked prefill budgets.** A walk that supports chunked prefill runs at most its token
 budget per step, and a longer prompt is split across steps. Each model sets its own
 budgets. A deployment can override them per node, either with one budget for every walk
-the model budgets or with a budget per walk; null turns a walk's chunking off.
+the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
+that is cut runs at least 128 tokens a step, or the whole budget if that is smaller, so
+when decode rows fill the budget, a step can run over it by up to that many tokens.
 
 Most chunked walks run inside a combined walk, which batches a node's prompts and its
 decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for

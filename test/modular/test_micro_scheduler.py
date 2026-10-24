@@ -1695,6 +1695,15 @@ def test_a_parked_row_is_measured_once_and_checked_once_per_pass():
 # ── chunked prefill ─────────────────────────────────────────────────────
 
 
+@pytest.fixture
+def no_chunk_floor(monkeypatch):
+    """Cut rows as small as the share says: these tests are about how a budget
+    of a few tokens is shared, which the chunk floor would round up."""
+    import mstar.engine.chunking
+
+    monkeypatch.setattr(mstar.engine.chunking, "MIN_CHUNK_TOKENS", 1)
+
+
 class _ChunkingEngine(_SizedEngine):
     """A 4-token budget; ``p0``'s walk can be chunked and it is 10 tokens long."""
 
@@ -1723,6 +1732,7 @@ class _ChunkingEngine(_SizedEngine):
         return InputSeqLenInfo(10 - cached, cached_prefix=cached)
 
 
+@pytest.mark.usefixtures("no_chunk_floor")
 def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
     sched.get_tensor = lambda uuid: uuid
@@ -1742,6 +1752,7 @@ def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
     assert ("p0", NODE) not in sched.chunk_progress, "the last chunk ends the progress"
 
 
+@pytest.mark.usefixtures("no_chunk_floor")
 def test_a_refused_chunk_waits_out_its_hold_and_runs_the_same_range():
     """An OOM refusal holds the rows and readies them again; nothing landed,
     so the chunk's progress has not moved and the retry runs the same tokens."""
@@ -1789,6 +1800,7 @@ def test_a_walk_cap_holds_its_rows_within_the_steps_budget():
     assert sorted(first.request_to_worker_graph) == ["d0", "d1", "p0"]
 
 
+@pytest.mark.usefixtures("no_chunk_floor")
 def test_a_walk_cap_shares_itself_among_its_rows():
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8, walk_caps={"prefill": 2}))
     sched.get_tensor = lambda uuid: uuid
@@ -1799,6 +1811,7 @@ def test_a_walk_cap_shares_itself_among_its_rows():
     assert first.chunk_ranges == {"p0": (0, 1, 10), "p1": (0, 1, 10)}
 
 
+@pytest.mark.usefixtures("no_chunk_floor")
 def test_a_chunked_row_starts_past_its_cached_prefix():
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p0": 4}))
     sched.get_tensor = lambda uuid: uuid
@@ -1815,6 +1828,7 @@ def test_a_chunked_row_starts_past_its_cached_prefix():
     ([3], (0, 1, 10)),   # the continuing row ran 3 tokens last step: 1 of the 4 is left
     ([-1], (0, 3, 10)),  # unknown: guessed at one token
 ])
+@pytest.mark.usefixtures("no_chunk_floor")
 def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
     sched.get_tensor = lambda uuid: uuid
@@ -1826,6 +1840,32 @@ def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
     )
 
     assert merged.chunk_ranges == {"p0": chunk}
+
+
+def test_rows_that_use_up_the_budget_leave_a_prompt_the_chunk_floor():
+    """A merge whose continuing rows ran the whole budget of 4 leaves the
+    prompt nothing; it still runs the floor (the whole budget here, which is
+    under MIN_CHUNK_TOKENS), not a token a step."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+
+    merged = _next_batch(
+        sched, _Manager(["p0"], walks={"p0": "prefill"}), target=(NODE, "prefill"),
+        pre_existing_batch_size=4, pre_existing_seq_lens=lambda: [1, 1, 1, 1],
+    )
+
+    assert merged.chunk_ranges == {"p0": (0, 4, 10)}
+
+
+def test_the_chunk_floor_does_not_pad_a_last_chunk():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p0": 7}))
+    sched.get_tensor = lambda uuid: uuid
+
+    first = _next_batch(sched, _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"}))
+
+    # the decode rows leave 2 of 4; the prompt's last 3 run whole, not cut to 2 or padded to 4
+    assert first.chunk_ranges == {}
+    assert sorted(first.request_to_worker_graph) == ["d0", "d1", "p0"]
 
 
 def test_a_merge_with_no_rows_to_size_never_estimates_its_own():

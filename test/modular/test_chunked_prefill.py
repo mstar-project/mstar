@@ -28,6 +28,52 @@ def test_two_long_prompts_share_what_is_left():
     assert take == {"a": 5, "b": 5}
 
 
+# ── the chunk floor ─────────────────────────────────────────────────────
+
+
+def _decodes(n: int) -> dict[str, int]:
+    return {f"d{i}": 1 for i in range(n)}
+
+
+def test_decode_rows_that_fill_the_budget_leave_a_prompt_the_floor():
+    decodes = _decodes(2047)
+    take, dropped = fill_token_budget([*decodes, "p"], decodes | {"p": 1000}, {"p"}, 2048, 128)
+    assert take["p"] == 128  # 127 over budget, rather than 1 token
+    assert len(take) == 2048 and not dropped
+
+
+def test_the_floor_takes_a_short_remainder_whole_not_padded():
+    decodes = _decodes(2040)
+    take, _ = fill_token_budget([*decodes, "p"], decodes | {"p": 50}, {"p"}, 2048, 128)
+    assert take["p"] == 50
+
+
+def test_a_share_under_the_floor_cuts_fewer_rows_within_budget():
+    prompts = {f"p{i}": 1000 for i in range(20)}
+    take, dropped = fill_token_budget(list(prompts), prompts, set(prompts), 2048, 128)
+    assert take == {f"p{i}": 128 for i in range(16)}
+    assert dropped == {f"p{i}" for i in range(16, 20)}
+
+
+def test_the_floor_shares_what_is_left_among_the_rows_it_cuts():
+    decodes = _decodes(1748)
+    take, dropped = fill_token_budget(
+        [*decodes, "a", "b", "c"], decodes | {"a": 1000, "b": 1000, "c": 1000}, {"a", "b", "c"}, 2048, 128,
+    )
+    assert (take["a"], take["b"]) == (150, 150) and dropped == {"c"}
+
+
+def test_a_share_over_the_floor_is_left_alone():
+    take, _ = fill_token_budget(["a", "b"], {"a": 5000, "b": 5000}, {"a", "b"}, 2048, 128)
+    assert take == {"a": 1024, "b": 1024}
+
+
+def test_a_head_that_cannot_be_cut_keeps_its_place_over_a_floored_row():
+    take, dropped = fill_token_budget(["d0", "p0"], {"d0": 3, "p0": 100}, {"p0"}, 0, 4)
+    assert take == {"d0": 3}
+    assert dropped == {"p0"}
+
+
 def test_a_row_that_cannot_be_cut_sits_out_over_budget():
     take, dropped = fill_token_budget(["d0", "p0"], {"d0": 1, "p0": 100}, set(), 10)
     assert take == {"d0": 1}
@@ -349,12 +395,13 @@ def test_a_step_over_its_token_budget_is_reported(caplog):
         submodule=SimpleNamespace(get_chunking_policy=lambda walk: ChunkingPolicy(max_batch_tokens=4)),
     )})
     batch = SimpleNamespace(node_name="LLM", step_context=SimpleNamespace(graph_walk="mixed"))
-    over = [SimpleNamespace(input_seq_len=3), SimpleNamespace(input_seq_len=2)]
+    # over the budget of 4 and the chunk floor's slack of 4 more
+    over = [SimpleNamespace(input_seq_len=6), SimpleNamespace(input_seq_len=3)]
 
     with caplog.at_level("WARNING"):
         for _ in range(3):
             chunking.check_budget(batch, over)
-        chunking.check_budget(batch, over[:1])
+        chunking.check_budget(batch, [SimpleNamespace(input_seq_len=8)])  # within the slack
 
     assert chunking._overruns == {("LLM", "mixed"): 3}
     assert len(caplog.records) == 2  # the 1st and 2nd overrun; the 4th would be next
