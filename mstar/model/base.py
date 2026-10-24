@@ -707,6 +707,32 @@ class Model(ABC):
         """
         return None
 
+    def reload_weights(
+        self, path: str, submodules: dict[str, torch.nn.Module], *, check_only: bool = False,
+    ) -> None:
+        """Copy the checkpoint at ``path`` into this worker's built ``submodules``
+        (node name -> the module ``get_submodule`` returned), in place.
+
+        The engine calls it on every rank while generation is paused and nothing
+        is in flight. With ``check_only`` it copies nothing: compare ``path``
+        against the loaded checkpoint (``check_reload_compatible`` in
+        ``mstar.model.loader.reload``) and raise ``WeightReloadRefusedError`` if it
+        cannot be copied in place. Otherwise copy every tensor the startup load
+        copies, through the same ``weight_loader``s, so fused and TP-sharded
+        parameters get their pieces the same way, and drop anything the model
+        caches from its weights. Never rebuild a module, call ``to_empty`` or
+        rebind ``.data``: compiled code and captured graphs hold pointers to the
+        existing storage, and the engine refuses a reload that moved any.
+
+        The default refuses; a model opts in by overriding this.
+        """
+        # Imported here: loader/__init__.py pulls safetensors, which the rust-transport
+        # job does not install, and importing this module is how those tests start.
+        from mstar.model.loader.reload import WeightReloadRefusedError
+
+        del path, submodules, check_only
+        raise WeightReloadRefusedError(f"{type(self).__name__} does not support reloading weights in place")
+
     def preprocess_fingerprint(self) -> str:
         """What this model's preprocessing contributes to the cache's root.
 

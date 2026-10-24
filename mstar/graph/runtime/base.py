@@ -572,6 +572,14 @@ class GraphRuntime(ABC):
     def get_sharding_config(self, rid: int) -> ShardingConfig | None:
         pass
 
+    @abstractmethod
+    def idle_counts(self) -> tuple[int, int, int]:
+        """``(requests, parked_routes, staged_specs)``: requests still
+        registered, routing parked between ``complete_and_route_batch`` and
+        ``send_outputs``, and speculative ingests staged but not settled. All
+        zero means the runtime holds nothing a weight reload could race."""
+        pass
+
     # --------- rid <-> handle, at the process boundary ----------
     #
     # Handles are worker-internal. Messages carry the string, so the only

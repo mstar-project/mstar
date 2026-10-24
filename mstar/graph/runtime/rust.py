@@ -324,6 +324,9 @@ class RustGraphRuntime(GraphRuntime):
         self._sharding.pop(rid, None)
         self._rust.remove_request(rid)
 
+    def idle_counts(self) -> tuple[int, int, int]:
+        return tuple(self._rust.idle_counts())
+
     def get_sharding_config(self, rid: int) -> ShardingConfig | None:
         """None for a rid this rank does not know: the teardown and TP-fanout
         callers can legitimately race a removal."""

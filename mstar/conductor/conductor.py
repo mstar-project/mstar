@@ -17,10 +17,12 @@ import yaml
 from mstar.api_server.request_types import (
     APIServerMessage,
     ConductorStatus,
+    GenerationControlResult,
     RequestComplete,
     RequestFailed,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.generation_control import GenerationControl, GenerationState
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
@@ -63,6 +65,14 @@ from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 
 logger = logging.getLogger(__name__)
+
+_GENERATION_CONTROL_TYPES = frozenset({
+    ConductorMessageType.PAUSE_GENERATION,
+    ConductorMessageType.CONTINUE_GENERATION,
+    ConductorMessageType.UPDATE_WEIGHTS_FROM_DISK,
+    ConductorMessageType.GET_GENERATION_STATE,
+    ConductorMessageType.WEIGHT_CONTROL_ACK,
+})
 
 
 class DeadWorkerError(RuntimeError):
@@ -396,6 +406,9 @@ class Conductor:
     # Metrics are off unless __init__ gets an interval; class-level so an
     # object built without __init__ reads them as off too.
     _status_interval_s: float | None = None
+    # Pause and weight-update state; class-level so an object built without
+    # __init__ admits as before.
+    _generation: GenerationControl | None = None
 
     def __init__(
         self,
@@ -575,6 +588,16 @@ class Conductor:
             my_id="conductor",
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
+        )
+        self._generation = GenerationControl(
+            workers=self.worker_ids,
+            # looked up per send: a test may build this with a stub communicator
+            send=lambda peer, message: self.communicator.send(peer, message),  # noqa: PLW0108
+            reject_queued=lambda: self._reject_waiting_queue(
+                "generation is paused", status=503,
+            ),
+            abort_in_flight=self._abort_in_flight_for_pause,
+            timeout_s=float(self.model_config.get("weight_update_timeout_s", 600)),
         )
 
     def _max_output_tokens(self, model_kwargs: dict) -> int:
@@ -1082,6 +1105,10 @@ class Conductor:
                 "Request %s was aborted before ingest; dropping", body.request_id
             )
             return
+        generation = self._generation
+        if generation is not None and generation.state is not GenerationState.SERVING:
+            self._reject_request(body.request_id, "generation is paused", status=503)
+            return
         try:
             _request_seed(body.model_kwargs or {}, _seed_id(body))
         except ValueError as exc:
@@ -1545,9 +1572,32 @@ class Conductor:
             return
         self._remove_request(request_id, request_data)
 
+    def _reject_waiting_queue(self, error: str, status: int) -> None:
+        """Fail every request queued at the concurrency cap; none reached a worker."""
+        queued, self.waiting_queue = self.waiting_queue, []
+        for body in queued:
+            if self._status_interval_s is not None:
+                self._queued_since.pop(body.request_id, None)
+            self._reject_request(body.request_id, error, status=status)
+
+    def _abort_in_flight_for_pause(self) -> None:
+        """Fail every admitted request through the drain barrier, with a 503.
+
+        A request already in teardown is left alone: it either completed or
+        already has its error on the way.
+        """
+        for request_id, request_data in list(self.requests.items()):
+            if request_id in self.draining:
+                continue
+            self._remove_request(
+                request_id, request_data,
+                failure_error="generation was paused, aborting requests in flight",
+                failure_status=503,
+            )
+
     def _remove_request(
         self, request_id: str, request_data: RequestData,
-        failure_error: str | None = None,
+        failure_error: str | None = None, failure_status: int = 500,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
         then (on the barrier's completion) hard-remove. Shared by the abort
@@ -1574,6 +1624,7 @@ class Conductor:
             expected_acks=participants,
             participants=participants,
             failure_error=failure_error,
+            failure_status=failure_status,
         )
 
     def _process_request_done(
@@ -1957,8 +2008,39 @@ class Conductor:
                 )
             if self.enable_nvtx:
                 range_pop()
+        # pause and weight-update control, after every per-request type so the
+        # per-step messages compare as many types as they did without it
+        elif message.message_type in _GENERATION_CONTROL_TYPES:
+            self._route_generation_control(message)
         else:
             raise ValueError(f"Unknown message type: {message.message_type}")
+
+    def _route_generation_control(self, message) -> None:
+        generation = self._generation
+        if generation is None:
+            # only a conductor built without __init__ (a test stub) has no state machine
+            logger.warning("Refusing %s: this conductor has no pause control", message.message_type.value)
+            op_id = getattr(message.body, "op_id", None)
+            if op_id is not None:
+                self.communicator.send("api_server", APIServerMessage(
+                    message_type="generation_control_result",
+                    body=GenerationControlResult(
+                        op_id=op_id, status=503, state=GenerationState.SERVING.value, paused=False,
+                        error_message="pause and weight updates are not available on this conductor",
+                    ),
+                ))
+            return
+        t = message.message_type
+        if t == ConductorMessageType.PAUSE_GENERATION:
+            generation.pause(message.body)
+        elif t == ConductorMessageType.CONTINUE_GENERATION:
+            generation.resume(message.body)
+        elif t == ConductorMessageType.UPDATE_WEIGHTS_FROM_DISK:
+            generation.update(message.body)
+        elif t == ConductorMessageType.GET_GENERATION_STATE:
+            generation.report(message.body)
+        else:
+            generation.ack(message.body)
 
     def _fail_after_error(
         self, request_id: str | None, step: str, exc: Exception,
@@ -2088,6 +2170,9 @@ class Conductor:
                             self._fail_after_error(request_id, "completing it", exc)
 
                 self._sweep_expiry()
+                generation = self._generation
+                if generation is not None and generation.state is not GenerationState.SERVING:
+                    generation.tick(len(self.requests))
                 if self._status_interval_s is not None:
                     self._maybe_send_status()
 

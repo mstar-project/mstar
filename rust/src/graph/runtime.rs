@@ -87,6 +87,11 @@ impl InternedRids {
     fn len(&self) -> usize {
         self.rid_names.len()
     }
+
+    /// Handles held by a request now; `len` counts freed ones too.
+    fn live(&self) -> usize {
+        self.rid_to_handle.len()
+    }
 }
 
 
@@ -1769,6 +1774,18 @@ impl GraphRuntime {
         // worker drops its outputs on a speculative new iteration and prep
         // excludes it from speculation.
         self.pending_loop_stops.retain(|&(r, _, _)| r != rid);
+    }
+
+    /// `(requests, parked_routes, staged_specs)`: requests still registered,
+    /// routing parked between complete_and_route_batch and send_outputs, and
+    /// speculative ingests staged but not settled. All zero means nothing here
+    /// can race a weight reload.
+    fn idle_counts(&self) -> (usize, usize, usize) {
+        (
+            self.rids.live(),
+            self.completions.len(),
+            self.staged_specs.len(),
+        )
     }
 
     fn get_rid_handle(&self, rid: &str) -> Option<u32> {
@@ -3750,6 +3767,22 @@ mod tests {
         let (b, _) = rids.intern("x");
         let (c, _) = rids.intern("y");
         assert_ne!(b, c, "a double free would have aliased these");
+    }
+
+    #[test]
+    fn live_counts_held_handles_not_slots() {
+        // idle_counts reads this: a freed slot must not keep a worker from
+        // reading idle for a weight reload.
+        let mut rids = InternedRids::new();
+        let (a, _) = rids.intern("req-a");
+        rids.intern("req-b");
+        rids.intern("req-b");
+        assert_eq!(rids.live(), 2);
+        assert!(rids.release(a));
+        assert!(!rids.release(a));
+        assert_eq!((rids.live(), rids.len()), (1, 2));
+        rids.intern("req-c");
+        assert_eq!((rids.live(), rids.len()), (2, 2), "the freed slot was reused");
     }
 
     #[test]

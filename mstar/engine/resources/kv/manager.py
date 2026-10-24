@@ -677,6 +677,32 @@ class KVManager(AttentionResource):
         self._index = PrefixIndex(self._arena)
         return True
 
+    def drop_prefix_cache(self, salt: str) -> int:
+        """Forget every cached page and hang later keys from a root salted with
+        ``salt``, for weights reloaded in place: a page computed under the old
+        weights must never match again. Returns the pages freed, device and
+        host together.
+
+        With no request in flight, as a reload is, the index is the only owner
+        of its pages, so all of them free. A page someone still held would stay
+        indexed under the old root, where no key can reach it. The host pool
+        files its pages under the same rooted keys, so it is emptied too.
+        """
+        with self._lock:
+            if self._index is None:
+                return 0
+            device = self._evict(self._index.num_pages())
+            host = 0
+            if self._cpu_pool is not None:
+                host_index = self._cpu_pool.index
+                host = len(host_index.evict(host_index.num_pages()))
+            self._prefix_root = fingerprint(self._prefix_root, "weights", salt)
+        logger.info(
+            "KV %s: prefix cache dropped for reloaded weights (%d device and %d host pages freed)",
+            self.name, device, host,
+        )
+        return device + host
+
     def page_counts(self) -> KVPageCounts:
         """The pool's pages right now, without the manager lock: each count is
         read whole, though the three may straddle an allocation."""

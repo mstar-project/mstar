@@ -311,6 +311,9 @@ class PythonGraphRuntime(GraphRuntime):
         # purged alongside this.
         self._rids.release(rid)
 
+    def idle_counts(self) -> tuple[int, int, int]:
+        return len(self._request_info), len(self._completions), len(self._staged_specs)
+
     def get_rid_string(self, handle: int) -> str:
         return self._rids.name(handle)
 

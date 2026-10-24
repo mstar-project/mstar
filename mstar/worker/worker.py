@@ -75,6 +75,9 @@ from mstar.utils.ipc_format import (
     TensorReceived,
     TPNoSpeculation,
     UnpersistTensors,
+    WeightControl,
+    WeightControlAck,
+    WeightOp,
     WorkerMessage,
     WorkerMessageType,
 )
@@ -355,6 +358,17 @@ class Worker:
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
     _metrics: WorkerMetrics | None = None
+
+    # Pause / weight-reload protocol: the step the conductor last asked for and
+    # not yet answered, and the weights this rank holds: the label they were
+    # copied under (None for the startup checkpoint) and the epoch of the apply
+    # step that copied them (0). Dirty means a reload stopped partway, so it
+    # holds no known version until one succeeds.
+    _weight_op: WeightControl | None = None
+    _weight_version: str | None = None
+    _weight_epoch: int = 0
+    _weights_dirty: bool = False
+    _weight_op_logged: int = -1
 
     @cached_property
     def device_capability(self) -> DeviceCapability:
@@ -1100,6 +1114,101 @@ class Worker:
         for rid in list(self._draining_rids):
             self._complete_drain_if_ready(rid)
 
+    # ------------------------------------------------------------------
+    # Pause and weight reload
+    # ------------------------------------------------------------------
+
+    def _idle_blockers(self) -> list[str]:
+        """What this rank still has in flight or queued; empty once it is idle.
+
+        A TP follower holds a request until rank 0's removal for it lands
+        behind the last step rank 0 broadcast (``after_tp_seq``), so it reads
+        idle only once it has run every step rank 0 committed.
+        """
+        blockers = []
+        requests, parked_routes, staged_specs = self._graph_runtime.idle_counts()
+        if requests:
+            blockers.append(f"{requests} request(s) still held")
+        if parked_routes:
+            blockers.append(f"{parked_routes} step output(s) not yet sent")
+        if staged_specs:
+            blockers.append(f"{staged_specs} staged speculative ingest(s)")
+        if self._in_flight_rids:
+            blockers.append("a step in flight")
+        teardowns = len(self._pending_removes) + len(self._pending_drains) + sum(
+            len(rids) for rids in self._removes_awaiting_step.values()
+        )
+        if teardowns:
+            blockers.append(f"{teardowns} teardown(s) not yet applied")
+        follows = len(self.scheduler.tp_batches_pending_schedule)
+        if follows:
+            blockers.append(f"{follows} committed TP step(s) not yet run")
+        return blockers
+
+    def _run_weight_op(self) -> None:
+        """Run the pause / reload step the conductor asked for.
+
+        Called only from the run loop's non-speculative path, where no step is
+        on the GPU thread and no pre-plan is outstanding. A quiesce waits for
+        the rest of this rank's work to drain and answers once it has; the
+        other steps answer at once.
+        """
+        op = self._weight_op
+        blockers = self._idle_blockers()
+        if op.op == WeightOp.QUIESCE:
+            if blockers:
+                if self._weight_op_logged != op.epoch:
+                    self._weight_op_logged = op.epoch
+                    logger.info(
+                        "Worker %s: waiting to be idle for the pause: %s",
+                        self.worker_id, "; ".join(blockers),
+                    )
+                return
+            self._weight_op = None
+            self._ack_weight_op(op)
+            return
+        self._weight_op = None
+        error = None
+        if op.op == WeightOp.VERIFY:
+            pass
+        elif blockers:
+            error = "not idle: " + "; ".join(blockers)
+        elif op.op == WeightOp.PREPARE:
+            try:
+                self.engine_manager.engine.check_weight_reload(op.model_path)
+            except Exception as exc:  # noqa: BLE001 - reported to the conductor
+                logger.warning("Worker %s: checkpoint %s refused: %s", self.worker_id, op.model_path, exc)
+                error = f"{type(exc).__name__}: {exc}"
+        elif op.op == WeightOp.APPLY:
+            # set before the copy: an exception partway leaves no known version
+            self._weights_dirty = True
+            try:
+                self.engine_manager.engine.reload_weights(op.model_path, op.weight_version)
+            except Exception as exc:  # noqa: BLE001 - reported to the conductor
+                logger.exception("Worker %s: reload from %s failed", self.worker_id, op.model_path)
+                error = f"{type(exc).__name__}: {exc}"
+            else:
+                self._weight_version = op.weight_version
+                self._weight_epoch = op.epoch
+                self._weights_dirty = False
+                logger.info(
+                    "Worker %s: weights reloaded from %s as version %r",
+                    self.worker_id, op.model_path, op.weight_version,
+                )
+        else:
+            error = f"unknown weight control step {op.op!r}"
+        self._ack_weight_op(op, error)
+
+    def _ack_weight_op(self, op: WeightControl, error: str | None = None) -> None:
+        self.communicator.send("conductor", ConductorMessage(
+            message_type=ConductorMessageType.WEIGHT_CONTROL_ACK,
+            body=WeightControlAck(
+                epoch=op.epoch, worker_id=self.worker_id, op=op.op, error=error,
+                weight_version=self._weight_version, weight_epoch=self._weight_epoch,
+                dirty=self._weights_dirty,
+            ),
+        ))
+
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
         # Uuids are global, so a late ack needs no rid lookup and works even
@@ -1270,6 +1379,10 @@ class Worker:
             elif message.message_type == WorkerMessageType.ENABLE_METRICS:
                 # sent only with metrics on, so _metrics is set
                 self._metrics.start_counting()
+            elif message.message_type == WorkerMessageType.WEIGHT_CONTROL:
+                # run from the loop once nothing is in flight; a newer step
+                # replaces one the conductor has given up on
+                self._weight_op = message.body
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -4697,6 +4810,10 @@ class Worker:
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
+                # Nothing is on the GPU thread or the plan thread here, which
+                # is what a pause or weight reload step needs.
+                if self._weight_op is not None:
+                    self._run_weight_op()
                 with self._span("worker.schedule"):
                     batch = None
                     if yield_away_from_target is not None:

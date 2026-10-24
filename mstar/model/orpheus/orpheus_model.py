@@ -68,6 +68,9 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class OrpheusModel(Model):
     """Orpheus TTS model: Llama 3.2 3B + SNAC 24kHz decoder."""
 
+    # the directory the LLM's weights were loaded from, once it is built
+    _llm_weights_dir: str | None = None
+
     def __init__(
         self,
         model_path_hf: str,
@@ -539,11 +542,35 @@ class OrpheusModel(Model):
 
         load_weights(language_model, local_dir, device=device)
         language_model.eval()
+        self._llm_weights_dir = local_dir
 
         return OrpheusLLMSubmodule(
             language_model=language_model,
             config=self.config,
         )
+
+    def reload_weights(
+        self, path: str, submodules: dict[str, torch.nn.Module], *, check_only: bool = False,
+    ) -> None:
+        """Reload the language model in place from an HF Llama checkpoint with
+        the loaded one's tensor names and shapes. The SNAC decoder's weights come
+        from their own repo and stay as they are."""
+        from mstar.model.loader import HF_DEFAULT_SKIP_FRAGMENTS, load_weights
+        from mstar.model.loader.reload import WeightReloadRefusedError, check_reload_compatible
+
+        llm = submodules.get("LLM")
+        if llm is None:
+            return  # this rank hosts only the SNAC decoder
+        if self._llm_weights_dir is None:
+            # an LLM submodule handed in from outside get_submodule
+            raise WeightReloadRefusedError("the Orpheus LLM was not loaded from a checkpoint directory")
+        check_reload_compatible(path, self._llm_weights_dir, skip_fragments=HF_DEFAULT_SKIP_FRAGMENTS)
+        if check_only:
+            return
+        # Read on the host: the KV pool may leave no device room for a whole
+        # tensor. load_weights routes q/k/v and gate/up into the fused
+        # parameters through their weight_loaders, as the startup load does.
+        load_weights(llm.language_model, path, device="cpu")
 
     def _create_snac_submodule(self, device: str) -> NodeSubmodule:
         from mstar.model.orpheus.components.snac import SNAC
