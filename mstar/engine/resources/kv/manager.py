@@ -3984,9 +3984,9 @@ class KVManager(AttentionResource):
         of what ``rid`` was allotted and hasn't used, then out of the room, and the walk
         recomputes the pages neither covers.
 
-        ``counted`` means that ``rid``'s allotment already holds ``pages``. A guaranteed request is
-        then charged for a page another request holds, instead of being lent it. Otherwise a
-        guaranteed request borrows an evictable page from the room, and its allotment grows by
+        ``counted`` means that ``rid``'s allotment already counts ``pages``. A guaranteed request is
+        then charged for a page another request holds, instead of being lent it. Otherwise an
+        evictable page comes out of the room for a guaranteed request, and its allotment grows by
         that page.
         """
         if self._decides:
