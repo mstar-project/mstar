@@ -106,9 +106,7 @@ thread per core) spins after every CPU tensor op it does; under load the
 spinning threads starve the event loop and the transport threads (at
 concurrency 32 the process sat at 600-1000% CPU while the worker was idle
 two thirds of the time). A passive wait policy keeps the pool but lets its
-threads sleep. Shrinking the pool instead (``OMP_NUM_THREADS=1`` or
-``torch.set_num_threads(1)`` in the process) is not recommended: it was in
-place during several unexplained request hangs in our runs.
+threads sleep.
 
 Serve with the shared-memory arena, ``MSTAR_SHM_ARENA=1`` (needs the ``rust/``
 extension; see :doc:`environment_variables`). The default SHM transport creates
