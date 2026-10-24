@@ -555,6 +555,8 @@ class CosyVoice3Model(Model):
             if knobs["text_frontend"]
             else prompt
         )
+        if not text.strip():
+            raise ValueError("CosyVoice3 has no text to speak once the text is normalized")
         prompt_ids = self.tokenizer(self.prompt_text(mode, transcript, kwargs.get("instruct"), text))
         text_ids = self.tokenizer(text)
         ids = torch.cat([prompt_ids, text_ids])

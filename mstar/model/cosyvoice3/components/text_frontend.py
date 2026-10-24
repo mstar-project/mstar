@@ -110,8 +110,11 @@ def close_sentences(text: str, lang: str) -> str:
     joined back: a stop is added at the end if missing, a stop that ends an
     empty sentence (the second and third dots of "...") is dropped, and a
     closing quote stays with its sentence. Returns "" when no sentence has a
-    character other than punctuation or symbols."""
+    character other than punctuation, symbols or blanks (and for "", which
+    a text of only brackets becomes)."""
     stops = _STOPS[lang]
+    if not text:
+        return ""
     if text[-1] not in stops:
         text += "。" if lang == "zh" else "."
     sentences: list[str] = []
@@ -128,7 +131,7 @@ def close_sentences(text: str, lang: str) -> str:
         else:
             start = i + 1
     joined = "".join(sentences)
-    if all(unicodedata.category(c)[0] in "PS" for c in joined):
+    if all(unicodedata.category(c)[0] in "PSZ" for c in joined):
         return ""
     return joined
 

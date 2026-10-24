@@ -392,6 +392,8 @@ def test_superscript_digits_are_not_spelled_out():
         ("没有句号", "zh", "没有句号。"),
         ("...", "en", ""),
         ("!?", "zh", ""),
+        ("", "zh", ""),
+        (" 。", "zh", ""),
     ],
 )
 def test_close_sentences_follows_the_reference_splitter(text, lang, expected):
@@ -405,6 +407,33 @@ def test_text_left_alone():
     assert frontend.normalize(tagged) == tagged
     assert frontend.normalize("...") == "..."
     assert frontend.normalize("  ") == "  "
+
+
+@pytest.mark.parametrize("text", ["（）", "()", "【】", "（【】）", "——", "``"])
+def test_a_piece_of_only_brackets_is_left_as_written(text):
+    """The Chinese rules drop brackets, so nothing is left to speak; like "...", it is kept."""
+    frontend = CosyVoice3TextFrontend()
+    assert frontend.normalize(text, chinese=True) == text
+    assert frontend.normalize(text) == text
+
+
+def test_chinese_text_that_ends_in_a_piece_of_only_brackets(model):
+    sentence = "今天天气很好，我们一起去公园玩，然后回家做饭，晚上看电影，明天还要上班，所以要早点睡觉，"
+    text = (sentence + "你说好吗，我觉得这样安排挺好的呀？") * 3
+    pieces, kwargs = _served_pieces(text + "（）" * 12)
+    assert pieces[-1] == "（）" * 12
+    frontend = CosyVoice3TextFrontend()
+    spoken = [frontend.normalize(p, chinese=kwargs["text_has_chinese"]) for p in pieces]
+    assert spoken[:-1] == [frontend.normalize(p) for p in _served_pieces(text)[0]]
+    assert spoken[-1] == pieces[-1]
+    out = model.process_prompt(pieces[-1], ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip()]}, **kwargs)
+    assert torch.equal(_text_ids(out, f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), _Tokenizer()(pieces[-1]))
+
+
+def test_text_that_normalizes_to_nothing_is_a_value_error(model, monkeypatch):
+    monkeypatch.setattr(model.text_frontend, "normalize", lambda text, chinese=False: "")
+    with pytest.raises(ValueError, match="no text to speak"):
+        model.process_prompt("（）", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip()]})
 
 
 # -- wetext -----------------------------------------------------------------------------
