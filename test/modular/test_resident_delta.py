@@ -722,8 +722,8 @@ class _Rank:
         self.flushed_removes += 1
         self.flush_protected = set(in_flight_rids)
 
-    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None):
-        del batch_ids, affected_resources
+    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None, inside_only=False):
+        del batch_ids, affected_resources, inside_only
         self.offload_attempts.append(node_name)
         return "victim"
 
@@ -733,7 +733,7 @@ def _oom(rank, referenced_rids=frozenset()):
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
-    node_batch = SimpleNamespace(node_name="node", failed_resource=None)
+    node_batch = SimpleNamespace(node_name="node", failed_resource=None, admit_error=None)
     rank._handle_allocation_failure(batch, node_batch, referenced_rids)
 
 
