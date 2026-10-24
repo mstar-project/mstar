@@ -521,9 +521,10 @@ Chatterbox notes
 - Requests: ``/v1/audio/speech`` with ``input``, ``voice`` (``default`` = the
   voice shipped in the checkpoint, or a preset name resolved under the
   deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
-  ``ref_audio`` (data URL of a reference clip, 5-30 s, cloning; an http(s)
-  URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the
-  server are refused), ``exaggeration`` (0-2, emotion intensity, default 0.5),
+  ``ref_audio`` (data URL or bare base64 of a reference clip, 5-30 s,
+  cloning; an http(s) URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``;
+  paths on the server, clips over 60 s and clips below 8 kHz are refused),
+  ``exaggeration`` (0-2, emotion intensity, default 0.5),
   ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
   ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
   whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;

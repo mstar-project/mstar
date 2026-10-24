@@ -643,8 +643,9 @@ class ChatterboxAdapter(OpenAIAdapter):
     ``voice`` is either ``"default"`` (the voice shipped with the checkpoint)
     or the name of a preset clip in the deployment's ``voices_dir``. A
     reference clip for cloning comes through ``ref_audio`` in ``extra_body``
-    (a data URL or, when the server allows it, an http(s) URL; paths on the
-    server are refused) and is loaded by the worker like an uploaded file.
+    (a data URL, bare base64 or, when the server allows it, an http(s) URL;
+    paths on the server are refused, and so is a clip over 60 s or below
+    8 kHz) and is loaded by the worker like an uploaded file.
     The model's own knobs --
     ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
     ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for

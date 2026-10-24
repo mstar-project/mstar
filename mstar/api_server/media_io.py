@@ -176,9 +176,9 @@ def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tup
 # 16 kHz).
 MIN_REF_AUDIO_SAMPLE_RATE = 8000
 # Voice cloning needs seconds of speech. Twice the longest reference a model
-# takes (Qwen3-TTS refuses over 30 s, Chatterbox keeps 30 s), so this never
-# refuses a clip a model would use; without it a 66 MB FLAC probe-decodes to
-# about 23 GB.
+# uses (Qwen3-TTS refuses over 30 s, Chatterbox trims to 30 s), so this only
+# refuses a clip well past what any model would keep; without it a 66 MB FLAC
+# probe-decodes to about 23 GB.
 MAX_REF_AUDIO_SECONDS = 60.0
 # The probe decode runs in the request thread pool (32 threads); this bounds
 # how many decode at once.
