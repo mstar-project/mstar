@@ -57,6 +57,7 @@ from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
@@ -827,8 +828,11 @@ class Worker:
             )
         except Exception as err:
             # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
-            logger.exception("Worker %s: ingest of request %s failed", self.worker_id, body.request_id)
-            self._fail_requests({request_id: f"Error in worker: {type(err).__name__}: {err}"})
+            text, _ = client_error_text(
+                err, f"Worker {self.worker_id}: ingest of request {body.request_id} failed",
+                log=logger,
+            )
+            self._fail_requests({request_id: f"Error in worker: {text}"})
             self._process_unprocessed(body.request_id)
             return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
@@ -4041,8 +4045,9 @@ class Worker:
         # where the concurrent.futures machinery has already wrapped the
         # engine's traceback. Report the leaf exception to the client and keep
         # the full chain in the log.
-        err = f"{type(exc).__name__}: {exc}"
-        logger.exception("Worker %s error in main loop: %s", self.worker_id, err)
+        err, _ = client_error_text(
+            exc, f"Worker {self.worker_id} error in main loop", log=logger,
+        )
 
         failed_rids: set[int] = set(self._in_flight_rids)
         for stale in in_flight:

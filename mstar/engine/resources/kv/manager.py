@@ -55,6 +55,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 
@@ -235,6 +236,8 @@ class CacheStream:
     # a failed retrieve, latched: the future is consumed once, but every later
     # readiness check has to keep reporting the stream as unusable
     read_error: BaseException | None = None
+    # what a client may see of it (no server paths or internal text)
+    read_error_text: str = ""
     # None while the stream is unkeyed, and once its keys stop describing it
     chain: PrefixChain | None = None
     # pages the index matched for this stream and is holding for it, from the
@@ -3461,16 +3464,17 @@ class KVManager(AttentionResource):
                 future.result()
             except Exception as e:
                 stream.read_error = e
+                stream.read_error_text, _ = client_error_text(
+                    e, f"KV retrieve for request {rid} label {label!r} failed", log=logger,
+                )
             else:
                 stream.read_pending = False
         if stream.host_copy is not None and stream.host_copy.landed:
             stream.host_copy = None
             stream.read_pending = stream.read_future is not None
         if stream.read_error is not None:
-            err = stream.read_error
             return False, AdmitRuntimeError(
-                f"KV retrieve for request {rid} label {label!r} failed: "
-                f"{type(err).__name__}: {err}"
+                f"KV retrieve for request {rid} label {label!r} failed: {stream.read_error_text}"
             )
         return not stream.read_pending, None
 
