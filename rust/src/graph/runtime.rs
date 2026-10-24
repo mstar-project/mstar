@@ -163,6 +163,8 @@ pub struct GraphRuntime {
     node_owner: FxHashMap<(Sym, Sym), WgIndex>,
     /// Loop stops from this iteration's check_stop; cleared every iteration.
     pending_loop_stops: FxHashSet<(u32, Sym, Sym)>,
+    /// (node, walk) -> its declared stop rules (`set_stop_rules`).
+    stop_rules: FxHashMap<(Sym, Sym), Vec<StopRule>>,
     /// Routing parked between complete_and_route_batch and send_outputs.
     completions: FxHashMap<u64, Completion>,
     completion_counter: u64,
@@ -864,6 +866,21 @@ pub struct GraphRuntime {
 
     /// Whether this request's current walk actually contains the loop. A stop
     /// for one it does not is a model bug: logged by the caller and dropped.
+    /// `rid`'s iteration of loop `lp` in partition `p`, as
+    /// `get_dynamic_loop_iters` reports it (the last worker graph with the
+    /// loop wins); 0 when no live worker graph has it.
+    fn loop_count(&self, rid: u32, p: Sym, lp: Sym) -> u32 {
+        let Some(part) = self.info(rid).and_then(|i| i.partitions.get(&p)) else { return 0 };
+        let mut count = 0;
+        for &wg in &part.walk_worker_graphs {
+            let Some(state) = self.state(wg, rid) else { continue };
+            if let Some(&lid) = self.graphs[wg as usize].loop_by_name.get(&lp) {
+                count = state.loop_iter(lid);
+            }
+        }
+        count
+    }
+
     fn check_dyn_loop(&self, rid: u32, partition: &str, loop_name: &str) -> bool {
         let (Some(p), Some(l)) = (
             self.interner.get(partition),
@@ -1287,6 +1304,15 @@ pub struct RouteOut {
     #[pyo3(get)] pub rids_needing_request_info: Vec<u32>,
 }
 
+/// One of a walk's declared stop checks (Python's `StopPolicy`): stop `lp`
+/// when its count plus one reaches the request's limit or, for an AR rule,
+/// when the row's token is in `eos` and the request does not ignore EOS.
+struct StopRule {
+    lp: Sym,
+    ar: bool,
+    eos: Vec<i64>,
+}
+
 /// `route_and_send_inline`'s result; see there.
 #[pyclass]
 #[derive(Default)]
@@ -1614,6 +1640,7 @@ impl GraphRuntime {
             walk_to_local_wgs,
             node_owner,
             pending_loop_stops: FxHashSet::default(),
+            stop_rules: FxHashMap::default(),
             completions: FxHashMap::default(),
             completion_counter: 0,
             staged_specs: FxHashMap::default(),
@@ -3156,6 +3183,143 @@ impl GraphRuntime {
             },
         );
         Ok(out)
+    }
+
+    /// Declares (node, walk)'s stop rules, as `NodeSubmodule.get_stop_policies`
+    /// gives them, one column entry per rule.
+    fn set_stop_rules(
+        &mut self, node_name: &str, graph_walk: &str,
+        loops: Vec<String>, ar: Vec<bool>, eos: Vec<Vec<i64>>,
+    ) -> PyResult<()> {
+        if loops.len() != ar.len() || loops.len() != eos.len() {
+            return Err(PyValueError::new_err("set_stop_rules: columns differ in length"));
+        }
+        let key = (self.interner.intern(node_name), self.interner.intern(graph_walk));
+        let mut rules = Vec::with_capacity(loops.len());
+        for ((name, ar), eos) in loops.iter().zip(ar).zip(eos) {
+            rules.push(StopRule { lp: self.interner.intern(name), ar, eos });
+        }
+        self.stop_rules.insert(key, rules);
+        Ok(())
+    }
+
+    /// Each rid's limits for `graph_walk`'s rules: `max_iters[k][i]` and
+    /// `ignore_eos[k][i]` are rule k's for `rids[i]`. Kept on the request, so
+    /// `remove_request` drops them with it.
+    fn set_stop_limits(
+        &mut self, graph_walk: &str, rids: Vec<u32>,
+        max_iters: Vec<Vec<u32>>, ignore_eos: Vec<Vec<bool>>,
+    ) -> PyResult<()> {
+        if max_iters.len() != ignore_eos.len()
+            || max_iters.iter().any(|c| c.len() != rids.len())
+            || ignore_eos.iter().any(|c| c.len() != rids.len())
+        {
+            return Err(PyValueError::new_err("set_stop_limits: columns differ in length"));
+        }
+        let walk = self.interner.intern(graph_walk);
+        for (i, &rid) in rids.iter().enumerate() {
+            let limits: Vec<(u32, bool)> =
+                max_iters.iter().zip(&ignore_eos).map(|(m, e)| (m[i], e[i])).collect();
+            let Some(Some(info)) = self.requests.get_mut(rid as usize) else { continue };
+            match info.stop_limits.iter_mut().find(|(w, _)| *w == walk) {
+                Some(entry) => entry.1 = limits,
+                None => info.stop_limits.push((walk, limits)),
+            }
+        }
+        Ok(())
+    }
+
+    /// (node, walk)'s declared stop rules over a step's rows, reading the
+    /// token column in place and each loop's count from the walk state.
+    ///
+    /// At a step's stop check its loop counts are the ones the step ran at:
+    /// they move when the step is routed, which comes after. Returns
+    /// `(stop_rids, stop_rules, missing)`: a stop per (rid, rule index), and
+    /// the rids with no limits for this walk yet, which the caller registers
+    /// with `set_stop_limits` and checks again. A rid with no token row is
+    /// skipped, as `check_stop` skips a request with no output.
+    #[pyo3(signature = (
+        partition, node_name, graph_walk, rids,
+        token_ptr, token_rows, token_stride, token_dtype, row_rids,
+    ))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn check_stops_inline(
+        &self,
+        partition: &str,
+        node_name: &str,
+        graph_walk: &str,
+        rids: Vec<u32>,
+        token_ptr: usize,
+        token_rows: usize,
+        token_stride: usize,
+        token_dtype: &str,
+        row_rids: Vec<u32>,
+    ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+        let (Some(node), Some(walk)) = (self.interner.get(node_name), self.interner.get(graph_walk))
+        else {
+            return Err(PyKeyError::new_err("check_stops_inline: no rules for this (node, walk)"));
+        };
+        let Some(rules) = self.stop_rules.get(&(node, walk)) else {
+            return Err(PyKeyError::new_err("check_stops_inline: no rules for this (node, walk)"));
+        };
+        let (mut stop_rids, mut stop_rules, mut missing) = (Vec::new(), Vec::new(), Vec::new());
+        if rules.is_empty() {
+            return Ok((stop_rids, stop_rules, missing));
+        }
+        let reads_token = rules.iter().any(|r| r.ar);
+        let itemsize = match token_dtype {
+            "int64" => 8,
+            "int32" => 4,
+            _ if !reads_token => 0,
+            _ => return Err(PyValueError::new_err("check_stops_inline: token dtype must be int32 or int64")),
+        };
+        if reads_token && (token_ptr == 0 || row_rids.len() > token_rows) {
+            return Err(PyValueError::new_err("check_stops_inline: no token column"));
+        }
+        let read = |row: usize| -> i64 {
+            // SAFETY: row < row_rids.len() <= token_rows, checked above; the
+            // caller holds the buffer for the duration of the call.
+            unsafe {
+                let at = (token_ptr as *const u8).add(row * token_stride * itemsize);
+                if itemsize == 8 {
+                    std::ptr::read_unaligned(at as *const i64)
+                } else {
+                    i64::from(std::ptr::read_unaligned(at as *const i32))
+                }
+            }
+        };
+        let in_order = row_rids.len() >= rids.len() && row_rids[..rids.len()] == rids[..];
+        let row_of: FxHashMap<u32, usize> = if in_order || !reads_token {
+            FxHashMap::default()
+        } else {
+            row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect()
+        };
+        let p = self.interner.get(partition);
+        for (i, &rid) in rids.iter().enumerate() {
+            let token = if !reads_token {
+                0
+            } else if in_order {
+                read(i)
+            } else {
+                match row_of.get(&rid) {
+                    Some(&row) => read(row),
+                    None => continue,
+                }
+            };
+            let Some(info) = self.info(rid) else { continue };
+            let Some((_, limits)) = info.stop_limits.iter().find(|(w, _)| *w == walk) else {
+                missing.push(rid);
+                continue;
+            };
+            for (k, (rule, &(max_iters, ignore_eos))) in rules.iter().zip(limits).enumerate() {
+                let count = p.map_or(0, |p| self.loop_count(rid, p, rule.lp));
+                if count + 1 >= max_iters || (rule.ar && !ignore_eos && rule.eos.contains(&token)) {
+                    stop_rids.push(rid);
+                    stop_rules.push(k as u32);
+                }
+            }
+        }
+        Ok((stop_rids, stop_rules, missing))
     }
 
     /// `complete_and_route_batch` then `send_outputs`, in one crossing and
