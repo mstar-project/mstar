@@ -11,6 +11,7 @@ from array import array
 from collections import defaultdict, deque
 from concurrent.futures import Future
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -20,10 +21,12 @@ from test_kv_prefix_lease import _StubTransfer
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine, ExecutingBatch
-from mstar.engine.resources import AllocationFailed, SamplerStep, StepContext, SubmoduleStep
+from mstar.engine.resources import AllocationFailed, KVStep, PositionStep, SamplerStep, StepContext, SubmoduleStep
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
-from mstar.engine.resources.step import AdmitRuntimeError
+from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout, mark_guaranteed
+from mstar.engine.resources.position.config import PositionConfig
+from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.step import AdmitRuntimeError, Segment
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs, BatchedModelOutput, HostRows
 from mstar.worker.micro_scheduler import ScheduledBatch
@@ -86,6 +89,49 @@ def _config(growth=(("loop", 1),), labels=("main",), walk=PREFILL) -> dict[str, 
         prompt_ids=dict.fromkeys(labels[:1], ids), kv_layout=dict.fromkeys(labels, layout),
         loop_caps={loop: 1 for loop, _ in growth},
     )}
+
+
+def _image_chat(w, eng) -> list[torch.Tensor]:
+    """Queue R's rebuild after a chat of text, two adjacent images and text, as Bagel lays out a chat with a walk per
+    image. Return the two images that R's host copies hold."""
+    images = [torch.full((4, 2), float(i)) for i in range(2)]
+    w._walk_inputs[("vit", NODE)], w._copied_inputs[("vit", NODE)] = {"img_emb"}, {"img_emb"}
+    copies = [PrefillCopies({"img_emb": [image]}, {"image": i}) for i, image in enumerate(images)]
+    w._kept_ids[NODE][R] = KeptIds(array("i", [1, 2, 3, 4, 5]).tobytes(), array("i", [6, 7]), copies, 2)
+    image = PrefixSpan(6, 1, "vit", kind="digest")
+    # the sample before 7 extends the last span, as `KVManager.lay_out_again` lays it out
+    eng.lay_out_rebuild = lambda node, rid, ids: (PrefixSpan(2, 2, PREFILL), image, image, PrefixSpan(4, 4, PREFILL))
+    eng.dropped.append(R)
+    w._rebuild(R, NODE)
+    return images
+
+
+def test_a_prompt_on_several_walks_rebuilds_a_row_per_span_in_order_and_is_resident_after_the_last():
+    w, eng = _worker()
+    images = _image_chat(w, eng)
+    rows = list(w._rebuild_rows[R])
+    assert [id(row.inputs.get("img_emb", [None])[0]) for row in rows] == [id(None), *map(id, images), id(None)], (
+        "an image row would read another image"
+    )
+    assert [row.step_metadata for row in rows] == [None, {"image": 0}, {"image": 1}, None], (
+        "an image row would run under decode's metadata, or another step's"
+    )
+    assert [row.inputs["text_inputs"][0].tolist() for row in (rows[0], rows[3])] == [[1, 2], [3, 4, 5, 6]]
+    walks = []
+    for row in rows:
+        assert w._runnable_rebuilds() == {R: row}, "a later row could run before the one ahead of it"
+        batch, scheduled = w._schedule_rebuild()
+        node_batch = w._build_executing_batch(batch, scheduled)
+        walks.append(batch.graph_walk)
+        if len(walks) == 2:
+            # the cache serves the first image whole, as `Engine._skip_cached_prefix` takes the row out of the step
+            node_batch.drop_rids({R})
+            node_batch.cached_rids.add(R)
+        assert not eng.landed, "the request would decode before its KV is whole"
+        w._postprocess_batch(PendingBatch(batch, node_batch, NODE, "p", walks[-1], Future()), BatchedModelOutput())
+
+    assert walks == [PREFILL, "vit", "vit", PREFILL], "a row would write another walk's span"
+    assert eng.landed == [R] and not w._rebuild_rows, "a row the cache served would leave its request dropped"
 
 
 @pytest.mark.parametrize("sampled", [[4, 5, 7], [[4], [5], [7]]])  # the sampler's [B] output, and a [B, 1] one
@@ -191,6 +237,33 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids(build):
     assert len(w._kept_ids[node][R].copies) == 1, "a rebuild row's inputs would stand in for the request's copy"
 
 
+def test_each_image_step_keeps_its_own_copy_in_a_mixed_step_and_when_the_cache_serves_it():
+    w, _ = _worker()
+    w._walk_inputs[("vit", NODE)], w.scheduler.combined_walk_of = {"img_emb"}, {(NODE, "vit"): "mixed"}
+    w._set_copied_inputs()
+    images = [torch.ones(4, 2), torch.zeros(4, 2)]
+    # A prefills its text beside R's first image, and copies its own image later
+    w._kept_ids[NODE].update({R: KeptIds(b"", array("i"), [], 2), A: KeptIds(b"", array("i"), [], 1)})
+    # a third step after every copy of R is taken, like an edit's denoise step after its prompt, adds none
+    for walk, image in zip(("mixed", "vit", "vit"), [*images, torch.ones(1)], strict=True):
+        batch = _step((R, A) if walk == "mixed" else (R,), walk, rebuild=None,
+                      per_request_input_tensors={R: {"img_emb": [image]}, A: {"text_inputs": [torch.tensor([1])]}})
+        if walk == "mixed":
+            batch.step_context.request_walks = {R: "vit", A: PREFILL}
+        else:
+            # the cache serves the second image whole, as `Engine._skip_cached_prefix` takes the row out of the step
+            batch.drop_rids({R})
+            batch.cached_rids.add(R)
+        assert (walk, NODE) in w._copied_inputs, "the step's rows would never be checked"
+        w._copy_inputs(batch)
+
+    copies = w._kept_ids[NODE][R].copies
+    assert [id(c.inputs["img_emb"][0]) for c in copies] == list(map(id, images)), (
+        "a rebuild would run an image row without its image, or the request would keep copies no row reads"
+    )
+    assert not w._kept_ids[NODE][A].copies, "a text row would be copied as an image row"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     w, _ = _worker()
@@ -258,16 +331,17 @@ def test_a_node_sharing_a_cache_whose_growth_walk_it_never_runs_copies_nothing()
 
 
 @pytest.mark.parametrize("request_, guaranteed", [
-    ("image chat on one walk", False), ("image chat on two walks", True), ("video", True), ("above one rank", True),
-    ("image last", True), ("keyed", True), ("ids short of their spans", True), ("text alone on the image walk", True),
+    ("image chat on one walk", False), ("image on a walk that reads no copies", True), ("video", True),
+    ("above one rank", True), ("image last", True), ("keyed short of its spans", True),
+    ("ids short of their spans", True), ("text alone on the image walk", True),
 ])
-def test_only_an_image_prompt_on_one_walk_at_one_rank_is_preemptible(request_, guaranteed):
+def test_only_an_image_prompt_its_rows_can_rebuild_at_one_rank_is_preemptible(request_, guaranteed):
     w, _ = _worker()
     w._walk_inputs[("vision", NODE)], w._copied_inputs = {"text_inputs", "embeds"}, {("vision", NODE): {"embeds"}}
     w.parallel_nodes = {NODE} if request_ == "above one rank" else set()
-    image_walk = "vit" if request_ == "image chat on two walks" else "vision"
+    image_walk = "vit" if request_ == "image on a walk that reads no copies" else "vision"
     image = "rows" if request_ == "video" else "digest"
-    # as Qwen3.5 lays out an image prompt, and Bagel an image chat whose image has a walk of its own
+    # as Qwen3.5 lays out an image prompt, or with the image on a walk of its own that reads nothing to copy
     spans = (PrefixSpan(2, 2, "vision"), PrefixSpan(6, 4, image_walk, kind=image), PrefixSpan(2, 2, "vision"))
     # the samples of a prompt that ends on its image would have no text part to extend
     spans = spans[:2] if request_ == "image last" else spans
@@ -276,7 +350,7 @@ def test_only_an_image_prompt_on_one_walk_at_one_rank_is_preemptible(request_, g
     count = sum(span.length for span in spans if span.kind == "ids") - (request_ == "ids short of their spans")
     ids = None if image == "rows" else {"main": array("i", range(count)).tobytes()}
     configs = {"kv": KVReqConfig(prompt_ids=ids, kv_layout={"main": StreamLayout(spans=spans, growth=(("loop", 1),))},
-                                 loop_caps={"loop": 1}, prefix_keys={"main": [b"k"]} if request_ == "keyed" else None)}
+                                 loop_caps={"loop": 1}, prefix_keys={"main": [b"k"]} if "keyed" in request_ else None)}
 
     w._keep_ids(R, configs)
     w._guarantee(R, configs)
@@ -285,14 +359,164 @@ def test_only_an_image_prompt_on_one_walk_at_one_rank_is_preemptible(request_, g
     assert guaranteed or w._kept_ids[NODE][R].copies is not None, "the request could be dropped before its copy exists"
 
 
+def _from_graph(model, node: str, cache: str) -> Worker:
+    """A worker over ``model``'s own walks, growth loops and combined walks, where ``node`` keeps ids."""
+    w, _ = _worker()
+    w._kv_keys, w._kept_ids, w.parallel_nodes = {node: [cache]}, {node: {}}, set()
+    w._walk_inputs = {
+        (walk, name): graph_node.input_names
+        for walk, section in model.get_graph_walk_graphs().items() for name, graph_node in section.get_nodes().items()
+    }
+    w._growth_loops = {(walk, node): loop for label in model.kv_labels()[cache].values() for walk, loop in label.growth}
+    w.scheduler.combined_walk_of = model.combined_walk_of()
+    w._set_copied_inputs()
+    return w
+
+
+def _models() -> dict:
+    from test_model_kv_layouts import _bagel, _higgs
+
+    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    bagel, omni = _bagel(), object.__new__(Qwen3OmniModel)
+    bagel.config.max_position_embeddings, bagel.config.num_timesteps, bagel._image_gen_remote_handoff = 4096, 3, False
+    omni.config = Qwen3OmniModelConfig()
+    return {"Bagel": (bagel, "LLM", "kv"), "Qwen3-Omni": (omni, "Thinker", "thinker_kv"),
+            "Higgs": (_higgs(), "LLM", "kv_cache")}
+
+
+def _media(walk: str) -> PrefixSpan:
+    return PrefixSpan(20, 1, walk, kind="digest")
+
+
+# Each request as its model lays it out: the spans, how many spans the keys cover, the labels and whether the
+# request speaks its answer.
+_TEXT, _CLOSE = PrefixSpan(5, 5, "prefill_text"), PrefixSpan(4, 4, "prefill_text")
+_EDIT = (_TEXT, _media("prefill_vae"), _media("prefill_vit"), _CLOSE)
+_MEDIA_REQUESTS = {
+    "Bagel image chat": ("Bagel", (_TEXT, _media("prefill_vit"), _CLOSE), 3, 1, False),
+    "Bagel chat with two images": ("Bagel", (_TEXT, _media("prefill_vit"), _media("prefill_vit"), _CLOSE), 4, 1, False),
+    "Bagel edit with think mode": ("Bagel", _EDIT, 1, 1, False),
+    "Bagel edit with think mode, cache off": ("Bagel", _EDIT, 0, 1, False),
+    "Bagel edit or guided generation": ("Bagel", (_TEXT, _media("prefill_vit"), _CLOSE), 3, 3, False),
+    "Qwen3-Omni audio in, text out": ("Qwen3-Omni", (_TEXT, _media("prefill_audio"), _CLOSE), 0, 1, False),
+    "Qwen3-Omni image in, text out": ("Qwen3-Omni", (_TEXT, _media("prefill_vision"), _CLOSE), 0, 1, False),
+    "Qwen3-Omni audio out": ("Qwen3-Omni", (_TEXT, _media("prefill_audio"), _CLOSE), 0, 1, True),
+    "Higgs transcription": ("Higgs", (_TEXT, _media("prefill_audio"), _CLOSE), 0, 1, False),
+}
+_PREEMPTIBLE = {"Bagel image chat", "Bagel chat with two images", "Bagel edit with think mode, cache off",
+                "Qwen3-Omni audio in, text out", "Qwen3-Omni image in, text out", "Higgs transcription"}
+
+
+@pytest.mark.parametrize("request_", _MEDIA_REQUESTS)
+def test_a_media_request_on_several_walks_is_preemptible_only_where_its_rows_can_rebuild_it(request_):
+    name, spans, keyed, labels, speaks = _MEDIA_REQUESTS[request_]
+    model, node, cache = _models()[name]
+    w = _from_graph(model, node, cache)
+    ((_, loop),) = model.kv_labels()[cache]["main"].growth
+    layout = StreamLayout(spans=spans, growth=((loop, 1),), keyed_spans=keyed)
+    config = KVReqConfig(
+        prompt_ids={"main": array("i", range(9)).tobytes()}, loop_caps={loop: 8},
+        kv_layout={"main": layout, **dict.fromkeys(("cfg_text", "cfg_img")[:labels - 1], StreamLayout())},
+        prefix_keys={"main": [b"k"]} if keyed else None,
+    )
+    # an answer spoken aloud has the Talker write rows of the Thinker's states
+    talker = KVReqConfig(kv_layout={"main": StreamLayout(spans=(PrefixSpan(9, 9, "talker_prefill", kind="rows"),))})
+    configs = {cache: config, **({"talker_kv": talker} if speaks else {})}
+    mark_guaranteed(configs, streaming=False, output_modalities=["text", "audio"] if speaks else ["text"])
+
+    w._keep_ids(R, configs)
+    w._guarantee(R, configs)
+
+    preemptible = request_ in _PREEMPTIBLE
+    assert config.guaranteed != preemptible, "a request no rows can rebuild would be preempted, or the reverse"
+    assert (R in w._kept_ids[node]) == preemptible, "a request that is never dropped would keep host copies"
+    assert not preemptible or w._kept_ids[node][R].steps == sum(span.kind == "digest" for span in spans), (
+        "the request could be dropped before its last image's copy, or keep copies no row reads"
+    )
+
+
+@pytest.mark.parametrize("name, digest_walk, input_name", [
+    ("Bagel", "prefill_vit", "img_emb"), ("Qwen3-Omni", "prefill_audio", "audio_embeds"),
+])
+def test_a_rebuilt_prompt_on_several_walks_holds_the_pages_and_positions_of_an_uninterrupted_run(
+    monkeypatch, name, digest_walk, input_name,
+):
+    from test_bagel_guidance_sink import _llm
+    from test_kv_drop import _manager
+
+    from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    # every commit checks the walk that wrote each span, and the last row's landing checks the slots
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    model, node, cache = _models()[name]
+    w = _from_graph(model, node, cache)
+    ((decode, loop),) = model.kv_labels()[cache]["main"].growth
+    declare = _llm().declare_step if name == "Bagel" else partial(ThinkerSubmodule.declare_step, None)
+    kv, rope, starts = _manager(), RopeManager(PositionConfig(kv_cache=cache), torch.device("cpu")), []
+
+    def write(walk, length):
+        starts.append(rope.position(R, "main"))
+        steps = declare(walk, [R], [ARNodeInputs(input_seq_len=length)], per_request_info={}).steps.values()
+        (kv_step,), (position,) = [[s for s in steps if isinstance(s, kind)] for kind in (KVStep, PositionStep)]
+        segments = (Segment(R, "main", length),)
+        kv_step, ctx = replace(kv_step, segments=segments), StepContext((R,), walk, 0, False)
+        assert kv.admit(kv_step, ctx).ok
+        kv.plan(kv_step, ctx)
+        kv.commit(kv_step, ctx)
+        rope.commit(replace(position, segments=segments), ctx)
+
+    # An attachment holds its rows and two sentinels. A Bagel image moves the position by one, and audio by its length.
+    rows, attachment = torch.zeros(18, 2), _media(digest_walk)
+    spans = (_TEXT, attachment if name == "Bagel" else replace(attachment, advance=attachment.length), _CLOSE)
+    kv.ingest_request(R, KVReqConfig(
+        kv_layout={"main": StreamLayout(spans=spans, growth=((loop, 1),))}, loop_caps={loop: 8},
+        prompt_ids={"main": array("i", range(9)).tobytes()},
+    ))
+    rope.ingest_request(R)
+    for span in spans:
+        write(span.walk, span.length)
+    for _ in range(2):
+        write(decode, 1)
+    stream = kv._streams[R]["main"]
+    held, uninterrupted = (stream.stored_len, len(stream.page_indices), rope.position(R, "main")), starts[:3]
+    kv.drop(R)
+    rope.drop(R)
+    eng = w.engine_manager.get_engine(node)
+    eng.lay_out_rebuild = lambda node, rid, ids: kv.lay_out_again(rid, ids)
+    eng.land_rebuild = lambda node, rid: kv.land_rebuild(rid)
+    copied = w._copied_inputs[(digest_walk, node)]
+    copies = [PrefillCopies({name_: [rows] if name_ == input_name else [] for name_ in copied}, {})]
+    # the samples before 9 are in the KV, and 9 is the next decode step's input
+    w._kept_ids[node][R] = KeptIds(array("i", range(9)).tobytes(), array("i", [7, 8, 9]), copies, 1)
+    eng.dropped.append(R)
+    w._rebuild(R, node)
+    starts.clear()
+    while R in w._rebuild_rows:
+        batch, scheduled = w._schedule_rebuild()
+        node_batch = w._build_executing_batch(batch, scheduled)
+        inputs = node_batch.per_request_input_tensors[R]
+        write(batch.graph_walk, len(inputs["text_inputs"][0]) if "text_inputs" in inputs else len(rows) + 2)
+        w._land_rebuilds(node_batch)
+
+    assert starts == uninterrupted, "a row would place its span where the uninterrupted prefill didn't"
+    assert (stream.stored_len, len(stream.page_indices), rope.position(R, "main")) == held, (
+        "the rebuilt stream would hold other slots, pages or positions than before its drop"
+    )
+
+
 @pytest.mark.parametrize("why", [
     "no ids", "in flight", "backlog", "rebuild queued", "prefill walk", "samples short", "copy not taken",
-    "copy not landed",
+    "copy not landed", "one image of two copied",
 ])
 def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w, eng = _worker()
-    copies = {"copy not taken": [], "copy not landed": [PrefillCopies({}, {}, SimpleNamespace(query=bool))]}
-    w._kept_ids[NODE].update({} if why == "no ids" else {R: KeptIds(b"", array("i", [5]), copies.get(why), 1)})
+    landed = PrefillCopies({}, {}, SimpleNamespace(query=lambda: True))
+    copies = {"copy not taken": [], "copy not landed": [PrefillCopies({}, {}, SimpleNamespace(query=bool))],
+              "one image of two copied": [landed]}
+    steps = 2 if why == "one image of two copied" else 1
+    w._kept_ids[NODE].update({} if why == "no ids" else {R: KeptIds(b"", array("i", [5]), copies.get(why), steps)})
     w._in_flight_rids.update({R} if why == "in flight" else ())
     w.scheduler.backlog.update({(NODE, DECODE): ScheduledBatch(NODE, DECODE, {R: 0})} if why == "backlog" else {})
     w._rebuild_rows.update({R: deque([RebuildRow(NODE, PREFILL, {}, None)])} if why == "rebuild queued" else {})
@@ -367,11 +591,13 @@ def test_the_run_loop_runs_a_queued_rebuild_row_once_and_a_remove_waits_for_its_
 
     w._build_executing_batch = build_after_one_raise
     # Remove R once, on the pass after its step went out, while that step is still pending.
-    w._process_messages = lambda: R in w._in_flight_rids and not w._pending_removes and w._remove_request(
-        SimpleNamespace(request_id=R))
+    queued = []
+    w._process_messages = lambda: R in w._in_flight_rids and not w._pending_removes and (
+        queued.append(R in w._rebuild_rows) or w._remove_request(SimpleNamespace(request_id=R)))
     with pytest.raises(_StopLoopError):
         w.run()
     assert postprocessed == ["rebuild"], "a raise before `_set_pending` would lose the rebuild row"
+    assert queued == [True], "the row would leave its queue before its step lands"
     assert w._pending_removes == {R: None}, "the REMOVE would tear its request down mid-step"
 
 
@@ -412,21 +638,22 @@ def test_a_rebuild_step_holds_nothing_the_scheduler_wouldnt_run(why):
         assert scheduled is None, "a torn-down request would prefill its whole history"
 
 
-@pytest.mark.parametrize("held", [False, True])
-def test_nothing_is_speculated_while_a_rebuild_row_could_run(held):
+@pytest.mark.parametrize("state", ["queued", "held", "in its step"])
+def test_nothing_is_speculated_while_a_rebuild_row_could_run(state):
     w, _ = _worker()
-    w._rebuild_rows[R] = deque([RebuildRow(NODE, PREFILL, {}, None)])
-    w.scheduler.held_until[R] = float("inf") if held else 0.0
+    w._rebuild_rows[R], held = deque([RebuildRow(NODE, PREFILL, {}, None)]), state != "queued"
+    w.scheduler.held_until[R] = float("inf") if state == "held" else 0.0
+    w._in_flight_rids.update({R} if state == "in its step" else ())
     w._can_speculate, w._tp_lead_needs_marker = lambda batch: True, lambda pending, speculation: False
     w._choose_spec_target = lambda batch: SimpleNamespace(info=SimpleNamespace(node_name=NODE, graph_walk=DECODE))
     w._try_speculate_next = lambda pending, target: pytest.fail("speculated past a queued rebuild row")
-    # unless the row is held, nothing else is ready, so only the queued row can stop speculation
+    # unless the row is held or in its step, nothing else is ready, so only the queued row can stop speculation
     w.scheduler.has_ready_excluding = lambda state, key: held
     pending = SimpleNamespace(batch=ScheduledBatch(NODE, DECODE, {A: 0}), node_name=NODE, graph_walk=DECODE,
                               node_batch=SimpleNamespace(admit_error=None))
 
     w._build_speculation(pending, 1, fair := _SpecFairness(peek=True, max_consecutive=8))
-    assert bool(w.asked) == held, "a yield-away step would run ahead of the rebuild, or wait out its hold"
+    assert bool(w.asked) == held, "a yield-away step would run ahead of the rebuild, or wait out its hold or step"
     w._choose_spec_target = lambda batch: pytest.fail("chose a target from a step of rebuild rows alone")
     w._build_speculation(SimpleNamespace(**{**vars(pending), "batch": ScheduledBatch(NODE, PREFILL)}), 1, fair)
 
