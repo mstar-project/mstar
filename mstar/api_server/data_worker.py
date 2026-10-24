@@ -168,9 +168,6 @@ class PreprocessWorker:
         self.stop_event = threading.Event()
         # Wakes the thread's idle wait: every producer below signals it.
         self.wakeup = EventWakeup()
-        # The other direction: signalled when chunks land on output_queue,
-        # which ends the API server's message thread's wait between passes.
-        self.results_wakeup = EventWakeup()
 
         self.per_request_reading_tensors = {}
         # request id -> output name -> chunks received, for received_final_chunks
@@ -209,7 +206,6 @@ class PreprocessWorker:
                 discard_tensor_queue=self.discard_tensor_queue,
                 stop_event=self.stop_event,
                 wakeup=self.wakeup,
-                results_wakeup=self.results_wakeup,
                 communicator=self.communicator,
                 tensor_manager=self.tensor_manager,
                 model=model,
@@ -473,7 +469,6 @@ class PreprocessWorkerThread:
         model_config: dict | None = None,
         enable_nvtx: bool=False,
         wakeup: EventWakeup | None = None,
-        results_wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
     ):
@@ -537,7 +532,6 @@ class PreprocessWorkerThread:
         # with a bare communicator).
         self.wakeup = wakeup
         self.idle_wait_ms = 20
-        self.results_wakeup = results_wakeup
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -1367,10 +1361,6 @@ class PreprocessWorkerThread:
             transfers = getattr(self.tensor_manager, "transfer_stats", None)
             if transfers is not None:
                 self._publish_transfers(transfers)
-            # getattr: teardown tests build a thread without its constructor
-            results_wakeup = getattr(self, "results_wakeup", None)
-            if results_wakeup is not None and not self.out_queue.empty():
-                results_wakeup.signal()
             if not did_work:
                 idle_wait()
 

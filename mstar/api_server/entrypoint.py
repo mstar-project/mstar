@@ -206,10 +206,6 @@ DUPLICATE_ID_GRACE_S = 0.5
 #: How often a non-streaming handler (``collect_results``) asks whether its
 #: client left while it waits for the request to finish.
 DISCONNECT_CHECK_S = 0.1
-#: The longest a handler waiting for its request sleeps before it rechecks
-#: the disconnect and deadline itself; the message thread wakes it as soon as
-#: a chunk or the completion lands.
-WAKE_BACKSTOP_S = 0.05
 
 
 def _client_text(text: str, key: str, request_id: str | None) -> str:
@@ -251,8 +247,6 @@ class PendingRequest:
     # Set by the streaming handler on its event loop; the message thread wakes
     # it through these when a chunk or the completion lands, so the handler
     # sleeps between chunks instead of polling every millisecond per request.
-    # collect_results registers them too but only needs the completion, so it
-    # turns off the per-chunk wake (one per decoded token for inline emitters).
     wake: Any | None = None
     loop: Any | None = None
     # Set by collect_results, which reads no chunk before the request ends:
@@ -265,7 +259,7 @@ class PendingRequest:
     first_chunk_times: dict[str, float] = field(default_factory=dict)
 
     def notify(self) -> None:
-        """Wake the waiting handler, from any thread."""
+        """Wake the streaming handler, from any thread."""
         loop, wake = self.loop, self.wake
         if loop is None or wake is None or (self.wake_on_finish and not self.event.is_set()):
             return
@@ -730,7 +724,6 @@ class APIServer:
         Also watches the conductor process. Once it exits, every pending
         request is failed and the HTTP server is told to stop."""
         next_liveness_check = 0.0
-        wait = self._pass_wait()
         while self.running:
             now = time.monotonic()
             if now >= next_liveness_check:
@@ -740,6 +733,10 @@ class APIServer:
                     self._fail_pending_for_dead_conductor(exited)
                     return
             try:
+                with self.request_lock:
+                    if len(self.recently_completed) > 0:
+                        self._prune_recently_completed()
+
                 for message in self.communicator.get_all_new_messages():
                     if not isinstance(message, APIServerMessage):
                         logger.warning("Unexpected message type: %s", type(message))
@@ -931,32 +928,11 @@ class APIServer:
                         )
                 if to_wake:
                     notify_many(to_wake.values())
-
-                # after this pass's messages and chunks, so a request whose
-                # completion and final chunk both just landed is released now
-                # rather than a pass later
-                with self.request_lock:
-                    if len(self.recently_completed) > 0:
-                        self._prune_recently_completed()
-                wait()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
                     time.sleep(0.01)
-
-    def _pass_wait(self):
-        """How the message thread waits between passes: at most 1 ms, ended
-        early by a message on the socket or by the data worker queueing result
-        chunks, so a finished request is not held for the rest of the
-        millisecond. getattr: tests build the server around fakes without
-        either."""
-        register = getattr(self.communicator, "register_event_for_poll", None)
-        poll = getattr(self.communicator, "poll_for_messages", None)
-        results_wakeup = getattr(self.preprocess_worker, "results_wakeup", None)
-        if not callable(register) or not callable(poll) or results_wakeup is None:
-            return lambda: time.sleep(0.001)
-        register(results_wakeup)
-        return lambda: poll(timeout_ms=1)
+            time.sleep(0.001)
 
     # ----------------------------------------------------------
     # Streaming helper
@@ -1100,7 +1076,7 @@ class APIServer:
                 if new_chunks:
                     continue  # more may already be waiting
                 try:
-                    await asyncio.wait_for(wake.wait(), timeout=WAKE_BACKSTOP_S)
+                    await asyncio.wait_for(wake.wait(), timeout=0.05)
                 except asyncio.TimeoutError:
                     pass
         finally:

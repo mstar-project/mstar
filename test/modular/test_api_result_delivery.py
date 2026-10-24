@@ -399,33 +399,6 @@ def test_tokens_do_not_wake_a_handler_waiting_for_the_finish():
     req.event.set()
     notify_many([req])
     assert req.wake.is_set()
-def test_the_message_thread_polls_on_the_socket_and_the_data_worker():
-    """Between passes the message thread waits at most 1 ms, ended early by
-    the communicator (a message, or the data worker's chunk signal)."""
-    from mstar.communication.event import EventWakeup
-
-    class _Comm:
-        def __init__(self):
-            self.registered, self.polls = [], []
-
-        def register_event_for_poll(self, event):
-            self.registered.append(event)
-
-        def poll_for_messages(self, timeout_ms):
-            self.polls.append(timeout_ms)
-
-    pw = _StubPreprocessWorker()
-    pw.results_wakeup = EventWakeup()
-    server = _api_server_stub(pw)
-    server.communicator = _Comm()
-    server._pass_wait()()
-    assert server.communicator.registered == [pw.results_wakeup]
-    assert server.communicator.polls == [1]
-    # without a poll to block on, the 1 ms sleep stays
-    server.communicator = object()
-    t0 = time.perf_counter()
-    server._pass_wait()()
-    assert time.perf_counter() - t0 >= 0.001
 
 
 def test_notify_many_wakes_every_handler_with_one_loop_call():
