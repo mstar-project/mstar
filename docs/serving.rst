@@ -42,6 +42,15 @@ mstar serve
    * - ``--gpus``
      - all visible
      - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
+   * - ``-O``, ``--compile-level``
+     - ``MSTAR_COMPILE_LEVEL``, else ``1``
+     - How much the captured forwards' compiles tune at startup. ``-O0``: torch.compile's
+       default mode, no tuning. ``-O1``: coordinate descent, which fuses the decode GEMMs
+       with their epilogues. ``-O2``: full max-autotune, which adds the GEMM template
+       search. Qwen3.5-0.8B on an H200 with an empty cache started in 170 s / 320 s /
+       1,294 s at the same throughput; Qwen3-TTS was 25-30% slower at ``-O0`` (c=1).
+       Use ``-O2`` for numbers quoted against other engines. Compiles a model runs itself
+       (e.g. a diffusion VAE decode) keep their own mode.
    * - ``--config``
      - model default
      - Override the resolved default config with a path to your own YAML.
