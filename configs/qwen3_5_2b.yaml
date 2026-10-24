@@ -8,6 +8,8 @@ node_groups:
 resources:
   gdn_state:
     max_slots: 129
+    # snapshots for prefix caching, one per request in flight
+    prefix_slots: 128
     # state_dtype: bfloat16  # default: the checkpoint's mamba_ssm_dtype (float32)
 
 # The vision encoder compiles on its first image shape and recompiles dynamic
