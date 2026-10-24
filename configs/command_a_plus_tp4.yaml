@@ -13,8 +13,11 @@ resources:
     max_num_pages: 8192  # 1M cached tokens shared by all requests, ~32 GB per GPU
 
 node_groups:
+  # The image encoder runs once per image prompt, beside the first LLM rank.
+  - node_names: [vision_encoder]
+    ranks: [0]
   - node_names: [LLM]
     ranks: [0, 1, 2, 3]
     tp_size: 4
     sp_size: 1
-    graph_walks: [prefill, decode]
+    graph_walks: [prefill, prefill_image, decode]
