@@ -1,25 +1,29 @@
-"""Real-weight parity for Qwen3-ASR (GPU): AuT encoder vs HF, greedy text vs the reference SDK.
+"""Real-weight parity for Qwen3-ASR (GPU): AuT encoder vs HF, served greedy text vs the reference SDK.
 
-Skipped without CUDA or the checkpoint in the local HF cache.
+Skipped without CUDA, the checkpoint in the local HF cache, or the benchmark
+set (``python -m benchmark.asr_data``, under ``MSTAR_ASR_DATA``).
 
   * encoder: the native ``AuTEncoder`` loaded from ``thinker.audio_tower.*``
     against transformers' ``Qwen3OmniMoeAudioEncoder`` built from the same
     weights, on real utterances shorter than one 8 s window (HF's SDPA path
     is un-windowed, so longer clips are not comparable on that path);
-  * end to end: the reference ``qwen_asr`` SDK (transformers backend, from
-    ``refs/Qwen3-ASR``) transcribes the same files; its text is the WER
-    reference the served model is held to. Needs ``MSTAR_QWEN_ASR_REF`` to
-    point at the SDK checkout.
+  * end to end: the reference ``qwen_asr`` SDK (transformers backend) and
+    ``mstar serve`` with the shipped config transcribe the same files, greedy
+    with the language forced; the texts must match (see
+    ``_served.assert_greedy_parity``). Needs ``MSTAR_QWEN_ASR_REF`` pointing at
+    the SDK checkout and the GPU to itself (the server takes most of it).
 
     MSTAR_QWEN_ASR_REPO=Qwen/Qwen3-ASR-1.7B pytest test/asr/test_qwen3_asr_parity.py -q
 """
 
+import gc
 import importlib
 import os
 import sys
 import types
 from pathlib import Path
 
+import _served
 import pytest
 import torch
 
@@ -27,7 +31,6 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 REPO = os.environ.get("MSTAR_QWEN_ASR_REPO", "Qwen/Qwen3-ASR-1.7B")
 KEY = "qwen3_asr_realtime" if REPO.endswith("0.6B") else "qwen3_asr"
-DATA = Path(os.environ.get("MSTAR_ASR_DATA", "data/asr"))
 SDK = os.environ.get("MSTAR_QWEN_ASR_REF", "refs/Qwen3-ASR")
 
 
@@ -40,30 +43,15 @@ def _snapshot():
         pytest.skip(f"{REPO} is not in the local HF cache")
 
 
-def _utterances(n: int, max_seconds: float | None = None) -> list[Path]:
-    refs = DATA / "test_clean_200" / "references.tsv"
-    if not refs.exists():
-        pytest.skip(f"benchmark set not found under {DATA}")
-    import wave
-
-    out = []
-    for line in refs.read_text().splitlines():
-        uid = line.split("\t", 1)[0]
-        path = DATA / "test_clean_200" / f"{uid}.wav"
-        with wave.open(str(path)) as wf:
-            seconds = wf.getnframes() / wf.getframerate()
-        if max_seconds is None or seconds <= max_seconds:
-            out.append(path)
-        if len(out) == n:
-            break
-    return out
-
-
-@pytest.fixture(scope="module")
+@pytest.fixture
 def model():
+    # per test, so the submodules a test put on the GPU are gone before the
+    # served comparison starts a server
     from mstar.model.registry import get_model_class
 
-    return get_model_class(KEY)(model_path_hf=_snapshot())
+    yield get_model_class(KEY)(model_path_hf=_snapshot())
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def test_aut_encoder_matches_hf_on_real_audio(model):
@@ -89,7 +77,7 @@ def test_aut_encoder_matches_hf_on_real_audio(model):
         layer.self_attn.ragged = None  # SDPA per window, like the oracle for <= 1 window
 
     worst = 0.0
-    for path in _utterances(4, max_seconds=7.5):
+    for path in _served.utterances(4, max_seconds=7.5):
         wave = model.load_audio(str(path), "cpu").data
         feats = model.log_mel(wave).to("cuda", torch.bfloat16)
         with torch.no_grad():
@@ -100,12 +88,18 @@ def test_aut_encoder_matches_hf_on_real_audio(model):
     assert worst < 0.1, worst
 
 
-def test_reference_sdk_transcribes_the_same_files(model):
-    """Reference transcripts for the served model's WER parity: the SDK's
-    transformers backend, greedy, bf16. Written next to the results so the
-    server-side benchmark can be compared token for token."""
+def test_served_greedy_text_matches_the_sdk(model):
+    """The served model against the reference SDK (transformers backend, the
+    benchmark's WER reference), greedy and bf16, on the benchmark's first files."""
     if not Path(SDK, "qwen_asr").is_dir():
         pytest.skip(f"reference SDK not found at {SDK}")
+    from mstar.model.qwen3_asr.repetition import fix_repetitions
+
+    def norm(text: str) -> str:
+        # what the served route applies to a finished transcript (Qwen3ASRAdapter.final_text)
+        return fix_repetitions(text.strip()).strip()
+
+    paths = _served.utterances(8)
     pkg = types.ModuleType("qwen_asr")
     pkg.__path__ = [str(Path(SDK) / "qwen_asr")]
     sys.modules.setdefault("qwen_asr", pkg)
@@ -117,15 +111,22 @@ def test_reference_sdk_transcribes_the_same_files(model):
         model.local_dir, dtype=torch.bfloat16, device_map="cuda", attn_implementation="sdpa",
     ).eval()
     processor = backend.Qwen3ASRProcessor.from_pretrained(model.local_dir, fix_mistral_regex=True)
-    texts = {}
-    for path in _utterances(3, max_seconds=7.5):
+    # the served route maps language="en" the same way (Qwen3ASRModel.process_prompt)
+    prompt = model.prompt_text(1, context="", language=model.config.language_name("en"))
+    reference = {}
+    for path in paths:
         wave = model.load_audio(str(path), "cpu").data.numpy()
-        prompt = model.prompt_text(1, context="", language="English")
         inputs = processor(text=[prompt], audio=[wave], return_tensors="pt", padding=True).to("cuda")
         inputs["input_features"] = inputs["input_features"].to(torch.bfloat16)
         with torch.no_grad():
-            out = ref.generate(**inputs, max_new_tokens=128)
-        texts[path.name] = processor.batch_decode(
+            out = ref.generate(**inputs, max_new_tokens=512)
+        reference[path.name] = norm(processor.batch_decode(
             out.sequences[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True,
-        )[0].strip()
-    assert all(texts.values()), texts
+        )[0])
+    del ref, processor, inputs, out
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    with _served.serving(KEY) as base:
+        served = {path.name: norm(_served.transcribe(base, path, "en")) for path in paths}
+    _served.assert_greedy_parity(reference, served)
