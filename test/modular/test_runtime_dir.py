@@ -326,3 +326,66 @@ def test_the_upload_dir_default_holds_the_user_name_only_when_short_and_ascii(mo
 
     monkeypatch.setattr(socket_prefix.getpass, "getuser", lambda: name)
     assert socket_prefix.default_upload_dir() == f"/tmp/mstar_uploads_{name if kept else os.getuid()}/"
+
+
+@pytest.fixture(params=["other_uid", "symlink", "mode_777"])
+def swapped_upload_dir(request, tmp_path, monkeypatch):
+    """An upload dir that passed the startup check, then was removed (a /tmp
+    cleaner) and recreated by someone else; returns (path, where a symlink
+    points, or None)."""
+    path = ensure_private_dir(tmp_path / "up")
+    path.rmdir()
+    target = None
+    if request.param == "symlink":
+        target = tmp_path / "theirs"
+        target.mkdir(mode=0o700)
+        path.symlink_to(target)
+    else:
+        path.mkdir(mode=0o700)
+        if request.param == "mode_777":
+            path.chmod(0o777)
+        else:
+            uid = os.geteuid()
+            monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
+    return path, target
+
+
+def _written(path, target) -> list:
+    return sorted(os.listdir(target if target is not None else path))
+
+
+def test_generate_rechecks_the_upload_dir_per_request(swapped_upload_dir, monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    path, target = swapped_upload_dir
+    monkeypatch.setattr(entrypoint, "api_server", SimpleNamespace(upload_dir=path))
+    client = TestClient(entrypoint.app)
+    with pytest.raises(PermissionError, match="refusing"):
+        client.post("/generate", data={"text": "hi"}, files=[("files", ("a.png", b"img", "image/png"))])
+    assert _written(path, target) == []
+
+
+def test_generate_ws_rechecks_the_upload_dir_per_message(swapped_upload_dir, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+    from mstar.api_server.entrypoint import _decode_ws_files
+
+    path, target = swapped_upload_dir
+    with pytest.raises(PermissionError, match="refusing"):
+        _decode_ws_files([{"name": "a.png", "data": b"img"}], path)
+
+    monkeypatch.setattr(entrypoint, "api_server", SimpleNamespace(upload_dir=path, takes_stream_input=False))
+    payload = base64.b64encode(b"img").decode()
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"request_id": "r1", "files": [{"name": "a.png", "data": payload}]}))
+        reply = json.loads(ws.receive_text())
+    assert reply["request_id"] == "r1" and reply["error"]
+    assert _written(path, target) == []

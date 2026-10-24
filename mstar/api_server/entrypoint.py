@@ -2080,6 +2080,10 @@ def _decode_ws_files(
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
     saved: list[Path] = []
+    if files:
+        # checked per message, not only at startup: a /tmp cleaner may have
+        # removed it and another user recreated it since
+        upload_dir = ensure_private_dir(upload_dir)
     try:
         for entry in files or []:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
@@ -2616,6 +2620,8 @@ async def generate(
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
     if files:
+        # checked per request, as the OpenAI routes and the Rust frontend do
+        upload_dir = await run_in_threadpool(ensure_private_dir, api_server.upload_dir)
         for f in files:
             modality = _detect_modality(f.filename or "")
             if modality == "unknown":
@@ -2630,7 +2636,7 @@ async def generate(
             # embedded separators (../) would escape upload_dir.
             base = os.path.basename(f.filename or "") or "upload"
             save_name = f"{uuid.uuid4()}_{base}"
-            save_path = api_server.upload_dir / save_name
+            save_path = upload_dir / save_name
             content = await f.read()
             await run_in_threadpool(write_private_file, save_path, content)
             paths = file_paths.setdefault(modality, [])
