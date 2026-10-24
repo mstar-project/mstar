@@ -187,6 +187,31 @@ def test_prompt_layout_matches_reference_template():
         model.prompt_ids(2, context="hello <|audio_pad|> world")
 
 
+@pytest.mark.parametrize("max_tokens", [1, 64, 8192])
+def test_decode_ends_at_the_cap_and_the_loop_holds_any_cap_the_context_does(max_tokens):
+    """The request's cap is the iteration check_stop ends decode on, and the graph's
+    decode loop runs to the context, so a length past the default cap is served
+    rather than refused at intake."""
+    from types import SimpleNamespace
+
+    from mstar.engine.resources import SamplingReqConfig
+    from mstar.model.qwen3_asr.config import DECODE_LOOP, SAMPLER
+
+    model = _make_model()
+    cap = model.get_loop_caps(max_output_tokens=max_tokens)[DECODE_LOOP]
+    assert cap <= model.get_graph_walk_graphs()[DECODE_WALK].max_iters
+
+    llm = Qwen3ASRLLMSubmodule(None, model.config)
+    word = {"new_token": [torch.tensor([1234])]}
+    stopped = next(
+        k + 1 for k in range(cap + 1)
+        if llm.check_stop("r", SimpleNamespace(
+            graph_walk=DECODE_WALK, max_tokens=cap, dynamic_loop_iter_counts={DECODE_LOOP: k},
+            resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
+        ), word)
+    )
+    assert stopped == cap, "the cap and the stop check end decode on different iterations"
+
 def test_process_prompt_builds_features_and_prompt():
     model = _make_model()
     wave = torch.randn(16_000 * 3 + 40)
@@ -200,6 +225,8 @@ def test_process_prompt_builds_features_and_prompt():
     slot, count = result.metadata["audio_slot"], result.metadata["audio_tokens"]
     assert count == n_tokens and ids[slot:slot + count] == [AUDIO_PAD] * count
     assert set(result.metadata) <= {*model.INTERNAL_KWARGS, "kv_layout"}
+    # the prompt span is what the prefill writes: every id, audio run included
+    assert [span.length for span in result.metadata["kv_layout"][KV_CACHE]["main"].spans] == [len(ids)]
 
     free = model.process_prompt("hot words", ["audio", "text"], ["text"], {"audio_inputs": [wave]})
     free_ids = free.new_input_tensors["text_inputs"][0].tolist()
@@ -212,6 +239,7 @@ def test_process_prompt_builds_features_and_prompt():
         None, ["audio"], ["text"], {"audio_inputs": [wave]}, assistant_prefix="language English<asr_text> hi",
     )
     prefixed_ids = prefixed.new_input_tensors["text_inputs"][0].tolist()
+    assert [span.length for span in prefixed.metadata["kv_layout"][KV_CACHE]["main"].spans] == [len(prefixed_ids)]
     assert prefixed_ids[-3:] == model.tokenizer.encode("<asr_text> hi")[-3:]
     slot = prefixed.metadata["audio_slot"]
     assert prefixed_ids[slot:slot + n_tokens] == [AUDIO_PAD] * n_tokens

@@ -338,17 +338,6 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 tensor_inputs["ts_rules"] = torch.tensor(inactive_state(), dtype=torch.long, device=device)
         else:
             state = self.request_state(fwd_info.rid_handle)
-            # The learned position table caps prompt + transcript at
-            # max_target_positions, and check_stop reads this back. Set per
-            # walk rather than added up, the worker runs prepare_inputs again
-            # after an AllocationFailed retry. The prompt walk after language
-            # detection follows the one-token detection prompt.
-            if graph_walk == PREFILL_PROMPT_WALK:
-                state.add("prompt_len", state.get("detect_len", 0) + seq_len)
-            else:
-                state.add("prompt_len", seq_len)
-                if graph_walk == DETECT_LANGUAGE_WALK:
-                    state.add("detect_len", seq_len)
             # The route resolved these from the request's kwargs, which is
             # where they came from in the first place: scanning the prompt
             # tensor for them meant a ``.tolist()`` here, and a D2H on the GPU
@@ -660,10 +649,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         decoded_tokens = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
-        # prompt + first token + decoded tokens must fit the position table
-        prompt_len = self.request_state(request_info.rid_handle).get("prompt_len", 0)
-        positions_left = self.config.max_target_positions - prompt_len - 1 - decoded_tokens
         if (not ignore_eos and token == self.config.eos_token_id) or \
-                decoded_tokens >= request_info.max_tokens or positions_left <= 0:
+                decoded_tokens >= request_info.max_tokens:
             return {DECODE_LOOP}
         return set()

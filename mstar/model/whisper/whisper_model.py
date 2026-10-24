@@ -135,6 +135,11 @@ class WhisperDetokenizer(ByteLevelDetokenizer):
 class WhisperModel(Model):
     """Whisper ASR: native batched encoder + native AR decoder."""
 
+    # A requested length is cut to the room the prompt leaves in the position
+    # table rather than refused, as a length past the table is clamped below:
+    # long-form windows carry the transcript so far as <|startofprev|> context.
+    LENGTH_KWARGS = ()
+
     # Requests the default decoder caches hold at once, each at full length.
     # A deployment retunes the page counts under ``resources:`` in its YAML.
     MAX_CONCURRENT_REQUESTS = 64
@@ -316,8 +321,7 @@ class WhisperModel(Model):
     def get_max_output_tokens(self, **model_kwargs):
         # The learned position table caps prompt + generated tokens at
         # max_target_positions (448), the shortest forced prompt takes 4.
-        # A longer prompt (``<|startofprev|>`` context) is accounted per
-        # request in the decoder's ``check_stop``.
+        # The conductor cuts a longer prompt's cap to what is left.
         limit = self.config.max_target_positions - 4
         return min(checked_request_kwargs(model_kwargs).get("max_output_tokens", limit), limit)
 

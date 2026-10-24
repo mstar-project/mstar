@@ -248,7 +248,7 @@ class Qwen3ASRModel(Model):
                     GraphEdge(next_node=LLM_NODE, name="text_inputs"),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.text.max_position_embeddings,
             outputs=[],
             accumulated_outputs=[
                 GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),

@@ -453,7 +453,6 @@ def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
     assert row.input_seq_len == 3
     batch = sub.preprocess(PREFILL_PROMPT_WALK, _engine_inputs(["r0"]), [row])
     assert batch["input_ids"].tolist() == [DE, TRANSCRIBE, NOTS] and "encoder_states" not in batch
-    assert sub.request_state(4)["prompt_len"] == 3
 
     detect_row = sub.prepare_inputs(
         DETECT_LANGUAGE_WALK, fwd,
@@ -461,18 +460,6 @@ def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
          "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]},
     )
     assert detect_row.input_seq_len == 1 and sub._context_span(detect_row) == cfg.max_source_positions
-    # the prompt walk counts the one-token detection prompt before its own
-    # tokens, and running prepare_inputs again (an allocation retry) does
-    # not grow the count
-    tail = {"text_inputs": [torch.tensor([DE])], "prompt_tail": [torch.tensor([TRANSCRIBE, NOTS])]}
-    sub.prepare_inputs(PREFILL_PROMPT_WALK, fwd, tail)
-    sub.prepare_inputs(PREFILL_PROMPT_WALK, fwd, tail)
-    assert sub.request_state(4)["prompt_len"] == 4
-    ctx = {"encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]}
-    forced = {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE])], **ctx}
-    sub.prepare_inputs(PREFILL_WALK, fwd, forced)
-    sub.prepare_inputs(PREFILL_WALK, fwd, forced)
-    assert sub.request_state(4)["prompt_len"] == 3
     assert sub.max_batch_size(DECODE_WALK) is None
     assert sub.max_batch_size(PREFILL_WALK) == sub.MAX_PREFILL_BATCH_SIZE
 
@@ -494,7 +481,7 @@ def test_decoder_logit_rules():
     assert torch.isinf(later[0, [1, 2]]).all() and torch.isfinite(later[0, EOT])
 
 
-def test_decoder_check_stop_honors_eos_max_tokens_and_position_table():
+def test_decoder_check_stop_honors_eos_and_max_tokens():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
 
@@ -508,16 +495,12 @@ def test_decoder_check_stop_honors_eos_max_tokens_and_position_table():
             "dynamic_loop_iter_counts": {"decode_loop": decoded},
         })()
 
-    sub.request_state(9).add("prompt_len", 4)
     eos = {"new_token": [torch.tensor([EOT])]}
     word = {"new_token": [torch.tensor([1234])]}
     assert sub.check_stop("r", info(PREFILL_WALK, 0), eos) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 0), eos) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 3, max_tokens=4), word) == {"decode_loop"}
-    # 4 prompt + 1 first token + 443 decoded fill the 448-slot table
-    assert sub.check_stop("r", info(DECODE_WALK, 441), word) == set()
-    assert sub.check_stop("r", info(DECODE_WALK, 442), word) == {"decode_loop"}
 
 
 # --------------------------------------------------------------------------
