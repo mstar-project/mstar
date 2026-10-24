@@ -321,4 +321,36 @@ def test_a_request_removed_while_its_prefix_is_arriving_leaks_nothing():
     kv.assert_pages_conserved()
 
 
+class _Walked(dict):
+    """A request's streams, counting the walks `_fetch_from_host` makes over them."""
+    walks = 0
+
+    def items(self):
+        if sys._getframe(1).f_code.co_name == "_fetch_from_host":
+            self.walks += 1
+        return super().items()
+
+
+def test_a_request_looked_up_skips_the_host_walk_until_its_stream_resets():
+    kv = _manager()
+    _on_the_host_only(kv)
+    _ingest(kv, "b", A_PROMPT + [7, 8])
+    assert not _ready(kv, "b")
+    kv._streams["b"] = b_streams = _Walked(kv._streams["b"])
+    _land(kv)
+    # c's first readiness check looks its prompt up and finds nothing on the host
+    _ingest(kv, "c", list(range(600, 600 + 6 * PAGE_SIZE)) + [1, 2])
+    assert _ready(kv, "c")
+    kv._streams["c"] = c_streams = _Walked(kv._streams["c"])
+
+    assert _ready(kv, "b") and _ready(kv, "c")
+
+    assert b_streams.walks == c_streams.walks == 0, "a readiness check walked a looked-up request's streams"
+    kv.reset_request("b", free=True)
+    kv._evict(kv._index.num_pages())
+    copied = len(kv._cpu_pool.copied_in)
+    _ready(kv, "b")
+    assert len(kv._cpu_pool.copied_in) == copied + 6, "a request whose stream reset didn't look its prefix up again"
+
+
 

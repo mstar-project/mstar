@@ -582,6 +582,10 @@ class KVManager(AttentionResource):
             needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
+        # requests whose every stream has been looked up for a copy from the host, with none arriving, so
+        # `_fetch_from_host` returns before reading their streams. Giving one of a request's streams a new chain
+        # takes the request out of the set.
+        self._looked_up: set[str] = set()
         # A copy is listed with `event` None until it is queued, since an event
         # that was never recorded reads as done.
         self._host_copies: list[HostCopy] = []
@@ -823,6 +827,7 @@ class KVManager(AttentionResource):
             if self._streams.get(rid, {}).get(label) is not stream:
                 return False
             chain.looked_up = True
+            self._note_looked_up(rid)
             rooted, ends = chain.rooted, chain.rooted_ends
             total = sum(span.length for span in chain.spans)
             # The lock was dropped to hash, so another thread's probe may have taken the lease already.
@@ -1330,6 +1335,7 @@ class KVManager(AttentionResource):
         stream.chain = PrefixChain.seed(
             keys, tail, layout.spans[:layout.keyed_spans], self.config.page_size,
         )
+        self._looked_up.discard(rid)
 
     @property
     def keys_prefix_chains(self) -> bool:
@@ -1782,6 +1788,8 @@ class KVManager(AttentionResource):
         """
         if self._cpu_pool is None or self._index is None or not self._cpu_pool.index.num_pages():
             return None
+        if rid in self._looked_up:
+            return None
         # Readiness is checked for every row on every pass, so return before
         # taking the lock when no stream still needs a lookup or waits on a copy.
         streams = self._streams.get(rid, {})
@@ -1811,6 +1819,7 @@ class KVManager(AttentionResource):
                 # The engine doesn't probe a walk that writes two labels, so no probe would read a copy.
                 # The chain is marked looked up, so later readiness checks return before taking the lock.
                 chain.looked_up = True
+                self._note_looked_up(rid)
                 return None
         self._root_chain(chain)
         with self._lock:
@@ -1837,6 +1846,7 @@ class KVManager(AttentionResource):
                 budget = self._allowance(rid) - sum(page in evictable for page in run)
             host = self._cpu_pool.retain_run(rooted[at:min(cap, at + budget)])
             if not host:
+                self._note_looked_up(rid)
                 return None
             # retained before the grant, whose eviction could drop the run's index-only pages
             held = self._retain_cached(rid, stream, run)
@@ -1855,6 +1865,16 @@ class KVManager(AttentionResource):
         self._cpu_pool.copy_in(self.kv_cache.tensor, PageCopies(gpu=fresh, cpu=host))
         copy.event = self._cpu_pool.record()
         return label
+
+    def _note_looked_up(self, rid: str) -> None:
+        """Add ``rid`` to `_looked_up` once each of its streams has been looked up for a copy from the
+        host and none waits on one. Callers hold the lock."""
+        streams = self._streams.get(rid)
+        if streams and all(
+            (stream.chain is None or stream.chain.looked_up) and stream.host_copy is None
+            for stream in streams.values()
+        ):
+            self._looked_up.add(rid)
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
@@ -3221,6 +3241,7 @@ class KVManager(AttentionResource):
                     copy.stream.chain.from_host += linked
                 copy.stream.host_copy = None
                 copy.stream.read_pending = copy.stream.read_future is not None
+                self._note_looked_up(copy.rid)
                 landed.append(copy)
             copy.landed = True
         self._host_copies = pending
@@ -3500,6 +3521,7 @@ class KVManager(AttentionResource):
             # unwound against whichever request is given this handle next
             self._forget_reservations(rid)
             self._streams.pop(rid, None)
+            self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
@@ -3853,6 +3875,7 @@ class KVManager(AttentionResource):
         if stream.host_copy is not None and stream.host_copy.landed:
             stream.host_copy = None
             stream.read_pending = stream.read_future is not None
+            self._note_looked_up(rid)
         if stream.read_error is not None:
             err = stream.read_error
             return False, AdmitRuntimeError(
