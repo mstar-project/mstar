@@ -58,7 +58,7 @@ WETEXT_REPO = "pengzhendong/wetext"
 _CHINESE = re.compile(r"[\u4e00-\u9fff]+")
 # every "." except one between two digits
 _STOP_DOT = re.compile(r"(?<!\d)\.|\.(?!\d)")
-_ZH_TRAILING_COMMAS = re.compile(r"[，,、]+$")
+_ZH_TRAILING_COMMAS = "，,、"
 _STOPS = {"zh": "。？！；：、.?!;", "en": ".?!;:"}
 _CLOSING_QUOTES = ('"', "”")
 
@@ -205,7 +205,9 @@ class CosyVoice3TextFrontend:
             out = _STOP_DOT.sub("。", out)
             out = out.replace(" - ", "，")
             out = remove_bracket(out)
-            out = _ZH_TRAILING_COMMAS.sub("。", out)
+            # rstrip, not a "[，,、]+$" regex, which is quadratic in a run of commas
+            if out.endswith(tuple(_ZH_TRAILING_COMMAS)):
+                out = out.rstrip(_ZH_TRAILING_COMMAS) + "。"
             lang = "zh"
         elif latin_script(stripped):
             out = normalize_english(self._wetext_normalize(stripped, "en"))

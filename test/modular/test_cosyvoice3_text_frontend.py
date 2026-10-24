@@ -340,6 +340,38 @@ def test_a_number_past_the_largest_scale_is_read_digit_by_digit_everywhere(text,
 
 
 @pytest.mark.parametrize(
+    "text, end",
+    [
+        ("{}.5", "one one point five"),
+        ("${}", "one one dollars"),
+        ("${}.25", "one one dollars and twenty five cents"),
+        ("{}th", "one one first"),
+        ("{} 1/2", "one one and a half"),
+        ("{}/2", "one one slash two"),
+        ("$1-{}", "one one dollars"),
+    ],
+)
+def test_a_run_too_long_for_int_is_read_digit_by_digit(text, end):
+    """Python's int() refuses more than 4,300 digits."""
+    spoken = normalize_english(text.format("1" * 5000))
+    assert spoken.endswith(end)
+    assert spoken.count("one ") >= 4999
+
+
+def test_a_long_run_of_thousands_groups_or_commas_takes_linear_time():
+    """Each took over 5 s at this size: a rule could start after every comma and rescan the rest."""
+    frontend = CosyVoice3TextFrontend()
+    for normalize, text in [
+        (normalize_english, "1" + ",234" * 10_000),
+        (normalize_english, "1,23" * 10_000),
+        (lambda t: frontend.normalize(t, chinese=True), "好" + "，" * 40_000),
+    ]:
+        start = time.perf_counter()
+        normalize(text)
+        assert time.perf_counter() - start < 1, text[:8]
+
+
+@pytest.mark.parametrize(
     "text, spoken",
     [
         ("100-1000 users", "one hundred to one thousand users"),

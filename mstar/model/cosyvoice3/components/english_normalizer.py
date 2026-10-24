@@ -67,6 +67,9 @@ _MAX_CARDINAL_DIGITS = 3 * len(_SCALES)
 
 # a number as written: thousands groups or a plain run, then an optional decimal part
 _NUM = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+# not inside a thousands group: a rule that may start after a comma would
+# otherwise scan the rest of "1,234,567,..." again from every comma
+_NOT_IN_GROUP = r"(?!(?<=\d,)\d{3})"
 _MONTH_WORD = r"(?:" + "|".join(_MONTHS) + r")"
 _DAY_SUFFIX = r"(?:st|nd|rd|th)?"
 
@@ -90,11 +93,18 @@ def _below_thousand(n: int, with_and: bool) -> str:
     return " ".join(words)
 
 
-def cardinal(n: int) -> str:
+def cardinal(n: int | str) -> str:
     """``wetext``'s cardinal: "and" only inside the last group of three
     (247 -> "two hundred and forty seven", 29,032 -> "twenty nine thousand and
     thirty two", 250,000 -> "two hundred fifty thousand"). A number past
-    the largest scale is read digit by digit."""
+    the largest scale is read digit by digit. ``n`` can be the digits as
+    written, separators included, so a run too long for ``int()`` is never
+    converted."""
+    if isinstance(n, str):
+        run = n.replace(",", "").lstrip("0")
+        if len(run) > _MAX_CARDINAL_DIGITS:
+            return digits(run)
+        n = int(run or "0")
     if n == 0:
         return "zero"
     if n >= 1000 ** len(_SCALES):
@@ -117,7 +127,7 @@ def cardinal(n: int) -> str:
     return " ".join(words)
 
 
-def ordinal(n: int) -> str:
+def ordinal(n: int | str) -> str:
     """``wetext``'s ordinal, without the cardinal's "and" (101 -> "one hundred first")."""
     head, _, last = cardinal(n).replace(" and", "").rpartition(" ")
     if last in _ORDINAL_WORDS:
@@ -169,7 +179,7 @@ def number(written: str) -> str:
     whole, dot, fraction = written.partition(".")
     if not dot:
         return integer(whole)
-    whole_words = cardinal(int(whole.replace(",", ""))) if whole else "zero"
+    whole_words = cardinal(whole) if whole else "zero"
     return f"{whole_words} point {digits(fraction, zero='oh')}"
 
 
@@ -179,17 +189,17 @@ def _money(match: re.Match) -> str:
     if scale:
         value = number(whole + (f".{cents}" if cents else ""))
         return f"{value} {scale} {majors}"
-    n = int(whole.replace(",", ""))
+    run = whole.replace(",", "").lstrip("0")
+    major_words = f"{cardinal(whole)} {major if run == '1' else majors}"
     if cents is None or len(cents) != 2:
         if cents is not None:
             return f"{number(whole + '.' + cents)} {majors}"
-        return f"{cardinal(n)} {major if n == 1 else majors}"
+        return major_words
     c = int(cents)
-    major_words = f"{cardinal(n)} {major if n == 1 else majors}"
     if not c:
         return major_words
     minor_words = f"{cardinal(c)} {minor if c == 1 else minors}"
-    return minor_words if n == 0 else f"{major_words} and {minor_words}"
+    return minor_words if not run else f"{major_words} and {minor_words}"
 
 
 def _date(month: int, day: int, year_written: str | None, sep: str = " ") -> str:
@@ -260,7 +270,10 @@ def _time(match: re.Match) -> str:
     return out
 
 
-def _fraction(numerator: int, denominator: int) -> str | None:
+def _fraction(written_numerator: str, written_denominator: str) -> str | None:
+    if len(written_denominator.lstrip("0")) > 3 or len(written_numerator.lstrip("0")) > 3:
+        return None
+    numerator, denominator = int(written_numerator), int(written_denominator)
     if not 0 < numerator < denominator <= 100:
         return None
     if denominator == 2:
@@ -270,17 +283,16 @@ def _fraction(numerator: int, denominator: int) -> str | None:
 
 
 def _mixed_fraction(match: re.Match) -> str:
-    whole, numerator, denominator = int(match["w"]), int(match["n"]), int(match["dd"])
-    words = _fraction(numerator, denominator)
+    words = _fraction(match["n"], match["dd"])
     if words is None:
         return match[0]
-    if numerator == 1:
+    if int(match["n"]) == 1:
         words = "a " + words.split(" ", 1)[1]
-    return f"{cardinal(whole)} and {words}"
+    return f"{cardinal(match['w'])} and {words}"
 
 
 def _simple_fraction(match: re.Match) -> str:
-    words = _fraction(int(match["n"]), int(match["dd"]))
+    words = _fraction(match["n"], match["dd"])
     return words if words is not None else f"{integer(match['n'])} slash {integer(match['dd'])}"
 
 
@@ -306,8 +318,8 @@ def _local_phone(match: re.Match) -> str:
 
 def _money_range(match: re.Match) -> str:
     (major, majors), _ = _CURRENCIES[match["cur"]]
-    a, b = (int(match[k].replace(",", "")) for k in ("a", "b"))
-    return f"{cardinal(a)} to {cardinal(b)} {major if b == 1 else majors}"
+    one = match["b"].lstrip("0") == "1"
+    return f"{cardinal(match['a'])} to {cardinal(match['b'])} {major if one else majors}"
 
 
 def _percent(match: re.Match) -> str:
@@ -361,18 +373,18 @@ _RULES: list[tuple[re.Pattern, Callable[[re.Match], str]]] = [
         _money,
     ),
     # 12.5%, -3%
-    (re.compile(rf"(?<![\w.])(?P<neg>-)?(?P<num>{_NUM})\s?%"), _percent),
+    (re.compile(rf"(?<![\w.]){_NOT_IN_GROUP}(?P<neg>-)?(?P<num>{_NUM})\s?%"), _percent),
     # 1st, 22nd, 101st, 1,000th
     (
-        re.compile(r"\b(\d{1,3}(?:,\d{3})+|\d+)(?:st|nd|rd|th)\b", re.IGNORECASE),
-        lambda m: ordinal(int(m[1].replace(",", ""))),
+        re.compile(rf"\b{_NOT_IN_GROUP}(\d{{1,3}}(?:,\d{{3}})+|\d+)(?:st|nd|rd|th)\b", re.IGNORECASE),
+        lambda m: ordinal(m[1]),
     ),
     # 1990s, '80s
     (re.compile(r"\b(\d{3}0)s\b"), _decade),
     (re.compile(r"(?<![\w'])'?([1-9]0)s\b"), lambda m: _plural(cardinal(int(m[1])))),
     # 2.5 kg, 65 mph, 30°C
     (
-        re.compile(rf"(?<![\w.])(?P<num>{_NUM})\s?(?P<unit>km/h|°C|°F|°|kg|km|cm|mm|mph|kph|lbs|lb|oz)(?![\w/])"),
+        re.compile(rf"(?<![\w.]){_NOT_IN_GROUP}(?P<num>{_NUM})\s?(?P<unit>km/h|°C|°F|°|kg|km|cm|mm|mph|kph|lbs|lb|oz)(?![\w/])"),
         _unit,
     ),
     # 3x faster, 3 x 4
