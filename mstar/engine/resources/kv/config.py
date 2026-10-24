@@ -255,7 +255,8 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
-    # label -> the prompt as int32 bytes, when it is the only label with spans and all of them are ids
+    # label -> the prompt's ids, without its digest spans, as int32 bytes, when it is the only label with spans
+    # and has no rows span
     prompt_ids: dict[str, bytes] | None = None
     # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
     arrival: int | None = None

@@ -736,18 +736,21 @@ class PreprocessWorkerThread:
 
     @staticmethod
     def _prompt_ids(tensors: dict, layouts: dict) -> dict[str, dict[str, bytes]]:
-        """The prompt's ids as int32 bytes, by resource and label, for a resource where exactly one label
-        has spans and all of them are ids. Like `_page_layout`, it starts every label at a source's first
-        entry, so a second label would get the first label's ids."""
+        """The prompt's ids as int32 bytes, skipping its digest spans, by resource and label. Only for a resource
+        where exactly one label has spans, at least one of them ids and none of them rows. Like `_page_layout`,
+        it starts every label at a source's first entry, so a second label would get the first label's ids."""
         prompt_ids: dict[str, dict[str, bytes]] = {}
         for resource_key, by_label in layouts.items():
             laid_out = [(label, layout) for label, layout in by_label.items() if layout.spans]
-            if len(laid_out) != 1 or any(span.kind != "ids" for span in laid_out[0][1].spans):
+            kinds = {span.kind for _, layout in laid_out for span in layout.spans}
+            if len(laid_out) != 1 or "rows" in kinds or "ids" not in kinds:
                 continue
             ((label, layout),) = laid_out
             entries: dict[str, int] = {}
             ids = []
             for span in layout.spans:
+                if span.kind != "ids":
+                    continue
                 entry = entries.get(span.source, 0)
                 entries[span.source] = entry + 1
                 ids.append(tensors[span.source][entry].flatten())
