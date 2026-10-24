@@ -325,11 +325,14 @@ class RopeManager(PositionManager):
         return pos_ids_out
 
     def commit(self, step: PositionStep, ctx: StepContext):
+        all_counters = self._counters
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
         ):
             if advance:
-                counters = self._counters.setdefault(segment.request_id, {})
+                counters = all_counters.get(segment.request_id)
+                if counters is None:
+                    counters = all_counters[segment.request_id] = {}
                 counters[segment.label] = counters.get(segment.label, 0) + advance
 
         # post-forks copy the source after this step advanced it, matching
@@ -401,13 +404,18 @@ class RopeManager(PositionManager):
         eager path has no slot to key a buffer by, so allocates plainly.
         """
         block = self._config.scheme == PosScheme.BLOCK
+        counters = self._counters
         pos_ids: list[int] = []
+        append, extend = pos_ids.append, pos_ids.extend
         for rid, label, to_compute in rows:
-            start = self.position(rid, label)
-            if block:
-                pos_ids.extend([start] * to_compute)
+            labels = counters.get(rid)
+            start = labels.get(label, 0) if labels is not None else 0
+            if to_compute == 1:
+                append(start)  # a decode row
+            elif block:
+                extend([start] * to_compute)
             else:
-                pos_ids.extend(range(start, start + to_compute))
+                extend(range(start, start + to_compute))
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
         key = CGSlotKey(

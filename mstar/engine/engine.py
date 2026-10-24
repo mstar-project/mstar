@@ -1606,7 +1606,10 @@ class Engine:
                 )
             t0 = phase_start()
             try:
-                self._runner.plan(step)
+                # promoted and inline plans per resource, apart
+                self._runner.plan(
+                    step, "res.plan" if batch.preplan_event is not None else "res.plan_fresh",
+                )
             finally:
                 phase_end(
                     "engine.plan.promoted" if batch.preplan_event is not None
