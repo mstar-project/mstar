@@ -224,6 +224,14 @@ def _until_error(chunks: list[ResultChunk]) -> tuple[list[ResultChunk], bool]:
     return list(chunks), False
 
 
+def _is_utf8(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def request_id_in_use(request_id: str) -> str:
     """The 409 detail for a ``request_id`` that still has a request in flight."""
     return (
@@ -562,6 +570,9 @@ class APIServer:
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
+        elif not _is_utf8(request_id):
+            # e.g. a lone surrogate from a JSON escape: no message could name it
+            raise HTTPException(status_code=400, detail="request_id is not valid UTF-8 text")
 
         for m in input_modalities + output_modalities:
             if m not in SUPPORTED_MODALITIES:

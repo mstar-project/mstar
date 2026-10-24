@@ -25,7 +25,12 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
-from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
+from mstar.communication.communicator import (
+    BaseCommunicator,
+    CommProtocol,
+    OutboxCommunicator,
+    make_communicator,
+)
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
@@ -178,11 +183,14 @@ class PreprocessWorker:
         # The socket is only *used* from the worker thread, but owning the
         # tensor manager here lets the main thread read its tx/rx profiling
         # directly once a request is done (no cross-thread queue / race).
-        self.communicator = make_communicator(
+        # Sends never block the thread (OutboxCommunicator): the conductor and
+        # the workers block on sends to it, so it has to keep reading.
+        self.communicator = OutboxCommunicator(make_communicator(
             my_id="api_server_preprocess_worker",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
-        )  # only used to send (from the worker thread)
+            nonblocking_send=True,
+        ))  # only used to send (from the worker thread)
         self.tensor_manager = create_tensor_communication_manager(
             protocol=tensor_comm_protocol,
             my_entity_id="api_server_preprocess_worker",
@@ -1235,14 +1243,24 @@ class PreprocessWorkerThread:
             self._live_requests[request_id] = live
 
     def _process_releases(self) -> bool:
-        """Apply the API server's aborts and finished_reading calls."""
+        """Apply the API server's aborts and finished_reading calls. One that
+        fails is logged, and the others still apply: raised, it would also
+        lose the input the pass took just before applying them."""
         did_work = False
         while not self.abort_request_queue.empty():
             did_work = True
-            self._send_abort(self.abort_request_queue.get())
+            rid = self.abort_request_queue.get()
+            try:
+                self._send_abort(rid)
+            except Exception:  # noqa: BLE001 — that release alone
+                logger.exception("Abort of request %r failed", rid)
         while not self.reads_done_queue.empty():
             did_work = True
-            self._finish_reading(*self.reads_done_queue.get())
+            rid, drained = self.reads_done_queue.get()
+            try:
+                self._finish_reading(rid, drained)
+            except Exception:  # noqa: BLE001 — that release alone
+                logger.exception("Release of request %r failed", rid)
         return did_work
 
     def _publish_transfers(self, transfers: EdgeTransfers) -> None:
@@ -1275,10 +1293,14 @@ class PreprocessWorkerThread:
         # only its queues) has nothing to warm up.
         if not self.stop_event.is_set():
             warm_up_model(getattr(self, "model", None))
+        if not isinstance(self.communicator, OutboxCommunicator):
+            self.communicator = OutboxCommunicator(self.communicator)
         idle_wait = self._idle_wait()
         while not self.stop_event.is_set():
             did_work = False
+            sends_pending = False
             try:
+                sends_pending = self.communicator.flush()
                 did_work = self._process_messages()
                 self._send_enable_metrics_if_requested()
                 # Output delivery is latency-sensitive: the API server holds a
@@ -1323,7 +1345,10 @@ class PreprocessWorkerThread:
                 # Reads may have just resolved; ACK any drains now free of them.
                 for rid in list(self._draining_rids):
                     self._complete_drain_if_ready(rid)
-                if not self.in_queue.empty():
+                # New input. None while a peer can't take what we already
+                # sent: as a blocking send did, that holds new work back, so
+                # the outbox stays short and requests wait unpreprocessed.
+                if not sends_pending and not self.in_queue.empty():
                     did_work = True
                     pre_input = self.in_queue.get()
                     # again here: a request submitted after the event was set
@@ -1361,7 +1386,9 @@ class PreprocessWorkerThread:
             transfers = getattr(self.tensor_manager, "transfer_stats", None)
             if transfers is not None:
                 self._publish_transfers(transfers)
-            if not did_work:
+            if sends_pending and not did_work:
+                time.sleep(0.001)       # a peer is full: retry soon, keep reading
+            elif not did_work:
                 idle_wait()
 
         # Stopping, and nothing will send the RemoveRequest for what is still

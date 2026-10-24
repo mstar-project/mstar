@@ -44,6 +44,13 @@ class _Socket:
     def send(self, entity, msg):
         self.sent.append((entity, msg))
 
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
+
     def to_conductor(self):
         return [(m.message_type, m.body.request_id) for e, m in self.sent if e == "conductor"]
 

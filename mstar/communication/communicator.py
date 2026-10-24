@@ -1,3 +1,4 @@
+import collections
 import fcntl
 import logging
 import os
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 #: ``rust/`` crate's version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching
 #: install - e.g. a stale wheel after an upgrade - takes over the mesh
 #: silently, so the factory warns when the imported version differs.
-EXPECTED_MSTAR_RUST_VERSION = "0.1.0"
+EXPECTED_MSTAR_RUST_VERSION = "0.1.1"
 
 
 #: The entity whose endpoint stands for the whole deployment: the one every
@@ -39,6 +40,13 @@ class BaseCommunicator(ABC):
         entity_id: worker_xyz, conductor, or api_server
         """
         pass
+
+    def try_send_bytes(self, entity_id: str, data: bytes) -> bool:
+        """Send a message already encoded with ``self.codec`` without
+        blocking: False, with nothing sent, when the peer is at its high-water
+        mark. A loop that must keep reading its own input while a peer is slow
+        sends with this and retries later (see ``OutboxCommunicator``)."""
+        raise NotImplementedError(f"{type(self).__name__} has no non-blocking send")
 
     @abstractmethod
     def get_all_new_messages(self) -> list:
@@ -187,12 +195,22 @@ class ZMQCommunicator(BaseCommunicator):
             "%s to send a message %s to entity %s",
             self.my_id, msg, entity_id
         )
+        self._push_socket(entity_id).send(self.codec.encode(msg))
+
+    def try_send_bytes(self, entity_id: str, data: bytes) -> bool:
+        try:
+            self._push_socket(entity_id).send(data, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return False
+        return True
+
+    def _push_socket(self, entity_id: str):
         if entity_id not in self.push_sockets:
             sock = self.context.socket(zmq.PUSH)
             sock.connect(self._endpoint(entity_id))
             sock.setsockopt(zmq.LINGER, 0)
             self.push_sockets[entity_id] = sock
-        self.push_sockets[entity_id].send(self.codec.encode(msg))
+        return self.push_sockets[entity_id]
 
     def get_all_new_messages(self, blocking=False, timeout_s=None) -> list:
         messages = []
@@ -225,7 +243,7 @@ class ZMQCommunicator(BaseCommunicator):
         return messages
 
 
-def make_communicator(*args, **kwargs) -> BaseCommunicator:
+def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCommunicator:
     """Construct the process's communicator, selecting the transport.
 
     ``MSTAR_RUST_ZMQ`` selects it (see ``docs/environment_variables.rst``):
@@ -239,6 +257,11 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
     The two are wire-compatible (same endpoints, same codec), so the
     flag can be set per-process — one entity at a time — while the rest of
     the mesh stays on pyzmq.
+
+    ``nonblocking_send`` is for a communicator ``OutboxCommunicator`` wraps,
+    which needs ``try_send_bytes``: an extension built before
+    ``ZmqCommunicator.try_send`` falls back to pyzmq under ``AUTO`` and
+    raises under ``1``. Every other caller keeps such a build.
     """
     choice = os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper()
     if choice not in ("0", "1", "AUTO"):
@@ -266,6 +289,59 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
                     "expected %s — a stale wheel may be shadowing the "
                     "vendored rust/ build (rebuild with `maturin develop "
                     "--release`)", version, EXPECTED_MSTAR_RUST_VERSION)
-            return RustZMQCommunicator(*args, **kwargs)
+            if not nonblocking_send or hasattr(mstar_rust.ZmqCommunicator, "try_send"):
+                return RustZMQCommunicator(*args, **kwargs)
+            # built before try_send: every send the outbox makes would fail.
+            # Only this process's outbox falls back; pyzmq shares the wire.
+            stale = (f"mstar_rust {version} predates ZmqCommunicator.try_send; "
+                     "rebuild it with `maturin develop --release` in rust/")
+            if choice == "1":
+                raise RuntimeError(stale)
+            logger.warning("%s. Using pyzmq for this non-blocking sender meanwhile", stale)
     logger.info("control mesh transport: pyzmq (MSTAR_RUST_ZMQ=%s)", choice)
     return ZMQCommunicator(*args, **kwargs)
+
+
+class OutboxCommunicator:
+    """A communicator whose sends never block: a send the peer can't take now
+    (at its high-water mark) is queued, in order behind any earlier one to the
+    same peer, and retried by ``flush``.
+
+    For a loop that peers block on while it sends to them (the API server's
+    preprocess thread, against the conductor and the workers): if it blocked on
+    a full peer it would stop reading the input that peer waits to deliver, and
+    the two would wait on each other for good. Everything else is the wrapped
+    communicator's.
+    """
+
+    def __init__(self, inner: BaseCommunicator):
+        self._inner = inner
+        self._outbox: dict[str, collections.deque[bytes]] = {}
+
+    def send(self, entity_id: str, msg) -> None:
+        # Encoded here, queued or not: a message the codec refuses fails its
+        # sender now, as a blocking send would, rather than at the head of the
+        # queue where it would hold up every later message.
+        data = self._inner.codec.encode(msg)
+        backlog = self._outbox.get(entity_id)
+        if backlog or not self._inner.try_send_bytes(entity_id, data):
+            self._outbox.setdefault(entity_id, collections.deque()).append(data)
+
+    def flush(self) -> bool:
+        """Send what peers can take now; True if anything is still queued.
+
+        A queued message whose send fails outright (not just a full peer) is
+        dropped and logged: there is no caller left to raise to, and keeping
+        it would stop every message behind it."""
+        for entity_id, backlog in self._outbox.items():
+            while backlog:
+                try:
+                    if not self._inner.try_send_bytes(entity_id, backlog[0]):
+                        break
+                except Exception:  # noqa: BLE001 — that message's failure alone
+                    logger.exception("Dropping a queued message to %s that failed to send", entity_id)
+                backlog.popleft()
+        return any(self._outbox.values())
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
