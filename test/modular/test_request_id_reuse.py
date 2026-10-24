@@ -713,7 +713,8 @@ def test_a_stream_is_bound_to_its_submission_before_it_is_iterated():
 
 
 def test_an_openai_chat_stream_is_bound_before_it_is_iterated():
-    """The chat stream yields its role event before it reads any result."""
+    """The chat stream is bound when it is made: Starlette first iterates it
+    after the id is reused, and it still reads its own request's result."""
     from mstar.api_server.openai.serving_chat import _stream
 
     pw = _PreprocessWorker()
@@ -722,11 +723,10 @@ def test_an_openai_chat_stream_is_bound_before_it_is_iterated():
 
     async def run():
         body = _stream(s, "m", "X", 24000)
-        role = await body.__anext__()
         _complete(s, pw.inputs[0].request_id, b"first")
         s.submit_request(text="second", request_id="X", **TEXT)
         _complete(s, pw.inputs[1].request_id, b"second")
-        return [role] + [frame async for frame in body]
+        return [frame async for frame in body]
 
     frames = asyncio.run(run())
 

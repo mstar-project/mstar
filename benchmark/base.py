@@ -299,7 +299,7 @@ class Qwen3TTS(Model):
 
 
 class Qwen3_5_Dense(Model):
-    """Qwen3.5 dense (text + image in, text out) benchmark metadata."""
+    """Qwen3.5 dense (text, image and video in, text out) benchmark metadata."""
 
     DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
     def __init__(self, model_id: str | None = None):
@@ -312,7 +312,7 @@ class Qwen3_5_Dense(Model):
         return self.model_id
 
     def get_supported_modalities(self):
-        return {RequestType.T2T, RequestType.I2T}
+        return {RequestType.T2T, RequestType.I2T, RequestType.V2T}
 
 
 class Qwen3_8_Dense(Qwen3_5_Dense):

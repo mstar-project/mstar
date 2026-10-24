@@ -199,7 +199,7 @@ def test_process_prompt_builds_features_and_prompt():
     # prefill splices the audio in at the run process_prompt reports
     slot, count = result.metadata["audio_slot"], result.metadata["audio_tokens"]
     assert count == n_tokens and ids[slot:slot + count] == [AUDIO_PAD] * count
-    assert set(result.metadata) <= set(model.INTERNAL_KWARGS)
+    assert set(result.metadata) <= {*model.INTERNAL_KWARGS, "kv_layout"}
 
     free = model.process_prompt("hot words", ["audio", "text"], ["text"], {"audio_inputs": [wave]})
     free_ids = free.new_input_tensors["text_inputs"][0].tolist()

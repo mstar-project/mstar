@@ -688,7 +688,7 @@ def test_route_metadata_agrees_with_the_prompt_it_was_built_beside(kwargs):
     wave = torch.randn(8_000)
     out = model.process_prompt(
         None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, **kwargs,
-    )
+    ).new_input_tensors
     args = model.get_initial_forward_pass_args(
         "default", ["audio", "text"], ["text"],
         {k: list(v) for k, v in out.items()}, model_kwargs=kwargs,
@@ -715,25 +715,29 @@ def test_route_metadata_agrees_with_the_prompt_it_was_built_beside(kwargs):
 def test_process_prompt_builds_window_and_prompts():
     model = _make_model()
     wave = torch.randn(8_000)  # half the tiny config's 1 s window
-    out = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en")
+    out = model.process_prompt(
+        None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en",
+    ).new_input_tensors
     assert torch.equal(out["audio"][0], wave)  # samples as they are; the encoder pads and makes the mel
     assert out["audio_frames"][0].tolist() == [wave.numel() // model.config.hop_length]
     assert out["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert "prompt_tail" not in out
 
-    detect = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, timestamps=True)
+    detect = model.process_prompt(
+        None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, timestamps=True,
+    ).new_input_tensors
     assert detect["text_inputs"][0].tolist() == [SOT]
     assert detect["prompt_tail"][0].tolist() == [TRANSCRIBE]
 
     prev = model.process_prompt(
         None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="de", initial_prompt="Hallo Welt",
-    )
+    ).new_input_tensors
     ids = prev["text_inputs"][0].tolist()
     assert ids[0] == PREV and ids[-4:] == [SOT, DE, TRANSCRIBE, NOTS]
     assert ids[1:-4] == model.tokenizer.encode(" Hallo Welt")
 
     long = torch.randn(16_000 * 45)  # beyond one window: trimmed, not rejected
-    assert model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [long]}, language="en")[
+    assert model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [long]}, language="en").new_input_tensors[
         "audio"][0].shape == (model.config.n_samples,)
     with pytest.raises(ValueError, match="one audio input"):
         model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": []}, language="en")
@@ -748,7 +752,7 @@ def test_process_prompt_builds_window_and_prompts():
         model.process_prompt(*args, language="xx")
     with pytest.raises(ValueError, match="task"):
         model.process_prompt(*args, language="en", task="sing")
-    coerced = model.process_prompt(*args, language="en", temperature="0.2")
+    coerced = model.process_prompt(*args, language="en", temperature="0.2").new_input_tensors
     assert coerced["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert model.get_max_output_tokens(max_output_tokens="40") == 40
     assert model.get_request_resource_configs({}, {"temperature": "0.5"})["sampler"].temperature == 0.5

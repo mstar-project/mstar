@@ -17,6 +17,10 @@
 //! Models with no OpenAI-standard output (robot actions, world-model latents)
 //! intentionally have no adapter: they are served only through `/generate` and
 //! `/v1/*` returns 404 for them.
+//!
+//! The model's adapter is the one `ADAPTER_REGISTRY` names for it: the
+//! launcher passes the Python adapter class in `MSTAR_OPENAI_ADAPTER`, and
+//! [`Adapter::from_python`] maps each class with a port here to its variant.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -86,7 +90,9 @@ pub fn flatten_messages(
     allow_remote: bool,
 ) -> Result<(Option<String>, BTreeMap<String, Vec<String>>, Vec<String>, Vec<Part>), String> {
     let mut parts: Vec<Part> = Vec::new();
-    let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // A refused chat is never submitted, so a refusal below drops `saved`
+    // unkept, which deletes the attachments saved before it.
+    let mut saved = crate::SavedUploads::new(upload_dir);
 
     for msg in messages {
         let role = match msg.role.as_str() {
@@ -128,7 +134,7 @@ pub fn flatten_messages(
                         let fallback = ptype.trim_end_matches("_url");
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
                         let m = if m == "unknown" { fallback.to_string() } else { m };
-                        add_file(&mut parts, &mut file_paths, m, p);
+                        add_file(&mut parts, &mut saved.paths, m, p);
                     }
                 }
                 "input_audio" => {
@@ -139,7 +145,7 @@ pub fn flatten_messages(
                         let fmt = ia.get("format").and_then(Value::as_str).unwrap_or("wav");
                         if !data.is_empty() {
                             let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
-                            add_file(&mut parts, &mut file_paths, m, p);
+                            add_file(&mut parts, &mut saved.paths, m, p);
                         }
                     }
                 }
@@ -151,7 +157,7 @@ pub fn flatten_messages(
     let texts: Vec<&str> = parts.iter().filter_map(|p| p.text.as_deref()).collect();
     let text = if texts.is_empty() { None } else { Some(texts.join("\n")) };
     let input_modalities = parts.iter().map(|p| p.modality.clone()).collect();
-    Ok((text, file_paths, input_modalities, parts))
+    Ok((text, saved.keep(), input_modalities, parts))
 }
 
 fn add_file(
@@ -245,30 +251,35 @@ fn json_num(f: f64) -> Value {
     serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
 }
 
-/// Which OpenAI surfaces a model serves + the request translation. Ported from
-/// the `OpenAIAdapter` subclasses.
+/// Which OpenAI surfaces a model serves + the request translation. One
+/// variant per ported `OpenAIAdapter` subclass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Adapter {
     Bagel,
     Qwen3Omni,
+    Qwen3_5,
     Orpheus,
     Cosmos3,
+    Cosmos3Edge,
 }
 
 impl Adapter {
-    pub fn from_model_name(name: &str) -> Option<Adapter> {
-        match name {
-            "bagel" => Some(Adapter::Bagel),
-            "qwen3_omni" => Some(Adapter::Qwen3Omni),
-            "orpheus" => Some(Adapter::Orpheus),
-            // NVIDIA Cosmos3 registers three checkpoints against one adapter.
-            "cosmos3" | "cosmos3_droid" | "cosmos3_super" => Some(Adapter::Cosmos3),
+    /// The variant for a Python adapter class name (`MSTAR_OPENAI_ADAPTER`);
+    /// `None` for a class with no port here.
+    pub fn from_python(class: &str) -> Option<Adapter> {
+        match class {
+            "BagelAdapter" => Some(Adapter::Bagel),
+            "Qwen3OmniAdapter" => Some(Adapter::Qwen3Omni),
+            "Qwen3_5Adapter" => Some(Adapter::Qwen3_5),
+            "OrpheusAdapter" => Some(Adapter::Orpheus),
+            "Cosmos3Adapter" => Some(Adapter::Cosmos3),
+            "Cosmos3EdgeAdapter" => Some(Adapter::Cosmos3Edge),
             _ => None,
         }
     }
 
     pub fn supports_chat(&self) -> bool {
-        matches!(self, Adapter::Bagel | Adapter::Qwen3Omni)
+        matches!(self, Adapter::Bagel | Adapter::Qwen3Omni | Adapter::Qwen3_5 | Adapter::Cosmos3Edge)
     }
 
     pub fn supports_speech(&self) -> bool {
@@ -276,11 +287,11 @@ impl Adapter {
     }
 
     pub fn supports_images(&self) -> bool {
-        matches!(self, Adapter::Bagel | Adapter::Cosmos3)
+        matches!(self, Adapter::Bagel | Adapter::Cosmos3 | Adapter::Cosmos3Edge)
     }
 
     pub fn supports_videos(&self) -> bool {
-        matches!(self, Adapter::Cosmos3)
+        matches!(self, Adapter::Cosmos3 | Adapter::Cosmos3Edge)
     }
 
     /// Whether this model's prompt processing is expressible in the frontend
@@ -305,32 +316,20 @@ impl Adapter {
     ) -> Result<SubmitArgs, String> {
         refuse_tool_calls(req)?;
         match self {
-            Adapter::Bagel => {
-                let (text, file_paths, in_mods, parts) =
-                    flatten_messages(&req.messages, upload_dir, allow_remote)?;
-                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-                // BAGEL reads sampling from model config; only max/seed are honored.
-                apply_sampling(
-                    &mut mk,
-                    Sampling {
-                        temperature: req.temperature,
-                        top_p: req.top_p,
-                        seed: req.seed,
-                        max_tokens: req.max_completion_tokens.or(req.max_tokens),
-                        temperature_key: "temperature",
-                        top_p_key: "top_p",
-                        max_tokens_key: Some("max_output_tokens"),
-                    },
-                );
-                Ok(SubmitArgs {
-                    tokens: None,
-                    text,
-                    file_paths,
-                    input_modalities: in_mods,
-                    output_modalities: vec!["text".to_string()],
-                    model_kwargs: mk,
-                    parts,
-                })
+            // BAGEL reads temperature / top_p from its model config; only
+            // max_output_tokens and seed are honored.
+            Adapter::Bagel | Adapter::Qwen3_5 => text_chat(req, upload_dir, allow_remote),
+            Adapter::Cosmos3Edge => {
+                // How the vLLM recipe toggles thinking; a flat enable_thinking wins.
+                // Read before the attachments are saved, since a malformed value
+                // refuses the request.
+                let thinking = template_enable_thinking(req.extra.get("chat_template_kwargs"))?;
+                let mut args = text_chat(req, upload_dir, allow_remote)?;
+                args.model_kwargs.remove("chat_template_kwargs");
+                if let Some(on) = thinking {
+                    set_default(&mut args.model_kwargs, "enable_thinking", Value::Bool(on));
+                }
+                Ok(args)
             }
             Adapter::Qwen3Omni => {
                 let (text, file_paths, in_mods, parts) =
@@ -353,7 +352,7 @@ impl Adapter {
                         temperature: req.temperature,
                         top_p: req.top_p,
                         seed: req.seed,
-                        max_tokens: req.max_completion_tokens.or(req.max_tokens),
+                        max_tokens: chat_max_tokens(req),
                         temperature_key: "thinker_temperature",
                         top_p_key: "thinker_top_p",
                         max_tokens_key: Some("max_output_tokens"),
@@ -434,7 +433,7 @@ impl Adapter {
                     parts: Vec::new(),
                 })
             }
-            Adapter::Bagel | Adapter::Cosmos3 => {
+            Adapter::Bagel | Adapter::Qwen3_5 | Adapter::Cosmos3 | Adapter::Cosmos3Edge => {
                 Err("audio/speech is not supported by this model".to_string())
             }
         }
@@ -457,7 +456,7 @@ impl Adapter {
                     parts: Vec::new(),
                 })
             }
-            Adapter::Cosmos3 => {
+            Adapter::Cosmos3 | Adapter::Cosmos3Edge => {
                 let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
                 if let Some(size) = &req.size {
                     set_default(&mut mk, "size", Value::from(size.clone()));
@@ -489,7 +488,7 @@ impl Adapter {
         allow_remote: bool,
     ) -> Result<SubmitArgs, String> {
         match self {
-            Adapter::Cosmos3 => {
+            Adapter::Cosmos3 | Adapter::Cosmos3Edge => {
                 let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
                 if let Some(size) = &req.size {
                     set_default(&mut mk, "size", Value::from(size.clone()));
@@ -576,6 +575,82 @@ impl Adapter {
             }
             _ => Err("image editing is not supported by this model".to_string()),
         }
+    }
+}
+
+/// `max_completion_tokens or max_tokens`, as Python reads them: a 0 falls
+/// through to `max_tokens`.
+fn chat_max_tokens(req: &ChatCompletionRequest) -> Option<i64> {
+    req.max_completion_tokens.filter(|&n| n != 0).or(req.max_tokens)
+}
+
+/// Text out of a chat's messages, with the standard sampling fields
+/// (`BagelAdapter` / `Qwen3_5Adapter.chat_to_request`).
+fn text_chat(
+    req: &ChatCompletionRequest,
+    upload_dir: &Path,
+    allow_remote: bool,
+) -> Result<SubmitArgs, String> {
+    let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, allow_remote)?;
+    let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+    apply_sampling(
+        &mut mk,
+        Sampling {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            seed: req.seed,
+            max_tokens: chat_max_tokens(req),
+            temperature_key: "temperature",
+            top_p_key: "top_p",
+            max_tokens_key: Some("max_output_tokens"),
+        },
+    );
+    Ok(SubmitArgs {
+        tokens: None,
+        text,
+        file_paths,
+        input_modalities: in_mods,
+        output_modalities: vec!["text".to_string()],
+        model_kwargs: mk,
+        parts,
+    })
+}
+
+/// `chat_template_kwargs.enable_thinking` read as `Cosmos3EdgeAdapter` does:
+/// `(kwargs or {})`, then `bool(kwargs["enable_thinking"])` when it has the
+/// key. A falsy value is no kwargs; a value Python cannot look the key up in
+/// is the `TypeError` that answers 400 there.
+fn template_enable_thinking(kwargs: Option<&Value>) -> Result<Option<bool>, String> {
+    const KEY: &str = "enable_thinking";
+    match kwargs {
+        None => Ok(None),
+        Some(v) if !truthy(v) => Ok(None),
+        Some(Value::Object(m)) => Ok(m.get(KEY).map(truthy)),
+        Some(Value::Array(items)) if items.iter().any(|i| i.as_str() == Some(KEY)) => {
+            Err("list indices must be integers or slices, not str".to_string())
+        }
+        Some(Value::String(s)) if s.contains(KEY) => {
+            Err("string indices must be integers, not 'str'".to_string())
+        }
+        Some(Value::Array(_) | Value::String(_)) => Ok(None),
+        Some(Value::Bool(_)) => Err("argument of type 'bool' is not iterable".to_string()),
+        Some(Value::Number(n)) => Err(format!(
+            "argument of type '{}' is not iterable",
+            if n.is_f64() { "float" } else { "int" }
+        )),
+        Some(Value::Null) => Ok(None),
+    }
+}
+
+/// Python's `bool()` of a JSON value.
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
     }
 }
 
@@ -699,6 +774,81 @@ mod tests {
         assert_eq!(err, "a message's role must be system, developer, user or assistant, not 'tool'");
     }
 
+    const CHAT_ADAPTERS: [Adapter; 4] =
+        [Adapter::Bagel, Adapter::Qwen3Omni, Adapter::Qwen3_5, Adapter::Cosmos3Edge];
+
+    #[test]
+    fn each_ported_python_adapter_class_has_its_variant() {
+        for (class, adapter) in [
+            ("BagelAdapter", Adapter::Bagel),
+            ("Qwen3OmniAdapter", Adapter::Qwen3Omni),
+            ("Qwen3_5Adapter", Adapter::Qwen3_5),
+            ("OrpheusAdapter", Adapter::Orpheus),
+            ("Cosmos3Adapter", Adapter::Cosmos3),
+            ("Cosmos3EdgeAdapter", Adapter::Cosmos3Edge),
+        ] {
+            assert_eq!(Adapter::from_python(class), Some(adapter));
+        }
+        for class in ["", "WhisperAdapter", "qwen3_5_0.8b", "bagel"] {
+            assert_eq!(Adapter::from_python(class), None, "{class:?}");
+        }
+        assert!(CHAT_ADAPTERS.iter().all(Adapter::supports_chat));
+        assert!(!Adapter::Orpheus.supports_chat() && !Adapter::Cosmos3.supports_chat());
+        assert!(Adapter::Cosmos3Edge.supports_images() && Adapter::Cosmos3Edge.supports_videos());
+        let q = Adapter::Qwen3_5;
+        assert!(!q.supports_speech() && !q.supports_images() && !q.supports_videos());
+    }
+
+    #[test]
+    fn a_qwen3_5_chat_maps_the_standard_fields_and_passes_the_rest_through() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"海について"}],
+                "temperature":0.7,"top_p":0.9,"max_tokens":32,"seed":5,
+                "enable_thinking":false,"repetition_penalty":1.1,"max_output_tokens":8}"#,
+        )
+        .unwrap();
+        let args = Adapter::Qwen3_5.chat_to_request(&req, Path::new("/unused"), false).unwrap();
+        assert_eq!(args.text.as_deref(), Some("Be brief.\n海について"));
+        assert_eq!(args.input_modalities, ["text", "text"]);
+        assert_eq!(args.output_modalities, ["text"]);
+        let mk = Value::Object(args.model_kwargs);
+        assert_eq!(mk, serde_json::json!({
+            "temperature": 0.7, "top_p": 0.9, "seed": 5, "enable_thinking": false,
+            "repetition_penalty": 1.1, "max_output_tokens": 8,
+        }), "an explicit extra_body max_output_tokens wins over max_tokens");
+    }
+
+    #[test]
+    fn a_cosmos3_edge_chat_reads_enable_thinking_from_the_template_kwargs() {
+        let chat = |fields: &str| Adapter::Cosmos3Edge.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
+        let thinking = |fields: &str| chat(fields).unwrap().model_kwargs.get("enable_thinking").cloned();
+        for (fields, want) in [
+            (r#""chat_template_kwargs":{"enable_thinking":false}"#, Some(Value::Bool(false))),
+            (r#""chat_template_kwargs":{"enable_thinking":1}"#, Some(Value::Bool(true))),
+            (r#""chat_template_kwargs":{"enable_thinking":""}"#, Some(Value::Bool(false))),
+            (r#""chat_template_kwargs":{"enable_thinking":false},"enable_thinking":true"#, Some(Value::Bool(true))),
+            (r#""chat_template_kwargs":{"other":1}"#, None),
+            (r#""chat_template_kwargs":{}"#, None),
+            (r#""chat_template_kwargs":null"#, None),
+            (r#""chat_template_kwargs":0"#, None),
+            (r#""chat_template_kwargs":["other"]"#, None),
+            (r#""chat_template_kwargs":"other""#, None),
+        ] {
+            assert_eq!(thinking(fields), want, "{fields}");
+            assert!(!chat(fields).unwrap().model_kwargs.contains_key("chat_template_kwargs"), "{fields}");
+        }
+        // what Python's TypeError says for a value it cannot look the key up in
+        for (fields, err) in [
+            (r#""chat_template_kwargs":["enable_thinking"]"#, "list indices must be integers or slices, not str"),
+            (r#""chat_template_kwargs":"enable_thinking=1""#, "string indices must be integers, not 'str'"),
+            (r#""chat_template_kwargs":true"#, "argument of type 'bool' is not iterable"),
+            (r#""chat_template_kwargs":3"#, "argument of type 'int' is not iterable"),
+            (r#""chat_template_kwargs":1.5"#, "argument of type 'float' is not iterable"),
+        ] {
+            assert_eq!(chat(fields).unwrap_err(), err, "{fields}");
+        }
+    }
+
     fn chat_with(fields: &str) -> ChatCompletionRequest {
         let body = format!(r#"{{"messages":[{{"role":"user","content":"Hi."}}],{fields}}}"#);
         serde_json::from_str(&body).unwrap()
@@ -713,7 +863,7 @@ mod tests {
             r#""functions":[{"name":"get_weather"}]"#,
             r#""function_call":{"name":"get_weather"}"#,
         ] {
-            for adapter in [Adapter::Bagel, Adapter::Qwen3Omni] {
+            for adapter in CHAT_ADAPTERS {
                 let err = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
                 assert_eq!(err, "tool calling is not supported for this model", "{fields} reached {adapter:?}");
             }
@@ -736,7 +886,7 @@ mod tests {
             r#""tools":[{"type":"function","function":{"name":"get_weather"}}],"tool_choice":"none""#,
             r#""functions":[{"name":"get_weather"}],"function_call":"none""#,
         ] {
-            for adapter in [Adapter::Bagel, Adapter::Qwen3Omni] {
+            for adapter in CHAT_ADAPTERS {
                 let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
                 assert!(args.is_ok(), "{fields} refused a plain chat on {adapter:?}");
             }

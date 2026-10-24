@@ -51,7 +51,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.qwen3_asr.config import (
@@ -413,8 +413,20 @@ class Qwen3ASRModel(Model):
                 "audio": [waveform.contiguous()],
                 "text_inputs": [torch.tensor(ids, dtype=torch.long)],
             },
-            metadata={"audio_slot": ids.index(self.config.audio_token_id), "audio_tokens": num_audio_tokens},
+            metadata={
+                "audio_slot": ids.index(self.config.audio_token_id), "audio_tokens": num_audio_tokens,
+                "kv_layout": {KV_CACHE: {"main": LabelLayout(
+                    spans=(Span("rows", PREFILL_WALK, len(ids), len(ids), "text_inputs"),),
+                    growth=((DECODE_LOOP, 1),),
+                )}},
+            },
         )
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

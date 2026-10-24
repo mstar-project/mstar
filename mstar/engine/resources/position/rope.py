@@ -43,6 +43,17 @@ def _rope_apply_qk_inplace_cuda(
     """Rotate q and k in place with FlashInfer's CUDA kernel."""
     import flashinfer
 
+    if cos_sin_cache is not None:
+        # a precomputed (rounded) table: PositionConfig.rope_table_dtype
+        flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(
+            pos_ids,
+            q.view(q.shape[0], -1),
+            k.view(k.shape[0], -1),
+            q.shape[-1],
+            cos_sin_cache,
+            is_neox=not interleave,
+        )
+        return
     rope_kwargs = dict(
         rotary_dim=rotary_dim, interleave=interleave,
         rope_scale=rope_scale, rope_theta=rope_theta,
