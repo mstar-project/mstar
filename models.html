@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 23, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 24, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -862,6 +862,10 @@ performance-optimized; treat their throughput/latency as provisional.</p></li>
 <li><p>The IDs above are representative. You may use local paths or compatible variants.</p></li>
 <li><p>Some families accept multimodal input (image/audio/video); see the model’s
 <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> for the inputs it expects.</p></li>
+<li><p>Models on the fused MoE kernel (Qwen3-Omni, Command A+) use a tuned tile table
+from <code class="docutils literal notranslate"><span class="pre">mstar/utils/fused_moe/configs/</span></code> when one matches the expert shape and
+GPU, and default tiles otherwise. <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.utils.fused_moe.tune</span></code>
+writes a table for the local GPU.</p></li>
 <li><p>To add a new family, see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></li>
 </ul>
 <section id="omnivoice-notes">
@@ -1937,7 +1941,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 23, 2026.
+  Last updated on Oct 24, 2026.
   <br/>
 </p>
   </div>
