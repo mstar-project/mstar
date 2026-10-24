@@ -564,3 +564,10 @@ Compilation
      - ``84``
      - Dynamo's recompile limit, clamped to [8, 256]. Raise it if the logs
        show ``hit config.recompile_limit``.
+   * - ``MSTAR_COMPILE_LEVEL``
+     - ``1``
+     - How much a captured forward's compile tunes; ``mstar serve -O`` sets it
+       (read by :func:`mstar.engine.accelerator_graph_runner.compile_level`).
+       ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
+       ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
+       own ``compile_mode`` keeps it.
