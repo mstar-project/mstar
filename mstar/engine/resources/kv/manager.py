@@ -1671,9 +1671,10 @@ class KVManager(AttentionResource):
         copy those pages back so its probe finds them. Returns the label whose
         stream waits on the copy.
 
-        Pages come only from the free list, since evicting cached pages for a copy
-        could drop pages a running request hits next. The walk computes whatever
-        isn't copied.
+        On a pool that decides admission the copy can take more pages than are free, and `_grant`
+        evicts for the rest, since the walk would take as many pages to compute them. Any other pool
+        has no allotment to bound the copy, so the copy takes free pages only. The walk computes
+        whatever isn't copied.
         """
         if self._cpu_pool is None or self._index is None or not self._cpu_pool.index.num_pages():
             return None
@@ -1702,6 +1703,11 @@ class KVManager(AttentionResource):
                 or stream.offloaded or stream.read_pending
             ):
                 return None
+            if self._overrides[rid].get_labels(node_name, graph_walk) != [label]:
+                # The engine doesn't probe a walk that writes two labels, so no probe would read a copy.
+                # The chain is marked looked up, so later readiness checks return before taking the lock.
+                chain.looked_up = True
+                return None
             keys, rooted = list(chain.keys), chain.rooted
             spans, ends = chain.spans, chain.rooted_ends
         if rooted is None:
@@ -1728,12 +1734,14 @@ class KVManager(AttentionResource):
             if self._decides:
                 # the copy and the run's evictable pages come out of the allowance
                 evictable = self._index.evictable()
-                budget = min(budget, self._allowance(rid) - sum(page in evictable for page in run))
+                budget = self._allowance(rid) - sum(page in evictable for page in run)
             host = self._cpu_pool.retain_run(rooted[at:min(cap, at + budget)])
             if not host:
                 return None
-            fresh = self._arena.acquire(len(host))
-            stream.hold = self._retain_cached(rid, stream, run) + fresh
+            # retained before the grant, whose eviction could drop the run's index-only pages
+            held = self._retain_cached(rid, stream, run)
+            fresh = self._grant(rid, label, len(host), 0)
+            stream.hold = held + fresh
             stream.read_pending = True
             # listed before the lock drops, so `assert_pages_conserved` on another thread finds a record
             # for every page the copy holds
