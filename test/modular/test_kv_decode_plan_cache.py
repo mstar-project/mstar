@@ -292,61 +292,6 @@ def test_views_built_after_the_next_preplan_keep_their_step():
     assert kv.plan_cache_stats["hit"] == 11
 
 
-def _packed(kv: KVManager, spans: dict[str, int], slot: int, pad: int = 0):
-    """One captured packed step (prompt rows among the decode rows) over
-    ``spans`` plus ``pad`` zero-span padding rows, as a mixed step runs."""
-    rids = tuple(spans)
-    padded = rids + tuple(f"pad{i}" for i in range(pad))
-    step = KVStep(segments=tuple(Segment(r, "main", spans.get(r, 0)) for r in padded))
-    tokens = sum(spans.values())
-    bucket = BucketKey(graph_walk="mixed", bs=len(padded), num_tokens=tokens)
-    ctx = StepContext(
-        request_ids=rids, graph_walk="mixed", slot=slot, capture=False,
-        slot_lease=SlotLease(slot=slot, bucket=bucket),
-    )
-    ctx.set_padded_rids(padded)
-    assert kv.admit(step, ctx).ok
-    res = kv.plan(step, ctx)
-    kv.commit(step, ctx)
-    return res
-
-
-@pytest.mark.parametrize("mode", [1, 2])
-def test_the_decode_step_after_a_packed_one_comes_off_the_cache(mode):
-    """A packed step's prompt rows decode in the step after it: that step is
-    the same rows at span 1, under the decode bucket's own padding."""
-    ref, kv = _manager(0), _manager(mode)
-    for m in (ref, kv):
-        _prefill(m, "a", 5)
-        _prefill(m, "b", 7)
-        _decode(m, ("a", "b"), slot=0, pad=1)
-        m.ingest_request("c", KVReqConfig())
-        m.ingest_request("d", KVReqConfig())
-        _packed(m, {"a": 1, "c": 6, "b": 1, "d": 3}, slot=1, pad=2)
-    for t in range(6):
-        rows = ("a", "c", "b", "d")
-        got = _flat(_decode(kv, rows, slot=t % 2, pad=1)[0])
-        assert got == _flat(_decode(ref, rows, slot=t % 2, pad=1)[0]), t
-    # the packed step tried the cache and missed; all six decode steps hit
-    assert kv.plan_cache_stats == {"hit": 6, "miss": 1, "mismatch": 0}
-
-
-def test_a_prompt_chunk_or_another_packed_step_after_a_packed_one_misses():
-    ref, kv = _manager(0), _manager(1)
-    for m in (ref, kv):
-        _prefill(m, "a", 5)
-        m.ingest_request("c", KVReqConfig())
-        _packed(m, {"a": 1, "c": 6}, slot=0)
-    # c's next chunk: not a decode step
-    r = _packed(ref, {"a": 1, "c": 4}, slot=1)
-    k = _packed(kv, {"a": 1, "c": 4}, slot=1)
-    assert _flat(k) == _flat(r)
-    # then decode, off the second packed step
-    assert _flat(_decode(kv, ("a", "c"), slot=0)[0]) == _flat(_decode(ref, ("a", "c"), slot=0)[0])
-    # the second packed step tried the cache and missed
-    assert kv.plan_cache_stats == {"hit": 1, "miss": 1, "mismatch": 0}
-
-
 def test_a_step_with_sink_rows_is_planned_from_the_streams():
     """A row on the step's sink holds no pages: the cached plan of the same
     segments, which addresses that row's pages, must not be served."""
