@@ -1589,6 +1589,7 @@ class Worker:
         consuming batch is built. A one-item chunk is that item, unstacked."""
         out = edges.to_input_tensors(
             self.tensor_manager.get_tensor, rids, skip_missing=skip_missing,
+            get_tensors=self.tensor_manager.get_tensors,
         )
         signals = [e for e, n in self._consumer_node_cache.items() if n == node_name]
         if signals:

@@ -66,6 +66,9 @@ class _StubTM:
     def get_tensor(self, uuid):
         return self.tensor_store.get_tensor(uuid)
 
+    def get_tensors(self, uuids):
+        return self.tensor_store.get_tensors(uuids)
+
     def _cleanup_by_uuid(self, uuid, registered=None):
         if self.tensor_store.check_uuid_presence(uuid):
             self.tensor_store.remove_tensor(uuid)
