@@ -14,7 +14,7 @@ max_seq_len: 12288  # config: voicechat streaming_max_len / vllm_max_model_len
 max_concurrent_requests: 32
 
 # Sessions longer than max_session_s get a 400. The talker KV pool is sized so
-# 32 sessions that long fit at once (160 s: 1025 pages, 28 GiB); a longer cap
+# 32 sessions that long fit at once (160 s: 1089 pages, 29.8 GiB); a longer cap
 # grows it in step. A full talker pool stalls every session.
 model_kwargs:
   max_session_s: 160

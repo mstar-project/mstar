@@ -406,8 +406,8 @@ class NemotronDuplexModel(Model):
     # once: a full pool stalls every session, not just the one that outgrew it.
     # A page is 128 positions: 28 layers x 128 x 16 heads x 128 (the padded
     # head dim) x K,V x bf16 = 28 MiB. 160 s = 2001 frames, so 37 warm-up + 2001
-    # + 1 final PAD frame fit 16 pages a stream; 32 sessions x 2 streams x 16 =
-    # 1024 pages (+ the sink) = 28 GiB.
+    # + 1 final PAD frame + LOOP_ITERS_MARGIN fit 17 pages a stream; 32 sessions
+    # x 2 streams x 17 = 1088 pages (+ the sink) = 29.8 GiB.
     max_session_s = 160.0
     # Longest system prompt (``model_kwargs: {max_prompt_tokens: ...}``). The
     # prompt prefills in one step batched with every live session's frame, so
@@ -425,8 +425,10 @@ class NemotronDuplexModel(Model):
         return stt.num_frames(int(self.max_session_s * stt.sample_rate))
 
     def talker_kv_pages(self, page_size: int) -> int:
-        """Pages for DEFAULT_MAMBA_SLOTS sessions of max_session_frames, both CFG streams."""
-        positions = self.TALKER_WARMUP_POSITIONS + self.max_session_frames + 1
+        """Pages for DEFAULT_MAMBA_SLOTS sessions of max_session_frames, both CFG streams. The KV pool reserves a
+        guaranteed session's whole loop cap before admitting it, and `get_max_output_tokens` sets that cap
+        LOOP_ITERS_MARGIN past the session's frames, so each stream is sized for the cap."""
+        positions = self.TALKER_WARMUP_POSITIONS + self.max_session_frames + 1 + self.LOOP_ITERS_MARGIN
         # + 1 for the pool's sink page
         return self.DEFAULT_MAMBA_SLOTS * 2 * -(-positions // page_size) + 1
 
