@@ -416,7 +416,8 @@ The spec types are:
        ``PagedKVConfig`` adds ``max_seq_len`` and five fields that
        a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
        (the number of pinned host pages used for offload; 0 disables offload),
-       ``prefix_cache`` and ``prefix_cache_salt``.
+       ``prefix_cache`` and ``prefix_cache_salt``. ``quant`` (a ``KVQuantConfig``)
+       stores the pages in fp8; see :doc:`serving`.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
@@ -482,7 +483,10 @@ A resource can also store in a different dtype from the one its nodes compute in
 in fp32 with ``PagedKVConfig(..., dtype=torch.bfloat16)`` gets bf16 pages, and its
 attention is planned in bf16. ``dtype`` is a plain storage dtype (float32, bfloat16 or
 float16): an fp8 or fp4 cache needs scales and a kernel that reads them, so a quantized
-dtype is a load error here.
+dtype is a load error here. A quantized KV cache is ``PagedKVConfig(..., quant=KVQuantConfig(...))``,
+with ``dtype`` still the unquantized dtype of its K/V. A layer that reads the pages itself
+must use ``KVManager.read_kv``, which dequantizes, and an attention resource must pass
+``layer_idx`` (or set the layer cursor) so static scales can be applied.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -1436,7 +1440,7 @@ that a misspelled setting is never silently ignored:
      - Accepts
    * - ``KVSpec`` with ``PagedKVConfig``
      - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
-       ``prefix_cache``, ``prefix_cache_salt``, ``dtype``
+       ``prefix_cache``, ``prefix_cache_salt``, ``dtype``, ``quant``
    * - ``KVSpec`` with ``RingKVConfig``
      - ``num_sessions``, ``dtype``
    * - ``AttentionSpec``

@@ -275,7 +275,7 @@ them by that name:
    resources:
      kv_cache:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                                # prefix_cache, prefix_cache_salt, dtype
+                                # prefix_cache, prefix_cache_salt, dtype, quant
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense), dtype
      vit_attn:                  # a cacheless (ragged) attention resource
@@ -294,6 +294,29 @@ the dtype its model declared for it, and otherwise the dtype of the nodes that u
 attention resource takes its KV cache's dtype before its nodes'. A resource whose nodes
 keep their build dtype, or have different param dtypes, and that declares no dtype fails
 at load. The full resolution order is in :doc:`adding_models`.
+
+**KV cache quantization.** ``quant`` on a paged KV cache stores its pages in fp8 (e4m3),
+halving their bytes; ``dtype`` stays the dtype of the K/V entering the cache:
+
+.. code-block:: yaml
+
+   resources:
+     kv_cache:
+       quant: {format: fp8_e4m3, scales: unit}     # null removes a model's
+
+``scales: unit`` stores the values as they are (saturating at ±448). ``scales: static``
+divides by a scale per layer and KV head, read from ``scales_path``. To make that file,
+serve the unquantized deployment with ``MSTAR_KV_OBSERVE=<dir>``, send it representative
+prompts, stop it, then run
+``python -m mstar.engine.resources.kv.calibrate <dir> --resource kv_cache --out scales.safetensors``.
+It maps twice the observed amax to the format's largest value (``--headroom``): a value past
+the calibrated range saturates, while headroom costs little in a float format.
+Only the FlashInfer and dense attention backends read a quantized cache; flex, xpu_paged,
+cross-attention and ring caches refuse it at load. Under FlashInfer, prefill over fp8 pages
+quantizes q per head too and runs FA3's fp8 kernel, so it needs sm90 and a
+``flashinfer_backend`` of ``auto`` or ``fa3``; decode keeps bf16 q. The dense backend
+dequantizes instead and runs anywhere. Prefix-cache roots and KV transfer
+descriptors name the format and the scales file, so caches that disagree never share pages.
 
 **Node precision.** Each node runs under the precision policy its model declares: the
 dtype its params are cast to, the modules kept fp32, and whether its forward runs under

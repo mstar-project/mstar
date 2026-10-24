@@ -48,6 +48,17 @@ class KVTransferInfo:
     conductor re-sends every pass takes the typed path."""
 
 
+def check_storage(remote: Any, kv_cache: KVCache) -> None:
+    """Pages are copied as bytes, so both caches must encode K/V alike (dtype, KV quant, scales).
+
+    An empty ``storage`` is a hand-built descriptor, and is not checked.
+    """
+    if remote.storage and remote.storage != kv_cache.storage_id:
+        raise ValueError(
+            f"remote KV pages are stored as {remote.storage!r}, local as {kv_cache.storage_id!r}"
+        )
+
+
 class KVTransferEngine(ABC):
     @abstractmethod
     def read_batched_async(
@@ -91,6 +102,8 @@ class MooncakeKVTransferInfo(KVTransferInfo):
     session_id: str
     data_ptr: int
     layout: KVLayout
+    # KVCache.storage_id of the publisher
+    storage: str = ""
 
 
 class MooncakeKVTransferEngine(KVTransferEngine):
@@ -108,7 +121,8 @@ class MooncakeKVTransferEngine(KVTransferEngine):
             entity_id=entity_id,
             session_id=transfer_engine.get_session_id(),
             data_ptr=kv_cache.data_ptr(),
-            layout=kv_cache.layout
+            layout=kv_cache.layout,
+            storage=kv_cache.storage_id,
         )
         self._async_reader = transfer_engine.get_async_reader(
             kv_cache.device
@@ -128,6 +142,7 @@ class MooncakeKVTransferEngine(KVTransferEngine):
             session_id=self._transfer_info.session_id,
             data_ptr=self._transfer_info.data_ptr,
             layout=self._transfer_info.layout,
+            storage=self._transfer_info.storage,
         )
 
     def owns_transfer_info(
@@ -153,6 +168,7 @@ class MooncakeKVTransferEngine(KVTransferEngine):
             f"remote KV layout {remote_kv_info.layout} != "
             f"local layout {self._kv_cache.layout}"
         )
+        check_storage(remote_kv_info, self._kv_cache)
         from mstar.communication.tensors import TransferReadInfo
 
         mooncake_read_info: list[TransferReadInfo] = []
@@ -194,6 +210,7 @@ class CudaIpcKVTransferInfo(KVTransferInfo):
     dtype: str
     requires_grad: bool
     layout: KVLayout
+    storage: str = ""
 
 
 
@@ -212,7 +229,8 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
             offset=tensor.storage_offset(),
             dtype=str(tensor.dtype),
             requires_grad=tensor.requires_grad,
-            layout=kv_cache.layout
+            layout=kv_cache.layout,
+            storage=kv_cache.storage_id,
         )
         self._device = kv_cache.device
         self._kv_cache = kv_cache
@@ -244,6 +262,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
             dtype=self._transfer_info.dtype,
             requires_grad=self._transfer_info.requires_grad,
             layout=self._transfer_info.layout,
+            storage=self._transfer_info.storage,
         )
 
     def owns_transfer_info(
@@ -282,6 +301,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
             f"remote KV layout {remote_kv_info.layout} != "
             f"local layout {self._kv_cache.layout}"
         )
+        check_storage(remote_kv_info, self._kv_cache)
         dtype = getattr(torch, remote_kv_info.dtype.split(".")[-1])
         (
             storage_device,
@@ -379,6 +399,7 @@ class ShmKVTransferInfo(KVTransferInfo):
     layout: KVLayout
     # None accepts descriptors produced before chunked SHM publication.
     chunks: tuple[ShmKVSnapshotChunk, ...] | None = None
+    storage: str = ""
 
 
 class ShmKVTransferEngine(KVTransferEngine):
@@ -496,6 +517,7 @@ class ShmKVTransferEngine(KVTransferEngine):
                 page_indices=pages,
                 layout=self._kv_cache.layout,
                 chunks=(*earlier_chunks, chunk) if earlier_chunks else (chunk,),
+                storage=self._kv_cache.storage_id,
             )
             self._published[key] = (version, info)
             self._published_paths.setdefault(key, set()).add(path)
@@ -540,6 +562,7 @@ class ShmKVTransferEngine(KVTransferEngine):
                 f"remote KV layout {remote_kv_info.layout} != "
                 f"local layout {self._kv_cache.layout}"
             )
+        check_storage(remote_kv_info, self._kv_cache)
 
         page_size = self._kv_cache.page_size
         chunks = remote_kv_info.chunks

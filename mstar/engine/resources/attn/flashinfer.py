@@ -20,6 +20,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.kv.quant import KVScales, layer_kv_scales
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 
@@ -34,6 +35,7 @@ class FlashInferManager(AttentionManager):
         backend: str="auto",
         splits: tuple[CombinedSplit, ...] = (),
         max_rows_in_combined: Mapping[str, int | None] | None = None,
+        kv_scales: KVScales | None = None,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
@@ -53,6 +55,10 @@ class FlashInferManager(AttentionManager):
         self._preplanned = False
 
         self._kv_config = kv_config
+        # the pages' storage dtype when quantized; None plans them in q's
+        self._kv_dtype = kv_config.quant.value_dtype if kv_config.quant is not None else None
+        # static scales per layer; the wrappers fold them in or hand them to the kernel
+        self._layer_scales = layer_kv_scales(kv_scales, kv_config.num_qo_heads)
         check_flashinfer_head_dim(kv_config.head_dim, device)     # at load, not at the first plan
         self._wrapper_kv_kwargs = dict(
             num_qo_heads=kv_config.num_qo_heads,
@@ -205,6 +211,7 @@ class FlashInferManager(AttentionManager):
             wrapper.plan(
                 causal=step.causal,
                 dtype=self._dtype,
+                kv_dtype=self._kv_dtype,
                 **indptrs.to_kwargs_dict()
             )
             plan_states[label] = wrapper
@@ -246,16 +253,23 @@ class FlashInferManager(AttentionManager):
         # in the pages (the layer wrote it through the KV resource) and the
         # planned wrapper carries the layout. Accepted and ignored so one
         # layer body serves either backend — see `requires_kv_write`.
-        del k, v, layer_idx
+        del k, v
         if label is None:
             label = self._default_label
-        return self._attend(q, label, kv_cache_layer)
+        if layer_idx is None:
+            layer_idx = self._default_layer_idx
+        return self._attend(q, label, kv_cache_layer, layer_idx)
 
     @torch.compiler.disable
     def _attend(
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor,
+        layer_idx: int | None = None,
     ) -> torch.Tensor:
-        o = self._current_plan_states[label].run(q, kv_cache_layer)
+        scales = None
+        if self._layer_scales is not None:
+            assert layer_idx is not None, "static KV scales are per layer: set the layer index"
+            scales = self._layer_scales[layer_idx]
+        o = self._current_plan_states[label].run(q, kv_cache_layer, scales)
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
         return o

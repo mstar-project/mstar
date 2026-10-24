@@ -10,6 +10,7 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep, AttnBackend
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
+from mstar.engine.resources.kv.quant import KVScales, dequantize_kv
 from mstar.engine.resources.step import StepContext
 from mstar.platforms import current_platform
 
@@ -122,8 +123,10 @@ class DenseAttentionManager(AttentionManager):
         device: torch.device,
         dtype: torch.dtype,
         kv_config: PagedKVConfig,
+        kv_scales: KVScales | None = None,
     ):
         self._kv_cache_name = kv_cache
+        self._kv_scales = kv_scales
         self._device = device
         self._dtype = dtype
         self._kv_config = kv_config
@@ -249,6 +252,13 @@ class DenseAttentionManager(AttentionManager):
         cached = (
             k_pref[:segment.prefix_len].clone(), v_pref[:segment.prefix_len].clone()
         )
+        if cfg.quant is not None:
+            # dequantized once per stream and layer, so the kernel reads plain K/V
+            scales = self._kv_scales
+            cached = (
+                dequantize_kv(cached[0], scales.k[layer_idx] if scales else None, self._dtype),
+                dequantize_kv(cached[1], scales.v[layer_idx] if scales else None, self._dtype),
+            )
         entry.layers[layer_idx] = cached
         return cached
 
@@ -289,6 +299,7 @@ class DenseAttentionManager(AttentionManager):
         key = torch.cat(k_parts, dim=0)
         val = torch.cat(v_parts, dim=0)
         if q.dtype != key.dtype:
+            # never fp8: a quantized prefix is dequantized at the gather
             q = q.to(key.dtype)
 
         out = flash_attn_varlen_func(

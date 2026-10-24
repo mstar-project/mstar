@@ -9,6 +9,7 @@ from mstar.engine.resources.attn.base import (
     EagerSlotKey,
     PlanCacheKey,
     WorkspacePool,
+    refuse_quantized_kv,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
@@ -57,6 +58,7 @@ class CrossAttentionManager(AttentionResource):
             spec.config.dtype if spec.config.dtype is not None else kv_config.dtype,
             spec.resource_key,
         )
+        refuse_quantized_kv(kv_config, f"cross attention {spec.resource_key!r}")
         if backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(
                 kv_cache=spec.config.kv_cache,

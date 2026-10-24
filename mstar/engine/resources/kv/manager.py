@@ -42,6 +42,7 @@ from mstar.engine.resources.kv.plan import (
     group_by_plan_label,
 )
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
+from mstar.engine.resources.kv.quant import KVObserver, load_kv_scales, observe_dir
 from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -436,10 +437,29 @@ class KVManager(AttentionResource):
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
             cfg.shard(joint_comm_group.world_size)
+        rank = joint_comm_group.rank if joint_comm_group is not None else 0
+        world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
+        scales = None
+        if cfg.quant is not None:
+            scales = load_kv_scales(
+                cfg.quant, cfg.num_layers, cfg._unsharded_kv_heads, rank, world_size, device,
+            )
         self.kv_cache = KVCache(
-            cfg, device, dtype
+            cfg, device, dtype, quant=cfg.quant, scales=scales,
         )
         self.name = name
+        if cfg.quant is not None:
+            logger.info(
+                "KV %s: %s pages, %s scales, %.2f GiB (%.2f unquantized)", name, cfg.quant.format,
+                cfg.quant.scales, self.kv_cache.nbytes / 2**30,
+                self.kv_cache.tensor.numel() * dtype.itemsize / 2**30,
+            )
+        self._observer = None
+        if (out_dir := observe_dir()) is not None:
+            self._observer = KVObserver(
+                out_dir, name, cfg.num_layers, cfg.num_kv_heads,
+                cfg._unsharded_kv_heads, rank, world_size, device,
+            )
 
         self._arena = PageArena(
             kv_cache=self.kv_cache,
@@ -1245,7 +1265,7 @@ class KVManager(AttentionResource):
     def fingerprint(self) -> bytes:
         return fingerprint(
             self.config.layout.value, self.config.page_size,
-            self.kv_cache.tensor.dtype, self._world_size,
+            self.kv_cache.storage_id, self._world_size,
             self.config.prefix_cache_salt,
         )
 
@@ -2836,6 +2856,8 @@ class KVManager(AttentionResource):
 
     def remove_request(self, rid: str):
         self._touch_plan_cache(rid)
+        if self._observer is not None:
+            self._observer.save()
         with self._lock:
             # its waiting tokens first, before the handle can name another request
             self._drain_chain_backlog(rid)
@@ -2934,6 +2956,9 @@ class KVManager(AttentionResource):
         ``all_gather`` itself is synchronizing, so no extra barrier is
         needed on the success path.
         """
+        if self._observer is not None:
+            # capture sizing and warmup ran on dummy inputs
+            self._observer.reset()
         if self._comm_group.world_size == 1:
             return
         local_free = self._arena.num_free
@@ -2956,6 +2981,8 @@ class KVManager(AttentionResource):
                 )
 
     def cleanup(self):
+        if self._observer is not None:
+            self._observer.save(force=True)
         self._transfer.cleanup()
 
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
@@ -3163,6 +3190,8 @@ class KVManager(AttentionResource):
             label = self._default_label
         plan_state = self._current_plan_states[label]
         n = plan_state.total_tokens
+        if self._observer is not None:
+            self._observer.observe(layer_idx, k[:n], v[:n])
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
             k=k[:n], v=v[:n],

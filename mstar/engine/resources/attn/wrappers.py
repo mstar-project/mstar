@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 FLASHINFER_HEAD_DIMS = frozenset({64, 128, 256})
 
 
+def _run_folded(attn_wrapper, q: torch.Tensor, kv_cache_layer: torch.Tensor, dtype, scales) -> torch.Tensor:
+    """Attention over pages with static per-head scales folded in: K's into q, V's into the output."""
+    if scales is None:
+        return attn_wrapper.run(q.to(dtype), kv_cache_layer)
+    # q . (k_q * s) == (q * s) . k_q, per KV head
+    o = attn_wrapper.run((q.float() * scales.k_qo).to(dtype), kv_cache_layer)
+    return (o.float() * scales.v_qo).to(dtype)
+
+
 def check_flashinfer_head_dim(head_dim: int, device: torch.device | None = None) -> None:
     """Raise unless FlashInfer's paged attention computes ``head_dim`` exactly.
     Only CUDA runs FlashInfer, so a non-CUDA ``device`` (CPU tests driving the
@@ -88,6 +97,7 @@ class FlashInferPrefillWrapper:
         self.enable_nvtx = enable_nvtx
         self.batch_size = batch_size
         self.max_total_tokens = max_total_tokens
+        self._q_dtype = None
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -188,6 +198,7 @@ class FlashInferPrefillWrapper:
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
+        kv_dtype: torch.dtype | None = None,
         **kwargs
     ):
         """Plan attention and compute KV write indices.
@@ -204,6 +215,8 @@ class FlashInferPrefillWrapper:
         per-token bookkeeping below.
         """
         self.dtype = dtype
+        # over fp8 pages q is quantized too, so FlashInfer runs FA3's fp8 kernel, not FA2
+        self._q_dtype = kv_dtype if kv_dtype is not None else dtype
         if self.accelerator_graph and paged_kv_indices.device.type != "cuda":
             # planned inline behind the step in flight, which a pageable copy
             # would wait for: stage page-locked, copy the indices in ourselves
@@ -227,7 +240,10 @@ class FlashInferPrefillWrapper:
             head_dim_qk=self.head_dim,
             page_size=self.page_size,
             causal=causal,
-            q_data_type=dtype,
+            q_data_type=self._q_dtype,
+            # the pages' storage dtype; None is q's
+            kv_data_type=kv_dtype,
+            o_data_type=dtype,
             # host lengths, so plan neither rebuilds them nor copies pageable ones
             seq_lens=kv_lens,
         )
@@ -245,17 +261,27 @@ class FlashInferPrefillWrapper:
             self._qo_indptr_buf = qo_indptr
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor, scales=None) -> torch.Tensor:
         """Run planned batched prefill attention.
 
         Args:
             q: [total_tokens, num_qo_heads, head_dim]
             kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
                 (single layer slice of the full KV cache)
+            scales: the layer's static KV scales (``LayerKVScales``), or None
         Returns:
             output: [total_tokens, num_qo_heads, head_dim]
         """
-        return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        if self._q_dtype is not None and self._q_dtype != self.dtype:
+            from mstar.engine.resources.kv.quant import quantize_q_per_head
+
+            # FA3's fp8 kernel takes per-head scales: q's per q head, K's and V's per KV head
+            q8, q_scale = quantize_q_per_head(q, self._q_dtype)
+            k_scale = v_scale = None
+            if scales is not None:
+                k_scale, v_scale = scales.k, scales.v
+            return self.attn_wrapper.run(q8, kv_cache_layer, q_scale, k_scale, v_scale)
+        return _run_folded(self.attn_wrapper, q, kv_cache_layer, self.dtype, scales)
 
 
 class FlashInferDecodeWrapper:
@@ -343,6 +369,7 @@ class FlashInferDecodeWrapper:
         paged_kv_last_page_len: torch.Tensor,
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
+        kv_dtype: torch.dtype | None = None,
         **kwargs
     ):
         """Plan decode attention and compute KV write locations.
@@ -381,6 +408,7 @@ class FlashInferDecodeWrapper:
                 head_dim=self.head_dim,
                 page_size=self.page_size,
                 q_data_type=dtype,
+                kv_data_type=kv_dtype,
                 # host lengths, so plan skips rebuilding them (`get_seq_lens`)
                 seq_lens=kv_lens,
             )
@@ -392,16 +420,17 @@ class FlashInferDecodeWrapper:
         self.dtype = dtype
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor, scales=None) -> torch.Tensor:
         """Run planned batched decode attention.
 
         Args:
             q: [n_req, num_qo_heads, head_dim]
             kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
+            scales: the layer's static KV scales (``LayerKVScales``), or None
         Returns:
             output: [n_req, num_qo_heads, head_dim]
         """
-        return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        return _run_folded(self.attn_wrapper, q, kv_cache_layer, self.dtype, scales)
 
 
 class FlashInferMixedWrapper:
@@ -489,6 +518,7 @@ class FlashInferMixedWrapper:
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
+        kv_dtype: torch.dtype | None = None,
         **kwargs,
     ):
         from mstar.engine.resources.kv.plan import HostLens
@@ -580,7 +610,7 @@ class FlashInferMixedWrapper:
             paged_kv_indices=self._pin("d_indices", d_indices, torch.int32),
             paged_kv_last_page_len=self._pin("d_last", d_last, torch.int32),
             kv_lens=self._pin("d_lens", d_lens, torch.int32).as_subclass(HostLens),
-            dtype=dtype,
+            dtype=dtype, kv_dtype=kv_dtype,
         )
         self._prefill.plan(
             qo_indptr=torch.from_numpy(p_qo),
@@ -588,17 +618,17 @@ class FlashInferMixedWrapper:
             paged_kv_indices=torch.from_numpy(p_idx),
             paged_kv_last_page_len=torch.from_numpy(p_last),
             kv_lens=torch.from_numpy(p_lens).as_subclass(HostLens),
-            causal=causal, dtype=dtype,
+            causal=causal, dtype=dtype, kv_dtype=kv_dtype,
         )
         self._done.record()
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor, scales=None) -> torch.Tensor:
         n = q.shape[0]
         front = q.index_select(0, self._perm[:n])
         rows = q.index_select(0, self._dec_src[: self._num_rows])
-        out_front = self._prefill.run(front, kv_cache_layer)
-        out_rows = self._decode.run(rows, kv_cache_layer)
+        out_front = self._prefill.run(front, kv_cache_layer, scales)
+        out_rows = self._decode.run(rows, kv_cache_layer, scales)
         out = out_front.new_empty((n + 1, *out_front.shape[1:]))
         out.index_copy_(0, self._perm[:n], out_front[:n])
         out.index_copy_(0, self._dec_dst[: self._num_rows], out_rows.to(out_front.dtype))

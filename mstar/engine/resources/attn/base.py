@@ -20,6 +20,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 from mstar.engine.resources.kv.config import KVConfig, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.resources.kv.quant import KVScales, load_kv_scales
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -28,6 +29,41 @@ _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
     AttnBackend.FLEX: RingKVConfig,
     AttnBackend.XPU_PAGED: PagedKVConfig,
 }
+
+
+def refuse_quantized_kv(kv_config: KVConfig, what: str) -> None:
+    """Raise if ``kv_config`` is quantized: ``what`` cannot read it."""
+    if kv_config.quant is not None:
+        raise ValueError(
+            f"{what} reads no quantized KV, but the cache stores {kv_config.quant.format!r}; "
+            "use the flashinfer or dense backend, or drop the KV quant"
+        )
+
+
+def check_fp8_flashinfer(resource_key: str, flashinfer_backend: str, device: torch.device) -> None:
+    """fp8 pages run FlashInfer's FA3 fp8 kernel at prefill, which is Hopper-only."""
+    if flashinfer_backend not in ("auto", "fa3"):
+        raise ValueError(
+            f"attention {resource_key!r}: fp8 KV runs on FA3, "
+            f"so flashinfer_backend {flashinfer_backend!r} is not supported"
+        )
+    if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] != 9:
+        raise ValueError(
+            f"attention {resource_key!r}: fp8 KV on FlashInfer needs FA3 (sm90); "
+            "use the dense backend, or drop the KV quant"
+        )
+
+
+def kv_scales_for(kv_config: KVConfig, info: EngineResourceInfo) -> KVScales | None:
+    """The static scales this rank's attention reads; the KV resource loads the same object."""
+    if kv_config.quant is None:
+        return None
+    group = info.joint_comm_group
+    return load_kv_scales(
+        kv_config.quant, kv_config.num_layers, kv_config._unsharded_kv_heads,
+        group.rank if group is not None else 0, group.world_size if group is not None else 1,
+        info.device,
+    )
 
 
 def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBackend:
@@ -100,12 +136,16 @@ class AttentionManager(AttentionResource):
                     device=info.device,
                     dtype=cls._planned_dtype(spec, info, kv_config),
                     kv_config=kv_config,
+                    kv_scales=kv_scales_for(kv_config, info),
                 )
             backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
             _warn_dense_fallback(reason, backend)
 
         if backend == AttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.flashinfer import FlashInferManager
+
+            if kv_config.quant is not None:
+                check_fp8_flashinfer(spec.resource_key, spec.config.flashinfer_backend, info.device)
 
             return FlashInferManager(
                 kv_cache=spec.config.kv_cache,
@@ -115,9 +155,11 @@ class AttentionManager(AttentionResource):
                 backend=spec.config.flashinfer_backend,
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
+                kv_scales=kv_scales_for(kv_config, info),
             )
 
         if backend == AttnBackend.FLEX:
+            refuse_quantized_kv(kv_config, "flex attention")
             from mstar.engine.resources.attn.flex import FlexAttentionManager
 
             return FlexAttentionManager(
@@ -128,6 +170,7 @@ class AttentionManager(AttentionResource):
             )
 
         if backend == AttnBackend.XPU_PAGED:
+            refuse_quantized_kv(kv_config, "xpu_paged attention")
             from mstar.engine.resources.attn.xpu import (
                 XPUPagedAttentionManager,
                 _xpu_paged_unavailable_reason,

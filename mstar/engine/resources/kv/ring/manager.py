@@ -92,6 +92,10 @@ class RingKVManager(AttentionResource):
                 "KVSpec dispatches on the config, so this means the spec was "
                 "built by hand with the wrong one."
             )
+        if config.quant is not None:
+            raise ValueError(
+                f"KV {spec.resource_key!r}: a ring cache cannot be quantized; flex attention reads no quantized KV"
+            )
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
         return cls(

@@ -25,7 +25,7 @@ def manager(monkeypatch):
     monkeypatch.setattr(flashinfer, "FlashInferDecodeWrapper", _Decode)
     monkeypatch.setattr(flashinfer, "FlashInferPrefillWrapper", _Prefill)
     kv_config = types.SimpleNamespace(
-        head_dim=8, num_qo_heads=1, num_kv_heads=1, page_size=16, max_num_pages=4,
+        head_dim=8, num_qo_heads=1, num_kv_heads=1, page_size=16, max_num_pages=4, quant=None,
     )
     manager = flashinfer.FlashInferManager("kv", torch.device("cpu"), torch.float32, kv_config)
     manager._workspaces = types.SimpleNamespace(get=lambda label, slot: None)

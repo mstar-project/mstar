@@ -8,10 +8,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+from mstar.engine.resources.kv.quant import KVQuantConfig, parse_yaml_kv_quant
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, parse_yaml_dtype
 from mstar.engine.resources.step import ResourceStep
 
@@ -22,6 +23,10 @@ if TYPE_CHECKING:
 class KVLayout(Enum):
     NHD = "NHD"
     # TODO: can add more, like HND, MLA
+
+
+# tells an omitted YAML key from an explicit null
+_UNSET = object()
 
 
 @dataclass(kw_only=True)
@@ -41,8 +46,10 @@ class KVConfig(ABC):
     num_kv_heads: int
     head_dim: int
     num_qo_heads: int | None = None
-    # storage dtype of the pages or ring; None takes the nodes' resolved dtype
+    # unquantized dtype of the K/V entering the cache; None takes the nodes' resolved dtype
     dtype: torch.dtype | None = None
+    # how the pages store K/V; None stores them in ``dtype``
+    quant: KVQuantConfig | None = None
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -100,10 +107,14 @@ class PagedKVConfig(KVConfig):
         prefix_cache_salt: str | None = None,
         prefix_cache: bool | None = None,
         dtype: str | torch.dtype | None = None,
+        quant: Any = _UNSET,
     ) -> None:
-        """How much cache this deployment gets, how it is cut up, and its dtype."""
+        """How much cache this deployment gets, how it is cut up, its dtype and quantization."""
         if dtype is not None:
             self.dtype = parse_yaml_dtype(dtype)
+        if quant is not _UNSET:
+            # null removes the model's
+            self.quant = parse_yaml_kv_quant("kv", quant)
         for name, value in (
             ("max_num_pages", max_num_pages),
             ("page_size", page_size),
@@ -171,6 +182,8 @@ class RingKVConfig(KVConfig):
         self, num_sessions: int | None = None, dtype: str | torch.dtype | None = None, **kwargs,
     ) -> None:
         """``num_sessions`` and ``dtype`` only. Nothing else here is a deployment knob."""
+        if "quant" in kwargs:
+            raise ValueError("ring KV cannot be quantized: no ring attention backend reads a quantized cache")
         if kwargs:
             raise TypeError(
                 "ring KV geometry is a checkpoint fact, not a deployment tunable; "
@@ -308,6 +321,9 @@ class KVSpec(NodeResourceSpec):
     def apply_yaml_overrides(self, **kwargs):
         """Forwarded to the config: which keys are legal is a property of the
         storage strategy, so the config answers for them."""
+        if "quant" in kwargs:
+            # parsed here so an error names the resource
+            kwargs["quant"] = parse_yaml_kv_quant(self.resource_key, kwargs["quant"])
         self.config.apply_yaml_overrides(**kwargs)
 
 
