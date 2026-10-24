@@ -433,8 +433,11 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
+        step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for every request off one ``tolist``."""
+        if step_walk is not None and step_walk != DECODE_WALK:
+            return {}  # as check_stop: only a decode row's token is checked
         tokens = host_rows.buffers.get("new_token")
         if not torch.is_tensor(tokens) or tokens.dim() == 0:
             return None

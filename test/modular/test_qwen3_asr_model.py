@@ -385,7 +385,10 @@ def test_llm_check_stop_batched_agrees_with_per_request():
         "prefill": info(PREFILL_WALK, 0),
     }
     check = list(reversed(row_rids))  # not forward order
-    batched = sub.check_stop_batched(check, infos, HostRows(row_rids, {"new_token": tokens}))
+    # called as Engine.check_stop_for_batch calls it (step_walk=None: a mixed step)
+    host_rows = HostRows(row_rids, {"new_token": tokens})
+    batched = sub.check_stop_batched(check, infos, host_rows, step_walk=None)
+    assert sub.check_stop_batched(check, infos, host_rows, step_walk=PREFILL_WALK) == {}
     per_request = {}
     for i, rid in enumerate(row_rids):
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
