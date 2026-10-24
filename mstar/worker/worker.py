@@ -3181,6 +3181,8 @@ class Worker:
             request_ids=batch_N.node_batch.request_ids,
         )
         _pp_stage("prematerialize")
+        engine.after_output_copy(batch_N.node_batch)
+        _pp_stage("after_output_copy")
         stops = engine.check_stop_for_batch(
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
         )

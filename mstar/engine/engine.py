@@ -1071,6 +1071,9 @@ class Engine:
             return frozenset()
         return mgmt.submodule.device_loopback_signals(graph_walk)
 
+    def after_output_copy(self, batch: ExecutingBatch) -> None:
+        self._runner.after_output_copy(batch.node_name)
+
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
         host_rows: HostRows | None = None,

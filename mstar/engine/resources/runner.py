@@ -101,6 +101,11 @@ class StepRunner:
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
+        self._after_output_copy_order = [
+            key for key in self._order
+            if type(self._resources[key]).after_output_copy is not Resource.after_output_copy
+        ]
+        self._node_after_output_copy_order = self._per_node(node_resources, self._after_output_copy_order)
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -194,6 +199,10 @@ class StepRunner:
                         rid, node_name,
                         walk_of if isinstance(walk_of, str) else walk_of(rid), per_rid,
                     )
+
+    def after_output_copy(self, node_name: str) -> None:
+        for key in self._sweep(self._node_after_output_copy_order, self._after_output_copy_order, node_name):
+            self._resources[key].after_output_copy()
 
     def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Tell the node's resources that the cache served this walk whole."""
