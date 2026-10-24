@@ -1238,10 +1238,12 @@ implementation on GH200 and H100 GPUs:
 - Cancellation, recovery and malformed inputs (rejected with 400) are checked
   on both graph runtimes; a 20-minute mixed-load soak on the Rust runtime kept
   GPU memory flat.
-- The model runs eagerly (no CUDA graphs). On one H100 an LM step takes about
-  50 ms for one request and 54 ms for four batched, and over HTTP four
-  concurrent 17.7 s requests each finish in 0.82x real time (median), about
-  4.1 seconds of audio per second in total.
+- The model runs eagerly (no CUDA graphs), so a step is bound by CPU overhead
+  and its speed varies between hosts. On one H100 an LM step took about 50 ms
+  for one request and 54 ms for four batched, and over HTTP four concurrent
+  17.7 s requests each finished in 0.82x real time (median), about 4.1 seconds
+  of audio per second in total; on a slower H100 host the step took 65 ms and
+  one request ran at 1.14x real time.
 - Audio quality has not been formally assessed. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge; no listening study
