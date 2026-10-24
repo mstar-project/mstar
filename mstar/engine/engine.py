@@ -23,6 +23,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
+from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
 from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
@@ -130,6 +131,8 @@ class SubmoduleManagement:
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
     capture_runner: AcceleratorGraphRunner | None = None
+    # the submodule's declared float32 settings; None keeps the process default
+    fp32_precision: Fp32Precision | None = None
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -583,7 +586,8 @@ class Engine:
                 forward=submodule.forward,
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
-                resources=resources
+                resources=resources,
+                fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
             if getattr(submodule, "reads_device_loopback", False):
@@ -685,7 +689,10 @@ class Engine:
 
         for node_name, submodule_mgmt in self._submodules.items():
             runner = ag_runners[node_name]
-            with self._capture_into(plan, node_name) as planned:
+            # the kernels a capture (and the compile inside it) picks are what
+            # every replay runs, so it happens under the node's precision
+            with self._capture_into(plan, node_name) as planned, \
+                    fp32_precision_scope(submodule_mgmt.fp32_precision):
                 runner.warmup_and_capture(planned)
             if plan is not None or runner.any_graphs:
                 submodule_mgmt.capture_runner = runner
@@ -695,9 +702,10 @@ class Engine:
             captured: dict[str, PiecewiseAcceleratorGraphRunner] = {}
             with self._capture_into(plan, f"{node_name} piecewise") as planned:
                 for label, pw_runner in piecewise[node_name].items():
-                    pw_runner.warmup_and_capture(
-                        None if planned is None else {bucket for region, bucket in planned if region == label}
-                    )
+                    with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                        pw_runner.warmup_and_capture(
+                            None if planned is None else {bucket for region, bucket in planned if region == label}
+                        )
                     if pw_runner.any_graphs:
                         captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
@@ -743,14 +751,16 @@ class Engine:
         def planned(size: Callable[[Any], dict]) -> tuple[dict[str, dict], int, CapturePlan]:
             """A plan over what ``size`` says each runner's buckets cost."""
             pools: dict[str, dict] = {}
-            for node_name in self._submodules:
-                pools[node_name] = size(ag_runners[node_name])
-                # one pool for all of a node's regions (see `_build_piecewise_runners`)
-                pools[f"{node_name} piecewise"] = {
-                    (label, bucket): cost
-                    for label, runner in piecewise[node_name].items()
-                    for bucket, cost in size(runner).items()
-                }
+            for node_name, submodule_mgmt in self._submodules.items():
+                # sizing runs the forwards and captures, so under the node's precision too
+                with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                    pools[node_name] = size(ag_runners[node_name])
+                    # one pool for all of a node's regions (see `_build_piecewise_runners`)
+                    pools[f"{node_name} piecewise"] = {
+                        (label, bucket): cost
+                        for label, runner in piecewise[node_name].items()
+                        for bucket, cost in size(runner).items()
+                    }
             torch.cuda.empty_cache()
             free, total = torch.cuda.mem_get_info(self._device)
             reusable = None
@@ -1649,10 +1659,12 @@ class Engine:
             range_push("engine.forward")
         t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
-            raw = self._forward(
-                batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
-                lease, running_batched, request_ids, release_event,
-            )
+            # eager, compiled (its first call traces under it too) or replayed
+            with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                raw = self._forward(
+                    batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
+                    lease, running_batched, request_ids, release_event,
+                )
         finally:
             if PHASE_PERIOD:
                 phase_record("engine.forward", perf_counter() - t0)

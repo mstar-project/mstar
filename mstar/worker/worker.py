@@ -30,7 +30,7 @@ from mstar.communication.tensors import (
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
-from mstar.engine import apply_torch_config
+from mstar.engine import apply_dynamo_config
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
 from mstar.engine.resources.kv.config import without_layouts
@@ -1985,12 +1985,12 @@ class Worker:
         lives on a non-zero device, work issued from an unpinned thread
         lands on device 0's stream, unordered with the real compute.
 
-        It also applies mstar's torch config, because dynamo config is
+        It also applies mstar's dynamo config, because dynamo config is
         per-thread since torch 2.12 and this thread compiles.
         """
         if self.device_capability.is_accelerator and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
-        apply_torch_config()
+        apply_dynamo_config()
 
     @contextmanager
     def _span(self, name: str):
