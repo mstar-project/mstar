@@ -15,8 +15,8 @@ predicted. The recipe, reproduced here on M*'s own components:
 3. dynamic time warping through that matrix gives a monotonic path; the
    frame at which the path first enters a row is when that token starts;
 4. tokens are grouped into words (a new word at a leading space or a lone
-   punctuation mark, or at every character in a language written without
-   spaces); a word starts with its first token and ends where the next word
+   punctuation mark, or at every run of tokens that decodes to whole
+   characters in a language written without spaces); a word starts with its first token and ends where the next word
    starts, the last one where end-of-text is predicted.
 
 The functions here are pure tensor/numpy code with no engine dependencies,
@@ -39,8 +39,9 @@ FRAMES_PER_SECOND = 50
 MEDIAN_FILTER_WIDTH = 7
 PREPENDED_PUNCTUATION = "\"'“¿([{-"
 APPENDED_PUNCTUATION = "\"'.。,，!！?？:：”)]}、"
-# Written without spaces between words: without morpheme analysis, each
-# character is a word (openai-whisper's split_to_word_tokens).
+# Written without spaces between words: without morpheme analysis, each run of
+# tokens that decodes to whole characters is a word (openai-whisper's
+# split_to_word_tokens).
 CHARACTER_SPLIT_LANGUAGES = frozenset({"zh", "ja", "th", "lo", "my", "yue"})
 
 
@@ -162,7 +163,8 @@ def split_words(
     first into pieces that decode to whole characters (a token ending inside a
     multi-byte character continues into the next), then, unless ``language``
     is written without spaces, into words that begin at a leading space or a
-    lone punctuation mark. ``decode(ids) -> str`` is the tokenizer's plain decode."""
+    lone punctuation mark. ``decode(ids) -> str`` is the tokenizer's plain decode,
+    without clean-up, so the pieces' texts add up to ``decode(token_ids)``."""
     full = decode(token_ids)
     pieces: list[tuple[str, list[int]]] = []
     pending: list[int] = []
@@ -172,10 +174,14 @@ def split_words(
         text = decode(pending)
         # a replacement character the whole transcript also has there is in the
         # text itself, not an unfinished character, and must not swallow the rest
-        if "�" not in text or full[offset + text.index("�")] == "�":
+        at = offset + text.index("�") if "�" in text else None
+        if at is None or (at < len(full) and full[at] == "�"):
             pieces.append((text, pending))
             pending = []
             offset += len(text)
+    if pending:
+        # the transcript ends inside a character (cut at the position table)
+        pieces.append((decode(pending), pending))
     if language in CHARACTER_SPLIT_LANGUAGES:
         return pieces
     words: list[tuple[str, list[int]]] = []

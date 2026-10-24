@@ -260,6 +260,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             self._inactive = torch.tensor(inactive_state(), dtype=torch.long, device=device)
         return self._inactive
 
+    def _decode_raw(self, ids: list[int]) -> str:
+        """Word grouping's decode: no clean-up, which rewrites text across token
+        boundaries (openai-whisper's tiktoken decode has none)."""
+        return self.tokenizer.decode(ids, clean_up_tokenization_spaces=False)
+
     # -- logit rules ------------------------------------------------------
 
     def _apply_suppress(self, logits: torch.Tensor, is_first_token: bool) -> torch.Tensor:
@@ -417,7 +422,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         rows = weights[:, prompt_len:-1]
         ids = input_ids.tolist()
         language = self.config.language_of(ids[1])
-        words = word_timings(rows, ids[prompt_len + 1:-1], self.tokenizer.decode, num_frames, language)
+        words = word_timings(rows, ids[prompt_len + 1:-1], self._decode_raw, num_frames, language)
         tb, top = self.config.timestamp_begin, self.config.vocab_size - 1
 
         def stamp(seconds: float) -> int:
@@ -501,17 +506,18 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 "audio_frames": inp.tensor_inputs["audio_frames"],
             }
         rows = [self._row_ids(inp) for inp in inputs]
+        device = rows[0].device
         rules = torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs])
-        preprocessed: dict[str, torch.Tensor | Any] = {"input_ids": torch.cat(rows)}
-        if graph_walk == DECODE_WALK:
-            preprocessed["ts_rules"] = rules
-        else:
-            # Host values go over in one pinned, non-blocking copy each: a
-            # torch.tensor(..., device=) from a list is a blocking copy that
-            # waits out the stream (at prefill, the encoder's window).
-            device = rows[0].device
-            preprocessed["ts_rules"] = torch.empty(rules.shape, dtype=torch.long, device=device)
-            self._stager.copy_(preprocessed["ts_rules"].view(-1), rules.view(-1).numpy())
+        if rules.device != device:
+            # Host values (prefill's rule state) go over in one pinned,
+            # non-blocking copy: a torch.tensor(..., device=) from a list is a
+            # blocking copy that waits out the stream (at prefill, the
+            # encoder's window). Rows already on the device stay as they are.
+            staged = torch.empty(rules.shape, dtype=torch.long, device=device)
+            self._stager.copy_(staged.view(-1), rules.view(-1).numpy())
+            rules = staged
+        preprocessed: dict[str, torch.Tensor | Any] = {"input_ids": torch.cat(rows), "ts_rules": rules}
+        if graph_walk != DECODE_WALK:
             # packed prefill: where each request's last token sits
             preprocessed["row_lens"] = torch.empty(len(rows), dtype=torch.long, device=device)
             self._stager.copy_(preprocessed["row_lens"], [r.shape[0] for r in rows])

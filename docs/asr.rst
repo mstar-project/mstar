@@ -119,9 +119,12 @@ on the arena, with the same 1.41 % WER.
 Every ASR config sets ``max_concurrent_requests``. Whisper's decoder caches
 hold 64 requests (12 cross-attention pages and 4 self-attention pages each),
 and the model refuses at startup a cap they cannot hold. Requests past the cap
-wait in the conductor. Qwen3-ASR's requests vary far more in size: in one run,
-16 concurrent single-window 20 minute files peaked at 1563 of the shipped
-config's 2048 pages (``kv_cache.max_num_pages``). More concurrent long files
+wait in the conductor. Qwen3-ASR's requests vary far more in size: a 20 minute
+file holds about 122 pages of 128 tokens for its prompt and up to 32 more for
+its transcript, so the shipped config's 2048 pages (``kv_cache.max_num_pages``)
+hold about 13 of them at full size at once. Concurrent files rarely all reach
+full size together: in one run, 16 concurrent single-window 20 minute files
+peaked at 1563 pages. More concurrent long files
 than the pool holds offload to the host pool and, once that is full too, wait
 on each other until they time out: serve many long files with a lower
 ``max_concurrent_requests`` or more pages.

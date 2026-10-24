@@ -150,6 +150,12 @@ def test_languages_without_spaces_split_per_character():
     assert dict(words)["公"] == [text.index("公"), text.index("公") + 1]
     assert len(alignment.split_words(decode, list(vocab), "en")) == 1
 
+    # a transcript cut inside a character (at the position table) keeps every
+    # token and does not read past the decoded text
+    cut = {0: "今".encode(), 1: b"\xe5", 2: b"\xa4"}
+    words = alignment.split_words(lambda ids: b"".join(cut[i] for i in ids).decode("utf-8", "replace"), [0, 1, 2], "zh")
+    assert sum((toks for _, toks in words), []) == [0, 1, 2]
+
 
 def test_word_timings_end_to_end_on_a_synthetic_alignment():
     vocab = {1: " He", 2: " hop", 3: "ed", 4: " there"}
