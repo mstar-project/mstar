@@ -1002,11 +1002,22 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Ceiling on the denoise loop; the per-request step count is clamped to it.</span>
     <span class="n">max_denoise_steps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">100</span>
 
+    <span class="c1"># Ceiling on a request's height x width x num_frames (about 3.6x the default</span>
+    <span class="c1"># 1280x704x81 clip); DiT memory grows with it. A larger request is a 400.</span>
+    <span class="n">max_video_pixels</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span> <span class="o">*</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span>
+
     <span class="c1"># torch.compile the inner DiT region (patchify -&gt; blocks -&gt; head). The UniPC</span>
     <span class="c1"># solver stays eager — its CPU-resident sigma trips Inductor (see</span>
     <span class="c1"># Wan22DitSubmodule). Default ON in serving; the reference-equivalence gates</span>
     <span class="c1"># build with this False so the eager path stays the bit-exact reference.</span>
     <span class="n">compile_dit</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># "WxHxF" request shapes (width x height x num_frames) the compiled DiT</span>
+    <span class="c1"># serves; None is the default shape (1280x704x81). Every other shape runs</span>
+    <span class="c1"># the transformer eager. The compile traces one graph per input shape and</span>
+    <span class="c1"># requests choose theirs, so an open set would let each new shape cost a</span>
+    <span class="c1"># compile on the shared worker. A listed shape compiles at most twice (CFG</span>
+    <span class="c1"># on and off).</span>
+    <span class="n">compile_dit_sizes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably</span>
     <span class="c1"># exceeds the estimated untiled peak for the output size and tiles otherwise;</span>
@@ -1072,7 +1083,38 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_factor_spatial</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">patch_size</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_factor_spatial</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">patch_size</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span>
-        <span class="p">)</span></div>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="Wan22Config.compile_dit_grids">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.wan22.config.html#mstar.model.wan22.config.Wan22Config.compile_dit_grids">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">compile_dit_grids</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">"""``compile_dit_sizes`` as latent (frames, height, width) grids, the</span>
+<span class="sd">        trailing dims of the DiT's input."""</span>
+        <span class="n">sizes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">compile_dit_sizes</span>
+        <span class="k">if</span> <span class="n">sizes</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">sizes</span> <span class="o">=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">default_width</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">default_height</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">default_num_frames</span><span class="si">}</span><span class="s2">"</span><span class="p">,)</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sizes</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">sizes</span><span class="p">,</span> <span class="p">(</span><span class="nb">list</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">)):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Wan2.2 compile_dit_sizes must be a list of 'WxHxF' shapes, got </span><span class="si">{</span><span class="n">sizes</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
+        <span class="n">align_h</span><span class="p">,</span> <span class="n">align_w</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">spatial_alignment</span>
+        <span class="n">temporal</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_factor_temporal</span>
+        <span class="n">grids</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">size</span> <span class="ow">in</span> <span class="n">sizes</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">frames</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="nb">str</span><span class="p">(</span><span class="n">size</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"x"</span><span class="p">))</span>
+            <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Wan2.2 compile_dit_sizes entry must be 'WxHxF', got </span><span class="si">{</span><span class="n">size</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+            <span class="k">if</span> <span class="nb">min</span><span class="p">(</span><span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">frames</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">width</span> <span class="o">%</span> <span class="n">align_w</span> <span class="ow">or</span> <span class="n">height</span> <span class="o">%</span> <span class="n">align_h</span> <span class="ow">or</span> <span class="p">(</span><span class="n">frames</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">temporal</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"Wan2.2 compile_dit_sizes entry </span><span class="si">{</span><span class="n">size</span><span class="si">!r}</span><span class="s2"> must be positive multiples of "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">align_w</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="n">align_h</span><span class="si">}</span><span class="s2"> with </span><span class="si">{</span><span class="n">temporal</span><span class="si">}</span><span class="s2">k+1 frames."</span>
+                <span class="p">)</span>
+            <span class="n">grids</span><span class="o">.</span><span class="n">add</span><span class="p">((</span>
+                <span class="p">(</span><span class="n">frames</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">temporal</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span>
+                <span class="n">height</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_factor_spatial</span><span class="p">,</span>
+                <span class="n">width</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_factor_spatial</span><span class="p">,</span>
+            <span class="p">))</span>
+        <span class="k">return</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">grids</span><span class="p">)</span></div>
+</div>
 
 </pre></div>
 

@@ -334,6 +334,18 @@ Kokoro notes
   voices for a picker: the bundled voices whose G2P extra is installed on the server
   (a request for one of the others gets a 400 with the ``pip install`` hint).
 
+Qwen3-Omni notes
+----------------
+
+- Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
+  25-frame chunks behind 25 frames of left context. Playback stays gapless
+  while the Talker produces frames at about 1.5x real time over the first 50
+  frames (about 19 frames/s per request); the Talker batches at most 32
+  requests, so requests past that queue and can fall below it and pause. Set
+  ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
+  start with a 25-frame chunk instead: first audio comes later, and the
+  Talker needs only about 1.0 to 1.3x real time.
+
 Qwen3-TTS notes
 ---------------
 
@@ -954,6 +966,25 @@ paths round the latent extent differently and the DiT dies mid-forward.
 32 frames and you would get 29 — so it too is rejected with a 400 naming the
 nearest valid counts.
 
+**Size ceiling.** ``height x width x num_frames`` may not exceed
+``max_video_pixels`` (default 268,435,456, about 3.6x the default clip; raise
+it under the yaml's ``model_kwargs``), each axis must fit the DiT's 1,024
+rotary positions (``num_frames`` up to 4,093), and height and width are at most
+16,384, the largest side the mp4 encoder (libx264) opens. Each is a 400 naming
+the limit.
+
+**Compiled DiT shapes.** With ``compile_dit`` the DiT compiles one graph per
+input shape, so only the ``"WxHxF"`` shapes in ``compile_dit_sizes`` (default
+``1280x704x81``) use the compiled transformer; each compiles on first use, once
+with CFG and once without, so at most two compiles per listed shape. Any other
+size or frame count runs the same transformer eager, with no compile, which is
+slower per request once warm: on an H200, about 49% more at 640x352x17 and 55%
+more at 832x480x33 than the same shape compiled. List the shapes a deployment
+serves under the yaml's ``model_kwargs``; each one listed costs its compiles on
+first use. The first DiT call after startup is traced twice (a guard on the
+rotary table), so a server compiles at most two graphs per listed shape plus
+one.
+
 **UniPC runs inline, inside the DiT node.** Unlike cosmos3, the scheduler is not
 a separate stage: the solver state (the order-2 history buffer and the
 corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
@@ -964,8 +995,8 @@ Requests are therefore independent and the loop is resumable across ranks.
 (``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,
 channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
 yaml's ``model_kwargs`` for stock ``vae.decode``). Both compile on first use:
-the DiT once per resolution, frame count and CFG setting, so the first request
-at a new size is slower. The VAE decode compiles once per resolution, and only
+the DiT only for the ``compile_dit_sizes`` shapes (see Compiled DiT shapes), so
+the first request at a listed shape is slower. The VAE decode compiles once per resolution, and only
 for the sizes in ``vae_decode_fast_sizes`` (default ``1280x704``); any other
 size decodes with stock ``vae.decode``, frames identical to
 ``vae_decode_fast: false``. The compile uses Inductor's deterministic mode, so
