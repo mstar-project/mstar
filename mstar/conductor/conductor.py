@@ -242,7 +242,6 @@ def _worker_process_target(
     all_worker_graph_ids_to_graph_walks: dict[int, set[str]],
     all_worker_graph_ids_to_nodes: dict[int, set[str]],
     all_worker_graph_ids_to_dyn_loops: dict[int, set[str]],
-    all_worker_graph_ids_to_instances: dict[int, list[list[str]]],
     sharding_config: ShardingConfig,
     parallel_groups: WorkerParallelGroups,
     hostname: str,
@@ -257,6 +256,7 @@ def _worker_process_target(
     tcp_transfer_device="",
     status_interval_s: float | None = None,
     env: dict[str, str] | None = None,
+    all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
     picklability. ``status_interval_s`` turns on the worker's metrics."""
