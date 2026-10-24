@@ -124,7 +124,12 @@ def test_words_split_on_spaces_and_punctuation_merges():
     timed = [{"word": w, "start": starts[a], "end": starts[b]} for (w, _), a, b in spans]
     merged = alignment.merge_punctuation(timed)
     assert [w["word"] for w in merged] == [" He", " hoped,", " there."]
-    assert merged[1] == {"word": " hoped,", "start": 0.2, "end": 0.9}
+    # the word keeps its own timing; the comma's is dropped
+    assert merged[1] == {"word": " hoped,", "start": 0.2, "end": 0.7}
+    # opening marks first, right to left, as openai-whisper: the quote joins
+    # "world" rather than the comma's word swallowing it
+    quoted = [{"word": w, "start": float(k), "end": k + 1.0} for k, w in enumerate([" Hello", ",", ' "', "world"])]
+    assert [w["word"] for w in alignment.merge_punctuation(quoted)] == [" Hello,", ' "world']
 
 
 def test_languages_without_spaces_split_per_character():

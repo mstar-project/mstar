@@ -189,24 +189,29 @@ def split_words(
 
 
 def merge_punctuation(words: list[dict]) -> list[dict]:
-    """Attach opening marks to the word after them and closing marks to the
-    word before them, keeping the neighbour's timing (openai-whisper does the
-    same before reporting words)."""
-    merged: list[dict] = []
-    for w in words:
-        text = w["word"]
-        if merged and not merged[-1]["word"].endswith(" ") and text.strip() in APPENDED_PUNCTUATION:
-            merged[-1]["word"] += text
-            merged[-1]["end"] = w["end"]
-            continue
-        merged.append(dict(w))
-    out: list[dict] = []
-    for w in merged:
-        if out and out[-1]["word"].startswith(" ") and out[-1]["word"].strip() in PREPENDED_PUNCTUATION:
-            opener = out.pop()
-            w = {"word": opener["word"] + w["word"], "start": opener["start"], "end": w["end"]}
-        out.append(w)
-    return out
+    """openai-whisper's ``merge_punctuations``: opening marks join the word
+    after them (scanning right to left), then closing marks join the word
+    before them. A word keeps its own timing; the mark's is dropped."""
+    words = [dict(w) for w in words]
+    i, j = len(words) - 2, len(words) - 1
+    while i >= 0:
+        prev, following = words[i], words[j]
+        if prev["word"].startswith(" ") and prev["word"].strip() in PREPENDED_PUNCTUATION:
+            following["word"] = prev["word"] + following["word"]
+            prev["word"] = ""
+        else:
+            j = i
+        i -= 1
+    i, j = 0, 1
+    while j < len(words):
+        prev, following = words[i], words[j]
+        if not prev["word"].endswith(" ") and following["word"] in APPENDED_PUNCTUATION:
+            prev["word"] += following["word"]
+            following["word"] = ""
+        else:
+            i = j
+        j += 1
+    return [w for w in words if w["word"]]
 
 
 def word_timings(
