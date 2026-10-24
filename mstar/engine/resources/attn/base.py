@@ -18,8 +18,9 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferPrefillWrapper,
 )
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
-from mstar.engine.resources.kv.config import KVConfig, PagedKVConfig, RingKVConfig
+from mstar.engine.resources.kv.config import KVConfig, KVGroup, PagedKVConfig, RingKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
@@ -55,6 +56,42 @@ class AttentionManager(AttentionResource):
         # where the FA3 kernel is unusable, and the two do not agree bit for bit
         return fingerprint(type(self).__name__)
 
+    @staticmethod
+    def _check_window_pool(
+        spec: AttentionSpec, backend: AttnBackend, kv_config: PagedKVConfig, device: torch.device,
+    ) -> str:
+        """The FlashInfer kernel to read a pool with sliding layers with. Only FlashInfer reads
+        the per-group page sizes and strided pages, and only the kernels that take any page
+        size: FA2, and FA3 on SM90 only. ``auto`` picks one of them below SM100, and from
+        SM100 can send short rows without a window to cuDNN, so there it becomes FA2. An
+        attention reads the group that keeps its window, so without one it needs a group
+        that keeps everything."""
+        name = spec.config.kv_cache
+        if backend != AttnBackend.FLASHINFER:
+            raise ValueError(f"KV {name!r} declares sliding_layers, which only the flashinfer backend reads")
+        kernel = spec.config.flashinfer_backend
+        capability = current_platform.cuda_capability(device)
+        sm100 = capability is not None and capability >= (10, 0)
+        # FlashInfer has fa3 for SM90 only; no capability is a CPU device or a GPU not NVIDIA's
+        allowed = ("auto", "fa2", "fa3") if capability is None or capability[0] == 9 else ("auto", "fa2")
+        if kernel not in allowed:
+            raise ValueError(
+                f"KV {name!r} declares sliding_layers, whose pages only FlashInfer's fa2 and fa3 "
+                f"(SM90 only) kernels read, so flashinfer_backend={kernel!r} can't on this GPU; "
+                f"use {' or '.join(allowed)}"
+            )
+        if spec.config.sliding_window not in (None, kv_config.sliding_window):
+            raise ValueError(
+                f"attention {spec.resource_key!r} has sliding_window={spec.config.sliding_window}, but "
+                f"KV {name!r} keeps a window of {kv_config.sliding_window} for its sliding layers"
+            )
+        if spec.config.sliding_window is None and kv_config.groups[0].retention is not None:
+            raise ValueError(
+                f"every layer of KV {name!r} slides, so attention {spec.resource_key!r} needs its "
+                f"sliding_window={kv_config.sliding_window}"
+            )
+        return "fa2" if sm100 and kernel == "auto" else kernel
+
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         backend = resolve_attn_backend(spec.config.backend, info.device)
@@ -66,6 +103,15 @@ class AttentionManager(AttentionResource):
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
+        flashinfer_backend = spec.config.flashinfer_backend
+        if isinstance(kv_config, PagedKVConfig) and kv_config.sliding_layers:
+            flashinfer_backend = cls._check_window_pool(spec, backend, kv_config, info.device)
+            if flashinfer_backend != spec.config.flashinfer_backend:
+                logger.info(
+                    "attention %r reads KV %r, which has sliding_layers: flashinfer_backend=%r "
+                    "runs as %r on this GPU",
+                    spec.resource_key, spec.config.kv_cache, spec.config.flashinfer_backend, flashinfer_backend,
+                )
         # Before `shard`, so a mismatch is reported rather than half-applied to
         # a config the KV resource also holds.
         if backend not in _BACKEND_KV_CONFIG:
@@ -129,7 +175,7 @@ class AttentionManager(AttentionResource):
                 device=info.device,
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
-                backend=spec.config.flashinfer_backend,
+                backend=flashinfer_backend,
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
                 decode_tensor_cores=spec.config.decode_tensor_cores,
@@ -207,17 +253,33 @@ class EagerSlotKey(NamedTuple):
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
 
 
-def captured_page_capacity(num_rows: int, num_tokens: int, kv_config: KVConfig) -> int:
+def captured_page_capacity(
+    num_rows: int, num_tokens: int, kv_config: PagedKVConfig, group: KVGroup | None = None,
+) -> int:
     """Page ids a captured wrapper's index buffer holds for a bucket of
-    ``num_rows`` rows and ``num_tokens`` tokens.
+    ``num_rows`` rows and ``num_tokens`` tokens, in pages of ``group`` (the
+    pool's first by default).
 
     Per row, not per pool: rows that matched one cached prefix all name its
     pages, so a step can name more page ids than the pool holds. And at least
     the bucket's own pages: a capture's rows name a SINK_PAGE per page of span,
-    whatever the pool's size."""
+    whatever the pool's size.
+
+    A pool with sliding layers keeps no prefix cache and forks nothing, so its
+    real rows share no pages and name at most the pool, and padding rows their
+    sink pages on top. A group with a retention holds less than a page past it
+    per row before the step, plus what the step adds."""
+    group = group or kv_config.groups[0]
+    page_size = group.page_size
+    step_pages = -(-num_tokens // page_size)
+    if group.retention is not None:
+        held = -(-(group.retention.context_budget + page_size - 1) // page_size) + 1
+        return num_rows * held + step_pages
+    if kv_config.sliding_layers:
+        return kv_config.num_units + step_pages + num_rows
     return max(
         num_rows * kv_config.max_num_pages,
-        -(-num_tokens // kv_config.page_size) + num_rows,
+        step_pages + num_rows,
     )
 
 

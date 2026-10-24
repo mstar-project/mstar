@@ -35,6 +35,7 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
+from mstar.engine.resources.attn.config import check_window_readers
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -516,6 +517,7 @@ class Engine:
         node_names = set(submodules.keys())
         node_to_resources = {}
         specs_by_key = resolve_spec_dependencies(specs)
+        check_window_readers(specs_by_key)
 
         self._classify_tp_roles(node_names, parallel_groups)
 

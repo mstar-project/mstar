@@ -92,6 +92,15 @@ def test_cuda_arch_and_capability(monkeypatch, capability, arch, hopper):
     assert platform.has_cuda_capability(*capability)
 
 
+def test_cuda_cpu_device_has_no_capability(monkeypatch):
+    """A CPU device on a GPU host (a resource built with CPU stand-ins) asks no GPU."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    platform = CudaPlatform()
+    assert platform.cuda_capability(torch.device("cpu")) is None
+    assert platform.arch(torch.device("cpu")) is None
+    assert not platform.has_cuda_capability(9, device=torch.device("cpu"))
+
+
 @pytest.mark.parametrize(
     ("hip", "cuda", "xpu", "expected"),
     [

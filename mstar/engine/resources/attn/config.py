@@ -4,10 +4,12 @@ Kept free of the managers and their kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
@@ -87,6 +89,24 @@ class AttentionSpec(NodeResourceSpec):
             self.config.flashinfer_backend = flashinfer_backend
         if decode_tensor_cores is not None:
             self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
+
+
+def check_window_readers(specs: Mapping[str, NodeResourceSpec]) -> None:
+    """Refuse a pool with sliding layers that no attention reads with its window, at startup:
+    its sliding layers would have no reader, or one that takes their window for the whole
+    context. Which layer runs which attention is checked as each forward sets its layer."""
+    for key, spec in specs.items():
+        if not (isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.sliding_layers):
+            continue
+        window = spec.config.sliding_window
+        if not any(
+            isinstance(other, AttentionSpec) and other.config.kv_cache == key and other.config.sliding_window == window
+            for other in specs.values()
+        ):
+            raise ValueError(
+                f"KV {key!r} keeps a window of {window} for its sliding_layers, but no attention "
+                f"over it declares sliding_window={window}"
+            )
 
 
 @dataclass

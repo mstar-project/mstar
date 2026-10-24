@@ -64,6 +64,10 @@ class CrossAttentionManager(AttentionResource):
     def build(cls, spec: CrossAttentionSpec, info: EngineResourceInfo):
         # the context cache's own head counts; see AttentionManager.build
         kv_config = info.dependency(spec.config.kv_cache).config
+        if isinstance(kv_config, PagedKVConfig) and kv_config.sliding_layers:
+            raise ValueError(
+                f"KV {spec.config.kv_cache!r} declares sliding_layers, whose pages cross attention doesn't read"
+            )
         backend = resolve_attn_backend(spec.config.backend, info.device)
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)

@@ -47,8 +47,6 @@ def _fa3_unavailable_reason(device: torch.device | None = None) -> str | None:
     imported (fa3-fwd, and AITER on ROCm), or fa3-fwd has none for its capability"""
     if _VARLEN_IMPORT_ERROR is not None:
         return _VARLEN_IMPORT_ERROR
-    if device is not None and torch.device(device).type != "cuda":
-        return None
     capability = current_platform.cuda_capability(device)
     if capability is not None and not _fa3_has_kernel(capability):
         return f"fa3-fwd has no kernel for compute capability {capability[0]}.{capability[1]}"
