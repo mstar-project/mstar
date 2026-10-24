@@ -849,7 +849,10 @@ class MicroScheduler:
         blocked = set()
         if backlogged is not None:
             waiting = self._waiting_rids(backlogged)
-            tokens, chunks = self._measure_rows(request_state, backlogged, waiting)
+            if max_tokens is not None:
+                tokens, chunks = self._measure_rows(request_state, backlogged, waiting)
+                row_tokens.update(tokens)
+                chunkable |= chunks
             # bounded by what this step could take, so a long backlog is not
             # swept in full on every pass. Not `remaining`: that is the
             # caller's own walk's leftover and is None when it holds no rows.
@@ -858,16 +861,16 @@ class MicroScheduler:
                 self._scan_limit(node_walk, pre_existing_batch_size),
                 capture_group_of, only_walk, skip_walk,
             )
-            row_tokens.update(tokens)
-            chunkable |= chunks
             if not backlogged:
                 backlogged = None  # every row failed
         walk_caps = self._walk_caps(node_walk)
 
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
-        if fresh:
-            # measured for the chunk sizing below, not to gate admission
+        # only for the chunk sizing below, never to gate admission, so a walk
+        # with no budget skips it: measuring a row costs an input-tensor build
+        # and a cached-prefix probe, and a backlogged one pays it every pass
+        if fresh and max_tokens is not None:
             tokens, chunks = self._measure_rows(request_state, fresh)
             row_tokens.update(tokens)
             chunkable |= chunks

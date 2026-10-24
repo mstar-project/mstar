@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.engine.chunking import ChunkingManagement
 from mstar.engine.engine import Engine
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
@@ -27,7 +28,7 @@ from mstar.engine.resources.step import (
     StepContext,
     SubmoduleStep,
 )
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.submodule_base import ARNodeInputs, ChunkingPolicy
 
 PAGE = 16
 
@@ -65,9 +66,10 @@ def _kv(pages: int) -> KVManager:
     )
 
 
-def _ctx(*rids, after=None) -> StepContext:
+def _ctx(*rids, after=None, reserve_ahead=True) -> StepContext:
     ctx = StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False)
     ctx.chunk_tokens_after = after or {}
+    ctx.reserve_whole_prefill = reserve_ahead
     return ctx
 
 
@@ -82,6 +84,17 @@ def test_a_first_chunk_reserves_the_rest_of_its_walk():
     assert kv.admit(_step(r1=PAGE), _ctx(1, after={1: 4 * PAGE})).ok
 
     assert len(kv._streams[1]["main"].page_indices) == 5
+
+
+def test_the_manager_reserves_ahead_only_when_the_step_says_so():
+    """``chunk_tokens_after`` is what the row has left either way; the flag is
+    the walk's say that those tokens are a span this label can reserve."""
+    kv = _kv(pages=32)
+    kv.ingest_request(1, None)
+
+    assert kv.admit(_step(r1=PAGE), _ctx(1, after={1: 4 * PAGE}, reserve_ahead=False)).ok
+
+    assert len(kv._streams[1]["main"].page_indices) == 1
 
 
 def test_a_later_chunk_takes_no_more_pages():
@@ -124,6 +137,16 @@ def test_a_refused_reservation_unwinds_with_the_step():
 
 
 class _Sub:
+    def __init__(self, reserve_whole_prefill=True):
+        self.policy = ChunkingPolicy(
+            chunkable=True, max_batch_tokens=8,
+            reserve_whole_prefill=reserve_whole_prefill,
+        )
+
+    def get_chunking_policy(self, graph_walk):
+        del graph_walk
+        return self.policy
+
     def declare_step(self, **kwargs):
         return SubmoduleStep(steps={})
 
@@ -137,24 +160,41 @@ class _Runner:
         return ADMIT_OK
 
 
-def test_the_engine_reports_only_non_final_chunks():
+def _declare(sub: "_Sub"):
+    """``_declare_and_admit`` over one non-final chunk, one final one and one
+    unchunked row; returns the ctx the runner was admitted with."""
     eng = Engine.__new__(Engine)
     eng._runner = _Runner()
-    eng._submodules = {"LLM": SimpleNamespace(piecewise_runners={})}
+    eng._submodules = {"LLM": SimpleNamespace(piecewise_runners={}, submodule=sub)}
+    eng._chunking = ChunkingManagement(eng._submodules)
+    ctx = StepContext(request_ids=(1, 2, 3), graph_walk="prefill", slot=0, capture=False)
     batch = SimpleNamespace(
         node_name="LLM", graph_walk="prefill", per_request_info={},
-        chunk_ranges={1: (0, 4, 10), 2: (4, 10, 10)},
+        chunk_ranges={1: (0, 4, 10), 2: (4, 10, 10)}, step_context=ctx,
     )
     inputs = [
         ARNodeInputs(input_seq_len=4, chunk_start=0, chunk_total=10),   # more to come
         ARNodeInputs(input_seq_len=6, chunk_start=4, chunk_total=10),   # its last chunk
         ARNodeInputs(input_seq_len=1),                                  # not chunked
     ]
-    ctx = StepContext(request_ids=(1, 2, 3), graph_walk="prefill", slot=0, capture=False)
 
     outcome, _ = eng._declare_and_admit(
-        batch, rids=[1, 2, 3], inputs=inputs, submodule=_Sub(), nvtx=False, ctx=ctx,
+        batch, rids=[1, 2, 3], inputs=inputs, submodule=sub, nvtx=False, ctx=ctx,
     )
 
     assert outcome.ok
-    assert eng._runner.ctx.chunk_tokens_after == {1: 6}
+    return eng._runner.ctx
+
+
+def test_the_engine_reports_only_non_final_chunks():
+    ctx = _declare(_Sub())
+    assert ctx.chunk_tokens_after == {1: 6}
+    assert ctx.reserve_whole_prefill
+
+
+def test_a_walk_that_reserves_per_chunk_still_reports_what_is_left():
+    """``reserve_whole_prefill=False``: the walk's KV does not grow by the
+    tokens a step runs, so the counts stand but no resource reserves by them."""
+    ctx = _declare(_Sub(reserve_whole_prefill=False))
+    assert ctx.chunk_tokens_after == {1: 6}
+    assert not ctx.reserve_whole_prefill

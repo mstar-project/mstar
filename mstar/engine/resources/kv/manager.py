@@ -1771,7 +1771,9 @@ class KVManager(AttentionResource):
 
             page_size = self.config.page_size
             sink = step.sink
-            ahead = ctx.chunk_tokens_after
+            # the counts are in tokens; the flag is the walk's say that its KV
+            # grows by them, so they are a span this label can reserve
+            ahead = ctx.chunk_tokens_after if ctx.reserve_whole_prefill else None
             for segment in step.segments:
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail

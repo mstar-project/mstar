@@ -1001,8 +1001,6 @@ class Engine:
                 # one object for all the step's rows: the per-row call would
                 # return an equal one each time (128 calls at a full decode
                 # batch, on the gpu thread before the launch)
-                # input_seq_lens stays empty: a uniform step is one token a
-                # row, which is what an unrecorded row is taken for
                 node_inputs = [uniform] * len(batch.request_ids)
                 batch.register_prepare_batch(node_inputs)
                 batch.prepared_rids = tuple(batch.request_ids)
@@ -1609,11 +1607,19 @@ class Engine:
             # there is nothing to admit, and the forward still runs
             return ADMIT_OK, None
         if batch.chunk_ranges:
+            walk_of = batch.step_context.walk_of
             ctx.chunk_tokens_after = {
                 rid: inp.chunk_total - inp.chunk_start - inp.input_seq_len
                 for rid, inp in zip(rids, inputs, strict=True)
                 if not inp.is_final_chunk
             }
+            # all, not per row: one answer for the step keeps a resource from
+            # having to reserve two ways within a single sweep, and no model
+            # mixes the two walks today
+            ctx.reserve_whole_prefill = all(
+                self._chunking.policy(batch.node_name, walk_of(rid)).reserve_whole_prefill
+                for rid in ctx.chunk_tokens_after
+            )
         # admit reads the step's ctx, so bind it before the sweep rather than
         # in `_drive_step`
         step.set_ctx(ctx)
@@ -2320,8 +2326,11 @@ class Engine:
         self, overrides: Mapping[str, Any], walks: set[str],
         combined_walk_of: Mapping[tuple[str, str], str] | None = None,
         override_mixed: Collection[str] = (),
+        no_chunking: Collection[str] = (),
     ) -> None:
-        self._chunking.set_budgets(overrides, walks, combined_walk_of, override_mixed)
+        self._chunking.set_budgets(
+            overrides, walks, combined_walk_of, override_mixed, no_chunking,
+        )
 
     def walk_token_caps(self, node_name: str, graph_walk: str) -> dict[str, int] | None:
         return self._chunking.walk_caps(node_name, graph_walk)
@@ -2352,7 +2361,9 @@ class Engine:
         if (
             info is None or rid is None
             or graph_walk not in self._keyed_walks.get(node_name, ())
-            or not policy.chunkable
+            # the manager's, not the policy's: a walk the deployment does not
+            # chunk is never cut, so it starts at its first token
+            or not self._chunking.chunkable(node_name, graph_walk)
             or (policy.reuses_cached_prefix is not None
                 and not policy.reuses_cached_prefix(request_info))
         ):

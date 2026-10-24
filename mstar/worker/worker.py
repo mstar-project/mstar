@@ -3461,6 +3461,7 @@ class Worker:
                     merged = self.scheduler.chunk_outputs.release(
                         rid, node, outputs.get(rid, {}),
                         engine.chunked_prefill_output_policies(node, batch.walk_of(rid)),
+                        join_stream=join_stream if joins else None,
                     )
                 if joins and join_stream is not None:
                     joined += [t for ts in merged.values() for t in ts if torch.is_tensor(t)]

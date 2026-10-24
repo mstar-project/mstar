@@ -311,6 +311,10 @@ class ChunkingPolicy:
     output_policies: Mapping[str, ChunkedPrefillOutputPolicy] = field(default_factory=dict)
     # whether a row may start past its cached prefix, asked before prepare; None is always
     reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
+    # whether a first chunk reserves the KV the whole prefill needs, so a
+    # part-done row cannot wedge on a full arena. Counted in tokens, so a walk
+    # whose KV grows by something else sets False and reserves per chunk.
+    reserve_whole_prefill: bool = True
 
 
 NO_CHUNKING = ChunkingPolicy()

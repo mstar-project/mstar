@@ -80,11 +80,16 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
-    # rid -> input tokens a chunked row runs after this step. A resource that
-    # reserves per token reserves for these too, so a chunked prompt admits
-    # its whole walk on its first chunk, as an unchunked one does, and never
-    # holds part of the pool while it waits for the rest.
+    # rid -> input tokens a chunked row runs after this step
     chunk_tokens_after: Mapping[int, int] = field(default_factory=dict)
+    # whether a resource may reserve for those tokens now, so a chunked prompt
+    # admits its whole walk on its first chunk as an unchunked one does, and
+    # never holds part of the pool while it waits for the rest. The count is in
+    # tokens and a resource reserves in its own units, so this is set only when
+    # every chunked row's walk grows its state by the tokens a step runs
+    # (``ChunkingPolicy.reserve_whole_prefill``). Check it before using
+    # ``chunk_tokens_after`` to reserve.
+    reserve_whole_prefill: bool = True
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)

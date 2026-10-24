@@ -1633,10 +1633,19 @@ class _SizedEngine(_Engine):
     path's job, so a declared length never makes a row not-ready.
     """
 
-    def __init__(self, unready, **kw):
+    def __init__(self, unready, max_batch_tokens=1024, **kw):
         super().__init__(**kw)
         self.unready = set(unready)
         self.measured = []
+        # wide enough to cut nothing: these tests are about what gets measured
+        self._max_batch_tokens = max_batch_tokens
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return self._max_batch_tokens
+
+    def walk_token_caps(self, node_name, graph_walk):
+        del node_name, graph_walk
 
     def declares_input_sequence_len(self, node_name):
         del node_name
@@ -1690,6 +1699,21 @@ def test_a_parked_row_is_measured_once_and_checked_once_per_pass():
     assert len(engine.measured) == 2, "b0 once, b1 once though it waited two passes"
     assert engine.checked == ["b0"], "one check per row, with its length"
     assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b1"]
+
+
+def test_a_walk_with_no_budget_measures_nothing():
+    """Row lengths only size chunks, so a walk with no budget skips the work:
+    an input build and a cached-prefix probe per fresh row, and a walk of the
+    backlog every pass. Turning chunking off in the config gets main's path."""
+    engine = _SizedEngine(unready=set(), max_bs=8, max_batch_tokens=None)
+    sched = _scheduler(engine)
+    sched.get_tensor = lambda uuid: uuid
+    sched.backlog[(NODE, WALK)] = _batch(["b0"])
+
+    batch = _next_batch(sched, _Manager(["r0"]))
+
+    assert list(batch.request_to_worker_graph) == ["b0", "r0"]
+    assert engine.measured == []
 
 
 # ── chunked prefill ─────────────────────────────────────────────────────

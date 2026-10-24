@@ -77,10 +77,18 @@ def _refuse_unskippable_resources(
         )
 
 
-def _refuse_unsupported_chunking(
+def _unchunkable_nodes(
     submodules: dict, model: Model, parallel_groups: WorkerParallelGroups,
-) -> None:
-    """A chunked walk must report row lengths, and chunking under TP/SP is not supported yet."""
+) -> frozenset[str]:
+    """Check what a chunked walk must declare, and name the nodes this worker
+    turns chunking off for.
+
+    Reporting row lengths is the model's own declaration, so a walk that
+    chunks without ``get_input_sequence_len`` is refused anywhere. Chunking
+    under TP/SP is not supported yet; refusing there would take TP away from
+    every model that chunks, so those nodes run their prefills whole instead.
+    """
+    off = set()
     for walk, section in model.get_graph_walk_graphs().items():
         for node in section.get_nodes():
             submodule = submodules.get(node)
@@ -92,9 +100,13 @@ def _refuse_unsupported_chunking(
                     "report get_input_sequence_len"
                 )
             if parallel_groups.get_instance_world_size_for_node(node) > 1:
-                raise NotImplementedError(
-                    f"{type(model).__name__}: chunked prefill of {node!r} under TP/SP"
-                )
+                off.add(node)
+    if off:
+        logger.warning(
+            "chunked prefill is off for %s: not supported under TP/SP yet, so "
+            "their prefills run whole", sorted(off),
+        )
+    return frozenset(off)
 
 
 def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
@@ -226,6 +238,9 @@ class LoadedSubmodules:
     submodules: dict[str, NodeSubmodule]
     specs: list
     autocast_dtype: torch.dtype
+    # nodes this worker chunks nowhere whatever the model says
+    # (`_unchunkable_nodes`): no token budget, and still speculable
+    no_chunking: frozenset[str] = frozenset()
 
     def chunkable_node_walks(self, model: Model) -> list[tuple[str, str]]:
         """(node, walk) pairs whose prefill may be split, which speculation
@@ -234,7 +249,7 @@ class LoadedSubmodules:
             (node, walk)
             for walk, section in model.get_graph_walk_graphs().items()
             for node in section.get_nodes()
-            if node in self.submodules
+            if node in self.submodules and node not in self.no_chunking
             and self.submodules[node].get_chunking_policy(walk).chunkable
         )
 
@@ -310,8 +325,8 @@ class EngineManager:
             node_dtype = submodule.get_autocast_dtype() or autocast_dtype
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
-        _refuse_unsupported_chunking(submodules, model, parallel_groups)
-        return LoadedSubmodules(submodules, specs, autocast_dtype)
+        no_chunking = _unchunkable_nodes(submodules, model, parallel_groups)
+        return LoadedSubmodules(submodules, specs, autocast_dtype, no_chunking)
 
     @classmethod
     def build(
@@ -364,6 +379,7 @@ class EngineManager:
             budgets, set(model.get_graph_walk_graphs()),
             combined_walk_of=model.combined_walk_of(),
             override_mixed={node for node, flag in override_mixed.items() if flag},
+            no_chunking=loaded.no_chunking,
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 

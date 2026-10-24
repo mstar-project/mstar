@@ -984,8 +984,13 @@ methods opt a walk in:
   ``max_batch_tokens``, the step's budget (a combined walk that carries chunked rows sets
   one too, since its steps run under it); ``output_policies`` for an output edge whose
   chunks are not joined by concatenating on dim 0 (``ChunkedPrefillOutputMode.CONCAT``,
-  ``LIST`` or ``FINAL``); and ``reuses_cached_prefix`` when a row may have to write a
-  cached prefix again rather than start past it.
+  ``LIST`` or ``FINAL``); ``reuses_cached_prefix`` when a row may have to write a
+  cached prefix again rather than start past it; and ``reserve_whole_prefill``, on by
+  default, which has a row's first chunk reserve the state its whole prefill needs so a
+  part-done row cannot wedge on a full pool. Turn it off for a walk whose state grows by
+  something other than the tokens a step runs, where that count would reserve the wrong
+  amount; a resource reads it as ``StepContext.reserve_whole_prefill`` and must check it
+  before reserving by ``StepContext.chunk_tokens_after``.
 - ``get_input_sequence_len(graph_walk, fwd_info, inputs)`` gives a row's length from its
   input shapes, before ``prepare_inputs`` runs. The scheduler cuts the row by it, and a
   row whose prepared input turns out another length fails.

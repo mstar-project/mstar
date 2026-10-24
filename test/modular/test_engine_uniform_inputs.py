@@ -29,7 +29,6 @@ class _Batch:
         self.rows_only = False
         self.loopback_rids = frozenset()
         self.chunk_ranges = {}
-        self.input_seq_lens = {}
 
     def register_prepare_batch(self, inputs):
         self.inputs = inputs

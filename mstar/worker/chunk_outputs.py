@@ -37,9 +37,16 @@ class ChunkOutputAccumulator:
     def release(
         self, rid: int, node_name: str, outputs: NameToTensorList,
         policies: Mapping[str, ChunkedPrefillOutputPolicy] = {},
+        join_stream: torch.Stream | None = None,
     ) -> NameToTensorList:
         """The final chunk's outputs joined with the held ones, each edge per
-        its policy (CONCAT on dim 0 when unlisted)."""
+        its policy (CONCAT on dim 0 when unlisted).
+
+        ``join_stream`` is the stream the caller joins on, when that is not
+        the one the chunks were allocated on. The last reference to a cat's
+        inputs goes as this returns, so the allocator has to be told to hold
+        their blocks until that stream has read them.
+        """
         held = self._held.pop((rid, node_name), None)
         if held is None:
             return outputs
@@ -60,6 +67,11 @@ class ChunkOutputAccumulator:
                     f"output {name!r} of {node_name!r}: chunks emitted {sorted(widths)} "
                     "tensors; CONCAT joins the same number from every chunk"
                 )
+            if join_stream is not None:
+                for chunk in chunks:
+                    for t in chunk:
+                        if t.device.type == join_stream.device.type:
+                            t.record_stream(join_stream)
             merged[name] = [
                 torch.cat([chunk[i] for chunk in chunks], dim=policy.dim)
                 for i in range(widths.pop())

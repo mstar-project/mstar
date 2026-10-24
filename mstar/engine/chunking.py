@@ -44,6 +44,8 @@ class ChunkingManagement:
         self._walk_caps: dict[tuple[str, str], dict[str, int] | None] = {}
         # (node, walk) -> steps that ran over the budget they were scheduled under
         self._overruns: dict[tuple[str, str], int] = {}
+        # nodes the worker chunks nowhere, whatever the model declares
+        self._no_chunking: frozenset[str] = frozenset()
         # (rid, node) -> a chunked row's whole input, prepared on its first chunk
         self.prepared: dict[tuple[int, str], NodeInputs] = {}
 
@@ -57,7 +59,10 @@ class ChunkingManagement:
         return policy
 
     def max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
-        """The walk's budget, unless the serving config overrides it."""
+        """The walk's budget, unless the serving config overrides it or the
+        worker chunks nothing on the node."""
+        if node_name in self._no_chunking:
+            return None
         budget = self.policy(node_name, graph_walk).max_batch_tokens
         if budget is None or not self._overrides:
             return budget
@@ -70,6 +75,7 @@ class ChunkingManagement:
         self, overrides: Mapping[str, Any], walks: set[str],
         combined_walk_of: Mapping[tuple[str, str], str] | None = None,
         override_mixed: Collection[str] = (),
+        no_chunking: Collection[str] = (),
     ) -> None:
         """Apply a serving config's ``max_batch_tokens`` to this engine's nodes.
 
@@ -83,7 +89,13 @@ class ChunkingManagement:
         it caps that walk's rows within the step. Elsewhere a per-walk override
         of such a walk would do nothing, so it is refused; the combined walk
         itself can be named instead.
+
+        ``no_chunking`` names nodes this worker chunks nowhere (TP/SP, which
+        chunked prefill does not support yet). A budget set on one is still
+        validated but has no effect, since the deployment, not the config, is
+        what turned chunking off there.
         """
+        self._no_chunking = frozenset(no_chunking)
         self._combined_walk_of = dict(combined_walk_of or {})
         self._override_mixed = frozenset(override_mixed)
         self._walk_caps = {}
@@ -131,7 +143,9 @@ class ChunkingManagement:
 
     def chunkable(self, node_name: str, graph_walk: str) -> bool:
         """The submodule's say, unless the serving config turned the walk's
-        chunking off (a null budget)."""
+        chunking off (a null budget) or the worker chunks nothing on the node."""
+        if node_name in self._no_chunking:
+            return False
         if self._overrides.get((node_name, graph_walk), 0) is None:
             return False
         return self.policy(node_name, graph_walk).chunkable
@@ -143,10 +157,13 @@ class ChunkingManagement:
 
     def check_budget(self, batch: "ExecutingBatch", node_inputs: list[NodeInputs]) -> None:
         """Warn when a step runs over the budget it was scheduled under: that of
-        the combined walk it ran in, if any, which a step relabelled to one
-        walk still did. A row too long to cut runs whole, and a speculation
-        merge sizes its continuing rows by estimate, before their inputs
-        exist. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
+        the combined walk it ran in, if any. A row too long to cut runs whole,
+        and a speculation merge sizes its continuing rows by estimate, before
+        their inputs exist. Logged on the 1st, 2nd, 4th, ... overrun per walk."""
+        # the step's label is not always the combined walk: a combined batch
+        # whose rows share one real walk is relabelled to it
+        # (`ScheduledBatch.relabel_if_uniform`), and it still ran under the
+        # combined walk's budget
         walk = batch.step_context.graph_walk
         walk = self._combined_walk_of.get((batch.node_name, walk), walk)
         budget = self.max_batch_tokens(batch.node_name, walk)
@@ -171,5 +188,7 @@ class ChunkingManagement:
         self.prepared.pop((rid, node_name), None)
 
     def forget_request(self, rid: int) -> None:
-        for key in [key for key in self.prepared if key[0] == rid]:
+        # over a snapshot: this runs on the main thread, while the gpu thread
+        # may still be adding the next step's rows to `prepared`
+        for key in [key for key in list(self.prepared) if key[0] == rid]:
             del self.prepared[key]

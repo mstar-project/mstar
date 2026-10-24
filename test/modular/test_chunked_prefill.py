@@ -9,6 +9,7 @@ sys.path.insert(0, ".")
 
 import torch
 
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.worker.batch_builder import fill_token_budget
 from mstar.worker.chunk_outputs import ChunkOutputAccumulator
 
@@ -478,6 +479,26 @@ def test_a_walk_budget_wins_and_null_turns_chunking_off():
     assert engine.get_max_batch_tokens("LLM", "vision") == 4096
 
 
+def test_a_node_the_worker_will_not_chunk_keeps_no_budget():
+    """Chunking is off under TP/SP, so the node's walks report no budget and
+    no chunking whatever the model declares -- the scheduler then takes the
+    same path as a walk the model never budgeted."""
+    engine = _budgeted_engine()
+    budgets = {"prefill": 512, "vision": 2048}
+    engine._submodules["LLM"] = SimpleNamespace(submodule=SimpleNamespace(
+        get_chunking_policy=lambda walk: ChunkingPolicy(
+            chunkable=True, max_batch_tokens=budgets.get(walk),
+        ),
+    ))
+    engine.set_token_budgets(
+        {"LLM": {"vision": 4096}}, {"prefill", "vision"}, no_chunking={"LLM"},
+    )
+
+    assert engine.get_max_batch_tokens("LLM", "prefill") is None
+    assert engine.get_max_batch_tokens("LLM", "vision") is None
+    assert not engine.supports_chunked_prefill("LLM", "vision")
+
+
 def test_a_budget_the_model_does_not_set_is_refused():
     import pytest
 
@@ -598,3 +619,61 @@ def test_a_non_final_chunks_row_leaves_the_kept_rows():
 
     untouched = SamplerStep()
     assert keep_final_chunk_samples(untouched, ["d"], [whole]) is untouched
+
+
+# ── load: the nodes the worker will not chunk ──────────────────────────
+
+
+class _Chunker:
+    """A submodule that chunks and reports row lengths, as a chunked walk must."""
+
+    def get_chunking_policy(self, graph_walk):
+        del graph_walk
+        return ChunkingPolicy(chunkable=True, max_batch_tokens=512)
+
+    def get_input_sequence_len(self, graph_walk, request_info, inputs):
+        del graph_walk, request_info, inputs
+
+
+class _Unmeasured(_Chunker):
+    """Chunks, but leaves row lengths to the base class, which reports none."""
+
+    get_input_sequence_len = NodeSubmodule.get_input_sequence_len
+
+
+def _chunking_model():
+    section = SimpleNamespace(get_nodes=lambda: ["LLM"])
+    return SimpleNamespace(get_graph_walk_graphs=lambda: {"prefill": section})
+
+
+def _groups(width):
+    return SimpleNamespace(get_instance_world_size_for_node=lambda node: width)
+
+
+def test_a_node_wider_than_one_rank_has_its_chunking_turned_off(caplog):
+    """Chunked prefill is not supported under TP/SP yet. Refusing to start
+    would take TP away from every model that chunks, so the node runs its
+    prefills whole and says so."""
+    from mstar.worker.engine_manager import _unchunkable_nodes
+
+    with caplog.at_level("WARNING"):
+        off = _unchunkable_nodes({"LLM": _Chunker()}, _chunking_model(), _groups(2))
+
+    assert off == frozenset({"LLM"})
+    assert "chunked prefill is off for ['LLM']" in caplog.text
+
+
+def test_a_node_on_one_rank_keeps_its_chunking():
+    from mstar.worker.engine_manager import _unchunkable_nodes
+
+    assert not _unchunkable_nodes({"LLM": _Chunker()}, _chunking_model(), _groups(1))
+
+
+def test_a_chunked_walk_that_reports_no_row_length_is_refused():
+    """The model's own declaration, so it is an error on one rank as well."""
+    import pytest
+
+    from mstar.worker.engine_manager import _unchunkable_nodes
+
+    with pytest.raises(ValueError, match="get_input_sequence_len"):
+        _unchunkable_nodes({"LLM": _Unmeasured()}, _chunking_model(), _groups(1))
