@@ -169,6 +169,7 @@ _SPECIALS = {
 _PLACEHOLDERS = {
     "image": "<|vision_start|><|image_pad|><|vision_end|>",
     "audio": "<|audio_start|><|audio_pad|><|audio_end|>",
+    "video": "<|vision_start|><|video_pad|><|vision_end|>",
 }
 
 
@@ -184,7 +185,16 @@ class _Tokenizer:
         return {"input_ids": torch.tensor([[ord(c) for c in text]])}
 
 
+class _VideoProcessor:
+    temporal_patch_size = 2
+
+    def __call__(self, videos, size):
+        return {"video_grid_thw": torch.tensor([[2, 4, 6]]), "pixel_values_videos": torch.zeros(1)}
+
+
 class _Processor:
+    video_processor = _VideoProcessor()
+
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
         turns = "".join(
             f"<|im_start|>{m['role']}\n" + (m["content"] if isinstance(m["content"], str) else "".join(
@@ -275,6 +285,17 @@ def test_the_vision_encoder_embeds_an_image_from_its_prepared_inputs_as_it_would
         torch.equal(layer, own) for layer, own in zip(ours["deepstack"], alone.deepstack_features, strict=True)
     ), "the inputs built before the compiled call embed the image otherwise than the encoder does"
 
+
+def test_a_prompt_with_a_video_keys_only_its_leading_text(model):
+    out = _prompt(
+        model, ["text", "video", "text"], {"video_inputs": [torch.zeros(4, 3, 64, 96)]},
+        input_metadata={"video_inputs": [{"video_sample_fps": 2.0}]},
+    )
+    layout = out.metadata["kv_layout"][THINKER_KV]["main"]
+
+    assert [span.walk for span in layout.spans[:layout.keyed_count()]] == ["prefill_text"], (
+        "a prompt with a video keyed other than its leading text"
+    )
 
 def _audio(attn_implementation: str = "sdpa") -> AudioEncoderSubmodule:
     # The tensors `prepare_inputs` builds depend only on the clip's length and the encoder's
