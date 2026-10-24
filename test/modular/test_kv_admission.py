@@ -15,8 +15,8 @@ from types import SimpleNamespace
 sys.path.insert(0, ".")
 
 import pytest
+import test_kv_host_index as host
 import torch
-from test_admit_rollback import _HostPoolStub
 from test_kv_prefix_layout_lease import ASK, IMAGE, OTHER_ASK, RID, TEXT, _config, _walks
 from test_kv_prefix_layout_lease import _Node as _LayoutNode
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _grow, _keys, _layout, _manager, _seed, _StubTransfer
@@ -33,7 +33,6 @@ from mstar.engine.resources.kv.config import (
     RetentionPolicy,
     StreamLayout,
 )
-from mstar.engine.resources.kv.cpu_page_pool import OffloadedStream
 from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
 from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
@@ -363,24 +362,6 @@ def test_an_allotment_covers_only_the_labels_its_workers_nodes_open():
     assert _ready(kv, "a") and kv._allotments["a"].pages == 3, "the leader counted a label only another worker opens"
 
 
-class _StubHostPool(_HostPoolStub):
-    """`_HostPoolStub` that keeps each offloaded stream, so `reload` can bring it back."""
-
-    def offload_stream(self, rid, label, gpu_kv_cache, gpu_page_indices, **state):
-        self.offloaded.setdefault(rid, {})[label] = OffloadedStream(list(gpu_page_indices), **state)
-        return True
-
-    def reload_stream(self, rid, label, **kwargs):
-        streams = self.offloaded[rid]
-        return streams.pop(label) if len(streams) > 1 else self.offloaded.pop(rid)[label]
-
-    def labels(self, rid):
-        return list(self.offloaded.get(rid, ()))
-
-    def num_pages(self, rid, label):
-        return len(self.offloaded[rid][label].cpu_page_indices)
-
-
 def _run(kv, rng, rid: str, span: int, walk: str, policy: RetentionPolicy | None, preplan: bool = False) -> str:
     """Admit one step of ``rid``, then commit the step, roll it back as a later resource's refusal
     would, or drop the step if it was staged ahead."""
@@ -419,6 +400,7 @@ def _drive(kv, rng: random.Random, ops: int) -> list[str]:
     live: dict[str, list] = {}  # rid -> [state, prompt length, policy, decoded]
     log: list[str] = []
     for i in range(ops):
+        kv._cpu_pool.land()  # a copy from the host lands by the next call
         op = rng.choices(list(_CALLS), weights=[w for _, w in _CALLS.values()])[0]
         rids = [rid for rid, entry in live.items() if entry[0] in _CALLS[op][0]]
         rid = rng.choice(rids) if rids else f"r{i}"
@@ -475,7 +457,7 @@ def _drive(kv, rng: random.Random, ops: int) -> list[str]:
 def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     kv = _manager(max_num_pages=20)
-    kv._cpu_pool = _StubHostPool()
+    kv._cpu_pool = host._HostPool(64)
 
     log = _drive(kv, random.Random(SEED), ops=10_000)
 
@@ -490,7 +472,7 @@ def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
 
 def test_every_page_an_offload_frees_is_room():
     kv = _manager(max_num_pages=9)
-    kv._cpu_pool = _StubHostPool()
+    kv._cpu_pool = host._HostPool(64)
     _laid_out(kv, "r0", list(range(4 * PAGE_SIZE)))
     assert _ready(kv, "r0")
     _grow(kv, "r0", 2 * PAGE_SIZE)
@@ -503,7 +485,7 @@ def test_every_page_an_offload_frees_is_room():
 
 def test_a_reload_past_the_room_is_refused_and_leaves_the_request_offloaded():
     kv = _manager(max_num_pages=9)
-    kv._cpu_pool = _StubHostPool()
+    kv._cpu_pool = host._HostPool(64)
     _laid_out(kv, "r0", list(range(4 * PAGE_SIZE)))
     assert _ready(kv, "r0")
     _grow(kv, "r0", 4 * PAGE_SIZE)
