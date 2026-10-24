@@ -110,6 +110,14 @@ threads sleep. Shrinking the pool instead (``OMP_NUM_THREADS=1`` or
 ``torch.set_num_threads(1)`` in the process) is not recommended: it was in
 place during several unexplained request hangs in our runs.
 
+Serve with the shared-memory arena, ``MSTAR_SHM_ARENA=1`` (needs the ``rust/``
+extension; see :doc:`environment_variables`). The default SHM transport creates
+and removes one file per tensor, and a transcription moves its audio, encoder
+states and output tokens as many small tensors; the arena places them in
+preallocated segments instead. Qwen3-ASR 1.7B in one run: RTFx 81, 218, 350 and
+412 at concurrency 1, 8, 32 and 64 on the file transport, 87, 252, 494 and 558
+on the arena, with the same 1.41 % WER.
+
 Every ASR config sets ``max_concurrent_requests``. Whisper's decoder caches
 hold 64 requests (12 cross-attention pages and 4 self-attention pages each),
 and the model refuses at startup a cap they cannot hold. Requests past the cap
