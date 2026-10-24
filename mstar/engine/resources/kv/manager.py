@@ -3713,8 +3713,8 @@ class KVManager(AttentionResource):
             ]
         # Requests are queued and removed on one thread only, so ``rid`` is still first in `_waiting`
         # once the lock is taken again.
-        for chain in chains:
-            self._root_chain(chain)
+        for prefix_chain in chains:
+            self._root_chain(prefix_chain)
         with self._lock:
             whole, charged = self._hit(rid, node_name, graph_walk, published)
             need = self._waiting[rid] - whole
