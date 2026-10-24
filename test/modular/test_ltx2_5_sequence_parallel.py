@@ -1,8 +1,6 @@
-"""Ulysses sequence parallelism for LTX-2.5's DiT, on two CPU processes over gloo.
-
-The batched exchanges (``sequence_to_heads`` / ``heads_to_sequence``) against the
-layout they promise, on even and uneven splits, and a toy-size DiT sharded across two
-ranks against the same DiT on one.
+"""Ulysses sequence parallelism for LTX-2.5's DiT, on two CPU processes over gloo: a
+toy-size DiT sharded across two ranks against the same DiT on one. The exchange itself
+is tested in ``test_sequence_parallel.py``.
 """
 
 from __future__ import annotations
@@ -21,11 +19,6 @@ sys.path.insert(0, ".")
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.model.components.diffusion.attention import sdpa_attention  # noqa: E402
-from mstar.model.components.distributed.sequence_parallel import (  # noqa: E402
-    heads_to_sequence,
-    sequence_to_heads,
-    sp_seq_split,
-)
 from mstar.model.ltx2_5.components.transformer import LTX2Attends, LTX2DiT, build_rope  # noqa: E402
 from mstar.model.ltx2_5.config import LTX25Config  # noqa: E402
 
@@ -57,22 +50,6 @@ def _entry(rank, fn, port, args):
         fn(rank, *args)
     finally:
         dist.destroy_process_group()
-
-
-def _exchanges(rank, total):
-    group = _group(rank)
-    sizes = sp_seq_split(total, WORLD)
-    full = torch.arange(2 * total * 4 * 3, dtype=torch.float32).view(2, total, 4, 3)
-    start = sum(sizes[:rank])
-    shard = full[:, start:start + sizes[rank]]
-    heads = sequence_to_heads(group, shard, sizes, seq_dim=1, head_dim=2)
-    assert torch.equal(heads, full[:, :, 2 * rank:2 * rank + 2])
-    assert torch.equal(heads_to_sequence(group, heads, sizes, seq_dim=1, head_dim=2), shard)
-
-
-@pytest.mark.parametrize("total", [6, 7])
-def test_sequence_and_head_exchanges(total):
-    _run(_exchanges, total)
 
 
 def _toy_config():

@@ -27,7 +27,7 @@ from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.distributed.sequence_parallel import heads_to_sequence, sequence_to_heads
+from mstar.model.components.distributed.sequence_parallel import ulysses_attention
 
 # ``(q, k, v) -> out`` over ``[B, L, H, D]`` tensors (``k``/``v`` may have their own
 # ``L``); see ``mstar.model.components.diffusion.attention``.
@@ -50,19 +50,16 @@ class SeqParallel(NamedTuple):
     is each rank's share of its ``L``.
 
     Only an attention whose queries and keys are both the sharded stream needs the
-    exchange: it attends every token over this rank's head-group (``to_heads``), and
-    the output goes back (``from_heads``). A query shard attending a replicated stream
-    needs nothing, and a replicated query attending the sharded keys merges the
-    ranks' partial attentions (``attend_shards``)."""
+    exchange: it attends every token over this rank's head-group (``attend``). A
+    query shard attending a replicated stream needs nothing, and a replicated query
+    attending the sharded keys merges the ranks' partial attentions
+    (``attend_shards``)."""
 
     group: CommGroup
     sizes: list[int]
 
-    def to_heads(self, x: torch.Tensor) -> torch.Tensor:
-        return sequence_to_heads(self.group, x, self.sizes, seq_dim=1, head_dim=2)
-
-    def from_heads(self, x: torch.Tensor) -> torch.Tensor:
-        return heads_to_sequence(self.group, x, self.sizes, seq_dim=1, head_dim=2)
+    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
+        return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
 
     @torch.compiler.disable
     def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -207,11 +204,7 @@ class GatedAttention(nn.Module):
             q = apply_split_rope(q, q_rope.heads(self.head_offset, self.local_heads))
             k_rope = q_rope if k_rope is None else k_rope
             k = apply_split_rope(k, k_rope.heads(self.head_offset, self.local_heads))
-        if exchange is not None:
-            q, k, v = exchange.to_heads(q), exchange.to_heads(k), exchange.to_heads(v)
-        out = attend(q, k, v).to(q.dtype)
-        if exchange is not None:
-            out = exchange.from_heads(out)
+        out = (attend(q, k, v) if exchange is None else exchange.attend(q, k, v, attend)).to(q.dtype)
         if self.to_gate_logits is not None:
             out = out * (2.0 * torch.sigmoid(self.to_gate_logits(x))).unsqueeze(-1)
         return self.to_out(out.flatten(-2))
