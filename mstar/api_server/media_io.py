@@ -617,6 +617,8 @@ def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
     back sample for sample."""
     scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
     pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
+    # realtime steps write here with no other check of the upload dir
+    ensure_private_dir(os.path.dirname(path) or ".")
     write_private_file(path, pcm16_to_wav_bytes(pcm, sample_rate))
     return path
 

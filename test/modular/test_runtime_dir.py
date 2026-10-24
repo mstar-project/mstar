@@ -389,3 +389,22 @@ def test_generate_ws_rechecks_the_upload_dir_per_message(swapped_upload_dir, mon
         reply = json.loads(ws.receive_text())
     assert reply["request_id"] == "r1" and reply["error"]
     assert _written(path, target) == []
+
+
+def test_a_realtime_step_rechecks_the_upload_dir(swapped_upload_dir):
+    """Realtime steps write each step's audio with ``write_wav`` and nothing
+    else checks the upload dir on that path."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from mstar.api_server.openai.serving_realtime import _run_step
+
+    path, target = swapped_upload_dir
+    submitted = []
+    api = SimpleNamespace(upload_dir=path, submit_request=lambda **kw: submitted.append(kw))
+    session = SimpleNamespace(session_id="s1", audio_so_far=lambda: np.zeros(160, dtype=np.float32), request=None)
+    with pytest.raises(PermissionError, match="refusing"):
+        asyncio.run(_run_step(api, None, session, ""))
+    assert submitted == [] and _written(path, target) == []

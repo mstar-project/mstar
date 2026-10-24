@@ -1487,8 +1487,10 @@ mod tests {
     }
 
     fn socket_dir() -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
         let dir = std::env::temp_dir().join(format!("mstar-metrics-{}", Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 0700 whatever the umask: tests use it as an upload dir, which is checked
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         dir
     }
 
