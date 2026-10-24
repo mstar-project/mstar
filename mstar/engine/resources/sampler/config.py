@@ -7,13 +7,14 @@ step without pulling them in behind it.
 
 import hashlib
 import math
-from dataclasses import dataclass, field
+from collections.abc import Collection
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.resources.step import ResourceStep, SubmoduleStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -148,3 +149,11 @@ class SamplerStep(ResourceStep):
     # Rows whose sampled token is kept; None keeps every row. A dropped row
     # still draws, but its RNG offset and seen-token mask are not committed.
     kept_rids: frozenset[int] | None = None
+
+
+def discard_samples(step: SubmoduleStep, rids: Collection[int], discarded: frozenset[int]) -> None:
+    """Keep no sample of the ``discarded`` rows in any sampler step of ``step``, whose rows are ``rids``."""
+    for key, resource_step in step.steps.items():
+        if isinstance(resource_step, SamplerStep):
+            kept = frozenset(rids) if resource_step.kept_rids is None else resource_step.kept_rids
+            step.steps[key] = replace(resource_step, kept_rids=kept - discarded)

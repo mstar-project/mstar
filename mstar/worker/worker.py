@@ -309,10 +309,12 @@ class Victim(NamedTuple):
 
 class RebuildRow(NamedTuple):
     """A row of the prefill walk that recomputes a dropped request's KV. Its input is the request's
-    kept ids without the last one."""
+    kept ids without the last one, and the host copies of what else the walk read. With ``step_metadata``
+    None, the row runs under the request's own step metadata."""
     node: str
     walk: str
     inputs: NameToTensorList
+    step_metadata: dict | None
 
 
 # The output a sampling node returns its token under. A decode input such as `text_inputs` gets the
@@ -1172,10 +1174,9 @@ class Worker:
     def _rebuildable(self, request_id: int, node_name: str) -> bool:
         """Whether the kept ids on ``node_name`` can rebuild the request's KV there.
 
-        The rebuild row runs under the request's step_metadata as it stands at the drop, and a model
-        discards the row's sample only under decode-time metadata, so the request must be in the walk
-        that grows its KV. The prefill and each iteration of the growth loop sample once, and the KV
-        holds all but the last sample. A prompt with digest spans also needs its host copies landed.
+        The request must be in the walk that grows its KV. The prefill and each iteration of the growth
+        loop sample once, and the KV holds all but the last sample. A prompt with digest spans also needs
+        its host copies landed.
         """
         kept = self._kept_ids.get(node_name, {}).get(request_id)
         if kept is None:
@@ -1275,12 +1276,21 @@ class Worker:
         kept = self._kept_ids[node_name][request_id]
         ids = array("i", kept.prompt)
         ids.extend(kept.sampled)
-        walk = engine.lay_out_rebuild(node_name, request_id, ids)[0].walk
-        (name,) = self._walk_inputs[(walk, node_name)]
+        spans = engine.lay_out_rebuild(node_name, request_id, ids)
+        walk, copies = spans[0].walk, kept.copies
+        (name,) = self._walk_inputs[(walk, node_name)] - self._copied_inputs.get((walk, node_name), set())
         tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(self.device, dtype=torch.long)
-        self._rebuild_rows[request_id] = RebuildRow(node_name, walk, {name: [tokens]})
+        lengths = [span.length for span in spans if span.kind == "ids"]
+        metadata, copied = None, {}
+        if copies is not None:
+            if len(tokens) > len(kept.prompt) // 4:
+                # The prefill row's metadata covers only the prompt, so the samples extend the prompt's last ids span.
+                lengths[-2:] = [sum(lengths[-2:])]
+            metadata, copied = copies.step_metadata, self._to_device(copies)
+        inputs = {**copied, name: list(tokens.split(lengths))}
+        self._rebuild_rows[request_id] = RebuildRow(node_name, walk, inputs, metadata)
         self._dropped.pop(request_id, None)
-        self._preemptions[node_name].rebuild_tokens += len(tokens)
+        self._preemptions[node_name].rebuild_tokens += sum(span.length for span in spans)
 
     def _readmit_dropped(self) -> None:
         """Rebuild each dropped request that is first in its node's queue, once the layout its rebuild
@@ -1311,7 +1321,7 @@ class Worker:
         rows = self._runnable_rebuilds()
         if not rows:
             return None
-        node_name, walk, _ = next(iter(rows.values()))
+        node_name, walk, *_ = next(iter(rows.values()))
         rows = {rid: row for rid, row in rows.items() if row.node == node_name and row.walk == walk}
         cap = self.engine_manager.get_engine(node_name).get_max_batch_size(node_name, walk)
         if cap is not None:
@@ -1925,9 +1935,11 @@ class Worker:
         request_ids = [rid for rid in batch.request_to_worker_graph if rid not in unresolved]
         if rebuild:
             for rid, row in rebuild.items():
+                info = self.request_state.get_fwd_info(rid, batch_partition)
                 per_request_inputs[rid] = row.inputs
                 per_request_info[rid] = replace(
-                    self.request_state.get_fwd_info(rid, batch_partition), graph_walk=row.walk,
+                    info, graph_walk=row.walk,
+                    step_metadata=info.step_metadata if row.step_metadata is None else row.step_metadata,
                 )
             request_ids = [*rebuild, *request_ids]
 
@@ -2547,9 +2559,9 @@ class Worker:
         whose `prepare_inputs` failed has left the step, and its request has failed already."""
         prepared = node_batch.rebuild_rids & set(node_batch.request_ids)
         for rid in prepared:
+            info = node_batch.per_request_info[rid]
             self._rebuild_rows[rid] = RebuildRow(
-                node_batch.node_name, node_batch.per_request_info[rid].graph_walk,
-                node_batch.per_request_input_tensors[rid],
+                node_batch.node_name, info.graph_walk, node_batch.per_request_input_tensors[rid], info.step_metadata,
             )
         named = {getattr(reason, "request_id", None), *getattr(reason, "request_ids", ())}
         named &= prepared
@@ -3790,6 +3802,21 @@ class Worker:
         # Once the worker drops the tensor, the step's stream may reuse its memory before the copy has read it.
         tensor.record_stream(side)
         return host
+
+    def _to_device(self, copies: PrefillCopies) -> NameToTensorList:
+        """Copy ``copies`` back to the device on the side stream once they have landed on the host, and make the compute
+        stream wait for that copy. The wait is issued now, so a step the GPU thread is still enqueuing can stall behind
+        the copy back."""
+        if copies.landed is None:
+            return copies.inputs
+        side = self._side_stream()
+        side.wait_event(copies.landed)
+        with side:
+            on_device = {name: [t.to(self.device, non_blocking=True) for t in ts] for name, ts in copies.inputs.items()}
+        ready = torch.Event(device=self.device)
+        ready.record(side)
+        torch.accelerator.current_stream(self.device).wait_event(ready)
+        return on_device
 
     def _side_stream(self) -> torch.Stream:
         if self._d2h_stream is None:
