@@ -28,6 +28,7 @@ sys.path.insert(0, ".")
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     OffloadDelta,
     RemoveRequest,
@@ -918,6 +919,7 @@ class _ForwardingLeader:
     _remove_request = Worker._remove_request
     _removal_step_reached = Worker._removal_step_reached
     _rid = Worker._rid
+    _mark_removed = Worker._mark_removed
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False
@@ -934,6 +936,8 @@ class _ForwardingLeader:
         self._draining_rids: set[str] = set()
         self._pending_drains: set[str] = set()
         self._reads_done_sent: set[str] = set()
+        self._removed_rids: RecentSet[str] = RecentSet(16)
+        self._unprocessed_messages: dict = {}
         group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
         # The runtime owns the handle table and the sharding config now, and
         # ``remove_request`` there is what frees the handle.
