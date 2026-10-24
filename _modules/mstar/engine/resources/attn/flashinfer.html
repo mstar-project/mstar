@@ -969,12 +969,15 @@ window.runMermaid = runMermaid;</script>
         <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="o">=</span><span class="s2">"auto"</span><span class="p">,</span>
         <span class="n">splits</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">CombinedSplit</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
         <span class="n">max_rows_in_combined</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">sliding_window</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span> <span class="o">=</span> <span class="n">kv_cache</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_splits</span> <span class="o">=</span> <span class="p">{</span><span class="n">split</span><span class="o">.</span><span class="n">combined_walk</span><span class="p">:</span> <span class="n">split</span> <span class="k">for</span> <span class="n">split</span> <span class="ow">in</span> <span class="n">splits</span><span class="p">}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_max_rows_in_combined</span> <span class="o">=</span> <span class="n">max_rows_in_combined</span> <span class="ow">or</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="n">dtype</span>
+        <span class="c1"># FlashInfer counts preceding positions; M* counts the current token too.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_window_left</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span> <span class="k">if</span> <span class="n">sliding_window</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">sliding_window</span> <span class="o">-</span> <span class="mi">1</span>
 
         <span class="c1"># label to plan state</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1103,6 +1106,8 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.plan">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
         <span class="n">refuse_context_only</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_window_left</span> <span class="o">&gt;=</span> <span class="mi">0</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"sliding_window requires causal attention"</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">reset_default_cursors</span><span class="p">()</span>
         <span class="n">lease</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span>
         <span class="k">assert</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="ow">or</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="p">(</span>
@@ -1144,6 +1149,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
                 <span class="n">causal</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
                 <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
+                <span class="n">window_left</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_window_left</span><span class="p">,</span>
                 <span class="o">**</span><span class="n">indptrs</span><span class="o">.</span><span class="n">to_kwargs_dict</span><span class="p">()</span>
             <span class="p">)</span>
             <span class="n">plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>

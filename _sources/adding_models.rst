@@ -521,6 +521,9 @@ The spec types are:
        the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
        fallback, which cannot be captured in a CUDA graph.
+       ``sliding_window=N`` lets each query attend to the last ``N`` positions, its
+       own included. It needs the FlashInfer backend and causal attention, and the
+       pages behind the window stay allocated.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.

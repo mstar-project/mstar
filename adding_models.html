@@ -1185,7 +1185,10 @@ refuse. Its <code class="docutils literal notranslate"><span class="pre">run</sp
 with the rope part as <code class="docutils literal notranslate"><span class="pre">q_pe</span></code>, and returns the output in the latent space, so
 the layer applies <code class="docutils literal notranslate"><span class="pre">W_UV</span></code>. FlashInfer’s kernel covers a 512-wide latent with a
 64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
-fallback, which cannot be captured in a CUDA graph.</p></td>
+fallback, which cannot be captured in a CUDA graph.
+<code class="docutils literal notranslate"><span class="pre">sliding_window=N</span></code> lets each query attend to the last <code class="docutils literal notranslate"><span class="pre">N</span></code> positions, its
+own included. It needs the FlashInfer backend and causal attention, and the
+pages behind the window stay allocated.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
 <td><p>Attention over a paged context that is written once and never extended.

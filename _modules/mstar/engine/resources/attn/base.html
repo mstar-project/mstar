@@ -999,10 +999,15 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager.build">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">build</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">AttentionSpec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">):</span>
+        <span class="n">backend</span> <span class="o">=</span> <span class="n">resolve_attn_backend</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sliding_window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">backend</span> <span class="o">!=</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"sliding_window is unsupported for attention backend </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">; "</span>
+                <span class="s2">"use the flashinfer backend"</span>
+            <span class="p">)</span>
         <span class="c1"># the KV resource's own config, not a copy; per-rank head counts, and</span>
         <span class="c1"># `shard` is idempotent so both builders can call it</span>
         <span class="n">kv_config</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">dependency</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">)</span><span class="o">.</span><span class="n">config</span>
-        <span class="n">backend</span> <span class="o">=</span> <span class="n">resolve_attn_backend</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
         <span class="c1"># Before `shard`, so a mismatch is reported rather than half-applied to</span>
         <span class="c1"># a config the KV resource also holds.</span>
         <span class="k">if</span> <span class="n">backend</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_BACKEND_KV_CONFIG</span><span class="p">:</span>
@@ -1068,6 +1073,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">backend</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
                 <span class="n">splits</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">splits</span><span class="p">,</span>
                 <span class="n">max_rows_in_combined</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">max_rows_in_combined</span><span class="p">,</span>
+                <span class="n">sliding_window</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sliding_window</span><span class="p">,</span>
             <span class="p">)</span>
 
         <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">FLEX</span><span class="p">:</span>

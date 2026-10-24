@@ -1127,9 +1127,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
         <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
         <span class="n">kv_lens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">window_left</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
         <span class="o">**</span><span class="n">kwargs</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Plan attention and compute KV write indices.</span>
+
+<span class="sd">        ``window_left`` is the number of preceding positions each query sees;</span>
+<span class="sd">        -1 is unbounded.</span>
 
 <span class="sd">        In CUDA graph mode, updates static buffers via .copy_() so that</span>
 <span class="sd">        the same GPU addresses are used during graph replay.</span>
@@ -1169,6 +1173,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">q_data_type</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
             <span class="c1"># host lengths, so plan neither rebuilds them nor copies pageable ones</span>
             <span class="n">seq_lens</span><span class="o">=</span><span class="n">kv_lens</span><span class="p">,</span>
+            <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_done</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># every copy out of the staging buffers is issued: the next</span>
@@ -1291,6 +1296,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">paged_kv_last_page_len</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
         <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
         <span class="n">kv_lens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">window_left</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
         <span class="o">**</span><span class="n">kwargs</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Plan decode attention and compute KV write locations.</span>
@@ -1298,6 +1304,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        For decode, each request appends exactly 1 token. The write</span>
 <span class="sd">        location is the last page at position = last_page_len (before</span>
 <span class="sd">        the append; after append it becomes last_page_len).</span>
+<span class="sd">        ``window_left`` is as in the prefill wrapper's ``plan``.</span>
 
 <span class="sd">        Inputs may be on CPU; see prefill wrapper's plan docstring.</span>
 <span class="sd">        """</span>
@@ -1331,6 +1338,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">q_data_type</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
                 <span class="c1"># host lengths, so plan skips rebuilding them (`get_seq_lens`)</span>
                 <span class="n">seq_lens</span><span class="o">=</span><span class="n">kv_lens</span><span class="p">,</span>
+                <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">finally</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_nvtx</span><span class="p">:</span>
@@ -1446,6 +1454,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">causal</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
         <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
         <span class="n">kv_lens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">window_left</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span>
         <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="n">HostLens</span>
@@ -1537,7 +1546,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">paged_kv_indices</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_indices"</span><span class="p">,</span> <span class="n">d_indices</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
             <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_last"</span><span class="p">,</span> <span class="n">d_last</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">),</span>
             <span class="n">kv_lens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin</span><span class="p">(</span><span class="s2">"d_lens"</span><span class="p">,</span> <span class="n">d_lens</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">),</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prefill</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
             <span class="n">qo_indptr</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_qo</span><span class="p">),</span>
@@ -1545,7 +1554,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">paged_kv_indices</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_idx</span><span class="p">),</span>
             <span class="n">paged_kv_last_page_len</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_last</span><span class="p">),</span>
             <span class="n">kv_lens</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">p_lens</span><span class="p">)</span><span class="o">.</span><span class="n">as_subclass</span><span class="p">(</span><span class="n">HostLens</span><span class="p">),</span>
-            <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">causal</span><span class="o">=</span><span class="n">causal</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="o">=</span><span class="n">window_left</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_done</span><span class="o">.</span><span class="n">record</span><span class="p">()</span></div>
 
