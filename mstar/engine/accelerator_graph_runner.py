@@ -2191,6 +2191,7 @@ class PiecewiseAcceleratorGraphRunner:
         Copies each real input into the runner-owned buffer of the same name,
         declares and plans the region's step over the padded batch, replays,
         then commits and returns the padded buffers behind a real-length view.
+        An input its buffer may round is refused.
 
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
@@ -2233,6 +2234,18 @@ class PiecewiseAcceleratorGraphRunner:
             buffer = data.static_inputs.get(name)
             if buffer is None or not isinstance(value, torch.Tensor):
                 continue
+            # the copy casts silently: into a wider float or a wider int it is
+            # exact, but narrowing, or an integer into a float or complex, can round
+            if torch.promote_types(value.dtype, buffer.dtype) != buffer.dtype or (
+                (buffer.dtype.is_floating_point or buffer.dtype.is_complex)
+                and not (value.dtype.is_floating_point or value.dtype.is_complex)
+                and value.dtype != torch.bool
+            ):
+                raise ValueError(
+                    f"piecewise {self._label!r}: buffer {name!r} ({buffer.dtype}) would round "
+                    f"its {value.dtype} input; allocate it in the input's dtype in "
+                    "make_static_inputs"
+                )
             n = value.shape[0]
             buffer[:n].copy_(value)
             if n < buffer.shape[0]:
