@@ -443,7 +443,6 @@ class HiggsAudio(Model):
 
 
 class ModelType(Enum):
-    PERSONAPLEX = "personaplex"
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     KOKORO = "kokoro"
@@ -458,10 +457,9 @@ class ModelType(Enum):
     HIGGS_AUDIO = "higgs_audio"
     QWEN3_5 = "qwen3.5"
     QWEN3_8 = "qwen3.8"
+    PERSONAPLEX = "personaplex"
 
     def inst(self, **kwargs) -> Model:
-        if self == ModelType.PERSONAPLEX:
-            return PersonaPlex(**kwargs)
         if self == ModelType.BAGEL:
             return Bagel(**kwargs)
         if self == ModelType.ORPHEUS:
@@ -490,4 +488,6 @@ class ModelType(Enum):
             return Qwen3_5_Dense(**kwargs)
         if self == ModelType.QWEN3_8:
             return Qwen3_8_Dense(**kwargs)
+        if self == ModelType.PERSONAPLEX:
+            return PersonaPlex(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")
