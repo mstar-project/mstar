@@ -12,6 +12,7 @@ CPU-only head-dimension validation lives in ``test_ragged_attention_cpu.py``.
 
 from __future__ import annotations
 
+import functools
 import sys
 
 sys.path.insert(0, ".")
@@ -320,6 +321,68 @@ def test_shards_head_counts_at_build():
     assert mgr._kwargs["num_qo_heads"] == HEADS // 2
     # head_dim never shards
     assert mgr._kwargs["head_dim"] == HEAD_DIM
+
+
+@pytest.mark.parametrize("compile_op", [True, False])
+def test_compiled_caller_keeps_attention_in_its_graph(compile_op):
+    """With ``compile_op``, the resource's ``run`` traces as one custom op: the region
+    keeps one graph around it and computes what eager does. Without it (the default)
+    the region breaks at the attention."""
+    mgr = manager(compile_op=compile_op)
+    spans = [128, 96]
+    mgr.plan(step(*spans), ctx(["r0", "r1"]))
+    q, k, v = qkv(sum(spans))
+    fn = functools.partial(mgr.run, label="main")
+
+    def region(q, k, v):
+        return fn(q * 1.0, k, v) + 1.0
+
+    torch._dynamo.reset()
+    explain = torch._dynamo.explain(region)(q, k, v)
+    assert (explain.graph_break_count == 0) is compile_op
+    close(torch.compile(region)(q, k, v), region(q, k, v))
+
+
+def test_callable_built_inside_a_compiled_region():
+    """A node that builds its callables lazily on first forward does so inside
+    the compiled region; later calls still reach the resource."""
+    mgr = manager(compile_op=True)
+    spans = [128, 96]
+    mgr.plan(step(*spans), ctx(["r0", "r1"]))
+    q, k, v = qkv(sum(spans))
+    fns: dict[int, functools.partial] = {}
+
+    def region(q, k, v):
+        fn = fns.get(id(mgr))
+        if fn is None:
+            fn = fns[id(mgr)] = functools.partial(mgr.run, label="main")
+        return fn(q, k, v) + 1.0
+
+    torch._dynamo.reset()
+    compiled = torch.compile(region)
+    expected = mgr.run(q, k, v, label="main") + 1.0
+    for _ in range(2):
+        close(compiled(q, k, v), expected)
+
+
+def test_a_compiled_region_attends_through_a_rebuilt_resource():
+    """The op names its manager by resource key: after the resource is rebuilt under
+    the same key, a region compiled against the old one attends through the new one's
+    plan, not the old one's."""
+    q, k, v = qkv(224)
+
+    def region(fn, q, k, v):
+        return fn(q, k, v) + 1.0
+
+    torch._dynamo.reset()
+    compiled = torch.compile(region)
+    old = manager(compile_op=True)
+    old.plan(step(128, 96), ctx(["r0", "r1"]))
+    close(compiled(functools.partial(old.run, label="main"), q, k, v), ref(q, k, v, cu([128, 96])) + 1.0)
+
+    rebuilt = manager(compile_op=True)
+    rebuilt.plan(step(64, 160), ctx(["r0", "r1"]))
+    close(compiled(functools.partial(rebuilt.run, label="main"), q, k, v), ref(q, k, v, cu([64, 160])) + 1.0)
 
 
 def test_plan_then_run_matches_reference():

@@ -13,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 
@@ -27,10 +28,33 @@ class HostRows(NamedTuple):
     buffers: dict[str, torch.Tensor]
 
 
+class TokenStop(NamedTuple):
+    """When an AR submodule's sampled token ends its decode loop: on a stop
+    id (unless the request's sampler config sets ``ignore_eos``), or once
+    the request has generated ``max_tokens`` tokens.
+
+    Declared as ``ARNodeSubmodule.token_stop``; ``check_stop`` and
+    ``check_stop_batched`` follow from it.
+    """
+
+    loop: str
+    # the output (and ``check_stop_buffers`` entry) holding the step's token
+    buffer: str
+    stop_ids: frozenset[int]
+    # resource key of the sampler whose request config carries ``ignore_eos``
+    sampler: str
+    # the only walk whose rows can stop the loop; None for every walk
+    walk: str | None = None
+    # request-state key counting the tokens generated so far; None counts
+    # the loop's iterations, plus the token this step sampled
+    generated_key: str | None = None
+
+
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.resources.sampler.resource import SamplerResource
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
@@ -583,8 +607,25 @@ class NodeSubmodule(torch.nn.Module, ABC):
             state = self.request_states[request_id] = PerRequestState()
         return state
 
+    # Cached: prepare_inputs and preprocess ask per row per step, and finding
+    # a parameter walks the module tree. Set by ``_apply`` (``.to()``,
+    # ``.cuda()``, ``to_empty()``), which the engine runs on every submodule at
+    # load, and never on read, so a compiled forward that asks doesn't see it
+    # change between calls. ``load_state_dict(assign=True)`` and reassigning a
+    # parameter don't update it; the engine's ``.to()`` after them does.
+    _device_cache: torch.device | None = None
+
     def get_device(self):
-        return next(self.parameters()).device
+        device = self._device_cache
+        if device is None:
+            device = next(self.parameters()).device
+        return device
+
+    def _apply(self, fn, *args, **kwargs):
+        module = super()._apply(fn, *args, **kwargs)
+        param = next(self.parameters(), None)
+        self._device_cache = None if param is None else param.device
+        return module
 
     @abstractmethod
     def prepare_inputs(
@@ -978,6 +1019,75 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 
 class ARNodeSubmodule(NodeSubmodule):
+    # Set (in ``__init__``, where the stop ids are known) by a submodule whose
+    # sampled token ends a dynamic loop; the stop checks below follow from it.
+    token_stop: TokenStop | None = None
+
+    def check_stop(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> set[str]:
+        stop = self.token_stop
+        if stop is None:
+            return super().check_stop(request_id, request_info, outputs)
+        if (stop.walk is not None and request_info.graph_walk != stop.walk) or stop.buffer not in outputs:
+            return set()
+        token = outputs[stop.buffer][0].item()
+        return self._token_stops(((request_id, token),), {request_id: request_info}, False).get(request_id, set())
+
+    def check_stop_batched(
+        self, request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
+    ) -> dict[str, set[str]] | None:
+        stop = self.token_stop
+        if stop is None:
+            return super().check_stop_batched(request_ids, request_infos, host_rows, step_walk)
+        if stop.walk is not None and step_walk is not None and step_walk != stop.walk:
+            return {}
+        tokens = host_rows.buffers.get(stop.buffer)
+        if not torch.is_tensor(tokens) or tokens.dim() == 0:
+            return None
+        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
+        rows = host_rows.request_ids
+        if len(rows) >= len(request_ids) and all(
+            a == b for a, b in zip(request_ids, rows, strict=False)
+        ):
+            # the common case: the batch in forward order, no row map needed
+            pairs = zip(request_ids, values, strict=False)
+        else:
+            row_of = {rid: i for i, rid in enumerate(rows)}
+            pairs = (
+                (rid, values[i]) for rid in request_ids
+                if (i := row_of.get(rid)) is not None and i < len(values)
+            )  # no row, no output: the per-request path skips it too
+        # a mixed step reads each row's walk; a step of one walk need not
+        return self._token_stops(pairs, request_infos, stop.walk is not None and step_walk is None)
+
+    def _token_stops(self, pairs, request_infos, check_walk: bool) -> dict[str, set[str]]:
+        """Both stop checks' verdict on ``(rid, token)`` pairs."""
+        stop = self.token_stop
+        stop_ids, loop, key = stop.stop_ids, stop.loop, stop.generated_key
+        stops: dict[str, set[str]] = {}
+        for rid, token in pairs:
+            info = request_infos[rid]
+            if check_walk and info.graph_walk != stop.walk:
+                continue
+            # the set test first: a stop id is rare, and the config read
+            # behind it goes through the info wrapper
+            if token in stop_ids and not info.resource_configs[stop.sampler].ignore_eos:
+                stops[rid] = {loop}
+                continue
+            generated = (
+                info.dynamic_loop_iter_counts.get(loop, 0) + 1 if key is None
+                else int(self.request_state(rid).get(key, 0))
+            )
+            if generated >= info.max_tokens:
+                stops[rid] = {loop}
+        return stops
+
     def split_inputs(
         self,
         graph_walk: str,
@@ -1041,3 +1151,24 @@ class ARNodeSubmodule(NodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
         pass
+
+    @staticmethod
+    def loopback_input_ids(
+        sampler: SamplerResource, request_ids: list[str], inputs: Sequence[ARNodeInputs],
+    ) -> torch.Tensor:
+        """A device loop-back decode step's input ids: each row's last sampled
+        token, read off the sampler on the device, except where a row brought
+        its own (its previous step ran elsewhere, e.g. the prefill)."""
+        ids = sampler.loopback_tokens(request_ids)
+        routed = [
+            i for i, inp in enumerate(inputs)
+            if inp.input_ids is not None and inp.input_seq_len
+        ]
+        if routed:
+            # every request's first decode step after its prefill comes here,
+            # so the row index goes up without a blocking copy
+            ids.index_copy_(
+                0, to_device_nonblocking(torch.tensor(routed, dtype=torch.long), ids.device),
+                torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
+            )
+        return ids

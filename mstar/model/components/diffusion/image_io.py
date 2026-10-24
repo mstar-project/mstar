@@ -146,6 +146,18 @@ def _zlib_parallel(data: bytes, level: int, workers: int, min_block: int = 1 << 
 OUTPUT_FORMATS = ("png", "jpeg", "webp")
 
 
+def image_output_format(request_kwargs: dict | None) -> str:
+    """The request's ``output_format`` (default ``png``; ``jpg`` means ``jpeg``), or ValueError
+    for one :func:`encode_image` cannot write. A model calls it at intake too, so a bad value
+    fails the request before generation rather than after."""
+    fmt = str((request_kwargs or {}).get("output_format") or "png").lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    if fmt not in OUTPUT_FORMATS:
+        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, got {fmt!r}")
+    return fmt
+
+
 def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> bytes:
     """Encode a uint8 ``[3, H, W]`` image for the client per the OpenAI images knobs.
 
@@ -155,11 +167,7 @@ def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> byt
     Everything else decodes to the pixels the VAE produced (PNG losslessly).
     """
     kwargs = request_kwargs or {}
-    fmt = str(kwargs.get("output_format") or "png").lower()
-    if fmt == "jpg":
-        fmt = "jpeg"
-    if fmt not in OUTPUT_FORMATS:
-        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, got {fmt!r}")
+    fmt = image_output_format(kwargs)
     if fmt == "png":
         return uint8_to_png(image, compress_level=int(kwargs.get("png_compress_level", 1)))
     from PIL import Image

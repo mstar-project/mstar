@@ -147,3 +147,57 @@ def test_hf_file_references_resolve_from_the_cache(monkeypatch) -> None:
     # a malformed reference is a failed warmup, not a crash
     entrypoint._run_warmup_requests(fake, [{"files": ["hf://nvidia.jpg"], "output_modalities": ["video"]}])
     assert len(fake.submitted) == 1
+
+
+def test_warmup_reaches_every_data_parallel_replica() -> None:
+    """One concurrent copy of each warmup per replica, so the conductor's
+    least-loaded placement warms every replica, not a random one."""
+    config = {"node_groups": [
+        {"node_names": ["dit", "vae_decoder"], "ranks": [0, 1]},
+        {"node_names": ["text_encoder"], "ranks": [0]},
+    ]}
+    assert entrypoint._data_parallel_replicas(config) == 2
+    # a lockstep instance is one replica
+    assert entrypoint._data_parallel_replicas({"node_groups": [{"ranks": [0, 1], "sp_size": 2}]}) == 1
+    assert entrypoint._data_parallel_replicas({"node_groups": [{"ranks": [0, 1, 2, 3], "tp_size": 2}]}) == 2
+    fake = _FakeServer()
+    entrypoint._run_warmup_requests(fake, [{"text": "a"}, {"text": "b"}], copies=2)
+    assert [s["request_id"] for s in fake.submitted] == ["warmup-0", "warmup-0-1", "warmup-1", "warmup-1-1"]
+
+
+def test_concurrency_runs_copies_together_for_batched_shapes() -> None:
+    """``concurrency: N`` submits N copies at once (times the replica count), so
+    a step compiled per batch size sees that batch before the bind."""
+    fake = _FakeServer()
+    entrypoint._run_warmup_requests(fake, [{"text": "a", "concurrency": 3}], copies=2)
+    assert [s["request_id"] for s in fake.submitted] == [f"warmup-0{s}" for s in ("", "-1", "-2", "-3", "-4", "-5")]
+    # a list runs one warmup per batch size, in order, each under its own ids
+    fake = _FakeServer()
+    entrypoint._run_warmup_requests(fake, [{"text": "a", "concurrency": [1, 2]}])
+    assert [s["request_id"] for s in fake.submitted] == ["warmup-0", "warmup-0.1", "warmup-0.1-1"]
+    fake = _FakeServer()
+    entrypoint._run_warmup_requests(fake, [
+        {"text": "a", "concurrency": 0}, {"text": "b", "concurrency": True},
+        {"text": "c", "concurrency": []}, {"text": "d", "concurrency": [2, 0]},
+    ])
+    assert fake.submitted == []
+
+
+def test_a_failing_copy_lets_its_siblings_finish(caplog) -> None:
+    """One copy failing early is reported after the others end, rather than
+    cancelling them mid-request."""
+    import asyncio
+
+    class _SlowServer(_FakeServer):
+        async def collect_results(self, request_id, raw_request=None):
+            if request_id == "warmup-0":
+                raise RuntimeError("compile blew up")
+            await asyncio.sleep(0.01)
+            self.collected.append(request_id)
+            return []
+
+    fake = _SlowServer()
+    with caplog.at_level(logging.WARNING):
+        entrypoint._run_warmup_requests(fake, [{"text": "a", "concurrency": 3}])
+    assert sorted(fake.collected) == ["warmup-0-1", "warmup-0-2"]
+    assert "warmup request 1/1 failed" in caplog.text

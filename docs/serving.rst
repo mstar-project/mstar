@@ -261,8 +261,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
        comes from the extension, or give ``{path: ..., modality: ...}``.
        ``repeat: N`` sends ``text`` N times over, a long prompt for a path only
-       long prompts take (a long-context prefill). A malformed or failing warmup
-       is logged and skipped.
+       long prompts take (a long-context prefill). ``concurrency: N`` submits N
+       copies at once, so they batch, for a step that compiles per batch size; a
+       list (``concurrency: [1, 2, 4]``) runs the entry once per size, in order. A
+       malformed or failing warmup is logged and skipped.
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
        subgroups during weight load and warmup; serving keeps PyTorch's default.
@@ -284,6 +286,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Largest message, in KiB, the symmetric-memory path takes;
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
+   * - ``api_switch_interval_s``
+     - *(optional)* GIL switch interval of the API server process, in seconds
+       (``sys.setswitchinterval``); unset keeps Python's 5 ms. Under streaming load
+       that process keeps three threads busy (event loop, message thread, data
+       worker), and a shorter interval hands the GIL between them sooner. The
+       Qwen3.5 configs set ``0.001``: Qwen3.5-0.8B text, c=64, +4 to +8% tok/s. A
+       model whose preprocessing runs long on the data-worker thread can lose from
+       it (Kokoro's G2P: about -3.6% at c=32), so it is per deployment.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
        (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which

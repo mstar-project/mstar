@@ -15,6 +15,11 @@ from contextvars import ContextVar
 
 import torch
 
+# FFmpeg threads per video decode. torchcodec decodes single-threaded by
+# default, which dominates a long clip's request latency; frame threading is
+# bit-identical. Capped so concurrent requests don't oversubscribe the host.
+VIDEO_DECODE_THREADS = min(8, os.cpu_count() or 1)
+
 # PIL's DecompressionBombWarning threshold (about 9459 x 9459 RGB)
 DEFAULT_MAX_IMAGE_PIXELS = 89_478_485
 # about 39 s of 720p30, or 2.6 min of 640x360 at 30 fps, decoded at once: a

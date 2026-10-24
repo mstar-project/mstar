@@ -17,7 +17,6 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mstar.engine.resources.convenience import RaggedAttentionCallable  # noqa: E402
 from mstar.model.components.diffusion.denoise_loop import (  # noqa: E402
     LATENTS,
     DenoiseLoopSubmodule,
@@ -397,25 +396,22 @@ def test_a_step_scalar_too_short_for_its_offset_says_so():
 def test_ragged_for_binds_the_label():
     class Resource:
         def run(self, q, k, v, label=None):
-            return label
+            return self, label
 
     sub = TwoSpanDenoise(attn_resource_key="dit_attn")
     resource = Resource()
     sub.bind_node_resources({"dit_attn": resource})
     image = sub.ragged_for("image")
-    assert isinstance(image, RaggedAttentionCallable)
-    assert image.attn is resource and image.label == "image"
-    assert image(None, None, None) == "image"
-    assert sub._ragged()(None, None, None) == "main"
-    # one callable object per label, so a compiled region's identity guards hold across steps
+    assert image(None, None, None) == (resource, "image")
+    assert sub._ragged()(None, None, None) == (resource, "main")
+    # built once per label for the binding, not per step
     assert sub.ragged_for("image") is image and sub._ragged() is sub._ragged()
     # a rebinding starts over: a callable holding the old resource would attend
     # through a plan nothing writes to any more
     new_resource = Resource()
     sub.bind_node_resources({"dit_attn": new_resource})
-    assert sub.ragged_for("image") is not image
-    assert sub.ragged_for("image").attn is new_resource
-    assert sub.ragged_for("main")(None, None, None) == "main"
+    assert sub.ragged_for("image")(None, None, None) == (new_resource, "image")
+    assert sub.ragged_for("main")(None, None, None) == (new_resource, "main")
     assert ToyDenoise().ragged_for("image") is None  # no resource declared -> SDPA
     unbound = TwoSpanDenoise(attn_resource_key="dit_attn")
     assert unbound.ragged_for("image") is None  # declared but not bound yet -> SDPA

@@ -28,7 +28,7 @@ def resolve_ragged_attn_backend(
 
 def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
     config = spec.config
-    if info.joint_comm_group is not None:
+    if info.joint_comm_group is not None and config.shard_heads:
         config.shard(info.joint_comm_group.world_size)
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
@@ -37,7 +37,9 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
             "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
             "(the engine has no KV dtype to fall back on)."
         )
-    return manager_cls(device=info.device, dtype=dtype, config=config, **kwargs)
+    return manager_cls(
+        device=info.device, dtype=dtype, config=config, key=spec.resource_key, **kwargs,
+    )
 
 
 class RaggedAttnManager(AttentionResource):

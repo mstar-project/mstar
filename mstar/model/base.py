@@ -29,7 +29,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
     top_level_entities,
 )
-from mstar.model.media_limits import VideoBudget, read_image
+from mstar.model.media_limits import VIDEO_DECODE_THREADS, VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
 
 DECODE = "decode"
@@ -870,7 +870,7 @@ class Model(ABC):
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device)
+        decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=VIDEO_DECODE_THREADS)
         budget = VideoBudget()
         frames = []
         for frame in decoder:

@@ -25,6 +25,31 @@ from mstar.engine.resources.attn.ragged.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 
+# Managers by resource key, which is how the custom op below names one: an op
+# takes tensors and scalars, not objects. The key is unique within the worker's
+# engine, so a rebuilt resource replaces its entry, and a compiled graph, which
+# bakes the key in as a constant, reaches the new manager without recompiling.
+_MANAGERS: dict[str, "_FlashInferRaggedBase"] = {}
+
+
+@torch.library.custom_op("mstar::ragged_attention", mutates_args=())
+def ragged_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, key: str, label: str | None,
+) -> torch.Tensor:
+    """``_MANAGERS[key].run(q, k, v, label)`` as one node of a compiled graph.
+
+    Contract: returns a fresh tensor shaped like ``q`` in the manager's dtype,
+    and mutates no argument. The wrapper's output is a new allocation, or a
+    clone of the graph-mode buffer the next call overwrites, so it aliases
+    neither an input nor anything a later call writes.
+    """
+    return _MANAGERS[key]._wrapper(label).run(q, k, v)
+
+
+@ragged_attention.register_fake
+def _(q, k, v, key, label):
+    return q.new_empty(q.shape, dtype=_MANAGERS[key]._dtype)
+
 
 class _FlashInferRaggedBase:
     """What the self- and cross-attention managers share: persistent wrappers per
@@ -38,7 +63,10 @@ class _FlashInferRaggedBase:
         device: torch.device,
         dtype: torch.dtype,
         config: RaggedAttentionConfig,
+        key: str,
     ):
+        self._key = key
+        _MANAGERS[key] = self
         self._config = config
         self._device = device
         self._dtype = dtype
@@ -218,18 +246,23 @@ class _FlashInferRaggedBase:
             )
         return wrapper
 
-    @torch.compiler.disable
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         label: str | None = None,
     ) -> torch.Tensor:
         """One layer's attention through the plan for ``label``.
 
-        Not behind a custom op, unlike the paged backend's ``run``: the ragged
-        caller (an encoder tower) has no per-layer KV write to keep in the same
-        graph, so the break this costs is one per layer of a region that is
-        CUDA-graph captured rather than compiled.
+        Traced by ``torch.compile`` with ``config.compile_op``, this is the
+        ``mstar::ragged_attention`` op: the region keeps one graph, and Inductor
+        fuses the pointwise work on either side of the attention. Otherwise a
+        compiled caller breaks here, and an eager one calls the kernel directly.
         """
+        if self._config.compile_op and torch.compiler.is_compiling():
+            return ragged_attention(q, k, v, self._key, label)
+        return self._run(q, k, v, label)
+
+    @torch.compiler.disable
+    def _run(self, q, k, v, label):
         return self._wrapper(label).run(q, k, v)
 
 
@@ -283,9 +316,10 @@ class FlashInferRaggedBlockCausalManager(_FlashInferRaggedBase, RaggedBlockCausa
         device: torch.device,
         dtype: torch.dtype,
         config: RaggedAttentionConfig,
+        key: str,
         block_size: int,
     ):
-        super().__init__(device=device, dtype=dtype, config=config)
+        super().__init__(device=device, dtype=dtype, config=config, key=key)
         self._kwargs["block_size"] = block_size
 
     def plan(self, step: AttentionStep, ctx: StepContext):

@@ -1549,7 +1549,7 @@ class Engine:
             # a batch the region refuses runs it eagerly, with no slot
             if not runner.lease_before_step or not runner.can_lease(inputs):
                 continue
-            lease = runner.lease_slot(bs, total_tokens)
+            lease = runner.lease_slot(1 if runner.one_row_per_step else bs, total_tokens)
             if lease is not None:
                 leases[label] = lease
         if leases:

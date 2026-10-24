@@ -558,7 +558,9 @@ def _dit_step_timestamps(log_text: str, request_ids: set[str]) -> list[float]:
             batch = ast.literal_eval(line.split(marker, 1)[1].strip())
         except (SyntaxError, ValueError):
             continue
-        if not isinstance(batch, (list, tuple)) or not any(rid in request_ids for rid in batch):
+        if not isinstance(batch, (list, tuple)) or not any(
+            str(rid).split("#", 1)[0] in request_ids for rid in batch
+        ):
             continue
         match = _LOG_TIMESTAMP_RE.match(line)
         if match is None:

@@ -53,3 +53,35 @@ def test_to_on_meta_is_in_place_and_zero_alloc():
     assert ret is m
     assert all(p.is_meta for p in m.parameters())
     assert all(p.dtype == torch.bfloat16 for p in m.parameters())
+
+
+def test_submodule_device_follows_materialisation():
+    """``NodeSubmodule.get_device`` is cached by a move, which updates it, and a
+    compiled forward that asks for it doesn't recompile on its second call."""
+    from torch._dynamo.utils import counters
+
+    from mstar.model.submodule_base import NodeSubmodule
+
+    class _Sub(NodeSubmodule):
+        def __init__(self):
+            super().__init__()
+            with torch.device("meta"):
+                self.layer = nn.Linear(2, 2)
+
+        def prepare_inputs(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def forward(self, x):
+            return self.layer(x) + torch.ones(2, device=self.get_device())
+
+    sub = _Sub()
+    assert sub.get_device().type == "meta"
+    sub.to_empty(device="cpu")
+
+    torch._dynamo.reset()
+    counters.clear()
+    forward = torch.compile(sub.forward, backend="eager")
+    for _ in range(2):
+        forward(torch.randn(3, 2))
+    assert counters["stats"]["unique_graphs"] == 1
+    assert sub.get_device().type == "cpu"

@@ -1,4 +1,5 @@
-"""Ragged attention head-dimension padding checks that need no GPU."""
+"""Ragged attention checks that need no GPU: head-dimension padding and head
+sharding."""
 
 import sys
 from types import SimpleNamespace
@@ -114,3 +115,23 @@ def test_mixed_wrapper_builds_both_halves_in_graph_mode(monkeypatch):
     assert mixed._prefill.batch_size == 3
     assert decode.call_args.kwargs["use_cuda_graph"] is True
     assert prefill.call_args.kwargs["use_cuda_graph"] is True
+
+
+@pytest.mark.parametrize("shard_heads,expected", [(True, 2), (False, 4)])
+def test_shard_heads_false_keeps_every_head(shard_heads, expected):
+    """A node whose ranks split something other than heads (guidance branches)
+    keeps the full head count on every rank."""
+    from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+
+    spec = RaggedAttentionSpec(
+        resource_key="ragged", nodes={"encoder"},
+        config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=72, shard_heads=shard_heads),
+    )
+    mgr = build_resource(
+        spec,
+        EngineResourceInfo(
+            device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=SimpleNamespace(world_size=2),
+        ),
+    )
+    assert mgr._kwargs["num_qo_heads"] == expected

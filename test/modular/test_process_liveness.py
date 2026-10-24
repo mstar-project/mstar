@@ -12,6 +12,7 @@ import queue
 import signal
 import threading
 import time
+from collections import Counter
 from types import SimpleNamespace
 from unittest import mock
 
@@ -104,6 +105,7 @@ def _conductor(procs, inbox=()):
     c._next_liveness_check = 0.0
     c.requests = {}
     c.draining = {}
+    c._worker_load = Counter()
     c.waiting_queue = []
     return c
 

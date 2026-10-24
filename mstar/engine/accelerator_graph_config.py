@@ -299,6 +299,11 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # (`ModelInputsFromEngine.step` is the declaration that tells it so).
     # None: every batch that fits a bucket.
     can_lease: Callable[[list[NodeInputs]], bool] | None = None
+    # The region replays a whole step as ONE row, however many requests the
+    # step carries (a vision tower packing every request's images as segments
+    # of one ragged batch), so its slot is leased at batch size 1. Only for a
+    # packed `lease_before_step` region captured at batch size 1 alone.
+    one_row_per_step: bool = False
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
     # None => defer to the runner's default batch-size buckets
@@ -312,6 +317,15 @@ class PiecewiseAcceleratorGraphConfig(ABC):
 
     def __post_init__(self):
         check_compile_mode(self.compile_mode)
+        if self.one_row_per_step and (
+            self.get_config_type() is not PiecewiseConfigType.PACKED
+            or not self.lease_before_step
+            or list(self.capture_batch_sizes or ()) != [1]
+        ):
+            raise ValueError(
+                "one_row_per_step needs a packed lease_before_step region "
+                "with capture_batch_sizes=[1]"
+            )
 
     @abstractmethod
     def get_config_type(self) -> PiecewiseConfigType:

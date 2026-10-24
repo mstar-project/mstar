@@ -742,7 +742,11 @@ encoder node only, and names no cache:
 
 A layer binds the key as it binds any other resource, then attends through the resource's
 ``run(q, k, v, label=None)``. There is no KV write to pair it with, so no
-``AttentionCallable`` is involved.
+``AttentionCallable`` is involved. A compiled caller breaks at ``run``; with
+``compile_op=True`` in the config, ``run`` traces as the ``mstar::ragged_attention``
+custom op instead, so the region keeps one graph across the attention (worth it for a
+compiled, uncaptured region; it costs startup time and capture memory where the region
+is also captured). An eager call goes straight to the kernel.
 
 The step is an ordinary ``AttentionStep``, and its ``segments`` are the entire layout.
 There is no cache to read the layout off, so a label that carries no segment in the
@@ -770,7 +774,7 @@ step names the ``(q_label, kv_label)`` pairs:
 
 Each pair is planned as its own layout, pairing each request's ``q_label`` span with that
 request's ``kv_label`` span; cross-attention is never causal. A layer attends through
-``RaggedAttentionCallable(resource, cross_label(q_label, kv_label))``, passing the key
+``resource.run(q, k, v, label=cross_label(q_label, kv_label))``, passing the key
 span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model whose
 attentions differ in head count or head dim declares one spec per (kind, geometry).
 LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
@@ -952,7 +956,10 @@ methods are:
 ``check_stop(...) -> set[str]`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
-   terminates.
+   terminates. An AR submodule whose loop ends on a stop token or the token budget sets
+   ``self.token_stop = TokenStop(...)`` in ``__init__`` instead of writing one; that also
+   gives it ``check_stop_batched``, which checks a whole step off one host copy of its
+   tokens.
 
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,
