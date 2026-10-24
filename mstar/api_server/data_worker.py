@@ -162,7 +162,8 @@ def _video_frame_metadata(
 class InlineTokens:
     """One RESULT_TOKENS frame's values for the requests still known here,
     queued behind the tensor results so each request's chunks keep arrival
-    order. One item per frame, not per request."""
+    order. One item per frame, not per request. No loop indices: a chunk's
+    order is its arrival sequence, and nothing reads them."""
     request_ids: list[str]
     values: list[int]
     modality: str
