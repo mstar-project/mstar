@@ -15,95 +15,6 @@ from mstar.utils.fused_moe import MoeAlignment
 
 
 @triton.jit
-def _add_layernorm_kernel(
-    residual_ptr, delta_ptr, weight_ptr, residual_out_ptr, normed_ptr,
-    stride_r, stride_d, stride_ro, stride_n,
-    H: tl.constexpr, BLOCK: tl.constexpr, HAS_DELTA: tl.constexpr, eps,
-):
-    row = tl.program_id(0).to(tl.int64)
-    offs = tl.arange(0, BLOCK)
-    mask = offs < H
-    x = tl.load(residual_ptr + row * stride_r + offs, mask=mask, other=0.0).to(tl.float32)
-    if HAS_DELTA:
-        d = tl.load(delta_ptr + row * stride_d + offs, mask=mask, other=0.0).to(tl.float32)
-        # The eager layer stores the residual sum in bf16 before normalizing it.
-        h = (x + d).to(residual_out_ptr.dtype.element_ty)
-        tl.store(residual_out_ptr + row * stride_ro + offs, h, mask=mask)
-        x = h.to(tl.float32)
-    mean = tl.sum(x, axis=0) / H
-    centered = tl.where(mask, x - mean, 0.0)
-    var = tl.sum(centered * centered, axis=0) / H
-    w = tl.load(weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    y = w * (centered * tl.rsqrt(var + eps))
-    tl.store(normed_ptr + row * stride_n + offs, y.to(normed_ptr.dtype.element_ty), mask=mask)
-
-
-def add_layernorm(
-    residual: torch.Tensor, delta: torch.Tensor | None,
-    weight: torch.Tensor, eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``h = residual + delta`` (bf16), then bias-free LayerNorm of ``h``.
-
-    Returns ``(h, layernorm(h))``. With ``delta=None`` returns
-    ``(residual, layernorm(residual))``.
-    """
-    tokens, hidden = residual.shape
-    normed = torch.empty_like(residual)
-    residual_out = torch.empty_like(residual) if delta is not None else residual
-    if tokens == 0:
-        return residual_out, normed
-    _add_layernorm_kernel[(tokens,)](
-        residual, delta if delta is not None else residual, weight, residual_out, normed,
-        residual.stride(0), (delta if delta is not None else residual).stride(0),
-        residual_out.stride(0), normed.stride(0),
-        H=hidden, BLOCK=triton.next_power_of_2(hidden), HAS_DELTA=delta is not None,
-        eps=eps, num_warps=8,
-    )
-    return residual_out, normed
-
-
-@triton.jit
-def _sigmoid_topk_kernel(
-    logits_ptr, weights_ptr, ids_ptr, stride_l,
-    E: tl.constexpr, K: tl.constexpr, BLOCK_E: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    offs = tl.arange(0, BLOCK_E)
-    logits = tl.load(logits_ptr + row * stride_l + offs, mask=offs < E, other=-float("inf"))
-    logits = logits.to(tl.float32)
-    kk = tl.arange(0, K)
-    top_vals = tl.zeros((K,), dtype=tl.float32)
-    top_ids = tl.zeros((K,), dtype=tl.int32)
-    for i in tl.static_range(K):
-        best = tl.max(logits, axis=0)
-        # lowest index among equal maxima
-        idx = tl.min(tl.where(logits == best, offs, BLOCK_E), axis=0)
-        top_vals = tl.where(kk == i, best, top_vals)
-        top_ids = tl.where(kk == i, idx, top_ids)
-        logits = tl.where(offs == idx, -float("inf"), logits)
-    # Match the eager rounding: bf16 sigmoid, bf16 sum, bf16 quotient.
-    s = tl.sigmoid(top_vals).to(weights_ptr.dtype.element_ty).to(tl.float32)
-    total = tl.sum(s, axis=0).to(weights_ptr.dtype.element_ty).to(tl.float32)
-    w = (s / total).to(weights_ptr.dtype.element_ty)
-    tl.store(weights_ptr + row * K + kk, w)
-    tl.store(ids_ptr + row * K + kk, top_ids)
-
-
-def sigmoid_topk(logits: torch.Tensor, k: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-    """Top-k over router logits, sigmoid, renormalize. Returns ``(weights, int32 ids)``."""
-    tokens, experts = logits.shape
-    assert logits.stride(1) == 1
-    weights = torch.empty((tokens, k), dtype=dtype, device=logits.device)
-    ids = torch.empty((tokens, k), dtype=torch.int32, device=logits.device)
-    if tokens:
-        _sigmoid_topk_kernel[(tokens,)](
-            logits, weights, ids, logits.stride(0),
-            E=experts, K=k, BLOCK_E=triton.next_power_of_2(experts), num_warps=1,
-        )
-    return weights, ids
-
-
-@triton.jit
 def _route_align_kernel(
     logits_ptr, weights_ptr, ids_ptr, sorted_ptr, expert_ids_ptr, post_pad_ptr,
     T, stride_l,
@@ -160,7 +71,8 @@ ROUTE_ALIGN_MAX_SLOTS = 128
 def route_align(
     logits: torch.Tensor, k: int, block_m: int, dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, MoeAlignment]:
-    """``sigmoid_topk`` plus ``moe_align_block_size`` in one single-program kernel.
+    """Sigmoid top-k routing (renormalized, bf16 like the eager router) plus
+    ``moe_align_block_size`` in one single-program kernel.
 
     Returns ``(weights, ids, alignment)``.
     The alignment buffers are sized for at most ``min(E, slots)`` active

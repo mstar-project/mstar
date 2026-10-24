@@ -14,11 +14,11 @@ import torch.nn.functional as F
 
 from mstar.model.command_a_plus.components.language_model import (
     CommandAPlusLanguageModel,
-    CommandAPlusLayerNorm,
     CommandAPlusRouter,
 )
 from mstar.model.command_a_plus.config import CommandAPlusConfig
 from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources, dense_reference
+from mstar.model.components.norm import BiasFreeLayerNorm
 
 CUDA = torch.cuda.is_available()
 
@@ -31,24 +31,22 @@ class FusedKernelTests(unittest.TestCase):
     def randn(self, *shape, scale=1.0):
         return torch.randn(*shape, generator=self.generator, device="cuda") * scale
 
-    def test_add_layernorm_matches_eager(self):
-        from mstar.model.command_a_plus.kernels import add_layernorm
-
-        norm = CommandAPlusLayerNorm(4096, eps=1e-5).cuda().to(torch.bfloat16)
+    def test_add_forward_matches_eager(self):
+        norm = BiasFreeLayerNorm(4096, eps=1e-5).cuda().to(torch.bfloat16)
         with torch.no_grad():
             norm.weight.copy_(1 + self.randn(4096, scale=0.1))
         for tokens in (1, 3, 64):
             x = self.randn(tokens, 4096, scale=3).to(torch.bfloat16)
             d = self.randn(tokens, 4096, scale=3).to(torch.bfloat16)
-            h, y = add_layernorm(x, d, norm.weight, norm.eps)
+            h, y = norm.add_forward(x, d)
             torch.testing.assert_close(h, x + d, atol=0, rtol=0)
             torch.testing.assert_close(y, norm(x + d), atol=2e-2, rtol=1e-2)
-            same, y0 = add_layernorm(x, None, norm.weight, norm.eps)
+            same, y0 = norm.add_forward(x, None)
             self.assertIs(same, x)
             torch.testing.assert_close(y0, norm(x), atol=2e-2, rtol=1e-2)
 
-    def test_sigmoid_topk_matches_router(self):
-        from mstar.model.command_a_plus.kernels import sigmoid_topk
+    def test_router_topk_without_bias_matches_router(self):
+        from mstar.utils.fused_moe.decode import router_topk
 
         router = CommandAPlusRouter(4096, 128, 8).cuda().to(torch.bfloat16)
         with torch.no_grad():
@@ -58,23 +56,16 @@ class FusedKernelTests(unittest.TestCase):
         # A strided view, as produced by slicing the fused projection.
         padded = torch.zeros(37, 200, dtype=torch.bfloat16, device="cuda")
         padded[:, 40:168] = F.linear(x, router.weight)
-        weights, ids = sigmoid_topk(padded[:, 40:168], 8, torch.bfloat16)
+        zero_bias = torch.zeros(128, device="cuda")
+        weights, ids = router_topk(padded[:, 40:168].float(), zero_bias, 8, 1.0, True)
         # bf16 logits can tie, and torch.topk orders ties arbitrarily; compare
-        # the selected (expert, weight) sets.
-        ours, order = ids.long().sort(dim=-1)
+        # the selected (expert, weight) sets. The kernel normalizes in fp32,
+        # the eager router in bf16.
+        ours, order = ids.sort(dim=-1)
         theirs, their_order = expected_ids.sort(dim=-1)
         torch.testing.assert_close(ours, theirs, atol=0, rtol=0)
-        torch.testing.assert_close(weights.gather(1, order), expected_w.gather(1, their_order),
-                                   atol=0, rtol=0)
-
-    def test_sigmoid_topk_ties_pick_lowest_index(self):
-        from mstar.model.command_a_plus.kernels import sigmoid_topk
-
-        logits = torch.zeros(2, 128, dtype=torch.bfloat16, device="cuda")
-        logits[1, 100] = 1
-        _, ids = sigmoid_topk(logits, 8, torch.bfloat16)
-        self.assertEqual(ids[0].tolist(), list(range(8)))
-        self.assertEqual(ids[1].tolist(), [100] + list(range(7)))
+        torch.testing.assert_close(weights.gather(1, order), expected_w.gather(1, their_order).float(),
+                                   atol=4e-3, rtol=1e-2)
 
     def test_silu_mul_matches_eager(self):
         from mstar.model.command_a_plus.kernels import silu_mul_into
@@ -87,14 +78,18 @@ class FusedKernelTests(unittest.TestCase):
         self.assertTrue((out[:, :1400] == 0).all())
 
     def test_route_align_matches_topk_and_moe_align(self):
-        from mstar.model.command_a_plus.kernels import route_align, sigmoid_topk
+        from mstar.model.command_a_plus.kernels import route_align
         from mstar.utils.fused_moe.align import moe_align_block_size
 
         for tokens, block_m in ((1, 16), (3, 16), (8, 16), (16, 32)):
             logits = self.randn(tokens, 128).to(torch.bfloat16)
             logits[0, 5] = logits[0, 9] = logits[0].max() + 1  # tie: lowest index first
             weights, ids, (sorted_ids, expert_ids, post_pad, _) = route_align(logits, 8, block_m, torch.bfloat16)
-            ref_weights, ref_ids = sigmoid_topk(logits, 8, torch.bfloat16)
+            # The eager router's math, with ties to the lowest index.
+            ref_ids = logits.float().sort(dim=-1, descending=True, stable=True).indices[:, :8]
+            ref_weights = torch.sigmoid(logits.gather(1, ref_ids))
+            ref_weights = ref_weights / ref_weights.sum(dim=-1, keepdim=True)
+            ref_ids = ref_ids.int()
             self.assertTrue(torch.equal(ids, ref_ids))
             self.assertTrue(torch.equal(weights, ref_weights))
             ref_sorted, ref_experts, ref_post = moe_align_block_size(ids, block_m, 128)
