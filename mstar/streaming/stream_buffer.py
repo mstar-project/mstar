@@ -82,6 +82,12 @@ class StreamBuffer:
     # once and ``has_chunk_ready`` doesn't spin returning True forever.
     _final_chunk_emitted: bool = False
 
+    # Whether a chunk may be ready: set by everything that can make one ready
+    # (an item arriving, the producer's done signal, a refused edge coming
+    # back, a pop that may leave another chunk), cleared by a poll that found
+    # nothing. Lets the poll skip a buffer without asking its policy.
+    maybe_ready: bool = True
+
     _num_tensors_registered = 0
     _num_buffer_writes = 0
     # Items the producer sent this worker in total, as the done signal reports
@@ -103,6 +109,7 @@ class StreamBuffer:
     def put(self, tensor_id: str, item) -> None:
         """Called when an item arrives via normal routing."""
         self._id_to_tensor[tensor_id] = item
+        self.maybe_ready = True
 
     def _update_buffer(self):
         while len(self._tensor_ids_in_order) > 0:
@@ -119,6 +126,7 @@ class StreamBuffer:
         it sent in total."""
         self.producer_done = True
         self._num_items_expected = num_items
+        self.maybe_ready = True
 
     def _producer_done_and_all_read(self) -> bool:
         return (
@@ -204,6 +212,7 @@ class StreamBuffer:
 
     def store_uningested_edge(self, streaming_edge: StreamingEdge):
         self._waiting_graph_edges.append(streaming_edge)
+        self.maybe_ready = True
 
     def _collate(self, items: list) -> dict[str, torch.Tensor | None]:
         if not items:

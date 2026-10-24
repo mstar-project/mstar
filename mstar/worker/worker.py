@@ -1335,6 +1335,7 @@ class Worker:
                 _final_stream_chunk=chunk.is_final,
             )
             return StreamingEdge(synthetic_edge, chunk.info)
+        sbuf.maybe_ready = False
         return None
 
     def _poll_stream_buffers_for_speculation(
@@ -1416,6 +1417,8 @@ class Worker:
         polled: list[tuple[int, StreamingEdge]] = []
         for request_id, req_info in list(self.request_state.per_request_info.items()):
             for edge_name, sbuf in req_info.stream_buffers.items():
+                if not sbuf.maybe_ready:
+                    continue
                 streaming_edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
                 if streaming_edge is not None:
                     polled.append((request_id, streaming_edge))
