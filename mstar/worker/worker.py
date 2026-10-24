@@ -1300,15 +1300,11 @@ class Worker:
         """Route a streaming tensor to its request's StreamBuffer for this edge."""
         req_info = self.request_state.per_request_info.get(request_id)
         stream_buf = req_info.stream_buffers[edge.name]
-
+        # The buffer holds the item by its handle: the read's usage reference
+        # passes to it, and the tensor is looked up when the consuming batch
+        # is built (``_input_tensors``).
         for info in edge.tensor_info:
-            tensor = self.tensor_manager.get_tensor(info.uuid)
-
-            stream_buf.put(info.uuid, tensor.clone())
-        # After the loop: one crossing for the edge rather than one per tensor.
-        self.tensor_manager.dereference_batch_uniform(
-            [info.uuid for info in edge.tensor_info]
-        )
+            stream_buf.put(info.uuid, info)
 
     def _pop_streaming_edge(
         self, sbuf: StreamBuffer, edge_name: str, request_id: int
@@ -1319,34 +1315,25 @@ class Worker:
             return waiting
         if sbuf.has_chunk_ready():
             chunk = sbuf.pop_chunk()
-            chunk_tensor = chunk.data.get("data")
-            if chunk_tensor is None:
-                # Empty chunk — producer done, no more data.
-                # Create edge with empty tensor_info.
-                synthetic_edge = GraphEdge(
-                    next_node=consumer_node,
-                    name=edge_name,
-                    tensor_info=[],
-                    _final_stream_chunk=chunk.is_final,
-                )
-            else:
-                # Normal chunk — store tensor and create edge with tensor_info.
-                # Local streaming tensors are routed from outputs that were
-                # already gated on the producer completion event before being
-                # stored, so avoid a default-stream sync here. If future
-                # streaming producers bypass that path, StreamChunk should
-                # carry producer events and this call site should wait on
-                # those events before storing with skip_cuda_sync=True.
-                tensor_infos = self.tensor_manager.store_and_return_tensor_info(
-                    request_id, {edge_name: [chunk_tensor]},
-                    skip_cuda_sync=True,
-                )
-                synthetic_edge = GraphEdge(
-                    next_node=consumer_node,
-                    name=edge_name,
-                    tensor_info=tensor_infos.get(edge_name, []),
-                    _final_stream_chunk=chunk.is_final,
-                )
+            # The chunk's items as the buffer holds them: their tensor infos,
+            # or None for an empty chunk (producer done, nothing left). The
+            # edge carries every item; ``_input_tensors`` stacks them when the
+            # consuming batch is built.
+            items = chunk.data.get("data") or []
+            tm = self.tensor_manager
+            if items:
+                # the edge's own reference, dropped once its node consumes it
+                tm.increment_ref_batch_uniform([info.uuid for info in items])
+            if chunk.released:
+                # the buffer's references to the items it advanced past; after
+                # the increment, so an item in both stays alive
+                tm.dereference_batch_uniform([info.uuid for info in chunk.released])
+            synthetic_edge = GraphEdge(
+                next_node=consumer_node,
+                name=edge_name,
+                tensor_info=list(items),
+                _final_stream_chunk=chunk.is_final,
+            )
             return StreamingEdge(synthetic_edge, chunk.info)
         return None
 
@@ -1590,6 +1577,25 @@ class Worker:
         return meta, fwd_info
 
 
+    def _input_tensors(
+        self, edges, node_name: str, rids, skip_missing: bool = False,
+    ):
+        """``edges.to_input_tensors``, with each stream chunk into ``node_name``
+        collated: a chunk's edge carries one uuid per item (``StreamBuffer``
+        holds them by handle), and the items are stacked here, when the
+        consuming batch is built. A one-item chunk is that item, unstacked."""
+        out = edges.to_input_tensors(
+            self.tensor_manager.get_tensor, rids, skip_missing=skip_missing,
+        )
+        signals = [e for e, n in self._consumer_node_cache.items() if n == node_name]
+        if signals:
+            for inputs in out.by_rid.values():
+                for name in signals:
+                    items = inputs.get(name)
+                    if items is not None and len(items) > 1:
+                        inputs[name] = [torch.stack(items)]
+        return out
+
     def _build_executing_batch(self, batch: ScheduledBatch) -> ExecutingBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
         batch_partition = self.request_state.get_partition_for_node(batch.node_name)
@@ -1609,8 +1615,8 @@ class Worker:
         # sessions for one bad chunk. Take out just that rid and report it, so
         # the failure is attributed and loud.
         per_request_inputs, final_edges, unresolved = (
-            batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor, batch.request_to_worker_graph,
+            self._input_tensors(
+                batch.input_edges, batch.node_name, batch.request_to_worker_graph,
                 skip_missing=True,
             )
         )
@@ -2836,8 +2842,8 @@ class Worker:
 
         # `ready_rids` seeds it, so a ready rid with no prepped edge still gets
         # an empty mapping -- what slicing a zero-length run used to give.
-        prepped_inputs = prep.input_edges.to_input_tensors(
-            self.tensor_manager.get_tensor, prep.ready_rids,
+        prepped_inputs = self._input_tensors(
+            prep.input_edges, spec_node_name, prep.ready_rids,
         ).by_rid
         for i, r in enumerate(prep.ready_rids):
             per_request_inputs[r] = prepped_inputs[r]
@@ -2906,8 +2912,8 @@ class Worker:
                 return None
             if rows.input_edges is not None:
                 # an input that is not the in-flight step's: per-row dicts
-                prepped_inputs = rows.input_edges.to_input_tensors(
-                    self.tensor_manager.get_tensor, ready_rids,
+                prepped_inputs = self._input_tensors(
+                    rows.input_edges, spec_node_name, ready_rids,
                 ).by_rid
                 per_request_inputs.update(prepped_inputs)
                 new_request_to_worker_graph.update(
@@ -2948,8 +2954,8 @@ class Worker:
                 f"Speculation asked for {spec_node_name!r} but the "
                 f"scheduler returned {fresh_batch.node_name!r}"
             )
-            fresh_inputs = fresh_batch.input_edges.to_input_tensors(
-                self.tensor_manager.get_tensor,
+            fresh_inputs = self._input_tensors(
+                fresh_batch.input_edges, spec_node_name,
                 fresh_batch.request_to_worker_graph,
             ).by_rid
             for rid in fresh_batch.request_to_worker_graph:
@@ -3216,12 +3222,11 @@ class Worker:
         # Both seeded with their rid lists, so the `in prep_inputs` test below
         # still separates prepped rids from fresh ones -- a ready rid with no
         # prepped edge gets an empty mapping, as a zero-length slice used to.
-        get_tensor = self.tensor_manager.get_tensor
-        prep_inputs = prep.input_edges.to_input_tensors(
-            get_tensor, prep.ready_rids,
+        prep_inputs = self._input_tensors(
+            prep.input_edges, head.node_name, prep.ready_rids,
         ).by_rid
-        fresh_inputs = fresh_edges.to_input_tensors(
-            get_tensor, list(fresh_wg),
+        fresh_inputs = self._input_tensors(
+            fresh_edges, head.node_name, list(fresh_wg),
         ).by_rid
         prep_wg = dict(zip(prep.ready_rids, prep.wg_ids, strict=True))
 
@@ -3931,10 +3936,6 @@ class Worker:
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
         signal_idxs = stored.signal_idxs
-        # Before the local-streaming dereference below: numel() needs the
-        # tensors, and a new_token whose only other destination is a local
-        # stream holds a single reference, which that dereference drops to zero
-        # -- collecting the tensor this count is about to read.
         new_token_counts = self._count_new_tokens(
             route_output.new_token_output_idxs,
             flat_rids, flat_uuids, signals, signal_idxs,
@@ -3943,18 +3944,16 @@ class Worker:
 
         # Local streaming stays here: a StreamBuffer holds real tensors, so it
         # cannot move behind the runtime's contract.
-        streamed: list[int] = []
+        # The buffer holds each item by its handle, taking over the routing
+        # reference the local stream destination holds (see
+        # ``_route_streaming_tensor``).
         for signal, per_signal in route_output.local_streaming_by_signal.items():
+            get_info = self.tensor_manager.tensor_store.get_info
             for rid, uuid in per_signal:
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
                 stream_buf.pre_read_register(uuid)
-                tensor = self.tensor_manager.get_tensor(uuid)
-                stream_buf.put(uuid, tensor.clone())
-                streamed.append(uuid)
-        # After the loop: one crossing for the batch rather than one per
-        # streamed tensor.
-        self.tensor_manager.dereference_batch_uniform(streamed)
+                stream_buf.put(uuid, get_info(uuid))
         laps.lap("local_streams")
 
         send_rids = list(rids)
