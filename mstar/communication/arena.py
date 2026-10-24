@@ -980,6 +980,15 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
 
     # -- reclaim ----------------------------------------------------------
 
+    def unlink_owned_files(self) -> None:
+        """The spill files, then this arena's own segments, for a process that
+        is stopping: its exit-time finalizer never runs when a hung teardown
+        ends in SIGKILL or the watchdog's hard exit. Peers keep the mappings
+        they have; the finalizer still runs at a normal exit and finds them
+        gone, and unlinks any segment grown after this call."""
+        super().unlink_owned_files()
+        _unlink_paths(list(self._own_segment_paths))
+
     def close(self) -> None:
         """Stop the wake watcher and unregister every pinned segment (the
         segments themselves unmap with the arena's Drop once the manager is

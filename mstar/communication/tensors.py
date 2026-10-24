@@ -1920,6 +1920,15 @@ def ensure_deployment_token() -> str:
     if not token or token == os.environ.get(_MINTED_TOKEN_ENV):
         token = secrets.token_hex(8)
         os.environ[DEPLOYMENT_TOKEN_ENV] = os.environ[_MINTED_TOKEN_ENV] = token
+    else:
+        # Kept as is: processes a launcher starts separately must all derive
+        # the same names, so mixing in a nonce here would split them apart.
+        logger.warning(
+            "%s=%s was set by the launcher and is kept. It must be new for every "
+            "launch: a fixed value (a systemd Environment= line, a pod template "
+            "shared by replicas or restarts) lets a stopping worker of the "
+            "previous launch unlink this launch's SHM tensor files. Unset it to "
+            "have the API server mint one.", DEPLOYMENT_TOKEN_ENV, token)
     return token
 
 
