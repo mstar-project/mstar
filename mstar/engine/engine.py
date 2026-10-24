@@ -309,8 +309,10 @@ class ExecutingBatch:
     stream_partition_done_rids: set[int] = field(default_factory=set)
 
     # rid -> (start, end, total): [start, end) of a chunked row's input this
-    # step, and the whole input's length as the scheduler measured it
+    # step, and the whole input's length as the scheduler measured it; and the
+    # rows whose node needs another chunk
     chunk_ranges: Mapping[int, tuple[int, int, int]] = field(default_factory=dict)
+    incomplete_node_rids: set[int] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None

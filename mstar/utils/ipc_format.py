@@ -197,6 +197,13 @@ class ScheduleTPNode(MessageBody):
     # rank 0's prefix-cache leases, by wire request id and then resource
     prefix_hits: dict[str, dict[str, list[int]]] = field(default_factory=dict)
     page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # per request_ids entry, the chunk this step runs ([start, end) of the
+    # row's measured total, -1 when not chunked; empty when none is), and the
+    # rows that need another chunk
+    chunk_starts: list[int] = field(default_factory=list)
+    chunk_ends: list[int] = field(default_factory=list)
+    chunk_totals: list[int] = field(default_factory=list)
+    incomplete_node_rids: list[str] = field(default_factory=list)
 
 
 @dataclass

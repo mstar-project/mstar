@@ -1953,3 +1953,41 @@ def test_the_last_chunk_of_a_row_mid_prefill_runs_whole_in_the_merge():
 
     assert merged.chunk_ranges == {"p0": (8, 10, 10)}
     assert not merged.incomplete_node_rids
+
+
+def test_a_follower_runs_the_leaders_chunks():
+    """The leader alone sizes chunks; a follower takes them off the head."""
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.register_tp_follow(ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"],
+        chunk_starts=[4, -1], chunk_ends=[8, -1], chunk_totals=[10, -1], incomplete_node_rids=["t0"],
+    ))
+
+    batch = _next_batch(sched, _Manager(["t0", "t1"]))
+
+    assert batch.chunk_ranges == {"t0": (4, 8, 10)}
+    assert batch.incomplete_node_rids == {"t0"}
+
+
+def test_a_follower_step_without_chunks_takes_no_ranges():
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.register_tp_follow(ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"]))
+
+    assert _next_batch(sched, _Manager(["t0", "t1"])).chunk_ranges == {}
+
+
+def test_a_follower_refuses_chunk_lists_that_do_not_match_its_rows():
+    from mstar.utils.ipc_format import ScheduleTPNode
+
+    sched = _scheduler(_Engine(max_bs=8))
+    message = ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=["t0", "t1"],
+        chunk_starts=[4], chunk_ends=[8], chunk_totals=[10],
+    )
+
+    with pytest.raises(ValueError):
+        sched.tp_chunks(message)

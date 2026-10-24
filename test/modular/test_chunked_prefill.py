@@ -598,3 +598,30 @@ def test_a_non_final_chunks_row_leaves_the_kept_rows():
 
     untouched = SamplerStep()
     assert keep_final_chunk_samples(untouched, ["d"], [whole]) is untouched
+
+
+def test_chunking_is_refused_under_sp_but_not_tp():
+    import pytest
+
+    from mstar.model.submodule_base import ChunkingPolicy
+    from mstar.worker.engine_manager import _refuse_unsupported_chunking
+
+    class _Chunked:
+        def get_chunking_policy(self, graph_walk):
+            return ChunkingPolicy(chunkable=True, max_batch_tokens=64)
+
+        def get_input_sequence_len(self, *args, **kwargs):
+            return None
+
+    model = SimpleNamespace(get_graph_walk_graphs=lambda: {"prefill": SimpleNamespace(get_nodes=lambda: ["LLM"])})
+    submodules = {"LLM": _Chunked()}
+
+    def groups(tp, sp):
+        return SimpleNamespace(
+            get_tp_config_for_node=lambda node: SimpleNamespace(world_size=tp),
+            get_sp_config_for_node=lambda node: SimpleNamespace(world_size=sp),
+        )
+
+    _refuse_unsupported_chunking(submodules, model, groups(tp=2, sp=1))
+    with pytest.raises(NotImplementedError, match="under SP"):
+        _refuse_unsupported_chunking(submodules, model, groups(tp=1, sp=2))
