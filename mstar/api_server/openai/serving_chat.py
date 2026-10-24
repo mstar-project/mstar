@@ -8,6 +8,7 @@ then maps the resulting modality chunks back to OpenAI shapes: text into
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import codecs
 
@@ -18,7 +19,8 @@ from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
-    args = adapter.chat_to_request(req, api.upload_dir)
+    # off the loop: media parts may be decoded, written or fetched (MSTAR_ALLOW_REMOTE)
+    args = await asyncio.to_thread(adapter.chat_to_request, req, api.upload_dir)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 

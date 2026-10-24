@@ -19,14 +19,20 @@ the base install stays slim.
 from __future__ import annotations
 
 import base64
+import http.client
 import io
+import ipaddress
+import logging
 import math
 import os
+import re
+import socket
+import ssl
 import threading
 import time
 import wave
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urljoin, urlparse, urlsplit
 from uuid import uuid4
 
 import numpy as np
@@ -276,23 +282,256 @@ def _require_ref_audio_seconds(seconds: float | None) -> None:
         )
 
 
+logger = logging.getLogger(__name__)
+
+REMOTE_MAX_BYTES = 64 * 2**20
+REMOTE_MAX_REDIRECTS = 3
+REMOTE_USER_AGENT = "mstar"
+_URL_SAFE = "".join(map(chr, range(0x21, 0x7F)))  # printable ASCII, so existing %-escapes stay
+# Refused unless the host is allowlisted: loopback, private, link-local (cloud
+# metadata at 169.254.169.254), shared/CGNAT, multicast, reserved. The same list
+# is in rust/server/src/media.rs.
+_BLOCKED_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+    "::/128", "::1/128", "64:ff9b:1::/48", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+))
+# IPv6 forms that reach the IPv4 address in their low 32 bits: NAT64 and IPv4-compatible.
+_V4_IN_LOW_BITS = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::/96"))
+_IPV4_NUMBER = re.compile(r"[0-9]+|0x[0-9a-f]*")
+# Both URL parsers delete these anywhere in a URL, so a host written with them
+# would match the allowlist as if they were not there; such URLs are refused.
+_URL_DROPPED = "\t\r\n"
+
+
+class RemoteFetchError(ValueError):
+    """A remote media fetch was refused or failed; the message is safe to return to the client."""
+
+
+def _fetch_error(host: str, reason: str, detail: object = "") -> RemoteFetchError:
+    logger.warning("remote media fetch from %s failed: %s %s", host, reason, detail)
+    return RemoteFetchError(f"remote media fetch failed: {reason}")
+
+
+def _blocked_address(addr: str) -> bool:
+    ip = ipaddress.ip_address(addr)
+    if ip.version == 6:
+        # IPv4-mapped, 6to4 (2002::/16), NAT64 and IPv4-compatible addresses are
+        # judged by the IPv4 address they carry. NAT64 is not refused outright:
+        # on an IPv6-only network with DNS64 every IPv4-only host resolves into it.
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip.sixtofour is not None:
+            ip = ip.sixtofour
+        elif any(ip in net for net in _V4_IN_LOW_BITS):
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return any(ip in net for net in _BLOCKED_NETS)
+
+
+def _canonical_host(host: str) -> bool:
+    """Whether ``host`` (lower-cased, no brackets or trailing dot) is spelled the way
+    the Rust frontend's URL parser prints it: an ASCII name, dotted-decimal IPv4 or
+    compressed IPv6. ``2130706433``, ``0x7f000001``, ``127.1`` and ``::ffff:127.0.0.1``
+    are not; a name whose last label is a number is an IPv4 address to that parser."""
+    if not host.isascii() or "%" in host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return not _IPV4_NUMBER.fullmatch(host.rsplit(".", 1)[-1])
+    if ip.version == 6 and ip.ipv4_mapped is not None:  # the URL parser prints these in hex
+        v4 = int(ip.ipv4_mapped)
+        return host == f"::ffff:{v4 >> 16:x}:{v4 & 0xFFFF:x}"
+    return ip.compressed == host
+
+
+def _host_allowlisted(host: str, patterns: list[str]) -> bool:
+    """``host`` equals an entry, or ends in ``.suffix`` for a ``*.suffix`` entry. Only a
+    canonically spelled host can match, so another spelling of a listed address gets the
+    address check instead, as in the Rust frontend."""
+    return _canonical_host(host) and any(
+        host == p or (p.startswith("*.") and host.endswith(p[1:])) for p in patterns)
+
+
+def _time_left(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError
+    return left
+
+
+class _Watchdog:
+    """Shuts a connected socket down at ``deadline``, so no read or write on it
+    (TLS handshake, headers, chunk framing, body) can outlast the fetch timeout.
+    It holds a duplicate of the socket, so the descriptor it shuts down cannot
+    have been reused by another connection in the meantime."""
+
+    def __init__(self, sock: socket.socket, deadline: float):
+        self._sock, self._lock, self.fired = sock.dup(), threading.Lock(), False
+        self._timer = threading.Timer(max(deadline - time.monotonic(), 0.0), self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self):
+        with self._lock:
+            if self._sock is not None:
+                self.fired = True
+                try:
+                    self._sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def close(self):
+        self._timer.cancel()
+        with self._lock:
+            if self._sock is not None:
+                self._sock.close()
+                self._sock = None
+
+
+class _PinnedConnection(http.client.HTTPConnection):
+    """Connects to addresses vetted up front, so a second DNS answer cannot move
+    the connection; the Host header and TLS name stay the URL's host. Each
+    connect attempt gets only what is left of ``deadline``, and a watchdog
+    bounds everything after it."""
+
+    def __init__(self, host: str, port: int, addrs: list, tls: bool, deadline: float):
+        super().__init__(host, port, timeout=_time_left(deadline))
+        if tls:  # the Host header leaves out port 443, as HTTPSConnection does
+            self.default_port = http.client.HTTPS_PORT
+        self._addrs, self._tls, self._deadline = addrs, tls, deadline
+        self.watchdog: _Watchdog | None = None
+
+    def connect(self):
+        err: OSError = OSError("no address")
+        for addr in self._addrs:
+            try:
+                sock = socket.create_connection(addr[:2], _time_left(self._deadline))
+            except OSError as e:
+                err = e
+                continue
+            self.watchdog = _Watchdog(sock, self._deadline)
+            self.sock = ssl.create_default_context().wrap_socket(sock, server_hostname=self.host) if self._tls else sock
+            return
+        raise err
+
+    def timed_out(self) -> bool:
+        return self.watchdog is not None and self.watchdog.fired
+
+
 def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[str, str]:
     """Download an ``http(s)`` URL into ``upload_dir``. Returns (modality, path).
 
-    Note: fetching arbitrary URLs has SSRF surface. Callers exposing this
-    publicly should allowlist hosts or disable remote fetch (data-URL only).
+    With ``MSTAR_REMOTE_ALLOWED_HOSTS`` set (comma-separated hosts and
+    ``*.suffix`` patterns) only those hosts are fetched. A host that is not
+    allowlisted is also refused when it resolves to a blocked address, and the
+    connection goes to the vetted address. Every redirect hop is checked again
+    (at most ``REMOTE_MAX_REDIRECTS``), the body is streamed to disk and capped
+    at ``MSTAR_REMOTE_MAX_BYTES``, and ``timeout`` bounds the whole fetch
+    (name resolution aside). Failures raise :class:`RemoteFetchError` with a
+    short message; the details are logged server-side only.
     """
-    import urllib.request
+    patterns = [p.strip().strip("[]").rstrip(".").lower() for p in
+                os.getenv("MSTAR_REMOTE_ALLOWED_HOSTS", "").split(",") if p.strip()]
+    raw_max = os.getenv("MSTAR_REMOTE_MAX_BYTES", "").strip()
+    max_bytes = int(raw_max) if raw_max.isdigit() else REMOTE_MAX_BYTES
+    deadline = time.monotonic() + timeout
+    host = ""
+    for _ in range(REMOTE_MAX_REDIRECTS + 1):
+        if any(c in url for c in _URL_DROPPED):  # urlsplit would drop them, also from the host
+            raise _fetch_error("", "invalid URL", repr(url))
+        try:
+            parsed = urlsplit(url)  # not urlparse, which would drop ;params from the path
+            host = (parsed.hostname or "").rstrip(".")
+            port = parsed.port
+        except ValueError as e:  # a bad port, or a bracketed host that is not an address
+            raise _fetch_error("", "invalid URL", e) from None
+        allowlisted = _host_allowlisted(host, patterns)
+        if parsed.scheme not in ("http", "https") or not host:
+            raise _fetch_error(host, "invalid URL", url)
+        if patterns and not allowlisted:
+            raise _fetch_error(host, "host not allowed", "not in MSTAR_REMOTE_ALLOWED_HOSTS")
+        conn = None
+        try:
+            tls = parsed.scheme == "https"
+            port = port or (443 if tls else 80)
+            addrs = [info[4] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+            if not allowlisted and any(_blocked_address(a[0]) for a in addrs):
+                raise _fetch_error(host, "host not allowed", f"resolves to {[a[0] for a in addrs]}")
+            conn = _PinnedConnection(host, port, addrs, tls, deadline)
+            # percent-encode spaces, controls and non-ASCII, as the Rust frontend's URL parser does
+            target = quote((parsed.path or "/") + (f"?{parsed.query}" if parsed.query else ""), safe=_URL_SAFE)
+            conn.request("GET", target, headers={"User-Agent": REMOTE_USER_AGENT})
+            resp = conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                location = resp.getheader("Location")
+                if not location:
+                    raise _fetch_error(host, "bad redirect", f"{resp.status} without Location")
+                if any(c in location for c in _URL_DROPPED):
+                    raise _fetch_error(host, "invalid URL", repr(location))
+                url = urljoin(url, location)
+                continue
+            if not 200 <= resp.status < 300:
+                raise _fetch_error(host, f"upstream returned {resp.status}")
+            return _stream_to_upload(resp, conn, url, Path(upload_dir), max_bytes, host)
+        except RemoteFetchError:
+            raise
+        # before ValueError: a failed certificate check (SSLCertVerificationError) is both;
+        # OverflowError: http.client takes a chunk size like -1000...0 and fails reading it
+        except (OSError, http.client.HTTPException, OverflowError) as e:
+            timed_out = (isinstance(e, TimeoutError) or time.monotonic() >= deadline
+                         or (conn is not None and conn.timed_out()))
+            raise _fetch_error(host, "timed out" if timed_out else "connection failed", repr(e)) from None
+        except ValueError as e:  # a bad port, an unencodable host or path
+            raise _fetch_error(host, "invalid URL", e) from None
+        finally:
+            if conn is not None:
+                conn.close()
+                if conn.watchdog is not None:
+                    conn.watchdog.close()
+    raise _fetch_error(host, "too many redirects")
 
-    with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 (caller-gated)
-        raw = resp.read()
-        mime = resp.headers.get_content_type() if resp.headers else ""
-    if not mime:
+
+def _stream_to_upload(resp, conn: _PinnedConnection, url: str, upload_dir: Path, max_bytes: int, host: str):
+    too_large = f"too large (limit {max_bytes} bytes)"
+    if resp.length is not None and resp.length > max_bytes:  # None when chunked or without Content-Length
+        raise _fetch_error(host, too_large, f"Content-Length {resp.length}")
+    mime = (resp.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if mime in ("", "application/octet-stream"):
         # Infer from the URL path extension.
         suffix = Path(urlparse(url).path).suffix.lower()
         rev = {v: k for k, v in _MIME_TO_EXT.items()}
         mime = rev.get(suffix, "application/octet-stream")
-    return _save_bytes(raw, mime, upload_dir)
+    path = upload_dir / f"{uuid4()}{_ext_for(mime)}"
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        f = open(path, "wb", buffering=0)
+    except OSError as e:
+        raise _fetch_error(host, "could not save the file", e) from None
+    size = 0
+    try:
+        with f:
+            while chunk := resp.read1(1 << 16):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise _fetch_error(host, too_large, "body exceeded the limit")
+                try:
+                    view = memoryview(chunk)
+                    while view:  # an unbuffered write may take only part of the chunk
+                        written = f.write(view)
+                        if not written:
+                            raise OSError("the file stopped accepting bytes")
+                        view = view[written:]
+                except OSError as e:
+                    raise _fetch_error(host, "could not save the file", e) from None
+        if resp.length:  # the peer closed before sending all of Content-Length
+            raise http.client.IncompleteRead(b"", resp.length)
+        if conn.timed_out():  # a body that runs to EOF also "ends" when the watchdog shuts the socket
+            raise TimeoutError
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return modality_from_mime(mime), str(path)
 
 
 def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False) -> tuple[str, str]:
@@ -306,7 +545,8 @@ def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False)
     """
     if ref.startswith("data:"):
         return save_data_url(ref, upload_dir)
-    if urlparse(ref).scheme.lower() in ("http", "https"):
+    # not urlparse: it raises on a malformed host with parser text the client would see
+    if ref.split(":", 1)[0].lower() in ("http", "https"):
         allow_remote = allow_remote or os.getenv("MSTAR_ALLOW_REMOTE", "0") == "1"
         if not allow_remote:
             raise ValueError("Remote media fetch is disabled on this server")

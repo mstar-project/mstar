@@ -11,6 +11,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import time
 import types
 import wave
@@ -232,6 +233,93 @@ def test_voice_clone_refuses_a_61_s_clip_with_400(client_and_stub, model, form):
     assert r.status_code == 400, r.text
     assert r.json()["error"]["message"].startswith("ref_audio must be 60 s or shorter")
     assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+@pytest.fixture
+def forbidding_upstream():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    hits = []
+
+    class Forbidden(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(403)
+            self.send_header("Content-Length", "26")
+            self.end_headers()
+            self.wfile.write(b"denied by db.internal.corp")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Forbidden)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}/a.png", hits
+    server.shutdown()
+    server.server_close()
+
+
+@pytest.mark.parametrize("model,path,body", [
+    ("bagel", "/v1/chat/completions", lambda url: {"messages": [{
+        "role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]}),
+    ("omnivoice", "/v1/audio/speech", lambda url: {"input": "hi", "ref_audio": url, "ref_text": "hi"}),
+])
+def test_remote_media_failures_are_short_400s(client_and_stub, forbidding_upstream, monkeypatch, model, path, body):
+    client, stub = client_and_stub
+    stub.model_name = model
+    url, hits = forbidding_upstream
+    monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+    for allowed, reason in (("127.0.0.1", "upstream returned 403"), ("", "host not allowed")):
+        monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", allowed)
+        r = client.post(path, json={"model": model, **body(url)})
+        assert r.status_code == 400, r.text
+        assert r.json()["error"]["message"] == f"remote media fetch failed: {reason}"
+    assert hits == ["/a.png"] and stub.last_submit is None
+
+
+@pytest.mark.parametrize("model,path,body", [
+    ("bagel", "/v1/chat/completions", lambda url: {"messages": [{
+        "role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]}),
+    ("cosmos3", "/v1/videos/generations", lambda url: {"prompt": "a cat", "image": url}),
+])
+def test_a_slow_remote_fetch_does_not_stall_other_requests(client_and_stub, monkeypatch, model, path, body):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    client, stub = client_and_stub
+    stub.model_name = model
+    arrived = threading.Event()
+
+    class Slow(BaseHTTPRequestHandler):
+        def do_GET(self):
+            arrived.set()
+            time.sleep(1.5)
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{upstream.server_address[1]}/a.png"
+    monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+    monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", "127.0.0.1")
+    slow = {}
+    try:
+        with TestClient(client.app) as shared:  # one event loop for both requests
+            t = threading.Thread(target=lambda: slow.update(r=shared.post(path, json={"model": model, **body(url)})))
+            t.start()
+            assert arrived.wait(5)
+            started = time.monotonic()
+            assert shared.get("/v1/models").status_code == 200
+            assert time.monotonic() - started < 1.0
+            t.join(10)
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+    assert slow["r"].status_code == 400
+    assert slow["r"].json()["error"]["message"] == "remote media fetch failed: upstream returned 404"
 
 
 def test_chat_audio_output(client_and_stub):

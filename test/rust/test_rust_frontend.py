@@ -640,6 +640,42 @@ def test_video_conditioning_refuses_server_file_paths():
     assert not stub.submitted
 
 
+def test_remote_media_failures_are_short_400s(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    hits = []
+
+    class Forbidden(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(403)
+            self.send_header("Content-Length", "26")
+            self.end_headers()
+            self.wfile.write(b"denied by db.internal.corp")
+
+        def log_message(self, *args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Forbidden)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{upstream.server_address[1]}/a.png"
+    body = json.dumps({"model": "qwen3_omni", "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": url}}]}]}).encode()
+    stub = _StubAPIServer()
+    monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+    try:
+        for allowed, reason in (("127.0.0.1", "upstream returned 403"), ("", "host not allowed")):
+            monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", allowed)
+            with _model_stack("qwen3_omni", stub) as (port, _up):
+                status, out = _post_raw(port, "/v1/chat/completions", body)
+            assert status == 400, (status, out)
+            assert out["error"]["message"] == f"remote media fetch failed: {reason}"
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+    assert hits == ["/a.png"] and not stub.submitted
+
+
 class _ErrorChunkStub(_StubAPIServer):
     """Deliver a backend failure the way the data plane does: a terminal chunk
     with modality 'error' + metadata.status that ends cleanly (no raise) — the
