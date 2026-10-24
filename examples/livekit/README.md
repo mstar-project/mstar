@@ -32,7 +32,7 @@ M\* serves one model per process, so the pipeline is three M\* servers. Turn det
 3. **The agent**, in its own environment:
 
    ```bash
-   pip install "livekit-agents[openai,silero]~=1.8"
+   pip install "livekit-agents[openai,silero]~=1.8.7"
    export LIVEKIT_URL=ws://localhost:7880 LIVEKIT_API_KEY=devkey LIVEKIT_API_SECRET=secret
    python examples/livekit/agent.py start
    ```
@@ -50,6 +50,7 @@ M\* serves one model per process, so the pipeline is three M\* servers. Turn det
 - `extra_body={"enable_thinking": False}` on the LLM. Qwen3.5's chat template opens a `<think>` block by default; the plugin strips it, but nothing is spoken until it closes.
 - `response_format="pcm"` on the TTS. The plugin reads bare PCM as 24 kHz mono, which is what Kokoro and Qwen3-TTS produce. For a model with another output rate use `wav`, which the plugin decodes and resamples.
 - The TTS plugin asks for streaming with OpenAI's `stream_format`, so the first audio of each sentence leaves M\* as soon as it is synthesized.
+- A TTS failure after a sentence's audio has started arrives as an in-band SSE `error` event, which the plugin ignores: the speech just stops early and the agent logs nothing. The M\* TTS server's log has the reason.
 - Barge-in. Self-hosted, LiveKit interrupts on VAD and needs 0.5 s of user speech first. In the runs below the agent went quiet 0.7 to 0.8 s (p50) after the user started talking over it, and on 4 of the 16 turns that talked over it the agent was still speaking when the user finished. `TurnHandlingOptions(interruption={"min_duration": ...})` tunes this. M\* is not on that path: the agent stops its own playout.
 - LiveKit's [audio turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/) (waits through mid-sentence pauses) and [adaptive interruption handling](https://docs.livekit.io/agents/logic/turns/adaptive-interruption-handling/) (tells a backchannel such as "uh-huh" from a barge-in) are set on the agent's `AgentSession`, outside M\*, and LiveKit documents both for an STT, LLM and TTS pipeline like this one. Their full models run on LiveKit Inference with LiveKit Cloud credentials (self-hosted use counts toward a monthly allowance); the turn detector's `v1-mini` runs on CPU in the agent. This example does not enable them, and the runs below were measured without them.
 
