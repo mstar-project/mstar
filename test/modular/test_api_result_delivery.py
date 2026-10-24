@@ -32,6 +32,11 @@ class _RecordingTensorManager:
         self.read_started.append(request_id)
         return []
 
+    def take_failed_reads(self):
+
+        return []
+
+
     def get_ready_tensors(self):
         return {}
 

@@ -7,13 +7,14 @@ import threading
 import time
 import time as _time
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import cached_property, partial
 from time import sleep
+from types import MappingProxyType
 from typing import NamedTuple
 
 import torch
@@ -68,6 +69,7 @@ from mstar.utils.ipc_format import (
     MessageSource,
     NewRequest,
     ReadsDone,
+    ReadsLanded,
     RemoveRequest,
     ScheduleTPNode,
     SetupDone,
@@ -82,6 +84,12 @@ from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.read_gate import (
+    FollowerReadGate,
+    edges_by_rid,
+    lockstep_feeders,
+    signals_by_rid,
+)
 from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -351,6 +359,15 @@ class Worker:
     # Empty for a text model, which lets a speculation build skip its three
     # per-row stream polls; None (a bare instance) means unknown, so poll.
     _stream_buffer_rids: set[int] | None = None
+    # The read gate's state (see ``__init__``); a bare instance has none.
+    _read_gate: FollowerReadGate | None = None
+    _lockstep_led: frozenset[str] = frozenset()
+    _lockstep_followed: frozenset[str] = frozenset()
+    _landed_counts: Mapping[int, dict[str, int]] = MappingProxyType({})
+    _landed_unreported: Mapping[int, set[str]] = MappingProxyType({})
+    _gate_followers: Mapping[tuple[int, str], tuple[str, ...]] = MappingProxyType({})
+    _lockstep_inputs: frozenset[str] | None = None
+    _lockstep_feeders: frozenset[str] | None = None
 
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
@@ -592,6 +609,8 @@ class Worker:
         self.scheduler.runtime = self._graph_runtime
         self.scheduler.rid_of = self._rid
         self.tensor_manager.rid_to_str = self._rid_str
+
+        self._setup_read_gate(model)
 
         # wire request id -> messages for requests that are not in the queue.
         # Keyed by the string: these arrive before the NEW_REQUEST that mints
@@ -995,6 +1014,13 @@ class Worker:
         self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
         self._pending_removes.pop(request_id, None)
+        if getattr(self, "_read_gate", None) is not None:
+            self._read_gate.forget(request_id)
+            for key in [k for k in self._gate_followers if k[0] == request_id]:
+                del self._gate_followers[key]
+        if getattr(self, "_lockstep_followed", None):
+            self._landed_counts.pop(request_id, None)
+            self._landed_unreported.pop(request_id, None)
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
@@ -1221,7 +1247,8 @@ class Worker:
         msg_types_needing_active_request = [
             WorkerMessageType.REMOVE_REQUEST,
             WorkerMessageType.INPUT_SIGNALS,
-            WorkerMessageType.STOP_LOOPS
+            WorkerMessageType.STOP_LOOPS,
+            WorkerMessageType.READS_LANDED,
         ]
         # Snapshot: a REMOVE handled mid-iteration can re-buffer trailing
         # signals onto this same list, and mutating it while iterating it would
@@ -1270,6 +1297,8 @@ class Worker:
             elif message.message_type == WorkerMessageType.ENABLE_METRICS:
                 # sent only with metrics on, so _metrics is set
                 self._metrics.start_counting()
+            elif message.message_type == WorkerMessageType.READS_LANDED:
+                self._record_follower_reads(message.body)
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -1436,10 +1465,224 @@ class Worker:
                 self._mark_stream_ingested(rid, se)
 
 
+    # ------------------------------------------------------------------
+    # Read gate (read_gate.py)
+    # ------------------------------------------------------------------
+
+    def _setup_read_gate(self, model: Model | None = None) -> None:
+        """Rank 0 of a lockstep instance runs a row only once every follower
+        has landed the row's inputs; the followers report what landed once
+        per loop pass."""
+        self._lockstep_led = frozenset(self.parallel_nodes & self.parallel_leader_nodes)
+        self._lockstep_followed = frozenset(self.parallel_nodes - self.parallel_leader_nodes)
+        self._read_gate = FollowerReadGate() if self._lockstep_led else None
+        if self._read_gate is not None:
+            self.scheduler.row_inputs_landed = self._row_inputs_landed
+        # rank 0: (rid, walk) -> the followers the gate waits on for that row,
+        # empty when it does not gate the request
+        self._gate_followers = {}
+        # rank 0: the lockstep node's input names, and the other nodes with an
+        # edge into it; None when unknown (every name, every node)
+        walks = {} if model is None else model.get_graph_walk_graphs()
+        nodes = [node for section in walks.values() for node in section.get_nodes().values()]
+        self._lockstep_inputs = None if model is None else frozenset(
+            name for node in nodes if node.name in self._lockstep_led
+            for name in node.input_names
+        )
+        self._lockstep_feeders = None if model is None else frozenset(
+            name for section in walks.values()
+            for name in lockstep_feeders(section, self._lockstep_led)
+        )
+        # follower: rid -> edge -> external inputs of it this rank holds
+        self._landed_counts = {}
+        # follower: rid -> edges (counted or streamed) changed since the last report
+        self._landed_unreported = {}
+
+    def _count_external(self, rid: int, edge: str, uuids: list[int]) -> None:
+        """One external input of ``edge`` for ``rid`` is available on this rank:
+        rank 0 numbers it, a follower counts it for its next report. An input
+        with no tensor has no read to fail, and rank 0 does not number it."""
+        if not uuids:
+            return
+        if self._read_gate is not None:
+            self._read_gate.external(rid, uuids)
+        else:
+            counts = self._landed_counts.setdefault(rid, {})
+            counts[edge] = counts.get(edge, 0) + 1
+            self._landed_unreported.setdefault(rid, set()).add(edge)
+
+    def _count_local_outputs(self, stored, signals: list[str]) -> None:
+        """Rank 0: outputs of a node outside the instance on a signal its
+        lockstep node takes, which that node gets without a read and each
+        follower reads."""
+        inputs = self._lockstep_inputs
+        by_rid: dict[int, list[int]] = {}
+        for rid, uuid, sig in zip(
+            stored.flat_rids, stored.flat_uuids, stored.signal_idxs, strict=True,
+        ):
+            if inputs is None or signals[sig] in inputs:
+                by_rid.setdefault(rid, []).append(uuid)
+        for rid, rid_uuids in by_rid.items():
+            self._read_gate.external(rid, rid_uuids)
+
+    def _followers_host_a_feeder(self, rid: int, node_name: str, followers: list[str]) -> bool:
+        """Whether a node with an edge into ``node_name`` runs beside one of
+        ``followers`` for ``rid``. Such a node feeds the follower without a
+        read, which it cannot count, so the request is not gated (as before
+        the gate). Other nodes beside a follower do not matter: it reports
+        only its lockstep node's inputs."""
+        placement = getattr(self._graph_runtime.get_sharding_config(rid), "node_to_worker", {})
+        feeders = self._lockstep_feeders
+        hosts = set(followers)
+        return any(
+            key.node != node_name and (feeders is None or key.node in feeders)
+            and hosts.intersection(workers)
+            for key, workers in placement.items()
+        )
+
+    def _instance_followers(self, rid: int, node_name: str, graph_walk: str) -> list[str]:
+        group = self._graph_runtime.get_sharding_config(rid).get_sharding_group(
+            node_name, graph_walk,
+        )
+        return [] if group is None else group._workers[1:]
+
+    def _stream_ends(self, rid: int, node_name: str, signals) -> dict[str, int]:
+        """Stream position each streamed input in ``signals`` ends at, as the
+        chunk ``node_name`` ingested for ``rid`` last."""
+        req_info = self.request_state.per_request_info.get(rid)
+        buffers = {} if req_info is None else req_info.stream_buffers_by_consumer.get(node_name, {})
+        ends = {}
+        for name in signals:
+            sbuf = buffers.get(name)
+            chunk = None if sbuf is None else sbuf.ingested_chunk
+            if chunk is not None:
+                ends[name] = chunk.start_offset + chunk.num_items
+        return ends
+
+    def _gated_followers(self, rid: int, node_name: str, graph_walk: str) -> tuple[str, ...]:
+        """The followers rank 0 waits on for ``rid``'s rows of ``node_name``,
+        fixed for the life of the request; empty when it does not gate it."""
+        key = (rid, graph_walk)
+        followers = self._gate_followers.get(key)
+        if followers is None:
+            followers = tuple(self._instance_followers(rid, node_name, graph_walk))
+            if followers and self._followers_host_a_feeder(rid, node_name, list(followers)):
+                followers = ()
+            self._gate_followers[key] = followers
+        return followers
+
+    def _row_inputs_landed(self, batch: ScheduledBatch, rid: int) -> bool:
+        """The scheduler's read-gate hook: whether every follower has landed
+        what ``rid``'s row of ``batch`` consumes. Cheapest checks first: a
+        decode row returns on the first two."""
+        if batch.node_name not in self._lockstep_led:
+            return True
+        req_info = self.request_state.per_request_info.get(rid)
+        streams = None if req_info is None else req_info.stream_buffers_by_consumer.get(batch.node_name)
+        if not streams and not self._read_gate.may_wait(rid):
+            return True
+        followers = self._gated_followers(rid, batch.node_name, batch.walk_of(rid))
+        if not followers:
+            return True
+        stream_ends = (
+            self._stream_ends(rid, batch.node_name, self._batch_index(batch, signals_by_rid).get(rid, ()))
+            if streams else {}
+        )
+        return not self._read_gate.missing(
+            rid, followers, lambda: self._batch_index(batch, edges_by_rid).get(rid, ()), stream_ends,
+        )
+
+    def _batch_index(self, batch: ScheduledBatch, build):
+        """``build(batch.input_edges)``, built once per batch and kind: the
+        gate asks for one row at a time."""
+        edges = batch.input_edges
+        cache = self.__dict__.setdefault("_gate_index", {})
+        hit = cache.get(build)
+        # the columns grow in place on a merge, so the length is part of the key
+        if hit is None or hit[0] is not edges or hit[1] != len(edges.rids):
+            hit = cache[build] = (edges, len(edges.rids), build(edges))
+        return hit[2]
+
+    def _spec_row_missing(self, rid, node_name, graph_walk, row_edges, stream_ends) -> bool:
+        """The read gate for a row a speculation would continue."""
+        followers = self._gated_followers(rid, node_name, graph_walk)
+        return bool(followers) and self._read_gate.missing(rid, followers, row_edges, stream_ends)
+
+    def _record_follower_reads(self, body: ReadsLanded) -> None:
+        handle = self._rid(body.request_id)
+        if self._read_gate is None or handle is None:
+            return
+        self._read_gate.record(handle, body.follower, body.counts, body.stream_items)
+
+    def _note_landed(self, ready: dict[int, list[GraphEdge]]) -> None:
+        """Count the external inputs of the lockstep node that landed this pass."""
+        node_names = self._lockstep_led or self._lockstep_followed
+        me = getattr(self.tensor_manager, "my_entity_id", None)
+        for rid, edges in ready.items():
+            for edge in edges:
+                if edge.next_node not in node_names:
+                    continue
+                if edge.tensor_info and all(
+                    i._source_node_name in node_names and i.source_entity == me
+                    for i in edge.tensor_info
+                ):
+                    # this rank's own output of the lockstep node coming back
+                    # (a persisted token as the decode walk's input): no read
+                    continue
+                if not edge.is_streaming:
+                    self._count_external(rid, edge.name, [i.uuid for i in edge.tensor_info])
+                elif self._lockstep_followed:
+                    self._landed_unreported.setdefault(rid, set()).add(edge.name)
+
+    def _report_landed_reads(self) -> None:
+        """Follower: send each changed request's counts to rank 0 of its instance."""
+        pending, self._landed_unreported = self._landed_unreported, {}
+        for rid, edges in pending.items():
+            req_info = self.request_state.per_request_info.get(rid)
+            if req_info is None:
+                continue
+            leader = self._instance_leader(rid)
+            if leader is None:
+                continue
+            counts = self._landed_counts.get(rid, {})
+            self.communicator.send(leader, msg=WorkerMessage(
+                message_type=WorkerMessageType.READS_LANDED,
+                body=ReadsLanded(
+                    request_id=self._rid_str(rid), follower=self.worker_id,
+                    counts={e: counts[e] for e in edges if e in counts},
+                    stream_items={
+                        e: sbuf.landed_items() for e in edges
+                        if e not in counts and (sbuf := req_info.stream_buffers.get(e)) is not None
+                    },
+                ),
+            ))
+
+    def _instance_leader(self, rid: int) -> str | None:
+        """Rank 0 of the instance this worker follows for ``rid``."""
+        for group in self._graph_runtime.get_sharding_config(rid).groups:
+            workers = getattr(group, "_workers", None)
+            if (
+                workers and group.nodes & self._lockstep_followed
+                and self.worker_id in workers[1:]
+            ):
+                return workers[0]
+        return None
+
     def _check_ready_tensors(self) -> None:
         """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
         self.wakeup_event.drain()
         ready = self.tensor_manager.get_ready_tensors()
+        failed = {
+            f.request_id: f"Error in worker: input tensor read failed: {type(f.error).__name__}: {f.error}"
+            for f in self.tensor_manager.take_failed_reads()
+            if f.request_id not in self.scheduler.failed_rids
+        }
+        if failed:
+            self._fail_requests(failed)
+        if ready and (
+            getattr(self, "_lockstep_followed", None) or getattr(self, "_read_gate", None)
+        ):
+            self._note_landed(ready)
         for request_id, edges in ready.items():
             # Separate streaming edges from normal edges
             streaming = [e for e in edges if e.is_streaming]
@@ -1460,6 +1703,8 @@ class Worker:
                 )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
+        if getattr(self, "_landed_unreported", None):
+            self._report_landed_reads()
 
     # ------------------------------------------------------------------
     # CPU offloading
@@ -2660,6 +2905,27 @@ class Worker:
                 per_rid_counts.append(len(edges))
         else:
             per_rid_counts = [0] * len(candidates)
+        gated = (
+            getattr(self, "_read_gate", None) is not None
+            and spec_node_name in self._lockstep_led
+        )
+        if gated and polled:
+            # a chunk a follower has not landed yet: that row is not continued
+            # here and runs once the gate lets it, like any other row
+            held = {
+                r for r, (e, chunk) in polled
+                if self._spec_row_missing(
+                    r, spec_node_name, graph_walk, tuple,
+                    {e.name: chunk.start_offset + chunk.num_items},
+                )
+            }
+            if held:
+                for r, se in polled:
+                    if r in held:
+                        self._return_streaming_edge(r, se)
+                polled = [(r, se) for r, se in polled if r not in held]
+                candidates = [r for r in candidates if r not in held]
+                per_rid_counts = [sum(1 for pr, _ in polled if pr == r) for r in candidates]
 
         prep = self._graph_runtime.prep_spec_rids(SpeculationPrepInput(
             spec_node_name=spec_node_name,
@@ -2676,6 +2942,24 @@ class Worker:
             ],
             streaming_edges_per_rid=per_rid_counts,
         ))
+
+        if gated and prep.ready_rids:
+            # A continuing row takes its loop-back and its already-gated
+            # inputs, so this only trips if a message input reached the node
+            # mid-loop; kept so such a row can never outrun a follower's read.
+            prepped = edges_by_rid(prep.input_edges)
+            if any(
+                self._spec_row_missing(
+                    r, spec_node_name, graph_walk, lambda r=r: prepped.get(r, ()), {},
+                )
+                for r in prep.ready_rids
+            ):
+                self._graph_runtime.commit_speculation(
+                    prep.spec_id, False, list(prep.ready_rids),
+                )
+                for r, se in polled:
+                    self._return_streaming_edge(r, se)
+                return None
 
         # Anything not consumed goes back to its StreamBuffer, so a later
         # scheduling of this node picks it up normally.
@@ -3489,6 +3773,10 @@ class Worker:
             stored = stored._replace(num_tensors=counts)
         else:
             stored = store(rids)
+        if getattr(self, "_read_gate", None) is not None \
+                and batch_N.node_name not in self.parallel_nodes:
+            # a node outside the instance feeds rank 0's lockstep node directly
+            self._count_local_outputs(stored, signals)
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
         signal_idxs = stored.signal_idxs

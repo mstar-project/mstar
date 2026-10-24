@@ -44,6 +44,7 @@ from mstar.utils.ipc_format import (
     NewRequest,
     NewRequestConductor,
     ReadsDone,
+    ReadsLanded,
     RemoveRequest,
     ScheduleTPNode,
     SetupDone,
@@ -74,6 +75,7 @@ _TYPES: dict[str, type] = {
     "stop_loops": StopLoops,
     "schedule_tp_node": ScheduleTPNode,
     "tp_no_speculation": TPNoSpeculation,
+    "reads_landed": ReadsLanded,
     # conductor-bound bodies
     "wgs_done": WorkerGraphsDone,
     "setup_done": SetupDone,

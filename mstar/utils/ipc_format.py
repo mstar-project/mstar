@@ -41,6 +41,7 @@ class WorkerMessageType(Enum):
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
     ENABLE_METRICS = "enable_metrics"
+    READS_LANDED = "reads_landed"
 
 
 @dataclass
@@ -204,6 +205,18 @@ class TPNoSpeculation(MessageBody):
     node_name: str
     graph_walk: str
     spec_from_seq: int
+
+@dataclass
+class ReadsLanded(MessageBody):
+    """A lockstep follower's inputs for one request that have landed since its
+    last report, for rank 0's read gate (``mstar/worker/read_gate.py``)."""
+    request_id: str
+    follower: str
+    # edge -> external inputs of it the follower holds, in total
+    counts: dict[str, int]
+    # stream edge -> items it holds in order, in total
+    stream_items: dict[str, int]
+
 
 @dataclass
 class WorkerMessage:

@@ -72,3 +72,39 @@ def test_b2_retract_is_refuted_on_structural_cancel():
 def test_b2_waste_matches_design_prediction():
     # expected run-ahead cost: one wasted forward per request end at B=1
     assert _run("B2_VOID", "clean-3step").max_waste == 1
+
+
+# --- a follower's input read failing after rank 0 scheduled the row ----------
+# Model: tp_read_gate_sim.py. It explores every order of the follower's read
+# outcome, its report to rank 0, rank 0's scheduling and the lockstep step.
+
+try:
+    from .tp_read_gate_sim import explore as explore_read_gate
+except ImportError:  # collected without package context
+    from tp_read_gate_sim import explore as explore_read_gate
+
+
+def test_read_gate_holds_for_data_and_shape_inputs():
+    """Rank 0 schedules a row only once the follower reported its input
+    landed: no interleaving hangs, every step has one shape on both ranks,
+    and only the request whose read failed fails."""
+    for kind in ("data", "shape"):
+        res = explore_read_gate("GATE", kind)
+        assert res.ok, (kind, res.violations[:1])
+
+
+def test_scheduling_from_rank_0s_reads_alone_hangs_the_instance():
+    """Without the gate a step rank 0 broadcast can need a read that then
+    fails on the follower, which can never run it."""
+    for kind in ("data", "shape"):
+        res = explore_read_gate("NONE", kind)
+        assert any(v == "live" for v, _ in res.violations), kind
+
+
+def test_zero_fill_desyncs_the_step_when_the_input_sets_its_shape():
+    """Zeros of the advertised shape keep a data input's step whole, but an
+    input the step derives its shape from (image_grid_thw) gives the follower
+    a different step than rank 0's."""
+    assert explore_read_gate("ZERO", "data").ok
+    res = explore_read_gate("ZERO", "shape")
+    assert any(v == "lockstep" for v, _ in res.violations)

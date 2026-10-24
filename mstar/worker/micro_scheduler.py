@@ -2,7 +2,7 @@ import functools
 import logging
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NamedTuple
@@ -98,6 +98,22 @@ class ScheduledBatch:
         self.request_to_worker_graph.pop(rid, None)
         self.request_walks.pop(rid, None)
         self._by_walk = None
+
+    def take_rows(self, rids: Iterable[int]) -> "ScheduledBatch":
+        """Move ``rids``' rows, with their input edges, into a new batch."""
+        rids = [r for r in rids if r in self.request_to_worker_graph]
+        taken = ScheduledBatch(
+            node_name=self.node_name, graph_walk=self.graph_walk,
+            request_to_worker_graph={r: self.request_to_worker_graph[r] for r in rids},
+            input_edges=self.input_edges.select_rids(rids),
+            output_signals=list(self.output_signals),
+            request_walks={r: self.request_walks[r] for r in rids if r in self.request_walks},
+            walk_output_signals=dict(self.walk_output_signals),
+        )
+        for rid in rids:
+            self.discard_rid(rid)
+        self.input_edges = self.input_edges.select_rids(self.request_to_worker_graph.keys())
+        return taken
 
     def relabel_if_uniform(self) -> None:
         """Label a combined batch whose rows share one real walk with that walk."""
@@ -247,6 +263,11 @@ class MicroScheduler:
         self.rid_of: Callable[[str], int | None] = lambda r: r
         self._warned_removed_rid = False
         self.sched_type = sched_type
+
+        # Rank 0's read gate: whether a lockstep row's inputs have landed on
+        # every follower of its instance, so the row may run. Installed by the
+        # worker; None (the default) lets every row run.
+        self.row_inputs_landed: Callable[[ScheduledBatch, int], bool] | None = None
 
         # RIDs that have failed but have not gone through the cleanup procedure;
         # these cannot be scheduled (unless this is a TP follower node)
@@ -714,6 +735,10 @@ class MicroScheduler:
                 entries.append(ReadyNodeEntry(rid, wg_id, spec.graph_walk))
         return ready
 
+    def _gated(self, batch: ScheduledBatch, rid: int) -> bool:
+        """Held by the read gate: a follower has not landed the row's inputs."""
+        return self.row_inputs_landed is not None and not self.row_inputs_landed(batch, rid)
+
     def _key(self, node_name: str, graph_walk: str) -> tuple[str, str]:
         """The scheduling key: the walk's combined walk if it has one."""
         return node_name, self.combined_walk_of.get((node_name, graph_walk), graph_walk)
@@ -775,9 +800,18 @@ class MicroScheduler:
 
         fresh = self._assemble_batch(request_state, *node_walk, entries) \
             if entries else None
+        held = None
+        if fresh:
+            gated = [r for r in fresh.request_to_worker_graph if self._gated(fresh, r)]
+            if gated:
+                # popped already: they wait in the backlog, claimed, for the
+                # follower's report, behind the rows that were there first
+                held = fresh.take_rows(gated)
         if backlogged is None and not fresh:
+            if held is not None:
+                self._backlog(node_walk, held)
             return None
-        return self._build_and_schedule(request_state, BatchBuildRequest(
+        scheduled = self._build_and_schedule(request_state, BatchBuildRequest(
             node_name=node_walk[0], graph_walk=node_walk[1],
             backlog=backlogged, fresh=fresh or None, blocked_rids=blocked,
             capture_group_of=capture_group_of,
@@ -786,6 +820,9 @@ class MicroScheduler:
             pre_existing_batch_size=pre_existing_batch_size,
             pre_existing_walk=pre_existing_walk,
         ))
+        if held is not None:
+            self._backlog(node_walk, held)
+        return scheduled
 
     def _room_left(
         self, node_walk: tuple[str, str], pre_existing_walk: str | None,
@@ -868,7 +905,7 @@ class MicroScheduler:
         return {
             r for r in waiting.request_to_worker_graph
             if r not in self.failed_rids and r not in self.pending_removes
-            and self.held_until.get(r, 0.0) <= now
+            and self.held_until.get(r, 0.0) <= now and not self._gated(waiting, r)
         }
 
     def _unready_backlog_rids(
@@ -922,7 +959,7 @@ class MicroScheduler:
                 break
             if rid in waiting:
                 continue
-            if not self._check_ready(
+            if self._gated(batch, rid) or not self._check_ready(
                 batch.node_name, rid,
                 request_state.get_fwd_info(rid, node_partition),
             ):
@@ -1166,6 +1203,8 @@ class MicroScheduler:
                 if rid in self.failed_rids or rid in self.pending_removes:
                     continue
                 if self.held_until.get(rid, 0.0) > now:
+                    continue
+                if self._gated(batch, rid):
                     continue
                 return True
         return False

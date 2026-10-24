@@ -291,6 +291,7 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
+        take_failed_reads=lambda: [],
         get_tensor=lambda uuid: object(),
         dereference=dereferenced.append,
     )
@@ -323,6 +324,7 @@ def test_a_failed_output_releases_the_outputs_held_behind_it():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
+        take_failed_reads=lambda: [],
         get_tensor=lambda uuid: object(),
         dereference=lambda uuid: None,
     )

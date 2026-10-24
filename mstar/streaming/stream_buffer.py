@@ -109,6 +109,12 @@ class StreamBuffer:
             self._num_buffer_writes += 1
             del self._id_to_tensor[tensor_id]
 
+    def landed_items(self) -> int:
+        """Items landed in order so far: the stream positions a chunk can
+        cover on this worker."""
+        self._update_buffer()
+        return self._num_buffer_writes
+
     def signal_done(self, num_items: int = 0) -> None:
         """Producer signals no more items will arrive after the ``num_items``
         it sent in total."""
