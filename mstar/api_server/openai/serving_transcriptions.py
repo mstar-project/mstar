@@ -57,11 +57,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 
 _TIMED_FORMATS = ("verbose_json", "srt", "vtt")
 RESPONSE_FORMATS = ("json", "text", *_TIMED_FORMATS)
@@ -507,8 +508,9 @@ async def create_transcription(
 
     if req.stream:
         # the stream owns the files and windows from here
-        return StreamingResponse(
+        return ReleasingStreamingResponse(
             _stream(api, adapter, req, planner, mode, raw_request),
+            release=planner.cleanup,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )

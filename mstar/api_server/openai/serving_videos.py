@@ -12,9 +12,13 @@ from mstar.api_server.openai._util import now, rid
 logger = logging.getLogger(__name__)
 
 
-async def create_videos(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
+def new_request_id() -> str:
+    return rid("vid")
+
+
+async def create_videos(api, model_name, adapter, req, raw_request=None, request_id=None):  # noqa: ARG001
     args = adapter.video_to_request(req, api.upload_dir)
-    request_id = rid("vid")
+    request_id = request_id or new_request_id()
 
     stream = bool(args.model_kwargs.get("stream_video"))
     try:

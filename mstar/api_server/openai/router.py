@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 
 from fastapi import APIRouter, Request, WebSocket
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from mstar.api_server.body_limit import max_body_bytes
 from mstar.api_server.openai import (
@@ -32,6 +32,7 @@ from mstar.api_server.openai.protocol import (
     TranscriptionRequest,
     VideoGenerationRequest,
 )
+from mstar.api_server.streaming_response import ReleasingStreamingResponse
 
 router = APIRouter()
 
@@ -89,14 +90,18 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     api, model_name, adapter, err = _resolve("supports_chat")
     if err is not None:
         return err
+    request_id = serving_chat.new_request_id()
     try:
-        result = await serving_chat.create_chat_completion(api, model_name, adapter, request, raw_request)
+        result = await serving_chat.create_chat_completion(
+            api, model_name, adapter, request, raw_request, request_id=request_id,
+        )
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
         default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
         return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
     if request.stream:
-        return StreamingResponse(
-            result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+        return ReleasingStreamingResponse(
+            result, release=lambda: api.release_request(request_id),
+            media_type="text/event-stream", headers={"Cache-Control": "no-cache"},
         )
     return JSONResponse(result)
 
@@ -203,16 +208,20 @@ async def videos_generations(request: VideoGenerationRequest, raw_request: Reque
     api, model_name, adapter, err = _resolve("supports_videos")
     if err is not None:
         return err
+    request_id = serving_videos.new_request_id()
     try:
-        result = await serving_videos.create_videos(api, model_name, adapter, request, raw_request)
+        result = await serving_videos.create_videos(
+            api, model_name, adapter, request, raw_request, request_id=request_id,
+        )
     except Exception as e:  # noqa: BLE001
         default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
         return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
     if (request.model_extra or {}).get("stream_video"):
         # A windowed request delivering each window as it lands: NDJSON lines
         # (see serving_videos._stream_ndjson) instead of one JSON body.
-        return StreamingResponse(
-            result, media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"}
+        return ReleasingStreamingResponse(
+            result, release=lambda: api.release_request(request_id),
+            media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"},
         )
     return JSONResponse(result)
 

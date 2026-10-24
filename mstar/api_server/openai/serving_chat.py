@@ -17,9 +17,13 @@ from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 
 
-async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
+def new_request_id() -> str:
+    return rid("chatcmpl")
+
+
+async def create_chat_completion(api, model_name, adapter, req, raw_request=None, request_id=None):
     args = adapter.chat_to_request(req, api.upload_dir)
-    request_id = rid("chatcmpl")
+    request_id = request_id or new_request_id()
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
     try:
