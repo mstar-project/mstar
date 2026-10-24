@@ -26,11 +26,11 @@ def test_an_output_no_signal_carries_is_not_stored(tmp_path):
     memory for the rest of the request."""
     w = _worker(tmp_path)
     store = w.tensor_manager.tensor_store
-    before = set(store._tensors)
+    before = set(store.get_all_uuids(0))
     stored = w.tensor_manager.store_and_return_tensor_info_batch(
         [0], {0: {"h": [torch.zeros(2)], "unrouted": [torch.ones(3)]}}, ["h"],
     )
-    assert set(store._tensors) - before == set(stored.flat_uuids)
+    assert set(store.get_all_uuids(0)) - before == set(stored.flat_uuids)
     assert store.get_all_uuids(0) == stored.flat_uuids
 
 
