@@ -143,6 +143,9 @@ class WhisperModel(Model):
     # Requests the default decoder caches hold at once, each at full length.
     # A deployment retunes the page counts under ``resources:`` in its YAML.
     MAX_CONCURRENT_REQUESTS = 64
+    # The API server decodes uploads and stages their tensors with small CPU
+    # ops; a thread per core spins between them and starves its event loop.
+    PREPROCESS_TORCH_THREADS = 4
     # Set from the deployment by validate_config_yaml: the align walk re-runs
     # the decoder unsharded, so word timestamps need tp_size 1.
     _decoder_tp_size = 1

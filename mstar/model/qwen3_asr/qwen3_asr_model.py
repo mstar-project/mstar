@@ -103,6 +103,10 @@ class Qwen3ASRModel(Model):
     # ``resources:`` in their YAML.
     KV_PAGES = 1024
 
+    # The API server decodes uploads and stages their tensors with small CPU
+    # ops; a thread per core spins between them and starves its event loop.
+    PREPROCESS_TORCH_THREADS = 4
+
     def __init__(
         self,
         model_path_hf: str,
