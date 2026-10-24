@@ -593,6 +593,12 @@ def _chatterbox(name, model_kwargs, tmp_path, monkeypatch):
                  voices_dir=None, local_dir="/nonexistent", _shared={})
 
 
+def _cosyvoice3(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.cosyvoice3.config import CosyVoice3Config
+    from mstar.model.cosyvoice3.cosyvoice3_model import CosyVoice3Model
+    return _bare(CosyVoice3Model, config=CosyVoice3Config())
+
+
 def _cosmos3(name, model_kwargs, tmp_path, monkeypatch):
     if name in ("cosmos3_edge", "cosmos3_edge_droid"):
         from test_cosmos3_edge_model import _fake_edge_dir
@@ -686,6 +692,7 @@ _FACTORIES = {
     "ChatterboxModel": _chatterbox,
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
+    "CosyVoice3Model": _cosyvoice3,
     "Flux2KleinModel": _flux2,
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,

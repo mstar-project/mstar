@@ -130,6 +130,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[fish_s2_pro]``
      - Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[cosyvoice3_wetext]``
+     - Optional, next to ``.[cosyvoice3]``: ``wetext``, the reference frontend's text
+       normalization grammars (Apache-2.0; about 52 MB fetched from ModelScope on the
+       first start). Without it, CosyVoice3's built-in rules read English numbers.
    * - ``.[omnivoice]``
      - OmniVoice TTS. The extra is empty on purpose: the runtime is the
        ``omnivoice`` package, installed separately from git —

@@ -25,9 +25,10 @@ _SENTENCE = re.compile(
     )""",
     re.VERBOSE | re.DOTALL,
 )
-# Soft break points inside an over-long sentence, most preferred first.
+# Soft break points inside an over-long sentence, most preferred first. A Latin
+# clause mark breaks only before whitespace, so "4,500,000" and "9:45" stay whole.
 _SOFT_BREAKS = (
-    re.compile(r"(?<=[,;:，；：])\s*"),
+    re.compile(r"(?<=[,;:])\s+|(?<=[，；：])\s*"),
     re.compile(r"\s+"),
 )
 
@@ -77,6 +78,11 @@ def _hard_wrap(sentence: str, max_chars: int) -> list[str]:
     return [q for p in pieces for q in (_cut_evenly(p, max_chars) if len(p) > max_chars else [p])]
 
 
+def _join(left: str, right: str) -> str:
+    """Two sentences of one chunk: a space after a Latin sentence, none after a CJK one."""
+    return left + right if left[-1] in "。！？；" else f"{left} {right}"
+
+
 def split_sentences(text: str, max_chars: int = 400, min_chars: int = 24) -> list[str]:
     """Group ``text`` into sentence chunks of at most ``max_chars`` characters.
 
@@ -108,7 +114,7 @@ def split_sentences(text: str, max_chars: int = 400, min_chars: int = 24) -> lis
             chunks.append(current)
             current = sentence
         else:
-            current = f"{current} {sentence}".strip()
+            current = _join(current, sentence) if current else sentence
     if current:
         chunks.append(current)
 
@@ -117,5 +123,5 @@ def split_sentences(text: str, max_chars: int = 400, min_chars: int = 24) -> lis
         and len(chunks[-1]) < min_chars
         and len(chunks[-2]) + 1 + len(chunks[-1]) <= max_chars * 5 // 4
     ):
-        chunks[-2:] = [f"{chunks[-2]} {chunks[-1]}"]
+        chunks[-2:] = [_join(chunks[-2], chunks[-1])]
     return chunks

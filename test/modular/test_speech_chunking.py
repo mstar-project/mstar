@@ -65,6 +65,13 @@ def test_cjk_terminators_and_paragraph_breaks_split():
     assert paragraphs == ["First paragraph no period", "second paragraph no period"]
 
 
+def test_cjk_sentences_in_one_chunk_are_joined_without_a_space():
+    text = "今天天气很好。我们去公园散步吧！你觉得怎么样？" * 2
+    chunks = split_sentences(text, max_chars=30, min_chars=1)
+    assert "".join(chunks) == text and all(" " not in c for c in chunks)
+    assert split_sentences("Hi there. 你好。Bye now.", max_chars=12, min_chars=1) == ["Hi there.", "你好。Bye now."]
+
+
 def test_quotes_after_terminators_stay_with_their_sentence():
     text = 'He said "Wait!" Then she left. "Really?" she asked. Yes.'
     chunks = split_sentences(text, max_chars=20, min_chars=1)
@@ -79,6 +86,19 @@ def test_overlong_sentence_is_wrapped_at_clauses_then_spaces():
     assert all(len(c) <= 30 for c in chunks)
     assert " ".join(chunks).replace(" ,", ",") == sentence
     assert chunks[0] == "alpha beta gamma,"
+
+
+def test_overlong_sentence_keeps_its_numbers_whole():
+    sentence = (
+        "The budget for the whole program across all regional offices is $4,500,000 "
+        "and the review starts at 9:45 on the third floor near the main entrance hall"
+    )
+    chunks = split_sentences(sentence, max_chars=60, min_chars=0)
+    assert all(len(c) <= 60 for c in chunks)
+    assert " ".join(chunks) == sentence
+    zh = "第一部分已经完成，第二部分正在进行，第三部分将在下个月开始，第四部分还在计划之中"
+    zh_chunks = split_sentences(zh, max_chars=20, min_chars=0)
+    assert len(zh_chunks) > 1 and all(len(c) <= 20 for c in zh_chunks)  # a full-width comma needs no space
 
 
 def test_tiny_trailing_fragment_merges_into_previous_chunk():
