@@ -31,12 +31,13 @@ mod bridge;
 mod media;
 mod protocol;
 mod refusals;
+mod runtime_dir;
 mod serving;
 mod tokenizer;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -74,10 +75,11 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
     let socket_dir = std::env::args().nth(3);
-    let upload_dir = PathBuf::from(
-        std::env::args()
+    let upload_dir = private_dir_or_exit(
+        &std::env::args()
             .nth(4)
-            .unwrap_or_else(|| "/tmp/mstar_uploads".to_string()),
+            .map(PathBuf::from)
+            .unwrap_or_else(runtime_dir::default_upload_dir),
     );
     let sample_rate: u32 = std::env::var("MSTAR_SAMPLE_RATE")
         .ok()
@@ -96,6 +98,7 @@ async fn main() {
         parse_max_images(std::env::var("MSTAR_MAX_IMAGES_PER_REQUEST").ok().as_deref());
 
     let bridge = socket_dir.map(|dir| {
+        private_dir_or_exit(Path::new(&dir));
         eprintln!("bridging to conductor at {dir}");
         Arc::new(Bridge::new(&dir).expect("bind bridge"))
     });
@@ -206,6 +209,13 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+}
+
+fn private_dir_or_exit(path: &Path) -> PathBuf {
+    runtime_dir::ensure_private_dir(path).unwrap_or_else(|e| {
+        eprintln!("mstar-server: {e}");
+        std::process::exit(1);
+    })
 }
 
 /// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
@@ -882,7 +892,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         _ => return error(400, "images/edits requires an 'image' file upload", "invalid_request_error"),
     };
     // Persist the uploaded image so the data-worker's loader can read it by path.
-    if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
+    if let Err(e) = runtime_dir::ensure_private_dir(&st.upload_dir) {
         return error(500, &e.to_string(), "server_error");
     }
     let ext = image_filename
@@ -890,7 +900,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
         .unwrap_or_else(|| ".png".to_string());
     let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
-    if let Err(e) = std::fs::write(&image_path, &image_bytes) {
+    if let Err(e) = runtime_dir::write_private_file(&image_path, &image_bytes) {
         return error(500, &e.to_string(), "server_error");
     }
 
@@ -1036,7 +1046,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                     return detail_error(status, &msg);
                 }
             };
-            if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
+            if let Err(e) = runtime_dir::ensure_private_dir(&st.upload_dir) {
                 return detail_error(500, &e.to_string());
             }
             // Sanitize: take ONLY the final path component of the
@@ -1050,7 +1060,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 .filter(|s| !s.is_empty())
                 .unwrap_or("upload");
             let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
-            if let Err(e) = std::fs::write(&save_path, &bytes) {
+            if let Err(e) = runtime_dir::write_private_file(&save_path, &bytes) {
                 return detail_error(500, &e.to_string());
             }
             uploads
@@ -1346,8 +1356,10 @@ mod tests {
     }
 
     fn socket_dir() -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
         let dir = std::env::temp_dir().join(format!("mstar-metrics-{}", Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 0700 whatever the umask: tests use it as an upload dir, which is checked
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         dir
     }
 
@@ -1650,7 +1662,7 @@ mod tests {
             assert_eq!((status, body["error"]["message"].as_str()), (StatusCode::BAD_REQUEST, Some(detail)), "{adapter}");
             left.push((adapter, std::fs::read_dir(&st.upload_dir).unwrap().count()));
             let _ = std::fs::remove_dir_all(&st.upload_dir);
-            std::fs::create_dir_all(&st.upload_dir).unwrap();
+            runtime_dir::ensure_private_dir(&st.upload_dir).unwrap();
         }
         let _ = std::fs::remove_dir_all(&st.upload_dir);
         assert_eq!(left, [("Qwen3_5Adapter", 0), ("Qwen3OmniAdapter", 0), ("Cosmos3EdgeAdapter", 0)]);

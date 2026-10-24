@@ -36,10 +36,10 @@ import asyncio
 import base64
 import contextlib
 import dataclasses
+import io
 import logging
 import time
 import uuid
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
@@ -50,6 +50,7 @@ from mstar.api_server.openai.protocol import (
     VideoGenerationRequest,
 )
 from mstar.api_server.openai.serving_images import image_count
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import APIServer
@@ -945,13 +946,14 @@ class Pi05TensorSpec:
         else:
             frames = np.asarray(values, dtype=np.uint8).reshape(shape)
 
-        upload_dir = Path(upload_dir)
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        upload_dir = ensure_private_dir(upload_dir)
         tag = uuid.uuid4().hex
         paths = []
         for i, frame in enumerate(frames):
             path = upload_dir / f"tensor_{tag}_cam{i}.png"
-            Image.fromarray(np.ascontiguousarray(frame), mode="RGB").save(path)
+            buf = io.BytesIO()
+            Image.fromarray(np.ascontiguousarray(frame), mode="RGB").save(buf, format="PNG")
+            write_private_file(path, buf.getvalue())
             paths.append(str(path))
 
         model_kwargs = {}
@@ -1061,10 +1063,9 @@ class VJepa2AcTensorSpec:
                 f"{actions['metadata']['shape']} vs {states['metadata']['shape']}"
             )
 
-        upload_dir = Path(upload_dir)
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        upload_dir = ensure_private_dir(upload_dir)
         path = upload_dir / f"tensor_{uuid.uuid4().hex}.mp4"
-        path.write_bytes(video_bytes)
+        write_private_file(path, video_bytes)
 
         model_kwargs = {"actions": action_rows, "states": state_rows}
         parameters = parameters or {}

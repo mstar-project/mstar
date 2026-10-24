@@ -5,13 +5,13 @@ from __future__ import annotations
 import base64
 import os
 import re
-from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import now, release_unread, rid
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
 
 
 async def create_images(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
@@ -82,11 +82,10 @@ async def create_image_edit(
 ):  # noqa: ARG001
     # Persist the uploaded image so the model's loader can read it by path
     # (same contract as multipart uploads), then run the image-to-image edit.
-    upload_dir = Path(api.upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = ensure_private_dir(api.upload_dir)
     ext = os.path.splitext(image_filename or "")[1] or ".png"
     image_path = upload_dir / f"{uuid4().hex}{ext}"
-    image_path.write_bytes(image_bytes)
+    write_private_file(image_path, image_bytes)
 
     try:
         args = adapter.image_edit_to_request(prompt, str(image_path), model_kwargs)

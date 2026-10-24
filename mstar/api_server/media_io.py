@@ -31,6 +31,8 @@ from uuid import uuid4
 
 import numpy as np
 
+from mstar.utils.runtime_dir import ensure_private_dir, write_private_file
+
 # MIME (top-level type or full type) -> file extension used when persisting.
 _MIME_TO_EXT: dict[str, str] = {
     "image/png": ".png",
@@ -130,10 +132,9 @@ def _ext_for(mime: str, fallback: str = ".bin") -> str:
 # ---------------------------------------------------------------------------
 
 def _save_bytes(raw: bytes, mime: str, upload_dir: Path) -> tuple[str, str]:
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = ensure_private_dir(upload_dir)
     path = upload_dir / f"{uuid4()}{_ext_for(mime)}"
-    path.write_bytes(raw)
+    write_private_file(path, raw)
     return modality_from_mime(mime), str(path)
 
 
@@ -159,15 +160,14 @@ def save_data_url(data_url: str, upload_dir: Path) -> tuple[str, str]:
 
 def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tuple[str, str]:
     """Persist a bare base64 blob with a known ``fmt`` (e.g. ``"wav"``)."""
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    upload_dir = ensure_private_dir(upload_dir)
     raw = _decode_base64_payload(b64)
     # Sanitize the client-controlled fmt: alphanumerics only, so it cannot
     # inject path separators into the upload path.
     clean = "".join(c for c in fmt.lstrip(".") if c.isalnum())
     ext = "." + clean if clean else ".bin"
     path = upload_dir / f"{uuid4()}{ext}"
-    path.write_bytes(raw)
+    write_private_file(path, raw)
     return modality_hint, str(path)
 
 
@@ -602,12 +602,14 @@ class StreamResampler:
 
 
 def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
-    """Float waveform -> 16-bit PCM WAV file at ``path``. The inverse of
-    reading PCM16 as ``int16 / 32768``, so 16-bit audio comes back sample for
-    sample."""
+    """Float waveform -> 16-bit PCM WAV file at a new ``path`` (mode 0600).
+    The inverse of reading PCM16 as ``int16 / 32768``, so 16-bit audio comes
+    back sample for sample."""
     scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
     pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
-    Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
+    # realtime steps write here with no other check of the upload dir
+    ensure_private_dir(os.path.dirname(path) or ".")
+    write_private_file(path, pcm16_to_wav_bytes(pcm, sample_rate))
     return path
 
 

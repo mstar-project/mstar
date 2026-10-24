@@ -8,6 +8,7 @@ import zmq
 
 from mstar.communication.codec import Codec, decode_each, default_codec
 from mstar.communication.event import EventWakeup
+from mstar.utils.runtime_dir import ensure_private_dir
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ class ZMQCommunicator(BaseCommunicator):
         self.protocol = CommProtocol(transport)
         self.pull_socket = self.context.socket(zmq.PULL)
         if self.protocol == CommProtocol.IPC:
-            os.makedirs(ipc_socket_path_prefix, exist_ok=True)
+            ensure_private_dir(ipc_socket_path_prefix)
 
         # TODO: maybe only open sockets as we need them, and close sockets
         # when we no longer need them

@@ -32,6 +32,7 @@ from mstar.communication.codec import (  # noqa: F401  (re-exported)
 )
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.event import EventWakeup
+from mstar.utils.runtime_dir import ensure_private_dir
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ class RustZMQCommunicator(BaseCommunicator):
         self._buffered: deque = deque()
 
         if self.protocol == CommProtocol.IPC:
-            os.makedirs(ipc_socket_path_prefix, exist_ok=True)
+            ensure_private_dir(ipc_socket_path_prefix)
             self._lock_deployment(my_id)
             self._inner = _RustZmq(my_id, ipc_socket_path_prefix)
         elif self.protocol == CommProtocol.TCP:

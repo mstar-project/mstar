@@ -61,6 +61,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
+from mstar.utils.runtime_dir import ensure_private_dir
 
 logger = logging.getLogger(__name__)
 
@@ -567,7 +568,7 @@ class Conductor:
         # worker id -> its latest WorkerStatus snapshots (cumulative)
         self._worker_metrics: dict[str, list[MetricSnapshot]] = {}
 
-        os.makedirs(socket_path_prefix, exist_ok=True)
+        ensure_private_dir(socket_path_prefix)
         self._derive_worker_info()
         self._launch_workers()
 

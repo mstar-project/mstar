@@ -74,6 +74,19 @@ mstar serve
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
 
+The server creates the socket and upload directories with mode 0700 and
+refuses to start if one already exists as a symlink, belongs to another user,
+or is writable by group or others; remove it or pass another path. The upload
+directory is checked again before each upload is written, so a request fails
+instead of writing into a directory someone else recreated after startup (say,
+after a ``/tmp`` cleaner removed it). Uploaded files are written 0600. The
+same holds for ``python -m mstar.api_server.entrypoint`` and the Rust
+frontend. Only the last path component is checked, so to use a shared or
+group-writable volume (for example a Kubernetes volume with ``fsGroup``), pass
+a subdirectory of its mount point; the server creates that subdirectory 0700.
+Anyone who can write the mount point itself can still rename that
+subdirectory away, so only trusted accounts should have write access to it.
+
 Each model maps to a default config (override with ``--config``):
 
 .. list-table::
@@ -141,8 +154,10 @@ mstar-serve
        worker (``python -m mstar.integrations.dynamo``) has no HTTP port, so
        it defaults to a new directory per launch and removes it at exit.
    * - ``--upload-dir``
-     - ``/tmp/mstar_uploads``
-     - Temp directory for uploaded media.
+     - ``/tmp/mstar_uploads_<user>/``
+     - Temp directory for uploaded media; per user, because the server
+       refuses an upload dir another user owns. The Dynamo worker uses the
+       same default.
    * - ``--timeout``
      - ``600``
      - Per-request timeout (seconds).
