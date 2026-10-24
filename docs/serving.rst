@@ -288,6 +288,16 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
        (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
        overrides it).
+   * - ``knobs``
+     - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
+       ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
+       ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs`` and
+       ``gc_gen0_threshold``
+       (``true``/``false`` or an integer). Each one's environment variable
+       (``MSTAR_DEVICE_LOOPBACK`` and so on; see
+       :doc:`environment_variables`) overrides it when set, and an unknown name
+       fails at startup. For example ``knobs: {kv_plan_cache: 1,
+       ingraph_decode_rope: true}``.
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /

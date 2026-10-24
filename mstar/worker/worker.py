@@ -57,6 +57,7 @@ from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
+from mstar.utils import knobs
 from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
@@ -78,7 +79,14 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
+from mstar.utils.profiler import (
+    PHASE_PERIOD,
+    PhaseLaps,
+    nvtx_enabled,
+    phase_buffer,
+    range_pop,
+    range_push,
+)
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -93,6 +101,16 @@ _HOLD_LOG_INTERVAL = 5.0
 # ``_await_admit_settled``'s safety net, not a tuning knob: the GPU thread
 # releases the event on every exit, so this only fires if that thread died.
 _ADMIT_FENCE_TIMEOUT_S = 10.0
+
+
+def _thread_role() -> str:
+    """The worker thread this runs on, by the executors' name prefixes."""
+    name = threading.current_thread().name
+    if name.startswith("mstar-gpu-"):
+        return "gpu"
+    if name.startswith("mstar-plan-"):
+        return "plan"
+    return "main" if threading.current_thread() is threading.main_thread() else "other"
 
 
 def _make_graph_runtime(
@@ -373,6 +391,8 @@ class Worker:
         dist_init_method=None,
         status_interval_s: float | None = None,
     ):
+        # before anything below builds a resource or a submodule that reads one
+        knobs.configure((model_config or {}).get("knobs"))
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
@@ -1906,7 +1926,10 @@ class Worker:
                 leased = engine.reserve_replay_slot(spec_batch) is not None
             if not leased:
                 return False  # eager, or no batched capture for this shape
-            with self._span("worker.plan_thread.pre_plan"):
+            with self._span(
+                "worker.plan_thread.pre_plan",
+                cpu="worker.plan_thread.pre_plan.cpu",
+            ):
                 return engine.pre_plan_for_batch(spec_batch)
         except Exception:
             logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
@@ -1942,8 +1965,12 @@ class Worker:
         apply_torch_config()
 
     @contextmanager
-    def _span(self, name: str):
+    def _span(self, name: str, cpu: str | None = None):
         """One NVTX range plus one MSTAR_PHASE_TIMING sample, same name.
+
+        ``cpu`` names a second sample: this thread's CPU time over the span.
+        Wall minus CPU is time spent blocked -- on an event, a lock or the
+        GIL -- which a wall-clock span alone cannot tell from work.
 
         Safe off the main thread: the append is the only shared mutation and
         run()'s flush snapshots before it clears.
@@ -1951,14 +1978,37 @@ class Worker:
         nvtx = self.enable_nvtx
         if nvtx:
             range_push(name, synchronize=False)
-        t0 = _time.perf_counter() if self._phase_period else 0.0
+        timed = self._phase_period
+        t0 = _time.perf_counter() if timed else 0.0
+        c0 = _time.thread_time() if timed and cpu else 0.0
         try:
             yield
         finally:
-            if self._phase_period:
+            if timed:
                 self._phase_buf[name].append(_time.perf_counter() - t0)
+                if cpu:
+                    self._phase_buf[cpu].append(_time.thread_time() - c0)
             if nvtx:
                 range_pop(synchronize=False)
+
+    # wall time of each collection by generation, on whichever thread ran it;
+    # a per-thread start stamp because collections on two threads can interleave
+    _GC_PHASES = ("gc.gen0", "gc.gen1", "gc.gen2")
+    _gc_t0 = threading.local()
+
+    def _gc_phase_callback(self, phase: str, info: dict) -> None:
+        if phase == "start":
+            self._gc_t0.t = _time.perf_counter()
+        else:
+            t0 = getattr(self._gc_t0, "t", None)
+            if t0 is not None:
+                dt = _time.perf_counter() - t0
+                name = self._GC_PHASES[info["generation"]]
+                self._phase_buf[name].append(dt)
+                # and by thread: a collection is charged to whatever span
+                # allocated when it triggered, so this says whose spans
+                # carry it (gc.gen0.main / .gpu / .plan)
+                self._phase_buf[f"{name}.{_thread_role()}"].append(dt)
 
     def _phase_record(self, name: str, dt: float) -> None:
         if self._phase_period > 0:
@@ -1993,6 +2043,10 @@ class Worker:
         """
         from mstar.utils.profiler import range_pop, range_push
 
+        timed = self._phase_period
+        t_start = _time.perf_counter() if timed else 0.0
+        c_start = _time.thread_time() if timed else 0.0
+        laps = PhaseLaps("worker.gpu_thread.")
         engine = self.engine_manager.get_engine(batch.node_name)
         # Every output of this step stays on the device: the engine keeps the
         # rows and skips the per-request dicts and tail (cached per node and
@@ -2012,6 +2066,7 @@ class Worker:
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
+        laps.lap("setup")
         # The plan thread wrote this batch's plan into the resources; wait for
         # it before the forward reads them. Waiting releases the GIL — which is
         # the point: running prepare_inputs here instead just puts the two
@@ -2019,6 +2074,7 @@ class Worker:
         if plan_future is not None:
             with self._span("worker.gpu_thread.await_plan"):
                 plan_future.result()
+        laps.skip()
         if self.enable_nvtx:
             range_push(
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
@@ -2026,7 +2082,10 @@ class Worker:
             )
         try:
             try:
-                with self._span("worker.gpu_thread.prepare_inputs"):
+                with self._span(
+                    "worker.gpu_thread.prepare_inputs",
+                    cpu="worker.gpu_thread.prepare_inputs.cpu",
+                ):
                     engine.prepare_inputs(node_batch)
             except Exception:
                 if plan_future is not None and node_batch.preplanned_rids is not None:
@@ -2034,6 +2093,7 @@ class Worker:
                     engine.reset_pre_plan_for_batch(node_batch)
                 raise
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
+            laps.skip()
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
             execution_stream = (
@@ -2053,18 +2113,25 @@ class Worker:
                 self._phase_record(
                     f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
                 )
-            with self._span("worker.gpu_thread.exec"):
+            laps.lap("pre_exec")
+            with self._span(
+                "worker.gpu_thread.exec", cpu="worker.gpu_thread.exec.cpu",
+            ):
                 outputs = engine.exec_and_postprocess(node_batch)
+            laps.skip()
             if execution_stream is not None:
                 self._stage_host_rows(outputs)
+                laps.lap("stage_host_rows")
                 event = torch.Event(device=self.device)
                 event.record(execution_stream)
                 node_batch.completion_event = event
+                laps.lap("completion_event")
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
                     self._gpu_spans.append((gpu_start, gpu_end))
                     self._drain_gpu_spans()
+                    laps.lap("gpu_exec_events")
             return outputs
         finally:
             # Safety net: a step that raised before the forward would otherwise
@@ -2080,10 +2147,19 @@ class Worker:
             # the next iter's prep and the conductor see it. Runs regardless
             # of success, allocation failure, or an uncaught raise —
             # finalize_batch reads whatever state the engine actually reached.
+            laps.skip()
             publish_rids = self._publishable_request_ids(node_batch)
             node_batch.resource_publish_info = engine.finalize_batch(
                 node_batch, publish_request_ids=publish_rids,
             )
+            laps.lap("finalize_batch")
+            if timed:
+                self._phase_record(
+                    "worker.gpu_thread.total", _time.perf_counter() - t_start,
+                )
+                self._phase_record(
+                    "worker.gpu_thread.total.cpu", _time.thread_time() - c_start,
+                )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2576,6 +2652,7 @@ class Worker:
             Without this merge, new rids have to wait for the entire
             current speculation chain to drain before they can be scheduled.
         """
+        laps = PhaseLaps("speculate.")
         batch_N = pending.batch
         spec_target_info, walk_rids = target
         graph_walk = spec_target_info.graph_walk
@@ -2595,6 +2672,7 @@ class Worker:
         if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid):
             return None
         max_continuing = self.scheduler.room_for_continuing(spec_target)
+        laps.lap("backlog_check")
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
         # assumes that.
@@ -2626,6 +2704,7 @@ class Worker:
             streaming_edges_per_rid=per_rid_counts,
         ))
 
+        laps.lap("prep_spec_rids")
         # Anything not consumed goes back to its StreamBuffer, so a later
         # scheduling of this node picks it up normally.
         consumed = set(prep.consumed_streaming_edge_idxs)
@@ -2645,6 +2724,7 @@ class Worker:
         for i, r in enumerate(prep.ready_rids):
             per_request_inputs[r] = prepped_inputs[r]
             new_request_to_worker_graph[r] = prep.wg_ids[i]
+        laps.lap("continuing_inputs")
 
         if not continuing:
             return None
@@ -2661,6 +2741,7 @@ class Worker:
             pre_existing_batch_size=len(continuing),
             capture_group_of=prep.ready_rids[0],
         )
+        laps.lap("fresh_schedule")
 
         if fresh_batch is not None:
             # The merge below relabels these node objects with the spec
@@ -2696,8 +2777,9 @@ class Worker:
                 if walk != graph_walk:
                     other_walks[rid] = walk
 
+        laps.lap("fresh_merge")
         logger.debug("Speculating: %s %s", spec_node_name, continuing)
-        return self._assemble_speculation(
+        speculation = self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
@@ -2707,6 +2789,8 @@ class Worker:
                 **dict.fromkeys(new_request_to_worker_graph, graph_walk), **other_walks,
             } if other_walks else None,
         )
+        laps.lap("assemble")
+        return speculation
 
     def _thread_outputs_to_speculative(
         self, speculation: Speculation,
@@ -4239,6 +4323,11 @@ class Worker:
             "Worker %s: gc.freeze() after warmup — %d objects moved to the "
             "permanent generation", self.worker_id, gc.get_freeze_count(),
         )
+        if gen0 := knobs.gc_gen0_threshold():
+            gc.set_threshold(gen0, *gc.get_threshold()[1:])
+            logger.info("Worker %s: gc thresholds %s", self.worker_id, gc.get_threshold())
+        if self._phase_period:
+            gc.callbacks.append(self._gc_phase_callback)
 
         # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main
@@ -4356,8 +4445,8 @@ class Worker:
                 p95 = vs[min(n - 1, int(n * 0.95))] * scale
                 mean = (sum(vs) / n) * scale
                 parts.append(
-                    f"{name}: p50={p50:.2f}{unit} p95={p95:.2f}{unit} "
-                    f"mean={mean:.2f}{unit} n={n}"
+                    f"{name}: p50={p50:.3f}{unit} p95={p95:.3f}{unit} "
+                    f"mean={mean:.3f}{unit} n={n}"
                 )
             bs = (sum(phase_bs) / len(phase_bs)) if phase_bs else 0.0
             logger.info(
@@ -4382,11 +4471,14 @@ class Worker:
                 batch = None
                 spec_pending = None
                 _iter_start = _time.perf_counter() if phase_period else 0.0
+                _iter_cpu = _time.thread_time() if phase_period else 0.0
+                laps = PhaseLaps("worker.main.")
                 # Everything below moves pages — the removes and drains directly,
                 # ``_process_messages`` through a follower's delta, the readiness
                 # scans through ``check_ready``'s reload — and none of it may run
                 # while N's admit is outstanding. See ``_await_admit_settled``.
                 self._await_admit_settled(pending)
+                laps.skip()
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
@@ -4395,6 +4487,7 @@ class Worker:
                 # ever fail them.
                 self._fail_requests(self.scheduler.take_admit_errors())
                 self._apply_pending_drains(self._in_flight_rids)
+                laps.lap("teardown")
 
                 # 1. CPU preamble — overlaps with GPU(N).
                 # synchronize=False on every range so torch.cuda.synchronize()
@@ -4406,22 +4499,26 @@ class Worker:
                 self._apply_removes_whose_step_landed()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+                laps.lap("process_messages")
 
                 if self.enable_nvtx:
                     range_push("worker.check_ready_tensors", synchronize=False)
                 self._check_ready_tensors()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+                laps.lap("check_ready_tensors")
 
                 if self.enable_nvtx:
                     range_push("worker.poll_stream_buffers", synchronize=False)
                 self._poll_stream_buffers()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+                laps.lap("poll_stream_buffers")
 
                 # Reads only: whether a rank sends this changes nothing it runs.
                 if metrics is not None:
                     metrics.maybe_report()
+                    laps.lap("metrics")
 
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.
@@ -4430,8 +4527,11 @@ class Worker:
                 speculation, yield_away_from_target = self._build_speculation(
                     pending, consecutive_spec_steps, fair,
                 )
+                # inclusive of `speculate` and `worker.schedule_yield_away`
+                laps.lap("build_speculation")
                 if speculation is not None:
                     _arm_speculation(speculation)
+                    laps.lap("arm_speculation")
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
                 # asap, then post-process N (fast then slow) overlapping
@@ -4463,9 +4563,11 @@ class Worker:
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
 
+                    laps.skip()
                     # set node._in_flight to false, since
                     # the node has just completed
                     self._clear_in_flight_flag(pending.batch)
+                    laps.lap("clear_in_flight")
 
                     def _maybe_clear_spec():
                         nonlocal speculation
@@ -4534,8 +4636,10 @@ class Worker:
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
                         spec_node_batch = speculation.node_batch
+                        laps.lap("failure_checks")
                         if not speculation.is_yield_away:
                             self._thread_outputs_to_speculative(speculation, outputs)
+                            laps.lap("thread_outputs")
                         # The one settle for a step that runs: marks the batch
                         # speculatively scheduled (so its nodes are not put back
                         # on the ready queue while it executes -- not the dropped
@@ -4548,6 +4652,7 @@ class Worker:
                             speculation, success=True,
                             dropped_rids=speculation.dropped,
                         )
+                        laps.lap("settle_speculation")
 
                         if spec_batch.request_to_worker_graph:
                             if self.enable_nvtx:
@@ -4607,9 +4712,14 @@ class Worker:
                     # failure since the output tensors aren't valid;
                     # ``_handle_admit_failure`` already rehabilitated the
                     # failed rids upstream.
+                    laps.skip()
                     if pending.node_batch.admit_error is None:
-                        with self._span("worker.postprocess_batch"):
+                        with self._span(
+                            "worker.postprocess_batch",
+                            cpu="worker.postprocess_batch.cpu",
+                        ):
                             self._postprocess_batch(pending, outputs)
+                        laps.skip()
                         if metrics is not None:
                             metrics.step_done(
                                 pending.node_name, pending.graph_walk,
@@ -4618,9 +4728,11 @@ class Worker:
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
+                    laps.lap("step_done")
                     in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
+                    laps.lap("post_removes")
                     _set_pending(None)
                     if spec_pending is None and self.is_tp_follower:
                         # N is done and nothing runs. Rank 0 tore down what N held
@@ -4629,6 +4741,7 @@ class Worker:
                         # it takes that step.
                         self._apply_removes_whose_step_landed()
                         self._apply_pending_removes_safe_to_drop(set())
+                    laps.lap("set_pending")
 
                 if spec_pending is not None:
                     if speculation.is_yield_away:
@@ -4637,6 +4750,7 @@ class Worker:
                         consecutive_spec_steps += 1
                     if phase_period:
                         _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                        _phase_record("iter_total.cpu", _time.thread_time() - _iter_cpu)
                         phase_bs.append(len(spec_pending.batch.request_to_worker_graph))
                         phase_iter[0] += 1
                         _phase_flush()
@@ -4699,6 +4813,7 @@ class Worker:
                 # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    _phase_record("iter_total.cpu", _time.thread_time() - _iter_cpu)
                     phase_bs.append(len(batch.request_to_worker_graph))
                     phase_iter[0] += 1
                     _phase_flush()

@@ -57,6 +57,7 @@ from mstar.engine.resources.step import (
 )
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
+from mstar.utils.profiler import PhaseLaps
 
 logger = logging.getLogger(__name__)
 
@@ -2371,6 +2372,9 @@ class KVManager(AttentionResource):
             "KV preplan is already pending; clear_preplan before planning a "
             "different step ahead"
         )
+        laps = PhaseLaps(
+            "res.pre_plan.kv_cache." if ctx.is_preplan else "res.plan.kv_cache."
+        )
         self.reset_default_cursors()
         if self._preplanned:
             if self._preplan_key == self._plan_key(step, ctx):
@@ -2386,6 +2390,7 @@ class KVManager(AttentionResource):
                 self._preplan_marked = []
                 # the promoted step runs; the plan cache still describes it
                 self.clear_preplan(promoted=True)
+                laps.lap("promote")
                 return res
             # A different step reached the GPU thread before the one planned
             # ahead (e.g. a new request's prefill while a decode step sits
@@ -2404,9 +2409,11 @@ class KVManager(AttentionResource):
 
         if self._indptr_ring is not None:
             self._indptr_ring.begin_plan()
+        laps.lap("forks")
         res = None
         if self._plan_cache_mode and not pending:
             res = self._fast_decode_plan(step, ctx)
+            laps.lap("fast_decode" if res is not None else "fast_decode_miss")
         if res is None or self._plan_cache_mode == 2:
             full = KVPlanOutputs(
                 {
@@ -2432,7 +2439,9 @@ class KVManager(AttentionResource):
                 res = full
                 if self._plan_cache_mode and not pending:
                     self._remember_decode_plan(step, ctx, res)
+            laps.lap("full")
         self._setup_plan_states(res, ctx, ctx.slot_lease)
+        laps.lap("setup_states")
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
             self._preplanned = True
