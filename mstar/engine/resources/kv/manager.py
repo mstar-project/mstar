@@ -1022,7 +1022,7 @@ class KVManager(AttentionResource):
             self._index.page_for(
                 fingerprint(self._prefix_root, chain.keys[chain.cursor - 1])
             )
-            if chain.cursor else None
+            if 0 < chain.cursor < filled else None
         )
         while chain.cursor < filled:
             key = fingerprint(self._prefix_root, chain.keys[chain.cursor])
