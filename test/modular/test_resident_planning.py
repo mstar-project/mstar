@@ -1148,6 +1148,7 @@ def _refused_worker(engine, line):
     worker.parallel_nodes = set()
     worker.parallel_leader_nodes = set()
     worker._hold_logged = {}
+    worker._no_victim_logged = {}
     worker.pushed = []
     worker.held = []
     worker._apply_removes_whose_step_landed = lambda: None
