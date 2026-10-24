@@ -170,6 +170,7 @@ LM_NODE, MIMI_ENCODER_NODE, MIMI_DECODER_NODE = "LM", "MimiEncoder", "MimiDecode
 ENCODE_USER_AUDIO_WALK, CONDITIONING_WALK, GENERATE_WALK = "encode_user_audio", "conditioning", "generate"
 GENERATE_AUDIO_WALK = "generate_audio"  # generate without emitting text
 CONDITIONING_LOOP, DECODE_LOOP = "cond_loop", "decode_loop"
+KV_LABEL = "main"  # the LM's one paged KV label
 LM_KV, LM_ATTN, LM_POS = "lm_kv", "lm_attn", "lm_pos"
 TEXT_SAMPLER, DEPTH_SAMPLER = "text_sampler", "depth_sampler"
 

@@ -40,7 +40,7 @@ from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, TensorAndMetadata
 
 from . import config as cfg
 from .voice import VOICES_ARCHIVE, extract_voice_presets, load_voice_preset, resolve_voice_path
@@ -58,10 +58,14 @@ LM_LOOP_BACKS = {
 }
 # 128 pages x 128 tokens x 512 KiB a token (32 layers x 32 heads x 128 dims, K+V, bf16) = 8 GiB
 DEFAULT_KV_PAGES = 128
+# process_prompt's frame counts, read back by get_loop_caps; a client cannot set it.
+LOOP_FRAMES_KWARG = "personaplex_loop_frames"
 
 
 class PersonaPlexModel(Model):
     """NVIDIA PersonaPlex-7B (``nvidia/personaplex-7b-v1``), single GPU."""
+
+    INTERNAL_KWARGS = (LOOP_FRAMES_KWARG,)
 
     def __init__(
         self,
@@ -298,7 +302,7 @@ class PersonaPlexModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Validate the request and build the conditioning tensors.
 
         Request checks run on the data worker (here and in ``load_audio``), where
@@ -328,15 +332,30 @@ class PersonaPlexModel(Model):
         persona_tokens = torch.tensor(tokens, dtype=torch.long)
         if persona_tokens.min() < 0 or persona_tokens.max() >= cfg.TEXT_CARD:
             raise ValueError("persona tokens fall outside the 32000-token text vocabulary")
+        user_frames = math.ceil(num_samples / cfg.FRAME_SIZE)
         cfg.validate_context_budget(
-            voice_embeddings=preset.num_embeddings, text_tokens=len(tokens),
-            user_frames=math.ceil(num_samples / cfg.FRAME_SIZE),
+            voice_embeddings=preset.num_embeddings, text_tokens=len(tokens), user_frames=user_frames,
         )
-        return {
+        conditioning = preset.num_embeddings + 2 * cfg.SILENCE_FRAMES + len(tokens)
+        # One temporal KV entry per LM iteration, in both loops.
+        layout = LabelLayout(growth=((cfg.CONDITIONING_LOOP, 1), (cfg.DECODE_LOOP, 1)))
+        return ProcessPromptOutput({
             "voice_embeddings": [preset.embeddings],
             "voice_cache": [preset.cache],
             "persona_tokens": [persona_tokens],
-        }
+        }, {
+            "kv_layout": {cfg.LM_KV: {cfg.KV_LABEL: layout}},
+            LOOP_FRAMES_KWARG: {cfg.CONDITIONING_LOOP: conditioning, cfg.DECODE_LOOP: user_frames},
+        })
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        growth = ((cfg.CONDITIONING_WALK, cfg.CONDITIONING_LOOP), (cfg.GENERATE_WALK, cfg.DECODE_LOOP),
+                  (cfg.GENERATE_AUDIO_WALK, cfg.DECODE_LOOP))
+        return {cfg.LM_KV: {cfg.KV_LABEL: KVLabel(growth=growth)}}
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # Each loop's stop check ends it after exactly this many frames, so the cap is that count.
+        return dict(model_kwargs.get(LOOP_FRAMES_KWARG) or {})
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         """Audio: PCM16. Text: one frame's token as its SentencePiece piece ([PP] offline.py:286-295).

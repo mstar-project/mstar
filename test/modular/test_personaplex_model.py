@@ -264,7 +264,9 @@ def _personaplex_runtime(tensor_manager):
     )
     generate_ids = [wg.worker_graph_id for wg in graphs if cfg.GENERATE_WALK in wg.graph_walks]
     mapping = ParallelList([wg.worker_graph_id for wg in graphs], [["worker_0"] for _ in graphs])
-    rid = runtime.add_request("request", "default", cfg.GENERATE_WALK, generate_ids, mapping)
+    # What the conductor sends when a request names no caps: every loop at its max_iters.
+    caps = {name: loop.max_iters for wg in graphs for name, loop in wg.section.get_loops().items()}
+    rid = runtime.add_request("request", "default", cfg.GENERATE_WALK, generate_ids, mapping, caps)
     return runtime, rid
 
 
@@ -587,7 +589,7 @@ def test_load_audio_missing_decoder_runtime_stays_a_server_error(monkeypatch):
 def _request(model, *, samples=1920 * 3, prompt=None, outputs=("audio", "text"), **kwargs):
     kwargs.setdefault("voice", "NATF2")
     return model.process_prompt(prompt, ["audio"], list(outputs), {"audio_inputs": [torch.zeros(samples)]},
-                                **kwargs)
+                                **kwargs).new_input_tensors
 
 
 def test_process_prompt_builds_conditioning_tensors(tmp_path):
@@ -601,6 +603,36 @@ def test_process_prompt_builds_conditioning_tensors(tmp_path):
     assert default == StubTokenizer().encode(f"<system> {cfg.DEFAULT_TEXT_PROMPT} <system>")
     assert _request(model, prompt="<system> Hi <system>")["persona_tokens"][0].tolist() == \
         StubTokenizer().encode("<system> Hi <system>")
+
+
+def test_kv_layout_and_loop_caps_match_the_frames_each_loop_runs(tmp_path):
+    """One KV entry per LM iteration; each loop is capped at the frames its stop check runs."""
+    from mstar.model.personaplex.personaplex_model import LOOP_FRAMES_KWARG
+
+    model = _model(tmp_path, voice_frames=5)
+    out = model.process_prompt(None, ["audio"], ["audio"], {"audio_inputs": [torch.zeros(1920 * 3 + 5)]},
+                               voice="NATF2", text_prompt="Be kind.")
+    tokens = len(StubTokenizer().encode("<system> Be kind. <system>"))
+    frames = out.metadata[LOOP_FRAMES_KWARG]
+    assert frames == {cfg.CONDITIONING_LOOP: 4 + 2 * cfg.SILENCE_FRAMES + tokens, cfg.DECODE_LOOP: 4}
+    layout = out.metadata["kv_layout"][cfg.LM_KV][cfg.KV_LABEL]
+    assert layout.spans == () and layout.growth == ((cfg.CONDITIONING_LOOP, 1), (cfg.DECODE_LOOP, 1))
+    assert model.get_loop_caps(**out.metadata) == frames
+    assert model.get_loop_caps() == {}  # before process_prompt: each loop's max_iters
+    assert LOOP_FRAMES_KWARG in model.INTERNAL_KWARGS  # the data worker drops a client's value
+
+
+def test_kv_declarations_pass_the_worker_startup_checks():
+    from mstar.worker.engine_manager import _refuse_undeclared_pools, _refuse_unknown_walks, _refuse_unservable_walks
+
+    model = _model()
+    specs = model.get_node_resources()
+    _refuse_unknown_walks(model)
+    _refuse_undeclared_pools(specs, model)
+    _refuse_unservable_walks(specs, model)
+    growth = model.kv_labels()[cfg.LM_KV][cfg.KV_LABEL].growth
+    assert set(growth) == {(cfg.CONDITIONING_WALK, cfg.CONDITIONING_LOOP), (cfg.GENERATE_WALK, cfg.DECODE_LOOP),
+                           (cfg.GENERATE_AUDIO_WALK, cfg.DECODE_LOOP)}
 
 
 @pytest.mark.parametrize(("kwargs", "match"), [

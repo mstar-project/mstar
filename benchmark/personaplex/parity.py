@@ -298,7 +298,8 @@ def pipeline(ref, native):
     audio = loaded.data.reshape(-1)[:samples].clone()
     user_frames = (samples + 1919) // 1920
     tensors = {"audio_inputs": [audio]}
-    static = model.process_prompt(None, ["audio"], ["audio", "text"], tensors, voice="NATF2", greedy=True)
+    prompt = model.process_prompt(None, ["audio"], ["audio", "text"], tensors, voice="NATF2", greedy=True)
+    static = prompt.new_input_tensors
     voice_path = a.voices / "NATF2.pt"
     persona = static["persona_tokens"][0]
     meta = {

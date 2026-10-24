@@ -110,7 +110,7 @@ def main():
     def prepare(path):
         audio = model.load_audio(str(path), "cpu").data.reshape(-1)
         static = model.process_prompt(None, ["audio"], ["audio", "text"], {"audio_inputs": [audio]},
-                                      voice="NATF2", greedy=True)
+                                      voice="NATF2", greedy=True).new_input_tensors
         frames = (audio.numel() + cfg.FRAME_SIZE - 1) // cfg.FRAME_SIZE
         meta = {
             "num_voice_embeddings": static["voice_embeddings"][0].shape[0],

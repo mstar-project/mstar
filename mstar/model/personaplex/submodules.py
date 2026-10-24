@@ -39,7 +39,6 @@ from .components.delayed_cache import DelayedTokenCache
 from .components.mimi import MimiCodec, pad_to_frames
 from .weights import PersonaPlexLM
 
-KV_LABEL = "main"
 GENERATE_WALKS = frozenset({cfg.GENERATE_WALK, cfg.GENERATE_AUDIO_WALK})
 LM_WALKS = GENERATE_WALKS | {cfg.CONDITIONING_WALK}
 
@@ -47,7 +46,7 @@ LM_WALKS = GENERATE_WALKS | {cfg.CONDITIONING_WALK}
 class ResourceTemporalBackend:
     """Temporal attention on M*'s paged KV, attention and position resources."""
 
-    def __init__(self, kv, attn, pos, rope_theta: float, label: str = KV_LABEL):
+    def __init__(self, kv, attn, pos, rope_theta: float, label: str = cfg.KV_LABEL):
         from mstar.engine.resources.convenience import AttentionCallable
 
         self.attend_fn = AttentionCallable(kv=kv, attn=attn)
@@ -270,7 +269,7 @@ class LMSubmodule(ARNodeSubmodule):
             steps[cfg.TEXT_SAMPLER] = SamplerStep(apply_penalty=False)
             steps[cfg.DEPTH_SAMPLER] = SamplerStep(apply_penalty=False)
         return SubmoduleStep(
-            segments=[Segment(request_id=rid, label=KV_LABEL, span=inp.input_seq_len)
+            segments=[Segment(request_id=rid, label=cfg.KV_LABEL, span=inp.input_seq_len)
                       for rid, inp in zip(request_ids, inputs, strict=True)],
             steps=steps,
         )

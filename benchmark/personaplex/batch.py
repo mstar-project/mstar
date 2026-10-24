@@ -41,7 +41,8 @@ def prepare_requests(args, model):
         samples = min(args.frames * cfg.FRAME_SIZE, loaded.data.numel())
         audio = loaded.data.reshape(-1)[:samples].clone()
         tensors = {"audio_inputs": [audio]}
-        static = model.process_prompt(None, ["audio"], ["audio", "text"], tensors, voice=voice, greedy=True)
+        prompt = model.process_prompt(None, ["audio"], ["audio", "text"], tensors, voice=voice, greedy=True)
+        static = prompt.new_input_tensors
         user_frames = -(-samples // cfg.FRAME_SIZE)
         n_emb, n_text = static["voice_embeddings"][0].shape[0], static["persona_tokens"][0].numel()
         meta = {"num_voice_embeddings": n_emb, "num_text_tokens": n_text, "num_user_frames": user_frames,
