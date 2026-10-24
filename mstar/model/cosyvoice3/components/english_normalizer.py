@@ -93,9 +93,12 @@ def _below_thousand(n: int, with_and: bool) -> str:
 def cardinal(n: int) -> str:
     """``wetext``'s cardinal: "and" only inside the last group of three
     (247 -> "two hundred and forty seven", 29,032 -> "twenty nine thousand and
-    thirty two", 250,000 -> "two hundred fifty thousand")."""
+    thirty two", 250,000 -> "two hundred fifty thousand"). A number past
+    the largest scale is read digit by digit."""
     if n == 0:
         return "zero"
+    if n >= 1000 ** len(_SCALES):
+        return digits(str(n))
     groups = []
     while n:
         n, group = divmod(n, 1000)

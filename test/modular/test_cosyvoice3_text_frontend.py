@@ -312,6 +312,33 @@ def test_a_run_past_the_largest_scale_is_read_digit_by_digit():
     )
 
 
+_19_DIGITS = "1234567890123456789"
+_19_SPOKEN = "one two three four five six seven eight nine zero one two three four five six seven eight nine"
+
+
+@pytest.mark.parametrize(
+    "text, spoken",
+    [
+        (_19_DIGITS, _19_SPOKEN),
+        (f"${_19_DIGITS}", f"{_19_SPOKEN} dollars"),
+        (f"${_19_DIGITS}.50", f"{_19_SPOKEN} dollars and fifty cents"),
+        (f"{_19_DIGITS}.5", f"{_19_SPOKEN} point five"),
+        (f"{_19_DIGITS}th", _19_SPOKEN.removesuffix("nine") + "ninth"),
+        (f"{_19_DIGITS} 1/2 cups", f"{_19_SPOKEN} and a half cups"),
+        (f"{_19_DIGITS}%", f"{_19_SPOKEN} percent"),
+        # the largest number the scales name is still read in words
+        (
+            "999,999,999,999,999,999th",
+            "nine hundred ninety nine quadrillion nine hundred ninety nine trillion nine hundred ninety nine "
+            "billion nine hundred ninety nine million nine hundred ninety nine thousand nine hundred ninety ninth",
+        ),
+    ],
+    ids=["integer", "money", "money-cents", "decimal", "ordinal", "mixed-fraction", "percent", "largest"],
+)
+def test_a_number_past_the_largest_scale_is_read_digit_by_digit_everywhere(text, spoken):
+    assert normalize_english(text) == spoken
+
+
 def test_text_without_digits_is_unchanged():
     assert normalize_english("Prices: $, %, # and ½.") == "Prices: $, %, # and ½."
     assert normalize_english("about 50 percent more") == "about fifty percent more"
