@@ -2660,7 +2660,7 @@ class KVManager(AttentionResource):
 
     def lay_out_again(self, rid: str, ids: Sequence[int]) -> tuple[PrefixSpan, ...]:
         """Lay ``rid``'s label out again for a rebuild over ``ids`` without the last id, and return its spans.
-        A label of ids alone is keyed as a prompt of those ids would be.
+        A label with keys is keyed as a prompt of those ids would be, with its digest spans where they were.
 
         The growth loop's cap drops by the iterations the spans now cover, so the footprint stays
         the one at intake. The decode step that samples an id keys it, so a label that keys
@@ -2675,9 +2675,22 @@ class KVManager(AttentionResource):
             length = len(prompt)
             grown = sum(span.length for span in spans) - sum(span.length for span in layout.spans)
             keyed = bool((overrides.prefix_keys or {}).get(label))
+            media = any(span.kind == "digest" for span in layout.spans)
+            page_size = self.config.page_size
             changes = {}
-            if keyed:
-                page_size = self.config.page_size
+            if keyed and media:
+                # Extend the keys by the samples, as the decode steps that sampled them did, and key the last
+                # partial page as a prompt's last page.
+                extended = PrefixChain.seed(
+                    overrides.prefix_keys[label], list(overrides.prefix_tail[label]), layout.spans, page_size,
+                )
+                extended.extend(list(prompt[length - grown:]), page_size)
+                keys = extended.keys[:extended.keyed_pages]
+                if extended.unkeyed:
+                    keys.append(page_key(keys[-1] if keys else b"", extended.unkeyed, extended.unkeyed_items))
+                changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
+                changes["prefix_tail"] = {**overrides.prefix_tail, label: extended.unkeyed}
+            elif keyed:
                 pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
                 changes["prefix_keys"] = {**overrides.prefix_keys, label: chain(pages)}
                 changes["prefix_tail"] = {
@@ -2685,7 +2698,9 @@ class KVManager(AttentionResource):
                 }
             self._overrides[rid] = replace(
                 overrides,
-                kv_layout={**overrides.kv_layout, label: replace(layout, spans=spans, keyed_spans=int(keyed))},
+                kv_layout={
+                    **overrides.kv_layout, label: replace(layout, spans=spans, keyed_spans=len(spans) if keyed else 0),
+                },
                 loop_caps={**overrides.loop_caps, loop: overrides.loop_caps[loop] - grown // slots},
                 **changes,
             )
