@@ -123,12 +123,19 @@ and the model refuses at startup a cap they cannot hold. Requests past the cap
 wait in the conductor. Qwen3-ASR's requests vary far more in size: a 20 minute
 file holds about 122 pages of 128 tokens for its prompt and up to 32 more for
 its transcript, so the shipped config's 2048 pages (``kv_cache.max_num_pages``)
-hold about 13 of them at full size at once. 16 concurrent single-window 20
-minute files peaked at 2352 pages with 4096 in the pool; on the shipped 2048
-they filled the pool and the host pool and stalled. More concurrent long files
-than the pool holds offload to the host pool and, once that is full too, wait
-on each other until they time out: serve many long files with a lower
-``max_concurrent_requests`` or more pages.
+hold about 13 of them at full size at once. More concurrent long files than
+the pool holds offload to the host pool and, once that is full too, wait on
+each other until they time out: 16 concurrent single-window 20 minute files
+stalled on 2048 pages, and peaked at 2352 pages with 4096 in the pool.
+
+``qwen3_asr.yaml`` therefore caps Qwen3-ASR at 12 concurrent requests, which
+any mix of files up to 20 minutes fits. The cap costs short-utterance
+throughput: on LibriSpeech test-clean (one H200, Qwen3-ASR 1.7B) RTFx was
+about 420 at 8 concurrent requests, 900 at 32 and 1280 at 64. A deployment
+that only serves short audio can raise ``max_concurrent_requests`` (64 fits
+the default pool); one that serves many long files at once can raise
+``kv_cache.max_num_pages`` with the cap. Admission that sizes the cap by each
+request's pages instead is planned.
 
 Whisper's decode loop hands a window's tokens to the client in one message
 when the loop ends (``Loop.accumulated_outputs``), so a streaming request
