@@ -339,6 +339,34 @@ def test_a_number_past_the_largest_scale_is_read_digit_by_digit_everywhere(text,
     assert normalize_english(text) == spoken
 
 
+@pytest.mark.parametrize(
+    "text, spoken",
+    [
+        ("100-1000 users", "one hundred to one thousand users"),
+        ("500-1000 users", "five hundred to one thousand users"),
+        ("pages 120-1500", "pages one hundred and twenty to fifteen hundred"),
+        ("$100-1000", "one hundred to one thousand dollars"),
+        ("$10-$20 each", "ten to twenty dollars each"),
+    ],
+)
+def test_a_range_of_three_and_four_digits_is_not_a_phone_number(text, spoken):
+    assert normalize_english(text) == spoken
+
+
+@pytest.mark.parametrize(
+    "text, spoken",
+    [
+        ("555-1234", "five five five, one two three four"),
+        ("call 555-1234", "call five five five, one two three four"),
+        ("Call 555-0199 today.", "Call five five five, zero one nine nine today."),
+        ("(415) 555-1234", "four one five, five five five, one two three four"),
+        ("415-555-1234", "four one five, five five five, one two three four"),
+    ],
+)
+def test_phone_numbers_are_still_read_digit_by_digit(text, spoken):
+    assert normalize_english(text) == spoken
+
+
 def test_text_without_digits_is_unchanged():
     assert normalize_english("Prices: $, %, # and ½.") == "Prices: $, %, # and ½."
     assert normalize_english("about 50 percent more") == "about fifty percent more"

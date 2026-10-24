@@ -294,6 +294,22 @@ def _phone(match: re.Match) -> str:
     return ", ".join(digits(group) for group in re.findall(r"\d+", match[0]))
 
 
+def _local_phone(match: re.Match) -> str:
+    """555-0199 as a phone number, but 100-1000 and 500-1000 as ranges, left
+    for the range rule: no exchange starts with 0 or 1, and a round hundred
+    above a round first number is a range far more often than a number."""
+    a, b = match[0].split("-")
+    if a[0] in "01" or (a[-1] == "0" and b.endswith("00") and int(a) < int(b)):
+        return match[0]
+    return _phone(match)
+
+
+def _money_range(match: re.Match) -> str:
+    (major, majors), _ = _CURRENCIES[match["cur"]]
+    a, b = (int(match[k].replace(",", "")) for k in ("a", "b"))
+    return f"{cardinal(a)} to {cardinal(b)} {major if b == 1 else majors}"
+
+
 def _percent(match: re.Match) -> str:
     return ("negative " if match["neg"] else "") + number(match["num"]) + " percent"
 
@@ -315,7 +331,7 @@ _RULES: list[tuple[re.Pattern, Callable[[re.Match], str]]] = [
         re.compile(r"(?<![\w.,-])(?:\+?1[-.\s])?(?:\(\d{3}\)\s?|\d{3}([-.]))\d{3}(?(1)\1|[-.])\d{4}(?![\w-])"),
         _phone,
     ),
-    (re.compile(r"(?<![\w.,-])\d{3}-\d{4}(?![\w-])"), _phone),
+    (re.compile(r"(?<![\w.,$€£-])\d{3}-\d{4}(?![\w-])"), _local_phone),
     # 2023-10-19, 3/14/2021, 12/25/23, 11/02
     (re.compile(r"(?<![\w.-])(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})(?![\d-])"), _iso_date),
     (re.compile(r"(?<![\w./])(?P<m>\d{1,2})/(?P<d>\d{1,2})/(?P<y>\d{4}|\d{2})(?![\w/])"), _slash_date),
@@ -328,6 +344,14 @@ _RULES: list[tuple[re.Pattern, Callable[[re.Match], str]]] = [
         _month_day,
     ),
     (re.compile(rf"\b(?P<d>\d{{1,2}}){_DAY_SUFFIX}\s+(?P<month>{_MONTH_WORD})\b(?:\s+(?P<y>\d{{4}})\b)?"), _day_month),
+    # $100-1000, $10-$20
+    (
+        re.compile(
+            r"(?P<cur>[$€£])\s?(?P<a>\d{1,3}(?:,\d{3})+|\d+)\s?[-\u2013]\s?(?P=cur)?(?P<b>\d{1,3}(?:,\d{3})+|\d+)"
+            r"(?![.,]?\d|\w|-|\s+(?:thousand|million|billion|trillion)\b)"
+        ),
+        _money_range,
+    ),
     # $1,299.99, $3.2 billion, €20, £5
     (
         re.compile(
