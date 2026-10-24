@@ -5165,9 +5165,6 @@ class Worker:
                     tp_seq=fallthrough_tp_seq,
                     submitted_at=submitted_at,
                 ))
-                # only now, so a raise before the step is pending leaves them queued
-                for rid in node_batch.rebuild_rids:
-                    del self._rebuild_rows[rid]
                 # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)
