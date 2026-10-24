@@ -2234,11 +2234,14 @@ class Worker:
             return False
         try:
             if pending is not None:
-                # Safety timeout — the engine releases this event even on its
-                # failure paths, so it should only fire if the GPU thread died.
-                # Bail out rather than block plan_executor forever.
+                # The engine releases this event even on its failure paths, so off a TP node the 10 s timeout fires
+                # only if the GPU thread died. A TP rank that pre-plans a head that N voids keeps pages, so every TP
+                # rank waits for N's commit, or for N's future after a raise before the GPU thread's `try`.
                 with self._span("worker.plan_thread.await_commit"):
                     committed = pending.node_batch.commit_done.wait(timeout=10.0)
+                    while not committed and pending.node_name in self.parallel_nodes and not pending.future.done():
+                        committed = pending.node_batch.commit_done.wait(timeout=10.0)
+                    committed = committed or pending.node_batch.commit_done.is_set()
                 if not committed:
                     logger.warning(
                         "Worker %s: plan_executor timed out waiting for "
@@ -2701,6 +2704,13 @@ class Worker:
     def _prefix_cache_open(self, node_name: str) -> bool:
         return self.engine_manager.get_engine(node_name).prefix_cache_open(node_name)
 
+    def _builds_voided_head(self, node_name: str) -> bool:
+        """The leader pre-planned the head and drops the pre-plan. By then the pages the prefix cache read have
+        moved, and in a pool that counts reservations each continuing row keeps the next page its pre-admit took."""
+        return self._prefix_cache_open(node_name) or any(
+            self._kv_caches[key].cache.counts for key in self._kv_keys.get(node_name, ())
+        )
+
     def _is_tp_follower_node(self, node_name: str) -> bool:
         """This rank follows ``node_name``: rank 0 of its instance decides both
         what runs on it and what gets evicted from it. Mirrors the engine's
@@ -2718,24 +2728,32 @@ class Worker:
 
     def _verify_tp_async_sched_agrees(self) -> None:
         """Refuse a per-rank flag mismatch at startup: a follower would wait for
-        a decision the leader never sends, or get a head it cannot build."""
+        a decision the leader never sends, or get a head it cannot build. A
+        follower also builds a head that N voids, matching the leader's
+        pre-plan, so with async scheduling on MSTAR_PRE_PLAN_SPEC has to agree
+        as well."""
+        pre_plan = int(os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1")
         for node in sorted(self.parallel_nodes):
-            local = torch.tensor(
-                [int(self._tp_async_for(node))], dtype=torch.int64, device=self.device,
-            )
-            for group in (
-                self.parallel_groups.get_tp_config_for_node(node),
-                self.parallel_groups.get_sp_config_for_node(node),
-            ):
-                if group.world_size == 1:
-                    continue
-                values = group.all_gather(local, dim=0).cpu().tolist()
-                if any(v != values[0] for v in values):
-                    raise RuntimeError(
-                        f"MSTAR_TP_ASYNC_SCHED disagrees across the ranks of {node!r} "
-                        f"(ranks {group.group_members}: async={values}); set it "
-                        "identically on every rank of the instance."
-                    )
+            async_sched = int(self._tp_async_for(node))
+            checks = [("MSTAR_TP_ASYNC_SCHED", async_sched)]
+            if async_sched:
+                # the first check makes every rank agree on this, so each rank gathers as often as the others
+                checks.append(("MSTAR_PRE_PLAN_SPEC", pre_plan))
+            for name, value in checks:
+                local = torch.tensor([value], dtype=torch.int64, device=self.device)
+                for group in (
+                    self.parallel_groups.get_tp_config_for_node(node),
+                    self.parallel_groups.get_sp_config_for_node(node),
+                ):
+                    if group.world_size == 1:
+                        continue
+                    values = group.all_gather(local, dim=0).cpu().tolist()
+                    if any(v != values[0] for v in values):
+                        raise RuntimeError(
+                            f"{name} disagrees across the ranks of {node!r} "
+                            f"(ranks {group.group_members}: {values}); set it "
+                            "identically on every rank of the instance."
+                        )
 
     def _is_tp_lead_pending(self, pending: PendingBatch) -> bool:
         """``pending`` is a parallel batch this worker leads under TP async."""
@@ -3382,20 +3400,26 @@ class Worker:
     ) -> tuple[dict[int, NameToTensorList] | None, Speculation | None]:
         """Wait for step N and settle the leader's decision about N+1. Returns
         ``(outputs or None, armed head or None)``. Once N is done this never
-        returns without a decision: going serial early strands the leader."""
+        returns without a decision: going serial early strands the leader.
+
+        If N raised where `_builds_voided_head` holds, this still settles the decision and returns no outputs, so
+        the caller's `result` raises with any head armed, and its error path drops the head."""
         s = pending.tp_seq
         outputs: dict[int, NameToTensorList] | None = None
+        raised = False
         t_done = last_warn = 0.0
         while True:
-            if outputs is None and pending.future.done():
-                outputs = pending.future.result()
+            if outputs is None and not raised and pending.future.done():
+                raised = pending.future.exception() is not None and self._builds_voided_head(pending.node_name)
+                if not raised:
+                    outputs = pending.future.result()
                 t_done = last_warn = _time.perf_counter()
             if s in self._tp_nospec:
                 return outputs, None
             head = self.scheduler.peek_tp_follow()
             if head is not None and head.speculative and head.spec_from_seq == s:
                 void = self._step_voids_head(pending) if outputs is not None else None
-                if void is not None and not self._prefix_cache_open(head.node_name):
+                if void is not None and not self._builds_voided_head(head.node_name):
                     # The leader clears its speculation on this verdict too.
                     self.scheduler.void_tp_follow_head()
                     logger.debug(
@@ -3403,8 +3427,6 @@ class Worker:
                         self.worker_id, head.spec_seq, s, void,
                     )
                     return outputs, None
-                # With the prefix cache open, build the head even when N's verdict voids it, since the
-                # leader pre-plans every head it sends and this rank's pages must move as the leader's do.
                 spec = self._try_follow_speculation(pending)
                 if spec is not None:
                     arm(spec)
@@ -3427,7 +3449,7 @@ class Worker:
             self._process_messages()
             self._check_ready_tensors()
             self._poll_stream_buffers()
-            if outputs is not None:
+            if outputs is not None or raised:
                 now = _time.perf_counter()
                 if now - last_warn > 2.0:
                     last_warn = now
@@ -4429,6 +4451,9 @@ class Worker:
         logger.exception("Worker %s error in main loop: %s", self.worker_id, err)
 
         failed_rids: set[int] = set(self._in_flight_rids)
+        if speculation is not None and not speculation.submitted:
+            # a follower's build put the head's fresh rows in `_in_flight_rids`, and they go back as on rank 0
+            failed_rids -= speculation.scheduled_batch.request_to_worker_graph.keys() - speculation.continuing_rids
         for stale in in_flight:
             if stale is None:
                 continue

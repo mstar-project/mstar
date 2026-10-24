@@ -3662,6 +3662,10 @@ class KVManager(AttentionResource):
         if self.journal is not None:
             self.journal(MoveKind.RESERVE, rid, pages)
 
+    @property
+    def counts(self) -> bool:
+        return self._counts
+
     def replay(self, kind: MoveKind, rid: str, count: int) -> None:
         """Make rank 0's ``kind`` move on ``rid`` in this rank's counts, or raise if the move doesn't fit them."""
         with self._lock:

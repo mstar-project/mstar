@@ -18,10 +18,12 @@ forward) and then hangs in the collective. So:
   ``ExecutingBatch``, written by the GPU thread before N's future resolves —
   turns a head into a step of moves alone without building it (the verdicts
   on which the leader clears its own speculation before threading), unless
-  the prefix cache is open, where the leader pre-planned the head and the
-  follower builds it too;
+  the prefix cache is open or a pool counts reservations, where the leader
+  pre-planned the head and the follower builds it too;
 * a step whose forward raised is closed (``_close_tp_follow_step``): a head from it,
-  queued or arriving later, becomes a step of moves alone.
+  queued or arriving later, becomes a step of moves alone. With the prefix cache open
+  or a pool that counts reservations, the follower first waits for the head and builds
+  it, and the error path drops its pre-plan as the leader's does.
 
 Drives the real ``Worker`` methods unbound on a minimal stub with a real
 ``MicroScheduler`` for the FIFO, the pattern ``test_worker_message_handling``
@@ -127,6 +129,8 @@ def _stub(cache_open: bool = False):
     )
     stub._step_voids_head = Worker._step_voids_head
     stub._prefix_cache_open = lambda node: Worker._prefix_cache_open(stub, node)
+    stub._kv_keys, stub._kv_caches = {}, {}
+    stub._builds_voided_head = lambda node: Worker._builds_voided_head(stub, node)
     return stub
 
 
@@ -162,6 +166,7 @@ def _future(stub, output, done_after=0):
     return types.SimpleNamespace(
         done=lambda: stub.communicator.waits >= done_after,
         result=lambda: output,
+        exception=lambda: None,
     )
 
 
