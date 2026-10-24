@@ -48,7 +48,8 @@ def _plan_chunks(req, adapter, text: str) -> list[str]:
     min_chars = getattr(adapter, "speech_chunk_min_chars", None)
     if requested is False or (requested is None and (min_chars is None or len(text) < min_chars)):
         return [text]
-    chunks = split_sentences(text, max_chars=getattr(adapter, "speech_chunk_max_chars", 400))
+    split = getattr(adapter, "split_speech_text", None)
+    chunks = split(text) if split else split_sentences(text, max_chars=getattr(adapter, "speech_chunk_max_chars", 400))
     max_pieces = getattr(adapter, "speech_chunk_max_pieces", 32)
     if len(chunks) > max_pieces:
         raise HTTPException(

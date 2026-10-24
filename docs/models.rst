@@ -47,6 +47,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
      - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
        stochastic sampler); TP=2 deployments.
+   * - ``cosyvoice3``
+     - ``FunAudioLLM/Fun-CosyVoice3-0.5B-2512``
+     - Zero-shot voice-cloning TTS: Qwen2-0.5B speech-token LM with RAS sampling,
+       DiT flow-matching decoder and causal HiFT vocoder, streamed in chunks.
+       Clones from a preset or an uploaded clip. 24 kHz.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
@@ -345,6 +350,39 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
+
+CosyVoice3 notes
+----------------
+
+- Install with ``pip install -e '.[cosyvoice3]'`` and serve with
+  ``mstar serve cosyvoice3 --gpus 0``. Every request clones a voice: a
+  ``ref_audio`` clip (with its transcript in ``ref_text`` for zero-shot
+  cloning) or a preset from ``voices_dir`` (see ``configs/cosyvoice3.yaml``).
+  ``instructions`` carries a style instruction. Output is 24 kHz.
+- Keep the reference clip short, a few seconds like CosyVoice's own 3.5 s
+  prompt clip: with a 23 s clip as the preset, round-trip word error rate rose
+  from 1.4% to 13.4%, with words dropped mid-sentence.
+- On ``/v1/audio/speech``, text longer than one piece is synthesized as ordered
+  sentence pieces, as the reference frontend does: about 80 tokens (320
+  characters) of English, or 80 characters of text with Chinese, each piece
+  cloning the same voice. In one request the LM ends long text early or
+  garbles its end. A Chinese sentence over 300 characters, which the
+  reference keeps whole, is also cut at its commas, so that each piece stays
+  under the LM's 512 tokens of transcript and text.
+  ``sentence_chunking: false`` sends the text whole.
+- Japanese written in kana alone, with spaces between words, is read poorly,
+  as it is by the official model: in tests both garbled common words such as
+  ゆっくり and ありがとうございました on every seed.
+- The flow's DiT estimator runs in bfloat16 by default; the Euler state, the
+  rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor
+  float64).
+  ``model_kwargs: {flow_estimator_dtype: float32}`` in the deployment YAML runs
+  the estimator at the reference's precision instead, at lower throughput.
+- The flow's Euler solve is captured at startup as CUDA graphs, one per frame
+  bucket and batch size (``flow_capture_frame_buckets``,
+  ``flow_capture_batch_sizes``, ``flow_capture_batch_frames``), which takes GPU
+  memory and startup time. ``model_kwargs: {flow_capture_frame_buckets: []}``
+  captures none, and every solve runs eagerly.
 
 Qwen3-TTS notes
 ---------------
