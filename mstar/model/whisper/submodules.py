@@ -405,8 +405,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         weights = self.decoder.cross_attention_weights(input_ids, encoder_states, heads)
         prompt_len = 3  # <|sot|><|lang|><|task|>; the <|notimestamps|> row predicts the first text token
         rows = weights[:, prompt_len:-1]
-        text = input_ids[prompt_len + 1:-1].tolist()
-        words = word_timings(rows, text, self.tokenizer.decode, num_frames)
+        ids = input_ids.tolist()
+        language = self.config.language_of(ids[1])
+        words = word_timings(rows, ids[prompt_len + 1:-1], self.tokenizer.decode, num_frames, language)
         tb, top = self.config.timestamp_begin, self.config.vocab_size - 1
 
         def stamp(seconds: float) -> int:
