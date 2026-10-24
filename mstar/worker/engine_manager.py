@@ -16,7 +16,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
-from mstar.model.base import Model, node_moe_parallel_configs, keyed_labels
+from mstar.model.base import Model, keyed_labels, node_moe_parallel_configs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 

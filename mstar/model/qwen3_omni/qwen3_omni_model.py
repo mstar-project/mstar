@@ -65,8 +65,8 @@ from mstar.model.base import (
     Span,
     TensorAndMetadata,
 )
-from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.components import MoeParallelConfig
+from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
