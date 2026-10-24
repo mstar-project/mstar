@@ -100,13 +100,14 @@ transcript.
 Serving notes
 -------------
 
-Launch the API server with ``OMP_WAIT_POLICY=PASSIVE``. That process only
-decodes uploads and stages tensors, and torch's default intra-op pool (one
-thread per core) spins after every CPU tensor op it does; under load the
-spinning threads starve the event loop and the transport threads (at
-concurrency 32 the process sat at 600-1000% CPU while the worker was idle
-two thirds of the time). A passive wait policy keeps the pool but lets its
-threads sleep.
+The ASR models cap the API server's torch intra-op pool at 4 threads
+(``PREPROCESS_TORCH_THREADS``; ``preprocess_torch_threads:`` in the config
+overrides it). That process only decodes uploads and stages tensors, and a
+pool of one thread per core spins after each of those small ops and starves
+the event loop and transport threads. On a 192-core H200 host the cap matched
+``OMP_WAIT_POLICY=PASSIVE`` on RTFx and latency at concurrency 1 to 64 for both
+models, where the default pool lost 4-9 % (up to 29 % with the server pinned
+to 16 cores), so no launch setting is needed.
 
 Serve with the shared-memory arena, ``MSTAR_SHM_ARENA=1`` (needs the ``rust/``
 extension; see :doc:`environment_variables`). The default SHM transport creates
@@ -122,9 +123,9 @@ and the model refuses at startup a cap they cannot hold. Requests past the cap
 wait in the conductor. Qwen3-ASR's requests vary far more in size: a 20 minute
 file holds about 122 pages of 128 tokens for its prompt and up to 32 more for
 its transcript, so the shipped config's 2048 pages (``kv_cache.max_num_pages``)
-hold about 13 of them at full size at once. Concurrent files rarely all reach
-full size together: in one run, 16 concurrent single-window 20 minute files
-peaked at 1563 pages. More concurrent long files
+hold about 13 of them at full size at once. 16 concurrent single-window 20
+minute files peaked at 2352 pages with 4096 in the pool; on the shipped 2048
+they filled the pool and the host pool and stalled. More concurrent long files
 than the pool holds offload to the host pool and, once that is full too, wait
 on each other until they time out: serve many long files with a lower
 ``max_concurrent_requests`` or more pages.

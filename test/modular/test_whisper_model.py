@@ -80,8 +80,8 @@ class _FakeTokenizer:
     def convert_tokens_to_ids(self, token):
         return {name: i for i, name in self._names.items()}[token]
 
-    def decode(self, ids, skip_special_tokens=False):
-        del skip_special_tokens
+    def decode(self, ids, skip_special_tokens=False, clean_up_tokenization_spaces=None):
+        del skip_special_tokens, clean_up_tokenization_spaces
         return "".join(self.convert_ids_to_tokens(list(ids))).replace("\u0120", " ")
 
     def convert_ids_to_tokens(self, ids):
