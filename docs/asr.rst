@@ -120,11 +120,16 @@ concurrent long files than the pool holds offload to the host pool and, once
 that is full too, wait on each other until they time out: serve many long files
 with a lower ``max_concurrent_requests`` or more pages.
 
-Both decode loops hand a window's tokens to the client in one message when
-the loop ends (``Loop.accumulated_outputs``) rather than one message per
-token. At concurrency 32 the per-token messages and their acknowledgements
-were a large share of the worker's host time. A streaming request therefore
-receives one delta per window, not one per token.
+Whisper's decode loop hands a window's tokens to the client in one message
+when the loop ends (``Loop.accumulated_outputs``), so a streaming request
+receives one delta per window. Qwen3-ASR's decode loop keeps its token on the
+device (``device_loopback_signals``) and the worker sends the batch's tokens
+inline, one frame per step (``inline_client_signals``), so they reach the API
+server while the window decodes: a 20 minute window is about 3,450 tokens,
+which, sent as one tensor apiece when the loop ended, could miss the API
+server's 15 s delivery deadline under load. Each chunk is one byte-level BPE
+token, which can end inside a UTF-8 character; the transcription route
+decodes the joined bytes.
 
 Benchmarks and parity
 ---------------------
