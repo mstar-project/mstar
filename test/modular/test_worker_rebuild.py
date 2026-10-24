@@ -8,7 +8,7 @@ fails the wrong requests on a refused admit, or speculates a step the rebuild wa
 from __future__ import annotations
 
 from array import array
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
@@ -145,7 +145,7 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     eng, landed = _engine(_Sub()), []
     eng.land_rebuild = lambda node, rid: landed.append(rid)
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
-    w._kept_ids = {node: {1: KeptIds(b"", array("i"))}}
+    w._kept_ids, w._rebuild_rows = {node: {1: KeptIds(b"", array("i"))}}, {R: deque([RebuildRow(node, walk, {}, None)])}
     batch = _step((R, 1, 2), walk, node)
     eng.prepare_inputs(batch)
     pending = PendingBatch(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, node, "p", walk, Future())
@@ -163,8 +163,8 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids(build):
     eng = _engine(_Sub())
     eng.land_rebuild = lambda node, rid: None
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
-    w._kept_ids = {node: {rid: KeptIds(b"", array("i"), PrefillCopies()) for rid in (R, 1)}}
-    w._copied_inputs = {(walk, node): {"embeds"}}
+    w._kept_ids = {node: {rid: KeptIds(b"", array("i"), []) for rid in (R, 1)}}
+    w._copied_inputs, w._rebuild_rows = {(walk, node): {"embeds"}}, {R: deque([RebuildRow(node, walk, {}, None)])}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
         rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()
@@ -182,18 +182,18 @@ def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids(build):
     with pytest.raises(_ReachedRoutingError):
         w._postprocess_batch(pending, outputs)
 
-    copies = w._kept_ids[node][1].copies
+    (copies,) = w._kept_ids[node][1].copies
     assert copies.inputs == {"embeds": [embeds[1]]}, "a rebuild would need the encoder to run again"
     assert copies.step_metadata == {"prefill_order": (1,)}, "the rebuild row would run under decode's metadata"
     assert copies.step_metadata is not batch.per_request_info[1].step_metadata, "a later step could rewrite the copy"
-    assert w._kept_ids[node][R].copies.inputs is None, "a rebuild row's inputs would stand in for the request's copy"
+    assert not w._kept_ids[node][R].copies, "a rebuild row's inputs would stand in for the request's copy"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     w, _ = _worker()
     w.device, w.device_capability, w._d2h_stream = torch.device("cuda"), SimpleNamespace(is_accelerator=True), None
-    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), PrefillCopies())
+    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), [])
     rows = 1 << 22
     embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
     expected = embeds.cpu()
@@ -211,7 +211,7 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     del batch, embeds
     torch.full((rows,), -1.0, device="cuda")
     torch.cuda.synchronize()
-    copies = w._kept_ids[NODE][R].copies
+    (copies,) = w._kept_ids[NODE][R].copies
     assert w._rebuildable(R, NODE)
     assert torch.equal(copies.inputs["embeds"][0], expected), "the next step's tensor took the memory before the copy"
 
@@ -224,7 +224,7 @@ def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
 def test_a_rebuild_row_runs_under_its_copied_metadata_even_when_empty():
     w, _ = _worker()
     w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
-    w._rebuild_rows[R] = RebuildRow(NODE, PREFILL, {"text_inputs": [torch.tensor([1, 2])]}, {})
+    w._rebuild_rows[R] = deque([RebuildRow(NODE, PREFILL, {"text_inputs": [torch.tensor([1, 2])]}, {})])
 
     node_batch = w._build_executing_batch(*w._schedule_rebuild())
 
@@ -289,11 +289,11 @@ def test_only_an_image_prompt_on_one_walk_at_one_rank_is_preemptible(request_, g
 ])
 def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w, eng = _worker()
-    copies = {"copy not taken": PrefillCopies(), "copy not landed": PrefillCopies({}, {}, SimpleNamespace(query=bool))}
+    copies = {"copy not taken": [], "copy not landed": [PrefillCopies({}, {}, SimpleNamespace(query=bool))]}
     w._kept_ids[NODE].update({} if why == "no ids" else {R: KeptIds(b"", array("i", [5]), copies.get(why))})
     w._in_flight_rids.update({R} if why == "in flight" else ())
     w.scheduler.backlog.update({(NODE, DECODE): ScheduledBatch(NODE, DECODE, {R: 0})} if why == "backlog" else {})
-    w._rebuild_rows.update({R: RebuildRow(NODE, PREFILL, {}, None)} if why == "rebuild queued" else {})
+    w._rebuild_rows.update({R: deque([RebuildRow(NODE, PREFILL, {}, None)])} if why == "rebuild queued" else {})
     w.infos[R].graph_walk = PREFILL if why == "prefill walk" else DECODE
     w.infos[R].dynamic_loop_iter_counts["loop"] = 1 if why == "samples short" else 0
 
@@ -304,7 +304,7 @@ def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
 
 def test_an_image_request_is_dropped_once_its_copy_has_landed():
     w, eng = _worker()
-    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), PrefillCopies({}, {}, SimpleNamespace(query=lambda: True)))
+    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), [PrefillCopies({}, {}, SimpleNamespace(query=lambda: True))])
 
     w._drop(R, NODE)
 
@@ -316,7 +316,7 @@ def test_a_request_is_rebuilt_only_once_per_drop(state):
     w, eng = _worker()
     w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]))
     eng.dropped += [] if state == "resident" else [R]
-    w._rebuild_rows.update(queued := {R: RebuildRow(NODE, PREFILL, {}, None)} if state == "queued" else {})
+    w._rebuild_rows.update(queued := {R: deque([RebuildRow(NODE, PREFILL, {}, None)])} if state == "queued" else {})
     w._in_flight_rids.update({R} if state == "in its step" else ())
     with pytest.raises(RuntimeError):
         w._rebuild(R, NODE)
@@ -349,10 +349,10 @@ def test_the_run_loop_runs_a_queued_rebuild_row_once_and_a_remove_waits_for_its_
     from test_worker_metrics import _looping_worker, _StopLoopError
 
     w, _, postprocessed, _ = _looping_worker(monkeypatch, schedule=[None, None], speculate={}, refuse=set())
-    w._rebuild_rows, w._pending_removes = {R: RebuildRow(NODE, "rebuild", {}, None)}, {}
+    w._rebuild_rows, w._pending_removes = {R: deque([RebuildRow(NODE, "rebuild", {}, None)])}, {}
     w._rid = lambda wire_rid: wire_rid
     w._graph_runtime = SimpleNamespace(get_sharding_config=lambda rid: pytest.fail("removed under its rebuild step"))
-    calls, build, step = [], w._build_executing_batch, (ScheduledBatch(NODE, "rebuild"), dict(w._rebuild_rows))
+    calls, build, step = [], w._build_executing_batch, (ScheduledBatch(NODE, "rebuild"), {R: w._rebuild_rows[R][0]})
     # the loop asks only while a row is queued, and this answers twice at most so the loop ends
     w._schedule_rebuild = lambda: step if calls.append(None) or len(calls) <= 2 else None
     w._handle_main_loop_error = lambda *args: None  # the loop keeps running, as with the real handler
@@ -364,12 +364,12 @@ def test_the_run_loop_runs_a_queued_rebuild_row_once_and_a_remove_waits_for_its_
 
     w._build_executing_batch = build_after_one_raise
     # Remove R once, on the pass after its step went out, while that step is still pending.
-    w._process_messages = lambda: len(calls) > 1 and not (w._rebuild_rows or w._pending_removes) and w._remove_request(
+    w._process_messages = lambda: R in w._in_flight_rids and not w._pending_removes and w._remove_request(
         SimpleNamespace(request_id=R))
     with pytest.raises(_StopLoopError):
         w.run()
     assert postprocessed == ["rebuild"], "a raise before `_set_pending` would lose the rebuild row"
-    assert w._pending_removes == {R: None}, "the row stayed queued, or the REMOVE tore its request down mid-step"
+    assert w._pending_removes == {R: None}, "the REMOVE would tear its request down mid-step"
 
 
 @pytest.mark.parametrize("reason, outcome", [
@@ -379,18 +379,13 @@ def test_the_run_loop_runs_a_queued_rebuild_row_once_and_a_remove_waits_for_its_
 ])
 def test_a_refused_admit_puts_the_rebuild_row_back_or_fails_only_its_request(reason, outcome):
     w, _, batch, node_batch = _rebuilding(fresh=ScheduledBatch(NODE, PREFILL, {A: 0}))
-    del w._rebuild_rows[R]  # as the main loop does once the step is pending
     node_batch.admit_error = reason
     node_batch.rebuild_rids |= {11}  # a second rebuild row, which left the step when its prepare_inputs raised
-    node_batch.per_request_info[R].step_metadata = {"prefill_order": (0,)}
     w._handle_allocation_failure = lambda *a: w.held.append("base")
 
     w._handle_admit_failure(batch, node_batch)
 
     assert (R in w._rebuild_rows) == (outcome != "failed"), "the rebuild row left its queue for good"
-    assert outcome == "failed" or w._rebuild_rows[R].step_metadata == {"prefill_order": (0,)}, (
-        "a requeued image row would run under decode's metadata"
-    )
     assert 11 not in w._rebuild_rows, "the failed request's row would run again"
     assert w.failed.keys() == ({R} if outcome == "failed" else set()), "the refusal failed the wrong requests"
     assert w.held == {"held": [R], "failed": [], "requeued": ["base"]}[outcome], "the other rows lost the base path"
@@ -400,7 +395,8 @@ def test_a_refused_admit_puts_the_rebuild_row_back_or_fails_only_its_request(rea
 @pytest.mark.parametrize("why", ["failed", "removed", "mixed merge", "cap"])
 def test_a_rebuild_step_holds_nothing_the_scheduler_wouldnt_run(why):
     w, _ = _worker(fresh=ScheduledBatch(NODE, "mixed", {A: 0}, request_walks={A: DECODE}))
-    w._rebuild_rows.update(dict.fromkeys((R, 11) if why == "cap" else (R,), RebuildRow(NODE, PREFILL, {}, None)))
+    for rid in (R, 11) if why == "cap" else (R,):
+        w._rebuild_rows[rid] = deque([RebuildRow(NODE, PREFILL, {}, None)])
     w.scheduler.failed_rids.update({R} if why == "failed" else ())
     w._pending_removes.update({R: None} if why == "removed" else {})
 
@@ -416,7 +412,7 @@ def test_a_rebuild_step_holds_nothing_the_scheduler_wouldnt_run(why):
 @pytest.mark.parametrize("held", [False, True])
 def test_nothing_is_speculated_while_a_rebuild_row_could_run(held):
     w, _ = _worker()
-    w._rebuild_rows[R] = RebuildRow(NODE, PREFILL, {}, None)
+    w._rebuild_rows[R] = deque([RebuildRow(NODE, PREFILL, {}, None)])
     w.scheduler.held_until[R] = float("inf") if held else 0.0
     w._can_speculate, w._tp_lead_needs_marker = lambda batch: True, lambda pending, speculation: False
     w._choose_spec_target = lambda batch: SimpleNamespace(info=SimpleNamespace(node_name=NODE, graph_walk=DECODE))

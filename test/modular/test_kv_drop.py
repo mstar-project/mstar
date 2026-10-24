@@ -207,13 +207,13 @@ def test_a_rebuild_keeps_an_image_prompts_spans_and_lays_its_samples_after_them(
 
     spans = kv.lay_out_again("r", array("i", [*range(5), 100, 101, 102]))
 
-    assert spans == (*PROMPT, PrefixSpan(2, 2, WALK)), "the image would lose its advance, or the samples their span"
+    assert spans == (*PROMPT[:2], PrefixSpan(4, 4, WALK)), "the image would lose its advance, or the samples a slot"
     assert kv._overrides["r"].loop_caps["decode_loop"] == 48 and kv._streams["r"]["main"].footprint == footprint, (
         "the rebuild would hold more pages than the request declared"
     )
 
 
-def test_a_second_rebuild_of_an_image_prompt_replaces_its_samples_span():
+def test_a_second_rebuild_of_an_image_prompt_counts_its_first_samples_once():
     kv = _manager()
     _image_prompt(kv)
     kv.lay_out_again("r", array("i", [*range(5), 100, 101, 102]))
@@ -225,7 +225,7 @@ def test_a_second_rebuild_of_an_image_prompt_replaces_its_samples_span():
 
     spans = kv.lay_out_again("r", array("i", [*range(5), 100, 101, 102, 103, 104]))
 
-    assert spans == (*PROMPT, PrefixSpan(4, 4, WALK)), "the first rebuild's samples would be taken for prompt"
+    assert spans == (*PROMPT[:2], PrefixSpan(6, 6, WALK)), "the first rebuild's samples would count twice"
     assert kv._overrides["r"].loop_caps["decode_loop"] == 46, "the samples would count twice against the footprint"
 
 

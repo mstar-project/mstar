@@ -2647,19 +2647,16 @@ class KVManager(AttentionResource):
 
     def _rebuilt_spans(self, rid: str, written: int) -> tuple[str, tuple[PrefixSpan, ...]]:
         """``rid``'s label and its spans once a rebuild has written ``written`` ids. A layout of ids alone becomes
-        one ids span. A layout with a digest span keeps its own spans, and the samples past its prompt become
-        one more ids span."""
+        one ids span. A layout with a digest span keeps its own spans, and the samples extend its last span, which
+        holds ids."""
         overrides = self._overrides[rid]
         ((label, layout),) = [(label, layout) for label, layout in overrides.kv_layout.items() if layout.spans]
-        (walk,) = {span.walk for span in layout.spans}
         if all(span.kind == "ids" for span in layout.spans):
+            (walk,) = {span.walk for span in layout.spans}
             return label, (PrefixSpan(written, written, walk),)
-        prompt = len(overrides.prompt_ids[label]) // 4
-        ends = itertools.accumulate(span.length if span.kind == "ids" else 0 for span in layout.spans)
-        # a span that ends past the prompt's ids holds the samples an earlier rebuild added
-        spans = tuple(span for span, end in zip(layout.spans, ends, strict=True) if end <= prompt)
-        samples = written - prompt
-        return label, (*spans, PrefixSpan(samples, samples, walk)) if samples else spans
+        *spans, last = layout.spans
+        grown = written - sum(span.length for span in layout.spans if span.kind == "ids")
+        return label, (*spans, replace(last, length=last.length + grown, advance=last.advance + grown))
 
     def lay_out_again(self, rid: str, ids: Sequence[int]) -> tuple[PrefixSpan, ...]:
         """Lay ``rid``'s label out again for a rebuild over ``ids`` without the last id, and return its spans.

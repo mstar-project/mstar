@@ -726,6 +726,7 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     from mstar.engine.resources.step import Segment
     from mstar.model.qwen3_5.config import KV_CACHE, ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
+    from mstar.worker.worker import PrefillCopies
 
     modalities, _ = LAYOUTS["images"]
     texts = [f"Question {i}: what happens?" for i in range(modalities.count(TEXT))]
@@ -782,7 +783,7 @@ def test_a_rebuilt_image_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     kept = w._kept_ids[NODE][R]
     # the samples before 9 are in the KV, and 9 is the next decode step's input
     kept.sampled.extend([*[7, 8][:samples], 9])
-    kept.copies.inputs, kept.copies.step_metadata = copied, metadata
+    kept.copies.append(PrefillCopies(copied, metadata))
     eng.dropped.append(R)
     w._rebuild(R, NODE)
     batch = w._build_executing_batch(*w._schedule_rebuild())

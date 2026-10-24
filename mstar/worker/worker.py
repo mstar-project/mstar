@@ -277,21 +277,21 @@ class Speculation:
 
 @dataclass(slots=True)
 class PrefillCopies:
-    """Host copies of what a request's prefill row read besides its ids, and a copy of that row's step metadata, for
-    its rebuild. Empty until the row's step has run. ``landed`` is recorded after the copies, and stays None on a CPU
-    device, where the inputs are kept as they are."""
-    inputs: NameToTensorList | None = None
-    step_metadata: dict | None = None
+    """Host copies of what one prefill step of a request read besides its ids, and a copy of that step's metadata, for
+    its rebuild. ``landed`` is recorded after the copies, and stays None on a CPU device, where the inputs are kept as
+    they are."""
+    inputs: NameToTensorList
+    step_metadata: dict
     landed: torch.Event | None = None
 
 
 @dataclass(slots=True)
 class KeptIds:
     """A request's token ids on one node as int32: its prompt, then each sample it kept. A prompt with digest spans
-    is rebuilt from ``copies`` as well."""
+    is rebuilt from ``copies`` as well, one for each of its prefill steps on a walk that reads more than ids."""
     prompt: bytes
     sampled: array
-    copies: PrefillCopies | None = None
+    copies: list[PrefillCopies] | None = None
 
 
 @dataclass(slots=True)
@@ -308,9 +308,9 @@ class Victim(NamedTuple):
 
 
 class RebuildRow(NamedTuple):
-    """A row of the prefill walk that recomputes a dropped request's KV. Its input is the request's
-    kept ids without the last one, and the host copies of what else the walk read. With ``step_metadata``
-    None, the row runs under the request's own step metadata."""
+    """A row that runs one prefill step of a dropped request again. Its inputs are the request's kept ids for the
+    step's ids spans, and the host copies of what else the step read. With ``step_metadata`` None, the row runs
+    under the request's own step metadata."""
     node: str
     walk: str
     inputs: NameToTensorList
@@ -320,6 +320,12 @@ class RebuildRow(NamedTuple):
 # The output a sampling node returns its token under. A decode input such as `text_inputs` gets the
 # token only in the per-request `postprocess`, so a step's host rows lack that input.
 _SAMPLED = "new_token"
+
+
+def _prefill_steps(spans: tuple) -> list[tuple]:
+    """The spans each prefill step of a prompt writes. A prompt on one walk writes every span in one step. A prompt on
+    several walks writes one span per step, since its model prefills each digest span in a step of its own."""
+    return [spans] if len({span.walk for span in spans}) == 1 else [(span,) for span in spans]
 
 
 class EvictionPolicy(Enum):
@@ -654,8 +660,8 @@ class Worker:
         # `_kv_keys`: node -> the keys of its paged KV caches, and `_kv_caches`: key -> its cache.
         # `_kept_ids`: node -> handle -> the request's ids on that node. Per node, since a colocated node
         #   of another partition samples tokens of its own.
-        # `_rebuild_rows`: handle -> its row waiting for a rebuild step.
-        # `_dropped`: handle -> the node it was dropped on, until its rebuild row is queued.
+        # `_rebuild_rows`: handle -> its rows waiting for rebuild steps, in the order its prefill ran.
+        # `_dropped`: handle -> the node it was dropped on, until its rebuild rows are queued.
         # `_victims`: handle -> the shortage that chose it, until it is dropped.
         # `_preempted`: handle -> how often it was preempted. `_preemptions`: node -> its counts for the metrics.
         # `_walk_inputs`: (walk, node) -> the node's inputs in that walk. A rebuild row's ids go under the
@@ -667,7 +673,7 @@ class Worker:
             self._kv_caches[kv.key] = kv
             for node_name in kv.nodes:
                 self._kv_keys[node_name].append(kv.key)
-        self._rebuild_rows: dict[int, RebuildRow] = {}
+        self._rebuild_rows: dict[int, deque[RebuildRow]] = {}
         self._dropped: dict[int, str] = {}
         self._victims: dict[int, Victim] = {}
         self._preempted: dict[int, Preempted] = {}
@@ -1117,7 +1123,7 @@ class Worker:
             reads = self._walk_inputs.get((*walks, node_name), set()) - copied
             grows = [walk for (walk, node), name in self._growth_loops.items() if node == node_name and name == loop]
             if len(reads) == 1 and grows and all(self._walk_inputs.get((walk, node_name)) == reads for walk in grows):
-                kept[request_id] = KeptIds(ids, array("i"), PrefillCopies() if media else None)
+                kept[request_id] = KeptIds(ids, array("i"), [] if media else None)
 
     def _set_copied_inputs(self) -> None:
         """Map (walk, node) to what a node that keeps ids reads in that walk and in none of its growth walks.
@@ -1176,13 +1182,13 @@ class Worker:
 
         The request must be in the walk that grows its KV. The prefill and each iteration of the growth
         loop sample once, and the KV holds all but the last sample. A prompt with digest spans also needs
-        its host copies landed.
+        its host copies landed. They queue on one stream, so the last one's event covers them all.
         """
         kept = self._kept_ids.get(node_name, {}).get(request_id)
         if kept is None:
             return False
         copies = kept.copies
-        if copies is not None and (copies.inputs is None or copies.landed is not None and not copies.landed.query()):
+        if copies is not None and (not copies or copies[-1].landed is not None and not copies[-1].landed.query()):
             return False
         info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
         loop = self._growth_loops.get((info.graph_walk, node_name))
@@ -1263,10 +1269,11 @@ class Worker:
         logger.warning(message, *args, unlogged)
 
     def _rebuild(self, request_id: int, node_name: str) -> None:
-        """Queue a row that recomputes the dropped request's KV on ``node_name`` from its kept ids.
+        """Queue the rows that recompute the dropped request's KV on ``node_name`` from its kept ids and
+        host copies, one for each step of its prefill.
 
-        Only the engine's batch holds the row, so the graph runtime keeps the request in its decode
-        walk, with its loop-back input pending, and routes none of the row's outputs.
+        Only the engine's batch holds the rows, so the graph runtime keeps the request in its decode
+        walk, with its loop-back input pending, and routes none of the rows' outputs.
         """
         engine = self.engine_manager.get_engine(node_name)
         if engine.is_resident(node_name, request_id) or engine.is_offloaded(node_name, request_id):
@@ -1277,18 +1284,20 @@ class Worker:
         ids = array("i", kept.prompt)
         ids.extend(kept.sampled)
         spans = engine.lay_out_rebuild(node_name, request_id, ids)
-        walk, copies = spans[0].walk, kept.copies
-        (name,) = self._walk_inputs[(walk, node_name)] - self._copied_inputs.get((walk, node_name), set())
         tokens = torch.frombuffer(ids, dtype=torch.int32)[:-1].to(self.device, dtype=torch.long)
-        lengths = [span.length for span in spans if span.kind == "ids"]
-        metadata, copied = None, {}
-        if copies is not None:
-            if len(tokens) > len(kept.prompt) // 4:
-                # The prefill row's metadata covers only the prompt, so the samples extend the prompt's last ids span.
-                lengths[-2:] = [sum(lengths[-2:])]
-            metadata, copied = copies.step_metadata, self._to_device(copies)
-        inputs = {**copied, name: list(tokens.split(lengths))}
-        self._rebuild_rows[request_id] = RebuildRow(node_name, walk, inputs, metadata)
+        ids_by_span = iter(tokens.split([span.length for span in spans if span.kind == "ids"]))
+        copies = iter(kept.copies or ())
+        rows = deque()
+        for run in _prefill_steps(spans):
+            walk, inputs, metadata = run[0].walk, {}, None
+            if any(span.kind == "digest" for span in run):
+                step = next(copies)
+                inputs, metadata = self._to_device(step), step.step_metadata
+            if any(span.kind == "ids" for span in run):
+                (name,) = self._walk_inputs[(walk, node_name)] - self._copied_inputs.get((walk, node_name), set())
+                inputs = {**inputs, name: [next(ids_by_span) for span in run if span.kind == "ids"]}
+            rows.append(RebuildRow(node_name, walk, inputs, metadata))
+        self._rebuild_rows[request_id] = rows
         self._dropped.pop(request_id, None)
         self._preemptions[node_name].rebuild_tokens += sum(span.length for span in spans)
 
@@ -1307,12 +1316,14 @@ class Worker:
                 self._rebuild(rid, node_name)
 
     def _runnable_rebuilds(self) -> dict[int, RebuildRow]:
-        """The queued rebuild rows the scheduler would run now: not held, failed or removed."""
+        """The first queued rebuild row of each request the scheduler would run now: not in a step, held, failed
+        or removed."""
         now = _time.monotonic()
         held, failed = self.scheduler.held_until, self.scheduler.failed_rids
         return {
-            rid: row for rid, row in self._rebuild_rows.items()
+            rid: rows[0] for rid, rows in self._rebuild_rows.items()
             if held.get(rid, 0.0) <= now and rid not in failed and rid not in self._pending_removes
+            and rid not in self._in_flight_rids
         }
 
     def _schedule_rebuild(self) -> "tuple[ScheduledBatch, dict[int, RebuildRow]] | None":
@@ -2534,7 +2545,7 @@ class Worker:
                 batch.discard_rid(rid)
 
         reason = node_batch.admit_error
-        if node_batch.rebuild_rids and self._requeue_rebuilds(batch, node_batch, reason):
+        if node_batch.rebuild_rids and self._handle_refused_rebuilds(batch, node_batch, reason):
             return
         if isinstance(reason, AllocationFailed):
             self._handle_allocation_failure(batch, node_batch, referenced_rids)
@@ -2550,19 +2561,14 @@ class Worker:
             type(reason).__name__, len(batch),
         )
 
-    def _requeue_rebuilds(
+    def _handle_refused_rebuilds(
         self, batch: ScheduledBatch, node_batch: ExecutingBatch, reason: AdmitFailedReason,
     ) -> bool:
-        """Put the step's rebuild rows back on their queue, and return whether the refusal named
-        one. A named row is held after an ``AllocationFailed``, or fails its request when the
-        refusal is terminal, and the step's other rows go back to their queues untouched. A row
-        whose `prepare_inputs` failed has left the step, and its request has failed already."""
+        """Return whether the refusal named one of the step's rebuild rows, which stay first in their queues.
+        A named row is held after an ``AllocationFailed``, or fails its request when the refusal is
+        terminal, and the step's other rows wait untouched. A row whose `prepare_inputs` failed has
+        left the step, and its request has failed already."""
         prepared = node_batch.rebuild_rids & set(node_batch.request_ids)
-        for rid in prepared:
-            info = node_batch.per_request_info[rid]
-            self._rebuild_rows[rid] = RebuildRow(
-                node_batch.node_name, info.graph_walk, node_batch.per_request_input_tensors[rid], info.step_metadata,
-            )
         named = {getattr(reason, "request_id", None), *getattr(reason, "request_ids", ())}
         named &= prepared
         if not named:
@@ -3766,12 +3772,17 @@ class Worker:
             range_pop(synchronize=False)
 
     def _land_rebuilds(self, node_batch: ExecutingBatch) -> None:
-        """For each rebuild row that ran in the step, make its request resident again."""
+        """Take each rebuild row that ran in the step, or that the cache served whole, off its queue, and make
+        its request resident again once none is left."""
         if not node_batch.rebuild_rids:
             return
         engine = self.engine_manager.get_engine(node_batch.node_name)
-        for rid in node_batch.rebuild_rids & set(node_batch.request_ids):
-            engine.land_rebuild(node_batch.node_name, rid)
+        for rid in node_batch.rebuild_rids & (set(node_batch.request_ids) | node_batch.cached_rids):
+            rows = self._rebuild_rows[rid]
+            rows.popleft()
+            if not rows:
+                del self._rebuild_rows[rid]
+                engine.land_rebuild(node_batch.node_name, rid)
 
     def _copy_inputs(self, node_batch: ExecutingBatch, names: set[str]) -> None:
         """Copy to the host each prefill row's inputs under ``names``, as the step received them, and its step
@@ -3783,9 +3794,12 @@ class Worker:
             if kept is None or kept.copies is None or rid in node_batch.rebuild_rids:
                 continue
             inputs = node_batch.per_request_input_tensors[rid]
-            kept.copies.inputs = {name: [self._to_host(t) for t in inputs[name]] for name in names}
-            kept.copies.step_metadata = dict(node_batch.per_request_info[rid].step_metadata)
-            taken.append(kept.copies)
+            copies = PrefillCopies(
+                {name: [self._to_host(t) for t in inputs[name]] for name in names},
+                dict(node_batch.per_request_info[rid].step_metadata),
+            )
+            kept.copies.append(copies)
+            taken.append(copies)
         if taken and self.device_capability.is_accelerator:
             landed = torch.Event(device=self.device)
             landed.record(self._side_stream())
@@ -5215,9 +5229,6 @@ class Worker:
                     tp_seq=fallthrough_tp_seq,
                     submitted_at=submitted_at,
                 ))
-                # only now, so a raise before the step is pending leaves them queued
-                for rid in node_batch.rebuild_rids:
-                    del self._rebuild_rows[rid]
                 # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)

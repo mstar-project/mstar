@@ -2414,14 +2414,14 @@ class Engine:
 
     def lay_out_rebuild(self, node_name: str, request_id: int, ids: Sequence[int]) -> tuple[PrefixSpan, ...]:
         """Lay the dropped request's KV out over all of ``ids`` but the last, and return the spans
-        the rebuild row writes."""
+        its rebuild rows write."""
         (spans,) = {
             kv.cache.lay_out_again(request_id, ids) for kv in self.paged_kv_caches() if node_name in kv.nodes
         }
         return spans
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
-        """Make the dropped request resident again, once its rebuild step has run."""
+        """Make the dropped request resident again, once its last rebuild row has run."""
         for kv in self.paged_kv_caches():
             if node_name in kv.nodes:
                 kv.cache.land_rebuild(request_id)
