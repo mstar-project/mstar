@@ -677,12 +677,42 @@ def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(WhisperModel, config=WhisperModelConfig())
 
 
+def _canary(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.canary.canary_model import CanaryModel
+    from mstar.model.canary.config import CanaryModelConfig
+    from mstar.model.components.fastconformer import FastConformerConfig
+    config = CanaryModelConfig(encoder=FastConformerConfig())
+    return _bare(CanaryModel, config=config)
+
+
+def _canary_qwen(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+    from mstar.model.canary_qwen.config import CanaryQwenModelConfig
+    from mstar.model.components.fastconformer import FastConformerConfig
+    from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    return _bare(CanaryQwenModel, config=CanaryQwenModelConfig(
+        encoder=FastConformerConfig(), llm=Qwen3LMConfig(), llm_repo="Qwen/Qwen3-1.7B",
+    ))
+
+
+def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.components.fastconformer import FastConformerConfig
+    from mstar.model.components.transducer import TransducerConfig
+    from mstar.model.parakeet.config import ParakeetModelConfig
+    from mstar.model.parakeet.parakeet_model import ParakeetModel
+    # Nemotron ASR's language prompt is one more input to the transducer
+    transducer = TransducerConfig(num_prompts=128 if name == "nemotron_asr" else 0)
+    return _bare(ParakeetModel, config=ParakeetModelConfig(name, FastConformerConfig(), transducer))
+
+
 def _default(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs)
 
 
 _FACTORIES = {
     "BagelModel": _bagel,
+    "CanaryModel": _canary,
+    "CanaryQwenModel": _canary_qwen,
     "ChatterboxModel": _chatterbox,
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
@@ -691,6 +721,7 @@ _FACTORIES = {
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
     "OrpheusModel": _orpheus,
+    "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,

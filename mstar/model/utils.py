@@ -423,3 +423,102 @@ def load_generation_defaults(
     if False in (config.get(prefix + "do_sample"), config.get(prefix + "dosample")):
         out[stage + "temperature"] = 0.0
     return out
+
+
+# The 25 European languages of NVIDIA's Granary-trained speech checkpoints
+# (canary-1b-v2, parakeet-tdt-0.6b-v3).
+GRANARY_LANGUAGES = (
+    "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it",
+    "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk",
+)
+
+
+def base_language(code: str) -> str:
+    """``en-US``, ``en_us`` or ``EN`` -> ``en``."""
+    if not isinstance(code, str):
+        raise ValueError(f"a language is a code such as 'en'; got {code!r}")
+    return code.replace("_", "-").split("-")[0].lower()
+
+
+def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:
+    """Raise unless ``loaded`` names every parameter of ``module``: one built on
+    ``meta`` and filled by a loader would otherwise serve uninitialized memory."""
+    missing = sorted({name for name, _ in module.named_parameters()} - loaded)
+    if missing:
+        raise KeyError(f"{what}: checkpoint is missing {len(missing)} parameters, e.g. {missing[:4]}")
+
+
+def kv_pages(tokens: int, page_size: int, requests: int) -> int:
+    """Pages for ``requests`` sequences of ``tokens`` each, plus the sink page
+    every KV cache keeps out of circulation."""
+    return 1 + requests * -(-tokens // page_size)
+
+
+def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logger) -> None:
+    """Refuse a ``max_concurrent_requests`` the model's KV caches cannot hold.
+
+    A request keeps its pages from prefill to its last token. Past a pool, a
+    prefill batch is refused and the worker offloads decoding requests to
+    admit it, which costs far more than queueing would. So the cap's requests
+    at full length must fit each cache next to its sink page; the conductor
+    queues the rest. Warnings go to the model's ``log``.
+    """
+    from mstar.engine.resources import KVSpec, PagedKVConfig
+
+    cap = config.get("max_concurrent_requests")
+    if cap is None:
+        log.warning(
+            "%s sets no max_concurrent_requests: past the requests the KV caches "
+            "hold, the worker offloads decoding requests to admit new ones instead "
+            "of queueing them", config_path,
+        )
+        return
+    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+        raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
+    overrides = config.get("resources") or {}
+    for spec in model.get_node_resources():
+        # paged caches only: a ring buffer is sized by its window, not by requests
+        if not isinstance(spec, KVSpec) or not isinstance(spec.config, PagedKVConfig):
+            continue
+        kv, override = spec.config, overrides.get(spec.resource_key) or {}
+        page_size = int(override.get("page_size", kv.page_size))
+        max_seq_len = int(override.get("max_seq_len", kv.max_seq_len))
+        max_num_pages = int(override.get("max_num_pages", kv.max_num_pages))
+        need = kv_pages(max_seq_len, page_size, cap)
+        if need > max_num_pages:
+            raise ValueError(
+                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
+                f"need {need} pages of resources.{spec.resource_key} "
+                f"({-(-max_seq_len // page_size)} per request and the sink page), "
+                f"which has {max_num_pages}; raise max_num_pages or lower "
+                "max_concurrent_requests"
+            )
+
+
+class SentencePieceDetokenizer:
+    """Per-token detokenization for SentencePiece-style vocabularies (``▁``
+    marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF
+    ``tokenizer.json``. Same contract as :class:`ByteLevelDetokenizer`: bytes
+    per token, so a character split across byte pieces reassembles client-side.
+    """
+
+    def __init__(self, tokenizer_json: dict, extra_skip_ids: set[int] = frozenset()):
+        vocab = tokenizer_json["model"]["vocab"]
+        if isinstance(vocab, list):  # Unigram: [piece, score] pairs
+            vocab = {piece: idx for idx, (piece, _) in enumerate(vocab)}
+        vocab = dict(vocab)
+        for added in tokenizer_json.get("added_tokens", []):
+            vocab[added["content"]] = added["id"]
+        self.pieces = {idx: piece for piece, idx in vocab.items()}
+        self.skip_ids = {a["id"] for a in tokenizer_json.get("added_tokens", []) if a["special"]} | set(extra_skip_ids)
+
+    def piece_bytes(self, token_id: int) -> bytes:
+        piece = self.pieces.get(token_id)
+        if piece is None or token_id in self.skip_ids:
+            return b""
+        if len(piece) == 6 and piece.startswith("<0x") and piece.endswith(">"):
+            return bytes([int(piece[3:5], 16)])
+        return piece.replace("▁", " ").encode("utf-8")
+
+    def to_bytes(self, token_ids: list[int]) -> bytes:
+        return b"".join(self.piece_bytes(i) for i in token_ids)

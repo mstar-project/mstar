@@ -4,6 +4,8 @@ from mstar.model.base import Model
 
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
+    "canary": ("mstar.model.canary.canary_model", "CanaryModel"),
+    "canary_qwen": ("mstar.model.canary_qwen.canary_qwen_model", "CanaryQwenModel"),
     "chatterbox": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_multilingual": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_turbo": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
@@ -27,7 +29,9 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
     "lingbot_world_1_3b": ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
+    "nemotron_asr": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
+    "parakeet": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
@@ -44,6 +48,12 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
+    # NVIDIA Canary-1B-v2: FastConformer encoder + Transformer decoder, speech
+    # recognition in 25 European languages and translation to/from English.
+    "canary": {"model_path_hf": "nvidia/canary-1b-v2"},
+    # NVIDIA Canary-Qwen-2.5B: Canary's FastConformer encoder feeding a
+    # LoRA-adapted Qwen3-1.7B (NeMo SALM); English speech recognition.
+    "canary_qwen": {"model_path_hf": "nvidia/canary-qwen-2.5b"},
     # Resemble AI Chatterbox: Llama-520M T3 speech-token LM + S3Gen flow
     # matching decoder + HiFT vocoder, zero-shot voice cloning with CFG and
     # exaggeration control. The Turbo checkpoint is a GPT-2-medium T3 with a
@@ -111,7 +121,13 @@ HF_MODELS: dict[str, dict] = {
     "omnivoice": {"model_path_hf": "k2-fsa/OmniVoice"},
     # Kokoro-82M TTS: misaki G2P + PL-BERT prosody + iSTFTNet decoder, 54 bundled voices.
     "kokoro": {"model_path_hf": "hexgrad/Kokoro-82M"},
+    # NVIDIA Nemotron-3.5-ASR: cache-aware streaming FastConformer + RNN-T with
+    # a language prompt, 40 language-locales; served here over whole clips.
+    "nemotron_asr": {"model_path_hf": "nvidia/nemotron-3.5-asr-streaming-0.6b"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
+    # NVIDIA Parakeet-TDT-0.6B-v3: FastConformer + token-and-duration
+    # transducer, 25 European languages, language detected from the speech.
+    "parakeet": {"model_path_hf": "nvidia/parakeet-tdt-0.6b-v3"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().
