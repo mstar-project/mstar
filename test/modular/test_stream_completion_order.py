@@ -278,9 +278,7 @@ def _consumer(policy):
         start_read_tensors=lambda *a, **k: [],
         get_tensor=lambda uuid: torch.tensor([uuid]),
         dereference_batch_uniform=lambda ids: None,
-        store_and_return_tensor_info=lambda rid, d, **k: {
-            name: [object()] for name in d
-        },
+        increment_ref_batch_uniform=lambda ids: None,
     )
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.streams.consumer_node = {EDGE: "snac_decoder"}

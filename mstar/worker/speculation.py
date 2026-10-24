@@ -137,8 +137,8 @@ class SpeculationPreparer:
         prep = PreparedSpeculation(rows.ready_rids, rows.spec_id, rows.wg_id)
         if rows.input_edges is not None and rows.ready_rids:
             # an input that is not the in-flight step's: per-row dicts
-            prep.per_request_inputs.update(rows.input_edges.to_input_tensors(
-                ctx.tensor_manager.get_tensor, rows.ready_rids,
+            prep.per_request_inputs.update(ctx.streams.input_tensors(
+                rows.input_edges, spec_node_name, rows.ready_rids,
             ).by_rid)
             prep.request_to_worker_graph.update(dict.fromkeys(rows.ready_rids, rows.wg_id))
             prep.rows_wg_id = None
@@ -193,8 +193,8 @@ class SpeculationPreparer:
 
         # `ready_rids` seeds it, so a ready rid with no prepped edge still gets
         # an empty mapping -- what slicing a zero-length run used to give.
-        prepped_inputs = out.input_edges.to_input_tensors(
-            ctx.tensor_manager.get_tensor, out.ready_rids,
+        prepped_inputs = streams.input_tensors(
+            out.input_edges, spec_node_name, out.ready_rids,
         ).by_rid
         for i, r in enumerate(out.ready_rids):
             prep.per_request_inputs[r] = prepped_inputs[r]
