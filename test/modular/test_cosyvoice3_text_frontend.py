@@ -844,3 +844,16 @@ def test_text_has_chinese_does_not_touch_text_sent_as_written(model):
         text_frontend=False, text_has_chinese=True,
     )
     assert torch.equal(_text_ids(out, f"{SYSTEM_PROMPT}{END_OF_PROMPT}"), _Tokenizer()("Flight 247"))
+
+
+def test_a_chinese_piece_heavy_in_digits_is_cut_before_wetext_can_spell_it_past_the_limit():
+    """wetext spells 98765432 in 15 characters, so 300 characters of such text
+    would reach the model as 531; a digit counts twice against the piece cap,
+    so the piece is cut at its commas instead."""
+    from mstar.api_server.openai import adapters
+
+    text = "订单" + ("98765432，" * 34)[:297] + "。"
+    assert len(text) == 300
+    pieces = adapters.CosyVoice3Adapter().split_speech_text(text)
+    assert len(pieces) > 1 and "".join(pieces) == text
+    assert all(len(p) + sum(c.isdigit() for c in p) <= 300 for p in pieces)

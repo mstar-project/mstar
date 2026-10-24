@@ -861,7 +861,9 @@ class CosyVoice3Adapter(OpenAIAdapter):
     # A Han character is one token of this tokenizer, and Latin text fewer per
     # character, so a piece's length bounds its tokens. The LM takes 512 tokens
     # of prompt text and text: 7 for the system prompt, at most about 200 for
-    # the transcript of a 30 s reference clip, and 300 for the piece.
+    # the transcript of a 30 s reference clip, and 300 for the piece. A digit
+    # counts twice: with the wetext extra the model spells a Chinese number in
+    # up to about twice its digits (98765432 is 15 characters).
     _ZH_MAX_PIECE_CHARS = 300
 
     def split_speech_text(self, text: str, req=None) -> list[str]:
@@ -899,7 +901,7 @@ class CosyVoice3Adapter(OpenAIAdapter):
         piece of that is under 160 characters."""
         pieces: list[str] = []
         for piece in cls._group_chinese(cls._ZH_SENTENCE.findall(text)):
-            if len(piece) <= cls._ZH_MAX_PIECE_CHARS:
+            if len(piece) + sum(ch.isdigit() for ch in piece) <= cls._ZH_MAX_PIECE_CHARS:
                 pieces.append(piece)
                 continue
             clauses = cls._ZH_CLAUSE.findall(piece)
