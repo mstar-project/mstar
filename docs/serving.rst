@@ -85,8 +85,10 @@ mstar serve
 
 The server creates the socket and upload directories with mode 0700 and
 refuses to start if one already exists as a symlink, belongs to another user,
-or is writable by group or others; remove it or pass another path. Uploaded
-files are written 0600. The same holds for ``python -m
+or is writable by group or others; remove it or pass another path. The upload
+directory is checked again before each upload is written, so a request fails
+instead of writing into a directory someone else recreated after startup (say,
+after a ``/tmp`` cleaner removed it). Uploaded files are written 0600. The same holds for ``python -m
 mstar.api_server.entrypoint`` and the Rust frontend. Only the last path
 component is checked, so to use a shared or group-writable volume (for example
 a Kubernetes volume with ``fsGroup``), pass a subdirectory of its mount point;
