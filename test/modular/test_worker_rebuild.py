@@ -20,14 +20,14 @@ from test_kv_prefix_lease import _StubTransfer
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine, ExecutingBatch
-from mstar.engine.resources import AllocationFailed, SamplerStep, StepContext
+from mstar.engine.resources import AllocationFailed, SamplerStep, StepContext, SubmoduleStep
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.step import AdmitRuntimeError
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs, BatchedModelOutput, HostRows
 from mstar.worker.micro_scheduler import ScheduledBatch
-from mstar.worker.worker import KeptIds, PendingBatch, RebuildRow, Worker, _SpecFairness
+from mstar.worker.worker import KeptIds, PendingBatch, PrefillCopies, RebuildRow, Speculation, Worker, _SpecFairness
 from mstar.worker.worker_metrics import PreemptionCounts
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
@@ -156,10 +156,151 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
     assert landed == [R], "the rebuilt request would never be ready to decode again"
 
 
-@pytest.mark.parametrize("why", ["no ids", "in flight", "backlog", "rebuild queued", "prefill walk", "samples short"])
+@pytest.mark.parametrize("build", ["executing", "speculative"])
+def test_a_prefill_row_keeps_a_host_copy_of_what_it_read_besides_its_ids(build):
+    from test_dropped_row_stream_stop import _engine, _ReachedRoutingError, _Runtime, _Sub, _worker
+
+    eng = _engine(_Sub())
+    eng.land_rebuild = lambda node, rid: None
+    w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
+    w._kept_ids = {node: {rid: KeptIds(b"", array("i"), PrefillCopies()) for rid in (R, 1)}}
+    w._copied_inputs = {(walk, node): {"embeds"}}
+    embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
+    batch = _step((R, 1, 2), walk, node, per_request_input_tensors={
+        rid: {"embeds": [] if build == "speculative" else [t], "ids": [t]} for rid, t in embeds.items()
+    })
+    if build == "speculative":
+        # a speculated step gets its embeds only once the encoder has run
+        spec = Speculation(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, {("embeds", node)}, {R, 1, 2}, "p",
+                           is_new_iter=False, is_same_node=False)
+        w._thread_outputs_to_speculative(spec, BatchedModelOutput({rid: {"embeds": [t]} for rid, t in embeds.items()}))
+    for rid, info in batch.per_request_info.items():
+        info.step_metadata = {"prefill_order": (rid,)}
+    eng.prepare_inputs(batch)
+    pending = PendingBatch(ScheduledBatch(node, walk, {1: 0, 2: 0}), batch, node, "p", walk, Future())
+    outputs = BatchedModelOutput(per_rid_outputs={rid: {"new_token": [torch.tensor([rid + 4])]} for rid in (1, 2)})
+    with pytest.raises(_ReachedRoutingError):
+        w._postprocess_batch(pending, outputs)
+
+    copies = w._kept_ids[node][1].copies
+    assert copies.inputs == {"embeds": [embeds[1]]}, "a rebuild would need the encoder to run again"
+    assert copies.step_metadata == {"prefill_order": (1,)}, "the rebuild row would run under decode's metadata"
+    assert copies.step_metadata is not batch.per_request_info[1].step_metadata, "a later step could rewrite the copy"
+    assert w._kept_ids[node][R].copies.inputs is None, "a rebuild row's inputs would stand in for the request's copy"
+
+
+def test_a_step_on_a_walk_that_copies_runs_past_a_request_kept_without_copies():
+    w, _ = _worker()
+    # as an unguided Bagel think-mode image generation on the LLM's image_gen walk
+    w._kept_ids[NODE][R] = KeptIds(b"", array("i"))
+    batch = _step((R,), "image_gen", rebuild=A, per_request_input_tensors={R: {"latents": [torch.zeros(2)]}})
+    batch.per_request_info[R].step_metadata = {}
+
+    w._copy_inputs(batch, {"latents"})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
+    w, _ = _worker()
+    w.device, w.device_capability, w._d2h_stream = torch.device("cuda"), SimpleNamespace(is_accelerator=True), None
+    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), PrefillCopies())
+    rows = 1 << 22
+    embeds = torch.arange(1, 1 + rows, dtype=torch.float32, device="cuda")
+    expected = embeds.cpu()
+    with w._side_stream():
+        # a cached block for the copy back, since allocating a block waits for the device
+        torch.full((rows,), -1.0, device="cuda")
+    batch = _step((R,), "vision", rebuild=A, per_request_input_tensors={R: {"embeds": [embeds]}})
+    batch.per_request_info[R].step_metadata = {}
+    # a busy side stream keeps the copy queued past the point where the worker lets go of the step's tensors
+    with w._side_stream():
+        torch.cuda._sleep(1 << 30)
+    w._copy_inputs(batch, {"embeds"})
+
+    assert not w._rebuildable(R, NODE), "the request could be dropped before its copy has landed"
+    del batch, embeds
+    torch.full((rows,), -1.0, device="cuda")
+    torch.cuda.synchronize()
+    copies = w._kept_ids[NODE][R].copies
+    assert w._rebuildable(R, NODE)
+    assert torch.equal(copies.inputs["embeds"][0], expected), "the next step's tensor took the memory before the copy"
+
+    with w._side_stream():
+        torch.cuda._sleep(1 << 30)
+    on_device = w._to_device(copies)
+    assert torch.equal(on_device["embeds"][0].cpu(), expected), "the rebuild row would read its inputs before they land"
+
+
+def test_a_rebuild_row_runs_under_its_copied_metadata_even_when_empty():
+    w, _ = _worker()
+    w.infos[R].step_metadata = {"prefill_order": ()}  # decode's metadata
+    w._rebuild_rows[R] = RebuildRow(NODE, PREFILL, {"text_inputs": [torch.tensor([1, 2])]}, {})
+
+    node_batch = w._build_executing_batch(*w._schedule_rebuild())
+
+    assert node_batch.per_request_info[R].step_metadata == {}, "the rebuild row would run under decode's metadata"
+
+
+@pytest.mark.parametrize("kept", [None, frozenset({R, A})])
+def test_a_rebuild_rows_sample_is_never_kept_even_under_its_prefills_metadata(kept):
+    engine = SimpleNamespace(_runner=SimpleNamespace(admit=lambda step: SimpleNamespace(ok=True)))
+    batch = _step((R, A))
+    step = SubmoduleStep(steps={"sampler": SamplerStep(kept_rids=kept)})
+
+    _, step = Engine._declare_and_admit(
+        engine, batch, rids=[R, A], inputs=[], submodule=None, nvtx=False, ctx=batch.step_context, step=step,
+    )
+
+    assert step.steps["sampler"].kept_rids == {A}, "the redrawn sample would replace the token decode resumes from"
+
+
+def test_a_node_sharing_a_cache_whose_growth_walk_it_never_runs_copies_nothing():
+    w, _ = _worker()
+    # as Cosmos3's dit beside its reasoner, or Bagel's CFG nodes beside the LLM
+    w._kv_keys["dit"], w._kept_ids["dit"], w._growth_loops[("reasoner_decode", "dit")] = ["kv"], {}, "loop"
+    w._walk_inputs[("vision", NODE)], w._walk_inputs[("denoise", "dit")] = {"text_inputs", "image"}, {"latents"}
+
+    w._set_copied_inputs()
+
+    assert w._copied_inputs == {("vision", NODE): {"image"}}, "the worker would fail to boot, or copy for nothing"
+
+
+@pytest.mark.parametrize("request_, guaranteed", [
+    ("image chat on one walk", False), ("image chat on two walks", True), ("video", True), ("above one rank", True),
+    ("image last", True), ("keyed", True), ("ids short of their spans", True), ("text alone on the image walk", True),
+])
+def test_only_an_image_prompt_on_one_walk_at_one_rank_is_preemptible(request_, guaranteed):
+    w, _ = _worker()
+    w._walk_inputs[("vision", NODE)], w._copied_inputs = {"text_inputs", "embeds"}, {("vision", NODE): {"embeds"}}
+    w.parallel_nodes = {NODE} if request_ == "above one rank" else set()
+    image_walk = "vit" if request_ == "image chat on two walks" else "vision"
+    image = "rows" if request_ == "video" else "digest"
+    # as Qwen3.5 lays out an image prompt, and Bagel an image chat whose image has a walk of its own
+    spans = (PrefixSpan(2, 2, "vision"), PrefixSpan(6, 4, image_walk, kind=image), PrefixSpan(2, 2, "vision"))
+    # the samples of a prompt that ends on its image would have no text part to extend
+    spans = spans[:2] if request_ == "image last" else spans
+    # a rebuild row of ids alone would leave out the other inputs the walk reads
+    spans = (PrefixSpan(4, 4, "vision"),) if request_ == "text alone on the image walk" else spans
+    count = sum(span.length for span in spans if span.kind == "ids") - (request_ == "ids short of their spans")
+    ids = None if image == "rows" else {"main": array("i", range(count)).tobytes()}
+    configs = {"kv": KVReqConfig(prompt_ids=ids, kv_layout={"main": StreamLayout(spans=spans, growth=(("loop", 1),))},
+                                 loop_caps={"loop": 1}, prefix_keys={"main": [b"k"]} if request_ == "keyed" else None)}
+
+    w._keep_ids(R, configs)
+    w._guarantee(R, configs)
+
+    assert configs["kv"].guaranteed == guaranteed, "a request no copy can rebuild would be preempted, or the reverse"
+    assert guaranteed or w._kept_ids[NODE][R].copies is not None, "the request could be dropped before its copy exists"
+
+
+@pytest.mark.parametrize("why", [
+    "no ids", "in flight", "backlog", "rebuild queued", "prefill walk", "samples short", "copy not taken",
+    "copy not landed",
+])
 def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     w, eng = _worker()
-    w._kept_ids[NODE].update({} if why == "no ids" else {R: KeptIds(b"", array("i", [5]))})
+    copies = {"copy not taken": PrefillCopies(), "copy not landed": PrefillCopies({}, {}, SimpleNamespace(query=bool))}
+    w._kept_ids[NODE].update({} if why == "no ids" else {R: KeptIds(b"", array("i", [5]), copies.get(why))})
     w._in_flight_rids.update({R} if why == "in flight" else ())
     w.scheduler.backlog.update({(NODE, DECODE): ScheduledBatch(NODE, DECODE, {R: 0})} if why == "backlog" else {})
     w._rebuild_rows.update({R: RebuildRow(NODE, PREFILL, {}, None)} if why == "rebuild queued" else {})
@@ -169,6 +310,15 @@ def test_a_drop_is_refused_when_its_rebuild_could_not_follow(why):
     with pytest.raises(RuntimeError):
         w._drop(R, NODE)
     assert not eng.dropped, "the request would lose pages a step still reads, or come back as nothing or wrongly keyed"
+
+
+def test_an_image_request_is_dropped_once_its_copy_has_landed():
+    w, eng = _worker()
+    w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]), PrefillCopies({}, {}, SimpleNamespace(query=lambda: True)))
+
+    w._drop(R, NODE)
+
+    assert eng.dropped == [R], "no image request could ever be preempted"
 
 
 @pytest.mark.parametrize("state", ["resident", "queued", "in its step"])
@@ -242,11 +392,15 @@ def test_a_refused_admit_puts_the_rebuild_row_back_or_fails_only_its_request(rea
     del w._rebuild_rows[R]  # as the main loop does once the step is pending
     node_batch.admit_error = reason
     node_batch.rebuild_rids |= {11}  # a second rebuild row, which left the step when its prepare_inputs raised
+    node_batch.per_request_info[R].step_metadata = {"prefill_order": (0,)}
     w._handle_allocation_failure = lambda *a: w.held.append("base")
 
     w._handle_admit_failure(batch, node_batch)
 
     assert (R in w._rebuild_rows) == (outcome != "failed"), "the rebuild row left its queue for good"
+    assert outcome == "failed" or w._rebuild_rows[R].step_metadata == {"prefill_order": (0,)}, (
+        "a requeued image row would run under decode's metadata"
+    )
     assert 11 not in w._rebuild_rows, "the failed request's row would run again"
     assert w.failed.keys() == ({R} if outcome == "failed" else set()), "the refusal failed the wrong requests"
     assert w.held == {"held": [R], "failed": [], "requeued": ["base"]}[outcome], "the other rows lost the base path"

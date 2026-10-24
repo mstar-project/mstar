@@ -20,6 +20,7 @@ import torch
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
@@ -185,6 +186,61 @@ def test_a_rebuilt_stream_keeps_its_footprint_and_is_keyed_as_a_fresh_prompt():
     assert (rebuilt.chain.keys, rebuilt.chain.unkeyed) == (want.chain.keys, want.chain.unkeyed), (
         "the rebuilt pages would be filed under keys another request with these ids can't match"
     )
+
+
+PROMPT = (PrefixSpan(3, 3, WALK), PrefixSpan(6, 4, WALK, kind="digest"), PrefixSpan(2, 2, WALK))
+
+
+def _image_prompt(kv: KVManager) -> None:
+    """Ingest ``r`` with a prompt of text, an image and text on one walk, as Qwen3.5 lays it out, then drop it."""
+    kv.ingest_request("r", KVReqConfig(
+        kv_layout={"main": StreamLayout(spans=PROMPT, growth=(("decode_loop", 1),))}, loop_caps={"decode_loop": 50},
+        prompt_ids={"main": array("i", range(5)).tobytes()},
+    ))
+    kv.drop("r")
+
+
+def test_a_rebuild_keeps_an_image_prompts_spans_and_lays_its_samples_after_them():
+    kv = _manager()
+    _image_prompt(kv)
+    footprint = kv._streams["r"]["main"].footprint
+
+    spans = kv.lay_out_again("r", array("i", [*range(5), 100, 101, 102]))
+
+    assert spans == (*PROMPT, PrefixSpan(2, 2, WALK)), "the image would lose its advance, or the samples their span"
+    assert kv._overrides["r"].loop_caps["decode_loop"] == 48 and kv._streams["r"]["main"].footprint == footprint, (
+        "the rebuild would hold more pages than the request declared"
+    )
+
+
+@pytest.mark.parametrize("first", [2, 0])
+def test_a_second_rebuild_of_an_image_prompt_replaces_its_samples_span(first):
+    kv = _manager()
+    _image_prompt(kv)
+    # ``first`` samples in the KV, then the next decode step's input
+    kv.lay_out_again("r", array("i", [*range(5), *range(100, 101 + first)]))
+    _write(kv, "r", 11 + first)  # the rebuild row
+    kv.land_rebuild("r")
+    _write(kv, "r", 1)
+    _write(kv, "r", 1)
+    kv.drop("r")
+
+    spans = kv.lay_out_again("r", array("i", [*range(5), *range(100, 103 + first)]))
+
+    samples = first + 2
+    assert spans == (*PROMPT, PrefixSpan(samples, samples, WALK)), "a span of the first rebuild would stay as prompt"
+    assert kv._overrides["r"].loop_caps["decode_loop"] == 50 - samples, "the samples would count twice in the footprint"
+
+
+def test_a_rebuild_that_writes_fewer_slots_than_its_layout_raises_under_debug_asserts(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _manager()
+    _image_prompt(kv)
+    kv.lay_out_again("r", array("i", [*range(5), 100, 101, 102]))
+    _write(kv, "r", 12)  # one slot fewer than the layout's 13, as when the image copy is one row short
+
+    with pytest.raises(AssertionError, match="wrong size"):
+        kv.land_rebuild("r")
 
 
 def test_a_rebuild_row_beside_another_keyed_row_keys_none_of_its_discarded_sample():
