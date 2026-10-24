@@ -168,17 +168,6 @@ class CommGroup:
         v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
         return (v * (weight.float() + weight_bias)).to(r.dtype), r
 
-    def fused_all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        """``all_reduce`` on the ``init_allreduce_fusion`` workspace when ``x``
-        fits it, which beats NCCL at decode sizes; NCCL otherwise."""
-        if (self._ar_fusion_ws is not None
-                and x.shape[0] <= self._ar_fusion_max_tokens
-                and x.is_contiguous()):
-            from mstar.distributed.ar_fusion import allreduce_oneshot
-
-            return allreduce_oneshot(x, self._ar_fusion_ws)
-        return self.all_reduce(x)
-
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.

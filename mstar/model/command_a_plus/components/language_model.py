@@ -301,11 +301,11 @@ class CommandAPlusLanguageModel(nn.Module):
         self.fused = False
         self._replicated_embedding: torch.Tensor | None = None
 
-    def fuse_for_inference(self, max_allreduce_tokens: int = 2048) -> None:
+    def fuse_for_inference(self) -> None:
         """Switch to fused kernels and concatenated GEMMs. CUDA only, after loading.
 
         Under TP this is collective: every rank must call it, because it also
-        sets up the one-shot NVLink all-reduce workspace.
+        gathers the replicated embedding table.
         """
         for layer in self.layers:
             layer.fuse_weights()
@@ -322,7 +322,6 @@ class CommandAPlusLanguageModel(nn.Module):
             torch.distributed.all_gather_into_tensor(
                 self._replicated_embedding, shard.contiguous(), group=group.device_group,
             )
-            group.init_allreduce_fusion(shard.shape[1], shard.dtype, max_allreduce_tokens)
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self._replicated_embedding is None:
@@ -352,7 +351,7 @@ class CommandAPlusLanguageModel(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             layer.self_attn.attend.bind_step(label)
             layer.self_attn.attend.set_layer_idx(layer_idx)
-            delta = self.comm_group.fused_all_reduce(layer.fused_branches(normalized))
+            delta = self.comm_group.all_reduce(layer.fused_branches(normalized))
             norm = norms[layer_idx + 1]
             residual, normalized = add_layernorm(residual, delta, norm.weight, norm.eps)
         return normalized

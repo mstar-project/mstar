@@ -327,8 +327,8 @@ give it a generous ``max_output_tokens``. A prompt plus ``max_output_tokens``
 Decode runs in CUDA graphs over a fused path that concatenates each layer's
 projections into two GEMMs, all-reduces once per layer, and uses Triton
 kernels for the norms, routing, SwiGLU and output projection. The all-reduce
-is FlashInfer's fused kernel (``CommGroup.init_allreduce_fusion``) up to 2048
-tokens, and NCCL when that workspace can't be set up. On 4x GB200 at TP4 with
+is FlashInfer's one-kernel all-reduce (``tp_allreduce: flashinfer`` in the
+configs) up to 2048 tokens, and NCCL when that workspace can't be set up. On 4x GB200 at TP4 with
 ``MSTAR_TP_ASYNC_SCHED=1`` and the Rust graph runtime, ``bench_http.py`` with
 256-token replies measures:
 
