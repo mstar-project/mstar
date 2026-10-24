@@ -17,19 +17,22 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
     request_id = rid("vid")
 
     stream = bool(args.model_kwargs.get("stream_video"))
-    api.submit_request(
-        text=args.text,
-        file_paths=args.file_paths,
-        input_modalities=args.input_modalities,
-        output_modalities=["video"],
-        model_kwargs=args.model_kwargs,
-        streaming=stream,
-        request_id=request_id,
-    )
-    if stream:
-        return _stream_ndjson(api, request_id)
-
-    chunks = await api.collect_results(request_id, raw_request)
+    try:
+        api.submit_request(
+            text=args.text,
+            file_paths=args.file_paths,
+            input_modalities=args.input_modalities,
+            # the adapter decides: video alone, or video with its generated audio
+            output_modalities=args.output_modalities,
+            model_kwargs=args.model_kwargs,
+            streaming=stream,
+            request_id=request_id,
+        )
+        if stream:
+            return _stream_ndjson(api, request_id)
+        chunks = await api.collect_results(request_id, raw_request)
+    finally:
+        media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
     # Each video chunk is an mp4 (H.264); return it base64-encoded, mirroring the
     # image endpoint's b64_json shape. A sound request additionally emits a raw
     # 16-bit PCM audio chunk, which is muxed into the mp4 as an AAC track (one
@@ -58,7 +61,12 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
     return {"created": now(), "data": data}
 
 
-async def _stream_ndjson(api, request_id):
+def _stream_ndjson(api, request_id):
+    # Bound to the submission now: the body is iterated later, by Starlette.
+    return _ndjson_lines(api.iter_result_chunks(request_id))
+
+
+async def _ndjson_lines(chunks):
     """Yield one NDJSON line per result chunk for a ``stream_video`` request.
 
     A windowed request emits each window's mp4 as its own ``video`` chunk;
@@ -70,7 +78,7 @@ async def _stream_ndjson(api, request_id):
     """
     index = 0
     failed = False
-    async for chunk in api.iter_result_chunks(request_id):
+    async for chunk in chunks:
         metadata = dict(chunk.metadata or {})
         if chunk.modality == "error":
             failed = True

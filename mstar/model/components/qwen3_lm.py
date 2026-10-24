@@ -115,7 +115,9 @@ class Qwen3DenseLM(nn.Module):
         if "lm_head.weight" not in loaded:
             if not self.config.tie_word_embeddings:
                 raise RuntimeError("Qwen3 checkpoint has no lm_head.weight and does not tie embeddings")
-            self.lm_head.weight_loader(self.lm_head.weight, self.embed_tokens.weight.data.clone())
+            # Both shard the vocab dim by TP rank over the same rows, so the
+            # local embedding shard is this rank's head shard.
+            self.lm_head.weight.data.copy_(self.embed_tokens.weight.data)
             loaded.add("lm_head.weight")
         missing = sorted(set(dict(self.named_parameters())) - loaded)
         if missing:

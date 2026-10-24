@@ -64,8 +64,7 @@ def test_mask_padding_reaches_model(parallel):
     ({"parallel": "dp"}, "parallel"),
     ({"parallel": "ep", "ep_group": "sp"}, "ep_group"),
     ({"parallel": "ep", "log_expert_load_every": -1}, ">= 0"),
-    ({"debug_check_routing": True}, "need parallel: ep"),
-    ({"log_expert_load_every": 10}, "need parallel: ep"),
+    ({"log_expert_load_every": 10}, "needs parallel: ep"),
     ({"parallel": "ep", "typo": 1}, "unknown"),
 ])
 def test_from_yaml_rejects(section, match):
@@ -83,16 +82,14 @@ def test_layer_picks_moe_block(parallel, cls):
         # Rank 1 of 2 owns experts 4..7 at full width.
         assert layer.mlp.expert_start == NUM_EXPERTS // 2
         assert layer.mlp.experts.down_proj.shape == (NUM_EXPERTS // 2, 64, 16)
-        assert not layer.mlp.debug_check_routing
 
 
 @pytest.mark.parametrize("rank, tracked", [(0, True), (1, False)])
 def test_only_group_rank_zero_tracks_load(rank, tracked):
-    moe = MoeParallelConfig(parallel="ep", log_expert_load_every=5, debug_check_routing=True)
+    moe = MoeParallelConfig(parallel="ep", log_expert_load_every=5)
     with torch.device("meta"):
         layer = Qwen3OmniThinkerLayer(_config(), 0, comm_group=_group(rank, 2), moe_parallel=moe)
     assert layer.mlp.track_expert_load is tracked
-    assert layer.mlp.debug_check_routing
 
 
 def _load_model(every):

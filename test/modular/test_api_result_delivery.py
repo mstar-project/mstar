@@ -9,13 +9,16 @@ success.
 """
 
 import asyncio
-import collections
 import queue
 import threading
 import time
 
+import pytest
+from api_server_helpers import make_test_api_server
+from fastapi import HTTPException
+
 from mstar.api_server.data_worker import PreprocessWorkerThread
-from mstar.api_server.entrypoint import APIServer, PendingRequest
+from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -136,11 +139,15 @@ class _StubPreprocessWorker:
         self.final = final
         self.cleaned = []
         self.drained_flags = []
+        self.aborted = []
+
+    def abort_request(self, rid):
+        self.aborted.append(rid)
 
     def has_pending_tensors(self, rid):
         return self.pending
 
-    def received_final_chunks(self, rid, final_outputs):
+    def received_final_chunks(self, rid, output_chunk_counts):
         return self.final
 
     def finished_reading(self, rid, drained=True):
@@ -150,9 +157,9 @@ class _StubPreprocessWorker:
         self.drained_flags.append(drained)
 
 
-def _pending_request():
+def _pending_request(streaming=True):
     return PendingRequest(
-        streaming=True,
+        streaming=streaming,
         input_modalities=["text"],
         output_modalities=["text"],
         profile=None,
@@ -160,16 +167,14 @@ def _pending_request():
 
 
 def _api_server_stub(preprocess_worker):
-    server = object.__new__(APIServer)
-    server.recently_completed = collections.OrderedDict()
-    server._recently_completed_ttl = 15.0
-    server.pending_requests = {}
-    server.preprocess_worker = preprocess_worker
-    server.log_stats = False
-    server.request_lock = threading.Lock()
-    server.timeout_seconds = 5.0
-    server.enable_nvtx = False
-    return server
+    return make_test_api_server(preprocess_worker=preprocess_worker)
+
+
+def _register(server, rid, req):
+    """What ``submit_request`` registers, with the request's key equal to its id."""
+    server.pending_requests[rid] = req
+    server._live[rid] = rid
+    server._client_ids[rid] = rid
 
 
 def test_ttl_expiry_with_undelivered_chunks_fails_request():
@@ -227,7 +232,7 @@ def test_stream_carries_error_as_final_chunk():
     req.error = "result delivery timed out; response is incomplete"
     req.error_status = 500
     req.event.set()
-    server.pending_requests["r3"] = req
+    _register(server, "r3", req)
 
     async def _collect():
         return [chunk async for chunk in server.iter_result_chunks("r3")]
@@ -243,7 +248,7 @@ def test_a_chunk_from_another_thread_wakes_the_stream_at_once():
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
     req = _pending_request()
-    server.pending_requests["r4"] = req
+    _register(server, "r4", req)
 
     async def _collect():
         loop = asyncio.get_running_loop()
@@ -274,6 +279,126 @@ def test_a_chunk_from_another_thread_wakes_the_stream_at_once():
     # each chunk reached the handler within the 50 ms backstop, not a poll later
     for (_, t_got), t_put in zip(got, times, strict=True):
         assert t_got - t_put < 0.05, f"chunk took {1000 * (t_got - t_put):.1f} ms"
+
+
+class _Client:
+    """The ``Request`` that ``collect_results`` asks whether the client left;
+    counts the asks."""
+
+    def __init__(self, gone=False):
+        self.gone = gone
+        self.checks = 0
+
+    async def is_disconnected(self):
+        self.checks += 1
+        return self.gone
+
+
+def test_a_finish_from_another_thread_wakes_collect_results_at_once():
+    """A non-streaming handler sleeps on the same wake as a streaming one: the
+    finish reaches it at once, and while it waits the client's connection is
+    checked on the 100 ms backstop, not every few ms (polling each waiting
+    request every 5 ms held the event loop at a few hundred in flight)."""
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    req = _pending_request(streaming=False)
+    _register(server, "r7", req)
+    client = _Client()
+
+    async def _collect():
+        finished = []
+
+        def producer():
+            time.sleep(0.5)
+            with server.request_lock:
+                req.chunks.append(ResultChunk(request_id="r7", modality="text", data=b"done"))
+                req.event.set()
+                finished.append(time.perf_counter())
+                req.notify()
+
+        start = time.perf_counter()
+        threading.Thread(target=producer, daemon=True).start()
+        chunks = await server.collect_results("r7", client)
+        end = time.perf_counter()
+        return chunks, end - finished[0], end - start
+
+    chunks, lag, waited = asyncio.run(_collect())
+    assert [c.data for c in chunks] == [b"done"]
+    assert lag < 0.05, f"the finish took {1000 * lag:.1f} ms to reach the handler"
+    assert client.checks <= waited / 0.1 + 1, f"{client.checks} disconnect checks in {waited:.2f} s"
+    assert "r7" not in server.pending_requests
+
+
+def _feed_tokens(server, req, rid, every=0.02, until=3.0):
+    """The message thread's per-token path: a chunk and a ``notify_many`` every
+    ``every`` s, until the request leaves ``pending_requests`` (or ``until``)."""
+    from mstar.api_server.entrypoint import notify_many
+
+    def run():
+        end = time.time() + until
+        while time.time() < end and rid in server.pending_requests:
+            with server.request_lock:
+                req.chunks.append(ResultChunk(request_id=rid, modality="text", data=b"t"))
+            notify_many([req])
+            time.sleep(every)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+@pytest.mark.parametrize("generating", [False, True], ids=["idle", "generating"])
+def test_collect_results_still_releases_a_request_whose_client_left(generating):
+    """Also while the request keeps producing tokens: a wake per token must
+    not keep the handler from asking whether the client left."""
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    req = _pending_request(streaming=False)
+    _register(server, "r8", req)
+    if generating:
+        _feed_tokens(server, req, "r8")
+
+    start = time.perf_counter()
+    assert asyncio.run(server.collect_results("r8", _Client(gone=True))) == []
+    assert time.perf_counter() - start < 1.0
+    assert pw.aborted == ["r8"]
+    assert "r8" not in server.pending_requests
+
+
+@pytest.mark.parametrize("generating", [False, True], ids=["idle", "generating"])
+def test_collect_results_still_times_out(generating):
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    server.timeout_seconds = 0.3
+    req = _pending_request(streaming=False)
+    _register(server, "r9", req)
+    if generating:
+        _feed_tokens(server, req, "r9")
+
+    start = time.perf_counter()
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.collect_results("r9", _Client()))
+    assert time.perf_counter() - start < 1.5
+    assert e.value.status_code == 500
+    assert pw.aborted == ["r9"]
+    assert "r9" not in server.pending_requests
+
+
+def test_tokens_do_not_wake_a_handler_waiting_for_the_finish():
+    """``collect_results`` reads no chunk before the finish, so a chunk's
+    notification leaves its wake alone; the finish sets it."""
+    from mstar.api_server.entrypoint import notify_many
+
+    class _Loop:
+        def call_soon_threadsafe(self, fn, *args):
+            fn(*args)
+
+    req = _pending_request(streaming=False)
+    req.loop, req.wake, req.wake_on_finish = _Loop(), asyncio.Event(), True
+    notify_many([req])
+    req.notify()
+    assert not req.wake.is_set()
+    req.event.set()
+    notify_many([req])
+    assert req.wake.is_set()
 
 
 def test_notify_many_wakes_every_handler_with_one_loop_call():
@@ -315,7 +440,7 @@ def test_chunks_waiting_together_come_as_one_batch():
     req = _pending_request()
     for i in range(3):
         req.chunks.append(ResultChunk(request_id="r5", modality="text", data=f"t{i}".encode()))
-    server.pending_requests["r5"] = req
+    _register(server, "r5", req)
 
     async def _collect():
         batches = server.iter_result_chunk_batches("r5")
@@ -344,7 +469,7 @@ def test_error_tail_is_its_own_last_batch():
     req.error = "result delivery timed out; response is incomplete"
     req.error_status = 500
     req.event.set()
-    server.pending_requests["r6"] = req
+    _register(server, "r6", req)
 
     async def _collect():
         return [[c.modality for c in b] async for b in server.iter_result_chunk_batches("r6")]

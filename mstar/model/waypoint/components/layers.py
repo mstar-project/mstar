@@ -6,6 +6,8 @@ checkpoint keys (``fc1``/``fc2``, ``bias_in``, ``cond_proj``, ``mlp``), not
 mstar's usual ``components.mlp.MLP`` spelling, so this doesn't reuse it.
 """
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -24,6 +26,19 @@ def bf16_roundtrip(table: torch.Tensor) -> torch.Tensor:
     Only reachable under ``WaypointConfig.reference_compat``.
     """
     return table.to(torch.bfloat16).to(table.dtype)
+
+
+@contextlib.contextmanager
+def fp32_matmul_highest():
+    """Run fp32 GEMMs as IEEE fp32, whatever the process-wide
+    ``float32_matmul_precision`` (``mstar.engine`` sets ``'high'``). Eager
+    only: the setting is global, so dynamo cannot trace a switch of it."""
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
 
 
 def _bf16_bits(x: torch.Tensor) -> torch.Tensor:
@@ -133,7 +148,11 @@ class NoiseConditioner(nn.Module):
 
     fp32 island: ``FP32_MODULE_PATHS`` pins ``self.mlp`` back to fp32 after the
     serving bf16 cast, and the body runs under ``autocast(enabled=False)`` on a
-    ``.float()`` sigma. ``* 1000`` scales [0, 1] into the Fourier basis's
+    ``.float()`` sigma and, eagerly, under ``fp32_matmul_highest`` (a batched
+    call rounds through TF32 at ``'high'``, and cuBLAS 13 on a B200 rounds
+    even the served ``[1, 512] @ [512, 8192]`` GEMV). Compiled regions read
+    the rows ``WaypointDiT`` builds eagerly instead of running the island.
+    ``* 1000`` scales [0, 1] into the Fourier basis's
     rotating range; ``* 2**0.5`` restores unit variance after the sin/cos concat.
     """
 
@@ -178,7 +197,10 @@ class NoiseConditioner(nn.Module):
         (bf16 under ``reference_compat``, whose table is stored bf16)."""
         if self.reference_compat:
             return self._cached_embed(s)
-        return self._embed(s)
+        if torch.compiler.is_compiling():
+            return self._embed(s)
+        with fp32_matmul_highest():
+            return self._embed(s)
 
     def materialize(self, device: torch.device | str) -> None:
         """Materialize frequency data and the optional post-load sigma LUT."""
@@ -217,8 +239,9 @@ class NoiseConditioner(nn.Module):
 
         The batch shape is load-bearing: an M=S GEMM (all S sigmas in one
         call) rounds through TF32 under ``float32_matmul_precision('high')``,
-        where the served M=1 GEMV stays exact fp32. Built on first use, so an
-        eager forward must warm it before ``compile_regions``.
+        where the served M=1 GEMV stays exact fp32 (not with cuBLAS 13 on a
+        B200). Built on first use, so an eager forward must warm it before
+        ``compile_regions``.
         """
         device = torch.device(device)
         if device not in self._lut:

@@ -58,9 +58,9 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
-   * - ``MSTAR_REQUIRE_CUDA_GRAPHS``
+   * - ``MSTAR_REQUIRE_ACCELERATOR_GRAPHS``
      - ``0``
-     - ``1`` makes a worker fail at startup when any CUDA graph bucket
+     - ``1`` makes a worker fail at startup when any accelerator graph bucket
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
@@ -71,6 +71,20 @@ Communication
        extension; raises if missing). ``AUTO``: the arena when the
        extension imports, files otherwise. Must match across the
        deployment — arena locations ride in the tensor descriptors.
+   * - ``MSTAR_DEPLOYMENT_TOKEN``
+     - random per launch
+     - Mixed into the namespace of the SHM tensor files and arena segments,
+       so no two launches share names: not a restart on the same socket
+       prefix, and not two deployments that share ``/dev/shm`` from different
+       containers (``--ipc=host``, hostIPC) with the same socket prefix and
+       ports. The API server mints a new one at every launch unless a
+       launcher set it (one an API server minted is replaced, also when
+       inherited), and the conductor and workers inherit it. Set it only
+       when a launcher starts a deployment's processes separately: the same
+       value in all of them, and a new value per launch (a dead run's files
+       are swept only once no process holds its namespace, and a stopping
+       worker unlinks its own files even after its conductor is gone, which
+       a reused value would let it do to the next launch's files).
    * - ``MSTAR_KV_SHM_DIR``
      - ``/dev/shm`` (or ``/tmp`` if unavailable)
      - Base directory for host-staged KV snapshots when remote KV transfer
@@ -81,7 +95,12 @@ Communication
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
      - ``256``
      - Size of each arena segment. The arena grows segment by segment;
-       existing segments never move (registrations stay valid).
+       existing segments never move (registrations stay valid). A
+       segment's /dev/shm pages are committed when it is created (pinned
+       segments always were, by ``cudaHostRegister``), so the whole
+       segment counts against /dev/shm, as do spill files, which land in
+       /dev/shm by default. A segment /dev/shm cannot hold counts as arena
+       full (sends spill, see ``MSTAR_SHM_ARENA_SPILL``).
    * - ``MSTAR_SHM_ARENA_MAX_SEGMENTS``
      - ``32``
      - Growth cap PER ENTITY. Every entity (workers + the api-server data
@@ -134,6 +153,17 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+   * - ``NCCL_SOCKET_IFNAME``
+     - ``lo``
+     - NCCL's own variable. Every worker runs on the conductor's host, so
+       the conductor sets ``lo`` for its workers and NCCL's bootstrap
+       sockets listen on loopback only. A value you set, or a set
+       ``NCCL_SOCKET_FAMILY``, is kept as is.
+   * - ``GLOO_SOCKET_IFNAME``
+     - ``lo``
+     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+       Same rule: the conductor sets ``lo`` for its workers unless you set
+       it, so Gloo does not listen on the address the hostname resolves to.
 
 Models
 ------
@@ -155,23 +185,36 @@ model, so they are named for it.
        images produce small bf16 drift, which at greedy ``temperature=0`` can
        flip a downstream LLM argmax. When off, ``prefill_vit`` runs one
        request at a time.
-   * - ``MSTAR_VIT_CUDA_GRAPH``
+   * - ``MSTAR_VIT_ACCELERATOR_GRAPH``
      - ``0``
-     - BAGEL: CUDA-graph capture of the ViT block loop, over the node's ragged
-       attention resource (see :doc:`adding_models`). Off by default: capture
-       costs one graph per (batch size, token bucket) and the eager
-       flash-attn path is already fast. The win is removing per-layer launch
-       overhead on small images.
-   * - ``MSTAR_VIT_CG_TOKEN_BUCKETS``
+     - BAGEL: accelerator graph capture of the ViT block loop, over the node's
+       ragged attention resource (see :doc:`adding_models`). Requires the
+       deployment option ``model_kwargs.accelerator_graph`` to be true;
+       BAGEL defaults this option to true (see :doc:`models`).
+       Off by default: capture costs one graph per (batch size, token bucket)
+       and the eager flash-attn path is already fast. The win is removing
+       per-layer launch overhead on small images.
+   * - ``MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS``
      - ``512,1024,2048,4096,4900``
      - Comma-separated token-count buckets to capture, when
-       ``MSTAR_VIT_CUDA_GRAPH=1``. A batch longer than the largest bucket runs
+       ``MSTAR_VIT_ACCELERATOR_GRAPH=1``. A batch longer than the largest bucket runs
        eagerly. ``4900`` is ``70*70``, the exact length the ``vllm``
        preprocess option emits.
-   * - ``MSTAR_VIT_CG_BATCH_SIZES``
+   * - ``MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES``
      - ``1,2,4``
      - Comma-separated batch sizes to capture. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
+   * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
+     - unset
+     - Cosmos3: any nonempty value disables denoise, prefill and reasoner
+       decode capture. The deployment option
+       ``model_kwargs.accelerator_graph: false`` also disables all these
+       captures and cannot be overridden by this variable.
+   * - ``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH``
+     - unset
+     - Cosmos3: any nonempty value disables only the understanding-tower
+       prefill capture. Denoise and reasoner decode captures remain eligible
+       when ``model_kwargs.accelerator_graph`` is true.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the
@@ -191,6 +234,16 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
    * - Variable
      - Default
      - Meaning
+   * - ``MSTAR_MAX_BODY_MB``
+     - ``128``
+     - Request body limit on every route, as in the Rust frontend: a larger
+       body gets a 413, refused on its ``Content-Length`` or, for a chunked
+       upload, while it is read. ``/v1/audio/transcriptions`` keeps its own
+       512 MiB file cap when this is lower. A body refused on its
+       ``Content-Length`` is answered before it is read, so a client that
+       writes the whole body before reading the reply can see a connection
+       reset instead of the 413; one that sends ``Expect: 100-continue``
+       gets the 413 before it sends the body.
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
@@ -198,6 +251,31 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
        every route. Empty by default, so a direct deployment is unaffected.
+   * - ``MSTAR_MAX_IMAGES_PER_REQUEST``
+     - ``10``
+     - Largest ``n`` one ``/v1/images/generations`` request may ask for (see
+       :func:`mstar.api_server.openai.serving_images.max_images_per_request`);
+       ``n`` outside ``1`` to this value is a 400 before anything is
+       submitted. The Rust frontend and the Dynamo bridge apply the same
+       variable and default.
+   * - ``MSTAR_API_KEY``
+     - unset
+     - API key (read by :func:`mstar.api_server.auth.resolve_api_key`;
+       ``--api-key`` overrides it). When set, every route except
+       ``/health`` and ``/metrics`` needs ``Authorization: Bearer <key>``, WebSocket
+       handshakes included; unset or empty turns the check off. The
+       launcher passes it on to the Rust frontend only (the conductor and
+       workers do not inherit it), and
+       :class:`mstar.client.MStarClient` sends it when not given
+       ``api_key``. See :ref:`api-key`.
+   * - ``MSTAR_SILERO_VAD_PATH``
+     - unset
+     - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``
+       ``server_vad`` turn detection, read by
+       ``realtime_vad.silero_weights``. Unset, the copy bundled with the
+       ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
+       with a file whose inputs or outputs differ (the package's other
+       exports), ``server_vad`` sessions are refused. Never downloaded.
 
 Serving (Rust frontend)
 -----------------------
@@ -217,6 +295,12 @@ Read by the ``mstar-server`` binary and its bridge
      - Path to the ``mstar-server`` binary. Fallback order:
        ``--rust-frontend-bin``, this variable, ``$PATH``, then the in-repo
        ``rust/server/target/release`` build.
+   * - ``MSTAR_API_KEY``
+     - unset
+     - Same rule as the Python server (``rust/server/src/auth.rs``, read
+       once at startup): every route except ``/health`` and ``/metrics`` needs
+       ``Authorization: Bearer <key>``. ``mstar-serve --rust-frontend``
+       sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend; on expiry the client gets
@@ -232,7 +316,7 @@ Read by the ``mstar-server`` binary and its bridge
      - ``256``
      - Admission cap on in-flight generation requests; beyond it clients
        get an immediate 503 instead of queueing into the request timeout.
-       ``/health`` and ``/v1/models`` bypass the cap.
+       ``/health``, ``/metrics`` and ``/v1/models`` bypass the cap.
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
      - Request body limit (multipart uploads included).
@@ -243,6 +327,13 @@ Read by the ``mstar-server`` binary and its bridge
        tokenizer only uses its thread pool while that variable reads true,
        and serving environments often export it false. ``0`` leaves the
        variable as it is (the chunked encode then runs serially).
+   * - ``MSTAR_OPENAI_ADAPTER``
+     - set by the launcher
+     - The class name of the model's adapter in ``ADAPTER_REGISTRY``
+       (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
+       picks the OpenAI translation ``mstar-server`` uses
+       (``Adapter::from_python``). ``mstar-serve --rust-frontend`` always sets it;
+       a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend
@@ -267,6 +358,57 @@ uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
   the Rust frontend (it spends compute on a track the client won't receive), or
   run the Python frontend for sound video.
 
+Request media
+-------------
+
+Read by the model's media loaders in the data worker's preprocess thread,
+behind either frontend. All four are also checked once when the data worker
+starts (:func:`mstar.model.media_limits.check_media_limits`), so an invalid
+value stops the server instead of failing every media request. The pixel and
+audio caps hold for a request's files together (:class:`mstar.model.media_limits.RequestMediaBudget`),
+so attaching more files does not multiply them.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_MAX_IMAGE_PIXELS``
+     - ``89478485``
+     - Pixels a request's images may decode to, summed over them (see
+       :func:`mstar.model.media_limits.max_image_pixels`), checked from each
+       header before decoding; over it, the request gets a 400. PNG, JPEG,
+       WebP and GIF are read (FLUX.2 klein, which decodes with Pillow, also
+       reads BMP and TIFF); other formats get a 400. A GIF or an animated
+       WebP is read as its first frame.
+   * - ``MSTAR_MAX_VIDEO_PIXELS``
+     - ``1073741824``
+     - Pixels a request's videos may decode to (see
+       :func:`mstar.model.media_limits.max_video_pixels`), summed over the
+       frames the model's loader decodes, each frame counting as at least
+       64x64; over it, the request gets a 400. At 1080p30 the default refuses
+       clips over about 17 s on Cosmos3, which decodes every frame, and over
+       about 259 s on Qwen3-Omni and Qwen3.5, which decode 2 frames a second
+       (Qwen3-Omni decodes every frame, as Cosmos3, when the clip's header
+       gives no frame count).
+   * - ``MSTAR_MAX_MEDIA_FILES``
+     - ``16``
+     - Images, audio clips and videos one request may attach, together (see
+       :func:`mstar.model.media_limits.max_media_files`); more get a 400
+       before any is decoded. A model can take fewer of one kind
+       (:meth:`mstar.model.base.Model.max_input_files`; Qwen3-TTS,
+       Chatterbox, Whisper and Higgs-Audio take one audio clip).
+   * - ``MSTAR_MAX_AUDIO_SECONDS``
+     - ``3600``
+     - Seconds a request's audio clips may decode to, summed over them (see
+       :func:`mstar.model.media_limits.max_audio_seconds`), checked from each
+       header before the model decodes it and again from the decoded clip (a
+       file whose header gives no length, such as a FLAC with no sample count,
+       is counted as it decodes, or from its size for a WAV with no data
+       length); over it, the request gets a 400.
+
 Worker scheduling
 -----------------
 
@@ -278,8 +420,9 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - ``0``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes. ``1``: the
+     - config's ``tp_async_sched``, else ``0``
+     - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+       deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
        opened) and broadcasts it at once as a speculative
@@ -290,7 +433,7 @@ Worker scheduling
        continuing request without loop-back output) are derived by each
        rank from replicated state, never signalled. A comma-separated
        list of node names (``thinker,talker``) enables it for those
-       parallel nodes only. ``0``: the serial path — leader schedules
+       parallel nodes only. ``0`` (or ``false``): the serial path — leader schedules
        after N, followers rebuild after the broadcast. Set it identically
        on every rank of an instance: the workers compare it at startup and
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at
@@ -321,7 +464,16 @@ Worker scheduling
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
-       other ready work.
+       other ready work. ``0`` turns speculation off. A value that is not an
+       integer is ignored with a warning when the worker starts.
+   * - ``MSTAR_LAUNCH_WAIT_MS``
+     - ``5``
+     - Milliseconds the speculative submitter holds off the GIL waiting for
+       the GPU thread to reach the launch before it carries on. A value that
+       is not a number, is ``nan`` or ``inf``, or is past
+       ``threading.TIMEOUT_MAX`` seconds is ignored with a warning when the
+       worker starts and ``5`` is used; a negative value is raised to ``0``
+       with a warning.
    * - ``MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS``
      - ``32,64,128,256,512,1024,2048,4096,8192``
      - Total tokens of a packed Qwen3.5 text-prefill step that get a captured
@@ -348,9 +500,9 @@ Worker scheduling
        the decode wrapper copies the indices straight into its captured
        device buffer from there, so the copies FlashInfer's ``plan`` issues
        are really asynchronous. From pageable memory the driver stages each
-       one and FlashInfer makes the indices copy blocking. Measured neutral
-       to slightly negative at c32-c128 on 0.8B (the event bookkeeping per
-       take costs about what it saves), so it is off by default.
+       one and FlashInfer makes the indices copy blocking. No measurable gain
+       at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
+       event per plan, which a buffer set waits on before it is rewritten.
    * - ``MSTAR_KV_PLAN_CACHE``
      - ``0``
      - The KV manager plans a captured decode step off the previous step's
@@ -408,9 +560,9 @@ Worker scheduling
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
      - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
-       ``remove_request``, check the KV page bookkeeping (free list, owner
-       counts, seals) against the streams holding the pages. Walks every
-       live stream; tests and debugging only.
+       ``remove_request``, check the KV page bookkeeping against the streams
+       holding the pages, and each commit against its request's layout. Logs a
+       label left under its footprint at removal. Tests and debugging only.
 
 Compilation
 -----------

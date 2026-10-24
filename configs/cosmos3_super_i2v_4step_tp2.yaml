@@ -6,7 +6,7 @@ resources:
   kv:
     max_num_pages: 384
 model_kwargs:
-  cuda_graph: true
+  accelerator_graph: true
   graph_max_latent_area: 2000
   # Distilled image-to-video: 4 fixed sigmas, guidance baked in; the
   # checkpoint is trained at 16 fps (transformer base_fps).

@@ -11,9 +11,19 @@ resources:
 # Windowed requests run the eager denoise path, so capture stays enabled only
 # for the t2i tiers it already covers.
 model_kwargs:
-  cuda_graph: true
+  accelerator_graph: true
   graph_max_latent_area: 2000
   enable_windowed_video: true
+  # The streaming decoder keeps each live stream's VAE conv cache (1.33 GiB
+  # of tensors per stream at 832x480 in bf16; it grows with the frame area and
+  # doubles in fp32). Uncomment to cap the warm streams per decoder copy;
+  # streams past the cap take the stateless context re-decode.
+  # windowed_decode_max_warm_streams: 0   # 0: no cap
+  # Latents per decoder call in the streaming decode (default 1). 0 decodes a
+  # steady window's new latents in one call: the decoder alone is ~6% faster at
+  # 832x480, but served end to end it is no faster and takes about 15 GiB more
+  # peak (832x480 bf16, measured on B200).
+  # windowed_decode_latents_per_call: 1
 node_groups:
   - node_names: ["dit"]
     ranks: [0]

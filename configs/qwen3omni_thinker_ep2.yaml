@@ -10,7 +10,6 @@ node_groups:
     ep_config:
       parallel: ep                # tp | ep
       ep_group: tp                # EP spans the group's TP ranks (only option today)
-      debug_check_routing: false  # true adds one all-gather per MoE layer
       log_expert_load_every: 0    # N > 0 logs per-rank slot counts every N steps
       mask_padding: false         # measured no throughput gain at P=8, TP or EP
 

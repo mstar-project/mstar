@@ -358,6 +358,24 @@ class PopRidsOutput(NamedTuple):
     # carries. Trailing with a default so a caller that does not need them can
     # leave it off.
     output_signals: tuple[str, ...] = ()
+    # Multi-walk pop only: each popped rid's index into the walks, and each
+    # walk's output edge names.
+    rid_walk_idx: list[int] = []
+    walk_output_signals: tuple[tuple[str, ...], ...] = ()
+
+
+class RequestWalks(NamedTuple):
+    """Rows of several walks of one node, columnar: rid ``rids[i]`` runs
+    ``walks[walk_idx[i]]``."""
+    rids: list[int]
+    walks: list[str]
+    walk_idx: list[int]
+
+    @classmethod
+    def from_walks(cls, rids: list[int], row_walks: list[str]) -> "RequestWalks":
+        index: dict[str, int] = {}
+        walk_idx = [index.setdefault(walk, len(index)) for walk in row_walks]
+        return cls(list(rids), list(index), walk_idx)
 
 
 class SpeculationPrepInput(NamedTuple):
@@ -435,6 +453,10 @@ class RouteInput(NamedTuple):
     # `supports_inline_emit` ignores both.
     inline_signal: str | None = None
     inline_values: tuple[int, ...] | list[int] = ()
+    # Rows of several walks in one call: wg_ids.keys[i] ran
+    # walks[rid_walk_idx[i]]. None, every row ran graph_walk.
+    walks: list[str] | None = None
+    rid_walk_idx: list[int] | None = None
 
 
 class RouteOutput(NamedTuple):
@@ -520,10 +542,12 @@ class GraphRuntime(ABC):
         partition: str,
         graph_walk: str,
         partition_worker_graph_ids: list[int],
-        worker_graph_to_workers: ParallelList[int, list[str]]
+        worker_graph_to_workers: ParallelList[int, list[str]],
+        loop_caps: Mapping[str, int],
     ) -> int:
         """
-        Returns the integer handle for this request.
+        Returns the integer handle for this request. Each loop named in
+        ``loop_caps`` runs at most that many iterations for it.
         """
         pass
 
@@ -575,9 +599,11 @@ class GraphRuntime(ABC):
 
     @abstractmethod
     def set_in_flight(
-        self, node: str, wg_id: int, rids: list[int],
+        self, node: str, rids: list[int], wg_ids: list[int],
         in_flight: bool,
     ):
+        """``rids[i]`` runs ``node`` in worker graph ``wg_ids[i]``, or every
+        rid in ``wg_ids[0]`` when it holds one id."""
         pass
 
     @abstractmethod
@@ -726,6 +752,15 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
+    def pop_walk_rids(
+        self, node_name: str, rows: "RequestWalks", check_ready: bool = False,
+    ) -> PopRidsOutput | None:
+        """``pop_rids`` for rows of several walks of one node in one call,
+        all or none across every walk under ``check_ready``. Fills
+        ``rid_walk_idx`` and ``walk_output_signals``."""
+        pass
+
+    @abstractmethod
     def has_ready_excluding(
         self, exclude_rids: set[int],
         exclude_target: tuple[str, str] | None=None,
@@ -750,6 +785,8 @@ class GraphRuntime(ABC):
         level ready-ness separately.
 
         exclude_rids includes failed_rids, pending_removes, and held_until.
+        ``target`` and ``exclude_target`` may name a combined walk, as the
+        runtime's ``combined_walk_of`` maps it.
         """
         pass
 
@@ -765,13 +802,14 @@ class GraphRuntime(ABC):
     @abstractmethod
     def speculate_node(
         self, node_name: str,
-        graph_walk: str,
-        sample_rid: int,
+        graph_walks: list[str],
+        sample_rids: list[int],
     ) -> list[SpeculationOutput]:
         """
-        Returns a list of nodes that are ready for speculation, checking
-        against whether the node is async enabled (known internally), as
-        well as whether the node is TP async compatible.
+        The nodes ready for speculation, checking against whether the node is
+        async enabled (known internally, per walk) and TP async compatible.
+        Takes one sample rid per walk; returns every walk's targets, each
+        naming its walk, for the caller to pick from.
         """
         pass
 
@@ -818,12 +856,13 @@ class GraphRuntime(ABC):
     @abstractmethod
     def commit_speculation(
         self, spec_id: int, success: bool, dropped_rids: list[int] = (),
-        node: str | None = None, wg_id: int | None = None,
+        node: str | None = None, wg_ids: list[int] | None = None,
         scheduled_rids: list[int] = (),
     ):
         """Settle the streaming ingests a prep staged under ``spec_id``.
         On ``success``, ``scheduled_rids`` are also marked speculatively
-        scheduled on ``node``.
+        scheduled on ``node``, ``scheduled_rids[i]`` in worker graph
+        ``wg_ids[i]``.
 
         The scheduled rids are passed rather than read off the stage in order
         to also include the fresh rids rolled in from the ready queue. For
@@ -876,8 +915,9 @@ class GraphRuntime(ABC):
 
     @abstractmethod
     def pending_loop_stop_rids(
-        self, graph_walk: str, loop_name: str,
+        self, graph_walks: list[str], loop_name: str,
     ) -> set[int]:
+        """Rids with a pending stop of ``loop_name`` in any of ``graph_walks``."""
         pass
 
     @abstractmethod

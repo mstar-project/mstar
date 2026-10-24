@@ -65,7 +65,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.config import (
     MAMBA,
@@ -360,7 +360,10 @@ class NemotronDuplexModel(Model):
     def tokenizer(self):
         # The text tokenizer lives in the Spark repo's ``nano/`` folder (the base
         # repo ships only ``rnnt_tokenizer/``). 131072-token vocab; 256 single-
-        # char tokens -> the talker's char vocab. Loaded lazily.
+        # char tokens -> the talker's char vocab. Loaded lazily. AutoTokenizer
+        # also reads ``nano/config.json`` when the snapshot has it, whose
+        # ``auto_map`` names repo code; transformers' native Nemotron-H config
+        # serves instead.
         if self._tokenizer is None:
             import os
 
@@ -371,7 +374,7 @@ class NemotronDuplexModel(Model):
             local_dir = None
             for f in ("nano/tokenizer.json", "nano/tokenizer_config.json", "nano/special_tokens_map.json"):
                 local_dir = os.path.dirname(hf_hub_download(repo, f, cache_dir=self.cache_dir))
-            self._tokenizer = AutoTokenizer.from_pretrained(local_dir, trust_remote_code=True)
+            self._tokenizer = AutoTokenizer.from_pretrained(local_dir, trust_remote_code=False)
         return self._tokenizer
 
     def _talker_tokenizer(self):
@@ -659,7 +662,7 @@ class NemotronDuplexModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         # Duplex request: raw user audio (-> Encoder partition) plus an optional
         # system-prompt text that primes the nano cache (prefill_text).
         out: NameToTensorList = {}
@@ -723,7 +726,28 @@ class NemotronDuplexModel(Model):
             out["has_prompt"] = [torch.tensor([1], dtype=torch.long)]
         else:
             out["text_inputs"] = [torch.tensor([-1], dtype=torch.long)]
-        return out
+        # a session's first frame writes the prompt along with its own row, and the talker's first frame writes
+        # its speaker warm-up
+        prompt_len = ids.numel() if prompt else 0
+        nano = LabelLayout(
+            spans=(Span("ids", "decode", prompt_len, prompt_len, "text_inputs"),) if prompt else (),
+            growth=(("decode_loop", 1),),
+        )
+        warmup = self.TALKER_WARMUP_POSITIONS
+        talker = LabelLayout(
+            spans=(Span("rows", "talker_decode", warmup, warmup, "audio_prompt_latents"),),
+            growth=(("talker_decode_loop", 1),),
+        )
+        return ProcessPromptOutput(out, {"kv_layout": {
+            NANO_KV: {"main": nano}, TALKER_KV: {"main": talker, "uncond": talker},
+        }})
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        talker = KVLabel(growth=(("talker_decode", "talker_decode_loop"),))
+        return {
+            NANO_KV: {"main": KVLabel(growth=(("decode", "decode_loop"),))},
+            TALKER_KV: {"main": talker, "uncond": talker},
+        }
 
     def load_audio(self, filepath: str, device: str):
         """Decode an uploaded audio file to 16 kHz mono via soundfile (the base uses
@@ -731,15 +755,15 @@ class NemotronDuplexModel(Model):
         ``TensorAndMetadata`` shape the data worker expects."""
         import soundfile as sf
 
+        from mstar.api_server.media_io import check_resample_rate, read_soundfile_capped
         from mstar.model.base import TensorAndMetadata
 
         try:
-            data, sr = sf.read(filepath, dtype="float32")
+            data, sr = read_soundfile_capped(filepath)   # mono
         except sf.SoundFileError as exc:   # garbage or truncated upload
             raise ValueError(f"could not decode the audio file: {exc}") from exc
         audio = torch.from_numpy(data)
-        if audio.dim() == 2:                       # stereo -> mono
-            audio = audio.mean(dim=-1)
+        check_resample_rate(sr, 16000)
         if sr != 16000:
             import torchaudio.functional as AF
             audio = AF.resample(audio, sr, 16000)
@@ -1168,9 +1192,14 @@ class NemotronDuplexModel(Model):
         cv = build_char_vocab(tok)
         s2c, _ = subword_to_char_ids(tok, cv)
         # checkpoint config, so the talker samples with its inference_* knobs
-        return EarTTSTalkerSubmodule(
+        submodule = EarTTSTalkerSubmodule(
             talker=talker, config=cfg, subword_to_char=s2c, char_pad_idx=len(cv),
         )
+        assert submodule.warmup_len == self.TALKER_WARMUP_POSITIONS, (
+            f"the checkpoint's speaker warm-up is {submodule.warmup_len} positions, "
+            f"where the talker's layout counts {self.TALKER_WARMUP_POSITIONS}"
+        )
+        return submodule
 
     def _create_codec_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,

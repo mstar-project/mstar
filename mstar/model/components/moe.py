@@ -21,6 +21,11 @@ Expert-parallel variant:
 * :class:`ExpertParallelSparseMoeBlock` — each rank owns a contiguous
   block of whole experts instead of a slice of every expert.
 
+Expert-parallel variant:
+
+* :class:`ExpertParallelSparseMoeBlock` — each rank owns a contiguous
+  block of whole experts instead of a slice of every expert.
+
 When triton is installed and inputs are on CUDA, dispatch goes through
 the Triton fused-MoE kernel in :mod:`mstar.utils.fused_moe`; otherwise it
 falls back to the naive per-expert loop in :func:`dispatch_experts_fused`.
@@ -75,7 +80,7 @@ logger = logging.getLogger(__name__)
 
 # Optional fused Triton MoE path. Imports succeed wherever triton is
 # installed; the alignment op JIT-builds a vendored CUDA kernel on first use
-# (or falls back to a torch impl), so no sgl-kernel/vllm dep is needed. The
+# (or falls back to a torch impl), so no extra kernel package is needed. The
 # actual kernels only run on CUDA -- guarded by the ``is_cuda`` check below.
 try:
     from mstar.utils.fused_moe import fused_experts as _fused_experts
@@ -722,13 +727,9 @@ class ExpertParallelSparseMoeBlock(nn.Module):
     The signature matches :class:`ParallelSparseMoeBlock`. When
     ``world_size == 1`` the forward is identical to :class:`SparseMoeBlock`.
 
-    Two debug knobs, both off by default and both CUDA-graph safe:
-
-    * ``debug_check_routing``: all-gather ``selected_experts`` and
-      device-assert every rank picked the same experts. Temporary; costs one
-      extra collective per layer.
-    * ``track_expert_load``: accumulate per-expert slot counts in the
-      ``expert_load`` buffer; read and reset it with :meth:`pop_expert_load`.
+    ``track_expert_load`` (off by default, CUDA-graph safe) accumulates
+    per-expert slot counts in the ``expert_load`` buffer; read and reset it
+    with :meth:`pop_expert_load`.
     """
 
     def __init__(
@@ -740,7 +741,6 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         norm_topk_prob: bool = True,
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
-        debug_check_routing: bool = False,
         track_expert_load: bool = False,
     ) -> None:
         super().__init__()
@@ -754,7 +754,6 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         self.moe_intermediate_size = moe_intermediate_size
         self.num_local_experts = divide(num_experts, comm_group.world_size)
         self.expert_start = comm_group.rank * self.num_local_experts
-        self.debug_check_routing = debug_check_routing
         self.track_expert_load = track_expert_load
         if track_expert_load:
             # Routing is replicated, so every rank counts every expert.
@@ -807,14 +806,6 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         self.expert_load.zero_()
         return counts
 
-    def _check_routing_agrees(self, selected_experts: torch.Tensor) -> None:
-        gathered = self.comm_group.all_gather(selected_experts.contiguous(), dim=0)
-        gathered = gathered.view(self.comm_group.world_size, *selected_experts.shape)
-        torch._assert_async(
-            (gathered == selected_experts).all(),
-            "EP routing disagrees across ranks: top-k expert ids differ",
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -836,8 +827,6 @@ class ExpertParallelSparseMoeBlock(nn.Module):
             else:
                 ones = token_valid[:, None].expand_as(selected_experts).flatten().to(torch.int64)
             self.expert_load.index_add_(0, ids, ones)
-        if self.debug_check_routing and self.comm_group.world_size > 1:
-            self._check_routing_agrees(selected_experts)
 
         if self.comm_group.world_size == 1:
             skip = token_valid is not None

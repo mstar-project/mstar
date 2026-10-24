@@ -5,6 +5,7 @@ aren't installed."""
 
 import asyncio
 import base64
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -243,7 +244,7 @@ def test_realtime_full_turn(tmp_path):
     server = _FakeRealtimeServer([
         _chunk("text", b"hello"),
         _chunk("audio", b"\x01\x02\x03\x04"),
-        _chunk("text", b"<|im_end|>"),  # bare end token: stripped, no delta
+        _chunk("text", b""),  # the end token decodes to nothing: no delta
     ], tmp_path)
     out = _run_connection(server, [
         {"type": "session.update", "session": {
@@ -280,6 +281,61 @@ def test_realtime_full_turn(tmp_path):
     wav = Path(sub["file_paths"]["audio"][0]).read_bytes()
     assert wav[:4] == b"RIFF" and PCM in wav
     assert server.aborted  # release runs even on clean completion
+
+
+def _committed_pcm(server) -> list[bytes]:
+    out = []
+    for sub in server.submitted:
+        with wave.open(sub["file_paths"]["audio"][0], "rb") as wf:
+            out.append(wf.readframes(wf.getnframes()))
+    return out
+
+
+def _append(raw: bytes) -> dict:
+    return {"type": "input_audio_buffer.append", "audio": base64.b64encode(raw).decode("ascii")}
+
+
+def test_realtime_joins_samples_split_across_appends(tmp_path):
+    """Odd-length appends (a byte stream forwarded as it is read) are joined,
+    not dropped; a commit takes whole samples and the byte of a sample split
+    across it starts the next turn."""
+    server = _FakeRealtimeServer([_chunk("text", b"ok")], tmp_path)
+    tone = (np.sin(np.arange(4800) * 0.05) * 8000).astype("<i2").tobytes()
+    first, second = tone[:4800], tone[4800:]
+    events = [{"type": "session.update", "session": {"type": "realtime", "model": "q3o"}}]
+    events += [_append(first[:-1][i:i + 1001]) for i in range(0, len(first) - 1, 1001)]
+    events += [_append(first[-1:] + second[:1]), {"type": "input_audio_buffer.commit"}]
+    events += [_append(second[1:]), {"type": "input_audio_buffer.commit"}]
+    out = _run_connection(server, events)
+    assert [e["type"] for e in out].count("input_audio_buffer.committed") == 2
+    assert "error" not in [e["type"] for e in out]
+    assert _committed_pcm(server) == [first, second]
+
+
+@pytest.mark.parametrize("audio", ["%%%", None])
+def test_realtime_malformed_append_is_a_client_error(tmp_path, audio):
+    server = _FakeRealtimeServer([_chunk("text", b"ok")], tmp_path)
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {"type": "realtime", "model": "q3o"}},
+        {"type": "input_audio_buffer.append", "audio": audio},
+        _append(PCM),
+        {"type": "input_audio_buffer.commit"},
+    ])
+    assert out[1]["type"] == "error" and out[1]["error"]["code"] == "invalid_audio"
+    assert _committed_pcm(server) == [PCM]
+
+
+def test_realtime_line_wrapped_base64_is_accepted(tmp_path):
+    """``base64.encodebytes`` wraps lines every 76 characters, as main accepted."""
+    server = _FakeRealtimeServer([_chunk("text", b"ok")], tmp_path)
+    tone = (np.sin(np.arange(1600) * 0.05) * 8000).astype("<i2").tobytes()
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {"type": "realtime", "model": "q3o"}},
+        {"type": "input_audio_buffer.append", "audio": base64.encodebytes(tone).decode("ascii")},
+        {"type": "input_audio_buffer.commit"},
+    ])
+    assert "error" not in [e["type"] for e in out]
+    assert _committed_pcm(server) == [tone]
 
 
 def test_realtime_empty_commit_errors(tmp_path):
@@ -329,9 +385,9 @@ def test_realtime_bad_input_is_survivable(tmp_path):
             "type": "realtime", "model": "q3o",
             "audio": {"input": {"format": {"type": "audio/pcmu"}}},
         }},
-        # Odd-length payload: dropped, so the buffer stays empty.
+        # Half a sample: nothing whole to commit yet.
         {"type": "input_audio_buffer.append",
-         "audio": base64.b64encode(b"\x00\x10\x20").decode("ascii")},
+         "audio": base64.b64encode(b"\x00").decode("ascii")},
         {"type": "input_audio_buffer.commit"},
     ])
     types = [e["type"] for e in out]
@@ -435,6 +491,61 @@ def test_chat_forces_text_only_output(tmp_path):
     assert out[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+def test_chat_reaches_the_server_with_its_prompt_parts(tmp_path):
+    """Without them the model plans from the layout alone: one user turn."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+
+    async def run():
+        return [out async for out in bridge.generate({"messages": [
+            {"role": "user", "content": "Name a color."},
+            {"role": "assistant", "content": "Blue."},
+            {"role": "user", "content": "Another."},
+        ]}, _Ctx())]
+
+    asyncio.run(run())
+    parts = server.submitted[0].get("prompt_parts") or []
+    assert [(p.role, p.text) for p in parts] == [
+        ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another."),
+    ], "the bridge dropped the prompt parts, so the chat reaches the model as one user turn"
+
+
+def _chat_through_bridge(server, fields):
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+
+    async def run():
+        return [out async for out in bridge.generate({
+            "messages": [{"role": "user", "content": "Weather in Paris?"}], **fields,
+        }, _Ctx())]
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("fields", [
+    {"tools": [{"type": "function", "function": {"name": "get_weather"}}]},
+    {"tool_choice": "required"},
+    {"tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
+], ids=["tools", "required", "named"])
+def test_a_chat_that_asks_for_a_tool_call_is_a_400_with_the_adapters_message(tmp_path, fields):
+    """Stripped before the adapter, the fields left a chat that ran and answered in plain text.
+
+    Dynamo's worker sends the client the ``code`` and ``message`` it finds on the exception.
+    """
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    with pytest.raises(ValueError) as refused:
+        _chat_through_bridge(server, fields)
+    assert (refused.value.code, refused.value.message) == (400, "tool calling is not supported for this model"), (
+        "the client gets a 400 without the adapter's own message"
+    )
+    assert not server.submitted, "the chat reached the model, which answers in plain text"
+
+
+def test_the_tool_fields_clients_send_by_default_reach_the_model(tmp_path):
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    _chat_through_bridge(server, {"tools": [], "tool_choice": "auto"})
+    assert server.submitted, "a client's default tool fields refused a plain chat"
+
+
 def test_images_cancel_before_first_chunk(tmp_path):
     # Media requests emit nothing until nearly done; a client that goes
     # away mid-generation must still cancel promptly.
@@ -470,6 +581,17 @@ def test_images_n_follows_native_seed_contract(tmp_path):
         {"prompt": "a cat", "model": "bagel", "n": 2}, _Ctx()))
     assert [s["model_kwargs"].get("seed") for s in server.submitted] == [None, None]
     assert len(unseeded["data"]) == 2
+
+
+@pytest.mark.parametrize("n", [0, -1, 11])
+def test_images_n_outside_one_to_the_cap_is_400_before_submit(tmp_path, monkeypatch, n):
+    monkeypatch.delenv("MSTAR_MAX_IMAGES_PER_REQUEST", raising=False)
+    server = _FakeRealtimeServer([_chunk("image", b"png-bytes")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["bagel"], "bagel")
+    with pytest.raises(ValueError) as refused:
+        asyncio.run(bridge._images({"prompt": "a cat", "model": "bagel", "n": n}, _Ctx()))
+    assert (refused.value.code, refused.value.message) == (400, f"n must be between 1 and 10, got {n}")
+    assert not server.submitted
 
 
 def test_images_edit_carries_declared_seed(tmp_path):
@@ -858,3 +980,39 @@ def test_vjepa2_misaligned_latent_bytes(tmp_path):
     with pytest.raises(ValueError, match="multiple of 1408"):
         _run_vjepa2(server, _vjepa2_request())
     assert server.aborted
+
+
+def test_realtime_refuses_server_turn_detection(tmp_path):
+    """The bridge has no turn detection: a session asking for it gets an
+    error and an echo with turn_detection null, not a silent no-op."""
+    server = _FakeRealtimeServer([_chunk("text", b"ok")], tmp_path)
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {"type": "realtime", "model": "q3o", "audio": {"input": {
+            "format": {"type": "audio/pcm", "rate": 24000},
+            "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}}}}},
+        _append(PCM),
+        {"type": "input_audio_buffer.commit"},
+    ])
+    assert [e["type"] for e in out][:2] == ["error", "session.updated"]
+    assert out[0]["error"]["code"] == "unsupported_turn_detection"
+    echoed = out[1]["session"]["audio"]["input"]
+    assert echoed["turn_detection"] is None and echoed["format"]["rate"] == 24000
+    assert "input_audio_buffer.committed" in [e["type"] for e in out]
+
+
+@pytest.mark.parametrize("fmt", [{"type": "audio/pcm", "rate": 16000}, {"type": "audio/pcmu"}])
+def test_realtime_refused_format_is_not_applied(tmp_path, fmt):
+    """A refused input format leaves the audio read as before: the echo says
+    24 kHz PCM, and the committed WAV is 24 kHz, not the rate just refused."""
+    server = _FakeRealtimeServer([_chunk("text", b"ok")], tmp_path)
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {"type": "realtime", "model": "q3o",
+                                               "audio": {"input": {"format": fmt}}}},
+        _append(PCM),
+        {"type": "input_audio_buffer.commit"},
+    ])
+    assert [e["type"] for e in out][:2] == ["error", "session.updated"]
+    assert out[0]["error"]["code"] == "unsupported_audio_format"
+    assert out[1]["session"]["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    with wave.open(server.submitted[0]["file_paths"]["audio"][0], "rb") as wf:
+        assert wf.getframerate() == 24000 and wf.readframes(wf.getnframes()) == PCM

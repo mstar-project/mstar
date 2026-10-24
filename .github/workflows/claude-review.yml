@@ -1,0 +1,678 @@
+name: Claude Review
+
+# Advisory LLM review of PRs. Not a merge gate. Rules live in AGENTS.md;
+# the reviewer's operating instructions are in .github/review/review-prompt.md.
+#
+# Why pull_request_target: a plain `pull_request` trigger withholds secrets from
+# fork PRs, so the reviewer could never review a fork's code. pull_request_target
+# runs with secrets, and uses
+# the workflow file from the PR's *base branch*, never the PR's version. For a PR
+# into main that is main's; for a stacked PR it is the base branch's copy, which
+# may be old or missing (then use /review, which always runs main's).
+#
+# The safety rules that come with that, and that must hold for any edit here:
+#
+#   1. Never check out the PR at the repository root, and never build, install
+#      or execute anything from it. The PR's tree goes in pr-head/ and is read
+#      only. There is no setup-python, no pip, no cargo, no make.
+#   2. persist-credentials: false on both checkouts, so no token is written into
+#      a working tree the PR controls.
+#   3. Rules are read from main's checkout at the root. The prompt tells the
+#      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
+#      cannot rewrite the rules it is judged by.
+#   4. The job's token can write only to pull requests, and the review app's
+#      token (below) only to pull requests and issues of this repository. The
+#      model has no shell and no mutation tools: it posts inline comments
+#      through the action's tool (which redacts secrets) and returns the summary
+#      as fields, which a workflow step renders, redacts and posts. The worst
+#      case for a prompt injection is a bad comment.
+#   5. Third-party actions are pinned to a commit SHA, since they run with the
+#      API key. Bump them deliberately.
+
+# When it runs, and who can cause it:
+#   - light, once, when a contributor's non-draft PR is opened, reopened or
+#     readied. "Contributor" is the PR author's author_association: OWNER,
+#     MEMBER, COLLABORATOR or CONTRIBUTOR, i.e. the team plus anyone who has had
+#     a PR merged here, from a fork or not. First-time contributors and
+#     strangers get no automatic review (cost, spam).
+#   - light, when someone with write access comments `/review` on a PR
+#     (re-review after pushes), or when a contributor comments `/review` on
+#     their own PR, unless it has the `skip-ai-review` label;
+#   - thorough, when someone with write access comments `/review thorough` or
+#     applies the `ai-review-thorough` label.
+# Write access (write, maintain or admin) is checked against the user's actual
+# permission in the preflight; author_association can't tell write from read.
+# The PR can be from anyone, so a maintainer can /review a first-timer's PR.
+# Pushes don't trigger a review on their own; comment /review for that.
+#
+# The action refuses to run for an actor without write access unless that
+# actor is listed in allowed_non_write_users. Most contributors' PRs come from
+# forks without write access, so the preflight lists exactly one login there,
+# and only when the actor is the PR's author, is a contributor, and the run is
+# the automatic review or their own light `/review`. Never '*'. Such a run
+# reads the same untrusted PR content as a maintainer's /review of that PR,
+# with the same tools and token; only who can start it changes.
+#
+# issue_comment also runs with secrets and the default branch's workflow file,
+# so the same rules hold. The comment body is only matched by the `if` below,
+# never passed to a shell.
+#
+# Failures never turn the PR's check red: every step after the preflight is
+# continue-on-error and gated on the one before it, and if the review didn't
+# complete, the last step says so in a PR comment with a link to the log.
+#
+# Failing gracefully: a review that finished but went past --max-turns (the
+# action then reports a failure) still has its summary in the action's
+# execution file, and that summary is posted. A review that stopped before it
+# finished gets a "didn't complete" comment with what it had so far (the inline
+# comments it made, which the action posts even when the run fails, and its
+# latest notes), and its Claude Code session is saved as an artifact for 7
+# days. `/review continue` resumes that session with a fresh turn budget
+# instead of starting over. Only artifacts made by this workflow on
+# issue_comment or pull_request_target are trusted, since a fork's own
+# `pull_request` workflow can upload an artifact with any name.
+
+on:
+  pull_request_target:
+    # `labeled` is for on-demand thorough reviews; other labels are filtered out below.
+    types: [opened, reopened, ready_for_review, labeled]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  review:
+    name: Review
+    # No repository pin: a fork with no ANTHROPIC_API_KEY exits green at the
+    # preflight below, which is the same protection and visible in the log
+    # rather than a silently skipped job. It also means a fork that *does* set
+    # the key gets reviews, which is how you test changes to this workflow.
+    #
+    # For /review and the label this only filters cheaply; the preflight's
+    # permission check decides.
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+       !github.event.pull_request.draft &&
+       !contains(github.event.pull_request.labels.*.name, 'skip-ai-review') &&
+       ((github.event.action == 'labeled' && github.event.label.name == 'ai-review-thorough') ||
+        (github.event.action != 'labeled' &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association))))
+      ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       (((github.event.comment.body == '/review' || github.event.comment.body == '/review thorough' ||
+          github.event.comment.body == '/review continue') &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+        ((github.event.comment.body == '/review' || github.event.comment.body == '/review continue') &&
+         github.event.comment.user.login == github.event.issue.user.login &&
+         !contains(github.event.issue.labels.*.name, 'skip-ai-review') &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.comment.author_association))))
+    # Job-level, so an unrelated PR comment (which still starts a workflow run
+    # that this `if` skips) can never cancel a review in progress.
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      # actions: read lists and downloads the saved session for /review continue.
+      actions: read
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+      # Credential-shaped strings, removed (sed -E "$REDACT") from everything
+      # the workflow posts or saves.
+      REDACT: |
+        s/sk-ant-[A-Za-z0-9_-]+/[REDACTED]/g
+        s/(gh[opsur]_|github_pat_)[A-Za-z0-9_]{20,}/[REDACTED]/g
+        s/AKIA[0-9A-Z]{16}/[REDACTED]/g
+        s/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/[REDACTED]/g
+    steps:
+      # Secrets can't be tested in a job-level `if`, so short-circuit here
+      # instead. Lets this land before ANTHROPIC_API_KEY exists without
+      # failing a check on every PR. Then the actor needs write access, or must
+      # be the PR's author, a contributor, on the automatic review or a light
+      # `/review` (see the header). Anyone else exits green with a notice.
+      # non_write_user is set only for that author, and only when they lack
+      # write access, so a maintainer's run is unchanged.
+      - name: Preflight
+        id: pre
+        env:
+          KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          ACTOR: ${{ github.actor }}
+          AUTHOR: ${{ github.event.pull_request.user.login || github.event.issue.user.login }}
+          # The PR author's association on the automatic run; the commenter's on
+          # /review, where SELF_SERVE also requires commenter == author.
+          ASSOC: ${{ github.event.comment.author_association || github.event.pull_request.author_association }}
+          SELF_SERVE: >-
+            ${{ (github.event_name == 'pull_request_target' && github.event.action != 'labeled') ||
+                (github.event_name == 'issue_comment' &&
+                 (github.event.comment.body == '/review' || github.event.comment.body == '/review continue') &&
+                 !contains(github.event.issue.labels.*.name, 'skip-ai-review')) }}
+        run: |
+          if [ "$KEY_SET" != "true" ]; then
+            echo "::warning::ANTHROPIC_API_KEY is not set; skipping the review."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2> /dev/null || echo none)
+          case "$perm" in
+            admin|maintain|write)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+          esac
+          case "$ASSOC" in
+            OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR) contributor=true ;;
+            *) contributor=false ;;
+          esac
+          if [ "$SELF_SERVE" = "true" ] && [ "$contributor" = "true" ] && [ -n "$ACTOR" ] && [ "$ACTOR" = "$AUTHOR" ]; then
+            echo "::notice::$ACTOR has '$perm' access; reviewing their own PR as its author ($ASSOC)."
+            {
+              echo "run=true"
+              echo "non_write_user=$ACTOR"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$ACTOR has '$perm' access, not write; only people with write access, or a contributor on their own PR, can request a review."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The bot posts as the mstar-review GitHub App, with the M* logo, rather
+      # than as github-actions. Until the app's client ID and key are set
+      # (README), the steps below post with the job's own token instead.
+      - name: Mint the review app's token
+        if: steps.pre.outputs.run == 'true' && vars.REVIEW_APP_CLIENT_ID != ''
+        id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          # Reacting to a conversation comment needs issues: write.
+          permission-issues: write
+          permission-pull-requests: write
+
+      # Tell the commenter their /review was picked up; a comment-triggered run
+      # is otherwise invisible from the PR.
+      - name: Acknowledge the /review comment
+        if: steps.pre.outputs.run == 'true' && github.event_name == 'issue_comment'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null
+
+      # The PR's refs and title, the same way for both triggers (an
+      # issue_comment event doesn't carry the PR's head or base). The title is
+      # untrusted; it only ever reaches the prompt.
+      - name: Resolve the PR
+        if: steps.pre.outputs.run == 'true'
+        id: pr
+        continue-on-error: true
+        env:
+          THOROUGH: ${{ (github.event.action == 'labeled' || github.event.comment.body == '/review thorough') && 'true' || 'false' }}
+          CONTINUE: ${{ github.event.comment.body == '/review continue' && 'true' || 'false' }}
+        run: |
+          gh api "repos/$REPO/pulls/$PR" > pr.json
+          if [ -z "$(jq -r '.head.repo.full_name // empty' pr.json)" ]; then
+            echo "::warning::The PR's head repository no longer exists; can't check it out."
+            echo "why=its head repository (the fork) no longer exists" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          {
+            echo "continue=$CONTINUE"
+            echo "head_sha=$(jq -r .head.sha pr.json)"
+            echo "head_repo=$(jq -r .head.repo.full_name pr.json)"
+            # Mode sets the prompt's reporting bar and the reasoning effort.
+            # Without --effort, Claude Code uses its default for Opus (medium).
+            if [ "$THOROUGH" = "true" ]; then
+              echo "mode=thorough"; echo "effort=xhigh"; echo "timeout=45"
+            else
+              echo "mode=light"; echo "effort=high"; echo "timeout=25"
+            fi
+            delim="TITLE_$(openssl rand -hex 8)"
+            echo "title<<$delim"; jq -r .title pr.json; echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+      # /review continue: fetch the session a stopped review saved (see "Save the
+      # session" below) and put it back where Claude Code looks for it. The
+      # newest unexpired artifact for this PR wins, and only from this workflow
+      # on a trigger that runs the base repository's copy of it. The session's
+      # mode is kept; a thorough one needs write access to continue, like
+      # `/review thorough`. Values from meta.json are checked before use. A
+      # stopped review is resumable only while its "didn't complete" comment is
+      # still open: any later run that finishes rewrites that comment as
+      # resolved, so a session it superseded is never resumed.
+      - name: Restore the stopped review
+        if: steps.pr.outcome == 'success' && steps.pr.outputs.continue == 'true'
+        id: prev
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          NON_WRITE: ${{ steps.pre.outputs.non_write_user }}
+        run: |
+          name="claude-review-session-$PR"
+          fail() { echo "why=$1" >> "$GITHUB_OUTPUT"; echo "::notice::$1"; exit 1; }
+          open_ids=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
+              select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
+                (.body | startswith("<!-- claude-review-incomplete -->"))) | .id') \
+            || fail "the PR's comments couldn't be read; try \`/review continue\` again"
+          [ -n "$open_ids" ] || fail "there is no stopped review of this PR to continue: none stopped part-way, or a later run already finished (sessions are kept for 7 days); comment \`/review\` for a new one"
+          found=""
+          for run_id in $(gh api "repos/$REPO/actions/artifacts?name=$name&per_page=30" --jq '
+              [.artifacts[] | select(.expired | not)] | sort_by(.created_at) | reverse | .[].workflow_run.id'); do
+            read -r path event < <(gh api "repos/$REPO/actions/runs/$run_id" --jq '"\(.path) \(.event)"') || continue
+            case "$path:$event" in
+              .github/workflows/claude-review.yml*:issue_comment|.github/workflows/claude-review.yml*:pull_request_target)
+                found=$run_id; break ;;
+            esac
+          done
+          [ -n "$found" ] || fail "there is no stopped review of this PR to continue (sessions are kept for 7 days); comment \`/review\` for a new one"
+          gh run download "$found" --repo "$REPO" -n "$name" -D "$RUNNER_TEMP/prev" \
+            || fail "the saved session couldn't be downloaded; try \`/review continue\` again"
+          meta="$RUNNER_TEMP/prev/meta.json"
+          sid=$(jq -r '.session_id // empty' "$meta")
+          mode=$(jq -r '.mode // empty' "$meta")
+          [[ "$sid" =~ ^[0-9a-f-]{36}$ ]] || fail "the saved session is malformed"
+          [ "$(jq -r '.pr' "$meta")" = "$PR" ] || fail "the saved session is for another PR"
+          [ "$(jq -r '.head_sha' "$meta")" = "$HEAD_SHA" ] \
+            || fail "the PR has new commits since that review stopped; comment \`/review\` for a review of the current head"
+          case "$mode" in
+            light) effort=high; timeout=25 ;;
+            thorough)
+              [ -z "$NON_WRITE" ] || fail "continuing a thorough review takes write access, like \`/review thorough\`"
+              effort=xhigh; timeout=45 ;;
+            *) fail "the saved session is malformed" ;;
+          esac
+          mkdir -p "$HOME/.claude/projects"
+          cp -R "$RUNNER_TEMP/prev/projects/." "$HOME/.claude/projects/"
+          {
+            echo "session_id=$sid"
+            echo "mode=$mode"; echo "effort=$effort"; echo "timeout=$timeout"
+          } >> "$GITHUB_OUTPUT"
+
+      # Trusted: main's tip, pinned by name. Without a `ref`, pull_request_target
+      # would check out the PR's base branch, which for a stacked PR is another
+      # feature branch, and the PR's base.sha is where main was when the PR was
+      # opened. Either way the PR would be judged by stale rules.
+      # AGENTS.md and the review prompt come from here.
+      - name: Check out main
+        if: steps.pr.outcome == 'success' && steps.prev.outcome != 'failure'
+        id: base
+        continue-on-error: true
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # Untrusted: the PR's tree, for reading changed files in full context.
+      # Never executed.
+      - name: Check out the PR into pr-head/
+        if: steps.base.outcome == 'success'
+        id: head
+        continue-on-error: true
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ steps.pr.outputs.head_repo }}
+          ref: ${{ steps.pr.outputs.head_sha }}
+          path: pr-head
+          persist-credentials: false
+          # actions/checkout refuses a fork's code under pull_request_target
+          # unless told otherwise (a July 2026 change, backported to v4). Safe
+          # here because of rule 1 above: pr-head/ is only read, never built or
+          # executed, and holds no credentials.
+          allow-unsafe-pr-checkout: true
+
+      # The body and all comments are untrusted; the prompt says so.
+      - name: Collect the diff, description and existing comments
+        if: steps.head.outcome == 'success'
+        id: diff
+        continue-on-error: true
+        run: |
+          # GitHub refuses `gh pr diff` past 20,000 lines or 300 files. Fall back
+          # to the files API (up to 3,000 files; it omits the patch of a file
+          # that is too large on its own).
+          if ! gh pr diff "$PR" --repo "$REPO" > pr.diff 2> diff.err; then
+            echo "::warning::gh pr diff failed ($(head -c 300 diff.err)); building pr.diff from the files API."
+            gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] |
+              (.previous_filename // .filename) as $old |
+              "diff --git a/\($old) b/\(.filename)\n--- a/\($old)\n+++ b/\(.filename)\n\(.patch // "(no patch from GitHub: binary, or too large to show)")"' > pr.diff
+          fi
+          gh pr view "$PR" --repo "$REPO" --json body --jq .body > pr-body.md
+
+          # Inline review comments, each marked with its thread's resolved and
+          # outdated state (only GraphQL has those).
+          gh api --paginate "repos/$REPO/pulls/$PR/comments" \
+            --jq '.[] | {id, user: .user.login, path, line, side, in_reply_to_id, body}' | jq -s . > review-comments.json
+          gh api graphql --paginate -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
+            query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+              repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
+                reviewThreads(first: 100, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId } } }
+                } } } }' \
+            --jq '.data.repository.pullRequest.reviewThreads.nodes[] |
+              {id: .comments.nodes[0].databaseId, resolved: .isResolved, outdated: .isOutdated}' | jq -s . > threads.json
+          jq --slurpfile t threads.json '
+            ($t[0] | map({key: (.id | tostring), value: {resolved, outdated}}) | from_entries) as $m
+            | map(. + ($m[(.in_reply_to_id // .id) | tostring] // {}))' review-comments.json > pr-comments.json
+
+          # The conversation tab: replies to the summary, and the author's answers.
+          gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | {id, user: .user.login, created_at, body}' | jq -s . > pr-conversation.json
+
+          echo "lines=$(wc -l < pr.diff)" >> "$GITHUB_OUTPUT"
+          # The summary's fields, from main, for --json-schema. Assigned first so
+          # a failure ends the step rather than passing an empty schema.
+          schema=$(python3 .github/review/render_summary.py --schema)
+          echo "schema=$schema" >> "$GITHUB_OUTPUT"
+
+      - name: Review
+        if: steps.diff.outcome == 'success'
+        id: review
+        # Advisory: an API or action failure (bad key, outage, out of turns,
+        # timeout) never turns the PR's check red; the last step reports it.
+        continue-on-error: true
+        timeout-minutes: ${{ fromJSON(steps.prev.outputs.timeout || steps.pr.outputs.timeout || '25') }}
+        uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The review app's token, or the job's own. Without a token the action
+          # tries to mint a Claude GitHub App token over OIDC, which needs
+          # `id-token: write` and that app installed, and fails before reviewing.
+          github_token: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          # Empty for anyone with write access. Otherwise the PR author alone,
+          # set by the preflight; the action then also scrubs secrets from any
+          # subprocess environment.
+          allowed_non_write_users: ${{ steps.pre.outputs.non_write_user }}
+          prompt: |
+            Read .github/review/review-prompt.md from the repository root and follow it
+            exactly. It defines your trust boundary, your method, your reporting bar and
+            your output format.
+
+            Mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+            PR #${{ env.PR }}: ${{ steps.pr.outputs.title }}
+            Head commit (pass as commit_id on every inline comment): ${{ steps.pr.outputs.head_sha }}
+            pr.diff is ${{ steps.diff.outputs.lines }} lines.
+            ${{ steps.prev.outputs.session_id && 'This run continues your review of this PR from the conversation above, which stopped before it finished. Pick up where you stopped, post only inline comments you have not posted already, and return the summary.' || '' }}
+          # No shell, no edits, no network. The only write tool is the inline-
+          # comment tool, which the action loads only when it is listed here and
+          # which redacts secrets. The summary comes back as structured output.
+          # The CLAUDE_REVIEW_MAX_TURNS repository variable overrides the 40-turn
+          # cap (a cost lever; set it low to exercise the out-of-turns path).
+          claude_args: |
+            --model claude-opus-5-5
+            --effort ${{ steps.prev.outputs.effort || steps.pr.outputs.effort }}
+            --max-turns ${{ vars.CLAUDE_REVIEW_MAX_TURNS || '40' }}
+            ${{ steps.prev.outputs.session_id && format('--resume {0}', steps.prev.outputs.session_id) || '' }}
+            --allowedTools "mcp__github_inline_comment__create_inline_comment"
+            --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch
+            --json-schema '${{ steps.diff.outputs.schema }}'
+
+      # The action fails a run that went past --max-turns even when Claude
+      # finished and returned its summary, and on a real failure it still
+      # writes everything Claude said to its execution file. Read the result
+      # from there: post a finished summary anyway, or say why it stopped and
+      # keep what it had so far (partial.md) for the "didn't complete" comment.
+      - name: Read what a failed review left
+        if: steps.review.outcome == 'failure'
+        id: salvage
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          f="$RUNNER_TEMP/claude-execution-output.json"
+          if [ ! -s "$f" ]; then
+            echo "why=it stopped before Claude Code returned (a timeout or a setup error)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Out of API credit: an automatic review skips with a warning in the
+          # log, rather than leave a "didn't complete" comment on every PR until
+          # it's topped up. A /review someone asked for gets a one-line answer.
+          if jq -e 'any(.[]; .type == "assistant" and (.error == "billing_error" or
+                ([.message.content[]? | select(.type == "text") | .text] | join("") | startswith("Credit balance is too low"))))' \
+              "$f" > /dev/null; then
+            echo "::warning::The Anthropic API account is out of credit; skipping the review."
+            echo "billing=true" >> "$GITHUB_OUTPUT"
+            if [ "$EVENT" = "issue_comment" ]; then
+              gh pr comment "$PR" --repo "$REPO" \
+                --body "The review didn't run: the API account for the review bot is out of credit." > /dev/null
+            fi
+            exit 0
+          fi
+          res=$(jq -c '[.[] | select(.type == "result")] | last // {}' "$f")
+          turns=$(jq -r '.num_turns // "?"' <<< "$res")
+          subtype=$(jq -r '.subtype // empty' <<< "$res")
+          output=$(jq -c 'select(.subtype == "success" and (.is_error | not) and (.structured_output | type == "object"))
+            | .structured_output' <<< "$res")
+          if [ -z "$output" ]; then
+            jq -r '[.[] | select(.type == "assistant") | .message.content[]?
+                | select(.type == "tool_use" and (.name | endswith("create_inline_comment"))) | .input]
+              | select(length > 0)
+              | "**Inline comments it made (\(length)):**\n"
+                + (map("- `\(.path):\(.line // .startLine)` \(.body | split("\n")[0] | .[0:160])") | join("\n"))' "$f" > partial.md
+            jq -r '[.[] | select(.type == "assistant")
+                | [.message.content[]? | select(.type == "text") | .text] | join("\n") | select(. != "")] | last // empty' "$f" \
+              | tail -c 3000 > notes.txt
+            if [ -s notes.txt ]; then
+              { printf '\n**Its latest notes:**\n\n'; sed 's/^/> /' notes.txt; } >> partial.md
+            fi
+            sed -E "$REDACT" partial.md > partial.tmp && mv partial.tmp partial.md
+          fi
+          {
+            echo "detail=$turns turns"
+            if [ -n "$output" ]; then
+              delim="OUT_$(openssl rand -hex 8)"
+              echo "structured_output<<$delim"; printf '%s\n' "$output"; echo "$delim"
+            else
+              case "$subtype" in
+                error_max_turns) echo "why=it ran out of turns" ;;
+                error_during_execution) echo "why=Claude Code stopped on an error" ;;
+                success) echo "why=it finished without returning a summary" ;;
+                *) echo "why=Claude Code ended without a result" ;;
+              esac
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      # The summary is model output from untrusted input. It reaches the shell
+      # only through an env var, is rendered by main's render_summary.py, and
+      # credential-shaped strings are redacted before it's posted. Each run
+      # posts its own summary comment, so a re-review doesn't overwrite the last
+      # one. A "didn't complete" comment left by an earlier run is then
+      # rewritten to point here, and loses its marker so a later failure starts
+      # a fresh one.
+      # Parsed by the script, not fromJSON(): a template error in `env` would
+      # fail the step outright, past continue-on-error.
+      - name: Post the summary
+        if: steps.review.outcome == 'success' || steps.salvage.outputs.structured_output != ''
+        id: post
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+          SALVAGED: ${{ steps.review.outcome != 'success' }}
+          DETAIL: ${{ steps.salvage.outputs.detail }}
+        run: |
+          # Read after the review posted its inline comments, so the status line
+          # counts them along with earlier ones still open.
+          gh api graphql --paginate --slurp -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
+            query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+              repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
+                reviewThreads(first: 100, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { isResolved isOutdated comments(first: 1) { nodes { author { login } body } } }
+                } } } }' > threads-now.json
+          printf '%s' "$OUTPUT" | python3 .github/review/render_summary.py --head "$HEAD_SHA" --mode "$MODE" \
+            --threads threads-now.json | sed -E "$REDACT" > summary.md
+          # A summary the script can't render leaves the file empty.
+          grep -q '[^[:space:]]' summary.md || { echo "::warning::The review returned no summary to render."; exit 1; }
+          if [ "$SALVAGED" = "true" ]; then
+            printf '\n<sub>This review finished but went past the workflow'"'"'s turn limit (%s), so the action reported it as failed.</sub>\n' "$DETAIL" >> summary.md
+          fi
+          url=$(gh pr comment "$PR" --repo "$REPO" --body-file summary.md)
+          echo "id=${url##*-}" >> "$GITHUB_OUTPUT"
+          for id in $(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
+              select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
+                (.body | startswith("<!-- claude-review-incomplete -->"))) | .id' 2> /dev/null); do
+            printf '<!-- claude-review-incomplete-resolved -->\nAn earlier review run didn'"'"'t complete; a later run finished: %s\n' "$url" > resolved.md
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@resolved.md > /dev/null || true
+          done
+
+      # Hide the earlier summaries as outdated, so the PR shows only the latest
+      # one and each earlier one stays a click away. Summaries from before the
+      # marker start with the heading instead. Only GraphQL says which comments
+      # are already hidden.
+      - name: Hide earlier summaries
+        if: steps.post.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          NEW_ID: ${{ steps.post.outputs.id }}
+        run: |
+          gh api graphql --paginate -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
+            query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+              repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
+                comments(first: 100, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { id databaseId isMinimized author { login } body }
+                } } } }' > comments.json
+          for node in $(jq -r --arg new "$NEW_ID" '.data.repository.pullRequest.comments.nodes[] |
+              select((.author.login == "mstar-review" or .author.login == "github-actions") and (.isMinimized | not) and (.databaseId | tostring) != $new and
+                ((.body | startswith("<!-- claude-review-summary -->")) or (.body | startswith("### Automated review"))))
+              | .id' comments.json); do
+            gh api graphql -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' \
+              -f id="$node" > /dev/null
+          done
+
+      # The PR's type/* labels, from the review's structured output. Model
+      # output, so each is checked against the fixed list before it reaches
+      # the API; type/* labels the review no longer returns are removed. Area
+      # and size labels come from pr-labels.yml.
+      - name: Set the type labels
+        if: steps.post.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
+        run: |
+          types=()
+          while IFS= read -r t; do
+            case "$t" in
+              new-model|bug|perf|feature|refactor|test|docs|ci) types+=("type/$t") ;;
+            esac
+          done < <(printf '%s' "$OUTPUT" | jq -r '.types // [] | .[] | strings')
+          if [ ${#types[@]} -eq 0 ]; then
+            echo "::warning::The review returned no valid type; leaving the type labels alone."
+            exit 0
+          fi
+          for old in $(gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name | select(startswith("type/"))'); do
+            [[ " ${types[*]} " == *" $old "* ]] || gh api -X DELETE "repos/$REPO/issues/$PR/labels/${old//\//%2F}" > /dev/null
+          done
+          for label in "${types[@]}"; do
+            gh api "repos/$REPO/labels/${label//\//%2F}" > /dev/null 2>&1 ||
+              gh api -X POST "repos/$REPO/labels" -f name="$label" -f color=fbca04 > /dev/null
+            gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$label" > /dev/null
+          done
+
+      # A review that stopped before it finished: keep its Claude Code session
+      # (the transcript Claude Code writes as it goes, so this works after a
+      # timeout too) for `/review continue`. The transcript holds the PR's own
+      # content and the model's notes on it; credential-shaped strings are
+      # redacted as for the summary. Artifacts are public on a public repo.
+      - name: Save the session for /review continue
+        if: >-
+          always() && steps.review.outcome == 'failure' &&
+          steps.salvage.outputs.structured_output == '' && steps.salvage.outputs.billing != 'true'
+        id: save
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+        run: |
+          dir="$HOME/.claude/projects"
+          # Sessions are $dir/<project>/<id>.jsonl; subagents' sit deeper, under <id>/.
+          newest=""
+          for f in "$dir"/*/*.jsonl; do
+            [ -f "$f" ] || continue
+            if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest=$f; fi
+          done
+          [ -n "$newest" ] || { echo "::notice::No Claude Code session on disk; nothing to save."; exit 1; }
+          sid=$(basename "$newest" .jsonl)
+          rel="${newest#"$dir"/}"
+          out="$RUNNER_TEMP/session"
+          # The session's transcript, and its subagents' beside it if any.
+          while IFS= read -r -d '' file; do
+            # (Project folders start with "-", e.g. -home-runner-work-mstar-mstar.)
+            dest="$out/projects/${file#"$dir"/}"
+            mkdir -p "${dest%/*}"
+            sed -E "$REDACT" < "$file" > "$dest"
+          done < <(find "$newest" "${newest%.jsonl}" -type f -print0 2> /dev/null)
+          jq -n --arg pr "$PR" --arg sha "$HEAD_SHA" --arg mode "$MODE" --arg sid "$sid" --arg rel "$rel" \
+            '{pr: $pr, head_sha: $sha, mode: $mode, session_id: $sid, transcript: $rel}' > "$out/meta.json"
+          echo "dir=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the session
+        if: always() && steps.save.outcome == 'success'
+        id: upload
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: claude-review-session-${{ env.PR }}
+          path: ${{ steps.save.outputs.dir }}
+          retention-days: 7
+          if-no-files-found: error
+
+      # Anything above failed: say so on the PR rather than leaving silence.
+      # A run the preflight skipped never gets here. Repeated failures update
+      # one comment, found by its marker, so retries don't stack up comments.
+      # A refused /review continue has a marker of its own, so it never writes
+      # over a stopped review's comment (its partial results, and that it can
+      # still be resumed by someone else).
+      - name: Report a review that didn't complete
+        if: >-
+          always() && steps.pre.outputs.run == 'true' && steps.salvage.outputs.billing != 'true' &&
+          (steps.pr.outcome == 'failure' || steps.prev.outcome == 'failure' ||
+           steps.base.outcome == 'failure' || steps.head.outcome == 'failure' ||
+           steps.diff.outcome == 'failure' || steps.post.outcome == 'failure' ||
+           (steps.review.outcome == 'failure' && steps.salvage.outputs.structured_output == ''))
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          WHY: ${{ steps.prev.outputs.why || steps.salvage.outputs.why || steps.pr.outputs.why || 'a step failed' }}
+          DETAIL: ${{ steps.salvage.outputs.detail }}
+          CAN_CONTINUE: ${{ steps.upload.outcome == 'success' }}
+          REFUSED: ${{ steps.prev.outcome == 'failure' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$REFUSED" = "true" ]; then
+            # /review continue that had nothing usable to resume; WHY says what to do.
+            marker='<!-- claude-review-continue-refused -->'
+            printf '%s\n`/review continue` didn'"'"'t run: %s. [Log](%s).\n' "$marker" "$WHY" "$RUN_URL" > failed.md
+          elif [ "$CAN_CONTINUE" = "true" ]; then
+            next='Comment `/review continue` to pick up where it stopped (kept for 7 days), or `/review` to start over.'
+          else
+            next='Comment `/review` to retry.'
+          fi
+          if [ "$REFUSED" != "true" ]; then
+            marker='<!-- claude-review-incomplete -->'
+            printf '<!-- claude-review-incomplete -->\nThe automated review didn'"'"'t complete: %s%s. [Log](%s). %s\n' \
+              "$WHY" "${DETAIL:+ ($DETAIL)}" "$RUN_URL" "$next" > failed.md
+          fi
+          if [ -s partial.md ]; then
+            printf '\nWhat it had so far:\n\n' >> failed.md
+            cat partial.md >> failed.md
+          fi
+          id=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq ".[] |
+            select((.user.login == \"mstar-review[bot]\" or .user.login == \"github-actions[bot]\") and (.body | startswith(\"$marker\"))) | .id" 2> /dev/null | tail -n 1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@failed.md > /dev/null
+          else
+            gh pr comment "$PR" --repo "$REPO" --body-file failed.md
+          fi

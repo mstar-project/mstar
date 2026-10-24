@@ -29,8 +29,6 @@ class MoeParallelConfig:
     parallel: str = "tp"
     # Comm group EP spans. Only "tp", the node group's TP ranks, exists today.
     ep_group: str = "tp"
-    # Temporary: device-assert every rank routes to the same experts.
-    debug_check_routing: bool = False
     # Log per-rank EP slot counts every N steps; 0 is off.
     log_expert_load_every: int = 0
     # Skip CUDA-graph padding rows in the routed experts; TP and EP alike.
@@ -43,10 +41,8 @@ class MoeParallelConfig:
             raise ValueError(f"ep_config.ep_group must be 'tp', got {self.ep_group!r}")
         if self.log_expert_load_every < 0:
             raise ValueError("ep_config.log_expert_load_every must be >= 0")
-        if self.parallel != "ep" and (self.debug_check_routing or self.log_expert_load_every):
-            raise ValueError(
-                "ep_config.debug_check_routing and log_expert_load_every need parallel: ep"
-            )
+        if self.parallel != "ep" and self.log_expert_load_every:
+            raise ValueError("ep_config.log_expert_load_every needs parallel: ep")
 
     @classmethod
     def from_yaml(cls, section: dict | None) -> "MoeParallelConfig":
@@ -96,7 +92,6 @@ def instantiate_moe_block(
         norm_topk_prob=norm_topk_prob,
         router=router,
         comm_group=ep_group,
-        debug_check_routing=moe_parallel.debug_check_routing,
         # Counts are identical on every rank, so only rank 0 keeps them.
         track_expert_load=(
             moe_parallel.log_expert_load_every > 0

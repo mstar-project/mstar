@@ -307,7 +307,7 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
         ar_schedule=schedule, ar_steps=4, ar_iters_per_window=5, ar_total_iters=15,
         ar_kv_mode=True, ar_rid="r", ar_tokens_per_unit=stride, ar_size=(64, 64),
         ar_generator=torch.Generator().manual_seed(0),
-        cond=cond0, uncond=uncond0, scheduler=SimpleNamespace(timesteps=torch.arange(4)),
+        cond=cond0, uncond=uncond0, scheduler=SimpleNamespace(timesteps=torch.arange(4), step_index=None),
         latent_shape=sub._window_latent_shape(64, 64, 4), gs=6.0, guidance_interval=None,
     )
     x0 = torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1, 1).expand(
@@ -477,9 +477,13 @@ def _tracing_vae():
 
 
 def _ar_decoder(monkeypatch):
+    """The AR decoder on its re-decode path, default layout (the tracing stub
+    has no causal decoder; test_windowed_decode.py covers the warm path)."""
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Config()
     cfg.windowed_decode_context_latents = 3
+    cfg.windowed_decode_warm_cache = False
+    cfg.vae_decode_channels_last = False
     sub = Cosmos3VAEDecoderARSubmodule(_tracing_vae(), cfg)
     sub._decode_dtype_cached = torch.float32
     return sub
@@ -533,7 +537,7 @@ def test_windowed_decoder_streams_chunks(monkeypatch) -> None:
 
 
 def test_windowed_stream_video_gen_params() -> None:
-    """stream_video resolves only alongside a windowed mode."""
+    """stream_video always runs windowed: chained unless a mode is named."""
     model = _windowed_model()
     p = model._resolve_gen_params(
         {"window_mode": "chained", "num_frames": 189, "stream_video": True}, [], ["video"],
@@ -541,8 +545,12 @@ def test_windowed_stream_video_gen_params() -> None:
     assert p["stream_video"] is True
     q = model._resolve_gen_params({"window_mode": "kv", "num_frames": 189}, [], ["video"])
     assert q["stream_video"] is False
-    with pytest.raises(ValueError):
-        model._resolve_gen_params({"num_frames": 189, "stream_video": True}, [], ["video"])
+    d = model._resolve_gen_params({"num_frames": 189, "stream_video": True}, [], ["video"])
+    assert d["window_mode"] == "chained" and d["stream_video"] is True
+    assert (d["window_latent_units"], d["overlap_latent_units"]) == (8, 2)
+    plain = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    with pytest.raises(ValueError, match="disabled"):
+        plain._resolve_gen_params({"num_frames": 189, "stream_video": True}, [], ["video"])
 
 
 def test_video_streaming_ndjson_lines() -> None:
@@ -708,7 +716,7 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
     assert torch.all(st["cond_video_latents"][:, :, :2] == 3.0)
     # "c" is pinned for this request until it stores its own last window
     assert sub._sessions.ids() == ["b", "c"] and sub._sessions.live("c") == "r"
-    st.add("scheduler", SimpleNamespace(timesteps=torch.arange(3)))
+    st.add("scheduler", SimpleNamespace(timesteps=torch.arange(3), step_index=None))
     ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"cond_latents": []})
     lat = ni.tensor_inputs["latents"]
     assert torch.all(lat[:, :, :2] == 3.0) and not torch.all(lat[:, :, 2:] == 3.0)

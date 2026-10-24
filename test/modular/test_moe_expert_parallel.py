@@ -305,31 +305,6 @@ def test_ep_expert_load_off_by_default():
     assert not hasattr(block, "expert_load")
 
 
-def test_ep_routing_check_passes_when_ranks_agree():
-    block = ExpertParallelSparseMoeBlock(
-        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(0, 4), debug_check_routing=True,
-    )
-    _load(block, _checkpoint())
-    with torch.no_grad():
-        block(torch.randn(6, HIDDEN))
-
-
-def test_ep_routing_check_catches_disagreement():
-    class _Disagreeing(_FakeCommGroup):
-        def all_gather(self, input_, dim=-1):
-            out = super().all_gather(input_, dim)
-            # The last peer picked a different expert for its first slot.
-            out[-input_.shape[0]] = (out[-input_.shape[0]] + 1) % NUM_EXPERTS
-            return out
-
-    block = ExpertParallelSparseMoeBlock(
-        HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_Disagreeing(0, 2), debug_check_routing=True,
-    )
-    _load(block, _checkpoint())
-    with torch.no_grad(), pytest.raises(RuntimeError, match="routing disagrees"):
-        block(torch.randn(3, HIDDEN))
-
-
 def _rank_blocks(cls, world_size, ckpt, router_w, device, dtype, **kwargs):
     blocks, bus = [], {}
     for rank in range(world_size):
