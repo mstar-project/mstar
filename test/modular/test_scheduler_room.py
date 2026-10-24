@@ -80,6 +80,9 @@ class _Engine:
     def get_max_rows_in_combined(self, node_name, graph_walk):
         return None
 
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        return None  # no chunking
+
     def splits_by_capture_key(self, node_name, graph_walk):
         return False
 

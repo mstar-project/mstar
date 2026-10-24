@@ -28,13 +28,14 @@ import mstar.communication.wire_types  # noqa: E402,F401  (registers the wire ta
 import mstar.conductor.conductor as conductor_mod  # noqa: E402
 from mstar.api_server.request_types import APIServerMessage  # noqa: E402
 from mstar.communication import wire  # noqa: E402
+from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
+from mstar.model.submodule_base import NO_CHUNKING, ARNodeInputs  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
@@ -81,6 +82,9 @@ class _Sub:
     def uniform_row_inputs(self, graph_walk, has_loopback=False):
         return None
 
+    def get_chunking_policy(self, graph_walk):
+        return NO_CHUNKING
+
     def prepare_inputs(self, **kw):
         info = kw["fwd_info"].info
         return None if info.rid in self.decline else ARNodeInputs(input_seq_len=info.n)
@@ -110,6 +114,7 @@ def _engine(resources=(), sub=None, keyed=False) -> Engine:
     eng._runner = StepRunner(eng._resources, node_resources={NODE: list(eng._resources)})
     eng._keyed_walks = {NODE: {PREFILL}} if keyed else {}
     eng._prefix_model = "Toy"
+    eng._chunking = ChunkingManagement(eng._submodules)
     return eng
 
 

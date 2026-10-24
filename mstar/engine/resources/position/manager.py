@@ -2,6 +2,7 @@
 
 has ownership of per-(request,label) position counter"""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 
 import torch
@@ -307,7 +308,7 @@ class RopeManager(PositionManager):
         # a stream forked off another starts at the source's position, so
         # mirror the forks KV just applied before any counter is read below
         self._apply_forks(
-            plan_outputs.pre_forks, ctx.padded_request_ids,
+            plan_outputs.pre_forks, self._forking_rids(plan_outputs, ctx),
             undo=self._preplan_fork_undo if ctx.is_preplan else None,
         )
 
@@ -336,7 +337,17 @@ class RopeManager(PositionManager):
         # where KV applies them
         plan_outputs = ctx.plan_results.get(self._kv_cache_name)
         if plan_outputs is not None:
-            self._apply_forks(plan_outputs.post_forks, ctx.padded_request_ids)
+            self._apply_forks(plan_outputs.post_forks, self._forking_rids(plan_outputs, ctx))
+
+    @staticmethod
+    def _forking_rids(plan_outputs: KVPlanOutputs, ctx: StepContext) -> Sequence[int]:
+        """The rows KV forked: a step's forks may cover only some of its rows
+        (a chunked prompt forks on its first and last chunk), and a counter
+        re-forked mid-prompt would restart the target's positions."""
+        fork_rids = plan_outputs.fork_rids
+        if fork_rids is None:
+            return ctx.padded_request_ids
+        return [rid for rid in ctx.padded_request_ids if rid in fork_rids]
 
     def _apply_forks(
         self, forks: tuple[tuple[str, str], ...], request_ids: tuple[str, ...],

@@ -33,6 +33,7 @@ from mstar.graph.runtime.base import (
     ReadyNodeSpec,
     RequestWalks,
 )
+from mstar.model.submodule_base import InputSeqLenInfo
 from mstar.utils.containers import ParallelList
 from mstar.worker.batch_builder import (
     BaseBatchBuilder,
@@ -40,7 +41,7 @@ from mstar.worker.batch_builder import (
     BatchBuildResult,
     FIFOBatchBuilder,
 )
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import ChunkProgress, MicroScheduler, MidPrefillRow, ScheduledBatch
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -245,6 +246,13 @@ class _Engine:
     def splits_by_capture_key(self, node_name, graph_walk):
         del node_name, graph_walk
         return True
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        del node_name, graph_walk
+
+    def supports_chunked_prefill(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return False
 
     def capture_group(self, node_name, graph_walk, rid, fwd_info, input_metadata=None):
         del node_name, graph_walk, fwd_info
@@ -798,9 +806,36 @@ def test_a_chain_does_not_yield_to_a_failed_rid():
 # ── round robin ─────────────────────────────────────────────────────────
 
 
+def test_an_empty_step_falls_through_to_the_next_node():
+    """Only the first round-robin pick used to be tried, so a node whose step
+    came out empty left the worker idle for the pass -- and since it is not
+    marked scheduled, round robin picked it again every pass. Under a
+    colocated model that starves the node which frees the first one's pages:
+    snac_decoder waits behind Orpheus's LLM, whose pages only come back once
+    snac_decoder finishes the request."""
+    engine = _Engine(max_bs=8)
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: engine),
+        parallel_leader_nodes={NODE, "B"},
+    )
+    manager = _Manager(["r0"])
+    manager.per_request_info["r1"] = object()
+    manager.ingest("r1", node="B")
+    # the first key scanned is NODE's; make its step come out empty
+    real = sched._schedule_key
+    sched._schedule_key = lambda rs, key, entries, **kw: (
+        None if key[0] == NODE else real(rs, key, entries, **kw)
+    )
+
+    batch = _next_batch(sched, manager)
+
+    assert batch is not None, "idled behind the node whose step was empty"
+    assert batch.node_name == "B"
+
+
 def test_scheduling_a_batch_advances_the_round_robin_cursor():
     """The regression: the bookkeeping moved out of batch assembly, so every
-    (node, walk) stayed at 0 and `_select_node_rr` kept picking the same one."""
+    (node, walk) stayed at 0 and `_node_rr_order` kept returning it first."""
     sched = _scheduler(_Engine(max_bs=2))
 
     _next_batch(sched, _Manager([f"r{i}" for i in range(4)]))
@@ -1586,3 +1621,359 @@ def test_a_mixing_yield_away_skips_the_whole_combined_walk():
 def test_a_bad_mixing_setting_is_refused(mixes, error):
     with pytest.raises(ValueError, match=error):
         _combined_scheduler(_Engine(max_bs=8), mixes)
+
+
+# ── measured rows ───────────────────────────────────────────────────────
+
+
+class _SizedEngine(_Engine):
+    """Reports each row's length; ``unready`` rows the engine cannot take.
+
+    Readiness does not key on the reported length: admission is the admit
+    path's job, so a declared length never makes a row not-ready.
+    """
+
+    def __init__(self, unready, max_batch_tokens=1024, **kw):
+        super().__init__(**kw)
+        self.unready = set(unready)
+        self.measured = []
+        # wide enough to cut nothing: these tests are about what gets measured
+        self._max_batch_tokens = max_batch_tokens
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return self._max_batch_tokens
+
+    def walk_token_caps(self, node_name, graph_walk):
+        del node_name, graph_walk
+
+    def declares_input_sequence_len(self, node_name):
+        del node_name
+        return True
+
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs, rid=None):
+        del node_name, graph_walk, request_info
+        self.measured.append(len(inputs))
+        return InputSeqLenInfo(len(inputs))
+
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        if rid in self.unready:
+            return FULL_ADMIT_NOT_READY
+        return super().check_ready(node_name, rid, fwd_info, allow_reload)
+
+
+def test_a_measured_row_is_not_gated_on_its_length():
+    """Every row goes in: a declared length is carried for the step build, it
+    is not an admission decision. The gate that used to live here deadlocked
+    decode, which holds every page and so can never run to free one."""
+    sched = _scheduler(_SizedEngine(unready=set(), max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["r0", "r1", "r2"])
+
+    batch = _next_batch(sched, manager)
+
+    assert list(batch.request_to_worker_graph) == ["r0", "r1", "r2"]
+    assert not sched.backlog
+
+
+def test_a_backlogged_row_the_engine_cannot_take_stays_parked():
+    sched = _scheduler(_SizedEngine(unready={"b1"}, max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["b0"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b1"]
+
+
+def test_a_parked_row_is_measured_once_and_checked_once_per_pass():
+    engine = _SizedEngine(unready={"b1"}, max_bs=8)
+    sched = _scheduler(engine)
+    sched.get_tensor = lambda uuid: uuid
+    sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
+
+    _next_batch(sched, _Manager([]))
+    _next_batch(sched, _Manager([]))
+
+    assert len(engine.measured) == 2, "b0 once, b1 once though it waited two passes"
+    assert engine.checked == ["b0"], "one check per row, with its length"
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["b1"]
+
+
+def test_a_walk_with_no_budget_measures_nothing():
+    """Row lengths only size chunks, so a walk with no budget skips the work:
+    an input build and a cached-prefix probe per fresh row, and a walk of the
+    backlog every pass. Turning chunking off in the config gets main's path."""
+    engine = _SizedEngine(unready=set(), max_bs=8, max_batch_tokens=None)
+    sched = _scheduler(engine)
+    sched.get_tensor = lambda uuid: uuid
+    sched.backlog[(NODE, WALK)] = _batch(["b0"])
+
+    batch = _next_batch(sched, _Manager(["r0"]))
+
+    assert list(batch.request_to_worker_graph) == ["b0", "r0"]
+    assert engine.measured == []
+
+
+# ── chunked prefill ─────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def no_chunk_floor(monkeypatch):
+    """Cut rows as small as the share says: these tests are about how a budget
+    of a few tokens is shared, which the chunk floor would round up."""
+    import mstar.engine.chunking
+
+    monkeypatch.setattr(mstar.engine.chunking, "MIN_CHUNK_TOKENS", 1)
+
+
+class _ChunkingEngine(_SizedEngine):
+    """A 4-token budget; ``p0``'s walk can be chunked and it is 10 tokens long."""
+
+    def __init__(self, cached=None, walk_caps=None, **kw):
+        super().__init__(unready=(), **kw)
+        self.cached = cached or {}
+        self.walk_caps = walk_caps
+
+    def get_max_batch_tokens(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return 4
+
+    def walk_token_caps(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return self.walk_caps
+
+    def supports_chunked_prefill(self, node_name, graph_walk):
+        del node_name
+        return graph_walk == "prefill"
+
+    def input_sequence_len(self, node_name, graph_walk, request_info, inputs, rid=None):
+        del node_name, request_info, inputs
+        if graph_walk != "prefill":
+            return InputSeqLenInfo(1)
+        cached = self.cached.get(rid, 0)
+        return InputSeqLenInfo(10 - cached, cached_prefix=cached)
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_long_prompt_runs_a_chunk_per_step_beside_decode_rows():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+
+    first = _next_batch(sched, manager)
+    assert first.chunk_ranges == {"p0": (0, 2, 10)}
+    assert first.incomplete_node_rids == {"p0"}
+
+    # the chunk lands; the worker advances it and readies the node again
+    sched.advance_chunk("p0", NODE, 2)
+    manager.queues["wg0"]._ready.update({"p0": {NODE}, "d0": {NODE}, "d1": {NODE}})
+    second = _next_batch(sched, manager)
+    assert second.chunk_ranges == {"p0": (2, 4, 10)}
+
+    sched.advance_chunk("p0", NODE, 10)
+    assert ("p0", NODE) not in sched.chunk_progress, "the last chunk ends the progress"
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_refused_chunk_waits_out_its_hold_and_runs_the_same_range():
+    """An OOM refusal holds the rows and readies them again; nothing landed,
+    so the chunk's progress has not moved and the retry runs the same tokens."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10)}
+
+    sched.hold_requests(["p0"])
+    manager.queues["wg0"]._ready.update({"p0": {NODE}, "d0": {NODE}, "d1": {NODE}})
+    held = _next_batch(sched, manager)
+    assert "p0" not in held.request_to_worker_graph and not held.chunk_ranges
+
+    sched.held_until["p0"] = 0.0  # the backoff ran out
+    manager.queues["wg0"]._ready.update({"d0": {NODE}, "d1": {NODE}})
+    retry = _next_batch(sched, manager)
+    assert retry.chunk_ranges == {"p0": (0, 2, 10)}
+
+
+def test_a_request_removed_mid_prompt_leaves_no_chunk_state():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p1": 4}))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+    _next_batch(sched, manager)
+    sched.chunk_outputs.hold("p0", NODE, {"hidden": ["a held chunk"]})
+    assert ("p0", NODE) in sched.chunk_progress
+
+    for rid in ("p0", "p1"):
+        sched.clear_rid(rid, rid)
+
+    assert not sched.chunk_progress and not sched.cached_prefix
+    assert not sched.chunk_outputs.holds("p0", NODE)
+
+
+def test_a_walk_cap_holds_its_rows_within_the_steps_budget():
+    """can_override_mixed_max_tokens: the prompt's walk is capped at 1 token a
+    step inside a budget of 4, where it would otherwise take the 2 the two
+    decode rows leave."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, walk_caps={"prefill": 1}))
+    sched.get_tensor = lambda uuid: uuid
+
+    first = _next_batch(sched, _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"}))
+
+    assert first.chunk_ranges == {"p0": (0, 1, 10)}
+    assert sorted(first.request_to_worker_graph) == ["d0", "d1", "p0"]
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_walk_cap_shares_itself_among_its_rows():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, walk_caps={"prefill": 2}))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+
+    first = _next_batch(sched, manager)
+
+    assert first.chunk_ranges == {"p0": (0, 1, 10), "p1": (0, 1, 10)}
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_chunked_row_starts_past_its_cached_prefix():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p0": 4}))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+
+    first = _next_batch(sched, manager)
+
+    assert first.chunk_ranges == {"p0": (4, 6, 10)}
+    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(4, 10)
+    assert not sched.cached_prefix
+
+
+@pytest.mark.parametrize("seq_lens,chunk", [
+    ([3], (0, 1, 10)),   # the continuing row ran 3 tokens last step: 1 of the 4 is left
+    ([-1], (0, 3, 10)),  # unknown: guessed at one token
+])
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_merge_charges_its_rows_their_previous_lengths(seq_lens, chunk):
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+
+    # a merge takes only its own walk, so the continuing row is a prompt too
+    merged = _next_batch(
+        sched, _Manager(["p0"], walks={"p0": "prefill"}), target=(NODE, "prefill"),
+        pre_existing_batch_size=1, pre_existing_seq_lens=lambda: seq_lens,
+    )
+
+    assert merged.chunk_ranges == {"p0": chunk}
+
+
+def test_rows_that_use_up_the_budget_leave_a_prompt_the_chunk_floor():
+    """A merge whose continuing rows ran the whole budget of 4 leaves the
+    prompt nothing; it still runs the floor (the whole budget here, which is
+    under MIN_CHUNK_TOKENS), not a token a step."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+
+    merged = _next_batch(
+        sched, _Manager(["p0"], walks={"p0": "prefill"}), target=(NODE, "prefill"),
+        pre_existing_batch_size=4, pre_existing_seq_lens=lambda: [1, 1, 1, 1],
+    )
+
+    assert merged.chunk_ranges == {"p0": (0, 4, 10)}
+
+
+def test_the_chunk_floor_does_not_pad_a_last_chunk():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p0": 7}))
+    sched.get_tensor = lambda uuid: uuid
+
+    first = _next_batch(sched, _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"}))
+
+    # the decode rows leave 2 of 4; the prompt's last 3 run whole, not cut to 2 or padded to 4
+    assert first.chunk_ranges == {}
+    assert sorted(first.request_to_worker_graph) == ["d0", "d1", "p0"]
+
+
+def test_a_merge_with_no_rows_to_size_never_estimates_its_own():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+
+    def estimate():
+        raise AssertionError("estimated the continuing rows with nothing to size")
+
+    # a steady decode merge: nothing fresh, so the estimate is never asked for
+    assert _next_batch(
+        sched, _Manager([]), target=(NODE, "prefill"),
+        pre_existing_batch_size=1, pre_existing_seq_lens=estimate,
+    ) is None
+
+
+# --- a row mid-prefill takes its next chunk in the speculation merge
+
+
+def _mid(rid, start, walk="prefill"):
+    return MidPrefillRow(rid, "wg0", walk, start)
+
+
+def test_a_mixing_merge_runs_the_next_chunk_of_a_row_whose_chunk_is_in_flight():
+    """Its node is off the ready queue until the chunk lands, so the merge is
+    handed it, and cuts from where the chunk in flight ends."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8), {NODE: True})
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 4, 10)}
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=1,
+        pre_existing_seq_lens=lambda: [1], mid_prefill=[_mid("p0", 4)],
+    )
+
+    assert merged.chunk_ranges == {"p0": (4, 8, 10)}
+    assert merged.incomplete_node_rids == {"p0"}
+    assert sched.chunk_progress[("p0", NODE)] == ChunkProgress(0, 10), "nothing landed yet"
+    assert not manager.pops[1:], "nothing popped: the row's node is in flight"
+
+
+def test_a_merge_that_keeps_to_its_walk_leaves_a_row_mid_prefill_to_its_chunk_landing():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    _next_batch(sched, manager)
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=1,
+        pre_existing_seq_lens=lambda: [1], mid_prefill=[_mid("p0", 4)],
+    )
+
+    assert merged is None
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_row_mid_prefill_the_merge_leaves_out_is_neither_parked_nor_readied():
+    """Left out by the cap, it waits for its chunk to land, which readies it."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs={MIXED: 2, WALK: 8, "prefill": 8}), {NODE: True})
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10), "p1": (0, 2, 10)}
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=1,
+        pre_existing_seq_lens=lambda: [1], mid_prefill=[_mid("p0", 2), _mid("p1", 2)],
+    )
+
+    assert list(merged.request_to_worker_graph) == ["p0"]
+    assert not sched.backlog
+    assert not manager.queues["wg0"].get_ready_node_names()
+
+
+def test_the_last_chunk_of_a_row_mid_prefill_runs_whole_in_the_merge():
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8), {NODE: True})
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    _next_batch(sched, manager)
+
+    merged = _next_batch(
+        sched, manager, target=(NODE, WALK), pre_existing_batch_size=1,
+        pre_existing_seq_lens=lambda: [1], mid_prefill=[_mid("p0", 8)],
+    )
+
+    assert merged.chunk_ranges == {"p0": (8, 10, 10)}
+    assert not merged.incomplete_node_rids
