@@ -1,9 +1,19 @@
-//! Port of `TensorBookkeeping`: per-uuid reference state and descriptors.
+//! Port of `TensorBookkeeping`: per-uuid reference state and descriptors,
+//! and -- when Python's `RustTensorStore` drives it -- the tensors themselves.
 //!
-//! Never sees a tensor. `TensorStore` stays Python because freeing a record
-//! inside a `py.allow_threads` section would drop a `Py<PyAny>` without the
-//! GIL; everything here is integers and interned strings, so it can be held
-//! across one.
+//! Holding the tensor objects here is what lets a dereference free a tensor
+//! without a per-uuid trip back to Python: an entry the store owns that needs
+//! no transport-side teardown (no registered memory, no arena slot, no
+//! spilled file, no Python-side per-uuid state) is dropped in the same pass
+//! that took it to zero, and only the rest are reported.
+//!
+//! A tensor object is never dropped with the bookkeeping lock held, since its
+//! dealloc can run Python that calls back in. The mutators hand displaced
+//! objects back (`Released::dropped`, `Option<StoredTensor>`) and the caller
+//! drops them after unlocking. A drop without the GIL (the graph runtime
+//! routing inside `py.allow_threads`) goes to pyo3's reference pool, which
+//! pyo3 0.23 drains when that `allow_threads` returns and the GIL is
+//! restored.
 //!
 //! The descriptors matter as much as the refcounts: ingest and routing carry
 //! uuids, and anything that has to put a descriptor back on the wire (a
@@ -11,9 +21,10 @@
 
 use crate::graph::spec::{StrToId, Sym};
 use crate::graph::state::TensorRef;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use rustc_hash::FxHashMap;
+use pyo3::types::PyString;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -21,6 +32,104 @@ struct ReferenceInfo {
     ref_count: i64,
     persist: bool,
     mem_registered: bool,
+    /// Python keeps per-uuid state for this one beyond `mem_registered` (a
+    /// shard dim to undo on read, a profiling edge name), so its collection
+    /// must be reported for Python to drop that state.
+    teardown: bool,
+}
+
+/// A request id as the store keys ownership: the worker's integer handle, or
+/// the string id the api server's data worker still passes.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum RidKey {
+    Int(i64),
+    Str(String),
+}
+
+impl<'py> FromPyObject<'py> for RidKey {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        // Type check first: a failed int extraction would build a PyErr per
+        // string rid.
+        if let Ok(s) = ob.downcast::<PyString>() {
+            return Ok(RidKey::Str(s.to_str()?.to_owned()));
+        }
+        Ok(RidKey::Int(ob.extract::<i64>()?))
+    }
+}
+
+/// One tensor the store holds: the object, the producer's optional host copy
+/// (for a transport that sends from host memory), and the request that
+/// answers for it at teardown.
+pub struct StoredTensor {
+    tensor: Py<PyAny>,
+    cpu: Option<Py<PyAny>>,
+    rid: RidKey,
+}
+
+/// The objects half of a batched put, index-parallel to its uuids. `cpus`,
+/// when given, is too; a None in it is a tensor with no host copy.
+pub struct StoreColumns {
+    rids: Vec<RidKey>,
+    tensors: Vec<Py<PyAny>>,
+    cpus: Option<Vec<Option<Py<PyAny>>>>,
+}
+
+type StoreRow = (RidKey, Py<PyAny>, Option<Py<PyAny>>);
+
+impl StoreColumns {
+    fn check(&self, n: usize, what: &str) -> PyResult<()> {
+        if self.rids.len() != n
+            || self.tensors.len() != n
+            || self.cpus.as_ref().is_some_and(|c| c.len() != n)
+        {
+            return Err(PyValueError::new_err(format!(
+                "{what}: rids, tensors and cpu_tensors must be parallel to uuids"
+            )));
+        }
+        Ok(())
+    }
+
+    fn into_rows(self) -> impl Iterator<Item = StoreRow> {
+        let mut cpus = self.cpus.map(Vec::into_iter);
+        self.rids
+            .into_iter()
+            .zip(self.tensors)
+            .map(move |(r, t)| (r, t, cpus.as_mut().and_then(|c| c.next()).flatten()))
+    }
+}
+
+/// What a release hands back: the uuids Python still has to tear down, with
+/// each one's `mem_registered` flag (the record that carried it is already
+/// gone), and the objects of the ones freed outright, for the caller to drop
+/// once it has released the lock.
+#[derive(Default)]
+pub struct Released {
+    pub uuids: Vec<u64>,
+    pub registered: Vec<bool>,
+    pub dropped: Vec<StoredTensor>,
+}
+
+impl Released {
+    /// The part Python acts on. Call it with the lock released: the objects
+    /// freed outright are dropped here.
+    pub fn report(self) -> (Vec<u64>, Vec<bool>) {
+        drop(self.dropped);
+        (self.uuids, self.registered)
+    }
+}
+
+fn store_columns(
+    rids: Option<Vec<RidKey>>,
+    tensors: Option<Vec<Py<PyAny>>>,
+    cpus: Option<Vec<Option<Py<PyAny>>>>,
+) -> PyResult<Option<StoreColumns>> {
+    match (rids, tensors) {
+        (Some(rids), Some(tensors)) => Ok(Some(StoreColumns { rids, tensors, cpus })),
+        (None, None) if cpus.is_none() => Ok(None),
+        _ => Err(PyValueError::new_err(
+            "rids and tensors go together, and cpu_tensors needs both",
+        )),
+    }
 }
 
 /// `TensorPointerInfo` with its strings interned. `source_entity`,
@@ -104,6 +213,19 @@ pub struct Bookkeeping {
     /// arena grows. Placement then crosses as an index, so a name never
     /// travels per tensor -- see `set_shm_placement`.
     shm_segments: Vec<Sym>,
+    /// The tensors, for a store that keeps them here. Apart from `ref_info`:
+    /// a record can exist with no object here (a caller that keeps its
+    /// tensors itself -- those are always reported on release), and an object
+    /// outlives its record between a release that reports it and the
+    /// teardown's `remove_tensor`.
+    stored: FxHashMap<u64, StoredTensor>,
+    /// Which uuids each request answers for, for request teardown. A sliced
+    /// tensor outlives its producer's entry under a new uuid, so ownership is
+    /// not derivable from the uuid.
+    owned: FxHashMap<RidKey, FxHashSet<u64>>,
+    /// Uuids stored with a host copy since the last `drop_cpu_tensors`, so
+    /// that call visits only them rather than every stored tensor.
+    with_cpu: Vec<u64>,
 }
 
 /// Uncontended in practice -- everything runs under the GIL today -- but a
@@ -192,16 +314,26 @@ impl Bookkeeping {
         &mut self,
         uuids: Vec<u64>,
         infos: Vec<TensorInfoArg>,
-    ) -> PyResult<()> {
+        objects: Option<StoreColumns>,
+    ) -> PyResult<Vec<StoredTensor>> {
         if uuids.len() != infos.len() {
             return Err(PyValueError::new_err(
                 "put_tensor_batch: uuids and infos must be the same length",
             ));
         }
+        if let Some(o) = &objects {
+            o.check(uuids.len(), "put_tensor_batch")?;
+        }
+        let mut displaced = Vec::new();
+        let mut objects = objects.map(StoreColumns::into_rows);
         for (uuid, info) in uuids.into_iter().zip(infos) {
             self.put_tensor(uuid, info);
+            if let Some(rows) = objects.as_mut() {
+                let (rid, tensor, cpu) = rows.next().expect("checked length");
+                displaced.extend(self.own(rid, uuid, tensor, cpu));
+            }
         }
-        Ok(())
+        Ok(displaced)
     }
 
     /// `put_tensor_batch` as columns instead of a dict per tensor.
@@ -232,7 +364,8 @@ impl Bookkeeping {
         source_entity: String,
         source_node_name: Option<String>,
         source_graph_walk: Option<String>,
-    ) -> PyResult<()> {
+        objects: Option<StoreColumns>,
+    ) -> PyResult<Vec<StoredTensor>> {
         let n = uuids.len();
         if addresses.len() != n
             || nbytes.len() != n
@@ -242,6 +375,16 @@ impl Bookkeeping {
             return Err(PyValueError::new_err(
                 "put_tensor_batch_columns: every per-tensor column must have \
                  the same length as uuids",
+            ));
+        }
+        if let Some(o) = &objects {
+            o.check(n, "put_tensor_batch_columns")?;
+        }
+        if dtype_idx.iter().any(|&d| d as usize >= dtype_names.len()) {
+            // Before anything is written, so a bad batch leaves no half of
+            // itself behind.
+            return Err(PyValueError::new_err(
+                "put_tensor_batch_columns: dtype_idx out of range",
             ));
         }
         let total: usize = ndims.iter().map(|d| *d as usize).sum();
@@ -260,14 +403,12 @@ impl Bookkeeping {
         let dtypes: Vec<Sym> =
             dtype_names.iter().map(|d| self.strings.intern(d)).collect();
 
+        let mut displaced = Vec::new();
+        let mut objects = objects.map(StoreColumns::into_rows);
         let mut at = 0usize;
         for i in 0..n {
             let k = ndims[i] as usize;
-            let dtype = *dtypes.get(dtype_idx[i] as usize).ok_or_else(|| {
-                PyValueError::new_err(
-                    "put_tensor_batch_columns: dtype_idx out of range",
-                )
-            })?;
+            let dtype = dtypes[dtype_idx[i] as usize];
             let uuid = uuids[i];
             let info = TensorPointerInfo {
                 dims: dims_flat[at..at + k].to_vec(),
@@ -291,9 +432,141 @@ impl Bookkeeping {
             };
             self.ref_info.insert(uuid, ReferenceInfo::default());
             self.tensor_info.insert(uuid, info);
+            if let Some(rows) = objects.as_mut() {
+                let (rid, tensor, cpu) = rows.next().expect("checked length");
+                displaced.extend(self.own(rid, uuid, tensor, cpu));
+            }
             at += k;
         }
-        Ok(())
+        Ok(displaced)
+    }
+
+    // -- the tensors ------------------------------------------------------
+
+    /// Hold `tensor` for `uuid` on behalf of `rid`. Returns what it replaced,
+    /// for the caller to drop outside the lock.
+    pub fn own(
+        &mut self,
+        rid: RidKey,
+        uuid: u64,
+        tensor: Py<PyAny>,
+        cpu: Option<Py<PyAny>>,
+    ) -> Option<StoredTensor> {
+        if cpu.is_some() {
+            self.with_cpu.push(uuid);
+        }
+        let old = self.stored.insert(
+            uuid, StoredTensor { tensor, cpu, rid: rid.clone() },
+        );
+        if let Some(o) = &old {
+            if o.rid != rid {
+                Self::disown(&mut self.owned, &o.rid, uuid);
+            }
+        }
+        self.owned.entry(rid).or_default().insert(uuid);
+        old
+    }
+
+    /// The rid's set goes with its last uuid: rids are recycled handles, and
+    /// an empty set left behind would be inherited by the next request.
+    fn disown(
+        owned: &mut FxHashMap<RidKey, FxHashSet<u64>>, rid: &RidKey, uuid: u64,
+    ) {
+        if let Some(set) = owned.get_mut(rid) {
+            set.remove(&uuid);
+            if set.is_empty() {
+                owned.remove(rid);
+            }
+        }
+    }
+
+    fn take_stored(&mut self, uuid: u64) -> Option<StoredTensor> {
+        let s = self.stored.remove(&uuid)?;
+        Self::disown(&mut self.owned, &s.rid, uuid);
+        Some(s)
+    }
+
+    /// Drop the object and the record together. Not stored means nothing
+    /// happens, the record included -- as Python's `remove_tensor`, which
+    /// returns early when it holds no tensor.
+    pub fn remove_tensor(&mut self, uuid: u64) -> Option<StoredTensor> {
+        let s = self.take_stored(uuid)?;
+        self.forget_tensor(uuid);
+        Some(s)
+    }
+
+    pub fn has_tensor(&self, uuid: u64) -> bool {
+        self.stored.contains_key(&uuid)
+    }
+
+    fn tensor(&self, py: Python<'_>, uuid: u64) -> Option<Py<PyAny>> {
+        self.stored.get(&uuid).map(|s| s.tensor.clone_ref(py))
+    }
+
+    fn cpu_tensor(&self, py: Python<'_>, uuid: u64) -> Option<Py<PyAny>> {
+        self.stored
+            .get(&uuid)
+            .and_then(|s| s.cpu.as_ref().map(|c| c.clone_ref(py)))
+    }
+
+    /// Take every host copy stored since the last call, for the caller to
+    /// drop outside the lock. They are views of buffers the producer reuses
+    /// on its next step (see `TensorCommunicationManager.drop_host_copies`).
+    fn take_cpu_tensors(&mut self) -> Vec<Py<PyAny>> {
+        let mut out = Vec::with_capacity(self.with_cpu.len());
+        for uuid in self.with_cpu.drain(..) {
+            if let Some(cpu) = self.stored.get_mut(&uuid).and_then(|s| s.cpu.take()) {
+                out.push(cpu);
+            }
+        }
+        out
+    }
+
+    fn rid_uuids(&self, rid: &RidKey) -> Vec<u64> {
+        self.owned
+            .get(rid)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Flag uuids whose collection Python must hear about although nothing
+    /// is registered for them -- see `ReferenceInfo::teardown`.
+    fn mark_teardown(&mut self, uuids: Vec<u64>) {
+        for uuid in uuids {
+            if let Some(e) = self.entry(uuid) {
+                e.teardown = true;
+            }
+        }
+    }
+
+    /// Request teardown in one pass: every uuid `rid` owns that is
+    /// collectable -- or every one, under `force` -- is released, the rest
+    /// returned as deferred. Released ones follow `drop_refs`: forgotten,
+    /// and either dropped here or reported for the transport's teardown.
+    fn release_request(&mut self, rid: &RidKey, force: bool) -> (Released, Vec<u64>) {
+        let mut out = Released::default();
+        let mut deferred = Vec::new();
+        for uuid in self.rid_uuids(rid) {
+            let (gc, registered, teardown) = match self.ref_info.get(&uuid) {
+                Some(e) => {
+                    (e.ref_count <= 0 && !e.persist, e.mem_registered, e.teardown)
+                }
+                // Untracked is never collectable, as in can_gc.
+                None => (false, false, false),
+            };
+            if !gc && !force {
+                deferred.push(uuid);
+                continue;
+            }
+            self.forget_tensor(uuid);
+            if registered || teardown {
+                out.uuids.push(uuid);
+                out.registered.push(registered);
+            } else if let Some(s) = self.take_stored(uuid) {
+                out.dropped.push(s);
+            }
+        }
+        (out, deferred)
     }
 
     /// Name one arena segment, once, when the arena grows into it.
@@ -433,7 +706,7 @@ impl Bookkeeping {
         uuids: Vec<u64>,
         counts: Vec<i64>,
         cleanup: bool,
-    ) -> PyResult<(Vec<u64>, Vec<bool>)> {
+    ) -> PyResult<Released> {
         if uuids.len() != counts.len() {
             return Err(PyValueError::new_err(
                 "dereference_batch: uuids and counts must be the same length",
@@ -456,19 +729,25 @@ impl Bookkeeping {
         uuids: Vec<u64>,
         n: i64,
         cleanup: bool,
-    ) -> (Vec<u64>, Vec<bool>) {
+    ) -> Released {
         self.drop_refs(uuids.into_iter().map(|u| (u, n)), cleanup)
     }
 
     /// The shared half of the two batched dereferences, and what the graph
     /// runtime releases consumed inputs through.
+    ///
+    /// Without `cleanup`, every uuid that reached zero is reported and
+    /// nothing is dropped. With it, a collectable uuid whose object is stored
+    /// here and that needs no teardown on the Python side is freed in this
+    /// pass -- record and object -- and only the rest are reported, already
+    /// forgotten. A reported uuid keeps its object until the teardown calls
+    /// `remove_tensor`, since unregistering memory reads the tensor.
     pub fn drop_refs(
         &mut self,
         refs: impl Iterator<Item = (u64, i64)>,
         cleanup: bool,
-    ) -> (Vec<u64>, Vec<bool>) {
-        let mut collectable: Vec<u64> = Vec::new();
-        let mut registered: Vec<bool> = Vec::new();
+    ) -> Released {
+        let mut out = Released::default();
         for (uuid, n) in refs {
             let Some(e) = self.entry(uuid) else { continue };
             e.ref_count -= n;
@@ -476,15 +755,23 @@ impl Bookkeeping {
             if e.ref_count > 0 || e.persist {
                 continue;
             }
-            registered.push(e.mem_registered);
-            collectable.push(uuid);
+            let (registered, teardown) = (e.mem_registered, e.teardown);
+            if cleanup && !registered && !teardown {
+                if let Some(s) = self.take_stored(uuid) {
+                    self.forget_tensor(uuid);
+                    out.dropped.push(s);
+                    continue;
+                }
+            }
+            out.registered.push(registered);
+            out.uuids.push(uuid);
         }
         if cleanup {
-            for &uuid in &collectable {
+            for &uuid in &out.uuids {
                 self.forget_tensor(uuid);
             }
         }
-        (collectable, registered)
+        out
     }
 
     pub fn set_persist(&mut self, uuid: u64, persist: bool) {
@@ -555,20 +842,58 @@ impl TensorBookkeeping {
         Self { inner: Arc::new(Mutex::new(Bookkeeping::default())) }
     }
 
-    // Each of these locks, delegates and drops. Nothing below calls back into
-    // Python, so the lock is never held across a re-entry.
+    // Each of these locks, delegates and unlocks. Nothing below calls back
+    // into Python with the lock held: a tensor object an operation displaces
+    // or frees is bound by a `let` (whose statement ends the guard) and
+    // dropped after it.
 
     fn put_tensor(&self, uuid: u64, info: TensorInfoArg) {
         self.inner.lock().unwrap().put_tensor(uuid, info)
     }
 
+    /// `put_tensor` plus the tensor itself, held here for `rid`.
+    #[pyo3(signature = (rid, uuid, tensor, info, cpu_tensor = None))]
+    fn put_stored(
+        &self,
+        rid: RidKey,
+        uuid: u64,
+        tensor: Py<PyAny>,
+        info: TensorInfoArg,
+        cpu_tensor: Option<Py<PyAny>>,
+    ) {
+        let displaced = {
+            let mut bk = self.inner.lock().unwrap();
+            bk.put_tensor(uuid, info);
+            bk.own(rid, uuid, tensor, cpu_tensor)
+        };
+        drop(displaced);
+    }
+
+    /// With `tensors` (and `rids`), the store's batched put: the objects
+    /// cross in the same call as the descriptors.
+    #[pyo3(signature = (uuids, infos, rids = None, tensors = None, cpu_tensors = None))]
     fn put_tensor_batch(
-        &self, uuids: Vec<u64>, infos: Vec<TensorInfoArg>,
+        &self,
+        uuids: Vec<u64>,
+        infos: Vec<TensorInfoArg>,
+        rids: Option<Vec<RidKey>>,
+        tensors: Option<Vec<Py<PyAny>>>,
+        cpu_tensors: Option<Vec<Option<Py<PyAny>>>>,
     ) -> PyResult<()> {
-        self.inner.lock().unwrap().put_tensor_batch(uuids, infos)
+        let objects = store_columns(rids, tensors, cpu_tensors)?;
+        let displaced =
+            self.inner.lock().unwrap().put_tensor_batch(uuids, infos, objects)?;
+        drop(displaced);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        uuids, addresses, nbytes, ndims, dims_flat, stride_flat, dtype_names,
+        dtype_idx, tp_size, tp_rank, source_session_id, source_entity,
+        source_node_name, source_graph_walk,
+        rids = None, tensors = None, cpu_tensors = None,
+    ))]
     fn put_tensor_batch_columns(
         &self,
         uuids: Vec<u64>,
@@ -585,13 +910,87 @@ impl TensorBookkeeping {
         source_entity: String,
         source_node_name: Option<String>,
         source_graph_walk: Option<String>,
+        rids: Option<Vec<RidKey>>,
+        tensors: Option<Vec<Py<PyAny>>>,
+        cpu_tensors: Option<Vec<Option<Py<PyAny>>>>,
     ) -> PyResult<()> {
-        self.inner.lock().unwrap().put_tensor_batch_columns(
+        let objects = store_columns(rids, tensors, cpu_tensors)?;
+        let displaced = self.inner.lock().unwrap().put_tensor_batch_columns(
             uuids, addresses, nbytes, ndims, dims_flat, stride_flat,
             dtype_names, dtype_idx, tp_size, tp_rank,
             source_session_id, source_entity, source_node_name,
-            source_graph_walk,
-        )
+            source_graph_walk, objects,
+        )?;
+        drop(displaced);
+        Ok(())
+    }
+
+    // -- the tensors ------------------------------------------------------
+
+    fn get_tensor(&self, py: Python<'_>, uuid: u64) -> PyResult<Py<PyAny>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .tensor(py, uuid)
+            .ok_or_else(|| PyKeyError::new_err(uuid))
+    }
+
+    /// `get_tensor` over a column, None where a uuid is not stored, so the
+    /// caller decides what a miss means.
+    fn get_tensors(&self, py: Python<'_>, uuids: Vec<u64>) -> Vec<Option<Py<PyAny>>> {
+        let bk = self.inner.lock().unwrap();
+        uuids.into_iter().map(|u| bk.tensor(py, u)).collect()
+    }
+
+    fn get_cpu_tensor(&self, py: Python<'_>, uuid: u64) -> Option<Py<PyAny>> {
+        self.inner.lock().unwrap().cpu_tensor(py, uuid)
+    }
+
+    fn has_tensor(&self, uuid: u64) -> bool {
+        self.inner.lock().unwrap().has_tensor(uuid)
+    }
+
+    fn remove_tensor(&self, uuid: u64) {
+        let removed = self.inner.lock().unwrap().remove_tensor(uuid);
+        drop(removed);
+    }
+
+    fn rid_uuids(&self, rid: RidKey) -> Vec<u64> {
+        self.inner.lock().unwrap().rid_uuids(&rid)
+    }
+
+    /// Forget every host copy stored since the last call. Dropped after the
+    /// lock is released.
+    fn drop_cpu_tensors(&self) {
+        let taken = self.inner.lock().unwrap().take_cpu_tensors();
+        drop(taken);
+    }
+
+    fn mark_teardown(&self, uuids: Vec<u64>) {
+        self.inner.lock().unwrap().mark_teardown(uuids)
+    }
+
+    /// `(teardown uuids, their mem_registered flags, deferred uuids)`.
+    fn release_request(
+        &self, rid: RidKey, force: bool,
+    ) -> (Vec<u64>, Vec<bool>, Vec<u64>) {
+        let (released, deferred) =
+            self.inner.lock().unwrap().release_request(&rid, force);
+        let (uuids, registered) = released.report();
+        (uuids, registered, deferred)
+    }
+
+    /// The raw count, None when untracked -- for parity tests against the
+    /// Python bookkeeper, where `can_gc` alone hides a count off by one.
+    fn ref_count(&self, uuid: u64) -> Option<i64> {
+        self.inner.lock().unwrap().ref_info.get(&uuid).map(|e| e.ref_count)
+    }
+
+    /// How many tensor objects are held, and for how many requests -- for
+    /// tests of what a release leaves behind.
+    fn stored_counts(&self) -> (usize, usize) {
+        let bk = self.inner.lock().unwrap();
+        (bk.stored.len(), bk.owned.len())
     }
 
     fn register_shm_segment(&self, index: usize, name: &str) {
@@ -644,19 +1043,23 @@ impl TensorBookkeeping {
     fn dereference_batch(
         &self, uuids: Vec<u64>, counts: Vec<i64>, cleanup: bool,
     ) -> PyResult<(Vec<u64>, Vec<bool>)> {
-        self.inner
+        let released = self
+            .inner
             .lock()
             .unwrap()
-            .dereference_batch(uuids, counts, cleanup)
+            .dereference_batch(uuids, counts, cleanup)?;
+        Ok(released.report())
     }
 
     fn dereference_batch_uniform(
         &self, uuids: Vec<u64>, n: i64, cleanup: bool,
     ) -> (Vec<u64>, Vec<bool>) {
-        self.inner
+        let released = self
+            .inner
             .lock()
             .unwrap()
-            .dereference_batch_uniform(uuids, n, cleanup)
+            .dereference_batch_uniform(uuids, n, cleanup);
+        released.report()
     }
 
     fn set_persist(&self, uuid: u64, persist: bool) {
