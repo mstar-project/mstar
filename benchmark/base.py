@@ -187,7 +187,7 @@ class Kokoro(Model):
 
 
 class PersonaPlex(Model):
-    """Offline prerecorded audio replay; concurrency is independent B=1 requests."""
+    """Offline prerecorded audio replay: an agent track as long as the user clip."""
 
     # NVIDIA/personaplex@3428dfd95309a7f3c84fd93259ded0f810d1ff91 offline.py:335.
     DEFAULT_PERSONA = (
