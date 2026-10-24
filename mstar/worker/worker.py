@@ -84,6 +84,8 @@ from mstar.utils.profiler import (
     PhaseLaps,
     nvtx_enabled,
     phase_buffer,
+    phase_end,
+    phase_start,
     range_pop,
     range_push,
 )
@@ -102,6 +104,10 @@ _HOLD_LOG_INTERVAL = 5.0
 # ``_await_admit_settled``'s safety net, not a tuning knob: the GPU thread
 # releases the event on every exit, so this only fires if that thread died.
 _ADMIT_FENCE_TIMEOUT_S = 10.0
+
+
+# worker_phases span per message type handled in _process_message_list
+_MSG_SPANS = {t: f"worker.msg.{t.name.lower()}" for t in WorkerMessageType}
 
 
 def _thread_role() -> str:
@@ -833,6 +839,7 @@ class Worker:
             # Being torn down (out-of-order NEW after DRAIN); don't start reads.
             return
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
+        laps = PhaseLaps("worker.msg.new_request.")
         # The one place a handle is minted; a request with several partitions
         # on this worker gets the same one for each. Everything below keys on it.
         request_id = self._graph_runtime.add_request(
@@ -844,6 +851,7 @@ class Worker:
             loop_caps=body.loop_caps,
         )
         body.request_info.rid_handle = request_id
+        laps.lap("runtime_add")
 
         now = _time.monotonic()
         for node_name in self.engine_manager.evictable_nodes():
@@ -853,11 +861,14 @@ class Worker:
         self.tensor_manager.register_request(
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
+        laps.lap("worker_state")
         try:
             self.engine_manager.add_request(
                 request_id, body.request_info.resource_configs,
             )
+            laps.lap("engine_add")
             self._skip_unshared_publish(request_id, body.worker_graph_to_workers)
+            laps.lap("skip_publish")
         except Exception as err:
             # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
             logger.exception("Worker %s: ingest of request %s failed", self.worker_id, body.request_id)
@@ -889,12 +900,14 @@ class Worker:
                 if lead:
                     sbuf.prime_context(lead)
 
+        laps.lap("stream_buffers")
         # Start RDMA reads for tensors that have tensor_info
         futures = self.tensor_manager.start_read_tensors(
             request_id, body.initial_inputs,
             graph_walk=body.request_info.graph_walk
         )
         self.wakeup_event.register_futures(futures)
+        laps.lap("start_reads")
 
         # Signal-only edges (tensor_info is None) can be processed immediately
         signal_only = [
@@ -904,6 +917,7 @@ class Worker:
             self._graph_runtime.ingest_inputs_batch(
                 self._one_rids_edges(request_id, signal_only), can_buffer=True,
             )
+        laps.lap("ingest_signals")
         self._process_unprocessed(body.request_id)
 
     def _process_unprocessed(self, wire_rid: str) -> None:
@@ -989,14 +1003,17 @@ class Worker:
         # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
         # on the abort/fail path via a prior DrainRequest, on the happy path
         # once the api server finished reading the outputs.
+        laps = PhaseLaps("worker.msg.remove_request.")
         self._draining_rids.discard(body.request_id)
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
         self.engine_manager.remove_request(request_id)
+        laps.lap("engine")
         if self._stream_buffer_rids:
             self._stream_buffer_rids.discard(request_id)
         self.request_state.remove_request(request_id)
         self.tensor_manager.force_cleanup_request(request_id)
+        laps.lap("worker_state_tensors")
         self.profile_info.pop_request(request_id)
         self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
@@ -1004,10 +1021,13 @@ class Worker:
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
+        laps.lap("misc")
         logger.info("Request cleanup complete: %s", body.request_id)
+        laps.lap("log")
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
+        laps.lap("runtime")
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -1244,6 +1264,7 @@ class Worker:
                     message.body.request_id, []
                 ).append(message)
                 continue
+            t0 = phase_start()
             if message.message_type == WorkerMessageType.NEW_REQUEST:
                 self._add_new_request(message.body)
             elif message.message_type == WorkerMessageType.DRAIN_REQUEST:
@@ -1265,6 +1286,8 @@ class Worker:
             elif message.message_type == WorkerMessageType.ENABLE_METRICS:
                 # sent only with metrics on, so _metrics is set
                 self._metrics.start_counting()
+            if t0 is not None:
+                phase_end(_MSG_SPANS[message.message_type], t0)
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
