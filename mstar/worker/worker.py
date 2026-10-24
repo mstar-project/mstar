@@ -2447,6 +2447,7 @@ class Worker:
         per_request_inputs: dict[int, NameToTensorList],
         consumed_streaming_edges: dict[int, list[StreamingEdge]],
         continuing: list[int],
+        fresh_final_edges: dict[int, set[str]],
         *,
         is_same_node: bool,
         spec_id: int = 0,
@@ -2454,7 +2455,11 @@ class Worker:
         request_walks: dict[int, str] | None = None,
     ) -> Speculation:
         """Package prepared rids (batch order) into the ``Speculation`` the main
-        loop runs. Leader and follower differ only in how they pick the rids."""
+        loop runs. Leader and follower differ only in how they pick the rids.
+
+        ``fresh_final_edges`` is ``final_edges`` (see ``_make_executing_batch``)
+        for the rids that did not come from batch N: their final chunks were
+        ingested before this step, not polled by it."""
         spec_node = spec_target.node_name
         request_ids = list(request_to_worker_graph)
         per_request_input_metadata = {
@@ -2493,7 +2498,7 @@ class Worker:
                 rid: {se.edge.name for se in edges if se.chunk.is_final}
                 for rid, edges in consumed_streaming_edges.items()
                 if any(se.chunk.is_final for se in edges)
-            },
+            } | fresh_final_edges,
             per_request_input_metadata=input_meta,
             request_walks=request_walks,
         )
@@ -2701,6 +2706,7 @@ class Worker:
             return None
         # fresh rows of another walk (a mixing chain): rid -> walk
         other_walks: dict[int, str] = {}
+        fresh_final_edges: dict[int, set[str]] = {}
 
         # Merge in fresh rids whose spec-target node is ready right now
         # Speculation only consumes work compatible with the spec target. In
@@ -2721,10 +2727,10 @@ class Worker:
                 f"Speculation asked for {spec_node_name!r} but the "
                 f"scheduler returned {fresh_batch.node_name!r}"
             )
-            fresh_inputs = fresh_batch.input_edges.to_input_tensors(
+            fresh_inputs, fresh_final, _ = fresh_batch.input_edges.to_input_tensors(
                 self.tensor_manager.get_tensor,
                 fresh_batch.request_to_worker_graph,
-            ).by_rid
+            )
             for rid in fresh_batch.request_to_worker_graph:
                 if rid in continuing:
                     # Shouldn't happen — continuing rids are held by the
@@ -2743,6 +2749,8 @@ class Worker:
                 new_request_to_worker_graph[rid] = (
                     fresh_batch.request_to_worker_graph[rid]
                 )
+                if rid in fresh_final:
+                    fresh_final_edges[rid] = fresh_final[rid]
                 walk = fresh_batch.walk_of(rid)
                 if walk != graph_walk:
                     other_walks[rid] = walk
@@ -2751,7 +2759,7 @@ class Worker:
         return self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
-            consumed_streaming_edges, continuing,
+            consumed_streaming_edges, continuing, fresh_final_edges,
             is_same_node=speculating_same_node, spec_id=prep.spec_id,
             # a per-row map only when the step mixes walks
             request_walks={
@@ -2959,9 +2967,9 @@ class Worker:
         prep_inputs = prep.input_edges.to_input_tensors(
             get_tensor, prep.ready_rids,
         ).by_rid
-        fresh_inputs = fresh_edges.to_input_tensors(
+        fresh_inputs, fresh_final_edges, _ = fresh_edges.to_input_tensors(
             get_tensor, list(fresh_wg),
-        ).by_rid
+        )
         prep_wg = dict(zip(prep.ready_rids, prep.wg_ids, strict=True))
 
         new_request_to_worker_graph: dict[int, int] = {}
@@ -2986,7 +2994,7 @@ class Worker:
         return self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
-            consumed_streaming_edges, continuing,
+            consumed_streaming_edges, continuing, fresh_final_edges,
             is_same_node=True, spec_id=prep.spec_id, tp_seq=head.spec_seq,
             request_walks={
                 r: head.walks[w] for r, w in head_walk_idx.items()
