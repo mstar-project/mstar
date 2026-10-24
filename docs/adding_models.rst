@@ -319,12 +319,16 @@ A layout has five fields:
   ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
   node's outputs. A request with a ``"rows"`` span can't be rebuilt, so it reserves its whole
-  footprint and is never preempted. A request with ``"digest"`` spans is rebuilt from a host
-  copy of what its prefill walk read, at one rank, when every span of the label is on that one
-  walk, the last is an ``"ids"`` span and the label isn't keyed for the prefix cache. It is
-  guaranteed otherwise. The rebuild row gives the walk one tensor of ids per ``"ids"`` span,
-  with the samples appended to the last, and the prefill row's step metadata, so the walk must
-  read its prompt in that shape.
+  footprint and is never preempted. A request with ``"digest"`` spans is rebuilt at one rank
+  from host copies of what each prefill step read, one rebuild row per step: one step for a
+  label on one walk, and one per span for a label on several walks. A walk with a ``"digest"``
+  span must read an input the growth walks don't, which is copied. A walk with an ``"ids"`` span
+  reads its ids under the growth walks' one input, and nothing else the growth walks read. The
+  last span must be ``"ids"``, and a keyed label's keys must cover every span. It is guaranteed
+  otherwise. A row gives its walk one tensor of ids per ``"ids"`` span, with the samples
+  appended to the last. A row with a ``"digest"`` span runs under its prefill step's step
+  metadata, and a row of ids alone under the request's own, so the walk must read its prompt in
+  that shape.
   ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.

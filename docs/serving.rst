@@ -327,15 +327,17 @@ and otherwise has the model's default length cut until it fits. A request that c
 rebuilt reserves only its prompt, so a decode step can find no page outside the reservations. The
 worker then drops the newest requests it can rebuild from their token ids and gives their
 pages to the request that ran short. A dropped request waits at its place in the queue
-until its history and one more page fit, then recomputes its KV in one prefill row. A
+until its history and one more page fit, then recomputes its KV in one row per prefill step. A
 request that streams audio out, or holds KV made from another node's outputs, reserves its
 whole footprint in every pool, with every cache hit counted, and is never dropped. So does a
-request in the pools of a node that keeps no token ids to rebuild it. A request with images
-whose whole prompt runs on one prefill walk, such as a Qwen3.5 chat with images, can be dropped
-at one rank: the worker keeps a host copy of what that walk read besides the token ids, the
-encoder's output included, and rebuilds the request from it. Bagel, Qwen3-Omni and Higgs Audio
-requests with media, whose prompts run on several walks, and requests with images above one
-rank keep no copies and stay guaranteed. A Qwen3.5 video stays guaranteed for its frames.
+request in the pools of a node that keeps no token ids to rebuild it. A request with media can
+be dropped at one rank: the worker keeps a host copy of what each prefill step read besides the
+token ids, the encoder's output included, and rebuilds the request from those copies in the
+order its prefill ran. That covers Qwen3.5 and Bagel image chats, Qwen3-Omni requests with
+audio, images or video in and text out, and Higgs Audio transcriptions. Requests that answer
+with audio, Bagel generations and edits, Qwen3.5 videos and requests with media above one rank
+keep no copies and stay guaranteed. The one exception is a Bagel edit in think mode with no
+guidance and the prefix cache off, which is rebuilt as a chat is.
 Voice requests then queue when the pool is short and are never preempted mid-stream.
 
 Above one rank, a decode step that finds no page holds its requests until they time out.
