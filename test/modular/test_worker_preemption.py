@@ -15,9 +15,8 @@ from types import SimpleNamespace
 sys.path.insert(0, ".")
 
 import pytest
-import torch
+import test_kv_host_index as host
 from test_kv_preemption import PAGE_SIZE, _pool, _running, _step, _stub_transfer  # noqa: F401
-from test_kv_prefix_lease import _manager
 
 from mstar.engine.engine import PagedKVCache
 from mstar.observability.recorders import EdgeTransfers
@@ -115,9 +114,9 @@ def test_a_pool_offloads_before_it_drops():
     assert w.held == ["v"] and not w._dropped and kv.is_resident("v"), "a request the pool could offload was dropped"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the host pool pins its memory")
 def test_the_pages_an_offload_frees_go_to_the_request_that_ran_short():
-    kv = _manager(max_num_pages=11, cpu_offload_pages=16)
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
     _running(kv, "r", 5, arrival=1)
     _running(kv, "v", 5, arrival=2)
     reason = _step(kv, "r", 1).reason
