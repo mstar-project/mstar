@@ -144,6 +144,8 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
     ) -> list[AcceleratorGraphConfig]:
         return [
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
@@ -152,6 +154,8 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
             PackedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_text", "prefill_audio"],
                 make_node_input=lambda n: ARNodeInputs(
