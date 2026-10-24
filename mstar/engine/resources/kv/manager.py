@@ -575,7 +575,9 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
-        self._dropped: set[str] = set()
+        # a dropped request -> the pages `readmit` allots it. The first `readmit` counts them, since the request's
+        # kept ids don't change while it waits.
+        self._dropped: dict[str, int | None] = {}
         # (node, walk) -> (label, stop buffer name) per request, for the
         # decode-step chain extension; dropped with the request
         self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
@@ -2896,7 +2898,7 @@ class KVManager(AttentionResource):
             if allotment is not None:
                 self._unused -= allotment.remaining
             self.reset_request(rid, free=True)
-            self._dropped.add(rid)
+            self._dropped[rid] = None
             self._short.pop(rid, None)
             self._ran_short.pop(rid, None)
             if allotment is not None:
@@ -2904,11 +2906,27 @@ class KVManager(AttentionResource):
             self._settle(rid, self._room() - room)
             return self._arena.num_free - free
 
-    def lay_out_again(self, rid: str, ids: Sequence[int]) -> str:
-        """Lay ``rid``'s label out again as one ids span over ``ids`` without the last id, keyed as a
-        prompt of those ids would be, and return the walk that writes the span.
+    def _rebuilt_spans(self, rid: str, written: int) -> tuple[str, tuple[PrefixSpan, ...]]:
+        """``rid``'s label and its spans once a rebuild has written ``written`` ids. A layout of ids alone becomes
+        one ids span. A layout with a digest span keeps its own spans, and the samples past its prompt become
+        one more ids span."""
+        overrides = self._overrides[rid]
+        ((label, layout),) = [(label, layout) for label, layout in overrides.kv_layout.items() if layout.spans]
+        (walk,) = {span.walk for span in layout.spans}
+        if all(span.kind == "ids" for span in layout.spans):
+            return label, (PrefixSpan(written, written, walk),)
+        prompt = len(overrides.prompt_ids[label]) // 4
+        ends = itertools.accumulate(span.length if span.kind == "ids" else 0 for span in layout.spans)
+        # a span that ends past the prompt's ids holds the samples an earlier rebuild added
+        spans = tuple(span for span, end in zip(layout.spans, ends, strict=True) if end <= prompt)
+        samples = written - prompt
+        return label, (*spans, PrefixSpan(samples, samples, walk)) if samples else spans
 
-        The growth loop's cap drops by the iterations the span now covers, so the footprint stays
+    def lay_out_again(self, rid: str, ids: Sequence[int]) -> tuple[PrefixSpan, ...]:
+        """Lay ``rid``'s label out again for a rebuild over ``ids`` without the last id, and return its spans.
+        A label of ids alone is keyed as a prompt of those ids would be.
+
+        The growth loop's cap drops by the iterations the spans now cover, so the footprint stays
         the one at intake. The decode step that samples an id keys it, so a label that keys
         generation also extends its chain by the last id.
         """
@@ -2921,10 +2939,10 @@ class KVManager(AttentionResource):
         # hashed before the lock, as `resolve_cached_prefix` hashes outside it
         keys = chain(pages) if keyed else None
         with self._lock:
+            _, spans = self._rebuilt_spans(rid, length)
             layout = overrides.kv_layout[label]
-            (walk,) = {span.walk for span in layout.spans}
             ((loop, slots),) = layout.growth
-            grown = length - sum(span.length for span in layout.spans)
+            grown = sum(span.length for span in spans) - sum(span.length for span in layout.spans)
             changes = {}
             if keyed:
                 changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
@@ -2933,10 +2951,7 @@ class KVManager(AttentionResource):
                 }
             self._overrides[rid] = replace(
                 overrides,
-                kv_layout={
-                    **overrides.kv_layout,
-                    label: replace(layout, spans=(PrefixSpan(length, length, walk),), keyed_spans=int(keyed)),
-                },
+                kv_layout={**overrides.kv_layout, label: replace(layout, spans=spans, keyed_spans=int(keyed))},
                 loop_caps={**overrides.loop_caps, loop: overrides.loop_caps[loop] - grown // slots},
                 **changes,
             )
@@ -2946,10 +2961,10 @@ class KVManager(AttentionResource):
             self._seed_keys(rid, label, stream)
             if stream.chain is not None and (overrides.prefix_decode or {}).get(label):
                 stream.chain.extend([ids[-1]], page_size)
-            return walk
+            return spans
 
     def land_rebuild(self, rid: str) -> None:
-        self._dropped.discard(rid)
+        self._dropped.pop(rid, None)
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns the device pages
@@ -3515,7 +3530,7 @@ class KVManager(AttentionResource):
             self._forget_reservations(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
-            self._dropped.discard(rid)
+            self._dropped.pop(rid, None)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
             self._settle(rid, self._room() - room)
@@ -3839,8 +3854,8 @@ class KVManager(AttentionResource):
                 self._allot(rid, released)
 
     def readmit(self, rid: str, history: int) -> bool:
-        """Allot dropped ``rid`` enough pages for its ``history`` kept tokens and one page more, at most its footprint.
-        False until ``rid`` is first in `_waiting` and those pages fit the room.
+        """Allot dropped ``rid`` enough pages for its rebuilt layout over ``history`` kept ids, and one page more,
+        at most its footprint. False until ``rid`` is first in `_waiting` and those pages fit the room.
 
         Every cache hit is charged as a fresh page, since nothing is leased here. When the rebuild's probe
         hits a page another request holds, the hit costs nothing, so that page of the allotment is left for
@@ -3849,11 +3864,16 @@ class KVManager(AttentionResource):
         with self._lock:
             if next(iter(self._waiting), None) != rid:
                 return False
-            pages = -(-history // self.config.page_size) + 1
-            need = sum(
-                pages if stream.footprint is None else min(pages, stream.footprint)
-                for stream in self._streams[rid].values()
-            )
+            need = self._dropped[rid]
+            if need is None:
+                label, spans = self._rebuilt_spans(rid, history)
+                layout = self._overrides[rid].kv_layout[label]
+                caps = dict.fromkeys(dict(layout.growth), 0)
+                pages = replace(layout, spans=spans).pages(caps, self.config.page_size) + 1
+                need = self._dropped[rid] = sum(
+                    pages if stream.footprint is None else min(pages, stream.footprint)
+                    for stream in self._streams[rid].values()
+                )
             if need > self._room():
                 return False
             self._allotments[rid] = Allotment(pages=need, prompt=self._waiting.pop(rid))

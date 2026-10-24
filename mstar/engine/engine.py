@@ -36,6 +36,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.kv.config import PrefixSpan
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -2474,13 +2475,13 @@ class Engine:
                 return refusal
         return None
 
-    def lay_out_rebuild(self, node_name: str, request_id: int, ids: Sequence[int]) -> str:
-        """Lay the dropped request's KV out over all of ``ids`` but the last, and return the walk
-        whose row writes it."""
-        (walk,) = {
+    def lay_out_rebuild(self, node_name: str, request_id: int, ids: Sequence[int]) -> tuple[PrefixSpan, ...]:
+        """Lay the dropped request's KV out over all of ``ids`` but the last, and return the spans
+        the rebuild row writes."""
+        (spans,) = {
             kv.cache.lay_out_again(request_id, ids) for kv in self.paged_kv_caches() if node_name in kv.nodes
         }
-        return walk
+        return spans
 
     def land_rebuild(self, node_name: str, request_id: int) -> None:
         """Make the dropped request resident again, once its rebuild step has run."""

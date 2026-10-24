@@ -41,7 +41,8 @@ def _cleanup(node, rids, wgs):
 
 def _worker(fresh: ScheduledBatch | None = None):
     eng = SimpleNamespace(dropped=[], landed=[], is_offloaded=lambda node, rid: False,
-                          lay_out_rebuild=lambda node, rid, ids: PREFILL, get_max_batch_size=lambda node, walk: 1)
+                          lay_out_rebuild=lambda node, rid, ids: (PrefixSpan(len(ids) - 1, len(ids) - 1, PREFILL),),
+                          get_max_batch_size=lambda node, walk: 1)
     eng.is_resident, eng.drop_request = lambda _, rid: rid not in eng.dropped, lambda _, rid: eng.dropped.append(rid)
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     w = Worker.__new__(Worker)
