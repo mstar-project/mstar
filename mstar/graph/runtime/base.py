@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import NamedTuple
 
 from mstar.communication.tensors import NameToTensorList, TensorStore
@@ -421,6 +422,28 @@ class SpecRows(NamedTuple):
     # None when no ready rid has a prepped input edge: everything the step
     # reads comes from the in-flight step's outputs
     input_edges: ColumnarEdgeSpecs | None
+
+
+class InlineRouteStatus(IntEnum):
+    """What ``route_and_send_inline`` did."""
+    # nothing (a rid with no host row, an unsupported dtype): the caller takes
+    # the general path
+    NOT_ROUTED = 0
+    # routed and sent
+    SENT = 1
+    # routed, but the send needs Python-side payloads: the caller finishes
+    # with ``send_outputs``
+    ROUTED = 2
+
+
+class InlineRoute(NamedTuple):
+    """``route_and_send_inline``'s result."""
+    status: InlineRouteStatus
+    completion_id: int
+    # ``send_outputs``' return, under SENT
+    sent_rids: list[int]
+    # the route for ``send_outputs`` to finish, under ROUTED
+    route_output: "RouteOutput | None"
 
 
 class ReadyNodeSpec(NamedTuple):
@@ -855,12 +878,11 @@ class GraphRuntime(ABC):
         self, spec_node_name: str, curr_node_name: str, graph_walk: str,
         rids: list[int], room_for_continuing: int | None = None,
     ) -> "SpecRows":
-        """``prep_spec_rids`` with no stream chunks to ingest, as columns.
-
-        The worker's common speculation -- one walk on a worker with no
-        streams -- in a form a runtime can serve in one crossing. This default
-        is that composition over ``prep_spec_rids``; a runtime with a cheaper
-        form overrides it and must return the same.
+        """``prep_spec_rids`` with no stream chunks to ingest, as columns, in
+        a form a runtime can serve in one crossing (the worker uses it where
+        ``Worker._spec_rows_eligible`` allows). This default is that
+        composition over ``prep_spec_rids``; a runtime with a cheaper form
+        overrides it and must return the same.
         """
         prep = self.prep_spec_rids(SpeculationPrepInput(
             spec_node_name=spec_node_name, curr_node_name=curr_node_name,

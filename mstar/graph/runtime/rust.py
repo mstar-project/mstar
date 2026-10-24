@@ -37,6 +37,8 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     FreedTensors,
     GraphRuntime,
+    InlineRoute,
+    InlineRouteStatus,
     ParallelList,
     PopRidsOutput,
     Profiling,
@@ -584,16 +586,18 @@ class RustGraphRuntime(GraphRuntime):
         self, spec_node_name: str, curr_node_name: str, graph_walk: str,
         rids: list[int], room_for_continuing: int | None = None,
     ) -> SpecRows:
-        ready, wg_id, spec_id, edges = self._rust.prep_spec_rows(
-            spec_node_name, curr_node_name, graph_walk, rids, room_for_continuing,
+        out = self._rust.prep_spec_rows(
+            spec_node_name=spec_node_name, curr_node_name=curr_node_name,
+            graph_walk=graph_walk, rids=rids, room_for_continuing=room_for_continuing,
         )
+        edge_rids = out.edge_rids
         return SpecRows(
-            ready_rids=ready, wg_id=wg_id, spec_id=spec_id,
-            input_edges=None if edges is None else ColumnarEdgeSpecs(
-                signal_names=edges[0], signal_name_idxs=edges[1], rids=edges[2],
-                tensors_per_edge=edges[3], is_final_streaming_chunk=edges[4],
-                uuids=edges[5],
-            ),
+            ready_rids=out.ready_rids, wg_id=out.wg_id, spec_id=out.spec_id,
+            input_edges=ColumnarEdgeSpecs(
+                signal_names=out.signal_names, signal_name_idxs=out.signal_name_idxs,
+                rids=edge_rids, tensors_per_edge=out.tensors_per_edge,
+                is_final_streaming_chunk=out.is_final_streaming_chunk, uuids=out.uuids,
+            ) if edge_rids else None,
         )
 
     def prep_follow_spec_rids(
@@ -654,27 +658,27 @@ class RustGraphRuntime(GraphRuntime):
         output_signals: list[str], rids: list[int],
         inline_signal: str, inline_column: torch.Tensor,
         row_rids: list[int],
-    ):
+    ) -> InlineRoute:
         """``complete_and_route_batch`` + ``send_outputs`` for a device-loopback
         step, one crossing with the GIL released (see the Rust side).
 
         ``inline_column`` is a 1-D host view (row i for ``row_rids[i]``) the
-        caller keeps alive; Rust reads it in place. Returns
-        ``(status, completion_id, sent_rids, route_output)``: status 0 means
-        nothing was done, 2 means routed with ``route_output`` left for
-        ``send_outputs``, 1 means routed and sent.
+        caller keeps alive; Rust reads it in place.
         """
         out = self._rust.route_and_send_inline(
-            partition, graph_walk, node_name, list(output_signals), rids,
-            inline_signal, inline_column.data_ptr(), inline_column.shape[0],
-            inline_column.stride(0), _dtype_name(inline_column.dtype), row_rids,
+            partition=partition, graph_walk=graph_walk, node_name=node_name,
+            output_signals=list(output_signals), rids=rids, inline_signal=inline_signal,
+            inline_ptr=inline_column.data_ptr(), inline_rows=inline_column.shape[0],
+            inline_stride=inline_column.stride(0),
+            inline_dtype=_dtype_name(inline_column.dtype), row_rids=row_rids,
         )
+        status = InlineRouteStatus(out.status)
         route = None
-        if out.status == 2:
+        if status is InlineRouteStatus.ROUTED:
             route = self._route_output(out.take_route())
         if PHASE_PERIOD:
             phase_record("rust.route_and_send_inline.nogil", out.nogil_ns * 1e-9)
-        return out.status, out.completion_id, out.sent_rids, route
+        return InlineRoute(status, out.completion_id, out.sent_rids, route)
 
     def stop_loops_batched(
         self, partition: str, graph_walk: str, last_node_run: str,

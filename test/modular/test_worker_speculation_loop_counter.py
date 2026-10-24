@@ -4,7 +4,7 @@ A request's shared ``CurrentForwardPassInfo`` is refreshed as each batch is
 built, so while iteration k of a loop is in flight it reads k. A speculative
 next iteration built over it would run k again: for a denoise step the same
 sigma twice, and no veto of the overshoot past the last step. So
-``Worker._assemble_speculation`` gives the speculative batch per-request
+``SpeculationBuilder.assemble`` gives the speculative batch per-request
 ``InputMetadata`` carrying the counters it will run at (the engine reads them
 through ``ForwardPassInfoWrapper``), and leaves the shared info to the in-flight
 batch, whose stop check still has to read k.
@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.graph.runtime.base import SpeculationOutput  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
+from mstar.worker.speculation import SpeculationBuilder  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 LOOP = "denoise"
@@ -58,14 +59,14 @@ def _worker(shared: dict[int, CurrentForwardPassInfo]):
     )
     for name in (
         "_make_executing_batch", "_build_input_metadata_and_fwd_info",
-        "_assemble_speculation", "_streams_possible",
+        "_streams_possible",
     ):
         setattr(worker, name, getattr(Worker, name).__get__(worker))
     return worker
 
 
 def _assemble(worker, spec_target, rids, continuing):
-    return worker._assemble_speculation(
+    return SpeculationBuilder(worker).assemble(
         SimpleNamespace(
             node_name="dit", graph_walk="t2i", partition=PARTITION,
         ),

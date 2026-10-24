@@ -1,10 +1,10 @@
 """A speculative step's per-row objects, built as columns.
 
-The common speculation is a loop's next iteration whose inputs all come back
-on the device (a decode step's sampled token). Its rows need no tensors and no
-per-row decisions, so everything the model and the engine read per row is
-built here with C-level maps over the runtime's columns, rather than by a
-Python loop per row.
+Used for a speculation whose continuing rows take all their inputs from the
+step in flight, which covers a decode loop's next step. Those rows need no
+per-row decisions when the step is built, so everything the model and the
+engine read per row is built here with C-level maps over the runtime's
+columns, rather than by a Python loop per row.
 """
 from __future__ import annotations
 
@@ -23,14 +23,18 @@ _NO_STREAM_CHUNKS = MappingProxyType({})
 assert InputMetadata._fields == ("stream_chunks", "dynamic_loop_iter_counts")
 
 
-class LoopbackRowInputs(MutableMapping):
-    """``per_request_input_tensors`` for rows whose inputs come from the step
-    in flight and stay on the device: each row maps every signal in
-    ``signals`` to an empty list, built the first time the row is read.
+class DeferredRowInputs(MutableMapping):
+    """``per_request_input_tensors`` of a speculative step built before the
+    step in flight has produced its outputs. A row with no inputs of its own
+    maps every signal in ``signals`` to an empty list, built the first time
+    the row is read.
 
-    A step the engine prepares through ``uniform_row_inputs`` reads none of
-    them. Rows can also be given concrete inputs (``rows[rid] = inputs``),
-    which ``set_signals`` leaves alone.
+    When every continuing row's inputs stayed on the device, threading N's
+    outputs in only names the signals (``set_signals``), and a step the
+    engine prepares through ``uniform_row_inputs`` never builds a row.
+    Otherwise threading ``materialize``s the rows and splices them one by
+    one. Fresh rows are given the inputs their pop gathered
+    (``rows[rid] = inputs``), which ``set_signals`` leaves alone.
     """
 
     __slots__ = ("_rows", "_built", "_signals")

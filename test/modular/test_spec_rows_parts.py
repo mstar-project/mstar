@@ -14,7 +14,7 @@ from mstar.engine.engine import ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.submodule_base import EMPTY_INPUT_METADATA, InputMetadata  # noqa: E402
 from mstar.worker.node_manager_utils import RequestStateManager  # noqa: E402
-from mstar.worker.spec_rows import LoopbackRowInputs, loop_counter_snapshots  # noqa: E402
+from mstar.worker.spec_rows import DeferredRowInputs, loop_counter_snapshots  # noqa: E402
 
 
 def _info(rid: int, counts: dict, partition: str = "p") -> CurrentForwardPassInfo:
@@ -26,7 +26,7 @@ def _info(rid: int, counts: dict, partition: str = "p") -> CurrentForwardPassInf
 
 
 def test_loop_back_inputs_read_like_the_dict_threading_builds():
-    rows = LoopbackRowInputs([3, 1, 2])
+    rows = DeferredRowInputs([3, 1, 2])
     assert list(rows) == [3, 1, 2] and len(rows) == 3 and 1 in rows and 9 not in rows
     # before threading, a row has no inputs yet, as a prep with no edges gives
     assert rows[1] == {} and rows.get(9) is None
@@ -41,7 +41,7 @@ def test_loop_back_inputs_read_like_the_dict_threading_builds():
 
 
 def test_concrete_rows_keep_their_inputs():
-    rows = LoopbackRowInputs([1, 2])
+    rows = DeferredRowInputs([1, 2])
     fresh = {"tok": ["t"]}
     rows[2] = fresh
     rows.set_signals(["tok", "other"])

@@ -1,4 +1,4 @@
-"""The columnar speculation (``prep_spec_rows`` + ``Worker._assemble_speculation_rows``)
+"""The columnar speculation (``prep_spec_rows`` + ``SpeculationBuilder.assemble_rows``)
 must build exactly the speculative step the per-row path builds.
 
 A real worker (``Worker.__new__`` plus the attributes these methods read) over
@@ -24,17 +24,21 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RouteInput
 from mstar.graph.runtime.python import PythonGraphRuntime
+from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import ParallelList
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.spec_rows import LoopbackRowInputs
+from mstar.worker.spec_rows import DeferredRowInputs
+from mstar.worker.speculation import SpeculationPreparer
 from mstar.worker.worker import PendingBatch, Worker
 
 WG, WALK, NODE, LOOP, SIG, PART, ME = 0, "decode", "LLM", "decode_loop", "text_inputs", "default", "w0"
 # the second node of a two-node loop (``pair=True``): NODE -> NODE_B -> NODE
 NODE_B, SIG_B = "head", "hidden"
+# a prefill walk on NODE (``mixed=True``), for a step whose rows mix walks
+WG_PRE, PRE, MIXED = 1, "prefill", "mixed"
 
 def _have_rust() -> bool:
     try:
@@ -97,7 +101,7 @@ class _Scheduler:
         return batch
 
 
-def _runtime(kind: str, max_iters: int, pair: bool = False):
+def _runtime(kind: str, max_iters: int, pair: bool = False, mixed: bool = False):
     body = GraphNode(
         name=NODE, input_names=[SIG],
         outputs=[GraphEdge(next_node=NODE, name=SIG)],
@@ -109,11 +113,22 @@ def _runtime(kind: str, max_iters: int, pair: bool = False):
         ])
     nodes = {NODE, NODE_B} if pair else {NODE}
     section = Loop(name=LOOP, section=body, max_iters=max_iters, outputs=[])
-    wg = WorkerGraph(section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG)
+    graphs = [WorkerGraph(section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG)]
+    walks, loops, wg_nodes = {WG: {WALK}}, {WG: {LOOP}}, {WG: nodes}
+    if mixed:
+        # prefill hands its token to the conductor, as a walk transition does
+        graphs.append(WorkerGraph(
+            section=GraphNode(
+                name=NODE, input_names=[SIG],
+                outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=SIG)],
+            ),
+            graph_walks={PRE}, ranks=[0], worker_graph_id=WG_PRE,
+        ))
+        walks[WG_PRE], loops[WG_PRE], wg_nodes[WG_PRE] = {PRE}, set(), {NODE}
     common = dict(
-        my_worker_id=ME, my_worker_graphs=[wg],
-        all_wg_ids_to_graph_walks={WG: {WALK}}, all_wg_ids_to_dyn_loops={WG: {LOOP}},
-        all_wg_ids_to_nodes={WG: nodes}, node_to_partition=dict.fromkeys(nodes, PART),
+        my_worker_id=ME, my_worker_graphs=graphs,
+        all_wg_ids_to_graph_walks=walks, all_wg_ids_to_dyn_loops=loops,
+        all_wg_ids_to_nodes=wg_nodes, node_to_partition=dict.fromkeys(nodes, PART),
         sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
     )
     if kind == "python":
@@ -125,8 +140,10 @@ def _runtime(kind: str, max_iters: int, pair: bool = False):
     return rust_runtime.RustGraphRuntime(**common, bookkeeping=book), _StubTM(book)
 
 
-def _worker(kind: str, max_iters: int = 1 << 20, pair: bool = False) -> Worker:
-    rt, tm = _runtime(kind, max_iters, pair)
+def _worker(
+    kind: str, max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False,
+) -> Worker:
+    rt, tm = _runtime(kind, max_iters, pair, mixed)
     w = Worker.__new__(Worker)
     w._graph_runtime = rt
     w.tensor_manager = tm
@@ -147,18 +164,20 @@ def _worker(kind: str, max_iters: int = 1 << 20, pair: bool = False) -> Worker:
     return w
 
 
-def _admit(w: Worker, n: int, start: int = 0) -> list[int]:
+def _admit(w: Worker, n: int, start: int = 0, walk: str = WALK) -> list[int]:
     """``n`` requests, each with its loop-back input ingested and its decode
-    node ready, as a device-loopback walk starts."""
+    node ready, as a device-loopback walk starts (or, for ``PRE``, with its
+    prompt ingested)."""
+    wg = WG_PRE if walk == PRE else WG
     rids = []
     for i in range(start, start + n):
         wire = f"req-{i}"
         rid = w._graph_runtime.add_request(
-            request_id=wire, partition=PART, graph_walk=WALK,
-            partition_worker_graph_ids=[WG],
-            worker_graph_to_workers=ParallelList([WG], [[ME]]), loop_caps={})
+            request_id=wire, partition=PART, graph_walk=walk,
+            partition_worker_graph_ids=[wg],
+            worker_graph_to_workers=ParallelList([wg], [[ME]]), loop_caps={})
         w.request_state.add_request(rid, CurrentForwardPassInfo(
-            request_id=wire, graph_walk=WALK, fwd_index=0, random_seed=0,
+            request_id=wire, graph_walk=walk, fwd_index=0, random_seed=0,
             max_tokens=1 << 30, rid_handle=rid, partition_name=PART,
             # a stale counter from an earlier walk rides along in the copies
             dynamic_loop_iter_counts={"other_loop": 7},
@@ -171,10 +190,10 @@ def _admit(w: Worker, n: int, start: int = 0) -> list[int]:
     return rids
 
 
-def _pop(w: Worker, rids: list[int]) -> ScheduledBatch:
-    popped = w._graph_runtime.pop_rids(NODE, WALK, rids)
+def _pop(w: Worker, rids: list[int], walk: str = WALK) -> ScheduledBatch:
+    popped = w._graph_runtime.pop_rids(NODE, walk, rids)
     return ScheduledBatch(
-        node_name=NODE, graph_walk=WALK,
+        node_name=NODE, graph_walk=walk,
         request_to_worker_graph=dict(zip(popped.wg_ids.keys, popped.wg_ids.values, strict=True)),
         input_edges=popped.input_edges, output_signals=list(popped.output_signals),
     )
@@ -189,13 +208,35 @@ def _first_step(w: Worker, rids: list[int]) -> PendingBatch:
     )
 
 
-_ROWS_ELIGIBLE = Worker._spec_rows_eligible
+def _mixed_first_step(w: Worker, decode: list[int], prefill: list[int]) -> PendingBatch:
+    """One step whose rows mix the decode and prefill walks, as a mixing
+    scheduler builds it."""
+    dec, pre = _pop(w, decode), _pop(w, prefill, PRE)
+    batch = ScheduledBatch(
+        node_name=NODE, graph_walk=MIXED,
+        request_to_worker_graph=dict(dec.request_to_worker_graph),
+        input_edges=dec.input_edges, output_signals=list(dec.output_signals),
+        request_walks=dict.fromkeys(decode, WALK),
+        walk_output_signals={WALK: list(dec.output_signals)},
+    )
+    pre.request_walks = dict.fromkeys(prefill, PRE)
+    pre.walk_output_signals = {PRE: list(pre.output_signals)}
+    pre.graph_walk = MIXED
+    batch.merge(pre)
+    w._set_in_flight_flag(batch, True)
+    return PendingBatch(
+        batch=batch, node_batch=w._build_executing_batch(batch), node_name=NODE,
+        partition=PART, graph_walk=MIXED, future=None,
+    )
+
+
+_ROWS_ELIGIBLE = SpeculationPreparer.rows_eligible
 
 
 def _speculate(w: Worker, pending: PendingBatch, rows: bool, monkeypatch):
     # the columnar path where the worker would take it, else the per-row one
     eligible = _ROWS_ELIGIBLE if rows else (lambda *a, **k: False)
-    monkeypatch.setattr(Worker, "_spec_rows_eligible", eligible)
+    monkeypatch.setattr(SpeculationPreparer, "rows_eligible", eligible)
     target = w._choose_spec_target(pending.batch)
     if target is None:
         return None
@@ -257,6 +298,10 @@ def _route(w: Worker, pending: PendingBatch) -> None:
     wg_ids = [b.request_to_worker_graph[r] for r in rids]
     w.tensor_manager.cleanup_collectable(*rt.cleanup_consumed_inputs(node, rids, wg_ids))
     rt.clear_pending_loop_stops()
+    # a mixed step's prefill rows hand their token to the conductor: only the
+    # loop's rows route here
+    rids = b.rids_by_walk().get(WALK, [])
+    wg_ids = [b.request_to_worker_graph[r] for r in rids]
     rt.complete_and_route_batch(RouteInput(
         partition=PART, graph_walk=WALK, node_name=node,
         output_signals=list(b.output_signals), wg_ids=ParallelList(rids, wg_ids),
@@ -286,7 +331,7 @@ def _step_both(w, pending, monkeypatch, outputs=None, check_unread=True):
     if general is None or rows is None:
         assert general is None and rows is None
         return None
-    assert isinstance(rows.node_batch.per_request_input_tensors, LoopbackRowInputs)
+    assert isinstance(rows.node_batch.per_request_input_tensors, DeferredRowInputs)
     # the inputs only after threading: reading them first would build every
     # row, which a step on the uniform path never does
     assert _view(rows, read_inputs=not check_unread) == _view(
@@ -331,6 +376,30 @@ def test_a_two_node_loop_builds_the_same_steps(kind, monkeypatch):
         hops.append((spec.scheduled_batch.node_name, spec.is_new_iter))
         pending = _advance(w, pending, spec)
     assert hops == [(NODE_B, False), (NODE, True)] * 3
+
+
+@pytest.mark.parametrize("outputs", ["rows_only", "loopback", "routed"])
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_step_that_mixes_walks_continues_its_loop_the_same(kind, outputs, monkeypatch):
+    # N mixes decode rows with prefill rows; the speculation continues the
+    # decode rows, which take N's outputs however N kept them
+    w = _worker(kind, mixed=True)
+    decode = _admit(w, 4)
+    prefill = _admit(w, 3, start=4, walk=PRE)
+    pending = _mixed_first_step(w, decode, prefill)
+    out = {
+        "rows_only": _rows_only(pending),
+        "loopback": BatchedModelOutput(loopback_rids=frozenset(decode)),
+        "routed": BatchedModelOutput(
+            per_rid_outputs={r: {SIG: [torch.tensor([r])]} for r in decode + prefill},
+        ),
+    }[outputs]
+    spec = _step_both(w, pending, monkeypatch, outputs=out)
+    assert list(spec.node_batch.request_ids) == decode
+    assert spec.scheduled_batch.graph_walk == WALK and not spec.scheduled_batch.request_walks
+    pending = _advance(w, pending, spec)
+    for _ in range(2):
+        pending = _advance(w, pending, _step_both(w, pending, monkeypatch))
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -387,7 +456,7 @@ def test_a_row_without_its_loop_back_drops_on_both_paths(kind, monkeypatch):
     spec = _step_both(w, pending, monkeypatch, outputs=_rows_only(pending, missing={rids[2]}))
     assert spec.dropped == {rids[2]}
     assert rids[2] not in spec.node_batch.request_ids
-    assert not isinstance(spec.node_batch.per_request_input_tensors, LoopbackRowInputs)
+    assert not isinstance(spec.node_batch.per_request_input_tensors, DeferredRowInputs)
     _advance(w, pending, spec)
 
 

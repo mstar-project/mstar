@@ -10,7 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from functools import cached_property, partial
 from time import sleep
@@ -46,6 +46,7 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     EdgeSpec,
     GraphRuntime,
+    InlineRouteStatus,
     RequestWalks,
     RouteInput,
     RouteOutput,
@@ -94,7 +95,12 @@ from mstar.utils.profiler import (
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.spec_rows import LoopbackRowInputs, loop_counter_snapshots
+from mstar.worker.spec_rows import DeferredRowInputs
+from mstar.worker.speculation import (
+    Speculation,
+    SpeculationBuilder,
+    SpeculationPreparer,
+)
 from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -259,44 +265,6 @@ class PendingBatch:
     # speculated step is handed off before the step it follows finishes, so
     # its step time starts at that finish anyway (see WorkerMetrics.step_done)
     submitted_at: float = 0.0
-
-
-@dataclass
-class Speculation:
-    scheduled_batch: ScheduledBatch
-    node_batch: ExecutingBatch
-    # ``(name, next_node)`` pairs the spec batch consumed from batch_N's
-    # outputs. Two cases:
-    #   * Same-node loop-back (AR decode iter K → iter K+1): pairs are
-    #     ``{(name, batch_N.node_name) for name in loop_back_outputs}``.
-    #   * Forward node A -> node B transition: pairs are
-    #     ``{(edge.name, edge.next_node) for edge in batch_N.outputs if
-    #     edge.next_node == spec_target.node_name}``.
-    # Consumed in ``_thread_outputs_to_speculative`` to splice batch_N's
-    # outputs into the spec batch's per-rid input tensors.
-    consumed_edges: set[tuple[str, str]]
-    continuing_rids: set[int]
-    partition: str
-    is_new_iter: bool
-    is_same_node: bool
-    # rid -> edges
-    consumed_streaming_edges: dict[int, list[StreamingEdge]] = field(default_factory=dict)
-    # Handle for the runtime's staged streaming ingests. Settled exactly once,
-    # via ``_settle_speculation``: on submit (keeping them), or on abandon /
-    # per-rid drop (undoing those rids', so the chunk leaves the node's slot
-    # before it is handed back to its StreamBuffer).
-    spec_id: int = 0
-    is_yield_away: bool = False
-    loop_name: str | None = None
-    dropped: set[int] = field(default_factory=set)
-
-    plan_future: Future | None = None
-    # Handed to the GPU thread: its rids are that step's now, and the error
-    # handler fails them with it instead of giving them back.
-    submitted: bool = False
-    # TP async scheduling: the broadcast seq of this speculation (leader:
-    # assigned at broadcast; follower: the head's). PendingBatch.tp_seq on submit.
-    tp_seq: int = -1
 
 
 class EvictionPolicy(Enum):
@@ -2893,166 +2861,6 @@ class Worker:
             and self._async_schedulable(pending.batch)
         )
 
-    def _assemble_speculation(
-        self,
-        pending: PendingBatch,
-        spec_target: SpeculationOutput,
-        request_to_worker_graph: dict[int, int],
-        per_request_inputs: dict[int, NameToTensorList],
-        consumed_streaming_edges: dict[int, list[StreamingEdge]],
-        continuing: list[int],
-        fresh_final_edges: dict[int, set[str]],
-        *,
-        is_same_node: bool,
-        spec_id: int = 0,
-        tp_seq: int = -1,
-        request_walks: dict[int, str] | None = None,
-    ) -> Speculation:
-        """Package prepared rids (batch order) into the ``Speculation`` the main
-        loop runs. Leader and follower differ only in how they pick the rids.
-
-        ``fresh_final_edges`` is ``final_edges`` (see ``_make_executing_batch``)
-        for the rids that did not come from batch N: their final chunks were
-        ingested before this step, not polled by it."""
-        spec_node = spec_target.node_name
-        request_ids = list(request_to_worker_graph)
-        per_request_input_metadata = {
-            rid: InputMetadata(stream_chunks=chunks) for rid in request_ids
-            if (chunks := self._stream_chunks_for(rid, spec_node, per_request_inputs[rid]))
-        } if self._streams_possible() else {}
-        # rows of one walk (the usual chain) need no per-row map
-        label, request_walks = (
-            self.scheduler.label_for(spec_node, request_walks) if request_walks
-            else (spec_target.graph_walk, {})
-        )
-        spec_batch = ScheduledBatch(
-            node_name=spec_node,
-            graph_walk=label,
-            request_to_worker_graph=request_to_worker_graph,
-            request_walks=request_walks,
-            # Reported by whichever step chose the target -- speculate_node on
-            # the leader, get_spec_target on a follower -- so the hot path does
-            # not cross back into the runtime once per forward pass.
-            output_signals=spec_target.output_signals,
-            tp_seq=tp_seq,
-        )
-        input_meta, per_request_info = self._build_input_metadata_and_fwd_info(
-            node_name=spec_node, batch_partition=pending.partition,
-            per_request_inputs=per_request_inputs,
-            increment_loop_rids=continuing if spec_target.is_new_loop_iter else None,
-            increment_loop_name=spec_target.loop_name
-        )
-        spec_node_batch = self._make_executing_batch(
-            node_name=spec_node,
-            graph_walk=label,
-            request_ids=request_ids,
-            per_request_input_tensors=per_request_inputs,
-            per_request_info=per_request_info,
-            final_edges={
-                rid: {se.edge.name for se in edges if se.chunk.is_final}
-                for rid, edges in consumed_streaming_edges.items()
-                if any(se.chunk.is_final for se in edges)
-            } | fresh_final_edges,
-            per_request_input_metadata=input_meta,
-            request_walks=request_walks,
-        )
-        return Speculation(
-            scheduled_batch=spec_batch,
-            node_batch=spec_node_batch,
-            # Outputs of batch_N the spec batch consumes: every edge of the
-            # in-flight node whose destination is the spec node.
-            consumed_edges=self._graph_runtime.get_consumed_edges(
-                pending.node_name, spec_node, spec_target.graph_walk,
-            ),
-            continuing_rids=set(continuing),
-            partition=pending.partition,
-            is_new_iter=spec_target.is_new_loop_iter,
-            is_same_node=is_same_node,
-            loop_name=spec_target.loop_name,
-            consumed_streaming_edges=consumed_streaming_edges,
-            spec_id=spec_id,
-            tp_seq=tp_seq,
-        )
-
-    @cached_property
-    def _consumed_edges_cache(self) -> dict[tuple[str, str, str], frozenset]:
-        """(source node, dest node, walk) -> ``get_consumed_edges``, which is
-        structural."""
-        return {}
-
-    def _consumed_edges(
-        self, source_node: str, dest_node: str, graph_walk: str,
-    ) -> frozenset[tuple[str, str]]:
-        key = (source_node, dest_node, graph_walk)
-        edges = self._consumed_edges_cache.get(key)
-        if edges is None:
-            edges = self._consumed_edges_cache[key] = frozenset(
-                self._graph_runtime.get_consumed_edges(*key)
-            )
-        return edges
-
-    def _assemble_speculation_rows(
-        self,
-        pending: PendingBatch,
-        spec_target: SpeculationOutput,
-        continuing: list[int],
-        wg_id: int,
-        *,
-        fresh_request_to_worker_graph: dict[int, int],
-        fresh_inputs: dict[int, NameToTensorList],
-    ) -> Speculation:
-        """``_assemble_speculation`` for a step prepped as columns
-        (``prep_spec_rows``): the continuing rows' inputs all come from the
-        in-flight step, so they need no per-row work beyond the loop-counter
-        snapshot until N's outputs are threaded in. Fresh rows of the same
-        walk follow them with the inputs their pop gathered.
-
-        Builds the same batch as the general assembly, with C-level maps:
-        every rid's ``per_request_info``, ``per_request_input_metadata`` (its
-        own copy of the loop counters) and wrapped info; the inputs as a
-        ``LoopbackRowInputs``, which threading fills in once N's outputs are
-        known (``_thread_outputs_to_speculative``).
-        """
-        spec_node, walk = spec_target.node_name, spec_target.graph_walk
-        request_ids = continuing + list(fresh_request_to_worker_graph)
-        request_to_worker_graph = dict.fromkeys(continuing, wg_id)
-        request_to_worker_graph.update(fresh_request_to_worker_graph)
-        infos = self.request_state.fwd_infos(request_ids, pending.partition)
-        metadata = loop_counter_snapshots(
-            infos,
-            spec_target.loop_name if spec_target.is_new_loop_iter else None,
-            n_next_iter=len(continuing),
-        )
-        inputs = LoopbackRowInputs(request_ids)
-        for rid, rid_inputs in fresh_inputs.items():
-            inputs[rid] = rid_inputs
-        spec_batch = ScheduledBatch(
-            node_name=spec_node,
-            graph_walk=walk,
-            request_to_worker_graph=request_to_worker_graph,
-            output_signals=spec_target.output_signals,
-        )
-        spec_node_batch = ExecutingBatch(
-            node_name=spec_node,
-            per_request_info=dict(zip(request_ids, infos, strict=True)),
-            per_request_input_tensors=inputs,
-            per_request_input_metadata=dict(zip(request_ids, metadata, strict=True)),
-            step_context=StepContext(
-                request_ids=tuple(request_ids), graph_walk=walk, slot=0,
-                capture=False, request_walks={},
-            ),
-        )
-        return Speculation(
-            scheduled_batch=spec_batch,
-            node_batch=spec_node_batch,
-            consumed_edges=self._consumed_edges(pending.node_name, spec_node, walk),
-            continuing_rids=set(continuing),
-            partition=pending.partition,
-            is_new_iter=spec_target.is_new_loop_iter,
-            is_same_node=spec_node == pending.node_name,
-            loop_name=spec_target.loop_name,
-        )
-
     def _settle_speculation(
         self, speculation: Speculation, success: bool,
         dropped_rids: set[int] = frozenset(),
@@ -3153,71 +2961,6 @@ class Worker:
             or self._pending_drains or self._draining_rids
         )
 
-    def _spec_rows_eligible(self, batch_N: ScheduledBatch) -> bool:
-        """Whether the step after ``batch_N`` can be prepped and built as
-        columns (``prep_spec_rows``, ``_assemble_speculation_rows``): one
-        walk and no streams to poll. A TP follower never comes here; it
-        rebuilds whatever rows the leader's head names."""
-        return not batch_N.request_walks and not self._streams_possible()
-
-    def _prep_spec_dicts(
-        self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
-        candidates: list[int], max_continuing: int | None,
-        per_request_inputs: dict[int, NameToTensorList],
-        new_request_to_worker_graph: dict[int, int],
-        consumed_streaming_edges: dict[int, list[StreamingEdge]],
-        laps: PhaseLaps,
-    ) -> tuple[list[int], int, set[int]]:
-        """``prep_spec_rids`` with the stream polls, filling the per-row dicts
-        for the ready rids. Returns ``(ready_rids, spec_id, continuing)``."""
-        # Polling the StreamBuffers stays on this side: they hold real tensors.
-        polled: list[tuple[int, StreamingEdge]] = []
-        per_rid_counts: list[int] = []
-        if self._streams_possible():
-            for r in candidates:
-                edges = self._poll_stream_buffers_for_speculation(r, spec_node_name)
-                polled.extend((r, e) for e in edges)
-                per_rid_counts.append(len(edges))
-        else:
-            per_rid_counts = [0] * len(candidates)
-
-        prep = self._graph_runtime.prep_spec_rids(SpeculationPrepInput(
-            spec_node_name=spec_node_name,
-            curr_node_name=batch_N.node_name,
-            graph_walk=graph_walk,
-            rids=candidates,
-            room_for_continuing=max_continuing,
-            streaming_edges=[
-                EdgeSpec(
-                    signal=e.name, next_node=e.next_node,
-                    uuids=[i.uuid for i in e.tensor_info],
-                    is_final_streaming_chunk=e._final_stream_chunk,
-                ) for _r, (e, _chunk) in polled
-            ],
-            streaming_edges_per_rid=per_rid_counts,
-        ))
-
-        laps.lap("prep_spec_rids")
-        # Anything not consumed goes back to its StreamBuffer, so a later
-        # scheduling of this node picks it up normally.
-        consumed = set(prep.consumed_streaming_edge_idxs)
-        for i, (r, se) in enumerate(polled):
-            if i not in consumed:
-                self._return_streaming_edge(r, se)
-            else:
-                self._mark_stream_ingested(r, se)
-                consumed_streaming_edges.setdefault(r, []).append(se)
-
-        # `ready_rids` seeds it, so a ready rid with no prepped edge still gets
-        # an empty mapping -- what slicing a zero-length run used to give.
-        prepped_inputs = prep.input_edges.to_input_tensors(
-            self.tensor_manager.get_tensor, prep.ready_rids,
-        ).by_rid
-        for i, r in enumerate(prep.ready_rids):
-            per_request_inputs[r] = prepped_inputs[r]
-            new_request_to_worker_graph[r] = prep.wg_ids[i]
-        return prep.ready_rids, prep.spec_id, set(prep.ready_rids)
-
     def _try_speculate_next(
         self,
         pending: PendingBatch,
@@ -3244,11 +2987,6 @@ class Worker:
         graph_walk = spec_target_info.graph_walk
         rid = walk_rids[0]
         spec_node_name = spec_target_info.node_name
-        speculating_same_node = spec_node_name == batch_N.node_name
-
-        new_request_to_worker_graph: dict[int, int] = {}
-        per_request_inputs: dict[int, NameToTensorList] = {}
-        consumed_streaming_edges: dict[int, list[StreamingEdge]] = {}
         # Backlogged rids for this target get first claim on the batch: they
         # have already waited a step, and the chain only ever continues its own
         # rids, so at the cap they would never be reached. None => uncapped.
@@ -3277,37 +3015,11 @@ class Worker:
                     spec_node_name, r, self.request_state.get_fwd_info(r, partition),
                 )
             ]
-        # The common case, one walk with no streams, is prepped as columns,
-        # and its rows built from them (`_assemble_speculation_rows`).
-        rows = None
-        if self._spec_rows_eligible(batch_N):
-            rows = self._graph_runtime.prep_spec_rows(
-                spec_node_name, batch_N.node_name, graph_walk, candidates,
-                max_continuing,
-            )
-            laps.lap("prep_spec_rows")
-            ready_rids, spec_id = rows.ready_rids, rows.spec_id
-            if not ready_rids:
-                return None
-            if rows.input_edges is not None:
-                # an input that is not the in-flight step's: per-row dicts
-                prepped_inputs = rows.input_edges.to_input_tensors(
-                    self.tensor_manager.get_tensor, ready_rids,
-                ).by_rid
-                per_request_inputs.update(prepped_inputs)
-                new_request_to_worker_graph.update(
-                    dict.fromkeys(ready_rids, rows.wg_id),
-                )
-                rows = None
-            continuing = set(ready_rids)
-        else:
-            ready_rids, spec_id, continuing = self._prep_spec_dicts(
-                batch_N, spec_node_name, graph_walk, candidates, max_continuing,
-                per_request_inputs, new_request_to_worker_graph,
-                consumed_streaming_edges, laps,
-            )
+        prep = self._spec_preparer.prepare(
+            batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
+        )
         laps.lap("continuing_inputs")
-
+        continuing = prep.ready_rids
         if not continuing:
             return None
         # fresh rows of another walk (a mixing chain): rid -> walk
@@ -3322,7 +3034,7 @@ class Worker:
             self.request_state,
             target=spec_target,
             pre_existing_batch_size=len(continuing),
-            capture_group_of=ready_rids[0],
+            capture_group_of=continuing[0],
         )
         laps.lap("fresh_schedule")
 
@@ -3338,8 +3050,9 @@ class Worker:
                 self.tensor_manager.get_tensor,
                 fresh_batch.request_to_worker_graph,
             )
+            in_flight = set(continuing)
             for rid in fresh_batch.request_to_worker_graph:
-                if rid in continuing:
+                if rid in in_flight:
                     # Shouldn't happen — continuing rids are held by the
                     # in-flight step and shouldn't be in ready queues —
                     # but if it does, the in-flight rid wins.
@@ -3352,8 +3065,8 @@ class Worker:
                     )
                     continue
 
-                per_request_inputs[rid] = fresh_inputs[rid]
-                new_request_to_worker_graph[rid] = (
+                prep.per_request_inputs[rid] = fresh_inputs[rid]
+                prep.request_to_worker_graph[rid] = (
                     fresh_batch.request_to_worker_graph[rid]
                 )
                 if rid in fresh_final:
@@ -3364,38 +3077,19 @@ class Worker:
 
         laps.lap("fresh_merge")
         logger.debug("Speculating: %s %s", spec_node_name, continuing)
-        if rows is not None and not other_walks and not fresh_final_edges:
-            # the dicts hold only the fresh rows here; a fresh row's final
-            # stream chunk takes the general assembly, which carries it
-            speculation = self._assemble_speculation_rows(
-                pending, spec_target_info, ready_rids, rows.wg_id,
-                fresh_request_to_worker_graph=new_request_to_worker_graph,
-                fresh_inputs=per_request_inputs,
-            )
-            laps.lap("assemble")
-            return speculation
-        if rows is not None:
-            # a mixing chain took fresh rows of another walk: the general
-            # assembly, with the continuing rows ahead of the fresh ones
-            per_request_inputs = {
-                **{r: {} for r in ready_rids}, **per_request_inputs,
-            }
-            new_request_to_worker_graph = {
-                **dict.fromkeys(ready_rids, rows.wg_id),
-                **new_request_to_worker_graph,
-            }
-        speculation = self._assemble_speculation(
-            pending, spec_target_info,
-            new_request_to_worker_graph, per_request_inputs,
-            consumed_streaming_edges, continuing, fresh_final_edges,
-            is_same_node=speculating_same_node, spec_id=spec_id,
-            # a per-row map only when the step mixes walks
-            request_walks={
-                **dict.fromkeys(new_request_to_worker_graph, graph_walk), **other_walks,
-            } if other_walks else None,
+        speculation = self._spec_builder.build(
+            pending, spec_target_info, prep, other_walks, fresh_final_edges,
         )
         laps.lap("assemble")
         return speculation
+
+    @cached_property
+    def _spec_preparer(self) -> SpeculationPreparer:
+        return SpeculationPreparer(self)
+
+    @cached_property
+    def _spec_builder(self) -> SpeculationBuilder:
+        return SpeculationBuilder(self)
 
     def _thread_outputs_to_speculative(
         self, speculation: Speculation,
@@ -3415,7 +3109,7 @@ class Worker:
         # fallback batch of such a walk does (``device_loopback_signals``).
         rows_only = getattr(outputs_N, "rows_only", False)
         row_inputs = speculation.node_batch.per_request_input_tensors
-        if isinstance(row_inputs, LoopbackRowInputs):
+        if isinstance(row_inputs, DeferredRowInputs):
             if rows_only and speculation.continuing_rids.issubset(
                 outputs_N.row_request_ids or (),
             ):
@@ -3570,7 +3264,7 @@ class Worker:
             self.scheduler.warn_unchecked_read_failure(head, fresh)
             return None
 
-        # output_signals are handled by _assemble_speculation
+        # output_signals are handled by SpeculationBuilder.assemble
         fresh_wg, fresh_edges = popped.wg_ids, popped.edge_specs
 
         # The leader's list is the composition every rank runs: all-or-nothing,
@@ -3654,7 +3348,7 @@ class Worker:
             "Follow-speculating: %s %s (seq %d from %d)",
             head.node_name, head_rids, head.spec_seq, head.spec_from_seq,
         )
-        speculation = self._assemble_speculation(
+        speculation = self._spec_builder.assemble(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, in_n, fresh_final_edges,
@@ -4154,16 +3848,19 @@ class Worker:
         if buf is None or buf.dim() == 0 or buf.numel() == 0:
             return False
         column = buf.reshape(buf.shape[0], -1)[:, 0]
-        status, _completion_id, sent_rids, route_output = rt.route_and_send_inline(
-            batch_N.partition, batch.graph_walk, batch_N.node_name, signals, rids,
-            signal, column, list(host_rows.request_ids),
+        inline = rt.route_and_send_inline(
+            partition=batch_N.partition, graph_walk=batch.graph_walk,
+            node_name=batch_N.node_name, output_signals=signals, rids=rids,
+            inline_signal=signal, inline_column=column,
+            row_rids=list(host_rows.request_ids),
         )
-        if status == 0:
+        if inline.status is InlineRouteStatus.NOT_ROUTED:
             return False
         rt.update_dynamic_loop_iters(
             batch_N.node_batch.per_request_info, batch_N.partition,
         )
-        if status == 2:
+        route_output = inline.route_output
+        if inline.status is InlineRouteStatus.ROUTED:
             # Routed; the send needs what only Python has: the general tail.
             if route_output.freed_inputs.uuids:
                 self.tensor_manager.cleanup_collectable(*route_output.freed_inputs)
@@ -4174,7 +3871,7 @@ class Worker:
                 buffered_publish,
             )
             return True
-        for rid in sent_rids:
+        for rid in inline.sent_rids:
             self.request_state.flush_publish_info(rid, batch_N.partition)
         return True
 

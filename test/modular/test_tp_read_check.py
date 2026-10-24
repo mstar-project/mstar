@@ -415,7 +415,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
             is_new_iter=False, is_same_node=True,
         )
 
-    w._assemble_speculation = assemble
+    w._spec_builder = SimpleNamespace(assemble=assemble)
     pending = SimpleNamespace(
         tp_seq=0, node_name=NODE, graph_walk=WALK,
         batch=ScheduledBatch(node_name=NODE, graph_walk=WALK,
@@ -485,7 +485,7 @@ def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_hea
         read_failed=["f1"], continuing=["c0"], fresh=["f0", "f1"], head_rids=["c0", "f0", "f1"],
     )
     spec = Worker._try_follow_speculation(w, pending)
-    spec.continuing_rids = set(w.continuing[-1])  # as ``_assemble_speculation`` sets it
+    spec.continuing_rids = set(w.continuing[-1])  # as ``SpeculationBuilder.assemble`` sets it
     manager = w.request_state
 
     # what ``_maybe_clear_spec`` gives back

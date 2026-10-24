@@ -12,7 +12,7 @@ to take it from there; dropping it leaves the loop waiting forever for a chunk
 the stream will never send.
 
 Drives the real ``_try_speculate_next`` / ``_try_follow_speculation``,
-``_assemble_speculation`` and ``_settle_final_streams``; the scheduler, graph
+``SpeculationBuilder.assemble`` and ``_settle_final_streams``; the scheduler, graph
 runtime and tensor store are stubs that hand back one continuing and one fresh
 rid.
 """
@@ -33,6 +33,7 @@ from mstar.graph.runtime.base import (  # noqa: E402
 )
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler, PopReadyResult, ScheduledBatch  # noqa: E402
+from mstar.worker.speculation import SpeculationBuilder, SpeculationPreparer  # noqa: E402
 from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
 
 NODE, WALK, LOOP, PART, STREAM = "nano_llm", "decode", "decode_loop", "LLM", "audio_frame"
@@ -84,16 +85,19 @@ def _worker(scheduler, runtime):
         _stream_partition={STREAM: PART},
         _in_flight_rids=set(),
         _is_tearing_down=lambda rid: False,
+        _teardowns_pending=lambda: False,
         _streams_possible=lambda: True,
         _poll_stream_buffers_for_speculation=lambda rid, node: [],
         _stream_chunks_for=lambda rid, node, inputs: None,
     )
     for name in (
-        "_try_speculate_next", "_try_follow_speculation", "_assemble_speculation",
+        "_try_speculate_next", "_try_follow_speculation",
         "_make_executing_batch", "_build_input_metadata_and_fwd_info",
         "_settle_final_streams",
     ):
         setattr(worker, name, getattr(Worker, name).__get__(worker))
+    worker._spec_preparer = SpeculationPreparer(worker)
+    worker._spec_builder = SpeculationBuilder(worker)
     return worker
 
 

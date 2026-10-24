@@ -1371,6 +1371,23 @@ pub struct SpecPrepOut {
     all_or_nothing_failed: bool,
 }
 
+/// `prep_spec_rows`' result: the ready rows, their one worker graph (-1
+/// when none is ready), the spec id, and the prepped input edges as the
+/// columns `prep_spec_rids` reports (empty when every input comes from the
+/// in-flight step).
+#[pyclass(get_all)]
+pub struct SpecRowsOut {
+    pub ready_rids: Vec<u32>,
+    pub wg_id: i64,
+    pub spec_id: u32,
+    pub signal_names: Vec<String>,
+    pub signal_name_idxs: Vec<u32>,
+    pub edge_rids: Vec<u32>,
+    pub tensors_per_edge: Vec<u32>,
+    pub is_final_streaming_chunk: Vec<bool>,
+    pub uuids: Vec<u64>,
+}
+
 impl SpecPrepOut {
     fn set_edges(&mut self, c: EdgeColumns) {
         self.signal_names = c.signal_names;
@@ -2376,21 +2393,14 @@ impl GraphRuntime {
     }
 
     /// `prep_spec_rids` for a speculation that ingests no stream chunks, as
-    /// columns in one crossing: the worker's common case, a loop's next
-    /// iteration on a worker with no streams.
-    ///
-    /// Returns `(ready_rids, wg_id, spec_id, edges)`. Every ready rid
-    /// speculates in the same worker graph (the target's owner), so one
-    /// `wg_id` stands for the column; -1 when no rid is ready. `edges` is
-    /// None when no ready rid has a prepped input edge -- every input comes
-    /// from the in-flight step -- else the six edge columns as
-    /// `prep_spec_rids` reports them. Runs holding the GIL: releasing it
+    /// columns in one crossing (see `SpecRowsOut`). Every ready rid
+    /// speculates in the same worker graph, the target's owner, so one
+    /// `wg_id` stands for the column. Runs holding the GIL: releasing it
     /// around the body measured no faster on the GPU.
     #[pyo3(signature = (
         spec_node_name, curr_node_name, graph_walk, rids,
         room_for_continuing = None,
     ))]
-    #[allow(clippy::type_complexity)]
     fn prep_spec_rows(
         &mut self,
         spec_node_name: String,
@@ -2398,10 +2408,7 @@ impl GraphRuntime {
         graph_walk: String,
         rids: Vec<u32>,
         room_for_continuing: Option<u32>,
-    ) -> PyResult<(
-        Vec<u32>, i64, u32,
-        Option<(Vec<String>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<bool>, Vec<u64>)>,
-    )> {
+    ) -> PyResult<SpecRowsOut> {
         let n = rids.len();
         let arg = SpecPrepArg {
             spec_node_name,
@@ -2413,12 +2420,17 @@ impl GraphRuntime {
             streaming_edges_per_rid: vec![0; n],
         };
         let out = self.prep_spec(arg, false)?;
-        let wg_id = out.wg_ids.first().map_or(-1, |&w| i64::from(w));
-        let edges = (!out.edge_rids.is_empty()).then(|| (
-            out.signal_names, out.signal_name_idxs, out.edge_rids,
-            out.tensors_per_edge, out.is_final_streaming_chunk, out.uuids,
-        ));
-        Ok((out.ready_rids, wg_id, out.spec_id, edges))
+        Ok(SpecRowsOut {
+            wg_id: out.wg_ids.first().map_or(-1, |&w| i64::from(w)),
+            ready_rids: out.ready_rids,
+            spec_id: out.spec_id,
+            signal_names: out.signal_names,
+            signal_name_idxs: out.signal_name_idxs,
+            edge_rids: out.edge_rids,
+            tensors_per_edge: out.tensors_per_edge,
+            is_final_streaming_chunk: out.is_final_streaming_chunk,
+            uuids: out.uuids,
+        })
     }
 
     /// Settle the streaming ingests a prep staged under `spec_id`.
