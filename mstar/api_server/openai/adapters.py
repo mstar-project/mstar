@@ -1219,8 +1219,8 @@ class OmnilingualASRAdapter(OpenAIAdapter):
     ``window_seconds`` in extra_body (5 to 40) sets both lengths for one
     request. ``language``, ``prompt`` and ``temperature`` have no
     effect (argmax CTC decoding has nothing to condition or sample). There
-    are no timestamps: ``srt`` / ``vtt`` get one cue spanning the file and
-    ``verbose_json`` an empty segment list.
+    are no timestamps: each window with text is one segment spanning it, so
+    ``srt`` / ``vtt`` get one cue and ``verbose_json`` one segment per window.
     """
 
     supports_transcriptions = True
