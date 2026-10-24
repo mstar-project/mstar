@@ -99,7 +99,10 @@ def test_engine_falls_back_and_attributes_failures():
         check_stop_batched=lambda *a: LLMSubmodule.check_stop_batched(_sub(), *a),
         check_stop=lambda rid, info, out: LLMSubmodule.check_stop(_sub(), rid, info, out),
     )
-    engine = SimpleNamespace(_submodules={"LLM": SimpleNamespace(submodule=sub)})
+    # no declared policies, so the batched check and its per-request fallback run
+    engine = SimpleNamespace(
+        _submodules={"LLM": SimpleNamespace(submodule=sub)}, stop_policies=lambda *a: None,
+    )
     tokens = torch.tensor([3, 3])
     outputs = {"a": {"new_token": [tokens[0:1]]}, "x": {"new_token": [tokens[1:2]]}}
     stops = Engine.check_stop_for_batch(

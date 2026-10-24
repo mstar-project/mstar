@@ -60,6 +60,8 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
     StopCheck,
+    StopKind,
+    StopPolicy,
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
@@ -117,6 +119,23 @@ def checkpoint_identity(path: str | Path) -> bytes:
     if config.is_file():
         parts.append(config.read_bytes())
     return fingerprint(*parts)
+
+
+def _row_values(host_rows: HostRows, signal: str, rids: list) -> list | None:
+    """``signal``'s first value per row of ``rids``, in order (None for a rid
+    with no row), or None when the host rows do not carry it."""
+    buf = host_rows.buffers.get(signal)
+    if not torch.is_tensor(buf) or buf.dim() == 0:
+        return None
+    values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
+    rows = host_rows.request_ids
+    if len(rows) >= len(rids) and all(a == b for a, b in zip(rids, rows, strict=False)):
+        return values
+    row_of = {rid: i for i, rid in enumerate(rows)}
+    return [
+        values[i] if (i := row_of.get(rid)) is not None and i < len(values) else None
+        for rid in rids
+    ]
 
 
 class PagedKVCache(NamedTuple):
@@ -571,6 +590,11 @@ class Engine:
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
         self._loopback_steps: dict[int, tuple[str, str]] = {}
+        # (node, walk) -> its declared stop policies with their EOS sets, or None
+        # when check_stop decides (NodeSubmodule.get_stop_policies)
+        self._stop_policies: dict[tuple[str, str], tuple[tuple[StopPolicy, frozenset], ...] | None] = {}
+        # rid -> walk -> per policy, (max_iters, ignore_eos); dropped in remove_request
+        self._stop_limits: dict[int, dict[str, tuple[tuple[int, bool], ...]]] = {}
         self._runner = StepRunner(
             self._resources,
             # every node, including one that owns nothing (Code2Wav) — an
@@ -1878,6 +1902,69 @@ class Engine:
         laps.lap("tail")
         return outputs
 
+    def stop_policies(
+        self, node_name: str, graph_walk: str,
+    ) -> tuple[tuple[StopPolicy, frozenset], ...] | None:
+        """``get_stop_policies`` for (node, walk), each with its EOS ids as a
+        set; None when ``check_stop`` decides. Asked once per (node, walk)."""
+        key = (node_name, graph_walk)
+        try:
+            return self._stop_policies[key]
+        except KeyError:
+            pass
+        policies = self._submodules[node_name].submodule.get_stop_policies(graph_walk)
+        out = None if policies is None else tuple((p, frozenset(p.eos_tokens)) for p in policies)
+        self._stop_policies[key] = out
+        return out
+
+    def stop_limits(
+        self, rid: int, graph_walk: str, info: CurrentForwardPassInfo,
+        policies: tuple[tuple[StopPolicy, frozenset], ...],
+    ) -> tuple[tuple[int, bool], ...]:
+        """Per policy, the request's (max_iters, ignore_eos) on this walk,
+        computed the first time the request is checked on it."""
+        walks = self._stop_limits.get(rid)
+        if walks is None:
+            walks = self._stop_limits[rid] = {}
+        limits = walks.get(graph_walk)
+        if limits is None:
+            limits = walks[graph_walk] = tuple(p.limits(info) for p, _ in policies)
+        return limits
+
+    def _check_declared_stops(
+        self, batch: ExecutingBatch, policies: tuple[tuple[StopPolicy, frozenset], ...],
+        host_rows: HostRows | None,
+    ) -> dict[int, set[str]] | None:
+        """The declared policies over the batch, off one ``tolist`` per token
+        signal; None when a token signal is not on the host rows."""
+        stops: dict[int, set[str]] = {}
+        if not policies:
+            return stops
+        rids = batch.request_ids
+        tokens: dict[str, list] = {}
+        for p, _ in policies:
+            if p.kind is StopKind.AR and p.token_signal not in tokens:
+                values = None if host_rows is None else _row_values(host_rows, p.token_signal, rids)
+                if values is None:
+                    return None
+                tokens[p.token_signal] = values
+        infos = batch.per_request_info_wrapped
+        walk = batch.step_context.graph_walk
+        for i, rid in enumerate(rids):
+            # a row with no token produced no output, which check_stop skips
+            if any(values[i] is None for values in tokens.values()):
+                continue
+            info = infos[rid]
+            counts = info.dynamic_loop_iter_counts
+            for (p, eos), (max_iters, ignore_eos) in zip(
+                policies, self.stop_limits(rid, walk, info, policies), strict=True,
+            ):
+                if counts.get(p.loop, 0) + 1 >= max_iters or (
+                    p.kind is StopKind.AR and not ignore_eos and tokens[p.token_signal][i] in eos
+                ):
+                    stops.setdefault(rid, set()).add(p.loop)
+        return stops
+
     def check_stop_for_batch(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
         host_rows: HostRows | None = None,
@@ -1899,9 +1986,22 @@ class Engine:
         on ``batch.withheld_outputs``, for the caller to leave unrouted.
         """
         submodule = self._submodules[batch.node_name].submodule
+        ctx = batch.step_context
+        policies = None if ctx.request_walks else self.stop_policies(batch.node_name, ctx.graph_walk)
+        if policies is not None:
+            try:
+                declared = self._check_declared_stops(batch, policies, host_rows)
+            except Exception:
+                # the paths below attribute a failure to its own request
+                logger.debug(
+                    "declared stop check failed (node=%s); falling back",
+                    batch.node_name, exc_info=True,
+                )
+                declared = None
+            if declared is not None:
+                return declared
         if host_rows is not None:
             try:
-                ctx = batch.step_context
                 batched = submodule.check_stop_batched(
                     batch.request_ids, batch.per_request_info_wrapped, host_rows,
                     step_walk=None if ctx.request_walks else ctx.graph_walk,
@@ -2813,6 +2913,7 @@ class Engine:
         a KV cache whose pages reach the free list or are left to the prefix
         index alone. An offloaded request, or one that never ran, frees none."""
         self._loopback_steps.pop(request_id, None)
+        self._stop_limits.pop(request_id, None)
         freed = {
             key for key, resource in self._resources.items()
             if resource.reclaimable(request_id)
