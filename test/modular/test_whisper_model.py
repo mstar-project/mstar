@@ -44,6 +44,7 @@ from mstar.model.whisper.config import (  # noqa: E402
 )
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule, WhisperEncoderSubmodule  # noqa: E402
 from mstar.model.whisper.whisper_model import WhisperDetokenizer, WhisperModel  # noqa: E402
+from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -325,6 +326,8 @@ def _decoder_submodule(cfg: WhisperModelConfig) -> WhisperDecoderSubmodule:
     sub.node_resources = {}
     sub.config = cfg
     sub._suppress_ids = sub._begin_suppress_ids = sub._language_mask = None
+    sub._stager = PinnedStager(torch.long)
+    sub._inactive = None
     return sub
 
 
@@ -378,7 +381,9 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     row2 = sub.prepare_inputs(PREFILL_WALK, plain, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE, NOTS])], **ctx})
     assert row2.tensor_inputs["ts_rules"].tolist() == inactive_state()
     batch = sub.preprocess(PREFILL_WALK, _engine_inputs(["ts", "plain"]), [row, row2])
-    assert batch["ts_rules"].shape == (2, 4)
+    # staged from the host rows in one copy each
+    assert batch["ts_rules"].tolist() == [row.tensor_inputs["ts_rules"].tolist(), inactive_state()]
+    assert batch["row_lens"].tolist() == [3, 4]
 
     # a decode step takes the state routed with its token, never a host history
     routed = torch.tensor([1, 2, cfg.timestamp_begin + 2, cfg.vocab_size])

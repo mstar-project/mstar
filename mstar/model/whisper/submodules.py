@@ -52,6 +52,7 @@ from mstar.model.whisper.config import (
     SAMPLER,
     WhisperModelConfig,
 )
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +250,15 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         self._begin_suppress_ids: torch.Tensor | None = None
         self._language_mask: torch.Tensor | None = None
         self.timestamp_rules = TimestampRules(config)
+        self._stager = PinnedStager(torch.long)
+        self._inactive: torch.Tensor | None = None
         alignment.warm_up()
+
+    def _inactive_rules(self, device: torch.device) -> torch.Tensor:
+        """The rules-off state, built once: rows are only read (stacked)."""
+        if self._inactive is None or self._inactive.device != device:
+            self._inactive = torch.tensor(inactive_state(), dtype=torch.long, device=device)
+        return self._inactive
 
     # -- logit rules ------------------------------------------------------
 
@@ -335,7 +344,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             if routed:
                 tensor_inputs["ts_rules"] = routed[0].to(device).reshape(-1)
             else:
-                tensor_inputs["ts_rules"] = torch.tensor(inactive_state(), dtype=torch.long, device=device)
+                tensor_inputs["ts_rules"] = self._inactive_rules(device)
         else:
             state = self.request_state(fwd_info.rid_handle)
             # The route resolved these from the request's kwargs, which is
@@ -361,7 +370,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             if task is not None:
                 state.add("task", task)
             row = rule_state([], self.config) if timestamps else inactive_state()
-            tensor_inputs["ts_rules"] = torch.tensor(row, dtype=torch.long, device=device)
+            # on the host: ``preprocess`` stages the batch's rows in one copy
+            tensor_inputs["ts_rules"] = torch.tensor(row, dtype=torch.long)
 
         return ARNodeInputs(
             input_seq_len=seq_len,
@@ -491,13 +501,20 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 "audio_frames": inp.tensor_inputs["audio_frames"],
             }
         rows = [self._row_ids(inp) for inp in inputs]
-        preprocessed: dict[str, torch.Tensor | Any] = {
-            "input_ids": torch.cat(rows),
-            "ts_rules": torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs]),
-        }
-        if graph_walk != DECODE_WALK:
+        rules = torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs])
+        preprocessed: dict[str, torch.Tensor | Any] = {"input_ids": torch.cat(rows)}
+        if graph_walk == DECODE_WALK:
+            preprocessed["ts_rules"] = rules
+        else:
+            # Host values go over in one pinned, non-blocking copy each: a
+            # torch.tensor(..., device=) from a list is a blocking copy that
+            # waits out the stream (at prefill, the encoder's window).
+            device = rows[0].device
+            preprocessed["ts_rules"] = torch.empty(rules.shape, dtype=torch.long, device=device)
+            self._stager.copy_(preprocessed["ts_rules"].view(-1), rules.view(-1).numpy())
             # packed prefill: where each request's last token sits
-            preprocessed["row_lens"] = torch.tensor([r.shape[0] for r in rows], dtype=torch.long, device=rows[0].device)
+            preprocessed["row_lens"] = torch.empty(len(rows), dtype=torch.long, device=device)
+            self._stager.copy_(preprocessed["row_lens"], [r.shape[0] for r in rows])
         if graph_walk in ENCODER_WALKS:
             # Concatenated in segment order, which is how the context plan
             # laid the requests' pages out.
