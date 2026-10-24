@@ -69,7 +69,7 @@ def reference(args):
     print(f"HF loaded in {load_seconds:.1f}s", flush=True)
     tensors, cases = {}, []
     for case_index, prompt in enumerate(PROMPTS):
-        ids = adapter.process_prompt(prompt, ["text"], ["text"])["text_inputs"][0]
+        ids = adapter.process_prompt(prompt, ["text"], ["text"]).new_input_tensors["text_inputs"][0]
         rendered = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
         )
@@ -205,7 +205,7 @@ def mstar(args):
         expected = load_file(args.output / "hf_logits.safetensors")
         results, tensors = [], {}
         for index, case in enumerate(reference_info["cases"]):
-            ids = runtime.model.process_prompt(case["prompt"], ["text"], ["text"])["text_inputs"][0]
+            ids = runtime.model.process_prompt(case["prompt"], ["text"], ["text"]).new_input_tensors["text_inputs"][0]
             if ids.tolist() != case["input_ids"]:
                 raise AssertionError("HF and M* input tokens differ")
             rid = f"parity_{index}"
