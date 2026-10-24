@@ -276,10 +276,22 @@ class Speculation:
 
 
 @dataclass(slots=True)
+class PrefillCopies:
+    """Host copies of what a request's prefill row read besides its ids, and a copy of that row's step metadata, for
+    its rebuild. Empty until the row's step has run. ``landed`` is recorded after the copies, and stays None on a CPU
+    device, where the inputs are kept as they are."""
+    inputs: NameToTensorList | None = None
+    step_metadata: dict | None = None
+    landed: torch.Event | None = None
+
+
+@dataclass(slots=True)
 class KeptIds:
-    """A request's token ids on one node as int32: its prompt, then each sample it kept."""
+    """A request's token ids on one node as int32: its prompt, then each sample it kept. A prompt with digest spans
+    is rebuilt from ``copies`` as well."""
     prompt: bytes
     sampled: array
+    copies: PrefillCopies | None = None
 
 
 @dataclass(slots=True)
@@ -674,6 +686,7 @@ class Worker:
         self._kept_ids: dict[str, dict[int, KeptIds]] = {
             node_name: {} for node_name in self._kv_keys if self._can_rebuild_on(node_name, my_walks)
         }
+        self._set_copied_inputs()
         self._set_local_loops(my_walks)
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
@@ -1069,27 +1082,51 @@ class Worker:
         """Keep the prompt's ids on each node where one prefill row can recompute the request's KV
         from them. The node's paged KV caches must lay out one label, written by one walk and grown
         by one loop. The node must also read a single input, with the same name in that walk and in
-        every walk the loop grows in, since the rebuild row's ids go under that name."""
+        every walk the loop grows in, since the rebuild row's ids go under that name. For an unkeyed label
+        with digest spans, on a node at one rank, that walk can read more inputs, and the node keeps host copies
+        of them for the rebuild row. Such a label must end on an ids span for the samples to extend, since the
+        rebuild row runs under the prefill row's step metadata, which covers only the prompt's spans. The prompt ids
+        must fill the label's ids spans exactly, since the rebuild row splits them by those spans."""
         for node_name, kept in self._kept_ids.items():
             keys = self._kv_keys[node_name]
             if request_id in kept:
                 continue  # its other partition's NewRequest
             prompts = [
-                (layout, (config.prompt_ids or {}).get(label))
+                (layout, (config.prompt_ids or {}).get(label), bool((config.prefix_keys or {}).get(label)))
                 for key in keys if isinstance(config := configs.get(key), KVReqConfig)
                 for label, layout in (config.kv_layout or {}).items()
             ]
             if len(prompts) != 1 or prompts[0][1] is None:
                 continue
-            layout, ids = prompts[0]
+            layout, ids, keyed = prompts[0]
             walks = {span.walk for span in layout.spans}
             if len(layout.growth) != 1 or len(walks) != 1:
                 continue
             ((loop, _),) = layout.growth
-            reads = self._walk_inputs.get((*walks, node_name), set())
+            media = any(span.kind == "digest" for span in layout.spans)
+            copied = self._copied_inputs.get((*walks, node_name), set())
+            if bool(copied) != media:
+                continue
+            if media and (
+                keyed or node_name in self.parallel_nodes or layout.spans[-1].kind != "ids"
+                or len(ids) // 4 != sum(span.length for span in layout.spans if span.kind == "ids")
+            ):
+                continue
+            reads = self._walk_inputs.get((*walks, node_name), set()) - copied
             grows = [walk for (walk, node), name in self._growth_loops.items() if node == node_name and name == loop]
             if len(reads) == 1 and grows and all(self._walk_inputs.get((walk, node_name)) == reads for walk in grows):
-                kept[request_id] = KeptIds(ids, array("i"))
+                kept[request_id] = KeptIds(ids, array("i"), PrefillCopies() if media else None)
+
+    def _set_copied_inputs(self) -> None:
+        """Map (walk, node) to what a node that keeps ids reads in that walk and in none of its growth walks.
+        These inputs, such as an encoder's output, are freed after a step, so a rebuild row takes them from host
+        copies. A node that shares a paged KV cache but runs none of the walks that grow it keeps no ids."""
+        self._copied_inputs: dict[tuple[str, str], set[str]] = {}
+        for node_name in self._kept_ids:
+            grown = set().union(*(self._walk_inputs.get(key, ()) for key in self._growth_loops if key[1] == node_name))
+            for (walk_name, node), names in self._walk_inputs.items():
+                if node == node_name and grown and names - grown:
+                    self._copied_inputs[(walk_name, node)] = names - grown
 
     def _set_local_loops(self, my_walks: set[tuple[str, str]]) -> None:
         """Give each paged KV cache the loops that grow in a walk this worker runs on one of the cache's nodes."""
@@ -1117,7 +1154,7 @@ class Worker:
         if not self._rebuildable(request_id, node_name):
             raise RuntimeError(
                 f"Worker {self.worker_id}: {self._rid_str(request_id)} keeps no ids on {node_name}, is in a walk "
-                "that grows no KV there, or keeps samples that don't cover its KV"
+                "that grows no KV there, keeps samples that don't cover its KV, or has host copies that haven't landed"
             )
         backlogged = any(
             request_id in batch.request_to_worker_graph
@@ -1138,10 +1175,13 @@ class Worker:
         The rebuild row runs under the request's step_metadata as it stands at the drop, and a model
         discards the row's sample only under decode-time metadata, so the request must be in the walk
         that grows its KV. The prefill and each iteration of the growth loop sample once, and the KV
-        holds all but the last sample.
+        holds all but the last sample. A prompt with digest spans also needs its host copies landed.
         """
         kept = self._kept_ids.get(node_name, {}).get(request_id)
         if kept is None:
+            return False
+        copies = kept.copies
+        if copies is not None and (copies.inputs is None or copies.landed is not None and not copies.landed.query()):
             return False
         info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
         loop = self._growth_loops.get((info.graph_walk, node_name))
@@ -3554,6 +3594,9 @@ class Worker:
             request_ids=batch_N.node_batch.request_ids,
         )
         _pp_stage("prematerialize")
+        copied = self._copied_inputs.get((batch_N.batch.graph_walk, batch_N.node_name))
+        if copied:
+            self._copy_inputs(batch_N.node_batch, copied)
         stops = engine.check_stop_for_batch(
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
         )
@@ -3717,6 +3760,41 @@ class Worker:
         engine = self.engine_manager.get_engine(node_batch.node_name)
         for rid in node_batch.rebuild_rids & set(node_batch.request_ids):
             engine.land_rebuild(node_batch.node_name, rid)
+
+    def _copy_inputs(self, node_batch: ExecutingBatch, names: set[str]) -> None:
+        """Copy to the host each prefill row's inputs under ``names``, as the step received them, and its step
+        metadata. The host has waited on the step, so the copies need no wait and queue behind the step's own
+        output copy."""
+        kept_ids, taken = self._kept_ids[node_batch.node_name], []
+        for rid in node_batch.request_ids:
+            kept = kept_ids.get(rid)
+            if kept is None or kept.copies is None or rid in node_batch.rebuild_rids:
+                continue
+            inputs = node_batch.per_request_input_tensors[rid]
+            kept.copies.inputs = {name: [self._to_host(t) for t in inputs[name]] for name in names}
+            kept.copies.step_metadata = dict(node_batch.per_request_info[rid].step_metadata)
+            taken.append(kept.copies)
+        if taken and self.device_capability.is_accelerator:
+            landed = torch.Event(device=self.device)
+            landed.record(self._side_stream())
+            for copies in taken:
+                copies.landed = landed
+
+    def _to_host(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type == "cpu":
+            return tensor
+        host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+        side = self._side_stream()
+        with side:
+            host.copy_(tensor, non_blocking=True)
+        # Once the worker drops the tensor, the step's stream may reuse its memory before the copy has read it.
+        tensor.record_stream(side)
+        return host
+
+    def _side_stream(self) -> torch.Stream:
+        if self._d2h_stream is None:
+            self._d2h_stream = torch.Stream(device=self.device)
+        return self._d2h_stream
 
     def _keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs, host_rows: "HostRows | None",
@@ -4252,9 +4330,7 @@ class Worker:
         if not source:
             return source, None
 
-        if self._d2h_stream is None:
-            self._d2h_stream = torch.Stream(device=self.device)
-        side = self._d2h_stream
+        side = self._side_stream()
         side.wait_event(completion_event)
 
         if outputs.check_stop_buffers is not None and row_rids is not None:
