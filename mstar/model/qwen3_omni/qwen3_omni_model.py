@@ -325,13 +325,6 @@ class Qwen3OmniModel(Model):
             )
         }
 
-    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """The Thinker keys its prompt by text ids, each image and audio clip by
-        file, and its replies as they decode."""
-        return {THINKER_KV: {"main": PrefixStream(
-            "text_inputs", "ids", "prefill_text", "thinker_decode", ("prefill_vision", "prefill_audio"),
-        )}}
-
     def checkpoint_path(self) -> str:
         return self.local_dir
 
@@ -1161,9 +1154,6 @@ class Qwen3OmniModel(Model):
         The result has ``text_inputs`` containing the FULL templated +
         expanded token IDs, plus the per-modality tensor outputs needed by
         the Thinker's prefill walks.
-
-        A prompt with images or audio and no video, given their tensors, also
-        returns the Thinker's ``prefix_layout``.
         """
         result: NameToTensorList = {}
 
@@ -1364,6 +1354,8 @@ class Qwen3OmniModel(Model):
         }
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        """The Thinker keys its prompt by text ids, each image and audio clip by
+        file, and its replies as they decode."""
         return {
             THINKER_KV: {"main": KVLabel(
                 growth=(("thinker_decode", "thinker_decode_loop"),),
