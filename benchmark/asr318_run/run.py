@@ -70,6 +70,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(REPO))
+from mstar.cli.main import DEFAULT_CONFIGS  # noqa: E402  (the `mstar serve` default per model)
 
 HOME = Path.home()
 DATA = Path(os.environ.get("ASR_DATA", HOME / "asr318_data"))
@@ -80,13 +81,13 @@ SERVER_SH = HERE / "server.sh"
 
 MODELS = {
     "turbo": {"key": "whisper_large_v3_turbo", "hf": "openai/whisper-large-v3-turbo", "family": "whisper",
-              "config": "configs/whisper_large_v3_turbo.yaml", "engines": ["mstar", "vllm", "sgl_omni"]},
+              "engines": ["mstar", "vllm", "sgl_omni"]},
     "large": {"key": "whisper_large", "hf": "openai/whisper-large-v3", "family": "whisper",
-              "config": "configs/whisper_large.yaml", "engines": ["mstar", "vllm", "sgl_omni"]},
+              "engines": ["mstar", "vllm", "sgl_omni"]},
     "qasr": {"key": "qwen3_asr", "hf": "Qwen/Qwen3-ASR-1.7B", "family": "qwen",
-             "config": "configs/qwen3_asr.yaml", "engines": ["mstar", "vllm", "sgl_omni"]},
+             "engines": ["mstar", "vllm", "sgl_omni"]},
     "qasr_rt": {"key": "qwen3_asr_realtime", "hf": "Qwen/Qwen3-ASR-0.6B", "family": "qwen",
-                "config": "configs/qwen3_asr_realtime.yaml", "engines": ["mstar", "vllm"],
+                "engines": ["mstar", "vllm"],
                 # vLLM registers /v1/realtime only for a SupportsRealtime class; the checkpoint's
                 # default architecture is the plain transcription one (the route answers 403)
                 "vllm_args": ["--hf-overrides", '{"architectures": ["Qwen3ASRRealtimeGeneration"]}']},
@@ -370,7 +371,7 @@ class Server:
     def __init__(self, out: Path, m: str, e: str, gpu: int, port: int, tag: str, timed: bool = True,
                  extra: list[str] | None = None, env_extra: dict | None = None, cap: int | None = None):
         """``cap``: the most concurrent requests the caller drives. An mstar config capping
-        max_concurrent_requests below it is served from a raised copy (``bench_config``)."""
+        max_concurrent_requests below it is served from a raised copy, Whisper's excepted (``bench_config``)."""
         self.out, self.m, self.e, self.gpu, self.port = out, m, e, gpu, port
         self.name = f"{m}_{e}_{tag}"
         self.timed, self.extra, self.env_extra = timed, list(extra or []), dict(env_extra or {})
@@ -385,14 +386,22 @@ class Server:
     def bench_config(self, cap: int | None) -> tuple[list[str], int | None]:
         """``self.extra`` with the served config raised to ``cap`` concurrent requests, and the cap served.
         Past the config's cap, requests queue in the conductor, so a cell above it would time the queue,
-        not the engine (Qwen3-ASR ships at 12). The KV page count stays: benchmark utterances are short."""
+        not the engine (Qwen3-ASR ships at 12). The KV page count stays: benchmark utterances are short.
+        Whisper is served as configured: its cap is what its decoder caches hold, and the model refuses
+        a config raised past it."""
         args = list(self.extra)
-        at = args.index("--config") + 1 if "--config" in args else None
-        src = REPO / (args[at] if at is not None else MODELS[self.m]["config"])
+        at, prefix = None, ""  # where the config path sits in args: `--config path` or `--config=path`
+        for i, arg in enumerate(args):
+            if arg == "--config" and i + 1 < len(args):
+                at, prefix = i + 1, ""
+            elif arg.startswith("--config="):
+                at, prefix = i, "--config="
+        src = (REPO / "configs" / DEFAULT_CONFIGS[MODELS[self.m]["key"]] if at is None
+               else REPO / args[at].removeprefix(prefix))
         text = src.read_text()
         found = re.search(r"^max_concurrent_requests:[ \t]*(\d+)", text, re.M)
         served = int(found.group(1)) if found else None
-        if cap is None or served is None or served >= cap:
+        if cap is None or served is None or served >= cap or MODELS[self.m]["family"] == "whisper":
             return args, served
         path = self.out / "servers" / f"{self.name}.config.yaml"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -401,7 +410,7 @@ class Server:
         if at is None:
             args += ["--config", str(path)]
         else:
-            args[at] = str(path)
+            args[at] = prefix + str(path)
         return args, cap
 
     def variants(self) -> list[tuple[str, list[str], dict]]:
@@ -1597,8 +1606,8 @@ def phase_summarize(a) -> int:
              "(400 requests), closed loop, language=en, temperature 0, json; 5 warmup waves at c=32 then 1 wave "
              "per point; RTFx = audio s / wall s. A cell counts only with 0 errors and 0 bad transcripts "
              "(per-request content check). mean +- sd over valid rounds with the same engine config. "
-             f"mstar's timed servers raise a config's max_concurrent_requests to {max(CONCS)} (the config "
-             "column says what each served).", ""]
+             f"mstar's timed servers raise a config's max_concurrent_requests to {max(CONCS)}, except "
+             "Whisper's, which is what its decoder caches hold (the config column says what each served).", ""]
 
     def ms(vals):
         vals = [v for v in vals if v is not None]

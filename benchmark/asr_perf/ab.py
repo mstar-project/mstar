@@ -177,7 +177,8 @@ def run_server_cells(a, arm: str, m: str, r: int, engine: str = "mstar", spec: "
 
 
 def max_conc(a) -> int:
-    """The most concurrent requests any cell or warmup drives: mstar servers are raised to it."""
+    """The most concurrent requests any cell or warmup drives: mstar servers are raised to it, Whisper's
+    excepted (``Server.bench_config``)."""
     return max(*a.concs, H.WARM_CONC, a.profile_conc)
 
 
