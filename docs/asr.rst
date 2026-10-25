@@ -47,11 +47,14 @@ requests batch together and are captured per batch size (1 to 64).
 ``align``
     only when word timestamps were asked for: one teacher-forced pass over
     ``<|startoftranscript|><|lang|><|task|><|notimestamps|> transcript
-    <|endoftext|>`` on the served decoder weights, outside the caches. The
-    alignment heads' cross-attention becomes word start/end times (per-head
-    standardization, median filter, dynamic time warping), emitted in
-    Whisper's own timestamp vocabulary after ``<|startoflm|>`` so the same
-    detokenizer renders it and the serving layer lifts it into ``words``.
+    <|endoftext|>`` on the served decoder weights, outside the caches. On the
+    GPU, the alignment heads' cross-attention is standardized per head,
+    median-filtered and averaged, and the walk emits that matrix with the
+    token ids as one float32 tensor. The API server's ``postprocess`` runs the
+    dynamic time warping (compiled by numba, part of the ``asr`` extra, when
+    the API server loads the model) and groups tokens into words, rendered in
+    Whisper's own timestamp vocabulary after ``<|startoflm|>``, which the
+    serving layer lifts into ``words``.
 
 **Request options** (``model_kwargs`` / the OpenAI fields): ``language``
 (ISO code; omit to detect), ``task`` (``transcribe`` or ``translate``),

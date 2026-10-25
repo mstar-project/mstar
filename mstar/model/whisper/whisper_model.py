@@ -22,10 +22,13 @@ Graph walks:
     prefill_prompt   — decoder only: ``<|lang|>`` (detected) + ``<|task|>[<|notimestamps|>]``
                        over the context the previous walk wrote
     decode           — decoder loop; each step feeds the sampled token back
+    align            — decoder only, after decode when word timestamps were
+                       asked for: emits the cross-attention alignment that
+                       ``postprocess`` turns into word timings
 
-Request state machine:
-    language given:  prefill -> decode -> done
-    language absent: detect_language -> prefill_prompt -> decode -> done
+Request state machine (``[-> align]`` for word timestamps):
+    language given:  prefill -> decode [-> align] -> done
+    language absent: detect_language -> prefill_prompt -> decode [-> align] -> done
 
 The transcript is streamed token by token as Whisper's own token stream
 rendered to text: spoken words as bytes, plus the language token (``<|en|>``)
@@ -65,6 +68,7 @@ from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer
+from mstar.model.whisper.components import alignment
 from mstar.model.whisper.components.timestamps import inactive_state
 from mstar.model.whisper.config import (
     ALIGN_WALK,
@@ -117,8 +121,6 @@ class WhisperDetokenizer(ByteLevelDetokenizer):
         super().__init__(tokenizer)
         self.config = config
         self._render_ids = set(config.language_token_ids)
-        # the align walk's word timings open with this marker (see submodules)
-        self._render_ids.add(tokenizer.convert_tokens_to_ids("<|startoflm|>"))
 
     def _rendered(self, token_id: int) -> bool:
         return token_id in self._render_ids or self.config.is_timestamp(token_id)
@@ -148,6 +150,8 @@ class WhisperModel(Model):
     # The API server decodes uploads and stages their tensors with small CPU
     # ops; a thread per core spins between them and starves its event loop.
     PREPROCESS_TORCH_THREADS = 4
+    # Mel frames that carry audio, set by ``process_prompt`` for the align walk
+    INTERNAL_KWARGS = ("audio_frames",)
     # Set from the deployment by validate_config_yaml: the align walk re-runs
     # the decoder unsharded, so word timestamps need tp_size 1.
     _decoder_tp_size = 1
@@ -303,8 +307,8 @@ class WhisperModel(Model):
                 if group.get("graph_walks") is None or walk in group["graph_walks"]
             )
 
-        # the align walk reads the tokens the decode walk recorded in the
-        # decoder's worker-local request state
+        # the align walk reads the tokens the decode walk's stop check
+        # recorded in the decoder's worker-local request state
         if serving(DECODE_WALK) != serving(ALIGN_WALK):
             raise ValueError(
                 f"{config_path}: the {DECODER_NODE} node's {DECODE_WALK!r} and {ALIGN_WALK!r} "
@@ -410,8 +414,9 @@ class WhisperModel(Model):
 
         align = GraphNode(
             name=DECODER_NODE,
-            input_names=["encoder_states", "transcript", "audio_frames"],
-            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="word_tokens", output_modality="text")],
+            input_names=["encoder_states"],
+            # float32, which is how ``postprocess`` tells it from token ids
+            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="alignment", output_modality="text")],
         )
 
         return {
@@ -441,9 +446,9 @@ class WhisperModel(Model):
         """
         return {
             "is_prefill": True,
-            "language": kwargs.get("language_token"),
-            "task": kwargs.get("task_token"),
             "timestamps": kwargs.get("timestamps", False),
+            # the stop check keeps the prompt walk's token for the align walk
+            "word_timestamps": kwargs.get("word_timestamps", False),
         }
 
     def get_initial_forward_pass_args(
@@ -460,12 +465,10 @@ class WhisperModel(Model):
         detect = bool(prompt_tail)
         kwargs = model_kwargs or {}
         # The same three settings ``process_prompt`` built the forced prompt
-        # from, resolved to token ids here and carried on the metadata. The
-        # decoder used to recover them by reading the prompt tensor back with
-        # ``.tolist()``, which is a D2H sync inside ``prepare_inputs`` on the
-        # GPU thread — at prefill it blocks on the encoder's queued window.
+        # from, resolved to token ids here and carried on the metadata, rather
+        # than read back off the prompt tensor on the GPU thread (a D2H sync).
         # Detection leaves the language token unknown by construction; the
-        # decoder keeps the sampled one from the prompt walk instead.
+        # decoder's stop check keeps the detected one instead.
         language = kwargs.get("language")
         if kwargs.get("timestamps") == "word" and self._decoder_tp_size > 1:
             # a 400 now, rather than a failure after the whole decode has run
@@ -482,7 +485,7 @@ class WhisperModel(Model):
                 "prompt_tail": prompt_tail,
                 # for the align walk: how much of the window carries audio,
                 # and whether the request asked for word timestamps at all
-                "audio_frames": input_signals.get("audio_frames", []),
+                "audio_frames": kwargs.get("audio_frames"),
                 "word_timestamps": kwargs.get("timestamps") == "word",
                 "language_token": (
                     None if language is None else self.config.language_token(language)
@@ -537,20 +540,25 @@ class WhisperModel(Model):
             metadata.is_prefill = False
             metadata.graph_walk = DECODE_WALK
         elif metadata.graph_walk == DECODE_WALK and word_timestamps:
-            # The loop is done. Align the transcript (the persisted first token
-            # here, the rest recorded on the decoder) against the persisted
-            # encoder output.
+            # The loop is done. Align the transcript (recorded on the decoder)
+            # against the persisted encoder output.
             metadata.graph_walk = ALIGN_WALK
             inputs = [
                 self._edge(DECODER_NODE, "encoder_states", persist_signals.get("encoder_states", [])),
-                self._edge(DECODER_NODE, "transcript", new_token),
-                self._edge(DECODER_NODE, "audio_frames", metadata.kwargs.get("audio_frames", [])),
             ]
+            kwargs = metadata.kwargs
             return ForwardPassArgs(
                 full_metadata=metadata,
                 inputs=inputs,
                 unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]) + list(ts_rules),
-                step_metadata={"is_prefill": False},
+                step_metadata={
+                    "is_prefill": False,
+                    # the forced prompt the transcript is aligned under; a
+                    # detected language (None here) the decoder recorded
+                    "language": kwargs.get("language_token"),
+                    "task": kwargs.get("task_token"),
+                    "audio_frames": kwargs.get("audio_frames"),
+                },
             )
         elif metadata.graph_walk in (DECODE_WALK, ALIGN_WALK):
             # The decode dynamic loop returned to the conductor (EOS or max
@@ -566,13 +574,10 @@ class WhisperModel(Model):
             self._edge(DECODER_NODE, "text_inputs", new_token),
             self._edge(DECODER_NODE, "ts_rules", ts_rules),
         ]
-        # the first transcript token stays persisted when the align walk
-        # will need the whole transcript
-        released = [] if word_timestamps else list(new_token)
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
-            unpersist_tensors=released + list(ts_rules),
+            unpersist_tensors=list(new_token) + list(ts_rules),
             step_metadata={"is_prefill": False},
         )
 
@@ -646,8 +651,6 @@ class WhisperModel(Model):
         out: NameToTensorList = {
             "audio": [window],
             "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
-            # mel frames that carry audio, word timestamps align within them
-            "audio_frames": [torch.tensor([self.log_mel.num_frames(window.numel())], dtype=torch.long)],
         }
         # the encoder takes the padded window whole, so its context is always this long
         context = self.config.max_source_positions
@@ -670,7 +673,11 @@ class WhisperModel(Model):
                 spans=(Span("rows", encoder_walk, context, context, "encoder_states"),),
             )},
         }
-        return ProcessPromptOutput(out, {"kv_layout": kv_layout})
+        return ProcessPromptOutput(out, {
+            "kv_layout": kv_layout,
+            # mel frames that carry audio, word timestamps align within them
+            "audio_frames": self.log_mel.num_frames(window.numel()),
+        })
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
@@ -691,9 +698,38 @@ class WhisperModel(Model):
         modality: str,
         **kwargs,
     ) -> bytes:
-        if modality == "text":
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
-        raise ValueError(f"Unsupported modality for Whisper: {modality!r}")
+        if modality != "text":
+            raise ValueError(f"Unsupported modality for Whisper: {modality!r}")
+        if output.is_floating_point():
+            # the align walk's alignment; every other text output is token ids
+            return self._word_timings_text(output)
+        return self._detokenizer.to_bytes(output.reshape(-1).tolist())
+
+    def warmup_preprocess(self) -> None:
+        # postprocess runs the word timestamps' DTW in this process
+        alignment.warm_up()
+
+    def _decode_raw(self, ids: list[int]) -> str:
+        """Word grouping's decode: no clean-up, which rewrites text across token
+        boundaries (openai-whisper's tiktoken decode has none)."""
+        return self.tokenizer.decode(ids, clean_up_tokenization_spaces=False)
+
+    def _word_timings_text(self, output: torch.Tensor) -> bytes:
+        """Word timings in Whisper's timestamp vocabulary, as the transcription
+        route parses them: ``<|startoflm|>`` then ``<|start|> word <|end|>``
+        per word."""
+        matrix, text, language = alignment.unpack_output(output)
+        words = alignment.word_timings(matrix, text, self._decode_raw, self.config.language_of(language))
+        tb, top = self.config.timestamp_begin, self.config.vocab_size - 1
+
+        def stamp(seconds: float) -> bytes:
+            token = min(top, tb + int(round(seconds / self.config.timestamp_precision)))
+            return self._detokenizer.to_bytes([token])
+
+        parts = [b"<|startoflm|>"]
+        for w in words:
+            parts += [stamp(w["start"]), w["word"].encode("utf-8"), stamp(w["end"])]
+        return b"".join(parts)
 
     # -------------------------------------------------------------------
     # Model ABC: sharding
@@ -790,4 +826,4 @@ class WhisperModel(Model):
         decoder.eval()
 
         from mstar.model.whisper.submodules import WhisperDecoderSubmodule
-        return WhisperDecoderSubmodule(decoder=decoder, config=self.config, tokenizer=self.tokenizer)
+        return WhisperDecoderSubmodule(decoder=decoder, config=self.config)

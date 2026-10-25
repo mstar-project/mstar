@@ -80,17 +80,22 @@ def test_dtw_follows_a_diagonal_band_and_is_monotonic():
 
 
 def test_warm_up_compiles_or_falls_back_and_the_dtw_still_agrees(monkeypatch):
-    """warm_up compiles the DTW at load; a compile failure falls back to the
+    """warm_up compiles the DTW at load; a compile failure keeps the
     plain-Python loop rather than failing the first word-timestamp request."""
+    import sys
+    import types
+
     cost = np.random.default_rng(0).random((6, 20))
     expected = alignment._dtw_trace(np.ascontiguousarray(cost))
+    monkeypatch.setattr(alignment, "_dtw_trace_fast", alignment._dtw_trace)
     alignment.warm_up()
     assert np.array_equal(alignment._dtw_trace_fast(np.ascontiguousarray(cost)), expected)
 
     def broken(_cost):
         raise RuntimeError("cannot compile")
 
-    monkeypatch.setattr(alignment, "_dtw_trace_fast", broken)
+    monkeypatch.setattr(alignment, "_dtw_trace_fast", alignment._dtw_trace)
+    monkeypatch.setitem(sys.modules, "numba", types.SimpleNamespace(njit=lambda **_: lambda fn: broken))
     alignment.warm_up()
     assert alignment._dtw_trace_fast is alignment._dtw_trace
 
@@ -158,16 +163,24 @@ def test_languages_without_spaces_split_per_character():
 
 
 def test_word_timings_end_to_end_on_a_synthetic_alignment():
+    """The align walk's output (GPU side) carries everything the host side
+    needs: the matrix over the frames with audio, the text ids, the language."""
+    sot, en, transcribe, nots, eot = 50258, 50259, 50360, 50364, 50257
     vocab = {1: " He", 2: " hop", 3: "ed", 4: " there"}
+    tokens = torch.tensor([sot, en, transcribe, nots, 1, 2, 3, 4, eot])
     rows, frames = 5, 100  # 4 text tokens + end-of-text, 2 s of encoder positions
-    matrix = torch.zeros(rows, frames)
+    weights = torch.zeros(2, len(tokens), 150)  # 3 s of positions, 2 of them audio
     for i in range(rows):
-        matrix[i, 20 * i: 20 * i + 20] = 1.0
-    weights = matrix.unsqueeze(0).repeat(2, 1, 1)
-    words = alignment.word_timings(weights, [1, 2, 3, 4], lambda ids: "".join(vocab[i] for i in ids), num_frames=200)
+        weights[:, alignment.PROMPT_ROWS + i, 20 * i: 20 * i + 20] = 1.0
+    output = alignment.alignment_output(weights, tokens, num_frames=200)
+    assert output.dtype == torch.float32 and output.shape == (rows, frames + 1)
+    assert output[:, -1].tolist() == [1, 2, 3, 4, en]
+    matrix, text, language = alignment.unpack_output(output)
+    assert text == [1, 2, 3, 4] and language == en and matrix.shape == (rows, frames)
+    words = alignment.word_timings(matrix, text, lambda ids: "".join(vocab[i] for i in ids))
     assert words == [
         {"word": "He", "start": 0.0, "end": 0.4},
         {"word": "hoped", "start": 0.4, "end": 1.2},
         {"word": "there", "start": 1.2, "end": 1.6},
     ]
-    assert alignment.word_timings(weights, [], lambda ids: "", num_frames=200) == []
+    assert alignment.word_timings(matrix, [], lambda ids: "") == []
