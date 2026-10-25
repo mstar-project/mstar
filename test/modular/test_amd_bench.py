@@ -1189,8 +1189,15 @@ def test_i2v_rows_send_their_own_first_frames(tmp_path):
     items = json.loads((wan / "manifest.json").read_text())["items"]
     assert wan == tmp_path / "wan" / "set-video-i2v" and len(items) == 5
     assert all(it["files"]["image"] == f"{catalog.ROWS['wan22'].i2v_frames}/{it['id']}.png" for it in items)
-    own = sweep.workload_set_dir(catalog.ROWS["cosmos3_nano"], i2v, tmp_path / "cosmos")
-    assert own == sweep.SETS_ROOT / "sets" / "video_v1" and not (tmp_path / "cosmos").exists()
+    # Cosmos3-Nano sends its reference's 480x832 crops too; a row without i2v_frames sends the set's own frames.
+    nano = sweep.workload_set_dir(catalog.ROWS["cosmos3_nano"], i2v, tmp_path / "cosmos")
+    nano_items = json.loads((nano / "manifest.json").read_text())["items"]
+    assert "Cosmos3-Nano-480x832x17-s35-i2v/video_v1/conditioning" in catalog.ROWS["cosmos3_nano"].i2v_frames
+    assert [it["files"]["image"] for it in nano_items] == [
+        f"{catalog.ROWS['cosmos3_nano'].i2v_frames}/{it['id']}.png" for it in nano_items]
+    plain = __import__("dataclasses").replace(catalog.ROWS["cosmos3_nano"], i2v_frames=None)
+    own = sweep.workload_set_dir(plain, i2v, tmp_path / "own")
+    assert own == sweep.SETS_ROOT / "sets" / "video_v1" and not (tmp_path / "own").exists()
     assert sweep.workload_set_dir(catalog.ROWS["wan22"], t2v, tmp_path / "t") == sweep.SETS_ROOT / "sets" / "video_v1"
     cmd = sweep.runner_command(catalog.ARMS["mstar"], catalog.ROWS["wan22"], i2v, 1, 8400, tmp_path / "r", 0,
                                set_dir=wan)
