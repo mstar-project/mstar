@@ -278,6 +278,8 @@ def _check_ref_audio_soundfile(path: str) -> None:
         # no sample count in the header (a FLAC written to a pipe)
         with _ref_audio_decodes:
             seconds = count_sound_file_seconds(path, MAX_REF_AUDIO_SECONDS)
+    if not seconds:
+        raise ValueError("reference audio has no samples")
     _require_ref_audio_seconds(seconds)
 
 
