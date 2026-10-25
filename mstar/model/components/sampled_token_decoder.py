@@ -88,14 +88,6 @@ def splice_media(
     return torch.where(pad[:, None], media[index].to(embeds.dtype), embeds)
 
 
-def token_is_real(walk: str, info: CurrentForwardPassInfo | None) -> bool:
-    """Whether a row's sampled token is the request's: every decode row's, and
-    the last prefill's. ``info`` is None for a capture's padding rows."""
-    return walk == "decode" or (
-        info is not None and info.step_metadata.get("last_prefill", False)
-    )
-
-
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     SAMPLER = SAMPLER
     # the decode walk reads its input ids off the sampler's slot masters
@@ -118,6 +110,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # (vision, audio or both). Capped well below a long prompt because static
     # buffers are sized by the largest bucket; past it the step runs eagerly.
     PREFILL_MEDIA_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
+    # Prompt rows a mixed step may carry beside its decode rows: the
+    # attention's prefill kernels are captured for this many, and a recurrent
+    # state's prefill kernel gathers and scatters each such row's whole state.
+    MIXED_MAX_PREFILL_ROWS = 4
     # Requests per media-walk step, of any medium: the largest caps every
     # media walk, captured or not (`max_batch_size`), so a packed step stays
     # near the top bucket (4 fit ~1000 tokens a request: a ~1000 px square
@@ -239,6 +235,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         return max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES) if graph_walk in self._media_walks else None
+
+    def max_rows_in_combined(self, graph_walk: str) -> int | None:
+        return self.MIXED_MAX_PREFILL_ROWS if graph_walk == "prefill_text" else None
 
     # ------------------------------------------------------------------
     # Inputs
@@ -373,15 +372,6 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             if (inp.graph_walk or graph_walk) != "decode"
         } if graph_walk != "decode" else {}
 
-        kept_rids = None
-        if graph_walk != "decode":
-            # decode rows, and the last prefill, keep their token through `postprocess`
-            info = per_request_info or {}
-            kept_rids = frozenset(
-                rid for rid, inp in zip(request_ids, inputs, strict=True)
-                if token_is_real(inp.graph_walk or graph_walk, info[rid] if rid in info else None)
-            )
-
         # None advances by the span; a media prompt placing its own
         # positions advances by what it says (see `_media_inputs`)
         advance = None
@@ -398,7 +388,6 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 SAMPLER: SamplerStep(
                     apply_penalty=True,
                     prefill_tracked_tokens=prefill_tokens,
-                    kept_rids=kept_rids,
                 ),
                 ROPE: PositionStep(advance=advance),
             },
@@ -465,18 +454,6 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # ------------------------------------------------------------------
     # Post-step
     # ------------------------------------------------------------------
-
-    def postprocess(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs,
-    ):
-        if not token_is_real(request_info.graph_walk, request_info):
-            outputs.pop("new_token", None)
-            return
-        super().postprocess(request_id, request_info, outputs, **kwargs)
 
     def check_stop(
         self,

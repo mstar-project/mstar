@@ -1,7 +1,7 @@
 """The shared VLM scaffolds: the media walk set in ``multimodal``, the
 `SampledTokenDecoder` LLM node and the `PackedBlockLoopEncoder` vision node.
 
-No checkpoint: the pad expansion, the splice and the schedule run on small
+No checkpoint: the pad expansion, the splice and the prefill walk run on small
 ids, and the nodes on stubs. The per-model files test each model's own pieces.
 """
 from types import SimpleNamespace
@@ -18,7 +18,7 @@ from mstar.model.multimodal import (
     expand_media_pads,
     initial_prefill_args,
     media_layout,
-    media_prefill_schedule,
+    media_prefill_step,
     media_walk_names,
     media_walks,
     next_prefill_args,
@@ -95,7 +95,7 @@ def test_a_replay_tail_cannot_shift_a_real_row():
 
 
 # ---------------------------------------------------------------------------
-# Walks, schedule and forward-pass args
+# Walks, prefill and forward-pass args
 # ---------------------------------------------------------------------------
 
 
@@ -115,40 +115,40 @@ def _signals(**counts: int) -> dict[str, list[str]]:
     return {name: [f"{name}{i}" for i in range(n)] for name, n in counts.items()}
 
 
-def test_text_only_prompts_prefill_a_walk_per_text():
-    signals = _signals(text_inputs=2)
-    schedule = media_prefill_schedule(signals, [VISION], model_name="m")
-    assert schedule == [
-        PrefillStep("prefill_text", {("LLM", "text_inputs"): [f"text_inputs{i}"]}) for i in range(2)
-    ]
+def test_a_text_prompt_is_one_prefill_text_walk():
+    signals = _signals(text_inputs=1)
+    step = media_prefill_step(signals, [VISION], model_name="m")
+    assert step == PrefillStep("prefill_text", {("LLM", "text_inputs"): ["text_inputs0"]})
+    # encoder inputs with no layout to place them by are refused, not dropped
+    with pytest.raises(ValueError, match="no media layout"):
+        media_prefill_step(_signals(text_inputs=1, pixel_values=1), [VISION], model_name="m")
 
 
 @pytest.mark.parametrize(("counts", "walk"), [
-    ({"pixel_values": 2, "image_grid_thw": 2}, "prefill_vision"),
+    ({"pixel_values": 2}, "prefill_vision"),
     ({"audio_values": 1}, "prefill_audio"),
-    ({"pixel_values": 1, "image_grid_thw": 1, "audio_values": 2}, "prefill_vision_audio"),
+    ({"pixel_values": 1, "audio_values": 2}, "prefill_vision_audio"),
 ])
 def test_a_media_prompt_is_one_walk_over_the_encoders_it_needs(counts, walk):
     signals = _signals(text_inputs=1, **counts)
-    layout = {"offset": [3]}
-    (step,) = media_prefill_schedule(signals, [VISION, AUDIO], layout, model_name="m")
+    encoder = {"pixel_values": VISION, "audio_values": AUDIO}
+    # the layout's runs name the encoders, as they do the KV layout's walk
+    layout = {"offset": [3] * len(counts), "output": [encoder[name].output for name in counts]}
+    step = media_prefill_step(signals, [VISION, AUDIO], layout, model_name="m")
     assert step.walk == walk and step.metadata == {MEDIA_LAYOUT: layout}
     edges = {(e.next_node, e.name): e.tensor_info for e in walk_input_edges(step)}
-    node = {"pixel_values": "vision_encoder", "image_grid_thw": "vision_encoder", "audio_values": "audio_encoder"}
     assert edges == {
         ("LLM", "text_inputs"): ["text_inputs0"],
-        **{(node[name], name): signals[name] for name in counts},
+        **{(encoder[name].node, name): signals[name] for name in counts},
     }
 
 
-def test_the_walks_run_the_schedule_then_decode_then_finish():
-    signals = _signals(text_inputs=2)
-    schedule = media_prefill_schedule(signals, [VISION], model_name="m")
-    first = initial_prefill_args(schedule, ["text"], ["text"], signals, model_name="m")
-    assert first.step_metadata == {"is_prefill": True, "last_prefill": False}
+def test_the_walks_run_the_prefill_then_decode_then_finish():
+    signals = _signals(text_inputs=1)
+    first = initial_prefill_args(media_prefill_step(signals, [VISION], model_name="m"), ["text"], ["text"])
+    assert first.step_metadata == {"is_prefill": True}
     meta = first.full_metadata
-    second = next_prefill_args(meta, {})
-    assert meta.graph_walk == "prefill_text" and second.step_metadata["last_prefill"]
+    assert meta.graph_walk == "prefill_text"
     decode = next_prefill_args(meta, {"new_token": ["tok"]})
     assert meta.graph_walk == "decode" and not meta.is_prefill
     assert [(e.next_node, e.name, e.tensor_info) for e in decode.inputs] == [("LLM", "text_inputs", ["tok"])]
@@ -156,33 +156,22 @@ def test_the_walks_run_the_schedule_then_decode_then_finish():
 
 
 def test_a_media_walk_carries_its_layout_in_step_metadata():
-    signals = _signals(text_inputs=1, pixel_values=1, image_grid_thw=1)
+    signals = _signals(text_inputs=1, pixel_values=1)
     layout = {"offset": [1], "tokens": [4], "output": ["vision_embeds"], "grid": [[1, 4, 4]]}
-    schedule = media_prefill_schedule(signals, [VISION], layout, model_name="m")
-    first = initial_prefill_args(schedule, ["image", "text"], ["text"], signals, model_name="m")
-    assert first.step_metadata == {"is_prefill": True, "last_prefill": True, MEDIA_LAYOUT: layout}
+    step = media_prefill_step(signals, [VISION], layout, model_name="m")
+    first = initial_prefill_args(step, ["image", "text"], ["text"])
+    assert first.step_metadata == {"is_prefill": True, MEDIA_LAYOUT: layout}
 
 
-def test_nothing_to_prefill_is_a_client_error():
-    with pytest.raises(ValueError, match="nothing to prefill"):
-        initial_prefill_args([], ["text"], ["text"], {}, model_name="m")
+@pytest.mark.parametrize(("texts", "match"), [(0, "nothing to prefill"), (2, "2 text tensors")])
+def test_a_prompt_is_one_text_tensor(texts, match):
+    with pytest.raises(ValueError, match=match):
+        media_prefill_step(_signals(text_inputs=texts), [VISION], model_name="m")
 
 
 # ---------------------------------------------------------------------------
 # The decoder node
 # ---------------------------------------------------------------------------
-
-
-def test_a_token_is_real_on_decode_and_on_the_last_prefill():
-    from mstar.model.components.sampled_token_decoder import token_is_real
-
-    last = SimpleNamespace(step_metadata={"last_prefill": True})
-    early = SimpleNamespace(step_metadata={"last_prefill": False})
-    assert token_is_real("decode", None)
-    assert token_is_real("prefill_text", last)
-    assert not token_is_real("prefill_text", early)
-    # a capture's padding rows carry no info
-    assert not token_is_real("prefill_vision", None)
 
 
 def _qwen_llm(encoders=(VISION,), model=None):

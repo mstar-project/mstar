@@ -1,7 +1,7 @@
 """Qwen3.5's multimodal prompt: one row of ids, each attachment's pad expanded.
 
 `process_prompt` renders and tokenizes the prompt once, then expands each
-image's pad to one pad per merged vision token; `_prefill_schedule` hands
+image's pad to one pad per merged vision token; `_prefill_step` hands
 the whole prompt and the tower's inputs to one walk. These check nothing is
 lost or duplicated in the expansion, and that the layout the LLM places
 positions with matches the ids.
@@ -66,7 +66,7 @@ def test_the_prompt_is_the_template_with_each_pad_expanded(model, modalities):
     layout = out.metadata[MEDIA_LAYOUT]
     out = out.new_input_tensors
     (ids,) = out["text_inputs"]
-    assert len(out["image_grid_thw"]) == n_images == len(layout["offset"])
+    assert len(layout["grid"]) == n_images == len(layout["offset"])
     assert len(out["pixel_values"]) == n_images
 
     parts = parts_from_modalities(modalities, "Describe this.")
@@ -91,8 +91,8 @@ def test_the_prompt_is_the_template_with_each_pad_expanded(model, modalities):
     assert torch.equal(torch.cat(collapsed), template)
 
 
-def test_schedule_hands_the_walk_the_prompt_and_the_tower_inputs(model):
-    """`_prefill_schedule` gives one walk the whole prompt and every image,
+def test_the_prefill_walk_gets_the_prompt_and_the_tower_inputs(model):
+    """`_prefill_step` gives one walk the whole prompt and every image,
     in prompt order; the grids reach only the encoder."""
     modalities = ["text", "image", "text", "image"]
     parts = [
@@ -109,14 +109,14 @@ def test_schedule_hands_the_walk_the_prompt_and_the_tower_inputs(model):
     layout = out.metadata[MEDIA_LAYOUT]
     out = out.new_input_tensors
     # the conductor passes tensor handles; the identity is all that matters
-    signals = {name: list(out[name]) for name in ("text_inputs", "pixel_values", "image_grid_thw")}
-    (step,) = model._prefill_schedule(modalities, signals, layout)
+    signals = {name: list(out[name]) for name in ("text_inputs", "pixel_values")}
+    step = model._prefill_step(signals, layout)
     assert step.walk == "prefill_vision"
     assert step.metadata == {MEDIA_LAYOUT: layout}
 
     edges = {(edge.next_node, edge.name): edge.tensor_info for edge in walk_input_edges(step)}
     assert set(edges) == {
-        ("LLM", "text_inputs"), ("vision_encoder", "pixel_values"), ("vision_encoder", "image_grid_thw"),
+        ("LLM", "text_inputs"), ("vision_encoder", "pixel_values"),
     }
     for (_node, name), got in edges.items():
         assert all(a is b for a, b in zip(got, signals[name], strict=True))
@@ -127,7 +127,7 @@ def test_text_only_prompt_still_uses_prefill_text(model):
     out = model.process_prompt("just text", ["text"], ["text"], tensors={})
     out = out.new_input_tensors
     signals = {"text_inputs": list(out["text_inputs"])}
-    (step,) = model._prefill_schedule(["text"], signals)
+    step = model._prefill_step(signals)
     assert step.walk == "prefill_text"
     assert step.input_tensors[("LLM", "text_inputs")][0] is signals["text_inputs"][0]
 
@@ -165,8 +165,9 @@ def test_image_only_message_renders_an_empty_text_span(model):
     out = model.process_prompt(
         None, ["image"], ["text"], tensors={"image_inputs": [an_image()]},
     )
+    assert len(out.metadata[MEDIA_LAYOUT]["grid"]) == 1
     out = out.new_input_tensors
-    assert len(out["pixel_values"]) == 1 and len(out["image_grid_thw"]) == 1
+    assert len(out["pixel_values"]) == 1 and "image_grid_thw" not in out
     # the template's framing around the image, one row
     assert len(out["text_inputs"]) == 1
 

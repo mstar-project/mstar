@@ -2344,21 +2344,42 @@ and BAGEL onto the scaffold is tracked as a follow-up.
 Graph and walks (``mstar/model/multimodal.py``), from the model's ``MediaEncoder`` list::
 
     prefill_text   : LLM(text_inputs)                        a text-only prompt
-    prefill_vision : vision_encoder(pixel_values, image_grid_thw)
+    prefill_vision : vision_encoder(pixel_values)            each run's grid off MEDIA_LAYOUT
                      -> LLM(text_inputs, vision_embeds)      the whole prompt, one row
     prefill_<a>_<b>: Parallel(encoder a, encoder b) -> LLM   one walk per subset of encoders
     decode         : Loop("decode_loop", LLM)
     mixed          : prefill_text and decode rows in one step (a combined walk)
 
-The ``Model`` methods are one line each: ``get_graph_walk_graphs`` returns
-``media_walks(max_iters, encoders)``, ``get_combined_graph_walks`` returns
-``text_combined_walks()``, and ``get_initial_forward_pass_args`` /
-``get_partition_forward_pass_args`` call ``initial_prefill_args`` / ``next_prefill_args``
-on the schedule from ``media_prefill_schedule``. ``process_prompt`` tokenizes the whole
-prompt once with one placeholder per attachment, expands each to one pad per token
-with ``expand_media_pads`` (adding the sentinels a template leaves to its processor),
-and returns the pads' layout (``media_layout``) as ``MEDIA_LAYOUT`` metadata. The
-encoders' inputs are lists in prompt order, as their outputs fill the pads.
+The ``Model`` subclasses ``MultimodalDecoderModel`` (``mstar/model/multimodal_decoder.py``),
+which declares the walks (``media_walks(max_iters, encoders)`` and
+``text_combined_walks()``), runs the one prefill walk ``media_prefill_step`` picks
+through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, and owns
+media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, which is
+also the request's output budget), the KV label and its one-span layout (``kv_labels``,
+``kv_layout``), sharding, the submodule cache and where the files come from. A model
+sets ``NAME`` and ``METADATA_FILES`` and writes ``__init__`` (setting ``config``,
+``tokenizer`` and ``media``), its resources (``MIXED_SPLIT`` is the attention resources'
+split of a mixed step), ``_prompt_ids``, ``get_request_resource_configs`` and
+``_create_submodule``. ``media`` holds a ``MediaIntake`` per attachment modality: its
+``MediaEncoder`` (modalities may share one), its placeholder ``pad`` id, the sentinels
+a template leaves to its processor, how many placeholders an attachment fills
+(``runs``, one by default; a Qwen3.5 video fills one per temporal group), and
+``prepare``, which turns an attachment into the encoder's input tensors and each
+placeholder's tokens (a ``PreparedMedia``). ``_prompt_ids`` renders and tokenizes the
+whole prompt once. ``intake`` then refuses a prompt whose placeholders don't match its
+attachments, prepares each attachment in prompt order, expands each placeholder to one
+pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
+layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length,
+advance)``. The layout's runs say which encoders the prompt runs (``media_encoders``), for
+the prefill schedule's walk and the KV layout's alike.
+``advance``, how far the prompt moves the position counter, defaults to the prompt's
+length; under Qwen-style MRoPE it is the positions' extent instead, an image spanning
+``max(h', w')`` positions rather than its tokens, which Qwen3.5 computes from the
+runs' grids in its own ``process_prompt`` over ``intake``. The encoders' inputs are
+lists in prompt order, as their outputs fill the pads. Each run's patch grid (the
+``grids`` of its ``PreparedMedia``) rides ``MEDIA_LAYOUT`` rather than a tensor, so a
+tower's grid maths in ``prepare_inputs`` reads host values (``PackedBlockLoopEncoder.grids``)
+and never syncs on the device.
 
 The ``LLM`` node subclasses ``SampledTokenDecoder``
 (``mstar/model/components/sampled_token_decoder.py``), which owns the capture configs
@@ -2378,13 +2399,9 @@ writes:
     class LLMSubmodule(SampledTokenDecoder):
         ATTN_KEY = ATTN_FULL  # the attention resource that picks each prefill row's last token
 
-        def __init__(self, model, config, encoders):
-            super().__init__(model, config, encoders)
-
         def layer_steps(self):  # this step's work on the layers' resources
             return {KV_CACHE: KVStep(), ATTN_FULL: AttentionStep(causal=True)}
 
-        def max_rows_in_combined(self, graph_walk): ...  # a mixed step's prompt-row cap
         # optional, for positions the resource cannot place (MRoPE):
         def prompt_positions(self, fwd_info, layout, num_tokens): ...  # -> (custom_pos_ids, advance)
         def decoder_kwargs(self, graph_walk, engine_inputs, num_tokens, **tensors): ...
@@ -2393,7 +2410,8 @@ Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **
 (the stack through its final norm), ``logits(hidden)`` and ``embed_dtype``, as
 ``Qwen3_5ForCausalLM`` does (``Qwen3DenseLM`` has the first three). The sampler and
 position resources are declared under ``mstar.model.keys``' ``SAMPLER`` and ``ROPE``.
-``MSTAR_DECODE_BUCKETS`` sets the default decode ladder.
+``MSTAR_DECODE_BUCKETS`` sets the default decode ladder, and
+``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's prompt rows.
 
 The ``vision_encoder`` node subclasses ``PackedBlockLoopEncoder``
 (``mstar/model/components/block_loop_encoder.py``): one prompt per step, every image

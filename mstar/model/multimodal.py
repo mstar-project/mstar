@@ -380,9 +380,7 @@ class MediaEncoder:
 
 def vision_encoder(pad_ids: tuple[int, ...]) -> MediaEncoder:
     """The ``vision_encoder`` node every VLM here declares."""
-    return MediaEncoder(
-        "vision", "vision_encoder", ("pixel_values", "image_grid_thw"), "vision_embeds", pad_ids,
-    )
+    return MediaEncoder("vision", "vision_encoder", ("pixel_values",), "vision_embeds", pad_ids)
 
 
 def media_walk_name(encoders: Sequence[MediaEncoder]) -> str:
@@ -405,7 +403,8 @@ def media_layout(
     """A media walk's ``MEDIA_LAYOUT`` step metadata, columnar: each run's
     ``offset`` and ``tokens``, the encoder ``output`` it is read from, and
     its patch ``grid`` (``[]`` for media without one). Plain lists: it rides
-    the step's control message."""
+    the step's control message, so every node of the walk reads it on the
+    host (`media_grids`)."""
     grids = grids or {}
     return {
         "offset": list(pads.offset),
@@ -416,6 +415,23 @@ def media_layout(
             for p, i in zip(pads.pad, pads.index, strict=True)
         ],
     }
+
+
+def media_grids(layout: Mapping, output: str) -> list[tuple[int, int, int]]:
+    """The patch grid of each run a ``MEDIA_LAYOUT`` fills from encoder output
+    ``output``, in prompt order."""
+    return [
+        tuple(grid) for grid, out in zip(layout.get("grid", ()), layout.get("output", ()), strict=True)
+        if out == output
+    ]
+
+
+def media_encoders(encoders: Sequence[MediaEncoder], layout: Mapping) -> list[MediaEncoder]:
+    """The encoders a prompt's ``MEDIA_LAYOUT`` runs, in declaration order:
+    those whose output fills one of its runs. Both the prefill walk and
+    the KV layout read this, so they name the same walk."""
+    outputs = set(layout.get("output", ()))
+    return [e for e in encoders if e.output in outputs]
 
 
 def media_walks(
@@ -480,30 +496,38 @@ class PrefillStep:
     metadata: dict = field(default_factory=dict)
 
 
-def media_prefill_schedule(
+def media_prefill_step(
     signals: dict[str, list[TensorPointerInfo]],
     encoders: Sequence[MediaEncoder],
     layout: dict | None = None,
     *,
     model_name: str,
-) -> list[PrefillStep]:
-    """The prefill walks a request runs: with media, one walk over the
-    encoders of the media it holds and the whole prompt (``text_inputs``,
-    one tensor); without, one ``prefill_text`` walk per text tensor."""
+) -> PrefillStep:
+    """The one prefill walk a request runs over its whole prompt
+    (``text_inputs``, one tensor): with media in its ``layout``, the walk over
+    the encoders it runs (`media_encoders`); without, ``prefill_text``."""
     texts = signals.get("text_inputs", [])
-    present = [e for e in encoders if signals.get(e.inputs[0])]
-    if not present:
-        return [PrefillStep("prefill_text", {("LLM", "text_inputs"): [t]}) for t in texts]
+    if not texts:
+        # the conductor answers this with a 400
+        raise ValueError(
+            f"{model_name} has nothing to prefill: the request carries no "
+            f"{sorted(signals) or 'inputs'}. An empty prompt cannot be served."
+        )
     if len(texts) != 1:
         # the model's intake renders one prompt; the conductor answers this with a 400
-        raise ValueError(
-            f"{model_name} got a media prompt as {len(texts)} text tensors, not the one whole prompt"
-        )
+        raise ValueError(f"{model_name} got a prompt as {len(texts)} text tensors, not the one whole prompt")
+    present = media_encoders(encoders, layout or {})
+    if not present:
+        sent = sorted(name for e in encoders for name in e.inputs if signals.get(name))
+        if sent:
+            # a text prefill would drop them
+            raise ValueError(f"{model_name} got {sent} with no media layout to place them by")
+        return PrefillStep("prefill_text", {("LLM", "text_inputs"): texts})
     inputs = {("LLM", "text_inputs"): texts}
     for e in present:
         for name in e.inputs:
             inputs[(e.node, name)] = signals.get(name, [])
-    return [PrefillStep(media_walk_name(present), inputs, {MEDIA_LAYOUT: layout or {}})]
+    return PrefillStep(media_walk_name(present), inputs, {MEDIA_LAYOUT: layout or {}})
 
 
 def walk_input_edges(step: PrefillStep) -> list[GraphEdge]:
@@ -517,8 +541,7 @@ def walk_input_edges(step: PrefillStep) -> list[GraphEdge]:
 
 
 def _prefill_args(
-    metadata: CurrentForwardConductorMetadata, inputs: list[GraphEdge],
-    last_prefill: bool, step_metadata: dict,
+    metadata: CurrentForwardConductorMetadata, inputs: list[GraphEdge], step_metadata: dict,
 ) -> ForwardPassArgs:
     from mstar.model.base import ForwardPassArgs
 
@@ -526,68 +549,38 @@ def _prefill_args(
         full_metadata=metadata,
         inputs=inputs,
         unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
-        step_metadata={
-            "is_prefill": metadata.is_prefill,
-            "last_prefill": last_prefill,
-            **step_metadata,
-        },
+        step_metadata={"is_prefill": metadata.is_prefill, **step_metadata},
     )
 
 
 def initial_prefill_args(
-    schedule: list[PrefillStep],
-    input_modalities: list[str],
-    output_modalities: list[str],
-    input_signals: dict[str, list[TensorPointerInfo]],
-    *,
-    model_name: str,
+    step: PrefillStep, input_modalities: list[str], output_modalities: list[str],
 ) -> ForwardPassArgs:
-    """The first walk of ``schedule``; the rest wait in the conductor metadata
-    for `next_prefill_args`."""
+    """The prefill walk; `next_prefill_args` takes it from there."""
     from mstar.conductor.request_info import CurrentForwardConductorMetadata
 
-    if not schedule:
-        # every step was skipped for want of a tensor
-        raise ValueError(
-            f"{model_name} has nothing to prefill for modalities "
-            f"{input_modalities}: the request carries no "
-            f"{sorted(input_signals) or 'inputs'}. An empty prompt cannot "
-            "be served."
-        )
-    step = schedule[0]
     metadata = CurrentForwardConductorMetadata(
         input_modalities=input_modalities,
         output_modalities=output_modalities,
         graph_walk=step.walk,
         is_prefill=True,
     )
-    metadata.kwargs["prefill_schedule"] = schedule[1:]
-    return _prefill_args(metadata, walk_input_edges(step), len(schedule) == 1, step.metadata)
+    return _prefill_args(metadata, walk_input_edges(step), step.metadata)
 
 
 def next_prefill_args(
     metadata: CurrentForwardConductorMetadata,
     persist_signals: dict[str, list[TensorPointerInfo]],
 ) -> ForwardPassArgs:
-    """Walk the rest of the prefill schedule, then loop in decode until the
-    decoder's stop check ends it."""
+    """After the prefill, loop in decode until the decoder's stop check ends it."""
     from mstar.model.base import ForwardPassArgs
 
-    remaining: list[PrefillStep] = metadata.kwargs.get("prefill_schedule", [])
-    # before the pop: the step about to run is the last when it is the only one left
-    last_prefill = len(remaining) == 1
-    if metadata.is_prefill and remaining:
-        # each prefill step carries its own tensors; only decode reads back
-        # what the previous step emitted
-        step = remaining.pop(0)
-        metadata.graph_walk = step.walk
-        return _prefill_args(metadata, walk_input_edges(step), last_prefill, step.metadata)
     if metadata.is_prefill:
         metadata.is_prefill = False
         metadata.graph_walk = "decode"
         edge = GraphEdge(next_node="LLM", name="text_inputs")
         edge.tensor_info = persist_signals.get("new_token", [])
-        return _prefill_args(metadata, [edge], last_prefill, {})
+        return _prefill_args(metadata, [edge], {})
     # reaching here again after decode stopped means the request is finished
     metadata.kwargs["decode_finished"] = True
     return ForwardPassArgs(
