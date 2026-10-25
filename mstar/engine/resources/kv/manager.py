@@ -2107,9 +2107,11 @@ class KVManager(AttentionResource):
 
     @staticmethod
     def _is_readonly(step: KVStep, ctx: StepContext) -> bool:
+        # no sink rows: they change the views without changing the segments
+        # the reuse key holds; the read-only steps that repeat have none
         return (
             not ctx.is_preplan and not ctx.capture and bool(step.segments)
-            and not step.pre_forks and not step.post_forks
+            and not step.pre_forks and not step.post_forks and not step.sink
             and all(seg.span == 0 for seg in step.segments)
         )
 

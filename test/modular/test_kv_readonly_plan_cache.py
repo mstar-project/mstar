@@ -66,10 +66,10 @@ def _write(kv: KVManager, rid: str, n: int, ingest: bool = True, **step_kw) -> N
     kv.commit(step, ctx)
 
 
-def _read(kv: KVManager, rids: tuple[str, ...], pad: int = 2, slot: int = 0):
+def _read(kv: KVManager, rids: tuple[str, ...], pad: int = 2, slot: int = 0, sink=frozenset()):
     """A captured read-only step over ``rids`` plus ``pad`` padding rows."""
     padded = rids + tuple(f"pad{i}" for i in range(pad))
-    step = KVStep(segments=tuple(Segment(r, "main", 0) for r in padded))
+    step = KVStep(segments=tuple(Segment(r, "main", 0) for r in padded), sink=sink)
     bucket = BucketKey(graph_walk="decode", bs=len(padded), num_tokens=len(padded))
     ctx = StepContext(
         request_ids=rids, graph_walk="decode", slot=slot, capture=False,
@@ -145,6 +145,16 @@ def test_a_touch_of_every_stream_plans_again(kv):
     first = _read(kv, ("a", "b"))
     kv._touch_plan_cache()
     assert _read(kv, ("a", "b")) is not first
+
+
+def test_a_step_with_sink_rows_plans_its_own_views(kv):
+    """The same segments with a row on the sink page are another plan."""
+    first = _read(kv, ("a", "b"))
+    sunk = _read(kv, ("a", "b"), sink=frozenset({("b", "main")}))
+    assert sunk is not first and _lengths(sunk)[:2] == [6, 0]
+    # the plain step still reuses its plan, staged again over the sink step's
+    assert _read(kv, ("a", "b")) is first
+    assert kv._staged_outputs[(0, "main")] is first["main"]
 
 
 def test_another_slot_stages_the_reused_plan(kv):
