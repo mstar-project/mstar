@@ -898,6 +898,7 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         router: nn.Module | None = None,
         comm_group: CommGroup | None = None,
         track_expert_load: bool = False,
+        moe_backend: str = "auto",
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -930,6 +931,9 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         )
         self.experts.down_proj = nn.Parameter(
             torch.empty(self.num_local_experts, hidden_size, moe_intermediate_size)
+        )
+        self.experts_backend = _make_experts_backend(
+            moe_backend, self.num_local_experts, moe_intermediate_size, hidden_size, num_experts_per_tok,
         )
         self._attach_weight_loaders()
 
@@ -992,7 +996,8 @@ class ExpertParallelSparseMoeBlock(nn.Module):
                 )
             out = _dispatch(
                 flat, self.experts.gate_up_proj, self.experts.down_proj,
-                self.num_experts, selected_experts, routing_weights, skip_invalid=skip,
+                self.num_experts, selected_experts, routing_weights,
+                self.experts_backend, skip_invalid=skip,
             )
         else:
             routing_weights, selected_experts = _sync_routing(
@@ -1018,7 +1023,8 @@ class ExpertParallelSparseMoeBlock(nn.Module):
         routing_weights = torch.where(owned, routing_weights, 0)
         out = _dispatch(
             flat, self.experts.gate_up_proj, self.experts.down_proj,
-            self.num_local_experts, local, routing_weights, skip_invalid=True,
+            self.num_local_experts, local, routing_weights,
+            self.experts_backend, skip_invalid=True,
         )
         self.comm_group.all_reduce(out)
         return out
