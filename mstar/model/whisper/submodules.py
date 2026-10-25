@@ -437,17 +437,24 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         already, so the sequence goes over in ``preprocess``'s pinned copy."""
         meta = fwd_info.step_metadata
         state = self.request_state(fwd_info.rid_handle)
-        # the stop check recorded the transcript, and a detected language
+        # The prompt walks' stop check recorded the transcript's first token
+        # and a detected language, on this worker: every decoder walk runs on
+        # the same ranks (`WhisperModel.validate_config_yaml`).
         decoded = state.get("decoded", None)
         language = meta.get("language")
         if language is None:
             language = state.get("language", None)
-        if decoded is None or language is None:
-            # the decode loop always runs a step first, on this worker
-            # (`WhisperModel.validate_config_yaml`)
+        if decoded is None:
             raise RuntimeError(
-                f"request {fwd_info.request_id!r}: the align walk found no decoded tokens; "
-                "it must run on the worker that ran the decode walk"
+                f"request {fwd_info.request_id!r}: the align walk found no transcript recorded; the "
+                f"{PREFILL_WALK!r} or {PREFILL_PROMPT_WALK!r} walk's stop check records it, on the worker "
+                "that ran it"
+            )
+        if language is None:
+            raise RuntimeError(
+                f"request {fwd_info.request_id!r}: the align walk found no language; the "
+                f"{DETECT_LANGUAGE_WALK!r} walk's stop check records the detected one, on the worker "
+                "that ran it"
             )
         # the 4 prompt tokens and end-of-text stay inside the position table
         text = [t for t in decoded if t < self.config.eos_token_id][: self.config.max_target_positions - 5]

@@ -477,23 +477,30 @@ def test_decoder_align_walk_fits_the_position_table():
     assert row.input_seq_len == cfg.max_target_positions and row.input_ids.tolist()[-1] == EOT
 
 
-def test_align_without_the_decode_walks_tokens_is_an_error():
-    """The decode walk records its tokens on the worker that ran it; an
-    align walk that finds none would otherwise time a single token."""
+@pytest.mark.parametrize("recorded,language,match", [
+    ({}, EN, "no transcript recorded; the 'prefill' or 'prefill_prompt' walk"),
+    ({"decoded": [7]}, None, "no language; the 'detect_language' walk"),
+])
+def test_align_without_the_prompt_walks_state_is_an_error(recorded, language, match):
+    """The prompt walks record the transcript's first token and a detected
+    language on the worker that ran them; the error names the walk whose
+    record is missing."""
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
-    with pytest.raises(RuntimeError, match="no decoded tokens"):
-        sub.prepare_inputs(ALIGN_WALK, _fwd(3, **_align_meta()), _align_inputs(cfg))
+    sub.request_state(3).add_all(**recorded)
+    with pytest.raises(RuntimeError, match=match):
+        sub.prepare_inputs(ALIGN_WALK, _fwd(3, **_align_meta(language=language)), _align_inputs(cfg))
 
 
 @pytest.mark.parametrize("groups,ok", [
     # one group serving every walk
     ([{"node_names": ["audio_encoder", "decoder"], "ranks": [0]}], True),
-    # walks split, but decode and align together
+    # decode and align together, but the prompt walks that record the first
+    # token and the language elsewhere
     ([{"node_names": ["audio_encoder"], "ranks": [0]},
       {"node_names": ["decoder"], "ranks": [0], "graph_walks": ["prefill"]},
-      {"node_names": ["decoder"], "ranks": [1], "graph_walks": ["decode", "align"]}], True),
+      {"node_names": ["decoder"], "ranks": [1], "graph_walks": ["decode", "align"]}], False),
     # align on another rank than decode
     ([{"node_names": ["audio_encoder"], "ranks": [0]},
       {"node_names": ["decoder"], "ranks": [0], "graph_walks": ["prefill", "decode"]},
@@ -502,7 +509,7 @@ def test_align_without_the_decode_walks_tokens_is_an_error():
     ([{"node_names": ["audio_encoder"], "ranks": [0]},
       {"node_names": ["decoder"], "ranks": [0], "graph_walks": ["prefill", "decode"]}], False),
 ])
-def test_decode_and_align_must_share_ranks(groups, ok):
+def test_decoder_walks_must_share_ranks(groups, ok):
     assert DECODE_WALK == "decode" and ALIGN_WALK == "align"
     config = {"max_concurrent_requests": 64, "node_groups": groups}
     model = _make_model()

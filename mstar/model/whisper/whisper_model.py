@@ -301,19 +301,22 @@ class WhisperModel(Model):
         ]
         self._decoder_tp_size = max((int(group.get("tp_size", 1)) for group in decoder_groups), default=1)
 
-        def serving(walk: str) -> list:
-            return sorted(
+        def serving(walk: str) -> tuple:
+            return tuple(sorted(
                 tuple(group.get("ranks") or ()) for group in decoder_groups
                 if group.get("graph_walks") is None or walk in group["graph_walks"]
-            )
+            ))
 
-        # the align walk reads the tokens the decode walk's stop check
-        # recorded in the decoder's worker-local request state
-        if serving(DECODE_WALK) != serving(ALIGN_WALK):
+        # the align walk reads the first token and detected language the
+        # prompt walks' stop check recorded, and the decode walk's tokens, in
+        # the decoder's worker-local request state
+        walks = (PREFILL_WALK, DETECT_LANGUAGE_WALK, PREFILL_PROMPT_WALK, DECODE_WALK, ALIGN_WALK)
+        served = {walk: serving(walk) for walk in walks}
+        if len(set(served.values())) > 1:
             raise ValueError(
-                f"{config_path}: the {DECODER_NODE} node's {DECODE_WALK!r} and {ALIGN_WALK!r} "
-                f"walks must run on the same ranks (word timestamps align the tokens the decode "
-                f"walk kept on its worker); got {serving(DECODE_WALK)} and {serving(ALIGN_WALK)}"
+                f"{config_path}: the {DECODER_NODE} node's {', '.join(map(repr, walks))} walks must "
+                f"run on the same ranks (word timestamps align the tokens those walks kept on their "
+                f"worker); got " + ", ".join(f"{walk}: {list(ranks)}" for walk, ranks in served.items())
             )
         cap = config.get("max_concurrent_requests")
         if cap is None:
