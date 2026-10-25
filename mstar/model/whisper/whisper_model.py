@@ -87,6 +87,7 @@ from mstar.model.whisper.config import (
     PREFILL_WALK,
     SAMPLER,
     TS_RULES,
+    WORDS_MARKER,
     WhisperModelConfig,
 )
 
@@ -719,7 +720,7 @@ class WhisperModel(Model):
 
     def _word_timings_text(self, output: torch.Tensor) -> bytes:
         """Word timings in Whisper's timestamp vocabulary, as the transcription
-        route parses them: ``<|startoflm|>`` then ``<|start|> word <|end|>``
+        route parses them: ``WORDS_MARKER`` then ``<|start|> word <|end|>``
         per word."""
         matrix, text, language = alignment.unpack_output(output)
         words = alignment.word_timings(matrix, text, self._decode_raw, self.config.language_of(language))
@@ -729,7 +730,7 @@ class WhisperModel(Model):
             token = min(top, tb + int(round(seconds / self.config.timestamp_precision)))
             return self._detokenizer.to_bytes([token])
 
-        parts = [b"<|startoflm|>"]
+        parts = [WORDS_MARKER.encode()]
         for w in words:
             parts += [stamp(w["start"]), w["word"].encode("utf-8"), stamp(w["end"])]
         return b"".join(parts)

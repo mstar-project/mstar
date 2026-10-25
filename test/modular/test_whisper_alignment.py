@@ -79,25 +79,38 @@ def test_dtw_follows_a_diagonal_band_and_is_monotonic():
 
 
 
-def test_warm_up_compiles_or_falls_back_and_the_dtw_still_agrees(monkeypatch):
-    """warm_up compiles the DTW at load; a compile failure keeps the
-    plain-Python loop rather than failing the first word-timestamp request."""
+def test_dtw_compiles_once_on_first_use_or_falls_back(monkeypatch):
+    """The first DTW compiles it, or ``warm_up`` does at load, once; a compile
+    failure keeps the plain-Python loop rather than failing the request."""
     import sys
     import types
 
     cost = np.random.default_rng(0).random((6, 20))
-    expected = alignment._dtw_trace(np.ascontiguousarray(cost))
-    monkeypatch.setattr(alignment, "_dtw_trace_fast", alignment._dtw_trace)
-    alignment.warm_up()
-    assert np.array_equal(alignment._dtw_trace_fast(np.ascontiguousarray(cost)), expected)
+    compiled = []
 
-    def broken(_cost):
-        raise RuntimeError("cannot compile")
+    def njit(**_):
+        def wrap(fn):
+            compiled.append(fn)
+            return fn
+        return wrap
 
-    monkeypatch.setattr(alignment, "_dtw_trace_fast", alignment._dtw_trace)
-    monkeypatch.setitem(sys.modules, "numba", types.SimpleNamespace(njit=lambda **_: lambda fn: broken))
-    alignment.warm_up()
-    assert alignment._dtw_trace_fast is alignment._dtw_trace
+    monkeypatch.setitem(sys.modules, "numba", types.SimpleNamespace(njit=njit))
+    alignment._compiled_dtw_trace.cache_clear()
+    try:
+        expected = alignment.dtw(cost)
+        alignment.dtw(cost)
+        alignment.warm_up()
+        assert compiled == [alignment._dtw_trace]
+
+        def broken(_cost):
+            raise RuntimeError("cannot compile")
+
+        monkeypatch.setitem(sys.modules, "numba", types.SimpleNamespace(njit=lambda **_: lambda fn: broken))
+        alignment._compiled_dtw_trace.cache_clear()
+        assert all(np.array_equal(a, b) for a, b in zip(alignment.dtw(cost), expected, strict=True))
+    finally:
+        alignment._compiled_dtw_trace.cache_clear()
+
 
 def test_median_filter_reflects_edges():
     x = torch.arange(10.0).view(1, 1, 10)
@@ -177,6 +190,8 @@ def test_word_timings_end_to_end_on_a_synthetic_alignment():
     assert output[:, -1].tolist() == [1, 2, 3, 4, en]
     matrix, text, language = alignment.unpack_output(output)
     assert text == [1, 2, 3, 4] and language == en and matrix.shape == (rows, frames)
+    with pytest.raises(ValueError, match="at least one frame"):
+        alignment.unpack_output(output[:, -1:])
     words = alignment.word_timings(matrix, text, lambda ids: "".join(vocab[i] for i in ids))
     assert words == [
         {"word": "He", "start": 0.0, "end": 0.4},

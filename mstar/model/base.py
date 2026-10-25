@@ -972,9 +972,10 @@ class Model(ABC):
     def warmup_preprocess(self) -> None:
         """Called once in the preprocess worker before it takes requests.
 
-        Build what ``process_prompt`` needs lazily (a G2P front end, a
-        tokenizer, a feature extractor) so the first request does not pay for
-        it. The default does nothing.
+        Build what ``process_prompt`` and ``postprocess`` would otherwise build
+        lazily (a G2P front end, a tokenizer, a feature extractor, a compiled
+        kernel) so the first request does not pay for it. The default does
+        nothing.
         """
         return None
 

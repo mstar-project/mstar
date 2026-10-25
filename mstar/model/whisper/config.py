@@ -49,6 +49,10 @@ DECODE_LOOP = "decode_loop"
 # one teacher-forced pass over the transcript whose cross-attention gives
 # every word its start and end (see ``components/alignment.py``).
 ALIGN_WALK = "align"
+# The align walk's word timings follow the transcript after this marker, one
+# ``<|start|> word <|end|>`` per word in the timestamp vocabulary. Here so the
+# API server's adapter reads it without loading the model's modules.
+WORDS_MARKER = "<|startoflm|>"
 
 
 @dataclass

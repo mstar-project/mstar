@@ -27,6 +27,7 @@ engine dependencies, so the same math is unit-tested on the CPU.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import string
 
@@ -84,31 +85,33 @@ def _dtw_trace(cost: np.ndarray) -> np.ndarray:
     return trace
 
 
-# The double loop is up to ~670k cells (444 rows by 1500 frames): milliseconds
-# compiled by numba (the asr extra), far longer as plain Python. ``warm_up``
-# swaps the compiled one in.
-_dtw_trace_fast = _dtw_trace
-
-
-def warm_up() -> None:
-    """Compile the DTW now, in the process that runs it (the API server's data
-    worker, at model load), rather than inside the first word-timestamp
-    request. Without numba, or if it cannot compile, the DTW stays plain
-    Python, loudly."""
-    global _dtw_trace_fast
+@functools.cache
+def _compiled_dtw_trace():
+    """``_dtw_trace`` compiled by numba (the asr extra), once, on first use: the
+    double loop is up to ~670k cells (444 rows by 1500 frames), milliseconds
+    compiled and far longer as plain Python. Imported here, not at module
+    load, so only the process that runs the DTW loads numba. Without numba, or
+    if it cannot compile, the DTW stays plain Python, loudly."""
     try:
         from numba import njit
     except ImportError:
         logger.warning("numba is not installed: word timestamps run the DTW in plain Python, far slower. "
                        "Install mstar[asr].")
-        return
+        return _dtw_trace
     try:
         fast = njit(cache=True, nogil=True)(_dtw_trace)
         fast(np.zeros((2, 2), dtype=np.float64))
     except Exception as exc:  # noqa: BLE001 — any compile failure: keep serving
         logger.warning("numba could not compile the DTW (%s): word timestamps fall back to plain Python", exc)
-        return
-    _dtw_trace_fast = fast
+        return _dtw_trace
+    return fast
+
+
+def warm_up() -> None:
+    """Compile the DTW now, in the process that runs it (the API server's data
+    worker, at model load), rather than inside the first word-timestamp
+    request."""
+    _compiled_dtw_trace()
 
 
 def dtw(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -116,7 +119,7 @@ def dtw(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     ``cost`` (rows x frames), moving right, down or diagonally. Returns the
     path's row and frame indices, each of length ``len(path)``."""
     cost = np.ascontiguousarray(cost, dtype=np.float64)
-    trace = _dtw_trace_fast(cost)
+    trace = _compiled_dtw_trace()(cost)
     trace[0, :] = 2
     trace[:, 0] = 1
     i, j = cost.shape
@@ -170,6 +173,10 @@ def alignment_output(weights: torch.Tensor, tokens: torch.Tensor, num_frames: in
 
 def unpack_output(output: torch.Tensor) -> tuple[torch.Tensor, list[int], int]:
     """``alignment_output``'s tensor -> (matrix, text token ids, language token id)."""
+    if output.dim() != 2 or output.shape[1] < 2:
+        raise ValueError(
+            f"an alignment output is [tokens, frames + 1] with at least one frame; got {tuple(output.shape)}"
+        )
     ids = output[:, -1].long().tolist()
     return output[:, :-1], ids[:-1], ids[-1]
 

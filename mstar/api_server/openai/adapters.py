@@ -34,6 +34,7 @@ from mstar.api_server import media_io
 from mstar.model.multimodal import PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
+from mstar.model.whisper.config import WORDS_MARKER
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -982,9 +983,6 @@ _CONTROL_TOKEN = re.compile(r"<\|([^|<>]*)\|>")
 _PARTIAL_CONTROL_TOKEN = re.compile(r"<(\|[^|<>]*\|?)?$")
 _TIMESTAMP = re.compile(r"^\d+\.\d{2}$")
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
-# Whisper's word timings follow the transcript after this marker, one
-# ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
-_WORDS_MARKER = "<|startoflm|>"
 
 
 # sampling knobs the engine reads as numbers; a string there fails every
@@ -1064,11 +1062,11 @@ class WhisperAdapter(OpenAIAdapter):
         )
 
     def stream_text(self, raw: str) -> str:
-        raw = raw.partition(_WORDS_MARKER)[0]  # word timings follow the transcript
+        raw = raw.partition(WORDS_MARKER)[0]  # word timings follow the transcript
         return _CONTROL_TOKEN.sub("", _PARTIAL_CONTROL_TOKEN.sub("", raw))
 
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
-        text, _, timed_words = text.partition(_WORDS_MARKER)
+        text, _, timed_words = text.partition(WORDS_MARKER)
         language, segments, parts, unfinished = _parse_timestamped(text)
         clean = " ".join(p.strip() for p in parts if p.strip())
         for idx, seg in enumerate(segments):
