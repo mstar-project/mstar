@@ -33,8 +33,8 @@ class AttentionConfig:
     backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
     # softmax scale; None means the kernel default (head_dim ** -0.5). MLA must
-    # pass the *original* qk head dim's scale, not the latent width's. Only the MLA
-    # backend reads it; the others refuse it at build
+    # pass the *original* qk head dim's scale, not the latent width's. FlashInfer
+    # and MLA read it; the others refuse it at build
     sm_scale: float | None = None
     # FlashInfer only: combined walks whose captured steps plan their
     # one-token rows on the decode wrapper and their prompt rows on a prefill

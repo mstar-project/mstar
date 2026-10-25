@@ -81,17 +81,3 @@ def test_mla_attention_needs_the_query_heads():
     with pytest.raises(ValueError, match="num_qo_heads"):
         fm.FlashInferMLAManager("kv", torch.device("cpu"), torch.float32, kv, sm_scale=0.1)
 
-
-def test_only_the_mla_backend_takes_sm_scale():
-    kv = PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=96, max_seq_len=64, page_size=16,
-                       max_num_pages=8)
-    info = SimpleNamespace(
-        dependency=lambda key: SimpleNamespace(config=kv),
-        device=torch.device("cpu"), kv_dtype=torch.float32, joint_comm_group=None,
-    )
-    spec = AttentionSpec(
-        resource_key="attn", nodes={"LLM"},
-        config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER, sm_scale=0.1),
-    )
-    with pytest.raises(ValueError, match="ignores sm_scale"):
-        AttentionManager.build(spec, info)

@@ -55,14 +55,26 @@ class AttentionManager(AttentionResource):
         # where the FA3 kernel is unusable, and the two do not agree bit for bit
         return fingerprint(type(self).__name__)
 
+    @staticmethod
+    def _refuse_unread(spec: AttentionSpec, backend: AttnBackend) -> None:
+        """A backend that ignores ``sliding_window`` or ``sm_scale`` would attend
+        with the wrong mask or scale; refuse the spec instead."""
+        reads_scale = (AttnBackend.FLASHINFER, AttnBackend.FLASHINFER_MLA)
+        for name, set_, readers in (
+            ("sliding_window", spec.config.sliding_window is not None, (AttnBackend.FLASHINFER,)),
+            ("sm_scale", spec.config.sm_scale is not None, reads_scale),
+        ):
+            if set_ and backend not in readers:
+                raise ValueError(
+                    f"attention backend {backend!r} ignores {name}; only "
+                    f"{', '.join(repr(b.value) for b in readers)} read it "
+                    f"(KV resource {spec.config.kv_cache!r})"
+                )
+
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         backend = resolve_attn_backend(spec.config.backend, info.device)
-        if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
-            raise ValueError(
-                f"sliding_window is unsupported for attention backend {backend!r}; "
-                "use the flashinfer backend"
-            )
+        cls._refuse_unread(spec, backend)
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
@@ -76,11 +88,6 @@ class AttentionManager(AttentionResource):
                 f"attention backend {backend.value!r} requires a "
                 f"{required.__name__}, but KV resource {spec.config.kv_cache!r} "
                 f"holds a {type(kv_config).__name__}. "
-            )
-        if spec.config.sm_scale is not None and backend != AttnBackend.FLASHINFER_MLA:
-            raise ValueError(
-                f"attention backend {backend.value!r} ignores sm_scale; only "
-                f"{AttnBackend.FLASHINFER_MLA.value!r} reads it"
             )
         # `shard` lives on the KVConfig base, so this is unchanged for both.
         if info.joint_comm_group is not None:
@@ -134,6 +141,7 @@ class AttentionManager(AttentionResource):
                 max_rows_in_combined=info.max_rows_in_combined,
                 decode_tensor_cores=spec.config.decode_tensor_cores,
                 sliding_window=spec.config.sliding_window,
+                sm_scale=spec.config.sm_scale,
             )
 
         if backend == AttnBackend.FLEX:

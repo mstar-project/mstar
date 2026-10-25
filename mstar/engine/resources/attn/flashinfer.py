@@ -20,6 +20,7 @@ from mstar.engine.resources.attn.wrappers import (
 )
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
@@ -38,6 +39,7 @@ class FlashInferManager(AttentionManager):
         max_rows_in_combined: Mapping[str, int | None] | None = None,
         decode_tensor_cores: bool = True,
         sliding_window: int | None = None,
+        sm_scale: float | None = None,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
@@ -67,14 +69,22 @@ class FlashInferManager(AttentionManager):
             page_size=kv_config.page_size,
             max_num_pages=kv_config.max_num_pages,
             device=device,
-            backend=backend
+            backend=backend,
+            sm_scale=sm_scale,
         )
         self._decode_tensor_cores = decode_tensor_cores
+        self._sm_scale = sm_scale
 
         self._workspaces = WorkspacePool(device)
 
     def depends_on(self):
         return {self._kv_cache_name}
+
+    def fingerprint(self) -> bytes:
+        if self._window_left == -1 and self._sm_scale is None:
+            return super().fingerprint()
+        # the window and scale shape every later layer's K/V
+        return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
 
     def _cg_wrapper(
         self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
