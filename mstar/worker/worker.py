@@ -667,7 +667,8 @@ class Worker:
         # `_kv_keys`: node -> the keys of its paged KV caches, and `_kv_caches`: key -> its cache.
         # `_kept_ids`: node -> handle -> the request's ids on that node. Per node, since a colocated node
         #   of another partition samples tokens of its own.
-        # `_rebuild_rows`: handle -> its row waiting for a rebuild step.
+        # `_rebuild_rows`: handle -> its row waiting for a rebuild step. `_rebuilding`: the handles whose rebuild
+        #   row is in the step in flight.
         # `_dropped`: handle -> the node it was dropped on, until its rebuild row is queued.
         # `_victims`: handle -> its `Victim`, until the request is dropped.
         # `_preempted`: handle -> its `Preempted`. `_preemptions`: node -> its counts for the metrics.
@@ -681,6 +682,7 @@ class Worker:
             for node_name in kv.nodes:
                 self._kv_keys[node_name].append(kv.key)
         self._rebuild_rows: dict[int, RebuildRow] = {}
+        self._rebuilding: frozenset[int] = frozenset()
         self._dropped: dict[int, str] = {}
         self._victims: dict[int, Victim] = {}
         self._preempted: dict[int, Preempted] = {}
@@ -1310,7 +1312,9 @@ class Worker:
         engine = self.engine_manager.get_engine(node_name)
         if engine.is_resident(node_name, request_id) or engine.is_offloaded(node_name, request_id):
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} isn't dropped on {node_name}")
-        if request_id in self._rebuild_rows or request_id in self._in_flight_rids:
+        # Not `_in_flight_rids`: a step of another node on this worker, such as Orpheus's SNAC decoder, can hold
+        # the request while its KV here is dropped.
+        if request_id in self._rebuild_rows or request_id in self._rebuilding:
             raise RuntimeError(f"Worker {self.worker_id}: {self._rid_str(request_id)} is already being rebuilt")
         kept = self._kept_ids[node_name][request_id]
         ids = array("i", kept.prompt)
@@ -4899,6 +4903,7 @@ class Worker:
             nonlocal pending
             pending = p
             self._in_flight_rids = set(p.batch.request_to_worker_graph) if p else set()
+            self._rebuilding = p.node_batch.rebuild_rids if p is not None else frozenset()
             if p is not None and p.node_batch.rebuild_rids:
                 # a REMOVE waits for the step instead of freeing pages under it
                 self._in_flight_rids |= p.node_batch.rebuild_rids

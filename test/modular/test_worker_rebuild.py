@@ -48,7 +48,7 @@ def _worker(fresh: ScheduledBatch | None = None):
     w = Worker.__new__(Worker)
     w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")
     w._in_flight_rids, w._last_active, w._stream_buffer_rids = set(), {}, set()
-    w._kv_keys, w._kept_ids, w._rebuild_rows = {NODE: ["kv"]}, {NODE: {}}, {}
+    w._kv_keys, w._kept_ids, w._rebuild_rows, w._rebuilding = {NODE: ["kv"]}, {NODE: {}}, {}, frozenset()
     w._copied_inputs = {}
     w._dropped, w._victims, w._preempted, w._preemptions = {}, {}, {}, defaultdict(PreemptionCounts)
     w._walk_inputs = {(PREFILL, NODE): {"text_inputs"}, (DECODE, NODE): {"text_inputs"}, ("embeds", NODE): {"embeds"},
@@ -327,10 +327,24 @@ def test_a_request_is_rebuilt_only_once_per_drop(state):
     w._kept_ids[NODE][R] = KeptIds(b"", array("i", [5]))
     eng.dropped += [] if state == "resident" else [R]
     w._rebuild_rows.update(queued := {R: RebuildRow(NODE, PREFILL, {}, None)} if state == "queued" else {})
-    w._in_flight_rids.update({R} if state == "in its step" else ())
+    if state == "in its step":
+        w._in_flight_rids, w._rebuilding = {R}, frozenset({R})
     with pytest.raises(RuntimeError):
         w._rebuild(R, NODE)
     assert w._rebuild_rows == queued, "a rebuild would lay out a stream that is live or already being rebuilt"
+
+
+def test_a_dropped_request_is_rebuilt_while_a_step_of_another_node_holds_it():
+    """Orpheus's SNAC decoder can run on the LLM's worker, so a SNAC step can be in flight when the request's LLM
+    KV is rebuilt."""
+    w, eng = _worker()
+    w._kept_ids[NODE][R] = KeptIds(array("i", [1, 2]).tobytes(), array("i", [5]))
+    eng.dropped.append(R)
+    w._in_flight_rids.add(R)
+
+    w._rebuild(R, NODE)
+
+    assert R in w._rebuild_rows, "the request never comes back, or its worker's main loop raises"
 
 
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
