@@ -97,6 +97,12 @@ class Platform:
         platform doesn't report an address."""
         return frozenset(a for i in range(torch.accelerator.device_count())
                          if (a := self.pci_address(i)) is not None)
+    def knob_defaults(self) -> dict[str, str]:
+        """This platform's defaults for engine knobs (``mstar.utils.knobs``), by
+        ``knobs:`` key, as strings in the env vars' format. A deployment config's
+        ``knobs:`` block and an exported variable both override them."""
+        return {}
+
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
     ) -> dict[str, str]:
@@ -225,6 +231,10 @@ class RocmPlatform(Platform):
 
     def pci_address(self, device_index: int) -> str | None:
         return _torch_pci_address(device_index)
+
+    def knob_defaults(self) -> dict[str, str]:
+        # the AMD-specific knob defaults, as measured on MI300X / MI325X
+        return {}
     def visible_devices_env(
         self, devices: str | None, environ: Mapping[str, str],
     ) -> dict[str, str]:
