@@ -1428,3 +1428,30 @@ def test_a_cell_where_nothing_comes_back_ends_the_arm(tmp_path, monkeypatch):
     info = sweep.run_arm(plan, row, arm, [6], 8400, "")
     assert info["status"] == "error" and ran == [1] and stopped
     assert "every request of tts-seed at c=1 failed (Timeout on reading data from socket)" in info["error"]
+
+
+def test_media_rows_hold_one_of_the_nodes_media_lanes(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(sweep, "MEDIA_LANE_DIR", tmp_path / "lanes")
+    lock, running, peak = threading.Lock(), [0], [0]
+
+    def fake_row(plan, row, index, gpus, port):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.2)
+        with lock:
+            running[0] -= 1
+
+    real = sweep.media_lane
+    monkeypatch.setattr(sweep, "run_row", fake_row)
+    monkeypatch.setattr(sweep, "media_lane", lambda n, log=print: real(n, log, poll_s=0.01))
+    plan = type("P", (), {"log": staticmethod(lambda m: None), "media_lanes": 1})()
+    rows = [catalog.ROWS[n] for n in ("flux2_klein", "flux2_klein_9b", "z_image_turbo")]
+    sweep.run_rows(plan, rows, [3, 4, 5], 3, 8580)
+    assert peak[0] == 1  # three GPUs' worth of lanes, one media lane
+    plan.media_lanes, peak[0] = 0, 0
+    sweep.run_rows(plan, rows, [3, 4, 5], 3, 8580)
+    assert peak[0] == 3
