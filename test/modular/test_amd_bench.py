@@ -1097,7 +1097,7 @@ def test_a_failed_first_request_leaves_out_that_workloads_cells(tmp_path, monkey
 
     class FakeLaunch:
         def __init__(self, **kw):
-            pass
+            self.port, self.name = kw["port"], "fake"
 
         def start(self):
             return {"ready_s": 1.0, "first_request_s": 1.0}
@@ -1271,3 +1271,41 @@ def test_video_job_poll_gives_up(monkeypatch):
     metrics = RequestMetrics(request_id=0, type=RequestType.T2V, expected_output_modalities=["video_file"])
     asyncio.run(routes._send_request_video_job(Session(), req, "http://x", ModelType.WAN22.inst(), metrics, {}))
     assert metrics.error and "still in_progress" in metrics.error
+
+
+def test_a_server_moves_up_from_a_port_another_server_holds(tmp_path, monkeypatch):
+    from benchmark.amd import launch
+
+    monkeypatch.setattr(launch, "LOCK_DIR", tmp_path / "locks")
+    wt = tmp_path / "wt"
+    (wt / "configs").mkdir(parents=True)
+    row = catalog.ROWS["kokoro"]
+    a = Launch(catalog.ARMS["mstar"], row, [3], 8400, tmp_path / "a", worktree=wt)
+    b = Launch(catalog.ARMS["mstar"], row, [4], 8400, tmp_path / "b", worktree=wt)
+    a._take_locks()
+    with pytest.raises(launch.PortTakenError, match="port 8400 is held by"):
+        b._take_locks()
+    assert not (tmp_path / "locks" / "gpu4").exists()  # b gave its GPU lock back
+    a._release_locks()
+    b._take_locks()
+    b._release_locks()
+    assert not list((tmp_path / "locks").iterdir())
+
+    tried = []
+
+    class Fake:
+        def __init__(self, port):
+            self.port, self.name = port, f"fake-{port}"
+
+        def start(self):
+            tried.append(self.port)
+            if self.port < 8400 + 2 * launch.PORT_STEP:
+                raise launch.PortTakenError(f"port {self.port} is busy")
+            return {"ready_s": 1.0}
+
+    got, startup = launch.start_on_free_port(Fake, 8400, log=lambda m: None)
+    assert tried == [8400, 9400, 10400] and got.port == 10400 and startup == {"ready_s": 1.0}
+    # SGLang Diffusion's own ports follow the reserved HTTP port, so two servers starting together can't share one.
+    s = Launch(catalog.ARMS["sglang-diffusion"], catalog.ROWS["wan22"], [5], 8640, tmp_path / "s", worktree=wt)
+    cmd = s.command()
+    assert cmd[cmd.index("--master-port") + 1] == "29640" and cmd[cmd.index("--scheduler-port") + 1] == "20640"
