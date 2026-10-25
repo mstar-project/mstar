@@ -1309,3 +1309,32 @@ def test_a_server_moves_up_from_a_port_another_server_holds(tmp_path, monkeypatc
     s = Launch(catalog.ARMS["sglang-diffusion"], catalog.ROWS["wan22"], [5], 8640, tmp_path / "s", worktree=wt)
     cmd = s.command()
     assert cmd[cmd.index("--master-port") + 1] == "29640" and cmd[cmd.index("--scheduler-port") + 1] == "20640"
+
+
+def test_dry_runs_leave_out_failures_but_not_lost_ports(tmp_path):
+    from benchmark.amd import dry
+
+    def arm(run, row, name, **info):
+        d = tmp_path / run / row / name
+        d.mkdir(parents=True)
+        (d / "arm.json").write_text(json.dumps({"arm": name, "row": row, **info}))
+        return d
+
+    arm("a", "flux2_klein_9b", "sglang-diffusion", status="error",
+        error="Traceback\ntorch.distributed.DistNetworkError: port: 30005, code: -98, name: EADDRINUSE")
+    arm("b", "cosmos3_nano_t2i", "sglang-diffusion", status="error",
+        error="Traceback\nRuntimeError: server.sh: port 8981 is answered by pid 1, which is not 'x'")
+    arm("a", "flux2_klein_9b", "vllm-omni-rc", status="error", error="Traceback\nRuntimeError: did not come up")
+    arm("b", "cosmos3_nano_t2i", "vllm-omni-rc", status="error", error="Traceback\nRuntimeError: did not come up")
+    arm("a", "flux2_klein_9b", "mstar", status="error", startup={"ready_s": 1.0},
+        error="Traceback\nRuntimeError: the first image-gen request at 1024x1024 did not finish in 1800 s (see x)")
+    arm("b", "wan22", "vllm-omni", status="done", first_size={"video-i2v": {"832x480": "failed (HTTP 400, see y)"}})
+    c = arm("b", "cosmos3_nano_t2i", "mstar", status="done")
+    (c / "cells/image-gen/c1").mkdir(parents=True)
+    (c / "cells/image-gen/c1/cell.json").write_text(json.dumps(
+        {"workload": "image-gen", "status": "error", "errors": ["2 failed requests"]}))
+    out, why = dry.skips([tmp_path / "a", tmp_path / "b"])
+    assert out == ["flux2_klein_9b/mstar/image-gen", "flux2_klein_9b/vllm-omni-rc/*",
+                   "cosmos3_nano_t2i/mstar/image-gen",
+                   "cosmos3_nano_t2i/vllm-omni-rc/*", "*/vllm-omni/video-i2v", "*/vllm-omni-rc/*"]
+    assert sum("lost its port to another server" in w for w in why) == 2
