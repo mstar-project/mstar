@@ -66,7 +66,7 @@ def test_the_prompt_is_the_template_with_each_pad_expanded(model, modalities):
     layout = out.metadata[MEDIA_LAYOUT]
     out = out.new_input_tensors
     (ids,) = out["text_inputs"]
-    assert len(out["image_grid_thw"]) == n_images == len(layout["offset"])
+    assert len(layout["grid"]) == n_images == len(layout["offset"])
     assert len(out["pixel_values"]) == n_images
 
     parts = parts_from_modalities(modalities, "Describe this.")
@@ -109,14 +109,14 @@ def test_schedule_hands_the_walk_the_prompt_and_the_tower_inputs(model):
     layout = out.metadata[MEDIA_LAYOUT]
     out = out.new_input_tensors
     # the conductor passes tensor handles; the identity is all that matters
-    signals = {name: list(out[name]) for name in ("text_inputs", "pixel_values", "image_grid_thw")}
+    signals = {name: list(out[name]) for name in ("text_inputs", "pixel_values")}
     (step,) = model._prefill_schedule(modalities, signals, layout)
     assert step.walk == "prefill_vision"
     assert step.metadata == {MEDIA_LAYOUT: layout}
 
     edges = {(edge.next_node, edge.name): edge.tensor_info for edge in walk_input_edges(step)}
     assert set(edges) == {
-        ("LLM", "text_inputs"), ("vision_encoder", "pixel_values"), ("vision_encoder", "image_grid_thw"),
+        ("LLM", "text_inputs"), ("vision_encoder", "pixel_values"),
     }
     for (_node, name), got in edges.items():
         assert all(a is b for a, b in zip(got, signals[name], strict=True))
@@ -165,8 +165,9 @@ def test_image_only_message_renders_an_empty_text_span(model):
     out = model.process_prompt(
         None, ["image"], ["text"], tensors={"image_inputs": [an_image()]},
     )
+    assert len(out.metadata[MEDIA_LAYOUT]["grid"]) == 1
     out = out.new_input_tensors
-    assert len(out["pixel_values"]) == 1 and len(out["image_grid_thw"]) == 1
+    assert len(out["pixel_values"]) == 1 and "image_grid_thw" not in out
     # the template's framing around the image, one row
     assert len(out["text_inputs"]) == 1
 

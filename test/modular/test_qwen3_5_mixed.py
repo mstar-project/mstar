@@ -7,7 +7,8 @@ import pytest
 import torch
 
 from mstar.engine.resources.linear_attn.gdn import GDNManager
-from mstar.model.qwen3_5.config import LLM_MIXED, SAMPLER
+from mstar.model.keys import MIXED
+from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs
@@ -15,7 +16,7 @@ from mstar.model.submodule_base import ARNodeInputs
 
 def test_text_prefill_and_decode_share_the_mixed_walk():
     assert Qwen3_5DenseModel.get_combined_graph_walks(None) == {
-        "LLM": {LLM_MIXED: {"prefill_text", "decode"}},
+        "LLM": {MIXED: {"prefill_text", "decode"}},
     }
 
 
@@ -27,7 +28,7 @@ def test_a_mixed_step_tracks_only_its_prefill_rows_prompt_tokens():
         ARNodeInputs(input_seq_len=3, input_ids=prompt, graph_walk="prefill_text"),
     ]
 
-    step = llm.declare_step(LLM_MIXED, [0, 1], rows)
+    step = llm.declare_step(MIXED, [0, 1], rows)
 
     tracked = step.steps[SAMPLER].prefill_tracked_tokens
     assert list(tracked) == [1] and tracked[1] is prompt

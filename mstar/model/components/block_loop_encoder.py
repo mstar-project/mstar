@@ -8,7 +8,8 @@ cannot express). Eager, a ViT tower is launch-bound (~500 kernels, ~4 ms of
 GPU work in a ~20 ms forward on Qwen3.5 9B), and one prompt per replay beats
 batching them.
 
-A model writes ``prepare_inputs``: the grid maths, returning ``NodeInputs``
+A model writes ``prepare_inputs``: the grid maths over `grids` (host values
+from the walk's ``MEDIA_LAYOUT``, so no device tensor is read), returning ``NodeInputs``
 with the forward's tensors in ``tensor_inputs``, the patch count as
 ``input_seq_len``, and ``resource_step_info`` mapping each of
 ``SEGMENT_LABELS`` to the spans that attend together under it (frames,
@@ -37,6 +38,7 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
@@ -47,7 +49,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.keys import VISION_ATTN
-from mstar.model.multimodal import MediaEncoder
+from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_grids
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 # The tower's block loop, as a piecewise capture region
@@ -65,6 +67,11 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         self.model = model
         self.config = config
         self.output = encoder.output
+
+    def grids(self, fwd_info: CurrentForwardPassInfo) -> list[tuple[int, int, int]]:
+        """The patch grid ``(t, h, w)`` of each run this node fills, in prompt
+        order, off the walk's ``MEDIA_LAYOUT``."""
+        return media_grids(fwd_info.step_metadata.get(MEDIA_LAYOUT) or {}, self.output)
 
     def _declare(
         self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]],

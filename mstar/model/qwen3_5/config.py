@@ -13,13 +13,6 @@ from mstar.model import keys
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
 
-# text prefill and decode rows batched in one step (Model.get_combined_graph_walks)
-LLM_MIXED = keys.MIXED
-# Prompt rows a mixed step may carry: its GDN runs them on the chunked kernel,
-# which gathers and scatters each one's whole state (`GDNMixedWrapper`), and
-# the decode rows on the decode kernel.
-MIXED_MAX_PREFILL_ROWS = 4
-
 # resource keys this model declares; the shared scaffolds read `keys`' ones
 KV_CACHE = keys.KV_CACHE
 ATTN = "attn"

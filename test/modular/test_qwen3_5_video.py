@@ -271,15 +271,21 @@ def run_both(model, processor, layout: str):
     return parts, out, ref
 
 
-def by_modality(modalities, tensors) -> dict[str, list]:
-    """The prompt-ordered tower inputs split back into images and videos."""
+def by_modality(modalities, tensors, layout) -> dict[str, list]:
+    """The prompt-ordered tower inputs split back into images and videos, each
+    with its grid off the media layout's runs (a video's runs are its temporal
+    groups, each a one-frame grid)."""
     split = {"image": ([], []), VIDEO: ([], [])}
-    ordered = zip(tensors.get("pixel_values", []), tensors.get("image_grid_thw", []), strict=True)
+    pixels, runs = iter(tensors.get("pixel_values", [])), iter(layout["grid"])
     for m in modalities:
         if m != TEXT:
-            pixels, grid = next(ordered)
-            split[m][0].append(pixels)
-            split[m][1].append(grid)
+            p = next(pixels)
+            t, h, w = next(runs)
+            for _ in range(p.shape[0] // (t * h * w) - 1):
+                assert next(runs) == [t, h, w]
+            split[m][0].append(p)
+            split[m][1].append(torch.tensor([p.shape[0] // (h * w), h, w]))
+    assert next(runs, None) is None
     return split
 
 
@@ -352,7 +358,7 @@ def test_prompt_ids_match_processor(model, processor, layout):
 def test_patches_and_grids_match_processor(model, processor, layout):
     _, out, ref = run_both(model, processor, layout)
     tensors = out.new_input_tensors
-    split = by_modality(LAYOUTS[layout][0], tensors)
+    split = by_modality(LAYOUTS[layout][0], tensors, out.metadata[MEDIA_LAYOUT])
     assert torch.equal(torch.stack(split[VIDEO][1]), ref["video_grid_thw"])
     assert torch.equal(torch.cat(split[VIDEO][0]), ref["pixel_values_videos"])
     if split["image"][0]:
@@ -385,11 +391,11 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
         step.input_tensors[("vision_encoder", "pixel_values")], tensors["pixel_values"], strict=True,
     ))
 
-    merge = model.vision_config.spatial_merge_size ** 2
-    kinds = [m for m in modalities if m != TEXT]
+    media = out.metadata[MEDIA_LAYOUT]
+    (prompt,) = tensors["text_inputs"]
     marks = torch.cat([
-        torch.full((int(g.prod()) // merge, 1), VIDEO_MARK if kind == VIDEO else IMAGE_MARK)
-        for g, kind in zip(tensors["image_grid_thw"], kinds, strict=True)
+        torch.full((n, 1), VIDEO_MARK if int(prompt[offset]) == model.config.video_token_id else IMAGE_MARK)
+        for offset, n in zip(media["offset"], media["tokens"], strict=True)
     ])
     (encoder,) = model.encoders
     llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
@@ -438,10 +444,11 @@ def test_mp4_matches_processor(model, processor, tmp_path):
         "What happens?", ["video", "text"], ["text"],
         tensors={"video_inputs": [loaded.data]},
         input_metadata={"video_inputs": [loaded.metadata]},
-    ).new_input_tensors
+    )
     ref = processor.video_processor(videos=[str(path)], return_tensors="pt")
-    assert torch.equal(out["image_grid_thw"][0], ref["video_grid_thw"][0])
-    assert torch.equal(out["pixel_values"][0], ref["pixel_values_videos"])
+    t, h, w = ref["video_grid_thw"][0].tolist()
+    assert out.metadata[MEDIA_LAYOUT]["grid"] == [[1, h, w]] * t
+    assert torch.equal(out.new_input_tensors["pixel_values"][0], ref["pixel_values_videos"])
 
 
 # ---------------------------------------------------------------------------
@@ -464,9 +471,9 @@ def test_more_frame_groups_than_a_replay_holds_is_accepted(model):
         tensors={"video_inputs": [frames]},
         input_metadata={"video_inputs": [metadata]},
     )
-    (grid,) = out.new_input_tensors["image_grid_thw"]
-    assert int(grid[0]) > limit
-    assert int(grid.prod()) <= VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
+    grids = out.metadata[MEDIA_LAYOUT]["grid"]
+    assert len(grids) > limit
+    assert sum(t * h * w for t, h, w in grids) <= VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
 
 
 def _encoder(max_segments: int):
@@ -662,6 +669,13 @@ def test_a_video_with_no_frame_size_is_refused(model, tmp_path, monkeypatch):
     assert decoded == []
 
 
+def test_the_model_pickles_for_its_workers(model):
+    """The server pickles the Model into every worker process it spawns."""
+    import pickle
+
+    assert len(pickle.loads(pickle.dumps(model)).media) == len(model.media)
+
+
 def test_still_refuses_audio(model):
     with pytest.raises(ValueError, match="no audio path"):
         model.process_prompt(
@@ -689,7 +703,7 @@ def test_the_layout_places_every_pad(model, processor):
         covered[offset:offset + n] = True
     assert torch.equal(covered, torch.isin(ids, torch.tensor(sorted(pads))))
     merge = model.vision_config.spatial_merge_size ** 2
-    assert sum(layout["tokens"]) == sum(int(g.prod()) // merge for g in out.new_input_tensors["image_grid_thw"])
+    assert sum(layout["tokens"]) == sum(p.shape[0] for p in out.new_input_tensors["pixel_values"]) // merge
 
 
 # ---------------------------------------------------------------------------

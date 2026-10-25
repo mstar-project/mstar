@@ -42,7 +42,6 @@ from mstar.model.qwen3_5.config import (
     GDN_STATE,
     KV_CACHE,
     LINEAR_ATTN,
-    MIXED_MAX_PREFILL_ROWS,
     ROPE,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
@@ -98,10 +97,6 @@ class LLMSubmodule(SampledTokenDecoder):
             GDN_STATE: RecurrentStep(),
             LINEAR_ATTN: LinearAttnStep(),
         }
-
-    def max_rows_in_combined(self, graph_walk: str) -> int | None:
-        # a mixed step's prompt rows take the chunked GDN path, sized to these
-        return MIXED_MAX_PREFILL_ROWS if graph_walk == "prefill_text" else None
 
     # ------------------------------------------------------------------
     # MRoPE
@@ -229,14 +224,10 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        # (num_images, 3): a bare [t, h, w] would read as three images
         device = self.get_device()
         merge = self.config.spatial_merge_size
-        grid = [
-            (int(t), int(h), int(w))
-            for g in inputs["image_grid_thw"]
-            for t, h, w in g.reshape(-1, 3).tolist()
-        ]
+        # a video's runs are its temporal groups, each a one-frame grid
+        grid = self.grids(fwd_info)
         # Built here, not in the compiled forward: a `.tolist()` there breaks
         # the graph and makes h, w symints inductor cannot codegen from.
         indices, weights = vision_interpolation(

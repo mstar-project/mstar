@@ -41,8 +41,15 @@ def vision_position_ids(
 
     Block-major, so the rotary sees the order the merger will fold.
     """
-    out = []
+    # a video's frames come as one-frame grids of one size: build each run once
+    runs: list[list[int]] = []
     for t, h, w in grid:
+        if runs and runs[-1][1:] == [h, w]:
+            runs[-1][0] += t
+        else:
+            runs.append([t, h, w])
+    out = []
+    for t, h, w in runs:
         hpos, wpos = torch.meshgrid(
             torch.arange(h, device=device),
             torch.arange(w, device=device),

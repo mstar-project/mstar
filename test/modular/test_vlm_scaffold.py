@@ -118,23 +118,27 @@ def test_text_only_prompts_prefill_a_walk_per_text():
     assert schedule == [
         PrefillStep("prefill_text", {("LLM", "text_inputs"): [f"text_inputs{i}"]}) for i in range(2)
     ]
+    # encoder inputs with no layout to place them by are refused, not dropped
+    with pytest.raises(ValueError, match="no media layout"):
+        media_prefill_schedule(_signals(text_inputs=1, pixel_values=1), [VISION], model_name="m")
 
 
 @pytest.mark.parametrize(("counts", "walk"), [
-    ({"pixel_values": 2, "image_grid_thw": 2}, "prefill_vision"),
+    ({"pixel_values": 2}, "prefill_vision"),
     ({"audio_values": 1}, "prefill_audio"),
-    ({"pixel_values": 1, "image_grid_thw": 1, "audio_values": 2}, "prefill_vision_audio"),
+    ({"pixel_values": 1, "audio_values": 2}, "prefill_vision_audio"),
 ])
 def test_a_media_prompt_is_one_walk_over_the_encoders_it_needs(counts, walk):
     signals = _signals(text_inputs=1, **counts)
-    layout = {"offset": [3]}
+    encoder = {"pixel_values": VISION, "audio_values": AUDIO}
+    # the layout's runs name the encoders, as they do the KV layout's walk
+    layout = {"offset": [3] * len(counts), "output": [encoder[name].output for name in counts]}
     (step,) = media_prefill_schedule(signals, [VISION, AUDIO], layout, model_name="m")
     assert step.walk == walk and step.metadata == {MEDIA_LAYOUT: layout}
     edges = {(e.next_node, e.name): e.tensor_info for e in walk_input_edges(step)}
-    node = {"pixel_values": "vision_encoder", "image_grid_thw": "vision_encoder", "audio_values": "audio_encoder"}
     assert edges == {
         ("LLM", "text_inputs"): ["text_inputs0"],
-        **{(node[name], name): signals[name] for name in counts},
+        **{(encoder[name].node, name): signals[name] for name in counts},
     }
 
 
@@ -153,7 +157,7 @@ def test_the_walks_run_the_schedule_then_decode_then_finish():
 
 
 def test_a_media_walk_carries_its_layout_in_step_metadata():
-    signals = _signals(text_inputs=1, pixel_values=1, image_grid_thw=1)
+    signals = _signals(text_inputs=1, pixel_values=1)
     layout = {"offset": [1], "tokens": [4], "output": ["vision_embeds"], "grid": [[1, 4, 4]]}
     schedule = media_prefill_schedule(signals, [VISION], layout, model_name="m")
     first = initial_prefill_args(schedule, ["image", "text"], ["text"], signals, model_name="m")

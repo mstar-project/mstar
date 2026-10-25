@@ -380,9 +380,7 @@ class MediaEncoder:
 
 def vision_encoder(pad_ids: tuple[int, ...]) -> MediaEncoder:
     """The ``vision_encoder`` node every VLM here declares."""
-    return MediaEncoder(
-        "vision", "vision_encoder", ("pixel_values", "image_grid_thw"), "vision_embeds", pad_ids,
-    )
+    return MediaEncoder("vision", "vision_encoder", ("pixel_values",), "vision_embeds", pad_ids)
 
 
 def media_walk_name(encoders: Sequence[MediaEncoder]) -> str:
@@ -405,7 +403,8 @@ def media_layout(
     """A media walk's ``MEDIA_LAYOUT`` step metadata, columnar: each run's
     ``offset`` and ``tokens``, the encoder ``output`` it is read from, and
     its patch ``grid`` (``[]`` for media without one). Plain lists: it rides
-    the step's control message."""
+    the step's control message, so every node of the walk reads it on the
+    host (`media_grids`)."""
     grids = grids or {}
     return {
         "offset": list(pads.offset),
@@ -416,6 +415,23 @@ def media_layout(
             for p, i in zip(pads.pad, pads.index, strict=True)
         ],
     }
+
+
+def media_grids(layout: Mapping, output: str) -> list[tuple[int, int, int]]:
+    """The patch grid of each run a ``MEDIA_LAYOUT`` fills from encoder output
+    ``output``, in prompt order."""
+    return [
+        tuple(grid) for grid, out in zip(layout.get("grid", ()), layout.get("output", ()), strict=True)
+        if out == output
+    ]
+
+
+def media_encoders(encoders: Sequence[MediaEncoder], layout: Mapping) -> list[MediaEncoder]:
+    """The encoders a prompt's ``MEDIA_LAYOUT`` runs, in declaration order:
+    those whose output fills one of its runs. Both the prefill schedule and
+    the KV layout read this, so they name the same walk."""
+    outputs = set(layout.get("output", ()))
+    return [e for e in encoders if e.output in outputs]
 
 
 def media_walks(
@@ -487,12 +503,17 @@ def media_prefill_schedule(
     *,
     model_name: str,
 ) -> list[PrefillStep]:
-    """The prefill walks a request runs: with media, one walk over the
-    encoders of the media it holds and the whole prompt (``text_inputs``,
-    one tensor); without, one ``prefill_text`` walk per text tensor."""
+    """The prefill walks a request runs: with media in its ``layout``, one
+    walk over the encoders it runs (`media_encoders`) and the whole prompt
+    (``text_inputs``, one tensor); without, one ``prefill_text`` walk per text
+    tensor."""
     texts = signals.get("text_inputs", [])
-    present = [e for e in encoders if signals.get(e.inputs[0])]
+    present = media_encoders(encoders, layout or {})
     if not present:
+        sent = sorted(name for e in encoders for name in e.inputs if signals.get(name))
+        if sent:
+            # a text prefill would drop them; the conductor answers this with a 400
+            raise ValueError(f"{model_name} got {sent} with no media layout to place them by")
         return [PrefillStep("prefill_text", {("LLM", "text_inputs"): [t]}) for t in texts]
     if len(texts) != 1:
         # the model's intake renders one prompt; the conductor answers this with a 400

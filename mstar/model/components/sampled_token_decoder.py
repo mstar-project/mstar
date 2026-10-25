@@ -118,6 +118,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # (vision, audio or both). Capped well below a long prompt because static
     # buffers are sized by the largest bucket; past it the step runs eagerly.
     PREFILL_MEDIA_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
+    # Prompt rows a mixed step may carry beside its decode rows: the
+    # attention's prefill kernels are captured for this many, and a recurrent
+    # state's prefill kernel gathers and scatters each such row's whole state.
+    MIXED_MAX_PREFILL_ROWS = 4
     # Requests per media-walk step, of any medium: the largest caps every
     # media walk, captured or not (`max_batch_size`), so a packed step stays
     # near the top bucket (4 fit ~1000 tokens a request: a ~1000 px square
@@ -239,6 +243,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         return max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES) if graph_walk in self._media_walks else None
+
+    def max_rows_in_combined(self, graph_walk: str) -> int | None:
+        return self.MIXED_MAX_PREFILL_ROWS if graph_walk == "prefill_text" else None
 
     # ------------------------------------------------------------------
     # Inputs
