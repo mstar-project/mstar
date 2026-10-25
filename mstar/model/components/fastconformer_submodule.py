@@ -88,10 +88,10 @@ def _plan(num_frames: list[int]) -> list[tuple[int | None, list[int]]]:
 class FastConformerEncoderSubmodule(NodeSubmodule):
     """Log-mel features and the FastConformer encoder over a batch of clips.
 
-    Features are computed per request on the GPU in ``prepare_inputs``. A
-    batch is grouped by length bucket and each group replays that bucket's
-    graph, padded to it; the encoder masks the padding, so each request gets
-    what it would get alone. A clip past every bucket runs eagerly. Emits
+    A batch is grouped by length bucket (``_plan``) in ``preprocess``, which
+    computes each group's features together, and each group replays that
+    bucket's graph, padded to it; the encoder masks the padding, so each request
+    gets what it would get alone. A clip past every bucket runs eagerly. Emits
     ``encoder_states`` of shape ``(frames, hidden)`` per request, through
     ``projection`` when the model maps them into an LLM's embedding space.
     """
@@ -146,10 +146,20 @@ class FastConformerEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        features = self.log_mel.batch([inp.tensor_inputs["audio"] for inp in inputs])
+        audio = [inp.tensor_inputs["audio"] for inp in inputs]
+        groups = _plan([self.log_mel.num_frames(a.numel()) for a in audio])
+        # features per encoder group, so one long clip doesn't pad the batch's short ones to its length
+        features: list[torch.Tensor | None] = [None] * len(audio)
+        for bucket, rows in groups:
+            # a clip past every bucket runs eagerly on its own
+            parts = [rows] if bucket is not None else [[r] for r in rows]
+            for part in parts:
+                for r, feats in zip(part, self.log_mel.batch([audio[r] for r in part]), strict=True):
+                    features[r] = feats.to(self._param_dtype())
         return {
-            "features": [f.to(self._param_dtype()) for f in features],
+            "features": features,
             "out_lengths": [inp.input_seq_len for inp in inputs],
+            "groups": groups,
         }
 
     # -- the encoder, captured per bucket or eager ---------------------------
@@ -187,9 +197,12 @@ class FastConformerEncoderSubmodule(NodeSubmodule):
 
     def _encode(
         self, features: list[torch.Tensor], out_lengths: list[int], runners: dict[str, Any],
+        groups: list[tuple[int | None, list[int]]] | None = None,
     ) -> list[torch.Tensor]:
         states: list[torch.Tensor | None] = [None] * len(features)
-        for bucket, rows in _plan([feats.shape[0] for feats in features]):
+        if groups is None:
+            groups = _plan([feats.shape[0] for feats in features])
+        for bucket, rows in groups:
             runner = runners.get(_region(bucket)) if bucket is not None else None
             step = max(_batch_sizes(bucket)) if bucket is not None else 1
             for part in (rows[i:i + step] for i in range(0, len(rows), step)):
@@ -216,9 +229,10 @@ class FastConformerEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         features: list[torch.Tensor],
         out_lengths: list[int],
+        groups: list[tuple[int | None, list[int]]] | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        return {"encoder_states": self._encode(features, out_lengths, engine_inputs.piecewise_runners)[:1]}
+        return {"encoder_states": self._encode(features, out_lengths, engine_inputs.piecewise_runners, groups)[:1]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -233,7 +247,8 @@ class FastConformerEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         features: list[torch.Tensor],
         out_lengths: list[int],
+        groups: list[tuple[int | None, list[int]]] | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        states = self._encode(features, out_lengths, engine_inputs.piecewise_runners)
+        states = self._encode(features, out_lengths, engine_inputs.piecewise_runners, groups)
         return {rid: {"encoder_states": [s]} for rid, s in zip(engine_inputs.request_ids, states, strict=True)}

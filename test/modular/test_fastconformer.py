@@ -263,6 +263,31 @@ def test_encoder_node_batches_like_single_requests(causal, captured):
 
 
 
+def test_encoder_node_features_pad_per_group_not_to_the_batch(monkeypatch):
+    """``preprocess`` computes log-mel per replay group, so a clip past every
+    bucket doesn't pad the batch's short clips to its length, and each row
+    still gets the features it would alone."""
+    from mstar.model.components.fastconformer_submodule import MEL_BUCKETS, FastConformerEncoderSubmodule
+    from mstar.model.submodule_base import NodeInputs
+
+    torch.manual_seed(5)
+    node = FastConformerEncoderSubmodule(FastConformerEncoder(FastConformerConfig.from_hf(TINY)).eval())
+    hop = node.log_mel.hop_length
+    clips = [torch.randn(n * hop) for n in (100, 300, MEL_BUCKETS[-1] + 500, 120)]
+    batch, padded_to = node.log_mel.batch, []
+
+    def spy(waveforms):
+        padded_to.append(max(w.numel() for w in waveforms))
+        return batch(waveforms)
+
+    monkeypatch.setattr(node.log_mel, "batch", spy)
+    out = node.preprocess("prefill", None, [NodeInputs(tensor_inputs={"audio": c}, input_seq_len=1) for c in clips])
+    assert padded_to.count(clips[2].numel()) == 1
+    assert max(n for n in padded_to if n != clips[2].numel()) <= clips[1].numel()
+    for clip, feats in zip(clips, out["features"], strict=True):
+        torch.testing.assert_close(feats, batch([clip])[0].to(feats.dtype), rtol=1e-5, atol=1e-5)
+
+
 def test_replay_plan_covers_every_row_and_merges_short_clips():
     """``_plan`` gives each row one group; short clips ride in a longer clip's
     replay when a replay of their own costs more than the padding, rows of one
