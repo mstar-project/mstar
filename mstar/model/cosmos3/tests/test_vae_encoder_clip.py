@@ -11,7 +11,9 @@ Inverse dynamics still encodes the whole observed clip.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
+from mstar.model.cosmos3.components.conditioning import prepare_conditioning_frames
 from mstar.model.cosmos3.submodules import Cosmos3VAEEncoderSubmodule
 from mstar.model.cosmos3.tests.test_edge import _tiny_edge_config
 from mstar.model.submodule_base import CurrentForwardPassInfo, ModelInputsFromEngine
@@ -97,3 +99,14 @@ def test_inverse_dynamics_and_i2v_keep_their_clips():
     ni, lat = _run(enc, {"height": 32, "width": 48, "num_frames": 33}, {"image_inputs": [torch.rand(3, 64, 96)]})
     assert ni.tensor_inputs["vision"].shape[2] == 1 and "condition_indexes" not in ni.kwargs
     assert tuple(lat.shape) == (1, cfg.latent_channel, 1, 2, 3)
+
+
+def test_i2v_follows_conditioning_resize():
+    image = torch.randint(0, 256, (3, 64, 96), generator=torch.Generator().manual_seed(0)).float() / 255.0
+    md = {"height": 32, "width": 32, "num_frames": 33}
+    for mode in ("aspect_crop", "stretch"):
+        ni, _ = _run(_node(_tiny_edge_config(conditioning_resize=mode)), md, {"image_inputs": [image]})
+        assert torch.equal(ni.tensor_inputs["vision"], prepare_conditioning_frames(image, 32, 32, mode)), mode
+    # diffusers' VideoProcessor resizes a tensor nearest-neighbour; the stretch must not.
+    nearest = F.interpolate(image.unsqueeze(0), size=(32, 32)) * 2 - 1
+    assert (ni.tensor_inputs["vision"][:, :, 0] - nearest).abs().mean() > 0.05

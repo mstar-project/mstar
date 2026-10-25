@@ -774,6 +774,16 @@ Cosmos3 environment requirements
   dtype. ``COSMOS3_VAE_DECODE_FP32`` (``WAN22_VAE_DECODE_FP32`` for Wan2.2)
   forces either choice.
 
+Cosmos3 image-to-video conditioning
+-----------------------------------
+
+An image-to-video request's conditioning image is scaled to cover the output
+size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
+NVIDIA's cosmos-framework and diffusers 0.40 and later. Setting
+``conditioning_resize: stretch`` under the config YAML's ``model_kwargs``
+resizes it to the output size instead (antialiased bilinear, aspect ratio not
+kept), as diffusers 0.39 did. Action requests ignore the setting.
+
 Cosmos3-Edge reasoner and action loop
 -------------------------------------
 
