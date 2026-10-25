@@ -22,6 +22,7 @@ from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
     RemoveRequest,
+    WorkerMessageType,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
@@ -395,7 +396,8 @@ def test_a_follower_takes_in_a_new_request_that_follows_rank_0s_drain_without_re
     w = Worker.__new__(Worker)
     w.worker_id = "w1"
     w._draining_rids = {"wire"}
-    w._unprocessed_messages = {"wire": ["remove"]}
+    remove = SimpleNamespace(message_type=WorkerMessageType.REMOVE_REQUEST)
+    w._unprocessed_messages = {"wire": [remove]}
     w._last_active = {}
     ingested, stopped, processed = [], [], []
     w._graph_runtime = SimpleNamespace(add_request=lambda **kw: 5, get_sharding_config=lambda rid: None)
@@ -416,7 +418,7 @@ def test_a_follower_takes_in_a_new_request_that_follows_rank_0s_drain_without_re
     Worker._add_new_request(w, body)
 
     assert ingested == [5], "rank 0's moves for a drained request would wait for good"
-    assert stopped == [5] and processed == ["remove"] and "wire" not in w._unprocessed_messages
+    assert stopped == [5] and processed == [remove] and "wire" not in w._unprocessed_messages
 
 
 def test_add_new_request_hands_off_the_handle_not_the_string():

@@ -413,3 +413,22 @@ def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guarant
     assert bool(leader._streams["b"]["main"].lent) != guaranteed
     assert follower._streams["b"]["main"].lent == leader._streams["b"]["main"].lent
     assert follower._unused == leader._unused, "the follower's room differs from rank 0's after the hit"
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_a_commit_above_one_rank_keeps_the_room_when_it_files_under_a_page_only_the_index_holds(rank):
+    """z prefills beside x, so it finds nothing cached and loses x's keys at commit. Its next page goes in with no
+    parent, so the cached pages x left stay evictable and the room the allotments count doesn't drop."""
+    kv = _manager(rank, max_num_pages=12)
+    x = _tokens(2 * PAGE_SIZE + 1, seed=50)
+    z = x[:2 * PAGE_SIZE] + _tokens(PAGE_SIZE + 3, seed=51)
+    _ingest(kv, "x", x)
+    _ingest(kv, "z", z)
+    steps = _step(kv, "x", len(x)), _step(kv, "z", len(z))
+    kv.commit(steps[0], _ctx("x"))
+    kv.remove_request("x")
+    room = kv._room()
+
+    kv.commit(steps[1], _ctx("z"))
+
+    assert kv._room() == room, "the commit pinned cached pages the room counted"

@@ -194,19 +194,18 @@ def test_leader_remove_then_conductor_remove_goes_through_remove_request():
     assert w.wire_rids_cleared == ["tp#1"]
 
 
-def test_conductor_remove_for_a_request_never_admitted_drops_what_was_parked():
-    """A NEW_REQUEST refused because the request was already draining: nothing
-    replays its parked messages or clears its drain state, and the conductor's
-    REMOVE follows it on the same socket, so no later NEW_REQUEST will."""
+def test_a_request_drained_before_its_new_request_acks_what_was_parked():
+    """A request drained before its NEW_REQUEST is still taken in, without reads, so a TP follower can apply rank
+    0's moves for it. Its parked inputs are never read, so they are ACKed unread, and the conductor's REMOVE tears
+    it down and clears its drain state."""
     w = _worker()
     w._process_message_list([_drain("D#1"), _signals("D#1", 3), _new("D#1")])
-    assert w._rid("D#1") is None and _parked(w) == 1
+    assert w._rid("D#1") is not None and _parked(w) == 0
+    assert w.tensor_manager.acked == [("D#1", 3)] and w.tensor_manager.reads == []
 
     w._process_message_list([_remove("D#1")])
-    assert not w._unprocessed_messages
-    assert w.tensor_manager.acked == [("D#1", 3)]
+    assert not w._unprocessed_messages and w._rid("D#1") is None
     assert "D#1" not in w._draining_rids and "D#1" not in w._reads_done_sent
-    assert w.wire_rids_cleared == ["D#1"]
 
 
 def test_a_remove_replayed_from_the_parking_lot_acks_what_trailed_it_once():
