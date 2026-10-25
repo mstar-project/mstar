@@ -1338,3 +1338,93 @@ def test_dry_runs_leave_out_failures_but_not_lost_ports(tmp_path):
                    "cosmos3_nano_t2i/mstar/image-gen",
                    "cosmos3_nano_t2i/vllm-omni-rc/*", "*/vllm-omni/video-i2v", "*/vllm-omni-rc/*"]
     assert sum("lost its port to another server" in w for w in why) == 2
+
+
+def test_closed_loop_stops_sending_after_failures_in_a_row():
+    import asyncio
+    from types import SimpleNamespace
+
+    from benchmark.base import RequestType
+    from benchmark.request import RequestInput, RequestMetrics
+    from benchmark.runner import Benchmark
+
+    sent = []
+
+    class System:
+        async def send_request(self, session, req_input, base_url, request_id, model):
+            sent.append(request_id)
+            m = RequestMetrics(request_id=request_id, type=req_input.req_type, expected_output_modalities=["audio"])
+            if request_id != 1:
+                m.record_error("Timeout on reading data from socket")
+            return m
+
+    b = Benchmark.__new__(Benchmark)
+    b.config = SimpleNamespace(max_concurrency=1, abort_after_failures=2, url="http://x", model=None)
+    b.inference_system = System()
+    out = asyncio.run(b._run_concurrent_closed_loop(None, [RequestInput(req_type=RequestType.T2S, prompt="p")
+                                                           for _ in range(8)]))
+    assert sent == [0, 1, 2, 3] and all(m.error.startswith("not sent") for m in out[4:])
+    sent.clear()
+    b.config.abort_after_failures = None
+    asyncio.run(b._run_concurrent_closed_loop(None, [RequestInput(req_type=RequestType.T2S, prompt="p")
+                                                     for _ in range(8)]))
+    assert sent == list(range(8))
+
+
+def test_a_cell_where_nothing_comes_back_ends_the_arm(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_client(cmd, env, log_path, timeout_s=None):
+        calls.append(cmd)
+        out = Path(cmd[cmd.index("--output-dir") + 1])
+        (out / "results.json").write_text(json.dumps({"completed": 0, "failed": 40, "errors": [
+            {"request_id": 0, "error": "Timeout on reading data from socket"}]}))
+        return 0, 0.1
+
+    monkeypatch.setattr(sweep, "run_client", fake_client)
+    monkeypatch.setattr(sweep, "cotenants", lambda job: {})
+    plan = type("P", (), {"resume": False, "repeats": 3, "table": tables.TABLES["tts"], "log": print})()
+    row, arm, wl = catalog.ROWS["qwen3tts_1p7b"], catalog.ARMS["sglang-omni"], tables.WORKLOADS["tts-seed"]
+    cell = sweep.run_cell(plan, arm, row, wl, 1, 8400, tmp_path / "arm", [6])
+    assert len(calls) == 1 and cell["status"] == "error" and cell["all_failed"] == "Timeout on reading data from socket"
+    assert calls[0][calls[0].index("--abort-after-failures") + 1] == "4"
+    cmd = sweep.runner_command(arm, row, wl, 64, 8400, tmp_path / "r", 1)
+    assert cmd[cmd.index("--abort-after-failures") + 1] == "64"
+
+    stopped, ran = [], []
+
+    class FakeLaunch:
+        def __init__(self, **kw):
+            self.port, self.name = kw["port"], "fake"
+
+        def start(self):
+            return {"ready_s": 1.0, "first_request_s": 1.0}
+
+        def stop(self):
+            stopped.append(1)
+            return {}
+
+    class FakeHealth:
+        monitor = None
+
+        def __init__(self, *a):
+            pass
+
+        def begin(self):
+            pass
+
+        def end(self):
+            return {}
+
+    monkeypatch.setattr(sweep, "Launch", FakeLaunch)
+    monkeypatch.setattr(sweep.health, "ArmHealth", FakeHealth)
+    monkeypatch.setattr(sweep.health, "smi_gpus", lambda gpus: gpus)
+    monkeypatch.setattr(sweep, "run_cell", lambda plan, arm, row, wl, c, *a: ran.append(c) or {
+        "summary": {}, "spread": None, "flags": [], "errors": ["40 failed requests"], "workload": wl.name,
+        "concurrency": c, "status": "error", "all_failed": "Timeout on reading data from socket"})
+    plan = type("P", (), {"run_dir": tmp_path / "run", "resume": False, "measured": [], "numa": False, "log": print,
+                          "correctness": False, "worktree": tmp_path, "trees": {}, "skips": [],
+                          "fixed_concurrency": False, "workloads": [wl]})()
+    info = sweep.run_arm(plan, row, arm, [6], 8400, "")
+    assert info["status"] == "error" and ran == [1] and stopped
+    assert "every request of tts-seed at c=1 failed (Timeout on reading data from socket)" in info["error"]
