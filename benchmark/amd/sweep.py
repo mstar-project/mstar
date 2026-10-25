@@ -18,8 +18,10 @@ runs the same path anywhere and labels the table as a functional run.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime
+import fcntl
 import fnmatch
 import json
 import os
@@ -206,6 +208,38 @@ def cotenants(job: str | None) -> dict:
 
 # --- the driver ----------------------------------------------------------------------------
 
+# Image and video rows running at once on a node, counted across every sweep there (dry runs too): more than two
+# diffusion servers side by side throttled MI300X GPUs for up to a fifth of each arm's window.
+MEDIA_LANES = 2
+MEDIA_LANE_DIR = Path("/tmp") / os.environ.get("USER", "user") / "wsj-media-lanes"
+
+
+@contextlib.contextmanager
+def media_lane(n: int, log=print, poll_s: float = 10.0):
+    """Hold one of the node's ``n`` media lanes while the block runs (a lock on one of n files, which the kernel
+    drops with the process)."""
+    MEDIA_LANE_DIR.mkdir(parents=True, exist_ok=True)
+    waited = False
+    while True:
+        for i in range(n):
+            f = open(MEDIA_LANE_DIR / f"lane{i}", "a+")
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                f.close()
+                continue
+            try:
+                yield i
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+                f.close()
+            return
+        if not waited:
+            log(f"waiting for one of the node's {n} media lanes")
+            waited = True
+        time.sleep(poll_s)
+
+
 @dataclass
 class Plan:
     table: tables.Table
@@ -228,6 +262,7 @@ class Plan:
     trees: dict = field(default_factory=dict)  # named mstar trees (--tree) for arms that serve one
     fixed_concurrency: bool = False  # --concurrency given: it wins over a row's own per-workload concurrency
     skips: list = field(default_factory=list)  # --skip ROW/ARM[/WORKLOAD] patterns (fnmatch), e.g. from a dry run
+    media_lanes: int = MEDIA_LANES  # image and video rows that may run at once on the node, across sweeps; 0: any
     log_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def log(self, msg: str) -> None:
@@ -561,7 +596,9 @@ def run_rows(plan: Plan, rows: list[Row], gpus: list[int], parallel: int, port_b
 
     def one(row, index, mine, port):
         try:
-            run_row(plan, row, index, mine, port)
+            n = getattr(plan, "media_lanes", 0)
+            with media_lane(n, plan.log) if n and row.family in ("image", "video") else contextlib.nullcontext():
+                run_row(plan, row, index, mine, port)
         finally:
             with cond:
                 free.extend(mine)
@@ -666,6 +703,8 @@ def main(argv=None) -> int:
     ap.add_argument("--repeats", type=int, default=None)
     ap.add_argument("--concurrency", default=None, help="comma list replacing every workload's (dry runs)")
     ap.add_argument("--lanes", type=int, default=1, help="rows that may run at once, each on its own GPUs")
+    ap.add_argument("--media-lanes", type=int, default=MEDIA_LANES,
+                    help="image and video rows that may run at once on the node, across sweeps (0: no cap)")
     ap.add_argument("--numa", action="store_true", help="bind each server to its GPU's NUMA node")
     ap.add_argument("--port-base", type=int, default=8400)
     ap.add_argument("--expect-gpus", type=int, default=None, help="node GPU count for the health check")
@@ -711,7 +750,7 @@ def main(argv=None) -> int:
                 repeats=args.repeats or table.repeats, lanes=args.lanes, dry=args.dry,
                 correctness=not args.no_correctness, numa=args.numa, resume=args.resume,
                 expect_gpus=args.expect_gpus, trees=tree_list(args.tree), fixed_concurrency=bool(args.concurrency),
-                skips=list(args.skip))
+                skips=list(args.skip), media_lanes=args.media_lanes)
     if plan.skips:
         plan.log(f"left out by --skip: {', '.join(plan.skips)}")
     skipped = sorted({a for a in arms if catalog.ARMS[a].tree and catalog.ARMS[a].tree not in plan.trees})
@@ -729,7 +768,8 @@ def main(argv=None) -> int:
     meta = {"table": table.name, "note": table.note, "run_id": run_id, "dry": args.dry, "node": node,
             "job": job, "gpus": gpus, "rows": [r.name for r in rows], "arms": arms, "workloads": [w.name for w in wls],
             "concurrency": {w.name: list(w.concurrency) for w in wls},
-            "repeats": plan.repeats, "spread_limit": table.spread_limit, "lanes": args.lanes, "numa": args.numa,
+            "repeats": plan.repeats, "spread_limit": table.spread_limit, "lanes": args.lanes,
+            "media_lanes": args.media_lanes, "numa": args.numa,
             "worktree": str(plan.worktree), "trees": {k: str(v) for k, v in plan.trees.items()},
             "driver": str(REPO), "argv": sys.argv,
             "correctness_src": str(plan.correctness_src) if plan.correctness_src else None,
