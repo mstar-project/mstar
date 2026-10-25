@@ -306,6 +306,40 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
     assert sub.max_batch_size(PREFILL_WALK) == sub.MAX_BATCH_SIZE and sub.can_batch(None, [])
 
 
+def test_encoder_replays_exactly_when_leased():
+    """A leased step declares nothing of its own, so the forward replays
+    then and runs eagerly otherwise, whatever the runner's buckets allow."""
+    from types import SimpleNamespace
+
+    from mstar.model.qwen3_asr.submodules import AUT_ENCODE
+
+    class Runner:
+        has_bucket = True
+
+        def can_run(self, batch_size, total_tokens):
+            return self.has_bucket
+
+        def run(self, **kwargs):
+            self.ran = kwargs
+            return {"embeds": "replayed"}
+
+    sub, runner = object.__new__(Qwen3ASREncoderSubmodule), Runner()
+
+    def replay(step):
+        engine_inputs = SimpleNamespace(piecewise_runners={AUT_ENCODE: runner}, request_ids=["a", "b"], step=step)
+        return sub._replay_encode(engine_inputs, torch.zeros(12, 8), [4, 8])
+
+    assert replay(step=object()) is None
+    assert not hasattr(runner, "ran")
+    # no declaration but no bucket either (a forward driven outside the engine)
+    runner.has_bucket = False
+    assert replay(step=None) is None
+    assert not hasattr(runner, "ran")
+    runner.has_bucket = True
+    assert replay(step=None) == "replayed"
+    assert runner.ran["seq_lens"] == [4, 8] and runner.ran["real_bs"] == 2
+
+
 def _llm_submodule(cfg):
     sub = object.__new__(Qwen3ASRLLMSubmodule)
     torch.nn.Module.__init__(sub)

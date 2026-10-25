@@ -212,11 +212,14 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
     def _replay_encode(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, windows: list[int],
     ) -> torch.Tensor | None:
-        """The stack replayed for the whole packed batch, or None if not leased
-        (decided as the engine leased, on batch size and total tokens)."""
+        """The stack replayed for the whole packed batch, or None if not leased.
+
+        A leased step declares nothing (`declare_step`), so ``engine_inputs.step``
+        is None; a bucket that fits is not enough, as ``can_lease`` may have
+        refused the batch."""
         runner = engine_inputs.piecewise_runners.get(AUT_ENCODE)
         bs = len(engine_inputs.request_ids)
-        if runner is None or not runner.can_run(bs, int(hidden.shape[0])):
+        if runner is None or engine_inputs.step is not None or not runner.can_run(bs, int(hidden.shape[0])):
             return None
         # an owned copy: the encoder states leave this worker after the step,
         # and the buffer is the next replay's
