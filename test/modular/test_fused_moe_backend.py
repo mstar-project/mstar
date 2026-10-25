@@ -127,7 +127,8 @@ def test_file_name_names_the_whole_problem():
 
 
 def _shipped():
-    return sorted(CONFIG_DIR.glob("*.json"))
+    # get_config's tables (mstar.utils.fused_moe.tune) share the directory, named without topk
+    return sorted(p for p in CONFIG_DIR.glob("*.json") if ",topk=" in p.name)
 
 
 @pytest.mark.parametrize("path", _shipped(), ids=lambda p: p.name)
