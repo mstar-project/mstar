@@ -317,16 +317,17 @@ class _ProbsSpy:
     """Records the distribution each ``sampling_from_probs`` call draws from."""
 
     def __init__(self, monkeypatch):
-        import flashinfer
+        from mstar.engine.resources.sampler import utils as sampler_utils
 
         self.seen: list[torch.Tensor] = []
-        real = flashinfer.sampling.sampling_from_probs
+        # the platform's kernel, which the draw reaches through this dispatch
+        real = sampler_utils._sampling_from_probs
 
         def spy(probs, *args, **kwargs):
             self.seen.append(probs)
             return real(probs, *args, **kwargs)
 
-        monkeypatch.setattr(flashinfer.sampling, "sampling_from_probs", spy)
+        monkeypatch.setattr(sampler_utils, "_sampling_from_probs", spy)
 
 
 def _capable(device) -> SamplerResource:
