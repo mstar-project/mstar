@@ -349,11 +349,15 @@ def _check(probs: torch.Tensor, rids: list[str], rows: dict[str, RefRow], logits
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-6)
 
 
-def _ctx(rids, lease=None) -> StepContext:
-    return StepContext(
+def _ctx(rids, lease=None, padded=None) -> StepContext:
+    ctx = StepContext(
         request_ids=tuple(rids), graph_walk="decode", slot=0, capture=False,
         slot_lease=lease,
     )
+    if padded is not None:
+        # the rows a leased step samples, as the engine pads them
+        ctx.set_padded_rids(tuple(padded))
+    return ctx
 
 
 STEPS = 60
@@ -428,14 +432,14 @@ def test_captured_graph_matches_upstream_step_by_step(monkeypatch):
     static = torch.zeros(bs, VOCAB, device=dev)
     graphs, outs, probs = [], [], []
     for lease in leases:
-        res.plan(step_kind, _ctx(live, lease))
+        res.plan(step_kind, _ctx(live, lease, padded))
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             res.sample(static)  # warmup: autotune, lazy init
         torch.cuda.current_stream().wait_stream(side)
         # the warmup advanced the per-step rows; regather before capturing
-        res.plan(step_kind, _ctx(live, lease))
+        res.plan(step_kind, _ctx(live, lease, padded))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             outs.append(res.sample(static))
