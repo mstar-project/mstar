@@ -80,13 +80,13 @@ SERVER_SH = HERE / "server.sh"
 
 MODELS = {
     "turbo": {"key": "whisper_large_v3_turbo", "hf": "openai/whisper-large-v3-turbo", "family": "whisper",
-              "engines": ["mstar", "vllm", "sgl_omni"]},
+              "config": "configs/whisper_large_v3_turbo.yaml", "engines": ["mstar", "vllm", "sgl_omni"]},
     "large": {"key": "whisper_large", "hf": "openai/whisper-large-v3", "family": "whisper",
-              "engines": ["mstar", "vllm", "sgl_omni"]},
+              "config": "configs/whisper_large.yaml", "engines": ["mstar", "vllm", "sgl_omni"]},
     "qasr": {"key": "qwen3_asr", "hf": "Qwen/Qwen3-ASR-1.7B", "family": "qwen",
-             "engines": ["mstar", "vllm", "sgl_omni"]},
+             "config": "configs/qwen3_asr.yaml", "engines": ["mstar", "vllm", "sgl_omni"]},
     "qasr_rt": {"key": "qwen3_asr_realtime", "hf": "Qwen/Qwen3-ASR-0.6B", "family": "qwen",
-                "engines": ["mstar", "vllm"],
+                "config": "configs/qwen3_asr_realtime.yaml", "engines": ["mstar", "vllm"],
                 # vLLM registers /v1/realtime only for a SupportsRealtime class; the checkpoint's
                 # default architecture is the plain transcription one (the route answers 403)
                 "vllm_args": ["--hf-overrides", '{"architectures": ["Qwen3ASRRealtimeGeneration"]}']},
@@ -368,7 +368,9 @@ def phase_data(a) -> int:
 
 class Server:
     def __init__(self, out: Path, m: str, e: str, gpu: int, port: int, tag: str, timed: bool = True,
-                 extra: list[str] | None = None, env_extra: dict | None = None):
+                 extra: list[str] | None = None, env_extra: dict | None = None, cap: int | None = None):
+        """``cap``: the most concurrent requests the caller drives. An mstar config capping
+        max_concurrent_requests below it is served from a raised copy (``bench_config``)."""
         self.out, self.m, self.e, self.gpu, self.port = out, m, e, gpu, port
         self.name = f"{m}_{e}_{tag}"
         self.timed, self.extra, self.env_extra = timed, list(extra or []), dict(env_extra or {})
@@ -376,6 +378,31 @@ class Server:
         self.log_path = out / "servers" / f"{self.name}.log"
         self.variant = None
         self.started = False
+        # the mstar server's max_concurrent_requests (None: uncapped, or not mstar), for the results
+        self.serve_args, self.max_concurrent = (self.bench_config(cap) if e == "mstar"
+                                                else (self.extra, None))
+
+    def bench_config(self, cap: int | None) -> tuple[list[str], int | None]:
+        """``self.extra`` with the served config raised to ``cap`` concurrent requests, and the cap served.
+        Past the config's cap, requests queue in the conductor, so a cell above it would time the queue,
+        not the engine (Qwen3-ASR ships at 12). The KV page count stays: benchmark utterances are short."""
+        args = list(self.extra)
+        at = args.index("--config") + 1 if "--config" in args else None
+        src = REPO / (args[at] if at is not None else MODELS[self.m]["config"])
+        text = src.read_text()
+        found = re.search(r"^max_concurrent_requests:[ \t]*(\d+)", text, re.M)
+        served = int(found.group(1)) if found else None
+        if cap is None or served is None or served >= cap:
+            return args, served
+        path = self.out / "servers" / f"{self.name}.config.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# benchmark copy of {src}: max_concurrent_requests {served} -> {cap}\n"
+                        + text[:found.start(1)] + str(cap) + text[found.end(1):])
+        if at is None:
+            args += ["--config", str(path)]
+        else:
+            args[at] = str(path)
+        return args, cap
 
     def variants(self) -> list[tuple[str, list[str], dict]]:
         m, e = MODELS[self.m], self.e
@@ -390,7 +417,7 @@ class Server:
             env.pop("CUDA_VISIBLE_DEVICES")  # --gpus sets it
             cmd = [str(MSTAR_BIN / "mstar"), "serve", m["key"], "--gpus", str(self.gpu), "--port", str(self.port),
                    "--socket-path-prefix", f"/tmp/mstar_{self.name}_{ts}/",
-                   "--upload-dir", f"/tmp/mstar_up_{self.name}_{ts}/"] + self.extra
+                   "--upload-dir", f"/tmp/mstar_up_{self.name}_{ts}/"] + self.serve_args
             strict = {**env, "MSTAR_REQUIRE_CUDA_GRAPHS": "1"}
             return [("graphs_required", cmd, strict), ("graphs_not_required", cmd, env)]
         if e == "vllm":
@@ -411,7 +438,8 @@ class Server:
                 ("minimal", base + self.extra, env)]
 
     def config_id(self) -> str:
-        return "default" if not self.extra else "tuned:" + " ".join(self.extra)
+        cid = "default" if not self.extra else "tuned:" + " ".join(self.extra)
+        return cid if self.max_concurrent is None else f"{cid}, max_concurrent_requests={self.max_concurrent}"
 
     def start(self) -> bool:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1018,7 +1046,7 @@ def run_engine_round(out: Path, m: str, e: str, r: int) -> None:
         log(f"{key}: done, skipping")
         return
     extra = tuned_extra(out, m, e) if r > 1 else []
-    srv = Server(out, m, e, TIMED_GPU, 8100, f"r{r}", extra=extra)
+    srv = Server(out, m, e, TIMED_GPU, 8100, f"r{r}", extra=extra, cap=max(CONCS))
     cdir = out / "cells" / m / e / f"r{r}"
     ok_all = True
     with serving(srv) as up:
@@ -1039,7 +1067,8 @@ def run_engine_round(out: Path, m: str, e: str, r: int) -> None:
         elif r == 2 and e == "mstar" and NGPU >= 8:
             collect(out, srv, m, e, "mstar_c", extras=False)  # a third process, where GPUs are spare
         meta = {"model": m, "engine": e, "round": r, "config": srv.config_id(), "variant": srv.variant,
-                "start_s": getattr(srv, "start_s", None), "server": srv.name}
+                "start_s": getattr(srv, "start_s", None), "server": srv.name,
+                "max_concurrent_requests": srv.max_concurrent}
         items = load("test_clean_200")
         first = True
         for c in CONCS:
@@ -1529,7 +1558,8 @@ def phase_profile(a) -> int:
     for m in targets:
         if done(out, f"profile/{m}"):
             continue
-        srv = Server(out, m, "mstar", TIMED_GPU, 8100, "profile", env_extra={"MSTAR_PHASE_TIMING": "100"})
+        srv = Server(out, m, "mstar", TIMED_GPU, 8100, "profile", env_extra={"MSTAR_PHASE_TIMING": "100"},
+                     cap=max(CONCS))
         with serving(srv) as up:
             if not up:
                 continue
@@ -1537,6 +1567,7 @@ def phase_profile(a) -> int:
             run_requests(srv.url, req_model(m, "mstar"), repeat(items, 64), 32, json_fields())
             res = cell(srv, m, "mstar", repeat(items, 400), 32, json_fields())
             res.pop("records")
+            res["max_concurrent_requests"] = srv.max_concurrent
             wjson(out / "profile" / f"{m}.json", res)
         shutil.copy(srv.log_path, out / "profile" / f"{m}_server.log")
         mark(out, f"profile/{m}")
@@ -1565,7 +1596,9 @@ def phase_summarize(a) -> int:
              "rotated; 200 LibriSpeech test-clean utterances (1818.5 s) at c=1/8 (200 requests) and c=32/64 "
              "(400 requests), closed loop, language=en, temperature 0, json; 5 warmup waves at c=32 then 1 wave "
              "per point; RTFx = audio s / wall s. A cell counts only with 0 errors and 0 bad transcripts "
-             "(per-request content check). mean +- sd over valid rounds with the same engine config.", ""]
+             "(per-request content check). mean +- sd over valid rounds with the same engine config. "
+             f"mstar's timed servers raise a config's max_concurrent_requests to {max(CONCS)} (the config "
+             "column says what each served).", ""]
 
     def ms(vals):
         vals = [v for v in vals if v is not None]

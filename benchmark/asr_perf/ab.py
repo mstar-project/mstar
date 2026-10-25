@@ -151,7 +151,7 @@ def run_server_cells(a, arm: str, m: str, r: int, engine: str = "mstar", spec: "
         if spec and spec.mps:
             mps_env = mps(True)
     srv = H.Server(a.out, m, engine, 0, 8100, f"{arm}_r{r}", extra=(spec.args if spec else []),
-                   env_extra={**(spec.env if spec else {}), **mps_env})
+                   env_extra={**(spec.env if spec else {}), **mps_env}, cap=max_conc(a))
     rows = []
     with H.serving(srv) as up:
         if not up:
@@ -166,7 +166,7 @@ def run_server_cells(a, arm: str, m: str, r: int, engine: str = "mstar", spec: "
             res = H.cell(srv, m, engine, H.repeat(items, H.REQS[c]), c, H.json_fields())
             row = {k: v for k, v in res.items() if k != "records"}
             row.update({"arm": arm, "model": m, "round": r, "start_s": getattr(srv, "start_s", None),
-                        "variant": srv.variant, "ts": time.time()})
+                        "variant": srv.variant, "max_concurrent_requests": srv.max_concurrent, "ts": time.time()})
             H.append_jsonl(a.out / "results" / "ab.jsonl", row)
             rows.append(row)
             log(f"r{r} {m} {arm} c={c}: RTFx {res['rtfx']:.0f} p50 {res['p50_ms'] or 0:.0f} ms "
@@ -174,6 +174,11 @@ def run_server_cells(a, arm: str, m: str, r: int, engine: str = "mstar", spec: "
     if mps_env:
         mps(False)
     return rows
+
+
+def max_conc(a) -> int:
+    """The most concurrent requests any cell or warmup drives: mstar servers are raised to it."""
+    return max(*a.concs, H.WARM_CONC, a.profile_conc)
 
 
 def phase_ab(a) -> int:
@@ -248,7 +253,7 @@ def phase_profile(a) -> int:
             set_arm(tree)
             mps_env = mps(True) if arm_spec.mps else {}
             srv = H.Server(a.out, m, "mstar", 0, 8100, f"{arm}_profile", extra=arm_spec.args,
-                           env_extra={"MSTAR_PHASE_TIMING": "100", **env, **mps_env})
+                           env_extra={"MSTAR_PHASE_TIMING": "100", **env, **mps_env}, cap=max_conc(a))
             with H.serving(srv) as up:
                 if not up:
                     log(f"profile {m} {arm}: server failed")
@@ -260,6 +265,7 @@ def phase_profile(a) -> int:
                     f"(timing on, not a headline number)")
                 H.append_jsonl(a.out / "results" / "profile.jsonl",
                                {"arm": arm, "tree": tree, "env": env, "model": m, "conc": a.profile_conc,
+                                "max_concurrent_requests": srv.max_concurrent,
                                 **{k: v for k, v in res.items() if k != "records"}, "ts": time.time()})
             if arm_spec.mps:
                 mps(False)
@@ -313,8 +319,11 @@ def phase_summarize(a) -> int:
         cells.setdefault((x["model"], x["conc"], x["arm"]), []).append(x["rtfx"])
     labels = [x.label for x in parse_arms(a.arms)] + ["vllm", "sgl_omni"]
     present = [lab for lab in labels if any(k[2] == lab for k in cells)]
+    caps = sorted({f"{x['model']}/{x['arm']}={x.get('max_concurrent_requests', '?') or 'uncapped'}" for x in rows
+                   if x.get("arm") not in ("vllm", "sgl_omni") and x.get("kind") != "start_failed"})
     lines = ["# ASR A/B", "",
              f"arms: {a.arms}; rounds alternate arm order, fresh server each; first arm is the reference", "",
+             f"mstar max_concurrent_requests served: {', '.join(caps) or '-'}", "",
              "| model | c | " + " | ".join(present) + " | "
              + " | ".join(f"{p} vs {present[0]}" for p in present[1:]) + " |",
              "|---|---:|" + "---:|" * (2 * len(present) - 1)]
