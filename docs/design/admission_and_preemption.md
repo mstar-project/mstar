@@ -1,7 +1,3 @@
----
-orphan: true
----
-
 # Preemption under KV pressure
 
 Since M* has no admission control today, requests take pages as they prefill and decode, and free them only when they finish. Once every running request in a full pool needs another page, none can finish, and all wait until clients time out (#307).
