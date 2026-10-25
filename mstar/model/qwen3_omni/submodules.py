@@ -1058,7 +1058,16 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # shipping both hidden states for every token.
             ts_list = outputs.get("thinker_states")
             mask_list = outputs.get("thinker_mask")
-            if ts_list and mask_list:
+            if ts_list and mask_list and request_info.graph_walk == "thinker_decode":
+                # One text token, which the decode mask keeps: its layer-0
+                # embedding as is. The boolean selection below would stall the
+                # GPU thread on this step's kernels at every decode step. The
+                # copies own their memory, as the selection's did: ``ts`` can
+                # be a view of a captured graph's output that a replay reuses.
+                ts = ts_list[0]
+                outputs["thinker_states"] = [ts[..., :self.config.thinker_hidden_size].clone()]
+                outputs["thinker_mask"] = [mask_list[0][0].to(torch.bool, copy=True)]
+            elif ts_list and mask_list:
                 ts = ts_list[0]                # (seq_len, 2*hidden)
                 mask = mask_list[0]            # (2, seq_len)
                 thinker_hidden = self.config.thinker_hidden_size
