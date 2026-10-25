@@ -115,7 +115,7 @@ Why this shape:
 
 ## 3. Preemption
 
-Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's offload and 50 ms hold, the worker drops victims, drops the request itself, or makes it wait.
+Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads the least recently active request first, as it does today, since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
 
 Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request that finds no free slot waits for one, as it does today.
 
@@ -345,10 +345,10 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 
 ## 8. Trade-offs
 
-- **Recompute, not swap.** Every victim is dropped and rebuilt, even when a host pool could hold it. Under sustained overload the newest requests are dropped again and again: on #307's workload one request was dropped four times, although that was a contrived test.
+- **Drops cost a rebuild.** Once nothing can be offloaded, every victim is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307's workload one request was dropped four times, although that was a contrived test.
 - **Rebuild steps.** A rebuild runs in a step of its own, so the node's decode rows wait one step. A long uncached history rebuilds in one step, eager past the capture buckets, until chunked prefill (#365) splits it. One step of delay on decode rows is small next to a request that never finishes.
 - **Kept ids.** Every request's prompt ids ride its first frame to each worker, which keeps them at 4 B per token, 128 KB for a 32K-token request. Carrying them adds 0.5 to 1.8 ms of TTFT per request at Bagel c16 and Qwen3.5 c32. Keeping the ids any other way would mean a d2h copy of every prefill.
-- **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.41x as long as they do today.
+- **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.
 - **Guaranteed requests queue.** On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.
 
 ---
