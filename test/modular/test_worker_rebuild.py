@@ -274,6 +274,8 @@ def test_a_step_on_a_walk_that_copies_runs_past_a_request_kept_without_copies():
 
     w._copy_inputs(batch)
 
+    assert w._kept_ids[NODE][R].copies is None, "a step would copy inputs for a request that keeps no copies"
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
