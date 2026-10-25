@@ -7,10 +7,9 @@ and which go back to their ready queues.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     from mstar.worker.micro_scheduler import ScheduledBatch
@@ -25,10 +24,9 @@ class BatchBuildRequest:
     # back as `BatchBuildResult.backlog`.
     backlog: "ScheduledBatch | None" = None
     fresh: "ScheduledBatch | None" = None
-    # Rows of `backlog` that cannot run this step; they stay parked.
+    # Rows that cannot run this step (waiting, not ready, or outside the
+    # step's capture group); they stay parked.
     blocked_rids: set[int] = field(default_factory=set)
-    # The rid whose capture group the step must share, else its first row's.
-    capture_group_of: int | None = None
     # Each real walk's cap (None or absent: uncapped); under `graph_walk`, the
     # cap of a step mixing walks.
     walk_caps: dict[str, int | None] = field(default_factory=dict)
@@ -38,8 +36,6 @@ class BatchBuildRequest:
     # The caller's own rows (a speculation merge's continuing ones) and their walk.
     pre_existing_batch_size: int = 0
     pre_existing_walk: str | None = None
-    # `Engine.capture_group` for one rid of this (node, walk).
-    capture_group: Callable[[int], Any] = lambda _: None
 
 
 class BatchBuildResult(NamedTuple):
@@ -48,23 +44,6 @@ class BatchBuildResult(NamedTuple):
     backlog: "ScheduledBatch | None" = None
     # Popped rows handed back to their ready queues: rid -> worker graph id.
     returned: dict[int, int] | None = None
-
-
-def off_group_rids(
-    batch: "ScheduledBatch", capture_group: Callable[[int], Any],
-    exclude_rids: set[int] = frozenset(), anchor: int | None = None,
-) -> set[int]:
-    """The rids of ``batch`` outside ``anchor``'s capture group, or outside
-    the first eligible rid's when no anchor is given."""
-    rids = [
-        rid for rid in batch.request_to_worker_graph
-        if rid not in exclude_rids
-    ]
-    if not rids:
-        return set()
-    # `is not None`: handle 0 is a real rid
-    wanted = capture_group(rids[0] if anchor is None else anchor)
-    return {rid for rid in rids if capture_group(rid) != wanted}
 
 
 def _merged(
@@ -98,18 +77,6 @@ class BaseBatchBuilder(ABC):
         if cap is None:
             return None
         return max(0, cap - (0 if backlog is None else len(backlog)))
-
-    def chain_must_yield(
-        self, backlog: "ScheduledBatch", live_rids: set[int], anchor: int,
-        capture_group: Callable[[int], Any],
-    ) -> bool:
-        """Whether a speculation chain anchored at ``anchor`` has to stop so
-        ``backlog``'s live rows can run: the chain's merge (a build with
-        ``capture_group_of=anchor``) would never take them."""
-        exclude = set(backlog.request_to_worker_graph) - live_rids
-        return bool(off_group_rids(
-            backlog, capture_group, exclude_rids=exclude, anchor=anchor,
-        ))
 
 
 class FIFOBatchBuilder(BaseBatchBuilder):
@@ -153,10 +120,7 @@ class FIFOBatchBuilder(BaseBatchBuilder):
         if batch is None:
             return BatchBuildResult(None)
 
-        exclude = request.blocked_rids | off_group_rids(
-            batch, request.capture_group,
-            exclude_rids=request.blocked_rids, anchor=request.capture_group_of,
-        )
+        exclude = set(request.blocked_rids)
         walk = _single_walk(batch, request)
         if walk is None:
             max_bs, left_out = _compose_walks(batch, exclude, request)

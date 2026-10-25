@@ -8,6 +8,7 @@ from typing import Any, NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWalks
+from mstar.model.submodule_base import InputMetadata
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
     BatchBuilderType,
@@ -17,9 +18,12 @@ from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.sched_core import (
     FAILED,
+    NO_GROUP,
+    OFF_GROUP,
     READY,
     UNCHECKED,
     CheckRequest,
+    CheckResult,
     PassRequest,
     RoundRobin,
     RustSchedCore,
@@ -44,6 +48,8 @@ class ReadyNodeEntry:
     request_id: int
     worker_graph_id: int
     graph_walk: str
+    # its capture group's id, as the check reported it (``NO_GROUP``: none)
+    group: int = NO_GROUP
 
 
 @dataclass
@@ -298,6 +304,8 @@ class MicroScheduler:
 
         # The pass and the backlog, chosen at first use (see ``core``)
         self._core: SchedCore | None = None
+        # capture group -> id (see `_group`)
+        self._group_ids: dict[Any, int] = {}
 
         # pending resident deltas for TP follow nodes
         self._pending_resident_deltas: dict[str, OffloadDelta] = {}
@@ -746,7 +754,7 @@ class MicroScheduler:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
         waiting = frozenset(self.pending_removes.keys() | self.held_until.keys())
         core = self.core
-        step = core.begin(request_state, PassRequest(
+        step = core.begin(PassRequest(
             target, exclude_target, pre_existing_batch_size, capture_group_of, now,
             waiting=waiting, failed=self.failed_rids,
             scan_exclude=waiting.union(self.failed_rids),
@@ -757,19 +765,32 @@ class MicroScheduler:
 
     def _run_checks(
         self, request_state: RequestStateManager, request: CheckRequest,
-    ) -> bytes:
-        """Engine readiness for a ``CheckRequest``'s rows, in order, as one
-        verdict byte per row; the engine half of a pass, the same for both
-        cores. A terminal failure is reported and the rid failed
-        (``_check_ready``), and comes back FAILED."""
+    ) -> CheckResult:
+        """Engine readiness for a ``CheckRequest``'s rows, in order; the
+        engine half of a pass, the same for both cores. A terminal failure is
+        reported and the rid failed (``_check_ready``), and comes back FAILED.
+
+        A node that splits batches by capture key also reports each ready
+        row's group, and the anchor's: the anchor row's when the request names
+        one, else the first ready row's. Under ``by_anchor`` a ready row of
+        another group is OFF_GROUP and does not count toward the limit."""
         rids = request.rids
         verdicts = bytearray(len(rids))
-        nodes, node_idx = request.nodes, request.node_idx
+        nodes, node_idx, walks = request.nodes, request.node_idx, request.walks
+        engines = [self.engine_manager.get_engine(node) for node in nodes]
         # `_check_ready` per row, with the per-node lookups hoisted
         partitions = [request_state.get_partition_for_node(node) for node in nodes]
-        checks = [self.engine_manager.get_engine(node).check_ready for node in nodes]
+        checks = [engine.check_ready for engine in engines]
+        split = [
+            walks is not None and engine.splits_by_capture_key(node, walks[n])
+            for n, (node, engine) in enumerate(zip(nodes, engines, strict=True))
+        ]
+        groups = [NO_GROUP] * len(rids) if any(split) else None
+        anchor_group = None
+        if groups is not None and request.anchor is not None:
+            anchor_group = self._group(request_state, nodes[0], walks[0], request.anchor)
         get_fwd_info = request_state.get_fwd_info
-        limit, counts, taken = request.limit, request.counts, 0
+        limit, taken = request.limit, 0
         for i, rid in enumerate(rids):
             if 0 <= limit <= taken:
                 verdicts[i:] = bytes((UNCHECKED,)) * (len(rids) - i)
@@ -780,11 +801,35 @@ class MicroScheduler:
             if outcome.reason is not None and outcome.reason.terminal:
                 self._fail_unservable(nodes[n], rid, full)
                 verdicts[i] = FAILED
-            elif outcome.ok and outcome.ready:
-                verdicts[i] = READY
-                if counts is None or counts(rid):
-                    taken += 1
-        return bytes(verdicts)
+                continue
+            if not (outcome.ok and outcome.ready):
+                continue
+            verdicts[i] = READY
+            if split[n]:
+                group = groups[i] = self._group(request_state, nodes[n], walks[n], rid)
+                if anchor_group is None:
+                    anchor_group = group
+                if request.by_anchor and group != anchor_group:
+                    verdicts[i] = OFF_GROUP
+                    continue
+            taken += 1
+        return CheckResult(bytes(verdicts), groups, anchor_group)
+
+    def _group(
+        self, request_state: RequestStateManager, node_name: str, graph_walk: str, rid: int,
+    ) -> int:
+        """``Engine.capture_group`` for ``rid``, as an id stable for this
+        scheduler's life (cores compare ids, not the engine's values)."""
+        fwd_info = request_state.get_fwd_info(
+            rid, request_state.get_partition_for_node(node_name),
+        )
+        # a streamed input's chunk can decide the capture (a codec's window size)
+        chunks = request_state.ingested_stream_chunks(rid, node_name)
+        group = self.engine_manager.get_engine(node_name).capture_group(
+            node_name, graph_walk, rid, fwd_info,
+            input_metadata=InputMetadata(stream_chunks=chunks) if chunks else None,
+        )
+        return self._group_ids.setdefault(group, len(self._group_ids))
 
     @property
     def runtime(self) -> GraphRuntime | None:
@@ -829,7 +874,7 @@ class MicroScheduler:
         from mstar.worker.sched_core.python import PythonSchedCore
 
         return PythonSchedCore(
-            self.runtime, self.engine_manager, self.keys, self.batch_builder, self.rr,
+            self.runtime, self.keys, self.batch_builder, self.rr,
             self.parallel_leader_nodes or (),
         )
 
@@ -844,12 +889,17 @@ class MicroScheduler:
         self, request_state: RequestStateManager,
         target: tuple[str, str], rid: int,
     ) -> bool:
-        """Whether ``target``'s backlog holds a live rid a speculation chain
-        anchored at ``rid`` would never merge (``chain_must_yield``), so the
-        chain has to yield for it to run."""
-        return self.core.backlog_splits_from(
-            request_state, target, rid, self._waiting(), self.failed_rids,
-        )
+        """Whether ``target``'s backlog holds a live rid of another capture
+        group than ``rid``'s: a speculation chain anchored at ``rid`` would
+        never merge it, so the chain has to yield for it to run."""
+        node, label = key = self._key(*target)
+        if not self.engine_manager.get_engine(node).splits_by_capture_key(node, label):
+            return False
+        live = self.core.live_backlog(key, self._waiting(), self.failed_rids)
+        if not live:
+            return False
+        anchor = self._group(request_state, node, label, rid)
+        return any(self._group(request_state, node, label, r) != anchor for r in live)
 
     def _drop_backlogged_rid(self, rid: int) -> None:
         """Take a request out of anything still queued for it: its node was

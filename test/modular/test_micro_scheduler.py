@@ -42,6 +42,7 @@ from mstar.worker.batch_builder import (
     FIFOBatchBuilder,
 )
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.sched_core import READY, CheckRequest
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -994,14 +995,22 @@ def test_the_scheduler_groups_streamed_rows_by_the_chunk_they_ingested():
 
 
 def test_a_walk_that_does_not_split_never_reads_stream_chunks():
-    """`capture_group` is asked per row on every build: rows of a walk that
-    does not split must not pay for the stream lookup."""
-    engine = SimpleNamespace(splits_by_capture_key=lambda node, walk: False)
+    """The check asks for capture groups only of a node that splits by them:
+    rows of a walk that does not split must not pay for the stream lookup."""
+    ready = SimpleNamespace(outcome=SimpleNamespace(reason=None, ok=True, ready=True))
+    engine = SimpleNamespace(
+        splits_by_capture_key=lambda node, walk: False,
+        check_ready=lambda node, rid, info, allow_reload: ready,
+    )
     sched = MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda name: engine), parallel_leader_nodes={NODE},
     )
-    manager = SimpleNamespace(ingested_stream_chunks=lambda rid, node: pytest.fail("read stream chunks"))
-    assert sched.core._capture_group(manager, NODE, WALK, 0) is None
+    manager = SimpleNamespace(
+        ingested_stream_chunks=lambda rid, node: pytest.fail("read stream chunks"),
+        get_partition_for_node=lambda node: "p", get_fwd_info=lambda rid, partition: None,
+    )
+    result = sched._run_checks(manager, CheckRequest([0, 1], None, [NODE], walks=[WALK]))
+    assert result.groups is None and result.verdicts == bytes([READY, READY])
 
 
 def test_request_state_reports_the_chunk_each_input_stream_ingested():
@@ -1106,7 +1115,6 @@ def test_the_scheduler_runs_the_configured_builder():
     (request,) = builder.requests
     assert (request.node_name, request.graph_walk) == (NODE, WALK)
     assert request.walk_caps == {WALK: 8}
-    assert request.capture_group_of == "r2"
 
 
 def test_returned_rows_go_back_to_their_ready_queue_not_the_backlog():

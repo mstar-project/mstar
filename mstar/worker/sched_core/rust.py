@@ -5,11 +5,16 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from mstar.graph.runtime.base import ColumnarEdgeSpecs
-from mstar.worker.sched_core.base import CheckRequest, PassRequest, PassStep, SchedCore
+from mstar.worker.sched_core.base import (
+    CheckRequest,
+    CheckResult,
+    PassRequest,
+    PassStep,
+    SchedCore,
+)
 
 if TYPE_CHECKING:
     from mstar.worker.micro_scheduler import ScheduledBatch
-    from mstar.worker.node_manager_utils import RequestStateManager
 
 
 class RustSchedCore(SchedCore):
@@ -30,15 +35,16 @@ class RustSchedCore(SchedCore):
             sorted(leader_nodes),
         )
 
-    def begin(self, request_state: RequestStateManager, request: PassRequest) -> PassStep:
-        del request_state  # its checks are the caller's
+    def begin(self, request: PassRequest) -> PassStep:
         return _step(*self._rt.sched_begin(
             request.target, request.exclude_target, request.pre_existing_batch_size,
             list(request.waiting), list(request.failed), list(request.scan_exclude),
         ))
 
-    def resume(self, verdicts: bytes) -> PassStep:
-        return _step(*self._rt.sched_resume(verdicts))
+    def resume(self, result: CheckResult) -> PassStep:
+        # Never asked for capture groups: it runs only where no node splits
+        # batches by capture key.
+        return _step(*self._rt.sched_resume(result.verdicts))
 
     def room_for_continuing(self, target: tuple[str, str]) -> int | None:
         return self._rt.sched_room_for_continuing(*target)
@@ -55,6 +61,15 @@ class RustSchedCore(SchedCore):
 
     def drop_rids(self, rids: Iterable[int]) -> None:
         self._rt.sched_drop_rids(list(rids))
+
+    def live_backlog(
+        self, key: tuple[str, str], waiting: Iterable[int], failed: Iterable[int],
+    ) -> list[int]:
+        skip = set(waiting).union(failed)
+        for node, label, rids, _walks in self._rt.sched_state()[0]:
+            if (node, label) == key:
+                return [rid for rid in rids if rid not in skip]
+        return []
 
     def state(self):
         """``(backlog, rr)`` for tests: backlog as ``[(node, label, rids,

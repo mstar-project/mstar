@@ -14,17 +14,19 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from collections.abc import Set as AbstractSet
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from mstar.worker.engine_manager import EngineManager
     from mstar.worker.micro_scheduler import ScheduledBatch
-    from mstar.worker.node_manager_utils import RequestStateManager
 
-# One verdict per requested row
-NOT_READY, READY, FAILED, UNCHECKED = 0, 1, 2, 3
+# One verdict per requested row. OFF_GROUP: ready, but outside the step's
+# capture group (``CheckRequest.by_anchor``).
+NOT_READY, READY, FAILED, UNCHECKED, OFF_GROUP = 0, 1, 2, 3, 4
+# ``CheckResult.groups`` for a row whose node does not split by capture key
+NO_GROUP = -1
 
 
 class CheckRequest(NamedTuple):
@@ -36,9 +38,23 @@ class CheckRequest(NamedTuple):
     # stop once this many rows were found ready (and counted); -1 checks all.
     # Rows past the stop are UNCHECKED.
     limit: int = -1
-    # Python core only: whether a ready row counts toward ``limit`` (a
-    # backlog scan counts only rows of the step's capture group)
-    counts: Callable[[int], bool] | None = None
+    # The scheduling key's walk per node, under which a node that splits
+    # batches by capture key groups its rows; None asks for no groups.
+    walks: list[str] | None = None
+    # The row whose capture group the step must share; None: the first ready row.
+    anchor: int | None = None
+    # Whether a ready row outside the anchor's group is OFF_GROUP rather than
+    # READY, and so does not count toward ``limit``.
+    by_anchor: bool = False
+
+
+class CheckResult(NamedTuple):
+    """A check's answer: one verdict per row, and for a capture-split node
+    each ready row's capture group (as an id, ``NO_GROUP`` otherwise) and the
+    anchor's."""
+    verdicts: bytes
+    groups: list[int] | None = None
+    anchor_group: int | None = None
 
 
 class PassRequest(NamedTuple):
@@ -205,12 +221,12 @@ class SchedCore(ABC):
     the rows of a ready set too big for one step, waiting their turn."""
 
     @abstractmethod
-    def begin(self, request_state: RequestStateManager, request: PassRequest) -> PassStep:
+    def begin(self, request: PassRequest) -> PassStep:
         """Start a pass; it runs until it needs rows checked, or is done."""
 
     @abstractmethod
-    def resume(self, verdicts: bytes) -> PassStep:
-        """Continue the pass with one verdict per row of its last check."""
+    def resume(self, result: CheckResult) -> PassStep:
+        """Continue the pass with the answer to its last check."""
 
     @abstractmethod
     def room_for_continuing(self, target: tuple[str, str]) -> int | None:
@@ -233,12 +249,8 @@ class SchedCore(ABC):
     def drop_rids(self, rids: Iterable[int]) -> None:
         """Take requests out of the backlog: the only place holding them."""
 
-    def backlog_splits_from(
-        self, request_state: RequestStateManager, target: tuple[str, str], rid: int,
-        waiting: Iterable[int], failed: Iterable[int],
-    ) -> bool:
-        """Whether ``target``'s backlog holds a live rid a speculation chain
-        anchored at ``rid`` would never merge, so the chain must yield. Never
-        for a core whose batches take every backlogged row."""
-        del request_state, target, rid, waiting, failed
-        return False
+    @abstractmethod
+    def live_backlog(
+        self, key: tuple[str, str], waiting: Iterable[int], failed: Iterable[int],
+    ) -> list[int]:
+        """``key``'s backlogged rows that are not failed or waiting, in order."""
