@@ -155,6 +155,9 @@ class BenchmarkConfig:
     request_kwargs: Optional[dict] = None
     # Audio format asked of chat replies with speech (vllm-omni sends WAV segments by default).
     chat_audio_format: Optional[str] = None
+    # Closed loop: after this many requests in a row fail, the rest are not sent (they fail at once), so a server
+    # that answers nothing costs a few request timeouts rather than the whole run's. None sends everything.
+    abort_after_failures: Optional[int] = None
 
 
 class Benchmark:
@@ -448,16 +451,25 @@ class Benchmark:
         """
         n = self.config.max_concurrency or 1
         sem = asyncio.Semaphore(n)
+        limit = self.config.abort_after_failures
+        failures = {"in_a_row": 0}
 
         async def _limited(request_id: int, req: RequestInput) -> RequestMetrics:
             async with sem:
-                return await self.inference_system.send_request(
+                if limit and failures["in_a_row"] >= limit:
+                    m = RequestMetrics(request_id=request_id, type=req.req_type,
+                                       expected_output_modalities=[req.req_type.get_output_modalities()])
+                    m.record_error(f"not sent: the {limit} requests before it failed in a row")
+                    return m
+                m = await self.inference_system.send_request(
                     session=session,
                     req_input=req,
                     base_url=self.config.url,
                     request_id=request_id,
                     model=self.config.model,
                 )
+                failures["in_a_row"] = failures["in_a_row"] + 1 if m.error else 0
+                return m
 
         tasks = [asyncio.create_task(_limited(i, r)) for i, r in enumerate(requests)]
         return list(await asyncio.gather(*tasks))
@@ -734,6 +746,12 @@ def parse_args() -> BenchmarkConfig:
         default=None,
         help="Audio format for chat replies with speech, e.g. pcm (vllm-omni defaults to WAV segments).",
     )
+    parser.add_argument(
+        "--abort-after-failures",
+        type=int,
+        default=None,
+        help="Closed loop: once this many requests in a row have failed, fail the rest without sending them.",
+    )
 
     args = parser.parse_args()
 
@@ -821,6 +839,7 @@ def parse_args() -> BenchmarkConfig:
         unique_prompts=args.unique_prompts,
         request_kwargs=args.request_kwargs,
         chat_audio_format=args.chat_audio_format,
+        abort_after_failures=args.abort_after_failures,
     )
 
 
