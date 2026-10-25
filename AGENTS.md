@@ -24,6 +24,8 @@ If a hang, crash, or other bug has several plausible causes, the tempting fix is
 
 Background: [docs/architecture.rst](docs/architecture.rst). Model authoring, end to end: [docs/adding_models.rst](docs/adding_models.rst).
 
+Before designing a feature, engine change or model port, derive its shape from mstar's own primitives (graph nodes, loops, walks, partitions, streaming edges, declared resources, `check_stop`) with [.claude/skills/mstar-way/SKILL.md](.claude/skills/mstar-way/SKILL.md).
+
 ## Invariants
 
 ### 1. Models declare, the engine executes
