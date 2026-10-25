@@ -319,7 +319,8 @@ A layout has five fields:
   ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
   ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
   node's outputs. A request with a ``"digest"`` or ``"rows"`` span can't be rebuilt from
-  its token ids, so it reserves its whole footprint and is never preempted.
+  its token ids, so in a pool that decides admission it reserves its whole footprint and is
+  never preempted.
   ``length`` is the slots the write fills, ``advance`` how far it moves
   the position counter. A span's ``scratch`` is the most one non-committing step writes
   before the span commits into those slots, as a window's denoise steps do.
