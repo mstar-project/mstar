@@ -53,6 +53,8 @@ class Row:
     # A directory of first frames (<item id>.png) that image-to-video requests send instead of the set's own, so
     # every arm conditions on the frames the reference used.
     i2v_frames: str | None = None
+    # Arms that send the set's own first frames anyway, to test an engine's own resize recipe end to end.
+    i2v_own_frames_arms: tuple[str, ...] = ()
     # Options of the row's correctness family (its mode, a pinned size), which also set the requests' settings.
     correctness_opts: dict = field(default_factory=dict)
 
@@ -129,7 +131,8 @@ ROWS: dict[str, Row] = {r.name: r for r in [
     # LANCZOS stretch, SGLang's crop), and one already at the request size passes through all of them unchanged.
     Row("cosmos3_nano", "video", "nvidia/Cosmos3-Nano", "cosmos3_nano", cost=4.0, generator_device="cuda",
         engine_args={"vllm-omni": ("--no-guardrails",), "vllm-omni-rc": ("--no-guardrails",)},
-        i2v_frames=f"{REFERENCES}/diffusers-nvidia--Cosmos3-Nano-480x832x17-s35-i2v/video_v1/conditioning"),
+        i2v_frames=f"{REFERENCES}/diffusers-nvidia--Cosmos3-Nano-480x832x17-s35-i2v/video_v1/conditioning",
+        i2v_own_frames_arms=("mstar-aspectcrop",)),
     Row("cosmos3_edge", "video", "nvidia/Cosmos3-Edge", "cosmos3_edge", cost=3.0, generator_device="cuda",
         workloads=("video-t2v",),
         engine_args={"vllm-omni": ("--no-guardrails",), "vllm-omni-rc": ("--no-guardrails",)}),
@@ -201,11 +204,13 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         recipe="as the mstar arm, with model_kwargs moe_backend: aiter (AITER's fused MoE for the Thinker and "
                "Talker experts; mstar's tuned Triton MoE tables don't apply)"),
     # Cosmos3-Nano's default conditioning stretches the frame to the generation size; the diffusers 0.41 reference
-    # (and SGLang) cover-scale and center-crop it. The same mstar with the reference's recipe, for image-to-video.
+    # (and SGLang) cover-scale and center-crop it. The same mstar with the reference's recipe, sent the raw set frames
+    # (the row's i2v_frames don't apply to it), so it does the crop itself as a production request would have it.
     Arm("mstar-aspectcrop", "mstar", ("video",), client="ours_openai", rows=("cosmos3_nano",),
         env={"MSTAR_SHM_ARENA": "1"}, model_kwargs={"conditioning_resize": "aspect_crop"}, follows="mstar",
         recipe="as the mstar arm, with model_kwargs conditioning_resize: aspect_crop (the reference's cover-scale "
-               "and center-crop of the conditioning frame, not the Nano default stretch)"),
+               "and center-crop of the conditioning frame, not the Nano default stretch), sent the raw 320x180 "
+               "set frames"),
     # The same arms on the base tree (--tree base=PATH), back to back with the head's on each row, so the head's
     # change is measured in the same session. Each serves its own tree's configs.
     Arm("mstar-base", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai", tree="base",
