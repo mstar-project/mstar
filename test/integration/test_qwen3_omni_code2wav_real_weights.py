@@ -2,8 +2,8 @@
 
 Streams real Talker codes (six TTS replies served by M*, in
 ``data/qwen3_omni_talker_codes.safetensors``) through the edge's
-``LeftContextChunkPolicy`` and ``Code2WavSubmodule``, and compares the
-concatenated audio with one decode of each whole utterance.
+``ScheduledLeftContextChunkPolicy`` and ``Code2WavSubmodule``, and compares
+the concatenated audio with one decode of each whole utterance.
 
 Streaming can't match the full decode exactly: 25 frames of left context cut
 into the vocoder's 72-frame attention window (24-28 dB SNR over an utterance).
@@ -78,7 +78,7 @@ from mstar.model.qwen3_omni.config import Code2WavConfig, Qwen3OmniModelConfig  
 from mstar.model.qwen3_omni.submodules import Code2WavSubmodule  # noqa: E402
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine  # noqa: E402
 from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards  # noqa: E402
-from mstar.streaming.chunk_policy import LeftContextChunkPolicy  # noqa: E402
+from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
 
 
@@ -108,7 +108,9 @@ def stream(submodule: Code2WavSubmodule, frames: torch.Tensor) -> list[torch.Ten
     cfg = submodule.config.code2wav
     buffer = StreamBuffer(
         request_id="r", edge_name="codec_tokens", from_partition="Talker",
-        policy=LeftContextChunkPolicy(chunk=cfg.codec_chunk_frames, left_context=cfg.codec_left_context_frames),
+        policy=ScheduledLeftContextChunkPolicy(
+            schedule=cfg.codec_chunk_schedule, chunk=cfg.codec_chunk_frames, left_context=cfg.codec_left_context_frames,
+        ),
     )
     for i, frame in enumerate(frames):
         buffer.pre_read_register(f"t{i}")
@@ -122,7 +124,8 @@ def stream(submodule: Code2WavSubmodule, frames: torch.Tensor) -> list[torch.Ten
         meta = {"r": InputMetadata(stream_chunks={"codec_tokens": chunk.info})}
         key = submodule.cg_key_info("code2wav_chunk", {"r": fwd_info}, per_request_input_metadata=meta)
         engine_inputs = ModelInputsFromEngine(
-            request_ids=["r"], per_request_info={}, per_request_input_metadata=meta, captured=key is None,
+            request_ids=["r"], per_request_info={}, per_request_input_metadata=meta,
+            captured=key != Code2WavSubmodule._CONTEXT_ONLY_KEY,
         )
         item = submodule.prepare_inputs(
             "code2wav_chunk", fwd_info, {"codec_tokens": [chunk.data["data"]]}, input_metadata=meta["r"],
@@ -147,18 +150,27 @@ def window_snr_db(audio: torch.Tensor, reference: torch.Tensor, center: int) -> 
     return 10 * math.log10(signal / max(error, 1e-9))
 
 
-def boundary_and_mid_snr(audio: torch.Tensor, reference: torch.Tensor, cfg: Code2WavConfig, upsample: int, tail: int):
+def chunk_frames(cfg: Code2WavConfig, num_frames: int) -> list[int]:
+    """New frames per chunk of a stream of ``num_frames`` (the last may be short)."""
+    sizes, schedule = [], iter(cfg.codec_chunk_schedule)
+    while sum(sizes) < num_frames:
+        sizes.append(min(next(schedule, cfg.codec_chunk_frames), num_frames - sum(sizes)))
+    return sizes
+
+
+def boundary_and_mid_snr(audio: torch.Tensor, reference: torch.Tensor, sizes: list[int], upsample: int, tail: int):
     """SNR around every chunk boundary of the stream, and halfway into every
     later chunk long enough to have a middle."""
     boundaries, middles = [], []
-    chunk = cfg.codec_chunk_frames * upsample
     end = min(audio.numel(), reference.numel()) - HALF_WINDOW
-    boundary = chunk - tail
-    while boundary < end:
+    boundary = sizes[0] * upsample - tail
+    for size in sizes[1:]:
+        if boundary >= end:
+            break
         boundaries.append(window_snr_db(audio, reference, boundary))
-        if boundary + chunk // 2 < end:
-            middles.append(window_snr_db(audio, reference, boundary + chunk // 2))
-        boundary += chunk
+        if boundary + size * upsample // 2 < end:
+            middles.append(window_snr_db(audio, reference, boundary + size * upsample // 2))
+        boundary += size * upsample
     return boundaries, middles
 
 
@@ -177,7 +189,8 @@ def test_real_codes_stream_to_the_full_decode_length_without_boundary_dips(code2
 
         chunks = stream(submodule, frames)
         audio = torch.cat(chunks)
-        boundaries, middles = boundary_and_mid_snr(audio, reference, config, upsample, tail)
+        sizes = chunk_frames(config, num_frames)
+        boundaries, middles = boundary_and_mid_snr(audio, reference, sizes, upsample, tail)
         print(
             f"{name}: samples per chunk {[c.numel() for c in chunks]}, total {audio.numel()} "
             f"(full decode {reference.numel()}), boundary SNR {[round(s, 1) for s in boundaries]} dB, "
@@ -185,11 +198,8 @@ def test_real_codes_stream_to_the_full_decode_length_without_boundary_dips(code2
         )
         assert tail == 555
         assert audio.numel() == reference.numel() == num_frames * upsample - tail
-        # the first chunk ends ``tail`` short; every later one carries 25 frames
-        chunk = config.codec_chunk_frames * upsample
-        expected = [chunk - tail] + [chunk] * max((num_frames - 1) // config.codec_chunk_frames - 1, 0)
-        if audio.numel() > sum(expected):
-            expected.append(audio.numel() - sum(expected))
+        # the first chunk ends ``tail`` short; every later one carries its new frames
+        expected = [sizes[0] * upsample - tail] + [size * upsample for size in sizes[1:]]
         assert [c.numel() for c in chunks if c.numel()] == expected
         all_boundaries += boundaries
         all_middles += middles

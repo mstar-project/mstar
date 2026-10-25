@@ -1,10 +1,11 @@
 """Qwen3-Omni Code2Wav streaming: the stitched chunks are one continuous decode.
 
-Each test drives Talker codec frames through the edge's real
-``LeftContextChunkPolicy`` and ``StreamBuffer``, then through
+Each test drives Talker codec frames through the edge's
+``ScheduledLeftContextChunkPolicy`` and a real ``StreamBuffer``, then through
 ``Code2WavSubmodule``'s ``cg_key_info`` / ``prepare_inputs`` / ``preprocess``
 / ``forward_batched`` / ``postprocess``, and compares the concatenated audio
-with one decode of the whole stream.
+with one decode of the whole stream. Schedule ``()`` is a plain 25-frame
+first chunk; the default ramps up from 4 frames.
 
 The decoder's ``ConvTranspose1d(2r, stride r, padding r)`` blocks look one
 frame ahead, so W frames decode to ``W * 1920 - 555`` samples, not
@@ -14,6 +15,7 @@ every chunk boundary.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from types import SimpleNamespace
 
@@ -26,10 +28,42 @@ from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.config import Code2WavConfig, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.submodules import Code2WavSubmodule
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
-from mstar.streaming.chunk_policy import LeftContextChunkPolicy
+from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
 UPSAMPLE = 1920
+CONTEXT_ONLY = Code2WavSubmodule._CONTEXT_ONLY_KEY
+SCHEDULES = [(), Code2WavConfig().codec_chunk_schedule]
+
+
+def _config(schedule: tuple[int, ...]) -> Qwen3OmniModelConfig:
+    return Qwen3OmniModelConfig(code2wav=Code2WavConfig(codec_chunk_schedule=schedule))
+
+
+def _chunk_sizes(cfg: Code2WavConfig):
+    """New frames per chunk, in stream order."""
+    yield from cfg.codec_chunk_schedule
+    while True:
+        yield cfg.codec_chunk_frames
+
+
+def _decodes(cfg: Code2WavConfig, num_frames: int) -> int:
+    """Windows that carry new frames: chunks until the stream is covered (the last may be short)."""
+    calls = delivered = 0
+    for size in _chunk_sizes(cfg):
+        if delivered >= num_frames:
+            return calls
+        calls += 1
+        delivered += size
+
+
+def _ends_on_boundary(cfg: Code2WavConfig, num_frames: int) -> bool:
+    """Whether the stream ends with a full chunk, so a flush of context alone follows."""
+    delivered = 0
+    for size in _chunk_sizes(cfg):
+        if delivered >= num_frames:
+            return delivered == num_frames
+        delivered += size
 
 
 def _to_pcm(wav: torch.Tensor) -> torch.Tensor:
@@ -37,18 +71,24 @@ def _to_pcm(wav: torch.Tensor) -> torch.Tensor:
     return (wav.clamp(-1, 1) * 32767).to(torch.int16)
 
 
-def _stream_batched(submodule: Code2WavSubmodule, frames: dict[str, torch.Tensor]) -> tuple[dict, list]:
+def _stream_batched(
+    submodule: Code2WavSubmodule, frames: dict[str, torch.Tensor], delays: dict[str, int] | None = None,
+) -> tuple[dict, list, list]:
     """Stream each request's ``frames`` ``[T, 16]`` through its own buffer
     with the edge's policy. Every step batches the requests that still have a
-    chunk, the way the scheduler batches Code2Wav. Returns, per request, its
+    chunk, the way the scheduler batches Code2Wav; a request with a delay
+    joins that many steps late. Returns, per request, its
     ``(chunk_info, audio, decoded)`` per step (``decoded``: whether the step
-    ran the vocoder), and each step's ``cg_key_info``."""
+    ran the vocoder), and each step's ``cg_key_info`` and row count."""
     cfg = submodule.config.code2wav
     buffers = {}
     for rid, request_frames in frames.items():
         buffers[rid] = StreamBuffer(
             request_id=rid, edge_name="codec_tokens", from_partition="Talker",
-            policy=LeftContextChunkPolicy(chunk=cfg.codec_chunk_frames, left_context=cfg.codec_left_context_frames),
+            policy=ScheduledLeftContextChunkPolicy(
+                schedule=cfg.codec_chunk_schedule, chunk=cfg.codec_chunk_frames,
+                left_context=cfg.codec_left_context_frames,
+            ),
         )
         for i, frame in enumerate(request_frames):
             buffers[rid].pre_read_register(f"t{i}")
@@ -57,18 +97,24 @@ def _stream_batched(submodule: Code2WavSubmodule, frames: dict[str, torch.Tensor
 
     fwd_infos = {rid: SimpleNamespace(request_id=rid, rid_handle=rid) for rid in frames}
     steps = {rid: [] for rid in frames}
-    keys = []
-    while rids := [rid for rid, buffer in buffers.items() if buffer.has_chunk_ready()]:
+    keys, sizes, step = [], [], 0
+    delays = delays or {}
+    while any(buffer.has_chunk_ready() for buffer in buffers.values()):
+        rids = [rid for rid, buffer in buffers.items() if step >= delays.get(rid, 0) and buffer.has_chunk_ready()]
+        step += 1
+        if not rids:
+            continue
         chunks = {rid: buffers[rid].pop_chunk() for rid in rids}
         meta = {rid: InputMetadata(stream_chunks={"codec_tokens": chunk.info}) for rid, chunk in chunks.items()}
-        # The engine replays the captured 50-frame graph when the batch's key
-        # names a capture (None), and runs the eager forward otherwise.
+        # The engine replays the capture of the window the key names, and runs
+        # the eager forward for the context-only key.
         key = submodule.cg_key_info(
             "code2wav_chunk", {rid: fwd_infos[rid] for rid in rids}, per_request_input_metadata=meta,
         )
         keys.append(key)
+        sizes.append(len(rids))
         engine_inputs = ModelInputsFromEngine(
-            request_ids=rids, per_request_info={}, per_request_input_metadata=meta, captured=key is None,
+            request_ids=rids, per_request_info={}, per_request_input_metadata=meta, captured=key != CONTEXT_ONLY,
         )
         items = [
             submodule.prepare_inputs(
@@ -80,6 +126,9 @@ def _stream_batched(submodule: Code2WavSubmodule, frames: dict[str, torch.Tensor
         assert submodule.can_batch(None, items)
         packed = submodule.preprocess("code2wav_chunk", engine_inputs, items)
         decoded = packed["codec_tokens"].shape[-1] > 0
+        if key != CONTEXT_ONLY:
+            # the replayed capture's input shape
+            assert key in submodule.windows and packed["codec_tokens"].shape[-1] == key
         with torch.no_grad():
             outputs = submodule.forward_batched("code2wav_chunk", engine_inputs, **packed)
         for rid, item in zip(rids, items, strict=True):
@@ -87,7 +136,7 @@ def _stream_batched(submodule: Code2WavSubmodule, frames: dict[str, torch.Tensor
             steps[rid].append((chunks[rid].info, outputs[rid]["audio_chunk"][0], decoded))
             if chunks[rid].is_final:
                 submodule.cleanup_request(rid)
-    return steps, keys
+    return steps, keys, sizes
 
 
 def _stream(submodule: Code2WavSubmodule, frames: torch.Tensor) -> list[tuple]:
@@ -141,16 +190,25 @@ def _codes(num_frames: int) -> torch.Tensor:
     return (torch.arange(num_frames) + 1)[:, None].expand(num_frames, 16).contiguous()
 
 
-@pytest.mark.parametrize("num_frames", [1, 24, 25, 26, 49, 50, 51, 75, 76, 120, 125])
-def test_streamed_chunks_stitch_into_the_full_decode(num_frames):
-    """First chunk, steady chunks and the terminal flush, for streams shorter
-    than a chunk, a multiple of 25 frames, and 25k + 1 frames."""
+def test_windows_follow_the_schedule():
+    assert Code2WavConfig(codec_chunk_schedule=()).codec_windows() == [25, 50]
+    assert Code2WavConfig(codec_chunk_schedule=(4, 8, 16)).codec_windows() == [4, 12, 28, 50]
+    assert Code2WavConfig(codec_chunk_schedule=(1, 3, 8, 16)).codec_windows() == [1, 4, 12, 28, 50]
+    assert Code2WavConfig(codec_chunk_schedule=(4,)).codec_windows() == [4, 29, 50]
+
+
+@pytest.mark.parametrize("schedule", SCHEDULES)
+@pytest.mark.parametrize("num_frames", [1, 4, 5, 11, 12, 24, 25, 26, 28, 49, 50, 51, 53, 75, 76, 120, 125])
+def test_streamed_chunks_stitch_into_the_full_decode(schedule, num_frames):
+    """First chunk, ramp, steady chunks and the terminal flush, for streams
+    shorter than a chunk, ending on a chunk boundary, and one frame past it."""
     decoder = _LookaheadDecoder()
-    submodule = Code2WavSubmodule(decoder, Qwen3OmniModelConfig())
+    config = _config(schedule)
+    submodule = Code2WavSubmodule(decoder, config)
     codes = _codes(num_frames)
 
     steps = _stream(submodule, codes)
-    assert decoder.calls == math.ceil(num_frames / 25)
+    assert decoder.calls == _decodes(config.code2wav, num_frames)
     full = _to_pcm(decoder(codes.t()[None], torch.arange(num_frames)[None]))[0, 0]
 
     assert full.numel() == num_frames * UPSAMPLE - decoder.TAIL
@@ -160,45 +218,66 @@ def test_streamed_chunks_stitch_into_the_full_decode(num_frames):
     assert torch.equal(streamed, full)
 
 
-@pytest.mark.parametrize("num_frames", [1, 24, 25, 26, 49, 50, 51, 125])
-def test_a_trailing_codec_eos_frame_adds_no_audio_and_no_decode(num_frames):
-    """Served streams end with the Talker's codec_eos frame. A reply of
-    k * 25 frames then ends with a flush of 25 context frames and the EOS
-    frame, which emits nothing and decodes nothing; for k * 25 - 1 frames the
-    EOS frame is the last new item of a window and then a context item of the
-    flush."""
+def test_first_audio_comes_after_the_first_scheduled_chunk():
+    """With the ramp, the first window holds 4 frames and emits their audio."""
     decoder = _LookaheadDecoder()
-    config = Qwen3OmniModelConfig()
+    submodule = Code2WavSubmodule(decoder, _config((4, 8, 16)))
+
+    steps = _stream(submodule, _codes(120))
+
+    first_info, first_audio, _ = steps[0]
+    assert (first_info.context_items, first_info.num_items) == (0, 4)
+    assert first_audio.numel() == 4 * UPSAMPLE - decoder.TAIL
+    assert [(info.context_items, info.num_items) for info, _, _ in steps[:5]] == [
+        (0, 4), (4, 12), (12, 28), (25, 50), (25, 50),
+    ]
+
+
+@pytest.mark.parametrize("schedule", SCHEDULES)
+@pytest.mark.parametrize("num_frames", [1, 4, 11, 12, 24, 25, 26, 28, 49, 50, 51, 53, 125])
+def test_a_trailing_codec_eos_frame_adds_no_audio_and_no_decode(schedule, num_frames):
+    """Served streams end with the Talker's codec_eos frame. A reply that
+    ends on a chunk boundary then ends with a flush of context frames and the
+    EOS frame, which emits nothing and decodes nothing; one frame short of a
+    boundary, the EOS frame is the last new item of a window and then a
+    context item of the flush."""
+    decoder = _LookaheadDecoder()
+    config = _config(schedule)
     submodule = Code2WavSubmodule(decoder, config)
     codes = _codes(num_frames)
     eos = torch.full((1, 16), config.talker.codec_eos_token_id)
 
     steps = _stream(submodule, torch.cat([codes, eos]))
-    assert decoder.calls == math.ceil(num_frames / 25)
+    assert decoder.calls == _decodes(config.code2wav, num_frames)
     full = _to_pcm(decoder(codes.t()[None], torch.arange(num_frames)[None]))[0, 0]
 
     assert torch.equal(torch.cat([audio for _, audio, _ in steps]), full)
     flush_info, flush_audio, flush_decoded = steps[-1]
     assert flush_info.is_final
-    if num_frames % 25 == 0:
+    if _ends_on_boundary(config.code2wav, num_frames):
         assert flush_info.num_items - flush_info.context_items == 1
         assert not flush_decoded and flush_audio.numel() == 0
 
 
-@pytest.mark.parametrize("num_frames", [25, 50, 125])
-def test_terminal_flush_without_new_frames_skips_the_decode(num_frames):
-    """A stream of k * 25 frames ends with a flush of the 25 retained context
-    frames. It emits nothing, so its batch is keyed off the captures and runs
-    no decode."""
+@pytest.mark.parametrize("schedule", SCHEDULES)
+@pytest.mark.parametrize("num_frames", [4, 12, 25, 28, 50, 53, 125])
+def test_terminal_flush_without_new_frames_skips_the_decode(schedule, num_frames):
+    """A stream that ends on a chunk boundary ends with a flush of the
+    retained context frames. It emits nothing, so its batch is keyed off the
+    captures and runs no decode."""
+    config = _config(schedule)
+    if not _ends_on_boundary(config.code2wav, num_frames):
+        pytest.skip("not a chunk boundary of this schedule")
     decoder = _LookaheadDecoder()
-    submodule = Code2WavSubmodule(decoder, Qwen3OmniModelConfig())
+    submodule = Code2WavSubmodule(decoder, config)
 
     steps = _stream(submodule, _codes(num_frames))
 
     flush_info, flush_audio, flush_decoded = steps[-1]
-    assert flush_info.is_final and flush_info.context_items == flush_info.num_items == 25
+    retained = min(config.code2wav.codec_left_context_frames, num_frames)
+    assert flush_info.is_final and flush_info.context_items == flush_info.num_items == retained
     assert not flush_decoded and flush_audio.numel() == 0
-    assert decoder.calls == num_frames // 25
+    assert decoder.calls == _decodes(config.code2wav, num_frames)
     assert all(decoded for _, _, decoded in steps[:-1])
 
 
@@ -212,12 +291,29 @@ def test_a_batch_with_any_new_frames_keeps_the_capture():
     one_new = InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(50, 25, 26, False)})
     infos = {"a": None, "b": None}
 
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": flush}) is not None
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": flush_eos}) is not None
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": one_new}) is None
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": steady}) is None
-    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush}) is None
-    assert submodule.cg_key_info("code2wav_chunk", infos, None) is None
+    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": flush}) == CONTEXT_ONLY
+    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": flush_eos}) == CONTEXT_ONLY
+    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": one_new}) == 28
+    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush, "b": steady}) == 50
+    assert submodule.cg_key_info("code2wav_chunk", infos, {"a": flush}) == 50
+    assert submodule.cg_key_info("code2wav_chunk", infos, None) == 50
+
+
+def test_small_windows_pad_to_the_full_window_in_large_batches():
+    """Small windows are captured for batches of up to SMALL_WINDOW_MAX_BS
+    only; the capture configs agree with the keys."""
+    submodule = Code2WavSubmodule(_LookaheadDecoder(), _config((4, 8, 16)))
+    first = InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(0, 0, 4, False)})
+    small = submodule.SMALL_WINDOW_MAX_BS
+    assert submodule.cg_key_info("code2wav_chunk", dict.fromkeys(range(small)), dict.fromkeys(range(small), first)) == 4
+    big = dict.fromkeys(range(small + 1))
+    assert submodule.cg_key_info("code2wav_chunk", big, dict.fromkeys(big, first)) == 50
+
+    configs = {cfg.additional_key_info: cfg for cfg in submodule.get_accelerator_graph_configs("cpu")}
+    assert sorted(configs) == submodule.windows == [4, 12, 28, 50]
+    assert configs[50].capture_batch_sizes == [1, 2, 4, 8, 16, 32] and configs[50].caps_eager_batch_size
+    for window in (4, 12, 28):
+        assert max(configs[window].capture_batch_sizes) == small and not configs[window].caps_eager_batch_size
 
 
 def test_mixed_batch_of_a_terminal_flush_and_a_live_window():
@@ -226,10 +322,10 @@ def test_mixed_batch_of_a_terminal_flush_and_a_live_window():
     step later. The mixed step keeps the capture and decodes both rows; a's
     row emits nothing and both streams stitch into their own full decodes."""
     decoder = _LookaheadDecoder()
-    submodule = Code2WavSubmodule(decoder, Qwen3OmniModelConfig())
+    submodule = Code2WavSubmodule(decoder, _config(()))
     codes = {"a": _codes(50), "b": _codes(76) + 200}
 
-    steps, keys = _stream_batched(submodule, codes)
+    steps, keys, _ = _stream_batched(submodule, codes)
 
     assert [len(steps["a"]), len(steps["b"])] == [3, 4]
     flush_info, flush_audio, flush_decoded = steps["a"][2]
@@ -238,14 +334,36 @@ def test_mixed_batch_of_a_terminal_flush_and_a_live_window():
     assert not live_info.is_final and live_info.num_items - live_info.context_items == 25
     # The mixed step replays the capture; b's flush of one new frame runs
     # eager and still decodes.
-    assert keys == [None, None, None, Code2WavSubmodule._CONTEXT_ONLY_KEY]
+    assert keys == [25, 50, 50, CONTEXT_ONLY]
     assert flush_decoded and live_decoded and decoder.calls == 4
     assert flush_audio.numel() == 0 and live_audio.numel() == 25 * UPSAMPLE
     for rid, request_codes in codes.items():
         full = _to_pcm(decoder(request_codes.t()[None], torch.arange(request_codes.shape[0])[None]))[0, 0]
         streamed = torch.cat([audio for _, audio, _ in steps[rid]])
         assert torch.equal(streamed, full), rid
-    assert not submodule._first_chunk_emitted
+
+
+@pytest.mark.parametrize("num_requests", [2, 5])
+def test_ramp_windows_batch_with_steady_ones(num_requests):
+    """Requests at different points of the ramp share steps: each step pads to
+    its widest window (the full window past SMALL_WINDOW_MAX_BS rows), and
+    every stream still stitches into its full decode."""
+    decoder = _LookaheadDecoder()
+    submodule = Code2WavSubmodule(decoder, _config((4, 8, 16)))
+    codes = {f"r{i}": _codes(30 + 17 * i) + 300 * i for i in range(num_requests)}
+    delays = {f"r{i}": 2 * i for i in range(num_requests)}
+
+    steps, keys, sizes = _stream_batched(submodule, codes, delays)
+
+    assert all(key in submodule.windows or key == CONTEXT_ONLY for key in keys)
+    assert any(size > 1 and key not in (50, CONTEXT_ONLY) for key, size in zip(keys, sizes, strict=True))
+    for key, size in zip(keys, sizes, strict=True):
+        if size > submodule.SMALL_WINDOW_MAX_BS:
+            assert key in (50, CONTEXT_ONLY)
+    for rid, request_codes in codes.items():
+        full = _to_pcm(decoder(request_codes.t()[None], torch.arange(request_codes.shape[0])[None]))[0, 0]
+        streamed = torch.cat([audio for _, audio, _ in steps[rid]])
+        assert torch.equal(streamed, full), rid
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +433,13 @@ def tiny_code2wav():
         yield model, config
 
 
-@pytest.mark.parametrize("num_frames", [24, 25, 26, 50, 51, 120])
-def test_real_decoder_streams_the_full_decode(tiny_code2wav, num_frames):
+@pytest.mark.parametrize("schedule", SCHEDULES)
+@pytest.mark.parametrize("num_frames", [3, 24, 25, 26, 50, 51, 120])
+def test_real_decoder_streams_the_full_decode(tiny_code2wav, schedule, num_frames):
     model, config = tiny_code2wav
     tail = _decoder_tail(config)
     assert tail == 8 * 60 + 5 * 12 + 4 * 3 + 3 == 555
+    config = dataclasses.replace(config, codec_chunk_schedule=schedule)
     submodule = Code2WavSubmodule(model, Qwen3OmniModelConfig(code2wav=config))
     generator = torch.Generator().manual_seed(num_frames)
     codes = torch.randint(0, config.codebook_size, (num_frames, config.num_quantizers), generator=generator)

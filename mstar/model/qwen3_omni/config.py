@@ -299,16 +299,19 @@ class Code2WavConfig:
     num_hidden_layers: int = 8
     upsample_rates: Tuple[int, ...] = (8, 5, 4, 3)
     upsampling_ratios: Tuple[int, ...] = (2, 2)
-    # Streaming chunk size (in codec frames) for the Talker→Code2Wav edge.
-    # 25 frames keeps TTFT low (~1s). ``codec_left_context_frames`` is the
-    # number of overlap frames prepended to non-first chunks by
-    # ``LeftContextChunkPolicy`` (warms up the causal ConvNet vocoder) and
-    # trimmed from the emitted waveform in ``Code2WavSubmodule``.
+    # Talker→Code2Wav streaming, in codec frames (12.5 per second of audio).
+    # Chunk k carries ``codec_chunk_schedule[k]`` new frames, then
+    # ``codec_chunk_frames`` each, behind up to ``codec_left_context_frames``
+    # frames already decoded (``ScheduledLeftContextChunkPolicy``); the
+    # Code2WavSubmodule trims their audio. While the Thinker is still writing,
+    # the Talker makes one frame per Thinker token, so the first chunk's size
+    # sets time to first audio: 4 frames instead of 25 saves 21 Thinker steps.
+    # The ramp keeps the next chunk ahead of playback.
     #
     # Named with a ``codec_`` prefix to avoid collision with HF's
-    # ``Qwen3OmniMoeCode2WavConfig`` (which has no such field today but could
-    # add one; the HF method ``chunked_decode(chunk_size=...)`` also uses the
-    # same bare name with different semantics).
+    # ``Qwen3OmniMoeCode2WavConfig`` (the HF method
+    # ``chunked_decode(chunk_size=...)`` uses the bare name differently).
+    codec_chunk_schedule: Tuple[int, ...] = (4, 8, 16)
     codec_chunk_frames: int = 25
     codec_left_context_frames: int = 25
     attention_bias: bool = False
@@ -336,6 +339,20 @@ class Code2WavConfig:
             if tup_field in filtered and isinstance(filtered[tup_field], list):
                 filtered[tup_field] = tuple(filtered[tup_field])
         return cls(**filtered)
+
+    def codec_windows(self) -> list[int]:
+        """Window sizes (context + new frames) the chunk schedule produces,
+        smallest first. A stream's terminal flush is never wider than the last."""
+        left = self.codec_left_context_frames
+        windows, delivered = set(), 0
+        for size in self.codec_chunk_schedule:
+            windows.add(min(left, delivered) + size)
+            delivered += size
+        while True:
+            windows.add(min(left, delivered) + self.codec_chunk_frames)
+            if delivered >= left:
+                return sorted(windows)
+            delivered += self.codec_chunk_frames
 
     def get_hf_config(self):
         from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
