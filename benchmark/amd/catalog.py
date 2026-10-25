@@ -196,6 +196,12 @@ ARMS: dict[str, Arm] = {a.name: a for a in [
         tp_env={"GLOO_SOCKET_IFNAME": "lo"}, model_kwargs={"moe_backend": "aiter"}, follows="mstar",
         recipe="as the mstar arm, with model_kwargs moe_backend: aiter (AITER's fused MoE for the Thinker and "
                "Talker experts; mstar's tuned Triton MoE tables don't apply)"),
+    # Cosmos3-Nano's default conditioning stretches the frame to the generation size; the diffusers 0.41 reference
+    # (and SGLang) cover-scale and center-crop it. The same mstar with the reference's recipe, for image-to-video.
+    Arm("mstar-aspectcrop", "mstar", ("video",), client="ours_openai", rows=("cosmos3_nano",),
+        env={"MSTAR_SHM_ARENA": "1"}, model_kwargs={"conditioning_resize": "aspect_crop"}, follows="mstar",
+        recipe="as the mstar arm, with model_kwargs conditioning_resize: aspect_crop (the reference's cover-scale "
+               "and center-crop of the conditioning frame, not the Nano default stretch)"),
     # The same arms on the base tree (--tree base=PATH), back to back with the head's on each row, so the head's
     # change is measured in the same session. Each serves its own tree's configs.
     Arm("mstar-base", "mstar", ("text", "tts", "asr", "omni", "image", "video"), client="ours_openai", tree="base",
