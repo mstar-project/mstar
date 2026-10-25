@@ -181,6 +181,7 @@ class _RecordingBackend(FusedMoEBackend):
 @pytest.mark.parametrize("block_name", [
     "SparseMoeBlock", "SparseMoeBlockWithSharedExpert",
     "ParallelSparseMoeBlock", "ParallelSparseMoeBlockWithSharedExpert",
+    "ExpertParallelSparseMoeBlock",
 ])
 def test_blocks_build_their_backend_and_prepare_hands_it_the_expert_weights(
     on_platform, monkeypatch, block_name,
@@ -207,6 +208,46 @@ def test_blocks_build_their_backend_and_prepare_hands_it_the_expert_weights(
     container = torch.nn.Sequential(block)
     moe_module.prepare_moe_weights(container)
     assert block.experts_backend.prepared == [(block.experts.gate_up_proj, block.experts.down_proj)]
+
+
+@pytest.mark.parametrize("parallel", ["tp", "ep"])
+def test_instantiate_moe_block_passes_the_backend_choice(on_platform, monkeypatch, parallel):
+    from mstar.model.components import MoeParallelConfig, instantiate_moe_block
+    from mstar.model.components import moe as moe_module
+
+    on_platform(CpuPlatform())
+    built = []
+
+    def fake_make(kind, problem):
+        built.append(kind)
+        return _RecordingBackend(problem)
+
+    monkeypatch.setattr(moe_module, "make_moe_backend", fake_make)
+    with torch.device("meta"):
+        instantiate_moe_block(
+            hidden_size=64, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32,
+            moe_parallel=MoeParallelConfig(parallel=parallel), moe_backend="aiter",
+        )
+    assert built == ["aiter"]
+
+
+@pytest.mark.parametrize("skip_invalid", [False, True])
+def test_triton_hands_skip_invalid_to_fused_experts(on_platform, monkeypatch, skip_invalid):
+    from mstar.utils.fused_moe import runner
+
+    on_platform(CudaPlatform())
+    seen = {}
+    monkeypatch.setattr(runner, "fused_experts", lambda *args, **kwargs: seen.update(kwargs))
+    make_moe_backend("triton", THINKER)(torch.zeros(3, 2048), None, None, None, None, skip_invalid=skip_invalid)
+    assert seen["skip_invalid"] is skip_invalid
+
+
+def test_aiter_refuses_to_skip_slots(on_platform, monkeypatch):
+    on_platform(RocmPlatform())
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: object())
+    backend = make_moe_backend("aiter", THINKER)
+    with pytest.raises(NotImplementedError, match="use 'triton'"):
+        backend(torch.zeros(1, 2048), None, None, torch.zeros(1, 8), torch.zeros(1, 8), skip_invalid=True)
 
 
 def test_qwen3_omni_text_configs_default_to_auto():

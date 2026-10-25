@@ -75,7 +75,12 @@ class AiterFusedMoE(FusedMoEBackend):
             w.data = shuffle_weight(w.data, layout=(16, 16))
         self._prepared = True
 
-    def __call__(self, hidden_states, w1, w2, topk_weights, topk_ids):
+    def __call__(self, hidden_states, w1, w2, topk_weights, topk_ids, skip_invalid=False):
+        if skip_invalid:
+            raise NotImplementedError(
+                "MoE backend 'aiter' can't skip padding rows or another rank's experts "
+                "(ep_config parallel: ep, or mask_padding); use 'triton'"
+            )
         if not self._prepared:
             raise RuntimeError("AiterFusedMoE: prepare_weights was not called after loading")
         return aiter_fused_moe(
