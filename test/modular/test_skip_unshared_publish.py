@@ -4,15 +4,11 @@ resource runs on this worker's lockstep instance: only another instance's
 
 from __future__ import annotations
 
-import sys
-
-sys.path.insert(0, ".")
-
 import pytest
+from test_resource_runner import _Stub
 
 from mstar.engine.resources import StepRunner
 from mstar.worker.worker import Worker
-from test.modular.test_resource_runner import _Stub
 
 
 def _runner():
