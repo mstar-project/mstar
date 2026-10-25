@@ -1455,3 +1455,21 @@ def test_media_rows_hold_one_of_the_nodes_media_lanes(tmp_path, monkeypatch):
     plan.media_lanes, peak[0] = 0, 0
     sweep.run_rows(plan, rows, [3, 4, 5], 3, 8580)
     assert peak[0] == 3
+
+
+def test_aspectcrop_arm_runs_after_mstar_on_cosmos3_nano_only(tmp_path, monkeypatch):
+    import yaml
+
+    video = list(tables.TABLES["video"].arms)
+    assert "mstar-aspectcrop" not in [a.name for a in catalog.arms_for(catalog.ROWS["wan22"], video)]
+    seen = []
+    monkeypatch.setattr(sweep, "run_arm", lambda plan, row, arm, gpus, port, lane: seen.append(arm.name))
+    sweep.run_row(type("P", (), {"arms": video, "trees": {}})(), catalog.ROWS["cosmos3_nano"], 0, [5], 8640)
+    assert seen[:3] == ["mstar", "mstar-aspectcrop", "vllm-omni"]
+    wt = tmp_path / "wt"
+    (wt / "configs").mkdir(parents=True)
+    (wt / "configs" / "cosmos3_nano.yaml").write_text("model: cosmos3\nmodel_kwargs:\n  accelerator_graph: true\n")
+    cfg = Launch(catalog.ARMS["mstar-aspectcrop"], catalog.ROWS["cosmos3_nano"], [5], 8640, tmp_path / "s",
+                 worktree=wt).mstar_config()
+    assert yaml.safe_load(cfg.read_text())["model_kwargs"] == {"accelerator_graph": True,
+                                                                "conditioning_resize": "aspect_crop"}
