@@ -67,10 +67,12 @@ def instantiate_moe_block(
     router: nn.Module | None = None,
     comm_group: CommGroup | None = None,
     moe_parallel: MoeParallelConfig | None = None,
+    moe_backend: str = "auto",
 ) -> ParallelSparseMoeBlock | ExpertParallelSparseMoeBlock:
     """The routed-expert block ``moe_parallel`` asks for; TP when None.
 
     ``comm_group`` is the node's TP group; EP picks its group from it.
+    ``moe_backend`` picks the routed experts' kernels (see ``MoEBackend``).
     """
     moe_parallel = moe_parallel or MoeParallelConfig()
     if moe_parallel.parallel == "tp":
@@ -82,6 +84,7 @@ def instantiate_moe_block(
             norm_topk_prob=norm_topk_prob,
             router=router,
             comm_group=comm_group,
+            moe_backend=moe_backend,
         )
     ep_group = moe_parallel.resolve_ep_group(comm_group)
     return ExpertParallelSparseMoeBlock(
@@ -97,6 +100,7 @@ def instantiate_moe_block(
             moe_parallel.log_expert_load_every > 0
             and (ep_group is None or ep_group.rank == 0)
         ),
+        moe_backend=moe_backend,
     )
 
 
