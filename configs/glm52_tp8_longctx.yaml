@@ -12,7 +12,7 @@ model: "glm52"
 # the sparse gather instead (fp32, outside the engine's bf16 autocast): same
 # selection, but not bitwise equal to the dense path.
 #
-# Limits, both follow-ups in components/attention.py: prefill prompts must
+# Limits, both follow-ups in mstar/engine/resources/dsa/manager.py: prefill prompts must
 # still fit index_topk, and serving is eager only, since the indexer's
 # per-request host work would not replay in a captured graph.
 max_seq_len: 8192
