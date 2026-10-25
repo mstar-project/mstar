@@ -17,7 +17,7 @@ import traceback
 from pathlib import Path
 
 from benchmark.amd import catalog, tables
-from benchmark.amd.launch import REPO, Launch, arm_worktree, gpu_list, tree_list
+from benchmark.amd.launch import REPO, Launch, arm_worktree, gpu_list, start_on_free_port, tree_list
 
 
 def plan_jobs(rows: list[str], arms: list[str]) -> list[tuple[catalog.Row, catalog.Arm]]:
@@ -37,15 +37,18 @@ def run(jobs, gpus: list[int], out: Path, worktree: Path, port_base: int, log=pr
 
     def worker(row, arm, mine, port):
         key = f"{row.name}/{arm.name}"
-        launch = Launch(arm=arm, row=row, gpus=mine, port=port, run_dir=out / row.name / arm.name,
-                        worktree=arm_worktree(arm, worktree, trees or {}))
+        launch = None
         t0 = time.monotonic()
         try:
-            res = {"gpus": mine, **launch.start()}
+            launch, startup = start_on_free_port(
+                lambda p: Launch(arm=arm, row=row, gpus=mine, port=p, run_dir=out / row.name / arm.name,
+                                 worktree=arm_worktree(arm, worktree, trees or {})), port, log)
+            res = {"gpus": mine, "port": launch.port, **startup}
         except Exception:
             res = {"gpus": mine, "error": traceback.format_exc()[-2000:]}
         finally:
-            launch.stop()
+            if launch is not None:
+                launch.stop()
             with cond:
                 free.extend(mine)
                 cond.notify_all()
