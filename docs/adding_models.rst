@@ -561,10 +561,12 @@ The spec types are:
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core
        kernel; ``False`` picks the CUDA-core decode kernel, which can be faster for
        MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-       Whisper and Qwen3-ASR declare ``False``. ``FLASHINFER_MLA`` is
+       Whisper and Qwen3-ASR declare ``False``. ``sm_scale`` (default
+       ``1/sqrt(head_dim)``) sets the softmax scale; FlashInfer and ``FLASHINFER_MLA``
+       read it, and the other backends refuse it. ``FLASHINFER_MLA`` is
        Multi-head Latent Attention over a ``KVLayout.MLA`` cache. It needs ``sm_scale``,
-       the softmax scale of the model's original qk head dim, which the other backends
-       refuse. Its ``run`` takes the absorbed query (``[tokens, heads, kv_lora_rank]``)
+       the softmax scale of the model's original qk head dim. Its ``run`` takes the
+       absorbed query (``[tokens, heads, kv_lora_rank]``)
        with the rope part as ``q_pe``, and returns the output in the latent space, so
        the layer applies ``W_UV``. FlashInfer's kernel covers a 512-wide latent with a
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
