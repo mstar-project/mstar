@@ -348,11 +348,15 @@ def _check(probs: torch.Tensor, rids: list[str], rows: dict[str, RefRow], logits
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-6)
 
 
-def _ctx(rids, lease=None) -> StepContext:
-    return StepContext(
+def _ctx(rids, lease=None, padded=None) -> StepContext:
+    ctx = StepContext(
         request_ids=tuple(rids), graph_walk="decode", slot=0, capture=False,
         slot_lease=lease,
     )
+    if padded is not None:
+        # the rows a leased step samples, as the engine pads them
+        ctx.set_padded_rids(tuple(padded))
+    return ctx
 
 
 STEPS = 60
@@ -375,7 +379,7 @@ def test_eager_matches_upstream_step_by_step(monkeypatch):
         logits = _logits(len(rids), step, dev)
         res.plan(step_kind, _ctx(rids))
         spy.seen.clear()
-        tokens = res.sample(rids, logits).tolist()
+        tokens = res.sample(logits).tolist()
         res.commit(step_kind, _ctx(rids))
         assert len(spy.seen) == 1
         _check(spy.seen[0], rids, rows, logits, step)
@@ -417,7 +421,7 @@ def test_captured_graph_matches_upstream_step_by_step(monkeypatch):
         logits = _logits(len(live), step, dev)
         res.plan(step_kind, _ctx(live))
         spy.seen.clear()
-        tokens = res.sample(live, logits).tolist()
+        tokens = res.sample(logits).tolist()
         res.commit(step_kind, _ctx(live))
         _check(spy.seen[0], live, rows, logits, step)
         advance(live, tokens)
@@ -427,17 +431,17 @@ def test_captured_graph_matches_upstream_step_by_step(monkeypatch):
     static = torch.zeros(bs, VOCAB, device=dev)
     graphs, outs, probs = [], [], []
     for lease in leases:
-        res.plan(step_kind, _ctx(live, lease))
+        res.plan(step_kind, _ctx(live, lease, padded))
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
-            res.sample(padded, static)  # warmup: autotune, lazy init
+            res.sample(static)  # warmup: autotune, lazy init
         torch.cuda.current_stream().wait_stream(side)
         # the warmup advanced the per-step rows; regather before capturing
-        res.plan(step_kind, _ctx(live, lease))
+        res.plan(step_kind, _ctx(live, lease, padded))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            outs.append(res.sample(padded, static))
+            outs.append(res.sample(static))
         graphs.append(graph)
         probs.append(spy.seen[-1])
 
@@ -530,12 +534,12 @@ def test_unfiltered_steps_skip_top_k_and_top_p(monkeypatch, captured):
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
-            res.sample(live, static)  # warmup
+            res.sample(static)  # warmup
         torch.cuda.current_stream().wait_stream(side)
         res.plan(unfiltered, _ctx(live, lease))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            out = res.sample(live, static)
+            out = res.sample(static)
         probs = spy.seen[-1]  # the graph's buffer: after a replay, the replay's distribution
         res.plan(unfiltered, StepContext(
             request_ids=tuple(live), graph_walk="decode", slot=0, capture=False,
@@ -554,7 +558,7 @@ def test_unfiltered_steps_skip_top_k_and_top_p(monkeypatch, captured):
         logits = _logits(len(live), step, dev)
         res.plan(kind, _ctx(live))
         spy.seen.clear()
-        tokens = res.sample(live, logits).tolist()
+        tokens = res.sample(logits).tolist()
         res.commit(kind, _ctx(live))
         check_and_advance(spy.seen[0], logits, tokens, step)
 
