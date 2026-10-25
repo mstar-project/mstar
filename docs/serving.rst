@@ -345,7 +345,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
        ingraph_decode_rope: true}``, or ``knobs: {pre_plan: false}``
-       (``whisper_large_v3_turbo.yaml``).
+       (``whisper_large_v3_turbo.yaml``). On AMD GPUs ``ingraph_decode_rope`` and
+       ``sampler_ingraph_scatter`` default to ``true``.
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /

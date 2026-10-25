@@ -591,7 +591,7 @@ Worker scheduling
      - config's ``knobs: ingraph_decode_rope``, else ``0`` (``1`` on ROCm)
      - A captured decode step builds its rotary tables inside the graph from
        the position resource's planned positions instead of staging them.
-       On by default on AMD GPUs (``RocmPlatform.process_env_defaults``), where
+       On by default on AMD GPUs (``RocmPlatform.knob_defaults``), where
        each launch beside a replayed graph costs about 5 us of GPU time.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
      - config's ``knobs: sampler_ingraph_scatter``, else ``0`` (``1`` on ROCm)
