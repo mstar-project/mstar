@@ -1,4 +1,3 @@
-import functools
 import logging
 import time
 from collections import Counter, defaultdict, deque
@@ -746,14 +745,15 @@ class MicroScheduler:
         if self.sched_type != SchedulingType.ROUND_ROBIN:
             raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
         waiting = frozenset(self.pending_removes.keys() | self.held_until.keys())
-        return self.core.run(
-            functools.partial(self._run_checks, request_state), request_state,
-            PassRequest(
-                target, exclude_target, pre_existing_batch_size, capture_group_of, now,
-                waiting=waiting, failed=self.failed_rids,
-                scan_exclude=waiting.union(self.failed_rids),
-            ),
-        )
+        core = self.core
+        step = core.begin(request_state, PassRequest(
+            target, exclude_target, pre_existing_batch_size, capture_group_of, now,
+            waiting=waiting, failed=self.failed_rids,
+            scan_exclude=waiting.union(self.failed_rids),
+        ))
+        while step.check is not None:
+            step = core.resume(self._run_checks(request_state, step.check))
+        return step.batch
 
     def _run_checks(
         self, request_state: RequestStateManager, request: CheckRequest,

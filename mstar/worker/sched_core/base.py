@@ -3,9 +3,10 @@
 The check (``Engine.check_ready``) is per-rank resource code with side effects
 (a KV reload, a transfer kickoff), so it stays Python. Everything around it --
 which rows to check and in what order, and what to do with the verdicts -- is
-the scheduler core's. A core hands the caller a ``CheckRequest``, the caller
-answers it with one verdict per row (``MicroScheduler._run_checks``), and the
-core either asks again or returns the step. ``SchedCore`` is that interface,
+the scheduler core's. A pass ``begin``s, and each time it stops with a
+``CheckRequest`` the caller answers with one verdict per row
+(``MicroScheduler._run_checks``) and ``resume``s it, until it returns the
+step. ``SchedCore`` is that interface,
 with the backlog queries the rest of the scheduler needs; ``PythonSchedCore``
 and ``RustSchedCore`` (the graph runtime's) implement it.
 """
@@ -54,6 +55,13 @@ class PassRequest(NamedTuple):
     failed: AbstractSet[int]
     # rows the ready scan skips, as the pass starts: failed, waiting
     scan_exclude: frozenset[int]
+
+
+class PassStep(NamedTuple):
+    """Where a pass stands: the rows it needs checked next, or (``check`` is
+    None) the step it built, if any."""
+    check: CheckRequest | None
+    batch: ScheduledBatch | None = None
 
 
 class SchedKeys:
@@ -197,12 +205,12 @@ class SchedCore(ABC):
     the rows of a ready set too big for one step, waiting their turn."""
 
     @abstractmethod
-    def run(
-        self, check: Callable[[CheckRequest], bytes],
-        request_state: RequestStateManager, request: PassRequest,
-    ) -> ScheduledBatch | None:
-        """One pass: answer each ``CheckRequest`` with ``check`` until the
-        core returns the step (or None)."""
+    def begin(self, request_state: RequestStateManager, request: PassRequest) -> PassStep:
+        """Start a pass; it runs until it needs rows checked, or is done."""
+
+    @abstractmethod
+    def resume(self, verdicts: bytes) -> PassStep:
+        """Continue the pass with one verdict per row of its last check."""
 
     @abstractmethod
     def room_for_continuing(self, target: tuple[str, str]) -> int | None:

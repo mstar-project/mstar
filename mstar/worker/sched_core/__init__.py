@@ -11,6 +11,7 @@ from mstar.worker.sched_core.base import (
     UNCHECKED,
     CheckRequest,
     PassRequest,
+    PassStep,
     RoundRobin,
     SchedCore,
     SchedKeys,
@@ -18,6 +19,6 @@ from mstar.worker.sched_core.base import (
 from mstar.worker.sched_core.rust import RustSchedCore
 
 __all__ = [
-    "FAILED", "NOT_READY", "READY", "UNCHECKED", "CheckRequest", "PassRequest",
+    "FAILED", "NOT_READY", "READY", "UNCHECKED", "CheckRequest", "PassRequest", "PassStep",
     "RoundRobin", "RustSchedCore", "SchedCore", "SchedKeys",
 ]

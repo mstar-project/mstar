@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import Any
 
 from mstar.graph.runtime.base import GraphRuntime, RequestWalks
@@ -23,6 +23,7 @@ from mstar.worker.sched_core.base import (
     UNCHECKED,
     CheckRequest,
     PassRequest,
+    PassStep,
     RoundRobin,
     SchedCore,
     SchedKeys,
@@ -47,25 +48,30 @@ class PythonSchedCore(SchedCore):
         # a split batch finishes before anything new starts.
         # (node, graph walk) -> ScheduledBatch
         self.backlog: dict[tuple[str, str], ScheduledBatch] = {}
-        # the pass in progress
+        # the pass in progress, and its generator
         self._req: PassRequest | None = None
+        self._steps = None
 
     # -- the pass ---------------------------------------------------------------
 
-    def run(
-        self, check: Callable[[CheckRequest], bytes],
-        request_state: RequestStateManager, request: PassRequest,
-    ) -> ScheduledBatch | None:
+    def begin(self, request_state: RequestStateManager, request: PassRequest) -> PassStep:
         self._req = request
-        steps = self._pass(request_state, request)
+        self._steps = self._pass(request_state, request)
+        return self._advance(None)
+
+    def resume(self, verdicts: bytes) -> PassStep:
+        return self._advance(verdicts)
+
+    def _advance(self, verdicts: bytes | None) -> PassStep:
         try:
-            asked = next(steps)
-            while True:
-                asked = steps.send(check(asked))
+            asked = self._steps.send(verdicts)
         except StopIteration as done:
-            return done.value
-        finally:
-            self._req = None
+            self._req = self._steps = None
+            return PassStep(None, done.value)
+        except BaseException:
+            self._req = self._steps = None
+            raise
+        return PassStep(asked)
 
     def _pass(self, request_state: RequestStateManager, request: PassRequest):
         target, exclude_target = request.target, request.exclude_target

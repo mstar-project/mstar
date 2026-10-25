@@ -1,11 +1,11 @@
 """The scheduling pass in the Rust graph runtime (see ``RustSchedCore``)."""
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from mstar.graph.runtime.base import ColumnarEdgeSpecs
-from mstar.worker.sched_core.base import CheckRequest, PassRequest, SchedCore
+from mstar.worker.sched_core.base import CheckRequest, PassRequest, PassStep, SchedCore
 
 if TYPE_CHECKING:
     from mstar.worker.micro_scheduler import ScheduledBatch
@@ -30,18 +30,15 @@ class RustSchedCore(SchedCore):
             sorted(leader_nodes),
         )
 
-    def run(
-        self, check: Callable[[CheckRequest], bytes],
-        request_state: RequestStateManager, request: PassRequest,
-    ) -> ScheduledBatch | None:
+    def begin(self, request_state: RequestStateManager, request: PassRequest) -> PassStep:
         del request_state  # its checks are the caller's
-        done, asked, batch = self._rt.sched_begin(
+        return _step(*self._rt.sched_begin(
             request.target, request.exclude_target, request.pre_existing_batch_size,
             list(request.waiting), list(request.failed), list(request.scan_exclude),
-        )
-        while not done:
-            done, asked, batch = self._rt.sched_resume(check(CheckRequest(*asked)))
-        return None if batch is None else _batch(batch)
+        ))
+
+    def resume(self, verdicts: bytes) -> PassStep:
+        return _step(*self._rt.sched_resume(verdicts))
 
     def room_for_continuing(self, target: tuple[str, str]) -> int | None:
         return self._rt.sched_room_for_continuing(*target)
@@ -64,6 +61,12 @@ class RustSchedCore(SchedCore):
         walks)]`` in order, rr as ``{(node, label): batch number}`` plus the
         counter."""
         return self._rt.sched_state()
+
+
+def _step(done: bool, asked, batch) -> PassStep:
+    if not done:
+        return PassStep(CheckRequest(*asked))
+    return PassStep(None, None if batch is None else _batch(batch))
 
 
 def _batch(cols) -> ScheduledBatch:
