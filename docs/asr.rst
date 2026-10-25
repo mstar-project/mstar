@@ -128,8 +128,8 @@ the pool holds offload to the host pool and, once that is full too, wait on
 each other until they time out: 16 concurrent single-window 20 minute files
 stalled on 2048 pages, and peaked at 2352 pages with 4096 in the pool.
 
-``qwen3_asr.yaml`` therefore caps Qwen3-ASR at 12 concurrent requests, which
-any mix of files up to 20 minutes fits. The cap costs short-utterance
+``qwen3_asr.yaml`` and ``qwen3_asr_split.yaml`` therefore cap Qwen3-ASR at 12
+concurrent requests, which any mix of files up to 20 minutes fits. The cap costs short-utterance
 throughput: on LibriSpeech test-clean (one H200, Qwen3-ASR 1.7B) RTFx was
 about 420 at 8 concurrent requests, 900 at 32 and 1280 at 64. A deployment
 that only serves short audio can raise ``max_concurrent_requests`` (64 fits
