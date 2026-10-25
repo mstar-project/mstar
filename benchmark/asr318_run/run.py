@@ -385,7 +385,7 @@ class Server:
             return [("selftest", [sys.executable, str(HERE / "selftest_server.py"), "--port", str(self.port),
                                   "--data", str(DATA)], env)]
         if e == "mstar":
-            env.update({"MSTAR_SHM_ARENA": "1", "OMP_WAIT_POLICY": "PASSIVE",
+            env.update({"MSTAR_SHM_ARENA": "1",
                         "PATH": f"{MSTAR_BIN}:{os.environ.get('PATH', '')}"})
             env.pop("CUDA_VISIBLE_DEVICES")  # --gpus sets it
             cmd = [str(MSTAR_BIN / "mstar"), "serve", m["key"], "--gpus", str(self.gpu), "--port", str(self.port),

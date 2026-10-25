@@ -42,7 +42,7 @@ def start(name: str, out: Path, env_extra: dict | None = None) -> subprocess.Pop
     cmd = [str(REPO / ".venv" / "bin" / "mstar"), "serve", "qwen3_5_0.8b", "--gpus", "0", "--port", str(PORT),
            "--socket-path-prefix", f"/tmp/lq_{name}_{ts}/", "--upload-dir", f"/tmp/lqu_{name}_{ts}/"]
     logf = open(out / "servers" / f"qwen35_{name}.log", "w")
-    env = {**os.environ, "MSTAR_SHM_ARENA": "1", "OMP_WAIT_POLICY": "PASSIVE", **(env_extra or {})}
+    env = {**os.environ, "MSTAR_SHM_ARENA": "1", **(env_extra or {})}
     p = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
     deadline = time.monotonic() + 1800
     while time.monotonic() < deadline:

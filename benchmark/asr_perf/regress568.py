@@ -15,7 +15,8 @@ The first --arm is the baseline; odd rounds run the arms in --arm order, even ro
 
 Models, chosen for what #568's arms changed:
   qwen3_tts  Qwen3-TTS-12Hz-1.7B (talker and code predictor GQA 16/8 = 2: the decode-kernel switch), streamed
-             audio (many chunks per request: the wake path). tts_speech_bench at c=1/8/32: TTFA, audio s/s.
+             audio (many chunks per request through the API server's output path). tts_speech_bench at
+             c=1/8/32: TTFA, audio s/s.
   higgs      Higgs-audio v3 STT (GQA 2), transcriptions at c=1/8/32: RTFx, WER on LibriSpeech test-clean.
   qwen35     Qwen3.5-0.8B text (GQA 4: unchanged kernel; the CPU-overhead litmus), 256 tokens at c=32/64.
 Fresh server per (round, model, arm), then one MSTAR_PHASE_TIMING server per
@@ -73,7 +74,7 @@ def start(arm: str, model: str, name: str, out: Path, env_extra: dict | None = N
     ts = int(time.time())
     cmd = [str(VENV_BIN / "mstar"), "serve", *MODELS[model], "--gpus", "0", "--port", str(PORT),
            "--socket-path-prefix", f"/tmp/rg_{name}_{ts}/", "--upload-dir", f"/tmp/rgu_{name}_{ts}/"]
-    env = {**os.environ, "PYTHONPATH": str(tree), "MSTAR_SHM_ARENA": "1", "OMP_WAIT_POLICY": "PASSIVE",
+    env = {**os.environ, "PYTHONPATH": str(tree), "MSTAR_SHM_ARENA": "1",
            "PATH": f"{VENV_BIN}:{os.environ.get('PATH', '')}", **(env_extra or {})}
     logf = open(out / "servers" / f"{name}.log", "w")
     p = subprocess.Popen(cmd, cwd=tree, env=env, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
