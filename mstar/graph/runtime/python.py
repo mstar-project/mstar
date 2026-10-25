@@ -1374,7 +1374,7 @@ class PythonGraphRuntime(GraphRuntime):
             for edge in routing.persist:
                 for info in edge.tensor_info:
                     self._tensor_manager.set_persist(info.uuid, persist=True)
-            if owned:
+            if owned or completion.transferred_refs:
                 # persist is deliberately absent: those tensors are held alive
                 # by the persist marker, and counting them here would
                 # double-count a signal whose destination is EMPTY_DESTINATION
@@ -1386,7 +1386,9 @@ class PythonGraphRuntime(GraphRuntime):
                     + sum(routing.to_workers.values(), start=[])
                     + sum(routing.streaming_to_workers.values(), start=[])
                 )
-                self._tensor_manager.set_output_ref_counts(owned, routed_edges)
+                self._tensor_manager.set_output_ref_counts(
+                    owned, routed_edges, completion.transferred_refs,
+                )
 
             # What the caller has to stage for remote reads. Every tensor on
             # an outgoing edge, not just the ones this batch produced: a loop
