@@ -43,6 +43,7 @@ from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker import micro_scheduler as ms  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.node_manager_utils import RequestStateManager  # noqa: E402
+from mstar.worker.sched_core import RustSchedCore  # noqa: E402
 
 ME, PART = "w0", "default"
 LLM, ENC = "LLM", "enc"
@@ -147,7 +148,7 @@ class World:
         )
         self.sched.runtime = self.rt
         if not rust_core:
-            self.sched._core_chosen = True  # the Python core, on the same runtime
+            self.sched._core = self.sched._python_core()  # on the same runtime
         self.rs = RequestStateManager(node_to_partition={LLM: PART, ENC: PART})
         self.walk: dict[int, str] = {}
         self.uuid = 0
@@ -210,8 +211,8 @@ class World:
 
     # -- observation ------------------------------------------------------
     def backlog(self):
-        if self.sched._core is not None:
-            return [tuple(b) for b in self.sched._core.state()[0]]
+        if isinstance(self.sched.core, RustSchedCore):
+            return [tuple(b) for b in self.sched.core.state()[0]]
         return [
             (node, label, list(b.request_to_worker_graph),
              [b.walk_of(r) for r in b.request_to_worker_graph] if b.request_walks else [])
@@ -219,8 +220,8 @@ class World:
         ]
 
     def rr(self):
-        if self.sched._core is not None:
-            _, rr, n = self.sched._core.state()
+        if isinstance(self.sched.core, RustSchedCore):
+            _, rr, n = self.sched.core.state()
             return sorted(rr), n
         return sorted((n, w, v) for (n, w), v in self.sched.node_and_walk_to_last_batch_num.items()), \
             self.sched.batch_number
@@ -359,7 +360,7 @@ def test_both_cores_schedule_the_same(config, seed, leaders, monkeypatch):
             if live:
                 rid = live[0]
                 both("splits", lambda w, rid=rid: w.sched.backlog_splits_from(w.rs, (LLM, DEC), rid))
-    assert worlds[1].sched._core is not None, "the Rust world must have run the Rust core"
+    assert isinstance(worlds[1].sched.core, RustSchedCore), "the Rust world must have run the Rust core"
 
 
 def test_a_node_split_by_capture_key_keeps_the_python_core(monkeypatch):

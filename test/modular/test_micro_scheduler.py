@@ -1001,7 +1001,7 @@ def test_a_walk_that_does_not_split_never_reads_stream_chunks():
         engine_manager=SimpleNamespace(get_engine=lambda name: engine), parallel_leader_nodes={NODE},
     )
     manager = SimpleNamespace(ingested_stream_chunks=lambda rid, node: pytest.fail("read stream chunks"))
-    assert sched._capture_group(manager, NODE, WALK, 0) is None
+    assert sched.core._capture_group(manager, NODE, WALK, 0) is None
 
 
 def test_request_state_reports_the_chunk_each_input_stream_ingested():
@@ -1214,7 +1214,7 @@ def test_an_input_landing_on_a_backlogged_row_does_not_ready_it_again():
     # Parked through the real path, which claims the row like a running batch.
     # A fresh row the cap pushes out no longer parks, so a row that genuinely
     # waits is the case worth pinning here.
-    sched._backlog((NODE, WALK), _batch(["r1"]))
+    sched.core._backlog((NODE, WALK), _batch(["r1"]))
     assert ("r1", NODE) in manager.in_flight
 
     manager.ingest("r1")
@@ -1303,7 +1303,7 @@ def test_the_backlog_and_round_robin_key_on_the_combined_walk():
     # and carries each row's real walk as the assembly would
     parked = _batch(["b0"], walk=MIXED)
     parked.request_walks = {"b0": WALK}
-    sched._backlog((NODE, MIXED), parked)
+    sched.core._backlog((NODE, MIXED), parked)
     assert set(sched.backlog) == {(NODE, MIXED)}
 
     first = _next_batch(sched, manager)
