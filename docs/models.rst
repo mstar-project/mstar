@@ -155,8 +155,6 @@ Notes
 
 - Models marked *(Beta)* are functionally supported but not yet
   performance-optimized; treat their throughput/latency as provisional.
-- Models marked *(Unvalidated)* have not yet run on their real checkpoint or a
-  GPU; see the model's section for what has been checked.
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
