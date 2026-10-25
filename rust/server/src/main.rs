@@ -1095,10 +1095,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
     .await
 }
 
-/// The files a `/generate` request saved under the upload directory, until
-/// the request takes them with [`SavedUploads::keep`]. A refusal drops them
-/// unkept, which deletes them: the deferred cleanup only covers submitted
-/// requests.
+/// The files a request saved under the upload directory (a `/generate` form,
+/// a chat's attachments), until the request takes them with
+/// [`SavedUploads::keep`]. A refusal drops them unkept, which deletes them:
+/// the deferred cleanup only covers submitted requests.
 struct SavedUploads {
     upload_dir: PathBuf,
     paths: BTreeMap<String, Vec<String>>,
@@ -1614,6 +1614,46 @@ mod tests {
         assert_eq!(body["error"]["message"], "image editing is not supported by this model");
         assert_eq!(std::fs::read_dir(&st.upload_dir).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&st.upload_dir);
+    }
+
+    #[tokio::test]
+    async fn a_chat_refused_after_an_attachment_leaves_no_upload_behind() {
+        let mut st = state(None);
+        st.upload_dir = socket_dir();
+        let image = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}});
+        let bad_image = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,***"}});
+        let audio = json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}});
+        let mut left = Vec::new();
+        for (adapter, request, detail) in [
+            (
+                "Qwen3_5Adapter",
+                json!({"messages": [{"role": "user", "content": [image, audio, bad_image]}]}),
+                "data URL base64 decode failed: Invalid symbol 42, offset 0.",
+            ),
+            (
+                "Qwen3OmniAdapter",
+                json!({"messages": [{"role": "user", "content": [image, audio]}, {"role": "tool", "content": "42"}]}),
+                "a message's role must be system, developer, user or assistant, not 'tool'",
+            ),
+            (
+                "Cosmos3EdgeAdapter",
+                json!({"messages": [{"role": "user", "content": [image]}], "chat_template_kwargs": true}),
+                "argument of type 'bool' is not iterable",
+            ),
+        ] {
+            st.python_adapter = adapter.into();
+            let req: ChatCompletionRequest = serde_json::from_value(request).unwrap();
+
+            let (status, _, data) = body(chat_completions(State(st.clone()), Ok(Json(req))).await).await;
+
+            let body: Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!((status, body["error"]["message"].as_str()), (StatusCode::BAD_REQUEST, Some(detail)), "{adapter}");
+            left.push((adapter, std::fs::read_dir(&st.upload_dir).unwrap().count()));
+            let _ = std::fs::remove_dir_all(&st.upload_dir);
+            std::fs::create_dir_all(&st.upload_dir).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&st.upload_dir);
+        assert_eq!(left, [("Qwen3_5Adapter", 0), ("Qwen3OmniAdapter", 0), ("Cosmos3EdgeAdapter", 0)]);
     }
 
     #[test]

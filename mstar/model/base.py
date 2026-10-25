@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
-from typing import NamedTuple, Type
+from typing import TYPE_CHECKING, NamedTuple, Type
 
 import torch
 import yaml
@@ -31,6 +31,9 @@ from mstar.graph.base import (
 )
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
+
+if TYPE_CHECKING:
+    from mstar.model.components.moe_parallel import MoeParallelConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -370,6 +373,23 @@ def _divide_into_worker_graphs(
         return loop_section_worker_graphs
 
 
+def node_moe_parallel_configs(node_groups: list[dict]) -> dict[str, "MoeParallelConfig"]:
+    """Each node's parsed ``ep_config``, from the node groups that list it.
+
+    Nodes whose config is the default (TP) are left out. A node listed by
+    several groups, one per graph walk, must get the same config from each.
+    """
+    from mstar.model.components.moe_parallel import MoeParallelConfig
+
+    configs: dict[str, MoeParallelConfig] = {}
+    for ng in node_groups:
+        cfg = MoeParallelConfig.from_yaml(ng.get("ep_config"))
+        for node in ng["node_names"]:
+            if configs.setdefault(node, cfg) != cfg:
+                raise ValueError(f"node {node!r} gets different ep_config from two node_groups")
+    return {node: cfg for node, cfg in configs.items() if cfg != MoeParallelConfig()}
+
+
 def _self_triggered(entity: GraphNode | Loop) -> bool:
     """Whether the stream alone can re-run a top-level entity once it completes:
     it is, or (a Loop) holds, a consumer with every input streamed. Completion
@@ -634,7 +654,15 @@ class Model(ABC):
         # node_groups section drives both worker assignment and TP grouping;
         # the separate "sharding_config" section just holds shard_dim.
         groups: list[ShardingGroup] = []
+        node_moe_parallel_configs(config.get("node_groups", []))
         for ng in config.get("node_groups", []):
+            if "ep_config" in ng and any(
+                node not in sharding_config.ep_enabled_nodes for node in ng["node_names"]
+            ):
+                raise ValueError(
+                    f"Node group with ep_config contains nodes not in "
+                    f"ep_enabled_nodes {sharding_config.ep_enabled_nodes}: {ng['node_names']}"
+                )
             tp = ng.get("tp_size", 1)
             sp = ng.get("sp_size", 1)
             instance_size = tp * sp
@@ -905,6 +933,7 @@ class Model(ABC):
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
+        moe_parallel: "MoeParallelConfig | None" = None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
 
@@ -919,6 +948,10 @@ class Model(ABC):
         participates in a non-trivial SP group, so models without SP support
         never receive it. Models that support SP forward it to their
         attention so it can all-to-all the sequence around the kernel.
+
+        ``moe_parallel`` is the node group's ``ep_config``: TP or EP for the
+        node's routed experts. Passed only for a node in ``ep_enabled_nodes``
+        whose group sets one; build MoE layers with ``instantiate_moe_block``.
 
         ``autocast_dtype`` is the dtype this node's params should be
         allocated in. Models that build on the meta device must cast the

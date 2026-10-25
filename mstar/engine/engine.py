@@ -7,7 +7,6 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from time import perf_counter
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
@@ -62,10 +61,11 @@ from mstar.profile.worker import ExecTimings
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
-    PHASE_PERIOD,
+    PhaseLaps,
     mark,
     nvtx_enabled,
-    phase_record,
+    phase_end,
+    phase_start,
     range_pop,
     range_push,
 )
@@ -1249,8 +1249,10 @@ class Engine:
                 self._autocast_dtype_for(self._submodules[batch.node_name].submodule),
                 device_type=self._device.type,
             ):
+                laps = PhaseLaps("engine.exec.")
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
+                laps.lap("reserve_slot")
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
                 # request runs its own full cycle and merges.
@@ -1262,10 +1264,12 @@ class Engine:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
+            laps = PhaseLaps("engine.exec.")
             if batch.admit_error is None:
                 self._record_loopback(batch)
                 batch.outputs.loopback_rids = batch.loopback_rids
             batch.outputs_ready.set()
+            laps.lap("record_loopback")
             return batch.outputs
         except Exception:
             # A raise before the plan was promoted (declare, admit) would leave
@@ -1286,6 +1290,7 @@ class Engine:
     ) -> BatchedModelOutput:
         """The one-forward path: batched (a lease replay or ``forward_batched``)
         or a single eager request."""
+        laps = PhaseLaps("engine.exec.")
         submodule_mgmt = self._submodules[batch.node_name]
         # On the GPU thread, right before the forward: point the region runners
         # at this batch's slot so the piecewise lease and replay agree with it.
@@ -1304,6 +1309,7 @@ class Engine:
             batch.step_context.set_padded_rids(
                 cg_runner.step_ids(lease, batch.request_ids)
             )
+        laps.lap("pad")
 
         try:
             admit, batch.step = self._declare_and_admit(
@@ -1333,7 +1339,7 @@ class Engine:
             batch.commit_done.set()
             if self._enable_nvtx:
                 range_push("engine.collect_outputs")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 out = self._collect_outputs(
                     submodule_mgmt, lease, raw, inputs, req_info,
@@ -1342,8 +1348,7 @@ class Engine:
                     rows_only=batch.rows_only,
                 )
             finally:
-                if PHASE_PERIOD:
-                    phase_record("engine.collect_outputs", perf_counter() - t0)
+                phase_end("engine.collect_outputs", t0)
                 if self._enable_nvtx:
                     range_pop()
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
@@ -1366,8 +1371,10 @@ class Engine:
                         range_pop()
             return out
         finally:
+            laps.skip()
             if lease is not None:
                 cg_runner.release(lease, real_bs)
+            laps.lap("release")
 
     def _exec_per_request(
         self, batch: ExecutingBatch
@@ -1499,7 +1506,7 @@ class Engine:
             self._maybe_lease_piecewise_regions(batch.node_name, ctx, inputs)
             if nvtx:
                 range_push("engine.declare_step")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 step = submodule.declare_step(
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
@@ -1508,8 +1515,7 @@ class Engine:
                     per_request_info=batch.per_request_info,
                 )
             finally:
-                if PHASE_PERIOD:
-                    phase_record("engine.declare_step", perf_counter() - t0)
+                phase_end("engine.declare_step", t0)
                 if nvtx:
                     range_pop()
         if step is None:
@@ -1522,12 +1528,11 @@ class Engine:
 
         if nvtx:
             range_push("engine.admit")
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        t0 = phase_start()
         try:
             admit_outcome = self._runner.admit(step)
         finally:
-            if PHASE_PERIOD:
-                phase_record("engine.admit", perf_counter() - t0)
+            phase_end("engine.admit", t0)
             if nvtx:
                 range_pop()
 
@@ -1612,19 +1617,19 @@ class Engine:
                     "engine.plan.promoted" if batch.preplan_event is not None
                     else "engine.plan.fresh"
                 )
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 self._runner.plan(step)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(
-                        "engine.plan.promoted" if batch.preplan_event is not None
-                        else "engine.plan.fresh",
-                        perf_counter() - t0,
-                    )
+                phase_end(
+                    "engine.plan.promoted" if batch.preplan_event is not None
+                    else "engine.plan.fresh",
+                    t0,
+                )
                 if nvtx:
                     range_pop()
 
+        laps = PhaseLaps("engine.")
         engine_inputs = ModelInputsFromEngine(
             request_ids=rids,
             per_request_info=req_info,
@@ -1634,19 +1639,21 @@ class Engine:
             # the submodule indexes this by step id, not by real rid
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
+            # `inputs` is padded after the real rows under a lease
+            real_seq_len=sum(inp.input_seq_len for inp in inputs[:len(request_ids)]),
             step=step,
             per_request_input_metadata=batch.per_request_input_metadata,
         )
+        laps.lap("engine_inputs")
         if nvtx:
             range_push("engine.preprocess")
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        t0 = phase_start()
         try:
             preprocessed = submodule.preprocess(
                 ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs,
             )
         finally:
-            if PHASE_PERIOD:
-                phase_record("engine.preprocess", perf_counter() - t0)
+            phase_end("engine.preprocess", t0)
             if nvtx:
                 range_pop()
 
@@ -1660,27 +1667,25 @@ class Engine:
             # the launch/enqueue span, not the GPU work: `synchronize=True`
             # here would drain the stream and destroy the overlap
             range_push("engine.forward")
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        t0 = phase_start()
         try:
             raw = self._forward(
                 batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
                 lease, running_batched, request_ids, release_event,
             )
         finally:
-            if PHASE_PERIOD:
-                phase_record("engine.forward", perf_counter() - t0)
+            phase_end("engine.forward", t0)
             if nvtx:
                 range_pop()
 
         if step is not None:
             if nvtx:
                 range_push("engine.commit")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 self._runner.commit(step)
             finally:
-                if PHASE_PERIOD:
-                    phase_record("engine.commit", perf_counter() - t0)
+                phase_end("engine.commit", t0)
                 if nvtx:
                     range_pop()
         return raw, step
@@ -1736,12 +1741,11 @@ class Engine:
         """
         if self._enable_nvtx:
             range_push("engine.postprocess")
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        t0 = phase_start()
         try:
             self._postprocess_batch(batch, outputs)
         finally:
-            if PHASE_PERIOD:
-                phase_record("engine.postprocess", perf_counter() - t0)
+            phase_end("engine.postprocess", t0)
             if self._enable_nvtx:
                 range_pop()
 
@@ -1798,6 +1802,7 @@ class Engine:
         place those itself.
         """
         outputs = self.exec(batch)
+        laps = PhaseLaps("engine.")
         # A failed admit means no forward ran and every rid's outputs are empty,
         # so the tail has nothing to consume; the worker re-drives the step.
         # A rows-only step has no per-request outputs; only a batch tail runs.
@@ -1814,6 +1819,7 @@ class Engine:
                     )
             for rid in batch.cached_rids:
                 self._runner.complete_cached_walk(rid, batch.node_name, batch.step_context.walk_of(rid))
+        laps.lap("tail")
         return outputs
 
     def check_stop_for_batch(
@@ -2343,6 +2349,7 @@ class Engine:
         cg_runner, lease: SlotLease,
     ) -> bool:
 
+        laps = PhaseLaps("engine.pre_plan.")
         # Declare-only, so the unprepared case takes the bucket's shared
         # template rows rather than cloning a fresh set per pre-plan.
         inputs = (
@@ -2353,7 +2360,8 @@ class Engine:
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
         )
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        laps.lap("pad")
+        t0 = phase_start()
         step = submodule_mgmt.submodule.declare_step(
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,
@@ -2361,8 +2369,7 @@ class Engine:
             slot_lease=lease,
             per_request_info=batch.per_request_info,
         )
-        if PHASE_PERIOD:
-            phase_record("engine.pre_declare", perf_counter() - t0)
+        phase_end("engine.pre_declare", t0)
         if step is None:
             return False
         if batch.inputs is not None or (
@@ -2378,10 +2385,9 @@ class Engine:
         batch.step_context.is_preplan = True
         step.set_ctx(batch.step_context)
         try:
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             admit_outcome = self._runner.pre_admit(step)
-            if PHASE_PERIOD:
-                phase_record("engine.pre_admit", perf_counter() - t0)
+            phase_end("engine.pre_admit", t0)
             if not admit_outcome.ok:
                 # exec re-drives the step and reports the failure from there
                 self.reset_pre_plan_for_batch(batch)
@@ -2389,9 +2395,11 @@ class Engine:
             stream = cg_runner.plan_stream()
             with stream if stream is not None else nullcontext():
                 self._runner.pre_plan(step)
+            laps.skip()
             batch.preplan_event = torch.Event(device=self._device)
             batch.preplan_event.record(stream)
             batch.preplanned_rids = tuple(batch.request_ids)
+            laps.lap("event")
         finally:
             batch.step_context.is_preplan = False
         return True
