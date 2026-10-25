@@ -1480,3 +1480,29 @@ def test_aspectcrop_arm_runs_after_mstar_on_cosmos3_nano_only(tmp_path, monkeypa
                  worktree=wt).mstar_config()
     assert yaml.safe_load(cfg.read_text())["model_kwargs"] == {"accelerator_graph": True,
                                                                 "conditioning_resize": "aspect_crop"}
+    # Its image-to-video requests carry the raw set frames, so it does the crop itself; mstar gets the reference's.
+    nano, i2v = catalog.ROWS["cosmos3_nano"], tables.WORKLOADS["video-i2v"]
+    raw = sweep.SETS_ROOT / "sets" / "video_v1"
+    assert sweep.workload_set_dir(nano, i2v, tmp_path / "ac", "mstar-aspectcrop") == raw
+    assert not (tmp_path / "ac").exists()
+    assert sweep.workload_set_dir(nano, i2v, tmp_path / "m", "mstar") == tmp_path / "m" / "set-video-i2v"
+    sent = []
+
+    def fake_client(cmd, env, log_path, timeout_s=None):
+        sdir = Path(cmd[cmd.index("--sample-set-dir") + 1])
+        sent.append((sdir, json.loads((sdir / "manifest.json").read_text())["items"][0]["files"]["image"]))
+        out = Path(cmd[cmd.index("--output-dir") + 1])
+        (out / "results.json").write_text(json.dumps({"completed": 1, "failed": 0, "per_request": [
+            {"request_id": 0, "jct_ms": 5000.0}]}))
+        return 0, 0.1
+
+    monkeypatch.setattr(sweep, "run_client", fake_client)
+    monkeypatch.setattr(sweep, "cotenants", lambda job: {})
+    plan = type("P", (), {"resume": False, "repeats": 1, "table": tables.TABLES["video"], "log": print})()
+    for name, frames in (("mstar-aspectcrop", raw / "image"), ("mstar", Path(nano.i2v_frames))):
+        sent.clear()
+        arm, arm_dir = catalog.ARMS[name], tmp_path / "run" / name
+        sweep.first_size_requests(plan, arm, nano, i2v, 8640, arm_dir, [5], None, {"height": 480, "width": 832})
+        sweep.run_cell(plan, arm, nano, i2v, 1, 8640, arm_dir, [5])
+        assert Path(sent[0][1]) == (frames / "00.png").resolve()  # the first-size request's frame
+        assert sent[1][0] == (raw if name == "mstar-aspectcrop" else arm_dir / "set-video-i2v")
