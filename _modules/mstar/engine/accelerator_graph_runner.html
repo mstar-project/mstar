@@ -2587,12 +2587,16 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        earlier hands the main thread a GIL the GPU thread still needs. Only</span>
 <span class="sd">        `graph.replay()` below drops it in C++.</span>
 <span class="sd">        """</span>
+        <span class="n">laps</span> <span class="o">=</span> <span class="n">profiler</span><span class="o">.</span><span class="n">PhaseLaps</span><span class="p">(</span><span class="s2">"engine.forward."</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_stage</span><span class="p">(</span><span class="n">lease</span><span class="p">,</span> <span class="n">preprocessed</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">plan_done_event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_graph_backend</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">wait_event</span><span class="p">(</span><span class="n">plan_done_event</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">launch_started_event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">launch_started_event</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_replay</span><span class="p">(</span><span class="n">lease</span><span class="p">)</span></div>
+        <span class="n">laps</span><span class="o">.</span><span class="n">lap</span><span class="p">(</span><span class="s2">"stage"</span><span class="p">)</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_replay</span><span class="p">(</span><span class="n">lease</span><span class="p">)</span>
+        <span class="n">laps</span><span class="o">.</span><span class="n">lap</span><span class="p">(</span><span class="s2">"replay"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">out</span></div>
 
 
 <div class="viewcode-block" id="AcceleratorGraphRunner.release">

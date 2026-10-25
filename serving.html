@@ -1020,6 +1020,17 @@ rendezvouses. Default 512.</p></td>
 (default) or a list of node names (see <code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code>, which
 overrides it).</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
+<td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
+<code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code>,
+<code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code> and
+<code class="docutils literal notranslate"><span class="pre">gc_gen0_threshold</span></code>
+(<code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> or an integer). Each one’s environment variable
+(<code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code> and so on; see
+<a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>) overrides it when set, and an unknown name
+fails at startup. For example <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">{kv_plan_cache:</span> <span class="pre">1,</span>
+<span class="pre">ingraph_decode_rope:</span> <span class="pre">true}</span></code>.</p></td>
+</tr>
 </tbody>
 </table>
 </div>

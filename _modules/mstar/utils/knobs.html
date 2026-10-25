@@ -930,98 +930,185 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.utils.knobs</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""Environment knobs read by more than one package."""</span>
+<span></span><span class="sd">"""Engine knobs read by more than one package.</span>
+
+<span class="sd">Each knob is set per deployment in the serving config's ``knobs:`` block</span>
+<span class="sd">(``configure`` installs it once per worker process, before the engine is</span>
+<span class="sd">built) and can be overridden for a run by its environment variable: a</span>
+<span class="sd">non-empty ``MSTAR_*`` value wins over the config, which wins over the default.</span>
+<span class="sd">"""</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+
+<span class="c1"># config key in the ``knobs:`` block -&gt; the environment variable that overrides it</span>
+<span class="n">KNOBS</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">"device_loopback"</span><span class="p">:</span> <span class="s2">"MSTAR_DEVICE_LOOPBACK"</span><span class="p">,</span>
+    <span class="s2">"sampler_ingraph_scatter"</span><span class="p">:</span> <span class="s2">"MSTAR_SAMPLER_INGRAPH_SCATTER"</span><span class="p">,</span>
+    <span class="s2">"sampler_slots"</span><span class="p">:</span> <span class="s2">"MSTAR_SAMPLER_SLOTS"</span><span class="p">,</span>
+    <span class="s2">"ingraph_decode_rope"</span><span class="p">:</span> <span class="s2">"MSTAR_INGRAPH_DECODE_ROPE"</span><span class="p">,</span>
+    <span class="s2">"kv_chain_lazy_steps"</span><span class="p">:</span> <span class="s2">"MSTAR_KV_CHAIN_LAZY_STEPS"</span><span class="p">,</span>
+    <span class="s2">"kv_plan_cache"</span><span class="p">:</span> <span class="s2">"MSTAR_KV_PLAN_CACHE"</span><span class="p">,</span>
+    <span class="s2">"kv_pinned_indptrs"</span><span class="p">:</span> <span class="s2">"MSTAR_KV_PINNED_INDPTRS"</span><span class="p">,</span>
+    <span class="s2">"gc_gen0_threshold"</span><span class="p">:</span> <span class="s2">"MSTAR_GC_GEN0_THRESHOLD"</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="c1"># this process's ``knobs:`` block, as strings in the env vars' format</span>
+<span class="n">_CONFIGURED</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+
+<div class="viewcode-block" id="check">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.check">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">check</span><span class="p">(</span><span class="n">settings</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``settings`` (a ``knobs:`` block) in the env vars' string format.</span>
+
+<span class="sd">    Raises on a key that names no knob, so a misspelled setting fails at</span>
+<span class="sd">    startup instead of being silently ignored."""</span>
+    <span class="k">if</span> <span class="n">settings</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">{}</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">settings</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"`knobs:` must be a mapping, got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">settings</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="n">unknown</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">settings</span><span class="p">)</span> <span class="o">-</span> <span class="n">KNOBS</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+    <span class="k">if</span> <span class="n">unknown</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"`knobs:` sets </span><span class="si">{</span><span class="n">unknown</span><span class="si">}</span><span class="s2">, which are not knobs; known: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">KNOBS</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+        <span class="p">)</span>
+    <span class="n">out</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">settings</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
+            <span class="n">out</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"1"</span> <span class="k">if</span> <span class="n">value</span> <span class="k">else</span> <span class="s2">"0"</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+            <span class="n">out</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"`knobs: </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">` must be a bool or an integer, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span>
+            <span class="p">)</span>
+    <span class="k">return</span> <span class="n">out</span></div>
+
+
+
+<div class="viewcode-block" id="configure">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.configure">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">configure</span><span class="p">(</span><span class="n">settings</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Install the deployment config's ``knobs:`` block for this process."""</span>
+    <span class="n">checked</span> <span class="o">=</span> <span class="n">check</span><span class="p">(</span><span class="n">settings</span><span class="p">)</span>
+    <span class="n">_CONFIGURED</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+    <span class="n">_CONFIGURED</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">checked</span><span class="p">)</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_setting</span><span class="p">(</span><span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="n">env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">KNOBS</span><span class="p">[</span><span class="n">key</span><span class="p">])</span>
+    <span class="k">if</span> <span class="n">env</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">env</span>
+    <span class="k">return</span> <span class="n">_CONFIGURED</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">default</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="device_loopback_enabled">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.device_loopback_enabled">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">device_loopback_enabled</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_DEVICE_LOOPBACK`` (default 1): whether a node may keep its</span>
-<span class="sd">    loop-back token on the device (the sampler's slot master) instead of</span>
-<span class="sd">    routing a tensor per request; also whether the sampler persists the</span>
-<span class="sd">    last token at all."""</span>
-    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_DEVICE_LOOPBACK"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+<span class="w">    </span><span class="sd">"""``device_loopback`` / ``MSTAR_DEVICE_LOOPBACK`` (default on): whether a</span>
+<span class="sd">    node may keep its loop-back token on the device (the sampler's slot</span>
+<span class="sd">    master) instead of routing a tensor per request; also whether the sampler</span>
+<span class="sd">    persists the last token at all."""</span>
+    <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"device_loopback"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
 
 
 
 <div class="viewcode-block" id="sampler_ingraph_scatter">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.sampler_ingraph_scatter">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">sampler_ingraph_scatter</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_SAMPLER_INGRAPH_SCATTER`` (default 0): the captured sampler</span>
-<span class="sd">    gathers its RNG offsets from the slot masters and scatters the advanced</span>
-<span class="sd">    offsets and the sampled tokens back inside the graph, so a replayed step</span>
-<span class="sd">    issues none of those launches on the gpu thread (each is a GIL release</span>
-<span class="sd">    the main thread's postprocess can win). Padding rows then address a trash</span>
-<span class="sd">    master row, and the masters are allocated once for</span>
-<span class="sd">    ``MSTAR_SAMPLER_SLOTS`` (default 4096) concurrent requests, since a</span>
-<span class="sd">    captured graph holds their addresses."""</span>
-    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_SAMPLER_INGRAPH_SCATTER"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+<span class="w">    </span><span class="sd">"""``sampler_ingraph_scatter`` / ``MSTAR_SAMPLER_INGRAPH_SCATTER`` (default</span>
+<span class="sd">    off): the captured sampler gathers its RNG offsets from the slot masters</span>
+<span class="sd">    and scatters the advanced offsets and the sampled tokens back inside the</span>
+<span class="sd">    graph, so a replayed step issues none of those launches on the gpu thread</span>
+<span class="sd">    (each is a GIL release the main thread's postprocess can win). Padding</span>
+<span class="sd">    rows then address a trash master row, and the masters are allocated once</span>
+<span class="sd">    for ``sampler_slots`` concurrent requests, since a captured graph holds</span>
+<span class="sd">    their addresses."""</span>
+    <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"sampler_ingraph_scatter"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
 
 
 
 <div class="viewcode-block" id="sampler_slots">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.sampler_slots">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">sampler_slots</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_SAMPLER_SLOTS`` (default 4096): master rows allocated up front</span>
-<span class="sd">    when the in-graph scatter is on (see ``sampler_ingraph_scatter``)."""</span>
-    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_SAMPLER_SLOTS"</span><span class="p">,</span> <span class="s2">"4096"</span><span class="p">))</span></div>
-
+<span class="w">    </span><span class="sd">"""``sampler_slots`` / ``MSTAR_SAMPLER_SLOTS`` (default 4096): master rows</span>
+<span class="sd">    allocated up front when the in-graph scatter is on (see</span>
+<span class="sd">    ``sampler_ingraph_scatter``)."""</span>
+    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">_setting</span><span class="p">(</span><span class="s2">"sampler_slots"</span><span class="p">,</span> <span class="s2">"4096"</span><span class="p">))</span></div>
 
 
 
 <div class="viewcode-block" id="ingraph_decode_rope">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.ingraph_decode_rope">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">ingraph_decode_rope</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_INGRAPH_DECODE_ROPE`` (default 0): a captured decode step</span>
-<span class="sd">    builds its rotary tables inside the graph from the position resource's</span>
-<span class="sd">    planned positions instead of staging them before the replay."""</span>
-    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_INGRAPH_DECODE_ROPE"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+<span class="w">    </span><span class="sd">"""``ingraph_decode_rope`` / ``MSTAR_INGRAPH_DECODE_ROPE`` (default off): a</span>
+<span class="sd">    captured decode step builds its rotary tables inside the graph from the</span>
+<span class="sd">    position resource's planned positions instead of staging them before the</span>
+<span class="sd">    replay."""</span>
+    <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"ingraph_decode_rope"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
 
 
 
 <div class="viewcode-block" id="kv_chain_lazy_steps">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.kv_chain_lazy_steps">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">kv_chain_lazy_steps</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_KV_CHAIN_LAZY_STEPS`` (default 16): how many decode steps of</span>
-<span class="sd">    sampled tokens the KV manager batches before extending the requests'</span>
-<span class="sd">    prefix chains, one extend per request per batch instead of one per step</span>
-<span class="sd">    (the per-row Python of that extension was 0.3-0.4 ms a step at 128</span>
-<span class="sd">    rows). A page key then appears up to that many steps late, and a later</span>
-<span class="sd">    commit indexes it, which the single-request path already allows for.</span>
-<span class="sd">    ``1`` (the default) extends every step: 16 measured as noise at c64/c128</span>
-<span class="sd">    on 0.8B (the extension is a small part of the stop check's tail)."""</span>
-    <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_KV_CHAIN_LAZY_STEPS"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)))</span></div>
+<span class="w">    </span><span class="sd">"""``kv_chain_lazy_steps`` / ``MSTAR_KV_CHAIN_LAZY_STEPS`` (default 1): how</span>
+<span class="sd">    many decode steps of sampled tokens the KV manager batches before</span>
+<span class="sd">    extending the requests' prefix chains, one extend per request per batch</span>
+<span class="sd">    instead of one per step (the per-row Python of that extension was</span>
+<span class="sd">    0.3-0.4 ms a step at 128 rows). A page key then appears up to that many</span>
+<span class="sd">    steps late, and a later commit indexes it, which the single-request path</span>
+<span class="sd">    already allows for. ``1`` extends every step: 16 measured as noise at</span>
+<span class="sd">    c64/c128 on 0.8B (the extension is a small part of the stop check's</span>
+<span class="sd">    tail)."""</span>
+    <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">_setting</span><span class="p">(</span><span class="s2">"kv_chain_lazy_steps"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)))</span></div>
 
 
 
 <div class="viewcode-block" id="kv_plan_cache">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.kv_plan_cache">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">kv_plan_cache</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_KV_PLAN_CACHE`` (default 0): the KV manager plans a leased</span>
-<span class="sd">    decode step from the previous step's plan when the batch is the same</span>
-<span class="sd">    rows in the same order and nothing but that step's commit touched the</span>
-<span class="sd">    streams: lengths advance by one, pages change only where a row crossed</span>
-<span class="sd">    a page boundary, and the five index arrays come from numpy instead of a</span>
-<span class="sd">    per-row Python pass. ``0`` (the default until the reworked path is</span>
-<span class="sd">    measured) plans every step from the streams; ``2`` does both and logs any</span>
-<span class="sd">    difference (a correctness check for runs)."""</span>
-    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_KV_PLAN_CACHE"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">))</span></div>
+<span class="w">    </span><span class="sd">"""``kv_plan_cache`` / ``MSTAR_KV_PLAN_CACHE`` (default 0): the KV manager</span>
+<span class="sd">    plans a leased decode step from the previous step's plan when the batch</span>
+<span class="sd">    is the same rows in the same order and nothing but that step's commit</span>
+<span class="sd">    touched the streams: lengths advance by one, pages change only where a</span>
+<span class="sd">    row crossed a page boundary, and the five index arrays come from numpy</span>
+<span class="sd">    instead of a per-row Python pass. ``0`` plans every step from the</span>
+<span class="sd">    streams; ``2`` does both and logs any difference (a correctness check for</span>
+<span class="sd">    runs)."""</span>
+    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">_setting</span><span class="p">(</span><span class="s2">"kv_plan_cache"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">))</span></div>
 
 
 
 <div class="viewcode-block" id="kv_pinned_indptrs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.kv_pinned_indptrs">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">kv_pinned_indptrs</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``MSTAR_KV_PINNED_INDPTRS`` (default 0): the KV plan writes FlashInfer's</span>
-<span class="sd">    index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a</span>
-<span class="sd">    ring of page-locked host buffers, and the decode wrapper copies the</span>
-<span class="sd">    indices straight into its captured device buffer from there. The copies</span>
-<span class="sd">    are then really asynchronous; from pageable memory the driver stages each</span>
-<span class="sd">    one, and FlashInfer makes the indices copy blocking. Off by default: no</span>
-<span class="sd">    measurable gain at c32-c128 on 0.8B. The cost is one CUDA event per plan,</span>
-<span class="sd">    which a buffer set waits on before it is rewritten."""</span>
-    <span class="k">return</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_KV_PINNED_INDPTRS"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+<span class="w">    </span><span class="sd">"""``kv_pinned_indptrs`` / ``MSTAR_KV_PINNED_INDPTRS`` (default off): the</span>
+<span class="sd">    KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,</span>
+<span class="sd">    kv_indices, last_page_len) into a ring of page-locked host buffers, and</span>
+<span class="sd">    the decode wrapper copies the indices straight into its captured device</span>
+<span class="sd">    buffer from there. The copies are then really asynchronous; from pageable</span>
+<span class="sd">    memory the driver stages each one, and FlashInfer makes the indices copy</span>
+<span class="sd">    blocking. Off by default: no measurable gain at c32-c128 on 0.8B. The</span>
+<span class="sd">    cost is one CUDA event per plan, which a buffer set waits on before it is</span>
+<span class="sd">    rewritten."""</span>
+    <span class="k">return</span> <span class="n">_setting</span><span class="p">(</span><span class="s2">"kv_pinned_indptrs"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span></div>
+
+
+
+<div class="viewcode-block" id="gc_gen0_threshold">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.gc_gen0_threshold">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">gc_gen0_threshold</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``gc_gen0_threshold`` / ``MSTAR_GC_GEN0_THRESHOLD`` (default 0, keep</span>
+<span class="sd">    CPython's 700): the generation-0 threshold a worker sets after warmup.</span>
+<span class="sd">    A decode step at 128 rows keeps more than 700 young container objects</span>
+<span class="sd">    alive at its peak, so at 700 a collection runs almost every step and</span>
+<span class="sd">    escalates to a full one (about 10 ms) every few hundred; the time lands</span>
+<span class="sd">    in whichever span is allocating. 50000 removed them on Qwen3.5 0.8B at</span>
+<span class="sd">    c=128 (8% shorter decode step) for at most that many young objects held</span>
+<span class="sd">    between collections."""</span>
+    <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">_setting</span><span class="p">(</span><span class="s2">"gc_gen0_threshold"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)))</span></div>
 
 </pre></div>
 

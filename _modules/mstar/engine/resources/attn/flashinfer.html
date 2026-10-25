@@ -955,6 +955,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVPlanOutputs</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">CombinedSplit</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">StepContext</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">PhaseLaps</span>
 
 
 <div class="viewcode-block" id="FlashInferManager">
@@ -1134,6 +1135,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">plan_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span>
 
         <span class="n">plan_states</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+        <span class="n">laps</span> <span class="o">=</span> <span class="n">PhaseLaps</span><span class="p">(</span><span class="s2">"res.pre_plan.attn."</span> <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="k">else</span> <span class="s2">"res.plan.attn."</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kv_out</span> <span class="ow">in</span> <span class="n">plan_outputs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="n">indptrs</span> <span class="o">=</span> <span class="n">kv_out</span><span class="o">.</span><span class="n">cpu_indptrs</span>
             <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
@@ -1145,13 +1147,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">)</span>
                 <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">is_decode</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
 
+            <span class="n">kwargs</span> <span class="o">=</span> <span class="n">indptrs</span><span class="o">.</span><span class="n">to_kwargs_dict</span><span class="p">()</span>
+            <span class="n">laps</span><span class="o">.</span><span class="n">lap</span><span class="p">(</span><span class="s2">"wrapper"</span><span class="p">)</span>
             <span class="c1"># TODO: cache the latest plan state</span>
             <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
-                <span class="n">causal</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
-                <span class="n">window_left</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_window_left</span><span class="p">,</span>
-                <span class="o">**</span><span class="n">indptrs</span><span class="o">.</span><span class="n">to_kwargs_dict</span><span class="p">()</span>
+                <span class="n">causal</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span> <span class="n">window_left</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_window_left</span><span class="p">,</span>
+                <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
             <span class="p">)</span>
+            <span class="n">laps</span><span class="o">.</span><span class="n">lap</span><span class="p">(</span><span class="s2">"wrapper_plan"</span><span class="p">)</span>
             <span class="n">plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span></div>

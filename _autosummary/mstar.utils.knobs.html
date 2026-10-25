@@ -639,7 +639,10 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.check"><code class="docutils literal notranslate"><span class="pre">check()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.configure"><code class="docutils literal notranslate"><span class="pre">configure()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.device_loopback_enabled"><code class="docutils literal notranslate"><span class="pre">device_loopback_enabled()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.gc_gen0_threshold"><code class="docutils literal notranslate"><span class="pre">gc_gen0_threshold()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.ingraph_decode_rope"><code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.kv_chain_lazy_steps"><code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.kv_pinned_indptrs"><code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs()</span></code></a></li>
@@ -659,41 +662,84 @@
                   
   <section id="module-mstar.utils.knobs">
 <span id="mstar-utils-knobs"></span><h1>mstar.utils.knobs<a class="headerlink" href="#module-mstar.utils.knobs" title="Link to this heading">#</a></h1>
-<p>Environment knobs read by more than one package.</p>
+<p>Engine knobs read by more than one package.</p>
+<p>Each knob is set per deployment in the serving config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span></code> block
+(<code class="docutils literal notranslate"><span class="pre">configure</span></code> installs it once per worker process, before the engine is
+built) and can be overridden for a run by its environment variable: a
+non-empty <code class="docutils literal notranslate"><span class="pre">MSTAR_*</span></code> value wins over the config, which wins over the default.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.check" title="mstar.utils.knobs.check"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check</span></code></a>(settings)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">settings</span></code> (a <code class="docutils literal notranslate"><span class="pre">knobs:</span></code> block) in the env vars' string format.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.configure" title="mstar.utils.knobs.configure"><code class="xref py py-obj docutils literal notranslate"><span class="pre">configure</span></code></a>(settings)</p></td>
+<td><p>Install the deployment config's <code class="docutils literal notranslate"><span class="pre">knobs:</span></code> block for this process.</p></td>
+</tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.device_loopback_enabled" title="mstar.utils.knobs.device_loopback_enabled"><code class="xref py py-obj docutils literal notranslate"><span class="pre">device_loopback_enabled</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code> (default 1): whether a node may keep its loop-back token on the device (the sampler's slot master) instead of routing a tensor per request; also whether the sampler persists the last token at all.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">device_loopback</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code> (default on): whether a node may keep its loop-back token on the device (the sampler's slot master) instead of routing a tensor per request; also whether the sampler persists the last token at all.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.ingraph_decode_rope" title="mstar.utils.knobs.ingraph_decode_rope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code> (default 0): a captured decode step builds its rotary tables inside the graph from the position resource's planned positions instead of staging them before the replay.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.gc_gen0_threshold" title="mstar.utils.knobs.gc_gen0_threshold"><code class="xref py py-obj docutils literal notranslate"><span class="pre">gc_gen0_threshold</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">gc_gen0_threshold</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_GC_GEN0_THRESHOLD</span></code> (default 0, keep CPython's 700): the generation-0 threshold a worker sets after warmup.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.kv_chain_lazy_steps" title="mstar.utils.knobs.kv_chain_lazy_steps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code> (default 16): how many decode steps of sampled tokens the KV manager batches before extending the requests' prefix chains, one extend per request per batch instead of one per step (the per-row Python of that extension was 0.3-0.4 ms a step at 128 rows).</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.ingraph_decode_rope" title="mstar.utils.knobs.ingraph_decode_rope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code> (default off): a captured decode step builds its rotary tables inside the graph from the position resource's planned positions instead of staging them before the replay.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.kv_pinned_indptrs" title="mstar.utils.knobs.kv_pinned_indptrs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code> (default 0): the KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a ring of page-locked host buffers, and the decode wrapper copies the indices straight into its captured device buffer from there.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.kv_chain_lazy_steps" title="mstar.utils.knobs.kv_chain_lazy_steps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code> (default 1): how many decode steps of sampled tokens the KV manager batches before extending the requests' prefix chains, one extend per request per batch instead of one per step (the per-row Python of that extension was 0.3-0.4 ms a step at 128 rows).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.kv_plan_cache" title="mstar.utils.knobs.kv_plan_cache"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_plan_cache</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PLAN_CACHE</span></code> (default 0): the KV manager plans a leased decode step from the previous step's plan when the batch is the same rows in the same order and nothing but that step's commit touched the streams: lengths advance by one, pages change only where a row crossed a page boundary, and the five index arrays come from numpy instead of a per-row Python pass.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.kv_pinned_indptrs" title="mstar.utils.knobs.kv_pinned_indptrs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code> (default off): the KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a ring of page-locked host buffers, and the decode wrapper copies the indices straight into its captured device buffer from there.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_ingraph_scatter" title="mstar.utils.knobs.sampler_ingraph_scatter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> (default 0): the captured sampler gathers its RNG offsets from the slot masters and scatters the advanced offsets and the sampled tokens back inside the graph, so a replayed step issues none of those launches on the gpu thread (each is a GIL release the main thread's postprocess can win).</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.kv_plan_cache" title="mstar.utils.knobs.kv_plan_cache"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv_plan_cache</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PLAN_CACHE</span></code> (default 0): the KV manager plans a leased decode step from the previous step's plan when the batch is the same rows in the same order and nothing but that step's commit touched the streams: lengths advance by one, pages change only where a row crossed a page boundary, and the five index arrays come from numpy instead of a per-row Python pass.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_slots" title="mstar.utils.knobs.sampler_slots"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_slots</span></code></a>()</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): master rows allocated up front when the in-graph scatter is on (see <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>).</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_ingraph_scatter" title="mstar.utils.knobs.sampler_ingraph_scatter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> (default off): the captured sampler gathers its RNG offsets from the slot masters and scatters the advanced offsets and the sampled tokens back inside the graph, so a replayed step issues none of those launches on the gpu thread (each is a GIL release the main thread's postprocess can win).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.knobs.sampler_slots" title="mstar.utils.knobs.sampler_slots"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler_slots</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): master rows allocated up front when the in-graph scatter is on (see <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>).</p></td>
 </tr>
 </tbody>
 </table>
 </div>
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.knobs.check">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">check</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">settings</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#check"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.check" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">settings</span></code> (a <code class="docutils literal notranslate"><span class="pre">knobs:</span></code> block) in the env vars’ string format.</p>
+<p>Raises on a key that names no knob, so a misspelled setting fails at
+startup instead of being silently ignored.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>settings</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.object" title="mstar.api_server.openai.protocol.ModelCard.object"><em>object</em></a><em>] </em><em>| </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.knobs.configure">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">configure</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">settings</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#configure"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.configure" title="Link to this definition">#</a></dt>
+<dd><p>Install the deployment config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span></code> block for this process.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>settings</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.object" title="mstar.api_server.openai.protocol.ModelCard.object"><em>object</em></a><em>] </em><em>| </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.knobs.device_loopback_enabled">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">device_loopback_enabled</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#device_loopback_enabled"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.device_loopback_enabled" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code> (default 1): whether a node may keep its
-loop-back token on the device (the sampler’s slot master) instead of
-routing a tensor per request; also whether the sampler persists the
-last token at all.</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">device_loopback</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code> (default on): whether a
+node may keep its loop-back token on the device (the sampler’s slot
+master) instead of routing a tensor per request; also whether the sampler
+persists the last token at all.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
@@ -702,11 +748,30 @@ last token at all.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.knobs.gc_gen0_threshold">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">gc_gen0_threshold</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#gc_gen0_threshold"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.gc_gen0_threshold" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">gc_gen0_threshold</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_GC_GEN0_THRESHOLD</span></code> (default 0, keep
+CPython’s 700): the generation-0 threshold a worker sets after warmup.
+A decode step at 128 rows keeps more than 700 young container objects
+alive at its peak, so at 700 a collection runs almost every step and
+escalates to a full one (about 10 ms) every few hundred; the time lands
+in whichever span is allocating. 50000 removed them on Qwen3.5 0.8B at
+c=128 (8% shorter decode step) for at most that many young objects held
+between collections.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.knobs.ingraph_decode_rope">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">ingraph_decode_rope</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#ingraph_decode_rope"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.ingraph_decode_rope" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code> (default 0): a captured decode step
-builds its rotary tables inside the graph from the position resource’s
-planned positions instead of staging them before the replay.</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code> (default off): a
+captured decode step builds its rotary tables inside the graph from the
+position resource’s planned positions instead of staging them before the
+replay.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
@@ -717,14 +782,15 @@ planned positions instead of staging them before the replay.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.knobs.kv_chain_lazy_steps">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">kv_chain_lazy_steps</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#kv_chain_lazy_steps"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.kv_chain_lazy_steps" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code> (default 16): how many decode steps of
-sampled tokens the KV manager batches before extending the requests’
-prefix chains, one extend per request per batch instead of one per step
-(the per-row Python of that extension was 0.3-0.4 ms a step at 128
-rows). A page key then appears up to that many steps late, and a later
-commit indexes it, which the single-request path already allows for.
-<code class="docutils literal notranslate"><span class="pre">1</span></code> (the default) extends every step: 16 measured as noise at c64/c128
-on 0.8B (the extension is a small part of the stop check’s tail).</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code> (default 1): how
+many decode steps of sampled tokens the KV manager batches before
+extending the requests’ prefix chains, one extend per request per batch
+instead of one per step (the per-row Python of that extension was
+0.3-0.4 ms a step at 128 rows). A page key then appears up to that many
+steps late, and a later commit indexes it, which the single-request path
+already allows for. <code class="docutils literal notranslate"><span class="pre">1</span></code> extends every step: 16 measured as noise at
+c64/c128 on 0.8B (the extension is a small part of the stop check’s
+tail).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
@@ -735,14 +801,15 @@ on 0.8B (the extension is a small part of the stop check’s tail).</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.knobs.kv_pinned_indptrs">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">kv_pinned_indptrs</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#kv_pinned_indptrs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.kv_pinned_indptrs" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code> (default 0): the KV plan writes FlashInfer’s
-index arrays (qo_indptr, kv_indptr, kv_indices, last_page_len) into a
-ring of page-locked host buffers, and the decode wrapper copies the
-indices straight into its captured device buffer from there. The copies
-are then really asynchronous; from pageable memory the driver stages each
-one, and FlashInfer makes the indices copy blocking. Off by default: no
-measurable gain at c32-c128 on 0.8B. The cost is one CUDA event per plan,
-which a buffer set waits on before it is rewritten.</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code> (default off): the
+KV plan writes FlashInfer’s index arrays (qo_indptr, kv_indptr,
+kv_indices, last_page_len) into a ring of page-locked host buffers, and
+the decode wrapper copies the indices straight into its captured device
+buffer from there. The copies are then really asynchronous; from pageable
+memory the driver stages each one, and FlashInfer makes the indices copy
+blocking. Off by default: no measurable gain at c32-c128 on 0.8B. The
+cost is one CUDA event per plan, which a buffer set waits on before it is
+rewritten.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
@@ -753,14 +820,14 @@ which a buffer set waits on before it is rewritten.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.knobs.kv_plan_cache">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">kv_plan_cache</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#kv_plan_cache"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.kv_plan_cache" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PLAN_CACHE</span></code> (default 0): the KV manager plans a leased
-decode step from the previous step’s plan when the batch is the same
-rows in the same order and nothing but that step’s commit touched the
-streams: lengths advance by one, pages change only where a row crossed
-a page boundary, and the five index arrays come from numpy instead of a
-per-row Python pass. <code class="docutils literal notranslate"><span class="pre">0</span></code> (the default until the reworked path is
-measured) plans every step from the streams; <code class="docutils literal notranslate"><span class="pre">2</span></code> does both and logs any
-difference (a correctness check for runs).</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PLAN_CACHE</span></code> (default 0): the KV manager
+plans a leased decode step from the previous step’s plan when the batch
+is the same rows in the same order and nothing but that step’s commit
+touched the streams: lengths advance by one, pages change only where a
+row crossed a page boundary, and the five index arrays come from numpy
+instead of a per-row Python pass. <code class="docutils literal notranslate"><span class="pre">0</span></code> plans every step from the
+streams; <code class="docutils literal notranslate"><span class="pre">2</span></code> does both and logs any difference (a correctness check for
+runs).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
@@ -771,14 +838,14 @@ difference (a correctness check for runs).</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.knobs.sampler_ingraph_scatter">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">sampler_ingraph_scatter</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#sampler_ingraph_scatter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.sampler_ingraph_scatter" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> (default 0): the captured sampler
-gathers its RNG offsets from the slot masters and scatters the advanced
-offsets and the sampled tokens back inside the graph, so a replayed step
-issues none of those launches on the gpu thread (each is a GIL release
-the main thread’s postprocess can win). Padding rows then address a trash
-master row, and the masters are allocated once for
-<code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096) concurrent requests, since a
-captured graph holds their addresses.</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> (default
+off): the captured sampler gathers its RNG offsets from the slot masters
+and scatters the advanced offsets and the sampled tokens back inside the
+graph, so a replayed step issues none of those launches on the gpu thread
+(each is a GIL release the main thread’s postprocess can win). Padding
+rows then address a trash master row, and the masters are allocated once
+for <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> concurrent requests, since a captured graph holds
+their addresses.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
@@ -789,8 +856,9 @@ captured graph holds their addresses.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.knobs.sampler_slots">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.knobs.</span></span><span class="sig-name descname"><span class="pre">sampler_slots</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/knobs.html#sampler_slots"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.knobs.sampler_slots" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): master rows allocated up front
-when the in-graph scatter is on (see <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>).</p>
+<dd><p><code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (default 4096): master rows
+allocated up front when the in-graph scatter is on (see
+<code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
@@ -847,7 +915,10 @@ when the in-graph scatter is on (see <code class="docutils literal notranslate">
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.check"><code class="docutils literal notranslate"><span class="pre">check()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.configure"><code class="docutils literal notranslate"><span class="pre">configure()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.device_loopback_enabled"><code class="docutils literal notranslate"><span class="pre">device_loopback_enabled()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.gc_gen0_threshold"><code class="docutils literal notranslate"><span class="pre">gc_gen0_threshold()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.ingraph_decode_rope"><code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.kv_chain_lazy_steps"><code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.knobs.kv_pinned_indptrs"><code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs()</span></code></a></li>

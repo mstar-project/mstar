@@ -1237,7 +1237,7 @@ spends 78 ms of wall time on 36 ms of kernels. The default now reaches
 8192; narrow it to save graph memory and capture time, or extend it.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_chain_lazy_steps</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>How many decode steps of sampled ids the KV manager holds back before
 it extends the requests’ prefix chains (the per-page keys the prefix
 cache is indexed by), one extend per request per batch of steps instead
@@ -1250,7 +1250,7 @@ measured as noise at c64/c128 on 0.8B (the extension is a small part
 of the stop check’s tail).</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_pinned_indptrs</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>The KV plan writes FlashInfer’s index arrays (qo_indptr, kv_indptr,
 kv_indices, last_page_len) into a ring of page-locked host buffers and
 the decode wrapper copies the indices straight into its captured
@@ -1260,8 +1260,19 @@ one and FlashInfer makes the indices copy blocking. No measurable gain
 at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
 event per plan, which a buffer set waits on before it is rewritten.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PLAN_CACHE</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_GC_GEN0_THRESHOLD</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">gc_gen0_threshold</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>The generation-0 garbage-collection threshold a worker sets after
+warmup (<code class="docutils literal notranslate"><span class="pre">0</span></code> keeps CPython’s 700). A decode step at 128 rows keeps
+more than 700 young container objects alive at its peak, so at 700 a
+collection runs almost every step and escalates to a full one (about
+10 ms) every few hundred steps; the time lands in whichever span is
+allocating. <code class="docutils literal notranslate"><span class="pre">50000</span></code> removed them on Qwen3.5 0.8B at c=128 (an 8%
+shorter decode step), at the cost of holding at most that many young
+objects between collections. Read by <code class="docutils literal notranslate"><span class="pre">knobs.gc_gen0_threshold</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PLAN_CACHE</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_plan_cache</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>The KV manager plans a captured decode step off the previous step’s
 plan when the batch is the same rows in the same order and nothing
 but that step’s commit touched the streams: every length is one
@@ -1273,8 +1284,8 @@ views); the reworked path keeps the views lazy and is off by default
 until measured. <code class="docutils literal notranslate"><span class="pre">0</span></code> plans every step from the streams. <code class="docutils literal notranslate"><span class="pre">2</span></code> runs
 both and logs a difference, for checking a run.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">device_loopback</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Whether a decode node may keep its loop-back token on the device:
 the sampler writes each request’s last token to a slot-addressed
 master and the next step reads its input ids from it, so the worker
@@ -1287,41 +1298,42 @@ decoder) no longer pays the eager-step master write, a small
 synchronous host-to-device copy per step. <code class="docutils literal notranslate"><span class="pre">0</span></code> keeps every node on
 the per-request tensor path.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">ingraph_decode_rope</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>A captured decode step builds its rotary tables inside the graph from
 the position resource’s planned positions instead of staging them.
 Experiment knob, measured and gated on its own.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_ingraph_scatter</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>The captured sampler gathers its RNG offsets from the slot masters
 and scatters the advanced offsets and the sampled tokens back inside
 the graph, so a replayed decode step issues none of those launches on
 the gpu thread afterwards (each one is a GIL release the main thread’s
 postprocess wins). Padding rows then address a trash master row and
-the masters are allocated once for <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> concurrent
-requests (default 4096, a hard cap with this on). Only with the device
+the masters are allocated once for <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code> (config’s
+<code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_slots</span></code>) concurrent requests (default 4096, a hard
+cap with this on). Only with the device
 loop-back on. An experiment knob; measure before turning it on.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_SEND_TIMING</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_SEND_TIMING</span></code></p></td>
 <td><p>unset</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> makes the Rust runtime print, every 500 calls, how long the
 worker’s per-step send spends in its own work against the whole call
 (which includes taking the GIL back when the send had to release it).
 A diagnostic for the host-overhead work; off by default.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SPEC_PEEK_FOR_FAIRNESS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SPEC_PEEK_FOR_FAIRNESS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Yield the speculation chain only when another (node, walk) is
 actually ready right now; <code class="docutils literal notranslate"><span class="pre">0</span></code> uses the consecutive-step cap alone.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_PHASE_TIMING</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_PHASE_TIMING</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>: every N iterations log per-phase p50/p95/mean of the
 worker main loop (speculate, await_gpu, submit_spec, …).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code>: after every <code class="docutils literal notranslate"><span class="pre">admit</span></code>, <code class="docutils literal notranslate"><span class="pre">commit</span></code>, <code class="docutils literal notranslate"><span class="pre">reset_request</span></code> and
 <code class="docutils literal notranslate"><span class="pre">remove_request</span></code>, check the KV page bookkeeping against the streams

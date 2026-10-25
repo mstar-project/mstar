@@ -13,7 +13,10 @@ mstar.utils.knobs
 
    .. autosummary::
    
+      check
+      configure
       device_loopback_enabled
+      gc_gen0_threshold
       ingraph_decode_rope
       kv_chain_lazy_steps
       kv_pinned_indptrs

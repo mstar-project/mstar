@@ -941,7 +941,6 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">time</span><span class="w"> </span><span class="kn">import</span> <span class="n">perf_counter</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CachedPrefix</span><span class="p">,</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">,</span> <span class="n">Resource</span>
@@ -952,7 +951,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FullAdmitOutcome</span><span class="p">,</span>
     <span class="n">SubmoduleStep</span><span class="p">,</span>
 <span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">PHASE_PERIOD</span><span class="p">,</span> <span class="n">phase_record</span><span class="p">,</span> <span class="n">range_pop</span><span class="p">,</span> <span class="n">range_push</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">phase_end</span><span class="p">,</span> <span class="n">phase_start</span><span class="p">,</span> <span class="n">range_pop</span><span class="p">,</span> <span class="n">range_push</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1431,12 +1430,12 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">continue</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                 <span class="n">range_push</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.admit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-            <span class="n">t0</span> <span class="o">=</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="k">if</span> <span class="n">PHASE_PERIOD</span> <span class="k">else</span> <span class="mf">0.0</span>
+            <span class="n">t0</span> <span class="o">=</span> <span class="n">phase_start</span><span class="p">()</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">outcome</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">admit</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
             <span class="k">finally</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">PHASE_PERIOD</span><span class="p">:</span>
-                    <span class="n">phase_record</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.admit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">t0</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">phase_end</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.admit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">t0</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                     <span class="n">range_pop</span><span class="p">()</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">outcome</span><span class="o">.</span><span class="n">ok</span><span class="p">:</span>
@@ -1483,12 +1482,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                 <span class="n">range_push</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.plan.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-            <span class="n">t0</span> <span class="o">=</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="k">if</span> <span class="n">PHASE_PERIOD</span> <span class="k">else</span> <span class="mf">0.0</span>
+            <span class="n">t0</span> <span class="o">=</span> <span class="n">phase_start</span><span class="p">()</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">results</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
             <span class="k">finally</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">PHASE_PERIOD</span><span class="p">:</span>
-                    <span class="n">phase_record</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.plan.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">t0</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">phase_end</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.plan.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">t0</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                     <span class="n">range_pop</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">results</span></div>
@@ -1509,9 +1508,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                 <span class="n">range_push</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.pre_admit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="n">t0</span> <span class="o">=</span> <span class="n">phase_start</span><span class="p">()</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">outcome</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">admit</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
             <span class="k">finally</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">t0</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">phase_end</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.pre_admit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">t0</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                     <span class="n">range_pop</span><span class="p">()</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">outcome</span><span class="o">.</span><span class="n">ok</span><span class="p">:</span>
@@ -1540,12 +1542,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                 <span class="n">range_push</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.pre_plan.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-            <span class="n">t0</span> <span class="o">=</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="k">if</span> <span class="n">PHASE_PERIOD</span> <span class="k">else</span> <span class="mf">0.0</span>
+            <span class="n">t0</span> <span class="o">=</span> <span class="n">phase_start</span><span class="p">()</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">results</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
             <span class="k">finally</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">PHASE_PERIOD</span><span class="p">:</span>
-                    <span class="n">phase_record</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.pre_plan.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">t0</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">phase_end</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.pre_plan.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">t0</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                     <span class="n">range_pop</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_step_key</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
@@ -1559,12 +1561,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                 <span class="n">range_push</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.commit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-            <span class="n">t0</span> <span class="o">=</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="k">if</span> <span class="n">PHASE_PERIOD</span> <span class="k">else</span> <span class="mf">0.0</span>
+            <span class="n">t0</span> <span class="o">=</span> <span class="n">phase_start</span><span class="p">()</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">commit</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
             <span class="k">finally</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">PHASE_PERIOD</span><span class="p">:</span>
-                    <span class="n">phase_record</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.commit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">t0</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">phase_end</span><span class="p">(</span><span class="sa">f</span><span class="s2">"res.commit.</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">t0</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                     <span class="n">range_pop</span><span class="p">()</span></div>
 

@@ -17,13 +17,21 @@ mstar.utils.profiler
       nvtx_enabled
       nvtx_range
       phase_buffer
+      phase_end
       phase_record
+      phase_start
       range_pop
       range_push
    
    
 
    
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      PhaseLaps
    
    
 
