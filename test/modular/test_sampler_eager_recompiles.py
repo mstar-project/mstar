@@ -40,7 +40,7 @@ class _GraphSampler:
     def __init__(self):
         self.calls: list[tuple] = []
 
-    def sample(self, request_ids, logits, apply_penalty=False):
+    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True):
         self.calls.append((tuple(request_ids), apply_penalty))
         return torch.zeros(len(request_ids), dtype=torch.long)
 
