@@ -40,7 +40,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.canary.config import (
     ATTN,
     CONTEXT_LABEL,
@@ -262,7 +262,7 @@ class CanaryModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """The clip's samples and the decoder prompt. The text ``prompt`` is
         unused: the task comes from ``language`` (the speech's language,
         default English), ``target_language`` (translation; default the
@@ -274,9 +274,26 @@ class CanaryModel(Model):
         if not isinstance(punctuation, bool):
             raise ValueError(f"punctuation must be true or false; got {punctuation!r}")
         prompt_ids = self.config.prompt_ids(source, target, punctuation)
-        return {
+        # the encoder's frames for this clip, as the encoder node counts them
+        context = int(self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH))
+        kv_layout = {
+            KV_CACHE: {"main": LabelLayout(
+                spans=(Span("ids", "prefill", len(prompt_ids), len(prompt_ids), "text_inputs"),),
+                growth=(("decode_loop", 1),),
+            )},
+            CROSS_KV_CACHE: {CONTEXT_LABEL: LabelLayout(
+                spans=(Span("rows", "prefill", context, context, "encoder_states"),),
+            )},
+        }
+        return ProcessPromptOutput({
             "audio": [samples],
             "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
+        }, {"kv_layout": kv_layout})
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {
+            KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))},
+            CROSS_KV_CACHE: {CONTEXT_LABEL: KVLabel()},
         }
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:

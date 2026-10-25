@@ -40,7 +40,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.canary_qwen.config import (
     ATTN,
     DECODE_LOOP,
@@ -286,7 +286,7 @@ class CanaryQwenModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """The clip's samples and the chat prompt. The text ``prompt`` is
         unused: the ASR harnesses send a generic one, which would replace the
         trained instruction. ``instruction`` replaces it on purpose (default
@@ -297,7 +297,18 @@ class CanaryQwenModel(Model):
             raise ValueError(f"instruction must be a string; got {instruction!r}")
         frames = self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH)
         ids = self.prompt_ids(frames, instruction.strip() or DEFAULT_INSTRUCTION)
-        return {"audio": [samples], "text_inputs": [torch.tensor(ids, dtype=torch.long)]}
+        # rows, not ids: the audio placeholders are the same for every clip of a length
+        kv_layout = {KV_CACHE: {"main": LabelLayout(
+            spans=(Span("rows", PREFILL_WALK, len(ids), len(ids), "text_inputs"),),
+            growth=((DECODE_LOOP, 1),),
+        )}}
+        return ProcessPromptOutput(
+            {"audio": [samples], "text_inputs": [torch.tensor(ids, dtype=torch.long)]},
+            {"kv_layout": kv_layout},
+        )
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)

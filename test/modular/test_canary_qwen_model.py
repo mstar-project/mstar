@@ -164,7 +164,11 @@ def test_prompt_ids():
     generic = "Transcribe the speech in this audio clip."
 
     def ids(**kwargs):
-        return model.process_prompt(generic, ["audio", "text"], ["text"], tensors=tensors, **kwargs)["text_inputs"][0]
+        out = model.process_prompt(generic, ["audio", "text"], ["text"], tensors=tensors, **kwargs)
+        # the prompt holds the clip's frames, so it's laid out as rows (never keyed for prefix reuse)
+        span, = out.metadata["kv_layout"]["kv_cache"]["main"].spans
+        assert span.kind == "rows" and span.length == len(out.new_input_tensors["text_inputs"][0])
+        return out.new_input_tensors["text_inputs"][0]
 
     assert ids().tolist() == model.prompt_ids(3)
     assert ids(instruction="Write down what is said:").tolist() == model.prompt_ids(3, "Write down what is said:")

@@ -79,8 +79,13 @@ def test_process_prompt_and_its_limits(snapshot):
     model = CanaryModel(str(snapshot))
     out = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(16_000)]},
                                language="de", target_language="en")
-    assert out["audio"][0].shape == (16_000,)
-    assert out["text_inputs"][0].tolist() == model.config.prompt_ids("de", "en")
+    assert out.new_input_tensors["audio"][0].shape == (16_000,)
+    assert out.new_input_tensors["text_inputs"][0].tolist() == model.config.prompt_ids("de", "en")
+    # the decoder writes the prompt, then a slot per step; the context is the clip's encoder frames
+    layout = out.metadata["kv_layout"]
+    assert set(layout) == set(model.kv_labels()) and all(set(layout[k]) == set(v) for k, v in model.kv_labels().items())
+    assert layout["kv_cache"]["main"].spans[0].length == PROMPT_LENGTH
+    assert layout["cross_kv_cache"]["main"].spans[0].length == model.config.encoder.output_lengths(100)
     # 40.96 s, the largest encoder graph, is the limit
     assert model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(655_360)]})
     for bad in (torch.zeros(655_361), torch.zeros(100)):
