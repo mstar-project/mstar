@@ -1,7 +1,7 @@
 """A StreamBuffer holds its items by handle: each item's tensor stays in the
 store while the buffer or a popped chunk's edge needs it, is released once
 neither does, and a chunk's items are stacked only when the consuming batch is
-built (``Worker._input_tensors``)."""
+built (``StreamBufferManager.input_tensors``)."""
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +13,7 @@ from mstar.graph.base import TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs
 from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
-from mstar.worker.worker import Worker
+from mstar.worker.stream_buffers import StreamBufferManager
 
 EDGE, NODE, RID = "new_token", "snac_decoder", 1
 
@@ -55,12 +55,11 @@ def _bookkeeping(kind):
 
 def _consumer(window, stride, kind="python"):
     tm = _TM(_bookkeeping(kind))
-    w = Worker.__new__(Worker)
-    w.tensor_manager = tm
     buf = StreamBuffer(RID, EDGE, "LLM", SlidingWindowChunkPolicy(window, stride))
-    w.request_state = SimpleNamespace(per_request_info={RID: SimpleNamespace(stream_buffers={EDGE: buf})})
-    w._consumer_node_cache = {EDGE: NODE}
-    return w, tm, buf
+    request_state = SimpleNamespace(per_request_info={RID: SimpleNamespace(stream_buffers={EDGE: buf})})
+    streams = StreamBufferManager(request_state, tm, [])
+    streams.consumer_node = {EDGE: NODE}
+    return streams, tm, buf
 
 
 def _produce(tm, buf, values, first_uuid=100):
@@ -77,12 +76,12 @@ def _produce(tm, buf, values, first_uuid=100):
     return uuids
 
 
-def _consume(w, tm, se):
+def _consume(streams, tm, se):
     """Build the consuming batch's input from the chunk's edge, then release
     the edge's references as the runtime does once the node consumed it."""
     block = ColumnarEdgeSpecs.empty()
     block.add(RID, EDGE, [i.uuid for i in se.edge.tensor_info], se.edge._final_stream_chunk)
-    by_rid = w._input_tensors(block, NODE, [RID]).by_rid
+    by_rid = streams.input_tensors(block, NODE, [RID]).by_rid
     tm.dereference_batch_uniform([i.uuid for i in se.edge.tensor_info])
     return by_rid[RID].get(EDGE)
 
@@ -97,12 +96,12 @@ def _consume(w, tm, se):
 def test_a_sliding_window_keeps_its_overlap_alive_and_frees_everything_once_consumed(
     kind, window, stride, n_items, chunks, flushed,
 ):
-    w, tm, buf = _consumer(window=window, stride=stride, kind=kind)
+    streams, tm, buf = _consumer(window=window, stride=stride, kind=kind)
     uuids = _produce(tm, buf, range(n_items))
     present = tm.tensor_store.check_uuid_presence
     seen = []
-    while (se := w._pop_streaming_edge(buf, EDGE, RID)) is not None:
-        chunk = _consume(w, tm, se)
+    while (se := streams.pop_edge(buf, EDGE, RID)) is not None:
+        chunk = _consume(streams, tm, se)
         seen.append(chunk[0].flatten().tolist())
         # whatever the buffer still holds is still in the store
         assert all(present(u) for u in uuids[buf._consumed:])
@@ -110,10 +109,10 @@ def test_a_sliding_window_keeps_its_overlap_alive_and_frees_everything_once_cons
     # the producer's done flushes what is left: the overlap item, unstacked,
     # or an empty final chunk with no items
     buf.signal_done(len(uuids))
-    se = w._pop_streaming_edge(buf, EDGE, RID)
+    se = streams.pop_edge(buf, EDGE, RID)
     assert se.chunk.is_final
     if flushed:
-        (tensor,) = _consume(w, tm, se)
+        (tensor,) = _consume(streams, tm, se)
         assert tensor.shape == (1,) and tensor.tolist() == flushed
     else:
         assert se.edge.tensor_info == []
@@ -123,18 +122,18 @@ def test_a_sliding_window_keeps_its_overlap_alive_and_frees_everything_once_cons
 def test_whatever_can_ready_a_chunk_marks_the_buffer_for_the_poll():
     """The poll skips a buffer that is not ``maybe_ready``, so a missed
     setter would leave its chunk unread for good."""
-    w, tm, buf = _consumer(window=2, stride=2)
-    w._pop_streaming_edge(buf, EDGE, RID)
+    streams, tm, buf = _consumer(window=2, stride=2)
+    streams.pop_edge(buf, EDGE, RID)
     _produce(tm, buf, [1])
     assert buf.maybe_ready, "an arriving item"
-    w._pop_streaming_edge(buf, EDGE, RID)
+    streams.pop_edge(buf, EDGE, RID)
     _produce(tm, buf, [2], first_uuid=200)
-    se = w._pop_streaming_edge(buf, EDGE, RID)
+    se = streams.pop_edge(buf, EDGE, RID)
     assert se is not None and buf.maybe_ready, "a pop may leave another chunk"
-    w._pop_streaming_edge(buf, EDGE, RID)
+    streams.pop_edge(buf, EDGE, RID)
     buf.store_uningested_edge(se)
     assert buf.maybe_ready, "a refused edge coming back"
-    assert w._pop_streaming_edge(buf, EDGE, RID) is se
-    w._pop_streaming_edge(buf, EDGE, RID)
+    assert streams.pop_edge(buf, EDGE, RID) is se
+    streams.pop_edge(buf, EDGE, RID)
     buf.signal_done(2)
     assert buf.maybe_ready, "the producer's done signal"
