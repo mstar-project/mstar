@@ -194,6 +194,9 @@ class ScheduleTPNode(MessageBody):
     # means every rid runs graph_walk
     walks: list[str] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
+    # rank 0's prefix-cache leases, by wire request id and then resource
+    prefix_hits: dict[str, dict[str, list[int]]] = field(default_factory=dict)
+    page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 @dataclass

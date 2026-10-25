@@ -255,20 +255,23 @@ def test_a_rebuild_keeps_an_image_prompts_spans_and_lays_its_samples_after_them(
     )
 
 
-def test_a_second_rebuild_of_an_image_prompt_counts_its_first_samples_once():
+@pytest.mark.parametrize("first", [2, 0])
+def test_a_second_rebuild_of_an_image_prompt_counts_its_first_samples_once(first):
     kv = _manager()
     _image_prompt(kv)
-    kv.lay_out_again("r", array("i", [*range(5), 100, 101, 102]))
-    _write(kv, "r", 13)  # the rebuild row
+    # ``first`` samples in the KV, then the next decode step's input
+    kv.lay_out_again("r", array("i", [*range(5), *range(100, 101 + first)]))
+    _write(kv, "r", 11 + first)  # the rebuild row
     kv.land_rebuild("r")
     _write(kv, "r", 1)
     _write(kv, "r", 1)
     kv.drop("r")
 
-    spans = kv.lay_out_again("r", array("i", [*range(5), 100, 101, 102, 103, 104]))
+    spans = kv.lay_out_again("r", array("i", [*range(5), *range(100, 103 + first)]))
 
-    assert spans == (*PROMPT[:2], PrefixSpan(6, 6, WALK)), "the first rebuild's samples would count twice"
-    assert kv._overrides["r"].loop_caps["decode_loop"] == 46, "the samples would count twice against the footprint"
+    last = PROMPT[-1].length + first + 2
+    assert spans == (*PROMPT[:2], PrefixSpan(last, last, WALK)), "the first rebuild's samples would count twice"
+    assert kv._overrides["r"].loop_caps["decode_loop"] == 48 - first, "the samples would count twice in the footprint"
 
 
 def test_a_request_dropped_between_rebuild_rows_frees_their_pages_and_is_laid_out_the_same():

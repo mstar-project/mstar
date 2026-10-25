@@ -15,6 +15,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -45,6 +46,8 @@ def _worker(
     w._pending_drains = set(pending_drains)
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
+    w._removed_rids = RecentSet(16)
+    w._unprocessed_messages = {}
     w._pending_removes = {}
     # Identity interning: these tests use the rid string as its own handle, so
     # the string/handle split is exercised without a real runtime.
@@ -194,6 +197,7 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
     )
     tensors.cleanup_collectable = lambda *freed: None
     tensors.increment_ref_batch_uniform = tensors.dereference_batch_uniform = lambda *args: None
+    tensors.drop_host_copies = lambda: None
     # counts each rid's outputs and stores none of them
     tensors.store_and_return_tensor_info_batch = lambda rids, outputs, signals, **kwargs: StoredOutputs(
         flat_uuids=[], flat_rids=[], signal_idxs=[],

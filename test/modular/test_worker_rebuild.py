@@ -264,6 +264,17 @@ def test_each_image_step_keeps_its_own_copy_in_a_mixed_step_and_when_the_cache_s
     assert not w._kept_ids[NODE][A].copies, "a text row would be copied as an image row"
 
 
+def test_a_step_on_a_walk_that_copies_runs_past_a_request_kept_without_copies():
+    w, _ = _worker()
+    # as an unguided Bagel think-mode image generation on the LLM's image_gen walk
+    w._kept_ids[NODE][R] = KeptIds(b"", array("i"))
+    batch = _step((R,), "image_gen", rebuild=A, per_request_input_tensors={R: {"latents": [torch.zeros(2)]}})
+    batch.per_request_info[R].step_metadata = {}
+    w._copied_inputs[("image_gen", NODE)] = {"latents"}
+
+    w._copy_inputs(batch)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     w, _ = _worker()
