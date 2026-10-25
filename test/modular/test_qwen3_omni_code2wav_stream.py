@@ -259,15 +259,23 @@ def test_a_trailing_codec_eos_frame_adds_no_audio_and_no_decode(schedule, num_fr
         assert not flush_decoded and flush_audio.numel() == 0
 
 
+def _boundaries(cfg: Code2WavConfig, count: int) -> list[int]:
+    """The first ``count`` stream lengths that end on a chunk boundary."""
+    out, delivered, sizes = [], 0, _chunk_sizes(cfg)
+    while len(out) < count:
+        delivered += next(sizes)
+        out.append(delivered)
+    return out
+
+
 @pytest.mark.parametrize("schedule", SCHEDULES)
-@pytest.mark.parametrize("num_frames", [4, 12, 25, 28, 50, 53, 125])
-def test_terminal_flush_without_new_frames_skips_the_decode(schedule, num_frames):
+@pytest.mark.parametrize("boundary", range(5))
+def test_terminal_flush_without_new_frames_skips_the_decode(schedule, boundary):
     """A stream that ends on a chunk boundary ends with a flush of the
     retained context frames. It emits nothing, so its batch is keyed off the
     captures and runs no decode."""
     config = _config(schedule)
-    if not _ends_on_boundary(config.code2wav, num_frames):
-        pytest.skip("not a chunk boundary of this schedule")
+    num_frames = _boundaries(config.code2wav, boundary + 1)[-1]
     decoder = _LookaheadDecoder()
     submodule = Code2WavSubmodule(decoder, config)
 
