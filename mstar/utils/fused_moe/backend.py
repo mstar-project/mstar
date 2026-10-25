@@ -51,9 +51,12 @@ class FusedMoEBackend:
         w2: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        skip_invalid: bool = False,
     ) -> torch.Tensor:
         """``(tokens, hidden)`` sum of the ``top_k`` experts' outputs, each
-        scaled by its routing weight."""
+        scaled by its routing weight. With ``skip_invalid``, ``topk_ids`` may
+        hold the id ``E`` (one past the last expert), and those slots add
+        nothing."""
         raise NotImplementedError
 
     def __repr__(self) -> str:
@@ -96,11 +99,11 @@ class TritonFusedMoE(FusedMoEBackend):
             **self._untuned_extras,
         }
 
-    def __call__(self, hidden_states, w1, w2, topk_weights, topk_ids):
+    def __call__(self, hidden_states, w1, w2, topk_weights, topk_ids, skip_invalid=False):
         from mstar.utils.fused_moe.runner import fused_experts
 
         return fused_experts(
-            hidden_states, w1, w2, topk_weights, topk_ids,
+            hidden_states, w1, w2, topk_weights, topk_ids, skip_invalid=skip_invalid,
             config=self.config(hidden_states.shape[0]),
         )
 
