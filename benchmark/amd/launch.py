@@ -91,6 +91,27 @@ def arm_worktree(arm: catalog.Arm, worktree: Path, trees: dict[str, Path]) -> Pa
     return trees.get(arm.tree) if arm.tree else worktree
 
 
+# A server's port is reserved on the node for its life, beside its GPU locks, so concurrent sweeps can't start two
+# servers on one port (a check-then-bind race otherwise). A taken port moves up PORT_STEP at a time.
+PORT_STEP, PORT_TRIES = 1000, 5
+
+
+class PortTakenError(RuntimeError):
+    """The launch's port is reserved by another server on this node, or bound by some other process."""
+
+
+def start_on_free_port(make, port: int, log=print):
+    """Start ``make(port)``'s server, moving to port + PORT_STEP while the port is taken. Returns the launch and
+    its startup record."""
+    for k in range(PORT_TRIES):
+        launch = make(port + k * PORT_STEP)
+        try:
+            return launch, launch.start()
+        except PortTakenError as e:
+            log(f"{launch.name}: {e}, trying port {port + (k + 1) * PORT_STEP}")
+    raise RuntimeError(f"no free port among {port} + k * {PORT_STEP} for k < {PORT_TRIES}")
+
+
 def port_is_free(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -260,8 +281,12 @@ class Launch:
             cmd = [str(CTR_SH), self.arm.image, "python3", "-m", "sglang.launch_server", "--model-path",
                    self.row.hf_id, "--host", "127.0.0.1", "--port", str(self.port), *args]
         elif e == "sglang-diffusion":
+            # Its torch.distributed master and scheduler ports default to fixed numbers that it checks before
+            # binding, so two servers starting together can both pick one. Ports derived from the reserved HTTP
+            # port can't collide.
             cmd = [str(CTR_SH), self.arm.image, "sglang", "serve", "--model-path", self.row.hf_id, "--host",
-                   "127.0.0.1", "--port", str(self.port), *args]
+                   "127.0.0.1", "--port", str(self.port), "--master-port", str(self.port + 21000),
+                   "--scheduler-port", str(self.port + 12000), *args]
         elif e == "sglang-omni":
             cmd = [str(CTR_SH), self.arm.image, "python3", "-m", "sglang_omni.cli", "serve", "--model-path",
                    self.row.hf_id, "--host", "127.0.0.1", "--port", str(self.port),
@@ -304,13 +329,19 @@ class Launch:
     def _lock_path(self, gpu: int) -> Path:
         return LOCK_DIR / f"gpu{gpu}"
 
+    def _lock_paths(self) -> list[Path]:
+        return [self._lock_path(g) for g in self.gpus] + [LOCK_DIR / f"port{self.port}"]
+
+    def _lock_labels(self) -> list[str]:
+        return [f"GPU {g}" for g in self.gpus] + [f"port {self.port}"]
+
     def _take_locks(self) -> None:
-        """One lock file per GPU naming the run that holds it. A lock whose owner is gone is stale."""
+        """One lock file per GPU and one for the port, naming the run that holds them. A lock whose owner is gone
+        is stale."""
         LOCK_DIR.mkdir(parents=True, exist_ok=True)
         taken = []
         try:
-            for g in self.gpus:
-                p = self._lock_path(g)
+            for what, p in zip(self._lock_labels(), self._lock_paths(), strict=True):
                 for _ in range(2):
                     try:
                         fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -320,8 +351,8 @@ class Launch:
                         except (OSError, ValueError):
                             owner = {}
                         if owner.get("pid") and _pid_alive(int(owner["pid"])):
-                            raise RuntimeError(f"GPU {g} is held by {owner.get('name')} "
-                                               f"({owner.get('run_dir')})") from None
+                            held = f"{what} is held by {owner.get('name')} ({owner.get('run_dir')})"
+                            raise (PortTakenError(held) if p.name.startswith("port") else RuntimeError(held)) from None
                         p.unlink(missing_ok=True)
                         continue
                     with os.fdopen(fd, "w") as f:
@@ -329,19 +360,18 @@ class Launch:
                     taken.append(p)
                     break
                 else:
-                    raise RuntimeError(f"could not lock GPU {g}")
+                    raise RuntimeError(f"could not lock {what}")
         except Exception:
             for p in taken:
                 p.unlink(missing_ok=True)
             raise
 
     def _point_locks_at(self, pid: int) -> None:
-        for g in self.gpus:
-            self._lock_path(g).write_text(json.dumps({"pid": pid, "name": self.name, "run_dir": str(self.run_dir)}))
+        for p in self._lock_paths():
+            p.write_text(json.dumps({"pid": pid, "name": self.name, "run_dir": str(self.run_dir)}))
 
     def _release_locks(self) -> None:
-        for g in self.gpus:
-            p = self._lock_path(g)
+        for p in self._lock_paths():
             try:
                 if json.loads(p.read_text()).get("run_dir") == str(self.run_dir):
                     p.unlink()
@@ -352,7 +382,7 @@ class Launch:
         """Refuse a busy port or a GPU with memory in use. VRAM of a server that just exited takes a few
         seconds to come back, so it is waited on for up to ``settle_s``."""
         if not port_is_free(self.port):
-            raise RuntimeError(f"port {self.port} is busy")
+            raise PortTakenError(f"port {self.port} is busy")
         deadline = time.monotonic() + settle_s
         while True:
             occ = gpu_occupancy(self.gpus)

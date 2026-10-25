@@ -47,6 +47,7 @@ from benchmark.amd.launch import (
     gpu_occupancy,
     host_record,
     smi_gpu,
+    start_on_free_port,
     tree_list,
 )
 
@@ -376,10 +377,11 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
     try:
         if arm.engine != "reference":
             tree = arm_worktree(arm, plan.worktree, plan.trees)
-            server = Launch(arm=arm, row=row, gpus=gpus, port=port, run_dir=arm_dir / "server", worktree=tree,
-                            numa_node=numa, lane=lane)
             plan.log(f"{row.name}/{arm.name}: starting on GPUs {gpus} port {port}")
-            info["startup"] = server.start()
+            server, info["startup"] = start_on_free_port(
+                lambda p: Launch(arm=arm, row=row, gpus=gpus, port=p, run_dir=arm_dir / "server", worktree=tree,
+                                 numa_node=numa, lane=lane), port, plan.log)
+            port = info["port"] = server.port
             plan.log(f"{row.name}/{arm.name}: ready in {info['startup']['ready_s']} s, first request "
                      f"{info['startup']['first_request_s']} s")
             if plan.correctness and row.family in ("text", "omni"):
