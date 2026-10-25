@@ -87,6 +87,11 @@ def workload_set_dir(row: Row, wl: tables.Workload, arm_dir: Path) -> Path | Non
     return out
 
 
+# Requests in a row that may fail before a run stops sending (at least the concurrency): a server that answers
+# nothing then costs a few request timeouts instead of every request's.
+ABORT_AFTER_FAILURES = 4
+
+
 def runner_command(arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, out_dir: Path, warmup: int,
                    sets_root: Path = SETS_ROOT, request_kwargs: dict | None = None,
                    set_dir: Path | None = None) -> list[str]:
@@ -94,7 +99,8 @@ def runner_command(arm: Arm, row: Row, wl: tables.Workload, c: int, port: int, o
            "--model", row.runner_model, "--inference-system", client_for(arm, row),
            "--request-type", wl.request_type, "--profiling-type", "closed_loop", "--max-concurrency", str(c),
            "--num-requests", str(wl.num_requests(c)), "--num-warmup", str(warmup), "--output-dir", str(out_dir),
-           "--local-cache", str(out_dir.parent / ".runner-cache")]
+           "--local-cache", str(out_dir.parent / ".runner-cache"),
+           "--abort-after-failures", str(max(ABORT_AFTER_FAILURES, c))]
     if row.runner_model_id:
         cmd += ["--model-id", row.hf_id]
     if wl.prompts.startswith("set:"):
@@ -296,6 +302,7 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
     cell_dir.mkdir(parents=True, exist_ok=True)
     input_seconds = input_seconds_of(row, wl)
     attempts = []
+    all_failed = None
     for attempt in (1, 2):
         reps = []
         for k in range(1, plan.repeats + 1):
@@ -327,6 +334,11 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
             if st.get("failed"):
                 st["error"] = f"{st['failed']} failed requests"
             reps.append(st)
+            if st.get("failed") and not st.get("completed"):
+                # Nothing came back: further repeats would only wait out the same timeouts.
+                errs = res.get("errors") or []
+                all_failed = str(errs[0].get("error"))[:200] if errs else "no request completed"
+                break
         good = [r for r in reps if "error" not in r]
         summary = summarize_repeats(good)
         sp = spread(summary, wl.primary[0])
@@ -349,6 +361,8 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
             "concurrency": c, "num_requests": wl.num_requests(c), "summary": last["summary"],
             "spread": last["spread"], "primary": wl.primary[0], "flags": flags, "errors": errors,
             "attempts": attempts}
+    if all_failed:
+        cell["all_failed"] = all_failed
     done.write_text(json.dumps(cell, indent=1))
     return cell
 
@@ -427,6 +441,9 @@ def run_arm(plan: Plan, row: Row, arm: Arm, gpus: list[int], port: int, lane: st
                              f"{cell['spread'] if cell['spread'] is not None else float('nan'):.1%} "
                              f"{' '.join(cell['flags'])} {'; '.join(cell['errors'])[:200]}")
                     info["cells"].append({k: cell[k] for k in ("workload", "concurrency", "status", "flags")})
+                    if cell.get("all_failed"):
+                        raise RuntimeError(f"every request of {wl.name} at c={c} failed ({cell['all_failed']}); "
+                                           "the arm's other cells were not run")
         info["health"] = hlth.end()
         hlth = None
         info["status"] = "done"
