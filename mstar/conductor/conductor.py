@@ -41,6 +41,7 @@ from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.utils import knobs
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import check_seed
@@ -143,7 +144,9 @@ def keep_bootstrap_sockets_on_loopback() -> None:
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
 
 
-def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> None:
+def _exit_when_orphaned(
+    worker_id: str, parent=None, poll_s: float = 0.5, before_hard_exit=None,
+) -> None:
     """Worker-side watchdog that leaves once the conductor is gone.
 
     So no worker outlives it holding GPU memory. That includes a worker still
@@ -154,8 +157,20 @@ def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> Non
     """
     exit_when_orphaned(
         f"Worker {worker_id}", "conductor", signal.SIGTERM,
-        parent=parent, poll_s=poll_s,
+        parent=parent, poll_s=poll_s, before_hard_exit=before_hard_exit,
     )
+
+
+def _unlink_owned_files(tensor_manager) -> None:
+    """Unlink the files ``tensor_manager`` still owns, if no later launch can
+    be writing the same names: under a launch token it names its own, so this
+    holds even once the conductor is gone. Without one (a Conductor built
+    directly, not under an API server) the names are the endpoint's alone, a
+    restart on the same prefix reuses them, and no check of the conductor
+    covers the unlinks that follow it (#767); the files stay for a later
+    start to sweep or reclaim instead."""
+    if tensor_manager.names_unique_per_launch:
+        tensor_manager.unlink_owned_files()
 
 
 def _run_worker(worker) -> None:
@@ -163,28 +178,28 @@ def _run_worker(worker) -> None:
 
     A stop (the conductor's SIGTERM, a Ctrl-C) leaves the files of requests in
     flight waiting for a TENSOR_RECEIVED or REMOVE_REQUEST that will not come,
-    in a RAM-backed dir. Only while the conductor lives: it holds the
-    deployment's IPC lock and ports until it has joined its workers, so no
-    other deployment can be using these names yet. An orphaned worker leaves
-    them, as a new deployment on the same prefix may already reuse them.
+    in a RAM-backed dir. Then leave with the first stop or error ``run()``
+    ended on.
     """
+    stop = None
     try:
         worker.run()
-    finally:
-        # A Ctrl-C reaches the conductor too, and its SIGTERM lands here within
-        # milliseconds, often already pending. Finish unlinking (it resumes
-        # where it was cut), then leave with that stop.
-        stop = None
-        while True:
-            try:
-                parent = mp.parent_process()
-                if parent is not None and parent.is_alive():
-                    worker.tensor_manager.unlink_owned_files()
-                break
-            except (KeyboardInterrupt, SystemExit) as e:
-                stop = e
-        if stop is not None:
-            raise stop
+    except BaseException as e:
+        stop = e
+    while True:
+        try:
+            # A Ctrl-C reaches the conductor too, and its SIGTERM lands here
+            # within milliseconds, often already pending. One that fires before
+            # these are ignored is caught below, and the unlinks start over
+            # (each file is untracked only once it is gone).
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            _unlink_owned_files(worker.tensor_manager)
+            break
+        except (KeyboardInterrupt, SystemExit) as e:
+            stop = stop or e
+    if stop is not None:
+        raise stop
 
 
 def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
@@ -241,8 +256,10 @@ def _worker_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    built: list = []  # the Worker, once it exists
     threading.Thread(
         target=_exit_when_orphaned, args=(worker_id,), daemon=True, name="parent-watch",
+        kwargs={"before_hard_exit": lambda: [_unlink_owned_files(w.tensor_manager) for w in built]},
     ).start()
 
     from mstar.worker.worker import Worker
@@ -276,6 +293,7 @@ def _worker_process_target(
     except BaseException as e:
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
         raise e
+    built.append(worker)
     _run_worker(worker)
 
 
@@ -434,6 +452,8 @@ class Conductor:
 
         with open(model_config_file, "r") as f:
             self.model_config = yaml.safe_load(f)
+        # fail here, once, rather than in every worker
+        knobs.check(self.model_config.get("knobs"))
         accelerator = torch.accelerator.current_accelerator(check_available=True)
         self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))

@@ -13,7 +13,7 @@ Architecture (3 async partitions):
 
 Streaming topology:
     Thinker --[thinker_states, FixedChunkPolicy(1)]--> Talker
-    Talker  --[codec_tokens,  FixedChunkPolicy(25)]--> Code2Wav
+    Talker  --[codec_tokens,  ScheduledLeftContextChunkPolicy((12, 13), 25, 25)]--> Code2Wav
 
 Conductor-triggered pipelined prefill (Approach C):
     After each Thinker walk completes (prefill_text, prefill_audio,
@@ -65,6 +65,7 @@ from mstar.model.base import (
     Span,
     TensorAndMetadata,
 )
+from mstar.model.components import MoeParallelConfig
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -94,10 +95,24 @@ from mstar.model.qwen3_omni.config import (
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, WeightConverter, drop_stop_tokens
-from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
+from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
+
+# Code2Wav streaming knobs a deployment YAML's ``model_kwargs`` may set; the
+# rest of the Code2Wav config comes from the checkpoint.
+CODE2WAV_SERVING_OVERRIDES = ("codec_chunk_schedule", "codec_chunk_frames", "codec_left_context_frames")
+
+
+def apply_code2wav_serving_overrides(code2wav, model_kwargs: dict) -> None:
+    """Move the Code2Wav streaming knobs out of ``model_kwargs`` into the
+    config, rejecting values that would drop or repeat streamed audio."""
+    for name in CODE2WAV_SERVING_OVERRIDES:
+        if model_kwargs.get(name) is not None:
+            value = model_kwargs.pop(name)
+            setattr(code2wav, name, tuple(value) if isinstance(value, list) else value)
+    code2wav.check_streaming_knobs()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -163,6 +178,7 @@ class Qwen3OmniModel(Model):
         local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
         self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
         self.local_dir = local_dir
+        apply_code2wav_serving_overrides(self.config.code2wav, kwargs)
 
         # Tokenizer (Thinker uses a Qwen-family tokenizer). Qwen3-Omni is native
         # in transformers, so no loader here runs code from the checkpoint repo.
@@ -584,12 +600,17 @@ class Qwen3OmniModel(Model):
                     from_partition="Talker",
                     to_partition="Code2Wav",
                     edge_name="codec_tokens",
-                    chunk_policy_factory=lambda: LeftContextChunkPolicy(
-                        chunk=self.config.code2wav.codec_chunk_frames,
-                        left_context=self.config.code2wav.codec_left_context_frames,
-                    ),
+                    chunk_policy_factory=self._code2wav_chunk_policy,
                 ),
             ],
+        )
+
+    def _code2wav_chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
+        cfg = self.config.code2wav
+        return ScheduledLeftContextChunkPolicy(
+            schedule=cfg.codec_chunk_schedule,
+            chunk=cfg.codec_chunk_frames,
+            left_context=cfg.codec_left_context_frames,
         )
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
@@ -1011,19 +1032,17 @@ class Qwen3OmniModel(Model):
         Same pattern as Orpheus SNAC -- the conductor just tracks whether
         there are more codec tokens to process.
         """
-        chunk_size = self.config.code2wav.codec_chunk_frames
         metadata.graph_walk = "code2wav_chunk"
-        step_metadata = {"consumed_tokens": chunk_size}
 
-        # Don't predict the last chunk from token counts: LeftContextChunkPolicy
-        # emits an extra flush pass for the retained overlap, so a count-based
-        # guess completes the request before that final chunk is emitted. The
-        # `available <= 0` check above fires once consumption actually catches up.
+        # Don't predict the last chunk from token counts: the left-context
+        # policy emits an extra flush pass for the retained overlap, so a
+        # count-based guess completes the request before that final chunk is
+        # emitted. The conductor ends the partition once the worker reports
+        # the pass that consumed the stream's final chunk.
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=[],
             unpersist_tensors=[],
-            step_metadata=step_metadata,
             request_done=False,
         )
 
@@ -1356,8 +1375,11 @@ class Qwen3OmniModel(Model):
         # ``codec_tokens``, ``talker_input_embeds``, ``new_token``) is
         # already replicated by the upstream all-reduce or sampler
         # broadcast before it leaves its producing node.
+        # The Thinker's routed experts can also run EP; the Talker's
+        # shared-expert block has no EP variant.
         return ShardingConfig(
             groups=[], tp_enabled_nodes={"Thinker", "Talker"}, shard_dim={},
+            ep_enabled_nodes={"Thinker"},
         )
 
     # -----------------------------------------------------------------------
@@ -1367,11 +1389,13 @@ class Qwen3OmniModel(Model):
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(
             node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+            moe_parallel=moe_parallel,
         )
         logger.info("Successfully loaded Qwen3-Omni submodule for %s", node_name)
         self._submodule_cache[node_name] = submodule
@@ -1399,10 +1423,12 @@ class Qwen3OmniModel(Model):
     def _create_submodule(
         self, node_name: str, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         if node_name == "Thinker":
             return self._create_thinker_submodule(
                 device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+                moe_parallel=moe_parallel,
             )
         elif node_name == "Talker":
             return self._create_talker_submodule(
@@ -1490,13 +1516,16 @@ class Qwen3OmniModel(Model):
     def _create_thinker_submodule(
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule:
         from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
 
         with torch.device("meta"):
-            thinker_model = Qwen3OmniThinkerModel(self.config, comm_group=tp_group)
+            thinker_model = Qwen3OmniThinkerModel(
+                self.config, comm_group=tp_group, moe_parallel=moe_parallel,
+            )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         if autocast_dtype is not None:

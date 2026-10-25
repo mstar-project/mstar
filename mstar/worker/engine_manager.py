@@ -16,7 +16,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
-from mstar.model.base import Model, keyed_labels
+from mstar.model.base import Model, keyed_labels, node_moe_parallel_configs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -251,14 +251,19 @@ class EngineManager:
         # return — the latter doubles the load-time VRAM peak. The cast below
         # applies the same resolved dtype, so allocation and runtime agree.
         submodules: dict[str, torch.nn.Module] = {}
+        # Checked by the conductor's get_sharding_config before spawn.
+        moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
             # Sequence parallelism is opt-in per node; only forward the SP
             # group when this node actually participates in one, so models
             # that don't support SP keep their existing get_submodule call.
+            # Likewise ``moe_parallel``, only for a node group's ``ep_config``.
             extra = {}
             node_sp_group = parallel_groups.get_sp_config_for_node(name)
             if node_sp_group.world_size > 1:
                 extra["sp_group"] = node_sp_group
+            if name in moe_parallel:
+                extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
                 name, device,
                 tp_group=parallel_groups.get_tp_config_for_node(name),
