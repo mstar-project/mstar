@@ -706,8 +706,6 @@ def filter_top_k_top_p(
       ``L = min(k, n_p)``, ``n_p`` what top-p keeps of the full distribution,
       raised to ``min_keep`` as HF's ``min_tokens_to_keep`` does.
     """
-    import flashinfer
-
     vocab = probs.shape[1]
     k = torch.where(top_k > 0, top_k, vocab).to(torch.int32)
     # one top-p pass for both orders: a top-p-first row's top-k here is the
@@ -723,12 +721,12 @@ def filter_top_k_top_p(
             BLOCK=triton.next_power_of_2(vocab), num_warps=FUSED_FILTER_WARPS,
         )
         return out
-    first = flashinfer.sampling.top_k_renorm_probs(probs, first_k)
+    first = _top_k_renorm_probs(probs, first_k)
     # FlashInfer's top-p expects p in (0, 1); p = 1 removes nothing
-    n = torch.where(top_p >= 1.0, _kept(first), _kept(flashinfer.sampling.top_p_renorm_probs(first, top_p)))
+    n = torch.where(top_p >= 1.0, _kept(first), _kept(_top_p_renorm_probs(first, top_p)))
     if order is not None:
         n = torch.maximum(n, order.min_keep)
-    return flashinfer.sampling.top_k_renorm_probs(probs, torch.minimum(n.to(torch.int32), k))
+    return _top_k_renorm_probs(probs, torch.minimum(n.to(torch.int32), k))
 
 
 def apply_min_tokens_floor(probs: torch.Tensor, rows: HistoryRows) -> torch.Tensor:
@@ -1241,6 +1239,14 @@ def _rocm_sampling(name: str):
     return factory
 
 
+def _rocm_op(name: str):
+    def factory():
+        from mstar.engine.resources.sampler.rocm import sampling_op
+
+        return sampling_op(name)
+    return factory
+
+
 # FlashInfer's rejection samplers, reading one device seed/offset per row.
 # Every platform but ROCm keeps upstream FlashInfer, as before this dispatch.
 _top_p_sampling_from_probs = PlatformDispatch(
@@ -1252,6 +1258,18 @@ _top_k_top_p_sampling_from_probs = PlatformDispatch(
     "top_k_top_p_sampling_from_probs",
     rocm=_rocm_sampling("top_k_top_p_sampling_from_probs"),
     default=_flashinfer_sampling("top_k_top_p_sampling_from_probs"),
+)
+_sampling_from_probs = PlatformDispatch(
+    "sampling_from_probs",
+    rocm=_rocm_sampling("sampling_from_probs"),
+    default=_flashinfer_sampling("sampling_from_probs"),
+)
+# the renorms filter_top_k_top_p uses past the fused kernel's vocabulary
+_top_k_renorm_probs = PlatformDispatch(
+    "top_k_renorm_probs", rocm=_rocm_op("top_k_renorm_probs"), default=_flashinfer_sampling("top_k_renorm_probs"),
+)
+_top_p_renorm_probs = PlatformDispatch(
+    "top_p_renorm_probs", rocm=_rocm_op("top_p_renorm_probs"), default=_flashinfer_sampling("top_p_renorm_probs"),
 )
 
 
@@ -1326,12 +1344,10 @@ def _filter_floor_and_draw(
     order: FilterOrder | None,
 ) -> torch.Tensor:
     """Filter, apply the min-tokens floor, and draw; graph-safe."""
-    import flashinfer
-
     probs = filter_top_k_top_p(probs, top_k, top_p, order)
     if history is not None and history.stop_ids is not None:
         probs = apply_min_tokens_floor(probs, history)
-    return flashinfer.sampling.sampling_from_probs(probs, deterministic=True, seed=seed, offset=offset)
+    return _sampling_from_probs(probs, deterministic=True, seed=seed, offset=offset)
 
 
 def _sample_xpu(
