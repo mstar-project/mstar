@@ -32,6 +32,7 @@ from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import SpeculationPreparer
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch, Worker
 
 WG, WALK, NODE, LOOP, SIG, PART, ME = 0, "decode", "LLM", "decode_loop", "text_inputs", "default", "w0"
@@ -152,12 +153,10 @@ def _worker(
     w._phase_period = 0
     w.enable_prof = False
     w.enable_nvtx = False
-    w._stream_buffer_rids = set()
+    w.streams = StreamBufferManager(w.request_state, tm, [])
     w._pending_removes = {}
     w._pending_drains = {}
     w._draining_rids = set()
-    w._consumer_node_cache = {}
-    w._stream_partition = {}
     w.parallel_nodes = set()
     w.worker_id = ME
     w._rid_str = rt.get_rid_string

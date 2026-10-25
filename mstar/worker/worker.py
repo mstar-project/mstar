@@ -29,12 +29,11 @@ from mstar.communication.tensors import (
     StoredOutputs,
     create_tensor_communication_manager,
 )
-from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
+from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
@@ -57,9 +56,9 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
-from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
+from mstar.model.submodule_base import BatchedModelOutput, HostRows
 from mstar.profile.worker import WorkerProfileInfo
-from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
+from mstar.streaming.stream_buffer import StreamingEdge
 from mstar.streaming.topology import Connection, ProducerWalkCtx
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
@@ -93,14 +92,17 @@ from mstar.utils.profiler import (
     range_push,
 )
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
+from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
     Speculation,
     SpeculationBuilder,
+    SpeculationContext,
     SpeculationPreparer,
 )
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -339,11 +341,6 @@ class Worker:
     computation via engines.
     """
 
-    # Rids that own a stream buffer (a streaming model's chunked inputs).
-    # Empty for a text model, which lets a speculation build skip its three
-    # per-row stream polls; None (a bare instance) means unknown, so poll.
-    _stream_buffer_rids: set[int] | None = None
-
     # Metrics are off unless __init__ gets a status interval; class-level so a
     # worker built without __init__ reads them as off too.
     _metrics: WorkerMetrics | None = None
@@ -405,7 +402,6 @@ class Worker:
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
         self._host_rows_slot = 0
-        self._stream_buffer_rids = set()
 
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
@@ -699,17 +695,11 @@ class Worker:
             conn.edge_name for conn in self._my_consumer_connections
         }
 
-        # Build consumer node cache: edge_name -> consuming node name.
-        self._consumer_node_cache: dict[str, str] = {}
-        if self._my_consumer_connections and model:
-            self._consumer_node_cache = self._build_consumer_node_cache(
-                self._my_consumer_connections, model.get_graph_walk_graphs(),
-            )
-
-        # edge_name -> partition the stream feeds
-        self._stream_partition: dict[str, str] = {
-            conn.edge_name: conn.to_partition for conn in self._my_consumer_connections
-        }
+        self.streams = StreamBufferManager(
+            self.request_state, self.tensor_manager, self._my_consumer_connections,
+            model.get_graph_walk_graphs() if model else None,
+            graph_runtime=self._graph_runtime, walk_driven_edges=self._walk_driven_edges,
+        )
 
         # (graph_walk, node) -> innermost enclosing loop, for ending a
         # stream-terminated loop in _postprocess_batch. Structural, so it is
@@ -760,26 +750,6 @@ class Worker:
                     if not set(loop.section.get_loops()) & enclosing.keys():
                         cache[(walk_name, node_name)] = name
                         break
-        return cache
-
-    @staticmethod
-    def _build_consumer_node_cache(
-        connections, walks: dict[str, GraphSection],
-    ) -> dict[str, str]:
-        """Map each incoming streaming edge to the node that consumes it.
-
-        Recurses through ``get_nodes()`` so a consumer nested inside a
-        ``Loop`` / ``Sequential`` / ``Parallel`` is found too. Matching the
-        walk's top-level ``input_names`` only finds a walk that is itself a
-        single ``GraphNode``; a decode ``Loop`` whose inner node consumes the
-        streamed edge would be missed, and its chunks routed to ``next_node=""``.
-        """
-        cache: dict[str, str] = {}
-        for conn in connections:
-            for section in walks.values():
-                for node in section.get_nodes().values():
-                    if conn.edge_name in node.input_names:
-                        cache[conn.edge_name] = node.name
         return cache
 
     def _get_node_names_for_partition(self, partition_name: str, model: Model) -> list[str]:
@@ -901,29 +871,7 @@ class Worker:
             return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
-        # Create StreamBuffers for consumer connections on this worker. A request
-        # with several partitions here arrives once per partition: keep the
-        # buffer the first arrival made (it may already hold items).
-        req_info = self.request_state.per_request_info[request_id]
-        for conn in self._my_consumer_connections:
-            sbuf = req_info.stream_buffers.get(conn.edge_name)
-            if sbuf is None:
-                sbuf = StreamBuffer(
-                    request_id=request_id,
-                    edge_name=conn.edge_name,
-                    from_partition=conn.from_partition,
-                    policy=conn.chunk_policy_factory(),
-                    walk_tagged=conn.consumer_walk is not None,
-                )
-                req_info.stream_buffers[conn.edge_name] = sbuf
-                consumer = self._consumer_node_cache.get(conn.edge_name, "")
-                req_info.stream_buffers_by_consumer.setdefault(consumer, {})[conn.edge_name] = sbuf
-                if self._stream_buffer_rids is not None:
-                    self._stream_buffer_rids.add(request_id)
-            if conn.to_partition == body.request_info.partition_name:
-                lead = body.request_info.stream_lead_items.get(conn.edge_name)
-                if lead:
-                    sbuf.prime_context(lead)
+        self.streams.add_request(request_id, body.request_info)
 
         # Start RDMA reads for tensors that have tensor_info
         futures = self.tensor_manager.start_read_tensors(
@@ -1060,8 +1008,7 @@ class Worker:
             self.scheduler.lift_batch_caps(freed)
         if self._lockstep_led:
             self._lockstep_unread.pop(request_id, None)
-        if self._stream_buffer_rids:
-            self._stream_buffer_rids.discard(request_id)
+        self.streams.remove_request(request_id)
         self.request_state.remove_request(request_id)
         self.tensor_manager.force_cleanup_request(request_id)
         self.profile_info.pop_request(request_id)
@@ -1370,33 +1317,6 @@ class Worker:
     # Tensor readiness
     # ------------------------------------------------------------------
 
-    def _route_streaming_tensor(self, request_id: int, edge: GraphEdge) -> None:
-        """Route a streaming tensor to its request's StreamBuffer for this edge."""
-        req_info = self.request_state.per_request_info.get(request_id)
-        stream_buf = req_info.stream_buffers[edge.name]
-
-        for info in edge.tensor_info:
-            tensor = self.tensor_manager.get_tensor(info.uuid)
-
-            stream_buf.put(info.uuid, tensor.clone())
-        # After the loop: one crossing for the edge rather than one per tensor.
-        self.tensor_manager.dereference_batch_uniform(
-            [info.uuid for info in edge.tensor_info]
-        )
-
-    def _partition_walk(self, request_id: int, partition: str) -> str | None:
-        req_info = self.request_state.per_request_info.get(request_id)
-        part_info = req_info and req_info.per_partition_info.get(partition)
-        return part_info.current_fwd_info.graph_walk if part_info else None
-
-    def _switch_partition_walk(
-        self, request_id: int, partition: str, walk: str,
-    ) -> None:
-        """Move a producer-triggered partition into ``walk``."""
-        self._graph_runtime.set_walk(request_id, partition, walk)
-        # Nothing of the partition is in flight to still read the old walk
-        self.request_state.get_fwd_info(request_id, partition).graph_walk = walk
-
     def _assign_consumer_walks(self, batch_N: PendingBatch) -> None:
         """Decide the consumer walk of this pass's streamed items, per rid and
         producer-triggered consumer partition, and stamp it on the fwd_info
@@ -1440,157 +1360,11 @@ class Worker:
             ctx.fwd_info = None
             ctx.loop_iters = {}
 
-    def _enter_chunk_walk(
-        self, sbuf: StreamBuffer, edge_name: str, request_id: int,
-        allow_walk_change: bool,
-    ) -> bool:
-        """Put the consumer in the walk the next chunk runs under. False when
-        the chunk has to wait: the partition is mid-pass in its current walk,
-        or the caller cannot change walks (speculation)."""
-        walk = sbuf.peek_walk()
-        if walk is None:
-            return True
-        partition = self._walk_driven_edges[edge_name]
-        if walk == self._partition_walk(request_id, partition):
-            return True
-        if not allow_walk_change or not self._graph_runtime.is_partition_idle(
-            request_id, partition,
-        ):
-            return False
-        self._switch_partition_walk(request_id, partition, walk)
-        return True
-
-    def _pop_streaming_edge(
-        self, sbuf: StreamBuffer, edge_name: str, request_id: int,
-        allow_walk_change: bool = True,
-    ) -> StreamingEdge | None:
-        consumer_node = self._consumer_node_cache.get(edge_name, "")
-        waiting = sbuf.pop_waiting_edge()
-        if waiting is not None:
-            return waiting
-        partition = self._walk_driven_edges.get(edge_name)
-        consumer_walk = (
-            self._partition_walk(request_id, partition) if partition else None
-        )
-        if sbuf.has_chunk_ready(consumer_walk) and self._enter_chunk_walk(
-            sbuf, edge_name, request_id, allow_walk_change,
-        ):
-            chunk = sbuf.pop_chunk()
-            chunk_tensor = chunk.data.get("data")
-            if chunk_tensor is None:
-                # Empty chunk — producer done, no more data.
-                # Create edge with empty tensor_info.
-                synthetic_edge = GraphEdge(
-                    next_node=consumer_node,
-                    name=edge_name,
-                    tensor_info=[],
-                    _final_stream_chunk=chunk.is_final,
-                )
-            else:
-                # Normal chunk — store tensor and create edge with tensor_info.
-                # Local streaming tensors are routed from outputs that were
-                # already gated on the producer completion event before being
-                # stored, so avoid a default-stream sync here. If future
-                # streaming producers bypass that path, StreamChunk should
-                # carry producer events and this call site should wait on
-                # those events before storing with skip_cuda_sync=True.
-                tensor_infos = self.tensor_manager.store_and_return_tensor_info(
-                    request_id, {edge_name: [chunk_tensor]},
-                    skip_cuda_sync=True,
-                )
-                synthetic_edge = GraphEdge(
-                    next_node=consumer_node,
-                    name=edge_name,
-                    tensor_info=tensor_infos.get(edge_name, []),
-                    _final_stream_chunk=chunk.is_final,
-                )
-            return StreamingEdge(synthetic_edge, chunk.info)
-        return None
-
-    def _poll_stream_buffers_for_speculation(
-        self, request_id: int, node_name: str
-    ) -> list[StreamingEdge]:
-        result = []
-        req_info = self.request_state.per_request_info.get(request_id)
-        if req_info is None:
-            return []
-        for edge_name, sbuf in req_info.stream_buffers_by_consumer.get(node_name, {}).items():
-            # The speculated step was built for the current walk
-            edge = self._pop_streaming_edge(
-                sbuf, edge_name, request_id, allow_walk_change=False,
-            )
-            if edge is not None:
-                result.append(edge)
-        return result
-
-    def _return_streaming_edge(
-        self, request_id: int, streaming_edge: StreamingEdge
-    ):
-        """Hand a chunk back to its StreamBuffer after it was refused.
-
-        Both polling paths use it: the plain one above and the speculative
-        prep, which rolls its ingests back per rid.
-        """
-        req_info = self.request_state.per_request_info.get(request_id)
-        if req_info is None:
-            return
-        sbuf = req_info.stream_buffers.get(streaming_edge.edge.name)
-        if sbuf is not None:
-            sbuf.store_uningested_edge(streaming_edge)
-        # The step that took the final chunk will not run; the stream is live again.
-        edge = streaming_edge.edge
-        if edge._final_stream_chunk:
-            req_info.ended_streams.discard(edge.name)
-
-    def _mark_stream_ingested(
-        self, request_id: int, streaming_edge: StreamingEdge
-    ) -> None:
-        """
-        Remember the chunk the graph accepted, for the batch that consumes it.
-        NOTE: a single ingested_chunk field works because streaming edges are
-        ingested with can_buffer=False -- except when speculating a loop-back,
-        where the current value is already in-flight in the forward, so the
-        buffered chunk is the only one a later build can still be describing.
-        """
-        req_info = self.request_state.per_request_info.get(request_id)
-        if req_info is None:
-            return
-        sbuf = req_info.stream_buffers.get(streaming_edge.edge.name)
-        if sbuf is not None:
-            sbuf.ingested_chunk = streaming_edge.chunk
-
-    def _streams_possible(self) -> bool:
-        """False when no live request owns a stream buffer: the per-row stream
-        polls of a speculation build then have nothing to find."""
-        rids = getattr(self, "_stream_buffer_rids", None)
-        return rids is None or bool(rids)
-
-    def _stream_chunks_for(
-        self, request_id: int, node_name: str, inputs: NameToTensorList
-    ) -> dict[str, StreamChunkInfo] | None:
-        """Chunk info for the streamed inputs this step consumes, or None."""
-        req_info = self.request_state.per_request_info.get(request_id)
-        if req_info is None:
-            return None
-        sbufs = req_info.stream_buffers_by_consumer.get(node_name)
-        if not sbufs:
-            return None
-        chunks = {
-            name: sbuf.ingested_chunk for name, sbuf in sbufs.items()
-            if name in inputs and sbuf.ingested_chunk is not None
-        }
-        return chunks or None
-
     def _poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
         # Every ready chunk is popped first and ingested in one call (and one
         # Python <> Rust roundtrip)
-        polled: list[tuple[int, StreamingEdge]] = []
-        for request_id, req_info in list(self.request_state.per_request_info.items()):
-            for edge_name, sbuf in req_info.stream_buffers.items():
-                streaming_edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
-                if streaming_edge is not None:
-                    polled.append((request_id, streaming_edge))
+        polled = self.streams.poll()
         if not polled:
             return
 
@@ -1609,9 +1383,9 @@ class Worker:
         # Indices into the block, which is `polled` order.
         for i, (rid, se) in enumerate(polled):
             if i in refused:
-                self._return_streaming_edge(rid, se)
+                self.streams.return_edge(rid, se)
             else:
-                self._mark_stream_ingested(rid, se)
+                self.streams.mark_ingested(rid, se)
 
 
     # ------------------------------------------------------------------
@@ -1743,7 +1517,7 @@ class Worker:
             if self.enable_nvtx:
                 range_push("check_ready-tensors.route_streaming")
             for edge in streaming:
-                self._route_streaming_tensor(request_id, edge)
+                self.streams.route_tensor(request_id, edge)
 
             if self.enable_nvtx:
                 range_pop(synchronize=False)
@@ -1841,34 +1615,6 @@ class Worker:
     # Batch building
     # ------------------------------------------------------------------
 
-    def _build_input_metadata_and_fwd_info(
-        self, node_name: str,
-        batch_partition: str,
-        per_request_inputs: dict[int, NameToTensorList],
-        increment_loop_rids: list[int] | None = None,
-        increment_loop_name: str | None=None
-    ) -> tuple[dict[str, InputMetadata], dict[str, CurrentForwardPassInfo]]:
-        meta = {}
-        fwd_info = {}
-        streams = self._streams_possible()
-        for rid, inputs in per_request_inputs.items():
-            req_info = self.request_state.get_fwd_info(rid, batch_partition)
-            fwd_info[rid] = req_info
-            stream_chunks = {}
-            if streams and (chunks := self._stream_chunks_for(rid, node_name, inputs)):
-                stream_chunks = chunks
-            meta[rid] = InputMetadata(
-                stream_chunks=stream_chunks,
-                dynamic_loop_iter_counts=req_info.dynamic_loop_iter_counts.copy()
-            )
-
-        if increment_loop_rids is not None and increment_loop_name is not None:
-            for rid in increment_loop_rids:
-                meta[rid].dynamic_loop_iter_counts[increment_loop_name] = \
-                    meta[rid].dynamic_loop_iter_counts.get(increment_loop_name, 0) + 1
-        return meta, fwd_info
-
-
     def _build_executing_batch(self, batch: ScheduledBatch) -> ExecutingBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
         batch_partition = self.request_state.get_partition_for_node(batch.node_name)
@@ -1898,12 +1644,14 @@ class Worker:
             # failed anyway is not asked for forward-pass state as well.
             per_request_inputs.pop(rid, None)
             final_edges.pop(rid, None)
-        per_request_input_metadata, per_request_info = self._build_input_metadata_and_fwd_info(
+        per_request_input_metadata, per_request_info = input_metadata_and_fwd_info(
+            self.request_state, self.streams,
             node_name=batch.node_name, batch_partition=batch_partition,
             per_request_inputs=per_request_inputs,
         )
 
-        node_batch = self._make_executing_batch(
+        node_batch = make_executing_batch(
+            self.streams,
             node_name=batch.node_name,
             graph_walk=batch.graph_walk,
             request_ids=[
@@ -1930,76 +1678,6 @@ class Worker:
                 rid, KeyError(f"input tensor missing for {batch.node_name}"),
             )
         return node_batch
-
-    def _settle_final_streams(
-        self, node_name: str, final_edges: dict[int, set[str]],
-    ) -> tuple[set[int], set[int]]:
-        """Record the streams whose final chunk this step consumes, per rid.
-
-        Returns two sets, ``(node_done, partition_done)``: the rids whose
-        streams into ``node_name`` have all ended once this step runs, and
-        the rids whose streams into the partition have. The second is a
-        subset of the first. Streams end in any order and over several
-        steps, so one final chunk alone means only that its own stream ended. A
-        ``continue_after_producer_done`` stream never sends a final chunk;
-        it holds neither back.
-        """
-        node_done: set[int] = set()
-        partition_done: set[int] = set()
-        for rid, edges in final_edges.items():
-            req_info = self.request_state.per_request_info.get(rid)
-            if req_info is None:
-                node_done.add(rid)
-                partition_done.add(rid)
-                continue
-            req_info.ended_streams |= edges
-            partition = self._stream_partition.get(next(iter(edges)))
-            live = [
-                edge_name for edge_name, sbuf in req_info.stream_buffers.items()
-                if edge_name not in req_info.ended_streams
-                and not sbuf.policy.continue_after_producer_done()
-            ]
-            if all(self._consumer_node_cache.get(e) != node_name for e in live):
-                node_done.add(rid)
-            if all(self._stream_partition.get(e) != partition for e in live):
-                partition_done.add(rid)
-        return node_done, partition_done
-
-    def _make_executing_batch(
-        self,
-        node_name: str,
-        graph_walk: str,
-        request_ids: list[int],
-        per_request_input_tensors: dict[int, NameToTensorList],
-        per_request_info: dict[int, CurrentForwardPassInfo],
-        final_edges: dict[int, set[str]] | None = None,
-        per_request_input_metadata: dict[int, InputMetadata] | None = None,
-        request_walks: dict[int, str] | None = None,
-    ) -> ExecutingBatch:
-        """One step's batch, with the step context the engine drives it through.
-
-        ``final_edges`` maps a rid to the streams whose final chunk the step
-        consumes. The context starts unleased and eager; a slot is reserved
-        later, once the real token count is known.
-        """
-        final_stream_rids, stream_partition_done_rids = self._settle_final_streams(
-            node_name, final_edges or {},
-        )
-        return ExecutingBatch(
-            node_name=node_name,
-            per_request_info=per_request_info,
-            per_request_input_tensors=per_request_input_tensors,
-            final_stream_rids=final_stream_rids,
-            stream_partition_done_rids=stream_partition_done_rids,
-            per_request_input_metadata=per_request_input_metadata or {},
-            step_context=StepContext(
-                request_ids=tuple(request_ids),
-                graph_walk=graph_walk,
-                slot=0,
-                capture=False,
-                request_walks=request_walks or {},
-            ),
-        )
 
     def maybe_send_zmq_to_tp_followers(
         self, node_batch: ExecutingBatch,
@@ -2143,32 +1821,6 @@ class Worker:
                 flat_uuids[idx]
             ).numel()
         return counts
-
-    def _stream_consumption(self, rid: int) -> dict[str, int]:
-        req_info = self.request_state.per_request_info.get(rid)
-        if req_info is None:
-            return {}
-        return {
-            edge_name: sbuf._consumed
-            for edge_name, sbuf in req_info.stream_buffers.items()
-        }
-
-    def _stream_consumption_batch(
-        self, rids: list[int],
-    ) -> list[tuple[int, dict[str, int]]]:
-        """``_stream_consumption`` for the rids that have stream buffers at
-        all; the rest would report an empty dict."""
-        infos = self.request_state.per_request_info
-        out: list[tuple[int, dict[str, int]]] = []
-        for rid in rids:
-            req_info = infos.get(rid)
-            if req_info is None or not req_info.stream_buffers:
-                continue
-            out.append((rid, {
-                edge_name: sbuf._consumed
-                for edge_name, sbuf in req_info.stream_buffers.items()
-            }))
-        return out
 
     def _profiling_payloads(self, rids: list[int]) -> ParallelList:
         """rx/tx/timings for each rid's WORKER_GRAPHS_DONE."""
@@ -2905,7 +2557,7 @@ class Worker:
         )
         for rid, edges in list(give_back):
             for se in edges:
-                self._return_streaming_edge(rid, se)
+                self.streams.return_edge(rid, se)
             speculation.consumed_streaming_edges.pop(rid, None)
         # The kept rids' chunks now belong to the step; nothing is left to undo.
         speculation.spec_id = 0
@@ -3007,7 +2659,7 @@ class Worker:
             [r for r in walk_rids if not self._is_tearing_down(r)]
             if self._teardowns_pending() else walk_rids
         )
-        if not speculating_same_node:
+        if spec_node_name != batch_N.node_name:
             partition = self.request_state.get_partition_for_node(spec_node_name)
             candidates = [
                 r for r in candidates
@@ -3084,12 +2736,20 @@ class Worker:
         return speculation
 
     @cached_property
+    def _spec_context(self) -> SpeculationContext:
+        return SpeculationContext(
+            graph_runtime=self._graph_runtime, tensor_manager=self.tensor_manager,
+            request_state=self.request_state, scheduler=self.scheduler,
+            streams=self.streams,
+        )
+
+    @cached_property
     def _spec_preparer(self) -> SpeculationPreparer:
-        return SpeculationPreparer(self)
+        return SpeculationPreparer(self._spec_context)
 
     @cached_property
     def _spec_builder(self) -> SpeculationBuilder:
-        return SpeculationBuilder(self)
+        return SpeculationBuilder(self._spec_context)
 
     def _thread_outputs_to_speculative(
         self, speculation: Speculation,
@@ -3239,7 +2899,7 @@ class Worker:
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []
         for r in continuing:
-            edges = self._poll_stream_buffers_for_speculation(r, head.node_name)
+            edges = self.streams.poll_for(r, head.node_name)
             polled.extend((r, e) for e in edges)
             per_rid_counts.append(len(edges))
 
@@ -3254,7 +2914,7 @@ class Worker:
 
         def _return_all_polled() -> None:
             for r, se in polled:
-                self._return_streaming_edge(r, se)
+                self.streams.return_edge(r, se)
 
         if popped is None:
             # ``pop_ready_rids`` scans with ``allow_reload=False``: an offloaded
@@ -3297,10 +2957,10 @@ class Worker:
         consumed_streaming_edges: dict[int, list[StreamingEdge]] = {}
         for i, (r, se) in enumerate(polled):
             if i in consumed:
-                self._mark_stream_ingested(r, se)
+                self.streams.mark_ingested(r, se)
                 consumed_streaming_edges.setdefault(r, []).append(se)
             else:
-                self._return_streaming_edge(r, se)
+                self.streams.return_edge(r, se)
 
         # Both seeded with their rid lists, so the `in prep_inputs` test below
         # still separates prepped rids from fresh ones -- a ready rid with no
@@ -4085,7 +3745,7 @@ class Worker:
         # extract on the runtime side. A rid left out gets nothing added,
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
-        consumed = self._stream_consumption_batch(send_rids)
+        consumed = self.streams.consumption_batch(send_rids)
         send_input = SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
