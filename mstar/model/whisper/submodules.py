@@ -800,6 +800,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         """For a word-timestamp request, keep what the align walk needs off a
         prompt walk's host token: the detected language, or the first
         transcript token, which starts the transcript ``_record`` extends."""
+        # Interim: the transcript lives in request state until the decode
+        # loop's outputs reach the align walk directly.
         if not info.step_metadata.get("word_timestamps"):
             return
         state = self.request_state(info.rid_handle)
@@ -812,10 +814,16 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         """Keep a decode step's token for the align walk (the loop no longer
         persists them), if the request has a transcript started. Nothing after
         the step that stopped the loop: a speculative step past it must not
-        extend the transcript."""
+        extend the transcript. Once per step: when the batched stop check
+        raises partway, the engine re-runs it per request, and a step whose
+        token is already in (after the prompt's, one per earlier iteration) is
+        not appended again."""
         state = self.request_state(info.rid_handle)
         decoded = state.get("decoded", None)
-        if decoded is not None and not state.get("stopped", False):
+        if (
+            decoded is not None and not state.get("stopped", False)
+            and len(decoded) == 1 + info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0)
+        ):
             decoded.append(token)
 
     def check_stop_batched(

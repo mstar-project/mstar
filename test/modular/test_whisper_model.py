@@ -630,7 +630,7 @@ def test_engine_stop_check_takes_the_batched_path(request_walks):
         raise AssertionError("fell back to the per-request stop check")
 
     sub.check_stop = per_request
-    sub.request_state(1).add("decoded", [])  # a word-timestamp request's transcript
+    sub.request_state(1).add("decoded", [7])  # a word-timestamp request's transcript, from its prompt walk
     infos = {}
     for handle, rid in enumerate(("eos", "word")):
         infos[rid] = type("I", (), {
@@ -650,7 +650,46 @@ def test_engine_stop_check_takes_the_batched_path(request_walks):
         engine, batch, {}, host_rows=HostRows(("eos", "word"), {"new_token": tokens}),
     )
     assert stops == {"eos": {"decode_loop"}} and not failures
-    assert sub.request_state(1).get("decoded") == [1234]
+    assert sub.request_state(1).get("decoded") == [7, 1234]
+
+
+def test_a_batched_stop_check_that_raises_partway_records_each_token_once():
+    """When the batched stop check raises, the engine re-runs it per request;
+    a row the batched pass already recorded keeps its token once."""
+    from types import SimpleNamespace
+
+    from mstar.engine.engine import Engine
+
+    sub = _decoder_submodule(_tiny_config())
+    infos = {}
+    for handle, (rid, first) in enumerate((("a", 7), ("b", 8))):
+        sub.request_state(handle).add("decoded", [first])
+        infos[rid] = _stop_info(DECODE_WALK, handle)
+
+    class _RaisesOnce(dict):
+        raised = False
+
+        def __getitem__(self, rid):
+            if rid == "b" and not self.raised:
+                self.raised = True
+                raise RuntimeError("lookup failed")
+            return super().__getitem__(rid)
+
+    failures = {}
+    batch = SimpleNamespace(
+        node_name="decoder", request_ids=["a", "b"], per_request_info_wrapped=_RaisesOnce(infos),
+        register_failure=failures.setdefault,
+        step_context=SimpleNamespace(graph_walk=DECODE_WALK, request_walks=None),
+    )
+    engine = SimpleNamespace(_submodules={"decoder": SimpleNamespace(submodule=sub)})
+    tokens = torch.tensor([1234, 99])
+    outputs = {"a": {"new_token": [tokens[:1]]}, "b": {"new_token": [tokens[1:]]}}
+    stops = Engine.check_stop_for_batch(
+        engine, batch, outputs, host_rows=HostRows(("a", "b"), {"new_token": tokens}),
+    )
+    assert batch.per_request_info_wrapped.raised and stops == {} and not failures
+    assert sub.request_state(0).get("decoded") == [7, 1234]
+    assert sub.request_state(1).get("decoded") == [8, 99]
 
 
 # --------------------------------------------------------------------------
