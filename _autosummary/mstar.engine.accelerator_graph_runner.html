@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 24, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -778,6 +778,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.capture_into_graph"><code class="docutils literal notranslate"><span class="pre">capture_into_graph()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs"><code class="docutils literal notranslate"><span class="pre">capture_with_static_outputs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.compile_kwargs"><code class="docutils literal notranslate"><span class="pre">compile_kwargs()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.compile_level"><code class="docutils literal notranslate"><span class="pre">compile_level()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_metadata"><code class="docutils literal notranslate"><span class="pre">dummy_metadata()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_rid_handle"><code class="docutils literal notranslate"><span class="pre">dummy_rid_handle()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_rid_name"><code class="docutils literal notranslate"><span class="pre">dummy_rid_name()</span></code></a></li>
@@ -817,19 +818,22 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.compile_kwargs" title="mstar.engine.accelerator_graph_runner.compile_kwargs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compile_kwargs</span></code></a>(config_mode)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>'s arguments for a capture config whose <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> is <code class="docutils literal notranslate"><span class="pre">config_mode</span></code>, which the config checked when it was built.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_metadata" title="mstar.engine.accelerator_graph_runner.dummy_metadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_metadata</span></code></a>(rids, graph_walk)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.compile_level" title="mstar.engine.accelerator_graph_runner.compile_level"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compile_level</span></code></a>()</p></td>
+<td><p>How much tuning a captured forward's compile does: <code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_LEVEL</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">-O</span></code>), one of <code class="docutils literal notranslate"><span class="pre">COMPILE_LEVELS</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_metadata" title="mstar.engine.accelerator_graph_runner.dummy_metadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_metadata</span></code></a>(rids, graph_walk)</p></td>
 <td><p>Stand-in request info for padding rows, which have no real request.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_rid_handle" title="mstar.engine.accelerator_graph_runner.dummy_rid_handle"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_handle</span></code></a>(name)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_rid_handle" title="mstar.engine.accelerator_graph_runner.dummy_rid_handle"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_handle</span></code></a>(name)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_rid_name" title="mstar.engine.accelerator_graph_runner.dummy_rid_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_name</span></code></a>(handle)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_rid_name" title="mstar.engine.accelerator_graph_runner.dummy_rid_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_name</span></code></a>(handle)</p></td>
 <td><p>The name a padding-row handle was minted from.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.fail_if_graphs_required" title="mstar.engine.accelerator_graph_runner.fail_if_graphs_required"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fail_if_graphs_required</span></code></a>(missing)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.fail_if_graphs_required" title="mstar.engine.accelerator_graph_runner.fail_if_graphs_required"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fail_if_graphs_required</span></code></a>(missing)</p></td>
 <td><p>MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup failure, for deployments that would rather not come up than serve the eager path at 10-20x the latency.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.plan_captures" title="mstar.engine.accelerator_graph_runner.plan_captures"><code class="xref py py-obj docutils literal notranslate"><span class="pre">plan_captures</span></code></a>(pools, free[, reusable])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.plan_captures" title="mstar.engine.accelerator_graph_runner.plan_captures"><code class="xref py py-obj docutils literal notranslate"><span class="pre">plan_captures</span></code></a>(pools, free[, reusable])</p></td>
 <td><p>The cheapest buckets across every pool on a device, added while the largest eager step still fits in <code class="docutils literal notranslate"><span class="pre">free</span></code> beside them.</p></td>
 </tr>
 </tbody>
@@ -2184,13 +2188,26 @@ node runs in between.</p>
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.compile_kwargs">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">compile_kwargs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config_mode</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#compile_kwargs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.compile_kwargs" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’s arguments for a capture config whose <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code>
-is <code class="docutils literal notranslate"><span class="pre">config_mode</span></code>, which the config checked when it was built.</p>
+is <code class="docutils literal notranslate"><span class="pre">config_mode</span></code>, which the config checked when it was built. None takes
+the compile level’s arguments.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>config_mode</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.compile_level">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">compile_level</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#compile_level"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.compile_level" title="Link to this definition">#</a></dt>
+<dd><p>How much tuning a captured forward’s compile does: <code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_LEVEL</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">-O</span></code>), one of <code class="docutils literal notranslate"><span class="pre">COMPILE_LEVELS</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -2470,6 +2487,7 @@ the reuse summed over all buckets, None for no bound.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.capture_into_graph"><code class="docutils literal notranslate"><span class="pre">capture_into_graph()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs"><code class="docutils literal notranslate"><span class="pre">capture_with_static_outputs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.compile_kwargs"><code class="docutils literal notranslate"><span class="pre">compile_kwargs()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.compile_level"><code class="docutils literal notranslate"><span class="pre">compile_level()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_metadata"><code class="docutils literal notranslate"><span class="pre">dummy_metadata()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_rid_handle"><code class="docutils literal notranslate"><span class="pre">dummy_rid_handle()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.dummy_rid_name"><code class="docutils literal notranslate"><span class="pre">dummy_rid_name()</span></code></a></li>
@@ -2508,7 +2526,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 24, 2026.
+  Last updated on Oct 25, 2026.
   <br/>
 </p>
   </div>

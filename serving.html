@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 24, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -707,42 +707,52 @@ and <code class="docutils literal notranslate"><span class="pre">/metrics</span>
 <td><p>all visible</p></td>
 <td><p>Sets <code class="docutils literal notranslate"><span class="pre">CUDA_VISIBLE_DEVICES</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">0</span></code> or <code class="docutils literal notranslate"><span class="pre">0,1,2</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--config</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">-O</span></code>, <code class="docutils literal notranslate"><span class="pre">--compile-level</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_LEVEL</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>How much the captured forwards’ compiles tune at startup. <code class="docutils literal notranslate"><span class="pre">-O0</span></code>: torch.compile’s
+default mode, no tuning. <code class="docutils literal notranslate"><span class="pre">-O1</span></code>: coordinate descent, which fuses the decode GEMMs
+with their epilogues. <code class="docutils literal notranslate"><span class="pre">-O2</span></code>: full max-autotune, which adds the GEMM template
+search. Qwen3.5-0.8B on an H200 with an empty cache started in 170 s / 320 s /
+1,294 s at the same throughput; Qwen3-TTS was 25-30% slower at <code class="docutils literal notranslate"><span class="pre">-O0</span></code> (c=1).
+Use <code class="docutils literal notranslate"><span class="pre">-O2</span></code> for numbers quoted against other engines. Compiles a model runs itself
+(e.g. a diffusion VAE decode) keep their own mode.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--config</span></code></p></td>
 <td><p>model default</p></td>
 <td><p>Override the resolved default config with a path to your own YAML.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--cache-dir</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--cache-dir</span></code></p></td>
 <td><p>HF default</p></td>
 <td><p>HuggingFace weight cache directory.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">SHM</span></code></p></td>
 <td><p>Tensor transport: <code class="docutils literal notranslate"><span class="pre">SHM</span></code> (safe single-node default), <code class="docutils literal notranslate"><span class="pre">TCP</span></code>, or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--socket-path-prefix</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--socket-path-prefix</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_&lt;user&gt;_&lt;port&gt;/</span></code></p></td>
 <td><p>ZMQ IPC socket prefix; one per server, so servers on other ports do
 not share sockets.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--upload-dir</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--upload-dir</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/tmp/mstar_uploads_&lt;user&gt;/</span></code></p></td>
 <td><p>Temp directory for uploaded media.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-level</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">INFO</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">DEBUG</span></code> / <code class="docutils literal notranslate"><span class="pre">INFO</span></code> / <code class="docutils literal notranslate"><span class="pre">WARNING</span></code> / <code class="docutils literal notranslate"><span class="pre">ERROR</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats</span></code></p></td>
 <td><p>off</p></td>
 <td><p>Print a per-request profile when each request finishes (see
 <a class="reference internal" href="#request-profiling"><span class="std std-ref">Request profiling</span></a>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats-file</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--log-stats-file</span></code></p></td>
 <td><p>stdout</p></td>
 <td><p>Append the per-request profiles to this file instead of stdout
 (implies <code class="docutils literal notranslate"><span class="pre">--log-stats</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code></p></td>
 <td><p>off</p></td>
 <td><p>Serve Prometheus metrics at <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> (see <a class="reference internal" href="#serving-metrics"><span class="std std-ref">Metrics</span></a>).
 Needs <code class="docutils literal notranslate"><span class="pre">.[metrics]</span></code>.</p></td>
@@ -1552,7 +1562,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 24, 2026.
+  Last updated on Oct 25, 2026.
   <br/>
 </p>
   </div>

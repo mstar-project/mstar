@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 24, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -937,6 +937,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">NameToTensorList</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AcceleratorGraphConfig</span><span class="p">,</span> <span class="n">BatchedAcceleratorGraphConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">compile_kwargs</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">RingKVStep</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span><span class="p">,</span> <span class="n">NodeSubmodule</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.waypoint.components.dit</span><span class="w"> </span><span class="kn">import</span> <span class="n">WaypointDiT</span>
@@ -998,6 +999,11 @@ window.runMermaid = runMermaid;</script>
         <span class="n">bs</span> <span class="o">*=</span> <span class="mi">2</span>
     <span class="n">sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">step_batch_size</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">sizes</span>
+
+
+<span class="c1"># The prime-walk capture and the decode compile share this mode. max-autotune</span>
+<span class="c1"># until the default compile level (mstar serve -O) is measured on Waypoint.</span>
+<span class="n">_COMPILE_MODE</span> <span class="o">=</span> <span class="s2">"max-autotune-no-cudagraphs"</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_SingleRequestMixin</span><span class="p">:</span>
@@ -1078,16 +1084,11 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">dit</span> <span class="o">=</span> <span class="n">dit</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">taehv</span> <span class="o">=</span> <span class="n">taehv</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
-        <span class="c1"># Matches the engine's own capture options (``compile=True`` -&gt;</span>
-        <span class="c1"># ``torch.compile(mode="max-autotune-no-cudagraphs", fullgraph=False,</span>
-        <span class="c1"># dynamic=False)``) so Inductor picks the same kernels bit-for-bit.</span>
-        <span class="c1"># Wrapping just the decode call keeps the engine from compiling across</span>
-        <span class="c1"># the denoise/decode boundary.</span>
+        <span class="c1"># The prime-walk capture's own arguments, so Inductor picks the same</span>
+        <span class="c1"># kernels bit-for-bit. Wrapping just the decode call keeps the engine</span>
+        <span class="c1"># from compiling across the denoise/decode boundary.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_decode_latent</span> <span class="o">=</span> <span class="p">(</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
-                <span class="n">decode_latent</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"max-autotune-no-cudagraphs"</span><span class="p">,</span>
-                <span class="n">fullgraph</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">dynamic</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-            <span class="p">)</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">decode_latent</span><span class="p">,</span> <span class="o">**</span><span class="n">compile_kwargs</span><span class="p">(</span><span class="n">_COMPILE_MODE</span><span class="p">))</span>
             <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">accelerator_graph</span> <span class="k">else</span> <span class="n">decode_latent</span>
         <span class="p">)</span>
 
@@ -1694,6 +1695,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">ae_dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="n">configs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">BatchedAcceleratorGraphConfig</span><span class="p">(</span>
+                <span class="n">compile_mode</span><span class="o">=</span><span class="n">_COMPILE_MODE</span><span class="p">,</span>
                 <span class="n">capture_graph_walk</span><span class="o">=</span><span class="n">PRIME_WALK</span><span class="p">,</span>
                 <span class="n">single_request_inputs</span><span class="o">=</span><span class="n">NodeInputs</span><span class="p">(</span>
                     <span class="n">tensor_inputs</span><span class="o">=</span><span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="n">image</span><span class="p">},</span>
@@ -1779,7 +1781,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 24, 2026.
+  Last updated on Oct 25, 2026.
   <br/>
 </p>
   </div>

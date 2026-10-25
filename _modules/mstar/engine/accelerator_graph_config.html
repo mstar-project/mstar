@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 24, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -989,8 +989,8 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Must be hashable.</span>
         <span class="n">additional_key_info</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="nb">compile</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span> <span class="c1"># whether to run torch.compile before cuda graph capture</span>
-        <span class="c1"># torch.compile mode for the captured forward; None takes the runner's</span>
-        <span class="c1"># default, max-autotune-no-cudagraphs</span>
+        <span class="c1"># torch.compile mode for the captured forward; None takes the deployment's</span>
+        <span class="c1"># compile level (mstar serve -O), a mode opts the config out of it</span>
         <span class="n">compile_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 
         <span class="c1"># Per-config override for the set of batch sizes to capture</span>
@@ -1297,8 +1297,8 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Whether to torch.compile capture_fn before capture. Default off; the</span>
     <span class="c1"># block loop already benefits from graph capture alone.</span>
     <span class="nb">compile</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="c1"># torch.compile mode for the region; None takes the runner's default,</span>
-    <span class="c1"># max-autotune-no-cudagraphs</span>
+    <span class="c1"># torch.compile mode for the region; None takes the deployment's compile</span>
+    <span class="c1"># level (mstar serve -O), a mode opts the config out of it</span>
     <span class="n">compile_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1465,7 +1465,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 24, 2026.
+  Last updated on Oct 25, 2026.
   <br/>
 </p>
   </div>

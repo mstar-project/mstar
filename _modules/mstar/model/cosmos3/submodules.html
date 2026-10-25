@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 24, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -4299,6 +4299,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">compile_decode</span> <span class="o">=</span> <span class="p">(</span><span class="n">env</span> <span class="o">==</span> <span class="s2">"1"</span><span class="p">)</span> <span class="k">if</span> <span class="n">env</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">compile_reasoner_decode</span><span class="p">)</span>
         <span class="k">return</span> <span class="p">[</span>
             <span class="n">BatchedAcceleratorGraphConfig</span><span class="p">(</span>
+                <span class="c1"># max-autotune until the default compile level (mstar serve -O) is measured on this model</span>
+                <span class="n">compile_mode</span><span class="o">=</span><span class="s2">"max-autotune-no-cudagraphs"</span><span class="p">,</span>
                 <span class="n">capture_graph_walk</span><span class="o">=</span><span class="n">REASONER_DECODE_WALK</span><span class="p">,</span>
                 <span class="n">single_request_inputs</span><span class="o">=</span><span class="n">ARNodeInputs</span><span class="p">(</span>
                     <span class="n">input_ids</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
@@ -4388,7 +4390,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 24, 2026.
+  Last updated on Oct 25, 2026.
   <br/>
 </p>
   </div>

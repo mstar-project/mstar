@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 24, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1908,8 +1908,9 @@ one place. This field replaces the removed <code class="docutils literal notrans
 engine’s eager batch size for the walk. The default is <code class="docutils literal notranslate"><span class="pre">True</span></code>, so the engine never
 batches beyond a captured size.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code> runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> before capture. The default is <code class="docutils literal notranslate"><span class="pre">True</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> is that <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’s mode. The default, <code class="docutils literal notranslate"><span class="pre">None</span></code>, is
-<code class="docutils literal notranslate"><span class="pre">max-autotune-no-cudagraphs</span></code>. <code class="docutils literal notranslate"><span class="pre">default</span></code> keeps Inductor’s fusion but takes cuBLAS for
+<li><p><code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> is that <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’s mode. The default, <code class="docutils literal notranslate"><span class="pre">None</span></code>, takes the
+deployment’s compile level (<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">-O</span></code>, <code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_LEVEL</span></code>); naming a
+mode takes the config out of that level. <code class="docutils literal notranslate"><span class="pre">default</span></code> keeps Inductor’s fusion but takes cuBLAS for
 every GEMM and skips autotuning. Building the config refuses an unknown mode, and one
 that turns on Inductor’s own CUDA graphs (<code class="docutils literal notranslate"><span class="pre">reduce-overhead</span></code>, <code class="docutils literal notranslate"><span class="pre">max-autotune</span></code>), which
 fail inside the runner’s capture.</p></li>
@@ -2891,7 +2892,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 24, 2026.
+  Last updated on Oct 25, 2026.
   <br/>
 </p>
   </div>

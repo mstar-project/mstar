@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 24, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1352,6 +1352,14 @@ label left under its footprint at removal. Tests and debugging only.</p></td>
 <td><p>Dynamo’s recompile limit, clamped to [8, 256]. Raise it if the logs
 show <code class="docutils literal notranslate"><span class="pre">hit</span> <span class="pre">config.recompile_limit</span></code>.</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_LEVEL</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>How much a captured forward’s compile tunes; <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">-O</span></code> sets it
+(read by <a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.compile_level" title="mstar.engine.accelerator_graph_runner.compile_level"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.engine.accelerator_graph_runner.compile_level()</span></code></a>).
+<code class="docutils literal notranslate"><span class="pre">0</span></code>: torch.compile’s default mode. <code class="docutils literal notranslate"><span class="pre">1</span></code>: coordinate descent tuning.
+<code class="docutils literal notranslate"><span class="pre">2</span></code>: <code class="docutils literal notranslate"><span class="pre">max-autotune-no-cudagraphs</span></code>. A capture config that names its
+own <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> keeps it.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -1448,7 +1456,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 24, 2026.
+  Last updated on Oct 25, 2026.
   <br/>
 </p>
   </div>

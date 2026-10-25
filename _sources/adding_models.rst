@@ -1287,8 +1287,9 @@ Both types share the base ``CudaGraphConfig`` fields:
   engine's eager batch size for the walk. The default is ``True``, so the engine never
   batches beyond a captured size.
 - ``compile`` runs ``torch.compile`` before capture. The default is ``True``.
-- ``compile_mode`` is that ``torch.compile``'s mode. The default, ``None``, is
-  ``max-autotune-no-cudagraphs``. ``default`` keeps Inductor's fusion but takes cuBLAS for
+- ``compile_mode`` is that ``torch.compile``'s mode. The default, ``None``, takes the
+  deployment's compile level (``mstar serve -O``, ``MSTAR_COMPILE_LEVEL``); naming a
+  mode takes the config out of that level. ``default`` keeps Inductor's fusion but takes cuBLAS for
   every GEMM and skips autotuning. Building the config refuses an unknown mode, and one
   that turns on Inductor's own CUDA graphs (``reduce-overhead``, ``max-autotune``), which
   fail inside the runner's capture.
