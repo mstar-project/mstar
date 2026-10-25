@@ -23,8 +23,13 @@ V = 32
 class _Masters:
     """Stands in for the slot masters an eager loop-back reads."""
 
+    ingraph_scatter = False
+
     def __init__(self):
         self.read: list[tuple] = []
+
+    def has_slot(self, rid):
+        return False
 
     def register_request(self, rid, sampling_config):
         pass
@@ -40,13 +45,15 @@ class _GraphSampler:
     def __init__(self):
         self.calls: list[tuple] = []
 
-    def sample(self, request_ids, logits, apply_penalty=False):
+    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True):
         self.calls.append((tuple(request_ids), apply_penalty))
         return torch.zeros(len(request_ids), dtype=torch.long)
 
 
 class _GraphBuffers:
     """Stands in for SamplerBuffers on the plan path of a leased step."""
+
+    ingraph_scatter = False
 
     def __init__(self):
         self.sampler = _GraphSampler()
@@ -57,7 +64,7 @@ class _GraphBuffers:
     def gather_static(self, request_ids, padded_bs, cg_slot):
         pass
 
-    def gather_dynamic(self, request_ids, padded_bs, cg_slot, gather_seen_tokens=True):
+    def gather_dynamic(self, request_ids, padded_bs, cg_slot, gather_seen_tokens=True, kept=None):
         pass
 
     def sampler_for(self, padded_bs, cg_slot):
