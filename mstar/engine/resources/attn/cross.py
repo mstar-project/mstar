@@ -15,6 +15,7 @@ from mstar.engine.resources.attn.config import (
     AttentionStep,
     AttnBackend,
     CrossAttentionSpec,
+    refuse_context_only,
 )
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
@@ -157,6 +158,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (

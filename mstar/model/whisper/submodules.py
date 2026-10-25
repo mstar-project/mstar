@@ -60,6 +60,7 @@ from mstar.model.whisper.config import (
     TS_RULES,
     WhisperModelConfig,
 )
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -284,7 +285,20 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         self._begin_suppress_ids: torch.Tensor | None = None
         self._language_mask: torch.Tensor | None = None
         self.timestamp_rules = TimestampRules(config)
+        self._stager = PinnedStager(torch.long)
+        self._inactive: torch.Tensor | None = None
         alignment.warm_up()
+
+    def _inactive_rules(self, device: torch.device) -> torch.Tensor:
+        """The rules-off state, built once: rows are only read (stacked)."""
+        if self._inactive is None or self._inactive.device != device:
+            self._inactive = torch.tensor(inactive_state(), dtype=torch.long, device=device)
+        return self._inactive
+
+    def _decode_raw(self, ids: list[int]) -> str:
+        """Word grouping's decode: no clean-up, which rewrites text across token
+        boundaries (openai-whisper's tiktoken decode has none)."""
+        return self.tokenizer.decode(ids, clean_up_tokenization_spaces=False)
 
     # -- logit rules ------------------------------------------------------
 
@@ -352,7 +366,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                             1, self.config.d_model,
                             dtype=next(self.parameters()).dtype, device=device,
                         ).expand(self.config.max_source_positions, -1),
-                        "ts_rules": torch.tensor(inactive_state(), device=device),
+                        # on the host like a real prefill row's: padding rows
+                        # are stacked with those in `preprocess`
+                        "ts_rules": torch.tensor(inactive_state(), dtype=torch.long),
                     },
                 ),
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -399,20 +415,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             if routed:
                 tensor_inputs["ts_rules"] = routed[0].to(device).reshape(-1)
             else:
-                tensor_inputs["ts_rules"] = torch.tensor(inactive_state(), dtype=torch.long, device=device)
+                tensor_inputs["ts_rules"] = self._inactive_rules(device)
         else:
             state = self.request_state(fwd_info.rid_handle)
-            # The learned position table caps prompt + transcript at
-            # max_target_positions, and check_stop reads this back. Set per
-            # walk rather than added up, the worker runs prepare_inputs again
-            # after an AllocationFailed retry. The prompt walk after language
-            # detection follows the one-token detection prompt.
-            if graph_walk == PREFILL_PROMPT_WALK:
-                state.add("prompt_len", state.get("detect_len", 0) + seq_len)
-            else:
-                state.add("prompt_len", seq_len)
-                if graph_walk == DETECT_LANGUAGE_WALK:
-                    state.add("detect_len", seq_len)
             # The route resolved these from the request's kwargs, which is
             # where they came from in the first place: scanning the prompt
             # tensor for them meant a ``.tolist()`` here, and a D2H on the GPU
@@ -436,7 +441,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             if task is not None:
                 state.add("task", task)
             row = rule_state([], self.config) if timestamps else inactive_state()
-            tensor_inputs["ts_rules"] = torch.tensor(row, dtype=torch.long, device=device)
+            # on the host: ``preprocess`` stages the batch's rows in one copy
+            tensor_inputs["ts_rules"] = torch.tensor(row, dtype=torch.long)
 
         return ARNodeInputs(
             input_seq_len=seq_len,
@@ -490,8 +496,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         weights = self.decoder.cross_attention_weights(input_ids, encoder_states, heads)
         prompt_len = 3  # <|sot|><|lang|><|task|>; the <|notimestamps|> row predicts the first text token
         rows = weights[:, prompt_len:-1]
-        text = input_ids[prompt_len + 1:-1].tolist()
-        words = word_timings(rows, text, self.tokenizer.decode, num_frames)
+        ids = input_ids.tolist()
+        language = self.config.language_of(ids[1])
+        words = word_timings(rows, ids[prompt_len + 1:-1], self._decode_raw, num_frames, language)
         tb, top = self.config.timestamp_begin, self.config.vocab_size - 1
 
         def stamp(seconds: float) -> int:
@@ -585,13 +592,21 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if graph_walk == DECODE_WALK and any(inp.input_ids is None for inp in inputs):
             return self._loopback_inputs(engine_inputs, inputs)
         rows = [self._row_ids(inp) for inp in inputs]
-        preprocessed: dict[str, torch.Tensor | Any] = {
-            "input_ids": torch.cat(rows),
-            "ts_rules": torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs]),
-        }
+        device = rows[0].device
+        rules = torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs])
+        if rules.device != device:
+            # Host values (prefill's rule state) go over in one pinned,
+            # non-blocking copy: a torch.tensor(..., device=) from a list is a
+            # blocking copy that waits out the stream (at prefill, the
+            # encoder's window). Rows already on the device stay as they are.
+            staged = torch.empty(rules.shape, dtype=torch.long, device=device)
+            self._stager.copy_(staged.view(-1), rules.view(-1).numpy())
+            rules = staged
+        preprocessed: dict[str, torch.Tensor | Any] = {"input_ids": torch.cat(rows), "ts_rules": rules}
         if graph_walk != DECODE_WALK:
             # packed prefill: where each request's last token sits
-            preprocessed["row_lens"] = torch.tensor([r.shape[0] for r in rows], dtype=torch.long, device=rows[0].device)
+            preprocessed["row_lens"] = torch.empty(len(rows), dtype=torch.long, device=device)
+            self._stager.copy_(preprocessed["row_lens"], [r.shape[0] for r in rows])
         if graph_walk in ENCODER_WALKS:
             # Fill the context pages this step reserved, here rather than in the
             # forward: the prefill graph is sized by the prompt, not by 1500
@@ -803,11 +818,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         self._record(request_info, token)
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         decoded_tokens = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
-        # prompt + first token + decoded tokens must fit the position table
-        prompt_len = self.request_state(request_info.rid_handle).get("prompt_len", 0)
-        positions_left = self.config.max_target_positions - prompt_len - 1 - decoded_tokens
         if (not ignore_eos and token == self.config.eos_token_id) or \
-                decoded_tokens >= request_info.max_tokens or positions_left <= 0:
+                decoded_tokens >= request_info.max_tokens:
             self.request_state(request_info.rid_handle).add("stopped", True)
             return {DECODE_LOOP}
         return set()
@@ -839,7 +851,6 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if pairs is None:
             return None
         eos = self.config.eos_token_id
-        max_positions = self.config.max_target_positions
         stops: dict[str, set[str]] = {}
         for rid, token in pairs:
             info = request_infos[rid]
@@ -847,11 +858,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 continue  # prefill and language detection never stop the loop
             self._record(info, token)
             decoded_tokens = info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
-            prompt_len = self.request_state(info.rid_handle).get("prompt_len", 0)
             if (
                 (token == eos and not info.resource_configs[SAMPLER].ignore_eos)
                 or decoded_tokens >= info.max_tokens
-                or max_positions - prompt_len - 1 - decoded_tokens <= 0
             ):
                 self.request_state(info.rid_handle).add("stopped", True)
                 stops[rid] = {DECODE_LOOP}

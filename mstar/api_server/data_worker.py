@@ -31,7 +31,7 @@ from mstar.communication.tensors import NameToTensorList, create_tensor_communic
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
+from mstar.model.base import Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -140,8 +140,6 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     }
 
 
-
-
 class PreprocessWorker:
     def __init__(
         self,
@@ -170,9 +168,6 @@ class PreprocessWorker:
         self.stop_event = threading.Event()
         # Wakes the thread's idle wait: every producer below signals it.
         self.wakeup = EventWakeup()
-        # The other direction: signalled when chunks land on output_queue,
-        # which ends the API server's message thread's wait between passes.
-        self.results_wakeup = EventWakeup()
 
         self.per_request_reading_tensors = {}
         # request id -> output name -> chunks received, for received_final_chunks
@@ -211,7 +206,6 @@ class PreprocessWorker:
                 discard_tensor_queue=self.discard_tensor_queue,
                 stop_event=self.stop_event,
                 wakeup=self.wakeup,
-                results_wakeup=self.results_wakeup,
                 communicator=self.communicator,
                 tensor_manager=self.tensor_manager,
                 model=model,
@@ -475,16 +469,15 @@ class PreprocessWorkerThread:
         model_config: dict | None = None,
         enable_nvtx: bool=False,
         wakeup: EventWakeup | None = None,
-        results_wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
     ):
-        # keying a stream needs the deployment's page size as well as the
-        # model's declaration, so a worker built without a config keys no stream
-        declared = model.prefix_key_streams() if model is not None and model_config else {}
+        # keying a label needs the deployment's page size as well as the
+        # model's declaration, so a worker built without a config keys no label
+        declared = keyed_labels(model) if model is not None and model_config else {}
         # resolved as the worker does at load, so both split a prompt into the same pages
         self._prefix_page_sizes = _kv_page_sizes(model, model_config) if declared else {}
-        self._prefix_streams = {
+        self._keyed_labels = {
             key: by_label for key, by_label in declared.items() if key in self._prefix_page_sizes
         }
         self.in_queue = in_queue
@@ -539,7 +532,6 @@ class PreprocessWorkerThread:
         # with a bare communicator).
         self.wakeup = wakeup
         self.idle_wait_ms = 20
-        self.results_wakeup = results_wakeup
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -592,7 +584,7 @@ class PreprocessWorkerThread:
                 input_metadata[key] = []
 
                 for filepath in input.file_paths[modality]:
-                    if self._prefix_streams:
+                    if self._keyed_labels:
                         # Record the file's state before loading it. If the file changes before it
                         # is hashed, its KV would be keyed by bytes we never decoded.
                         file_states.setdefault(modality, []).append(_file_state(filepath))
@@ -628,7 +620,7 @@ class PreprocessWorkerThread:
         # another request's pages and be served that request's KV. Likewise
         # only process_prompt sets the model's INTERNAL_KWARGS.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "prefix_layout", *internal):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", *internal):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
@@ -645,12 +637,18 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
-            layouts = model_kwargs.pop("prefix_layout", {})
+            layouts = model_kwargs.pop("kv_layout", {})
+            rows = {
+                key: {label: layout.row() for label, layout in by_label.items()}
+                for key, by_label in layouts.items()
+            }
+            if rows:
+                model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
             if model_kwargs.get("prefix_cache") is not False:
                 model_kwargs.update(self._prefix_keys(
-                    tensors, layouts, input.file_paths, file_states,
+                    tensors, layouts, rows, input.file_paths, file_states,
                 ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
@@ -731,52 +729,32 @@ class PreprocessWorkerThread:
         )
 
     def _prefix_keys(
-        self, tensors: dict, layouts: dict, file_paths: dict | None,
+        self, tensors: dict, layouts: dict, rows: dict, file_paths: dict | None,
         file_states: dict[str, list[tuple[int, int, int]]],
     ) -> dict:
-        """Key each page of every declared stream, by resource and label.
+        """Key each page of every label's keyed spans, by resource and label.
 
         Returns the kwargs that carry the keys, the prompt tail past the last whole
-        page, each stream's layout as ``[length, advance, walk, digest, end_key]``
-        rows, and the output tensor each stream's sampled ids arrive in. The keys
-        are unrooted.
+        page, and the output tensor each label's sampled ids arrive in. The keys
+        are unrooted. Each keyed span's row in ``rows`` gains its digest and end key.
         """
-        if not self._prefix_streams:
+        if not self._keyed_labels:
             return {}
-        for resource_key, by_label in layouts.items():
-            for label in by_label:
-                if label not in self._prefix_streams.get(resource_key, {}):
-                    raise ValueError(
-                        f"{type(self.model).__name__} returned a prefix_layout for "
-                        f"{resource_key!r}/{label!r}, which it does not declare"
-                    )
         keys: dict[str, dict[str, list[bytes]]] = {}
         tails: dict[str, dict[str, list[int]]] = {}
-        layout_rows: dict[str, dict[str, list[list]]] = {}
         decode: dict[str, dict[str, str]] = {}
-        for resource_key, by_label in self._prefix_streams.items():
+        for resource_key, by_label in self._keyed_labels.items():
             page_size = self._prefix_page_sizes[resource_key]
-            for label, stream in by_label.items():
+            for label, kv_label in by_label.items():
                 layout = layouts.get(resource_key, {}).get(label)
-                if layout is None:
-                    ids = tensors.get(stream.tensor)
-                    if stream.keyed_by != "ids" or not ids:
-                        continue
-                    layout = [Span(
-                        "ids", stream.walk, ids[0].numel(), ids[0].numel(),
-                        stream.tensor,
-                    )]
-                elif not stream.layout_walks:
-                    raise ValueError(
-                        f"{type(self.model).__name__} returned a prefix_layout "
-                        f"for {resource_key!r}/{label!r}, which declares no "
-                        "layout_walks"
-                    )
+                keyed = () if layout is None else layout.spans[:layout.keyed_count()]
+                if not keyed:
+                    continue
                 try:
                     digests = [
                         self._digest(span, file_paths, file_states)
                         if span.kind == "digest" else None
-                        for span in layout
+                        for span in keyed
                     ]
                 except _FileChangedError as changed:
                     logger.warning(
@@ -784,39 +762,37 @@ class PreprocessWorkerThread:
                     )
                     return {"prefix_cache": False}
                 pages, items = self._page_layout(
-                    stream, layout, digests, tensors, page_size,
+                    kv_label.keys, keyed, digests, tensors, page_size,
                 )
                 page_keys = chain(pages, items)
                 keys.setdefault(resource_key, {})[label] = page_keys
-                total = sum(span.length for span in layout)
+                total = sum(span.length for span in keyed)
                 tails.setdefault(resource_key, {})[label] = (
                     pages[-1] if total % page_size else []
                 )
-                rows, at = [], 0
-                for span, digest in zip(layout, digests, strict=True):
+                at = 0
+                span_rows = rows[resource_key][label][0][:len(keyed)]
+                for row, span, digest in zip(span_rows, keyed, digests, strict=True):
                     at += span.length
                     page, end = divmod(at, page_size)
-                    rows.append([span.length, span.advance, span.walk, digest, end_key(
+                    row += [digest, end_key(
                         page_keys[page - 1] if page else b"", pages[page], items.get(page, ()), end,
-                    ) if digest is not None and end else None])
-                layout_rows.setdefault(resource_key, {})[label] = rows
-                if stream.decode_walk is not None:
-                    decode.setdefault(resource_key, {})[label] = stream.tensor
+                    ) if digest is not None and end else None]
+                if kv_label.keys.growth:
+                    decode.setdefault(resource_key, {})[label] = kv_label.keys.tensor
         if not keys:
             return {}
-        kwargs = {
-            "prefix_keys": keys, "prefix_tail": tails, "prefix_layout": layout_rows,
-        }
+        kwargs = {"prefix_keys": keys, "prefix_tail": tails}
         if decode:
             kwargs["prefix_decode"] = decode
         return kwargs
 
     def _page_layout(
-        self, stream: PrefixStream, layout: list[Span],
+        self, prefix_keys: PrefixKeys, layout: tuple[Span, ...],
         digests: list[bytes | None], tensors: dict, page_size: int,
     ) -> tuple[list[list[int]], dict[int, list[PageItem]]]:
         """Check the layout's spans and return each page's ids and items."""
-        walks = {stream.walk, *stream.layout_walks}
+        walks = set(prefix_keys.walks)
         entries: dict[str, int] = {}
         total = sum(span.length for span in layout)
         pages: list[list[int]] = [[] for _ in range(-(-total // page_size))]
@@ -827,12 +803,7 @@ class PreprocessWorkerThread:
             if span.walk not in walks:
                 raise ValueError(
                     f"a {span.kind} span names walk {span.walk!r}, which the "
-                    f"stream does not declare; it declares {sorted(walks)}"
-                )
-            if not (isinstance(span.length, int) and isinstance(span.advance, int)):
-                raise ValueError(
-                    f"a {span.kind} span's length and advance are "
-                    f"{type(span.length).__name__} and {type(span.advance).__name__}"
+                    f"label's keys do not name; they name {sorted(walks)}"
                 )
             touched = range(at // page_size, -(-(at + span.length) // page_size))
             if span.kind == "ids":
@@ -1390,10 +1361,6 @@ class PreprocessWorkerThread:
             transfers = getattr(self.tensor_manager, "transfer_stats", None)
             if transfers is not None:
                 self._publish_transfers(transfers)
-            # getattr: teardown tests build a thread without its constructor
-            results_wakeup = getattr(self, "results_wakeup", None)
-            if results_wakeup is not None and not self.out_queue.empty():
-                results_wakeup.signal()
             if not did_work:
                 idle_wait()
 

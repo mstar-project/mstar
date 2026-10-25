@@ -44,6 +44,7 @@ from mstar.model.whisper.config import (  # noqa: E402
 )
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule, WhisperEncoderSubmodule  # noqa: E402
 from mstar.model.whisper.whisper_model import WhisperDetokenizer, WhisperModel  # noqa: E402
+from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -79,8 +80,8 @@ class _FakeTokenizer:
     def convert_tokens_to_ids(self, token):
         return {name: i for i, name in self._names.items()}[token]
 
-    def decode(self, ids, skip_special_tokens=False):
-        del skip_special_tokens
+    def decode(self, ids, skip_special_tokens=False, clean_up_tokenization_spaces=None):
+        del skip_special_tokens, clean_up_tokenization_spaces
         return "".join(self.convert_ids_to_tokens(list(ids))).replace("\u0120", " ")
 
     def convert_ids_to_tokens(self, ids):
@@ -325,6 +326,8 @@ def _decoder_submodule(cfg: WhisperModelConfig) -> WhisperDecoderSubmodule:
     sub.node_resources = {}
     sub.config = cfg
     sub._suppress_ids = sub._begin_suppress_ids = sub._language_mask = None
+    sub._stager = PinnedStager(torch.long)
+    sub._inactive = None
     return sub
 
 
@@ -383,7 +386,9 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     written = []
     sub._write_context = written.append
     batch = sub.preprocess(PREFILL_WALK, _engine_inputs(["ts", "plain"]), [row, row2])
-    assert batch["ts_rules"].shape == (2, 4)
+    # staged from the host rows in one copy each
+    assert batch["ts_rules"].tolist() == [row.tensor_inputs["ts_rules"].tolist(), inactive_state()]
+    assert batch["row_lens"].tolist() == [3, 4]
     # the context is written eagerly, both requests in segment order, and stays
     # out of the forward's inputs (the prefill graph is sized by the prompt)
     assert [t.shape for t in written] == [(2 * cfg.max_source_positions, cfg.d_model)]
@@ -407,6 +412,9 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     (template,) = prefill_cfg.get_node_inputs(1, 4)
     assert template.tensor_inputs["ts_rules"].tolist() == inactive_state()
     assert template.tensor_inputs["encoder_states"].shape[0] == cfg.max_source_positions
+    # a replay's padding rows are stacked with real prefill rows, whose rule state is on the host
+    _, meta_prefill = sub.get_accelerator_graph_configs(torch.device("meta"))
+    assert meta_prefill.get_node_inputs(1, 4)[0].tensor_inputs["ts_rules"].device.type == "cpu"
     # prompt buckets give every row 3 to 8 tokens
     assert all(3 * bs <= n <= 8 * bs for bs in (1, 2, 32) for n in prefill_cfg.get_total_tokens(bs))
     assert prefill_cfg.get_total_tokens(32) == [128]
@@ -510,7 +518,6 @@ def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
     assert row.input_seq_len == 3
     batch = sub.preprocess(PREFILL_PROMPT_WALK, _engine_inputs(["r0"]), [row])
     assert batch["input_ids"].tolist() == [DE, TRANSCRIBE, NOTS] and "encoder_states" not in batch
-    assert sub.request_state(4)["prompt_len"] == 3
 
     detect_row = sub.prepare_inputs(
         DETECT_LANGUAGE_WALK, fwd,
@@ -518,18 +525,6 @@ def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
          "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]},
     )
     assert detect_row.input_seq_len == 1 and sub._context_span(detect_row) == cfg.max_source_positions
-    # the prompt walk counts the one-token detection prompt before its own
-    # tokens, and running prepare_inputs again (an allocation retry) does
-    # not grow the count
-    tail = {"text_inputs": [torch.tensor([DE])], "prompt_tail": [torch.tensor([TRANSCRIBE, NOTS])]}
-    sub.prepare_inputs(PREFILL_PROMPT_WALK, fwd, tail)
-    sub.prepare_inputs(PREFILL_PROMPT_WALK, fwd, tail)
-    assert sub.request_state(4)["prompt_len"] == 4
-    ctx = {"encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]}
-    forced = {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE])], **ctx}
-    sub.prepare_inputs(PREFILL_WALK, fwd, forced)
-    sub.prepare_inputs(PREFILL_WALK, fwd, forced)
-    assert sub.request_state(4)["prompt_len"] == 3
     assert sub.max_batch_size(DECODE_WALK) is None
     assert sub.max_batch_size(PREFILL_WALK) == sub.MAX_PREFILL_BATCH_SIZE
 
@@ -551,7 +546,7 @@ def test_decoder_logit_rules():
     assert torch.isinf(later[0, [1, 2]]).all() and torch.isfinite(later[0, EOT])
 
 
-def test_decoder_check_stop_honors_eos_max_tokens_and_position_table():
+def test_decoder_check_stop_honors_eos_and_max_tokens():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
 
@@ -565,16 +560,12 @@ def test_decoder_check_stop_honors_eos_max_tokens_and_position_table():
             "dynamic_loop_iter_counts": {"decode_loop": decoded},
         })()
 
-    sub.request_state(9).add("prompt_len", 4)
     eos = {"new_token": [torch.tensor([EOT])]}
     word = {"new_token": [torch.tensor([1234])]}
     assert sub.check_stop("r", info(PREFILL_WALK, 0), eos) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 0), eos) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
     assert sub.check_stop("r", info(DECODE_WALK, 3, max_tokens=4), word) == {"decode_loop"}
-    # 4 prompt + 1 first token + 443 decoded fill the 448-slot table
-    assert sub.check_stop("r", info(DECODE_WALK, 441), word) == set()
-    assert sub.check_stop("r", info(DECODE_WALK, 442), word) == {"decode_loop"}
 
 
 def test_decoder_check_stop_batched_agrees_with_per_request():
@@ -588,29 +579,24 @@ def test_decoder_check_stop_batched_agrees_with_per_request():
             "dynamic_loop_iter_counts": {"decode_loop": decoded},
         })()
 
-    for handle in range(6):
-        sub.request_state(handle).add("prompt_len", 4)
     # rows in forward order, plus two padding rows a replay leaves at the end
-    tokens = torch.tensor([EOT, 1234, EOT, 1234, 1234, EOT, 0, 0])
-    row_rids = ("eos", "word", "ignored", "budget", "table", "prefill")
+    tokens = torch.tensor([EOT, 1234, EOT, 1234, EOT, 0, 0])
+    row_rids = ("eos", "word", "ignored", "budget", "prefill")
     infos = {
         "eos": info(DECODE_WALK, 0, 0),                       # stops
         "word": info(DECODE_WALK, 0, 1),                      # keeps going
         "ignored": info(DECODE_WALK, 0, 2, ignore_eos=True),  # EOS ignored
         "budget": info(DECODE_WALK, 3, 3, max_tokens=4),      # out of budget
-        "table": info(DECODE_WALK, 442, 4),                   # position table full
-        "prefill": info(PREFILL_WALK, 0, 5),                  # never stops the loop
+        "prefill": info(PREFILL_WALK, 0, 4),                  # never stops the loop
     }
-    check = ["prefill", "table", "budget", "ignored", "word", "eos"]  # not forward order
+    check = ["prefill", "budget", "ignored", "word", "eos"]  # not forward order
     batched = sub.check_stop_batched(check, infos, HostRows(row_rids, {"new_token": tokens}))
     per_request = {}
     for i, rid in enumerate(row_rids):
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
         if got:
             per_request[rid] = got
-    assert batched == per_request == {
-        "eos": {"decode_loop"}, "budget": {"decode_loop"}, "table": {"decode_loop"},
-    }
+    assert batched == per_request == {"eos": {"decode_loop"}, "budget": {"decode_loop"}}
     # no token buffer: the engine falls back to the per-request path
     assert sub.check_stop_batched(["eos"], infos, HostRows(("eos",), {})) is None
 
@@ -631,7 +617,6 @@ def test_engine_stop_check_takes_the_batched_path(request_walks):
     sub.check_stop = per_request
     infos = {}
     for handle, rid in enumerate(("eos", "word")):
-        sub.request_state(handle).add("prompt_len", 4)
         infos[rid] = type("I", (), {
             "graph_walk": DECODE_WALK, "max_tokens": 444, "rid_handle": handle,
             "resource_configs": {"sampler": type("C", (), {"ignore_eos": False})()},
@@ -821,7 +806,7 @@ def test_route_metadata_agrees_with_the_prompt_it_was_built_beside(kwargs):
     wave = torch.randn(8_000)
     out = model.process_prompt(
         None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, **kwargs,
-    )
+    ).new_input_tensors
     args = model.get_initial_forward_pass_args(
         "default", ["audio", "text"], ["text"],
         {k: list(v) for k, v in out.items()}, model_kwargs=kwargs,
@@ -848,25 +833,29 @@ def test_route_metadata_agrees_with_the_prompt_it_was_built_beside(kwargs):
 def test_process_prompt_builds_window_and_prompts():
     model = _make_model()
     wave = torch.randn(8_000)  # half the tiny config's 1 s window
-    out = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en")
+    out = model.process_prompt(
+        None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en",
+    ).new_input_tensors
     assert torch.equal(out["audio"][0], wave)  # samples as they are; the encoder pads and makes the mel
     assert out["audio_frames"][0].tolist() == [wave.numel() // model.config.hop_length]
     assert out["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert "prompt_tail" not in out
 
-    detect = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, timestamps=True)
+    detect = model.process_prompt(
+        None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, timestamps=True,
+    ).new_input_tensors
     assert detect["text_inputs"][0].tolist() == [SOT]
     assert detect["prompt_tail"][0].tolist() == [TRANSCRIBE]
 
     prev = model.process_prompt(
         None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="de", initial_prompt="Hallo Welt",
-    )
+    ).new_input_tensors
     ids = prev["text_inputs"][0].tolist()
     assert ids[0] == PREV and ids[-4:] == [SOT, DE, TRANSCRIBE, NOTS]
     assert ids[1:-4] == model.tokenizer.encode(" Hallo Welt")
 
     long = torch.randn(16_000 * 45)  # beyond one window: trimmed, not rejected
-    assert model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [long]}, language="en")[
+    assert model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [long]}, language="en").new_input_tensors[
         "audio"][0].shape == (model.config.n_samples,)
     with pytest.raises(ValueError, match="one audio input"):
         model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": []}, language="en")
@@ -881,7 +870,7 @@ def test_process_prompt_builds_window_and_prompts():
         model.process_prompt(*args, language="xx")
     with pytest.raises(ValueError, match="task"):
         model.process_prompt(*args, language="en", task="sing")
-    coerced = model.process_prompt(*args, language="en", temperature="0.2")
+    coerced = model.process_prompt(*args, language="en", temperature="0.2").new_input_tensors
     assert coerced["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert model.get_max_output_tokens(max_output_tokens="40") == 40
     assert model.get_request_resource_configs({}, {"temperature": "0.5"})["sampler"].temperature == 0.5
@@ -1033,7 +1022,6 @@ def test_decode_tokens_are_recorded_for_the_align_walk_until_the_stop():
     sub = _decoder_submodule(cfg)
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
     sub.request_state(9).add("language", EN)
-    sub.request_state(9).add("prompt_len", 4)
     info = type("I", (), {
         "graph_walk": DECODE_WALK, "max_tokens": 100, "rid_handle": 9,
         "resource_configs": {"sampler": type("C", (), {"ignore_eos": False})()},

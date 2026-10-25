@@ -114,6 +114,8 @@ def test_words_split_on_spaces_and_punctuation_merges():
     assert alignment.split_words(decode, [1, 3]) == [(" Heed", [1, 3])]
     # a multi-byte character split across tokens stays one piece
     assert alignment.split_words(decode, [8, 9])[0][1] == [8, 9]
+    # a replacement character the transcript itself holds ends its piece, as in openai-whisper
+    assert alignment.split_words(decode, [8, 1, 6]) == [("�", [8]), (" He", [1]), (" there", [6])]
 
     starts = [0.0, 0.2, 0.5, 0.7, 0.9, 1.2, 1.5]  # row starts: 6 tokens + end-of-text
     words = alignment.split_words(decode, [1, 2, 3, 4, 6, 7])
@@ -122,7 +124,37 @@ def test_words_split_on_spaces_and_punctuation_merges():
     timed = [{"word": w, "start": starts[a], "end": starts[b]} for (w, _), a, b in spans]
     merged = alignment.merge_punctuation(timed)
     assert [w["word"] for w in merged] == [" He", " hoped,", " there."]
-    assert merged[1] == {"word": " hoped,", "start": 0.2, "end": 0.9}
+    # the word keeps its own timing; the comma's is dropped
+    assert merged[1] == {"word": " hoped,", "start": 0.2, "end": 0.7}
+    # opening marks first, right to left, as openai-whisper: the quote joins
+    # "world" rather than the comma's word swallowing it
+    quoted = [{"word": w, "start": float(k), "end": k + 1.0} for k, w in enumerate([" Hello", ",", ' "', "world"])]
+    assert [w["word"] for w in alignment.merge_punctuation(quoted)] == [" Hello,", ' "world']
+
+
+def test_languages_without_spaces_split_per_character():
+    # openai-whisper's split_tokens_on_unicode for zh/ja/th/lo/my/yue: one word per
+    # whole character, with a character split across two tokens kept together
+    text = " 今天天气很好，我们去公园散步吧。"
+    pieces = []
+    for ch in text:
+        b = ch.encode()
+        pieces += [b[:2], b[2:]] if ch == "公" else [b]
+    vocab = dict(enumerate(pieces))
+
+    def decode(ids):
+        return b"".join(vocab[i] for i in ids).decode("utf-8", "replace")
+
+    words = alignment.split_words(decode, list(vocab), "zh")
+    assert [w for w, _ in words] == list(text)
+    assert dict(words)["公"] == [text.index("公"), text.index("公") + 1]
+    assert len(alignment.split_words(decode, list(vocab), "en")) == 1
+
+    # a transcript cut inside a character (at the position table) keeps every
+    # token and does not read past the decoded text
+    cut = {0: "今".encode(), 1: b"\xe5", 2: b"\xa4"}
+    words = alignment.split_words(lambda ids: b"".join(cut[i] for i in ids).decode("utf-8", "replace"), [0, 1, 2], "zh")
+    assert sum((toks for _, toks in words), []) == [0, 1, 2]
 
 
 def test_word_timings_end_to_end_on_a_synthetic_alignment():

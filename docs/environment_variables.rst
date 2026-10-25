@@ -71,6 +71,20 @@ Communication
        extension; raises if missing). ``AUTO``: the arena when the
        extension imports, files otherwise. Must match across the
        deployment — arena locations ride in the tensor descriptors.
+   * - ``MSTAR_DEPLOYMENT_TOKEN``
+     - random per launch
+     - Mixed into the namespace of the SHM tensor files and arena segments,
+       so no two launches share names: not a restart on the same socket
+       prefix, and not two deployments that share ``/dev/shm`` from different
+       containers (``--ipc=host``, hostIPC) with the same socket prefix and
+       ports. The API server mints a new one at every launch unless a
+       launcher set it (one an API server minted is replaced, also when
+       inherited), and the conductor and workers inherit it. Set it only
+       when a launcher starts a deployment's processes separately: the same
+       value in all of them, and a new value per launch (a dead run's files
+       are swept only once no process holds its namespace, and a stopping
+       worker unlinks its own files even after its conductor is gone, which
+       a reused value would let it do to the next launch's files).
    * - ``MSTAR_KV_SHM_DIR``
      - ``/dev/shm`` (or ``/tmp`` if unavailable)
      - Base directory for host-staged KV snapshots when remote KV transfer
@@ -326,6 +340,13 @@ Read by the ``mstar-server`` binary and its bridge
        tokenizer only uses its thread pool while that variable reads true,
        and serving environments often export it false. ``0`` leaves the
        variable as it is (the chunked encode then runs serially).
+   * - ``MSTAR_OPENAI_ADAPTER``
+     - set by the launcher
+     - The class name of the model's adapter in ``ADAPTER_REGISTRY``
+       (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
+       picks the OpenAI translation ``mstar-server`` uses
+       (``Adapter::from_python``). ``mstar-serve --rust-frontend`` always sets it;
+       a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset
      - Path to a HuggingFace ``tokenizer.json`` enabling frontend
@@ -382,8 +403,9 @@ so attaching more files does not multiply them.
        frames the model's loader decodes, each frame counting as at least
        64x64; over it, the request gets a 400. At 1080p30 the default refuses
        clips over about 17 s on Cosmos3, which decodes every frame, and over
-       about 259 s on Qwen3-Omni, which decodes 2 frames a second (every
-       frame, as Cosmos3, when the clip's header gives no frame count).
+       about 259 s on Qwen3-Omni and Qwen3.5, which decode 2 frames a second
+       (Qwen3-Omni decodes every frame, as Cosmos3, when the clip's header
+       gives no frame count).
    * - ``MSTAR_MAX_MEDIA_FILES``
      - ``16``
      - Images, audio clips and videos one request may attach, together (see
@@ -411,8 +433,9 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - ``0``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes. ``1``: the
+     - config's ``tp_async_sched``, else ``0``
+     - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+       deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
        opened) and broadcasts it at once as a speculative
@@ -423,7 +446,7 @@ Worker scheduling
        continuing request without loop-back output) are derived by each
        rank from replicated state, never signalled. A comma-separated
        list of node names (``thinker,talker``) enables it for those
-       parallel nodes only. ``0``: the serial path — leader schedules
+       parallel nodes only. ``0`` (or ``false``): the serial path — leader schedules
        after N, followers rebuild after the broadcast. Set it identically
        on every rank of an instance: the workers compare it at startup and
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at
@@ -551,9 +574,9 @@ Worker scheduling
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
      - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
-       ``remove_request``, check the KV page bookkeeping (free list, owner
-       counts, seals) against the streams holding the pages. Walks every
-       live stream; tests and debugging only.
+       ``remove_request``, check the KV page bookkeeping against the streams
+       holding the pages, and each commit against its request's layout. Logs a
+       label left under its footprint at removal. Tests and debugging only.
 
 Compilation
 -----------

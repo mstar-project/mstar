@@ -140,7 +140,11 @@ def test_native_endpoint_reports_nonstreaming_raw_frames_as_bad_request(monkeypa
         )
 
     assert raised.value.status_code == 400
-    assert "requires streaming=true" in str(raised.value.detail)
+    # test/rust/test_rust_frontend.py checks mstar-server sends the same
+    assert raised.value.detail == (
+        "Output modality video_frame requires streaming=true; raw frame "
+        "chunks cannot be returned as an aggregated response."
+    )
 
 
 def test_native_endpoint_rejects_raw_frames_as_input(monkeypatch):
@@ -393,7 +397,7 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker.device = "cpu"
     worker.enable_prof = False
     worker.timing_requested = threading.Event()
-    worker._prefix_streams = {}
+    worker._keyed_labels = {}
     worker._live_requests = {}
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(

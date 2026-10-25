@@ -190,7 +190,7 @@ class Lockstep:
         return self._both(f"add_request({rid_str})", lambda rt, b, s: rt.add_request(
             request_id=rid_str, partition="default", graph_walk=WALK,
             partition_worker_graph_ids=[WG_ID],
-            worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]])))
+            worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]), loop_caps={}))
 
     def put(self, uuid):
         """Store a tensor on both sides so routing has something to refer to."""

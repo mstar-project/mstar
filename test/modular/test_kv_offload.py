@@ -30,7 +30,8 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.kv import cpu_page_pool, page_copier
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVLayout, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.cpu_page_pool import PageCopies
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.platforms import current_platform
@@ -74,7 +75,12 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransferManager)
 
 
-def _make_manager(max_num_pages: int = 16, cpu_offload_pages: int = 16):
+def _make_manager(
+    max_num_pages: int = 16, cpu_offload_pages: int = 16,
+    layout: KVLayout = KVLayout.NHD,
+):
+    mla = (dict(kv_lora_rank=3, qk_rope_head_dim=1, num_qo_heads=2)
+           if layout == KVLayout.MLA else {})
     cfg = PagedKVConfig(
         num_layers=2,
         num_kv_heads=1,
@@ -83,6 +89,8 @@ def _make_manager(max_num_pages: int = 16, cpu_offload_pages: int = 16):
         max_num_pages=max_num_pages,
         page_size=PAGE_SIZE,
         cpu_offload_pages=cpu_offload_pages,
+        layout=layout,
+        **mla,
     )
     return KVManager(
         cfg=cfg, name="kv", joint_comm_group=None, transfer_engine_info=None,
@@ -142,21 +150,21 @@ def _assert_pages_conserved(mgr: KVManager) -> None:
     assert not missing, f"pages orphaned (leaked): {sorted(missing)}"
 
 
-def _hook_offload_stream(mgr: KVManager, hook, when: str | None = None):
+def _hook_host_copy(mgr: KVManager, hook):
     """Run ``hook`` on another thread from inside a host copy.
 
     The manager lock is not held there, so this reproduces exactly what the
     plan thread can do mid-offload. Joining with a timeout means a regression
     that takes the lock across the copy fails the test instead of hanging it.
     """
-    real = mgr._cpu_pool.offload_stream
+    real = mgr._cpu_pool.copy_out
     fired = False
 
-    def wrapper(**kwargs):
+    def wrapper(gpu_kv_cache, copies):
         nonlocal fired
-        moved = real(**kwargs)
+        real(gpu_kv_cache, copies)
         # once only, so a test can retry the offload without racing it again
-        if not fired and (when is None or kwargs["label"] == when):
+        if not fired:
             fired = True
             thread = threading.Thread(target=hook)
             thread.start()
@@ -165,17 +173,17 @@ def _hook_offload_stream(mgr: KVManager, hook, when: str | None = None):
                 "the racing thread blocked: offload is holding the manager "
                 "lock across the host copy"
             )
-        return moved
 
-    mgr._cpu_pool.offload_stream = wrapper
+    mgr._cpu_pool.copy_out = wrapper
 
 
 # --- round trip ------------------------------------------------------------
 
 
 @requires_cuda
-def test_offload_reload_round_trip():
-    mgr = _make_manager()
+@pytest.mark.parametrize("layout", [KVLayout.NHD, KVLayout.MLA])
+def test_offload_reload_round_trip(layout):
+    mgr = _make_manager(layout=layout)
     mgr.ingest_request("r0")
     _grow(mgr, "r0", "main", 3 * PAGE_SIZE)
 
@@ -378,7 +386,7 @@ def test_alloc_during_offload_is_refused():
     _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
     raced: list = []
 
-    _hook_offload_stream(mgr, lambda: raced.append(_grow(mgr, "r0", "main", PAGE_SIZE)))
+    _hook_host_copy(mgr, lambda: raced.append(_grow(mgr, "r0", "main", PAGE_SIZE)))
 
     assert mgr.offload("r0") == 2
     outcome = raced[0]
@@ -408,7 +416,7 @@ def test_admit_refused_for_every_label_of_an_offloading_request():
         # can still be reported
         seen.append(_grow(mgr, "r0", "main", PAGE_SIZE, pre_forks=(("main", "cfg"),)))
 
-    _hook_offload_stream(mgr, race, when="main")
+    _hook_host_copy(mgr, race)
 
     mgr.offload("r0")
     assert all(isinstance(o.reason, RequestOffloading) for o in seen), seen
@@ -432,9 +440,7 @@ def test_fork_during_offload_declines_the_offload():
     host_free = mgr._cpu_pool.num_free_pages
 
     # the fork bumps `cfg`'s generation while its pages are mid-copy
-    _hook_offload_stream(
-        mgr, lambda: mgr._apply_fork("r0", "main", "cfg"), when="main"
-    )
+    _hook_host_copy(mgr, lambda: mgr._apply_fork("r0", "main", "cfg"))
 
     assert mgr.offload("r0") == 0
     assert mgr.is_offloaded("r0") is False
@@ -456,7 +462,7 @@ def test_remove_during_offload_leaks_nothing():
     mgr.ingest_request("r0")
     _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
 
-    _hook_offload_stream(mgr, lambda: mgr.remove_request("r0"))
+    _hook_host_copy(mgr, lambda: mgr.remove_request("r0"))
 
     assert mgr.offload("r0") == 0
     assert mgr._streams.get("r0") is None
@@ -476,14 +482,16 @@ def test_raise_mid_copy_leaves_no_half_offloaded_request():
     _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
     _grow(mgr, "r0", "cfg", 2 * PAGE_SIZE)
     held = mgr.reclaimable("r0")
-    real = mgr._cpu_pool.offload_stream
+    real = mgr._cpu_pool.copy_out
+    copied = []
 
-    def blow_up_on_the_second(**kwargs):
-        if kwargs["label"] == "cfg":
+    def blow_up_on_the_second(gpu_kv_cache, copies):
+        copied.append(copies)
+        if len(copied) == 2:
             raise RuntimeError("copy died")
-        return real(**kwargs)
+        real(gpu_kv_cache, copies)
 
-    mgr._cpu_pool.offload_stream = blow_up_on_the_second
+    mgr._cpu_pool.copy_out = blow_up_on_the_second
 
     with pytest.raises(RuntimeError, match="copy died"):
         mgr.offload("r0")
@@ -494,7 +502,7 @@ def test_raise_mid_copy_leaves_no_half_offloaded_request():
     _assert_pages_conserved(mgr)
 
     # and the request is still usable afterwards
-    mgr._cpu_pool.offload_stream = real
+    mgr._cpu_pool.copy_out = real
     assert mgr.offload("r0") == held
     assert mgr.reload("r0") is True
     _assert_pages_conserved(mgr)
@@ -508,7 +516,7 @@ def test_is_offloaded_true_while_the_copy_is_in_flight():
     _grow(mgr, "r0", "main", PAGE_SIZE)
     seen: list[bool] = []
 
-    _hook_offload_stream(mgr, lambda: seen.append(mgr.is_offloaded("r0")))
+    _hook_host_copy(mgr, lambda: seen.append(mgr.is_offloaded("r0")))
 
     mgr.offload("r0")
     assert seen == [True]
@@ -524,7 +532,7 @@ def test_alloc_for_other_requests_still_works_during_offload():
     _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
     raced: list = []
 
-    _hook_offload_stream(mgr, lambda: raced.append(_grow(mgr, "r1", "main", PAGE_SIZE)))
+    _hook_host_copy(mgr, lambda: raced.append(_grow(mgr, "r1", "main", PAGE_SIZE)))
 
     assert mgr.offload("r0") == 2
     assert raced[0].ok
@@ -793,12 +801,12 @@ def test_pool_copies_keep_every_layer_and_element(copier_cls):
     device = mgr.kv_cache.tensor
     device.copy_(torch.randn_like(device))
     expected = device.clone()
-    src, dst = [5, 2, 9], [3, 11, 7]
+    src, dst, host = [5, 2, 9], [3, 11, 7], [0, 1, 2]
 
-    assert pool.offload_stream("r0", "main", device, src, stored_len=0, position=0)
+    pool.copy_out(device, PageCopies(gpu=src, cpu=host))
     pool.sync()
     device.fill_(-99.0)
-    pool.reload_stream("r0", "main", device, dst)
+    pool.copy_in(device, PageCopies(gpu=dst, cpu=host))
     pool.sync()
     torch.cuda.synchronize()
 
@@ -818,14 +826,13 @@ def test_pool_copies_do_not_block_the_host():
         "no 2D async memcpy binding loaded on a CUDA or ROCm build of torch"
     )
     device = mgr.kv_cache.tensor
-    pool.offload_stream("warm", "main", device, [1], stored_len=0, position=0)
-    pool.remove_request("warm")
+    pool.copy_out(device, PageCopies(gpu=[1], cpu=[0]))
     torch.cuda.synchronize()
 
     torch.cuda._sleep(500_000_000)  # a few hundred ms of compute ahead of the copies
     start = time.perf_counter()
-    pool.offload_stream("r0", "main", device, [1, 2, 3], stored_len=0, position=0)
-    pool.reload_stream("r0", "main", device, [4, 5, 6])
+    pool.copy_out(device, PageCopies(gpu=[1, 2, 3], cpu=[0, 1, 2]))
+    pool.copy_in(device, PageCopies(gpu=[4, 5, 6], cpu=[0, 1, 2]))
     pool.sync()
     elapsed = time.perf_counter() - start
     torch.cuda.synchronize()
@@ -838,16 +845,15 @@ def test_a_full_host_pool_logs_a_summary_not_every_refusal(monkeypatch, caplog):
     counting the refusals it stood for, keeps the log readable."""
     mgr = _make_manager(cpu_offload_pages=1)
     pool = mgr._cpu_pool
-    device = mgr.kv_cache.tensor
-    assert pool.offload_stream("held", "main", device, [1], stored_len=0, position=0)
+    assert pool.place("held", "main", [1], [], stored_len=0, position=0)
     clock = [100.0]
     monkeypatch.setattr(cpu_page_pool.time, "monotonic", lambda: clock[0])
 
     with caplog.at_level("WARNING", logger=cpu_page_pool.__name__):
         for _ in range(50):
-            assert not pool.offload_stream("r0", "main", device, [2], stored_len=0, position=0)
+            assert pool.place("r0", "main", [2], [], stored_len=0, position=0) is None
         clock[0] += cpu_page_pool._EXHAUSTED_LOG_INTERVAL
-        assert not pool.offload_stream("r0", "main", device, [2], stored_len=0, position=0)
+        assert pool.place("r0", "main", [2], [], stored_len=0, position=0) is None
 
     warnings = [r.getMessage() for r in caplog.records if "exhausted" in r.getMessage()]
     assert len(warnings) == 2

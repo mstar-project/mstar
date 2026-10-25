@@ -483,8 +483,11 @@ def _event(kind: str, **fields) -> dict:
     return {"event_id": f"event_{uuid.uuid4().hex[:12]}", "type": kind, **fields}
 
 
-def _error(message: str, kind: str = "invalid_request_error") -> dict:
-    return _event("error", error={"type": kind, "message": message})
+def _error(message: str, kind: str = "invalid_request_error", code: str | None = None) -> dict:
+    error = {"type": kind, "message": message}
+    if code is not None:
+        error["code"] = code
+    return _event("error", error=error)
 
 
 class RealtimeTranscription:
@@ -565,9 +568,10 @@ class RealtimeTranscription:
         elif kind == "input_audio_buffer.append":
             s = self.session
             try:
-                audio, odd_byte = pcm16_to_float(event.get("audio") or "", s.odd_byte)
+                # not `or ""`: a null is an error, not an empty append, on every realtime path
+                audio, odd_byte = pcm16_to_float(event.get("audio", ""), s.odd_byte)
             except Exception:  # noqa: BLE001 — bad base64
-                await self.send(_error("audio is not base64"))
+                await self.send(_error("audio is not base64", code="invalid_audio"))
                 return
             # with server_vad the segmenter ends a turn at the cap instead
             if s.segmenter is None and s.item_samples(audio.size) > s.max_item_seconds * SAMPLE_RATE:

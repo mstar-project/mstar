@@ -51,7 +51,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.qwen3_asr.config import (
@@ -102,6 +102,10 @@ class Qwen3ASRModel(Model):
     # mix (1024 pages of 128 = 131k tokens). Deployments retune under
     # ``resources:`` in their YAML.
     KV_PAGES = 1024
+
+    # The API server decodes uploads and stages their tensors with small CPU
+    # ops; a thread per core spins between them and starves its event loop.
+    PREPROCESS_TORCH_THREADS = 4
 
     def __init__(
         self,
@@ -201,8 +205,9 @@ class Qwen3ASRModel(Model):
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Requests past the cap wait in the conductor. A 20 min file holds
-        about 150 pages of 128 tokens (prompt and transcript), so the page
-        count, not the cap, bounds how many long files decode at once."""
+        about 122 pages of 128 tokens for its prompt and up to 32 for its
+        transcript, so the page count, not the cap, bounds how many long files
+        decode at once."""
         cap = config.get("max_concurrent_requests")
         if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
             raise ValueError(f"{config_path}: set max_concurrent_requests to a positive int")
@@ -251,7 +256,7 @@ class Qwen3ASRModel(Model):
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.text.max_position_embeddings,
             outputs=[],
         )
         return {PREFILL_WALK: prefill, DECODE_WALK: decode}
@@ -413,8 +418,20 @@ class Qwen3ASRModel(Model):
                 "audio": [waveform.contiguous()],
                 "text_inputs": [torch.tensor(ids, dtype=torch.long)],
             },
-            metadata={"audio_slot": ids.index(self.config.audio_token_id), "audio_tokens": num_audio_tokens},
+            metadata={
+                "audio_slot": ids.index(self.config.audio_token_id), "audio_tokens": num_audio_tokens,
+                "kv_layout": {KV_CACHE: {"main": LabelLayout(
+                    spans=(Span("rows", PREFILL_WALK, len(ids), len(ids), "text_inputs"),),
+                    growth=((DECODE_LOOP, 1),),
+                )}},
+            },
         )
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

@@ -1,5 +1,6 @@
 import itertools
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from typing import NamedTuple, Type
@@ -16,6 +17,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -28,7 +30,7 @@ from mstar.graph.base import (
     top_level_entities,
 )
 from mstar.model.media_limits import VideoBudget, read_image
-from mstar.model.multimodal import PromptPart
+from mstar.model.multimodal import TEXT, PromptPart
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -50,26 +52,17 @@ class ProcessPromptOutput(NamedTuple):
     metadata: dict
 
 
-class PrefixStream(NamedTuple):
-    """How one cache stream's pages are keyed: by one input tensor's token ids, or by a layout over several walks."""
-    tensor: str
-    keyed_by: str
-    # the walk that writes the keyed span; a write from a walk not named here ends the chain
-    walk: str
-    # the walk whose input is the last sampled token, to key generated pages; None keys the prompt only
-    decode_walk: str | None = None
-    # the other walks a layout may name
-    layout_walks: tuple[str, ...] = ()
-
-
 class Span(NamedTuple):
-    """One write to a keyed stream. A layout lists them in the order the walks write.
+    """One write to a KV stream. A layout lists them in the order the walks write.
 
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is
     the tensor whose next entry an ids span keys, or the file of a digest span
     as ``(modality, index)``. ``params`` are the preprocessing arguments that
-    change the tensors made from the file.
+    change the tensors made from the file. A ``rows`` span writes KV made from
+    anything else, such as another node's outputs, and is never keyed.
+    ``scratch`` is the most a non-committing step writes before the span
+    commits into those slots, as a denoised window does.
     """
     kind: str
     walk: str
@@ -77,6 +70,96 @@ class Span(NamedTuple):
     advance: int
     source: str | tuple[str, int]
     params: tuple = ()
+    scratch: int = 0
+
+
+class LabelLayout(NamedTuple):
+    """Everything a request writes into one paged KV label, from `process_prompt`'s ``kv_layout``.
+
+    ``spans`` are the committed writes known at intake, in walk order. Each
+    ``(loop, slots)`` in ``growth`` writes ``slots`` per iteration of the named
+    loop. ``scratch`` is the most one non-committing step writes past the
+    committed length, and ``retention`` the policy the label's committing steps declare.
+    """
+    spans: tuple[Span, ...] = ()
+    growth: tuple[tuple[str, int], ...] = ()
+    scratch: int = 0
+    retention: RetentionPolicy | None = None
+    # how many leading spans the label's keys cover, by default every span before the first rows span
+    keyed_spans: int | None = None
+
+    def keyed_count(self) -> int:
+        if self.keyed_spans is not None:
+            return self.keyed_spans
+        return next((i for i, span in enumerate(self.spans) if span.kind == "rows"), len(self.spans))
+
+    def row(self) -> list:
+        """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
+        ``[length, advance, walk, scratch]``: plain values, which keep a request's kwargs on the
+        wire's msgpack path."""
+        for span in self.spans:
+            if span.kind not in ("ids", "digest", "rows"):
+                raise ValueError(f"a span of kind {span.kind!r}")
+            if not (isinstance(span.length, int) and isinstance(span.advance, int) and isinstance(span.scratch, int)):
+                raise ValueError(
+                    f"a {span.kind} span's length, advance and scratch are {type(span.length).__name__}, "
+                    f"{type(span.advance).__name__} and {type(span.scratch).__name__}"
+                )
+        retention = self.retention
+        return [
+            [[span.length, span.advance, span.walk, span.scratch] for span in self.spans],
+            [[loop, slots] for loop, slots in self.growth],
+            self.scratch,
+            None if retention is None else [retention.context_budget, retention.protected_prefix],
+            self.keyed_count(),
+        ]
+
+
+def prompt_spans(
+    plan: Iterable[PromptPart], texts: Sequence[torch.Tensor], text_walk: str,
+    item_spans: Callable[[PromptPart], Iterable[Span]],
+) -> list[Span]:
+    """A prompt's prefill writes in ``plan`` order: a text step's ids from ``texts``, and an
+    attachment's from ``item_spans``."""
+    spans = []
+    for step in plan:
+        if step.modality != TEXT:
+            spans.extend(item_spans(step))
+            continue
+        length = texts[step.index].numel()
+        spans.append(Span("ids", text_walk, length, length, "text_inputs"))
+    return spans
+
+
+class PrefixKeys(NamedTuple):
+    """How a label's pages are keyed for cross-request prefix reuse.
+
+    ``tensor`` holds the ids an ids span is keyed by. Only a write from one of
+    ``walks`` keeps the keys going. With ``growth``, the ids the label's growth
+    walk samples extend the keys.
+    """
+    tensor: str
+    walks: tuple[str, ...]
+    growth: bool = False
+
+
+class KVLabel(NamedTuple):
+    """A paged KV label, as the model's walks write it.
+
+    Each ``(walk, loop)`` in ``growth`` writes after admission, bounded by the
+    named loop. A label with ``keys`` is keyed for prefix reuse.
+    """
+    growth: tuple[tuple[str, str], ...] = ()
+    keys: PrefixKeys | None = None
+
+
+def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
+    keyed = {}
+    for key, labels in model.kv_labels().items():
+        marked = {label: kv_label for label, kv_label in labels.items() if kv_label.keys is not None}
+        if marked:
+            keyed[key] = marked
+    return keyed
 
 
 def video_metadata_dict(metadata_obj) -> dict:
@@ -339,6 +422,10 @@ class Model(ABC):
     # leads) for the conductor to read back from model_kwargs. The data
     # worker drops a client's values for them before process_prompt.
     INTERNAL_KWARGS: tuple[str, ...] = ()
+
+    # Request keys that set an output length. A request that sets one is refused when it
+    # doesn't fit the context, instead of having its length cut to fit.
+    LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
@@ -658,16 +745,14 @@ class Model(ABC):
                     out[(node, walk)] = name
         return out
 
-    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """Which input tensor keys which ``(resource, label)`` cache stream.
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        """The paged KV labels the model's walks write, by resource and label.
 
-        Declaring one opts a node into cross-request prefix reuse: the
-        preprocess worker keys that tensor and the KV resource matches what it
-        already holds. Empty leaves the model uncached whatever the deployment
-        asks for.
-
-        A stream with ``layout_walks`` takes its ``prefix_layout`` from
-        `process_prompt`'s metadata, as ``{resource: {label: [Span, ...]}}``.
+        `process_prompt` returns a `LabelLayout` for each under ``kv_layout``, as
+        ``{resource: {label: LabelLayout}}``. A label with keys opts its node into
+        cross-request prefix reuse: the preprocess worker keys its layout's keyed
+        spans and the KV resource matches what it already holds. With no keyed
+        label the model is uncached whatever the deployment asks for.
         """
         return {}
 
@@ -849,16 +934,14 @@ class Model(ABC):
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
 
-    def get_max_output_tokens_limit(self) -> int | None:
-        """The largest ``max_output_tokens`` a request may ask for; above it the
-        conductor refuses the request (a 400) rather than stopping short. None
-        is no published limit.
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        """The iterations each named loop may run for this request, each at least 1.
 
-        A model whose decode Loop is built with ``max_iters`` from the
-        kwarg-less ``get_max_output_tokens()`` must return that value: the loop
-        ends there whatever the request asked.
+        A loop runs the smaller of its graph ``max_iters`` and its cap. A model
+        whose stop check ends a loop at a count sets the cap to that count, so the
+        loop ends on the same iteration and never speculates past it.
         """
-        return None
+        return {}
 
     def request_kwargs(self) -> frozenset[str] | None:
         """Every ``model_kwargs`` key this model reads, including the ones an

@@ -273,7 +273,7 @@ class MicroScheduler:
         self.held_until: dict[int, float] = {}
         # Rids with a deferred remove; stop initiating new work for them.
         # Shared by reference with Worker._pending_removes.
-        self.pending_removes: set[int] = set()
+        self.pending_removes: dict[int, None] = {}
 
         # WIRE STRING -> number of committed (ZMQ received) tp follow batches
         # still queued. On the fail/abort path we drain these before ACKing
@@ -397,7 +397,7 @@ class MicroScheduler:
             return self._apply_resident_delta(message.node_name, message.resident_delta)
         return self._apply_resident_delta(message.node_name)
 
-    def settle_tp_follow_delta(self) -> bool:
+    def settle_tp_follow_delta(self, caught_up: bool) -> bool:
         """Replay the front head's resident delta; True once every move landed.
 
         The one seam both consumers of this FIFO go through — the serial path
@@ -406,11 +406,23 @@ class MicroScheduler:
         to skip this entirely and read the difference as "rid not ready", which
         it then polled on for ever.
 
+        ``caught_up`` means every step this rank took before the head has committed.
         """
         head = self.peek_tp_follow()
         if head is None:
             return True
-        return self._apply_delta_from_message(head)
+        if not self._apply_delta_from_message(head):
+            return False
+        if not head.prefix_hits and not head.page_trails:
+            return True
+        engine = self.engine_manager.get_engine(head.node_name)
+        try:
+            engine.check_page_trails(head.node_name, head.graph_walk, head.spec_seq, head.page_trails)
+            return engine.adopt_cached_prefix(head, caught_up)
+        except Exception as exc:
+            # The error would repeat on every pass over this head, and failing its requests would
+            # leave the other ranks stuck in its collective.
+            raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
@@ -507,8 +519,8 @@ class MicroScheduler:
                 self.has_ready_excluding(request_state, head_key):
             return
         # Check readiness for every rid to pop all-or-none. Use the
-        # leader's graph walk.
-        if not self.settle_tp_follow_delta():
+        # leader's graph walk. No step of the node is in flight on this path.
+        if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name,
@@ -644,7 +656,11 @@ class MicroScheduler:
                 return scheduled
         if ready is None:
             ready = self._scan_ready(request_state, scan_target, scan_exclude)
-        rr_key = self._select_node_rr(ready)
+        # A walk with no room (a cap of 0) takes nothing, so it stays the least
+        # recent; picked anyway, it would starve the walk that frees the room.
+        rr_key = self._select_node_rr({
+            key: rows for key, rows in ready.items() if self._walk_caps(key)[key[1]] != 0
+        })
         if rr_key is None or rr_key in keys:
             return None
         return schedule(rr_key, ready.get(rr_key, []))
@@ -676,7 +692,7 @@ class MicroScheduler:
         # Do not schedule a request that was removed between scheduling
         # cycles, has its remove deferred for in-flight safety, is in OOM
         # backoff, or recently failed.
-        exclude = self.pending_removes | set(self.held_until) | self.failed_rids
+        exclude = self.failed_rids.union(self.pending_removes, self.held_until)
         for spec in self._ready_specs(exclude, target, exclude_target):
             if spec.node_name not in self.parallel_leader_nodes:
                 continue  # only rank 0 can initiate scheduling!
@@ -1282,7 +1298,7 @@ class MicroScheduler:
         its backlog, and graph-ready rows still on the queues. Read-only and
         graph-level (no engine readiness check, which can reload), so a held
         or not yet reloaded row counts; a failed or removed one does not."""
-        exclude = self.pending_removes | self.failed_rids
+        exclude = self.failed_rids.union(self.pending_removes)
         rows: Counter[str] = Counter()
         for (node, _), waiting in self.backlog.items():
             rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)

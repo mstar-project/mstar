@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep, AttnBackend
+from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
@@ -162,6 +162,7 @@ class DenseAttentionManager(AttentionManager):
             del self._prefix_cache[key]
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         if ctx.slot_lease is not None or ctx.is_preplan:
             raise RuntimeError(

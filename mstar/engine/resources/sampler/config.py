@@ -54,6 +54,14 @@ class SamplerSpec(NodeResourceSpec):
     # token (``SamplerResource.loopback_state`` / ``store_loopback_state``);
     # only used on the device loop-back path
     loopback_state: dict[str, LoopbackState] = field(default_factory=dict)
+    # Capabilities for the generation-aware request knobs below; each off by
+    # default, leaving the node's sampler as it was.
+    # The longest ``repetition_window`` a request may ask for (sizes the history).
+    max_repetition_window: int = 0
+    # The ids ``min_tokens`` bars (the model's EOS ids).
+    min_tokens_stop_ids: tuple[int, ...] = ()
+    # Allows ``top_p_first`` / ``top_p_min_keep``.
+    enable_top_p_first: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -69,11 +77,23 @@ class SamplingReqConfig(ResourceReqConfig):
     top_p: float = 1
     ignore_eos: bool = False # used for benchmark parity
     repetition_penalty: float = 1
-    # Min-p (HF ``MinPLogitsWarper`` / vLLM ``min_p``): drop every token whose
+    # Min-p (HF ``MinPLogitsWarper``): drop every token whose
     # probability is below ``min_p`` times the most likely token's, after the
     # penalty and temperature and before top-k/top-p. 0 disables.
     min_p: float = 0.0
-    # Whether the repetition penalty also counts the prompt's tokens (HF/vLLM do).
+    # > 0: the penalty is ``repetition_penalty ** n``, n a token's count among
+    # the last ``repetition_window`` generated tokens; 0: presence over prompt
+    # and output.
+    repetition_window: int = 0
+    # The spec's stop ids get no probability until this many tokens exist
+    # (applied after top-k/top-p).
+    min_tokens: int = 0
+    # HF's order, top-p then top-k, each on the full distribution (FlashInfer's
+    # is top-k, then top-p over the renormalised top-k).
+    top_p_first: bool = False
+    # Top-p keeps at least this many tokens (HF's ``min_tokens_to_keep``).
+    top_p_min_keep: int = 1
+    # Whether the repetition penalty also counts the prompt's tokens (HF does).
     # A node whose step declares no ``prefill_tracked_tokens`` only ever has the
     # generated ones to count.
     penalize_prompt: bool = True
@@ -110,7 +130,9 @@ class SamplingReqConfig(ResourceReqConfig):
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
-        if self.repetition_penalty not in (None, 1) and not spec.enable_repetion_penalty:
+        # a windowed penalty counts the generation history, not the seen-token mask
+        windowed = self.repetition_window > 0 and spec.max_repetition_window > 0
+        if self.repetition_penalty not in (None, 1) and not (spec.enable_repetion_penalty or windowed):
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )
@@ -139,6 +161,9 @@ def _check_real(name: str, value, ok, rule: str) -> None:
 @dataclass(frozen=True)
 class SamplerStep(ResourceStep):
     apply_penalty: bool = True
+    # False turns top-k/top-p off for this step (e.g. a TTS's first code).
+    # Captured graphs bake it: declare it the same way on every step of a walk.
+    apply_filters: bool = True
     # rid -> prefill tokens for the repetition penalty
     prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory=dict)
     # Rows whose sampled token is kept; None keeps every row. A dropped row

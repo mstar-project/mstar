@@ -36,6 +36,21 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
+# torch.compile mode for a captured forward whose config's ``compile_mode`` is None
+_DEFAULT_COMPILE_MODE = "max-autotune-no-cudagraphs"
+
+
+def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
+    """``torch.compile``'s arguments for a capture config whose ``compile_mode``
+    is ``config_mode``, which the config checked when it was built."""
+    kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": False}
+    mode = _DEFAULT_COMPILE_MODE if config_mode is None else config_mode
+    # "default" is torch.compile's own: Inductor fusion, cuBLAS GEMMs, no autotuning
+    if mode != "default":
+        kwargs["mode"] = mode
+    return kwargs
+
+
 def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[str]:
     """Return resource keys that prevent capture of the declared step."""
     if step is None:
@@ -1161,10 +1176,7 @@ class AcceleratorGraphRunner:
             return forward
         if spec.config_idx not in self._compiled_forwards:
             self._compiled_forwards[spec.config_idx] = torch.compile(
-                forward,
-                mode="max-autotune-no-cudagraphs",
-                fullgraph=False,
-                dynamic=False,
+                forward, **compile_kwargs(spec.config.compile_mode),
             )
         return with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
@@ -1951,9 +1963,7 @@ class PiecewiseAcceleratorGraphRunner:
         fn = self._config.capture_fn
         if self._config.compile:
             fn = with_inductor_overrides(
-                torch.compile(
-                    fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
-                ),
+                torch.compile(fn, **compile_kwargs(self._config.compile_mode)),
                 shape.total_tokens,
             )
 
@@ -2112,6 +2122,10 @@ class PiecewiseAcceleratorGraphRunner:
     def lease_before_step(self) -> bool:
         """Whether this region takes its slot ahead of the declaration."""
         return self._config.lease_before_step
+
+    def can_lease(self, inputs: list[NodeInputs]) -> bool:
+        """The config's ``can_lease`` for this batch; True when it sets none."""
+        return self._config.can_lease is None or self._config.can_lease(inputs)
 
     def lease_slot(
         self, batch_size: int, total_tokens: int | None = None,

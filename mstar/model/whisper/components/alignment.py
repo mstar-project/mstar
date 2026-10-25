@@ -15,8 +15,9 @@ predicted. The recipe, reproduced here on M*'s own components:
 3. dynamic time warping through that matrix gives a monotonic path; the
    frame at which the path first enters a row is when that token starts;
 4. tokens are grouped into words (a new word at a leading space or a lone
-   punctuation mark); a word starts with its first token and ends where the
-   next word starts, the last one where end-of-text is predicted.
+   punctuation mark, or at every run of tokens that decodes to whole
+   characters in a language written without spaces); a word starts with its first token and ends where the next word
+   starts, the last one where end-of-text is predicted.
 
 The functions here are pure tensor/numpy code with no engine dependencies,
 so the same math is unit-tested on the CPU and run by the decoder
@@ -38,6 +39,10 @@ FRAMES_PER_SECOND = 50
 MEDIAN_FILTER_WIDTH = 7
 PREPENDED_PUNCTUATION = "\"'“¿([{-"
 APPENDED_PUNCTUATION = "\"'.。,，!！?？:：”)]}、"
+# Written without spaces between words: without morpheme analysis, each run of
+# tokens that decodes to whole characters is a word (openai-whisper's
+# split_to_word_tokens).
+CHARACTER_SPLIT_LANGUAGES = frozenset({"zh", "ja", "th", "lo", "my", "yue"})
 
 
 def median_filter(x: torch.Tensor, width: int = MEDIAN_FILTER_WIDTH) -> torch.Tensor:
@@ -151,21 +156,34 @@ def token_start_frames(matrix: torch.Tensor) -> np.ndarray:
     return frames[first]
 
 
-def split_words(decode, token_ids: list[int]) -> list[tuple[str, list[int]]]:
-    """Group text tokens into words: multi-byte characters are kept whole
-    (a token whose text decodes to the replacement character continues into
-    the next), and a word begins at a leading space or a lone punctuation
-    mark. ``decode(ids) -> str`` is the tokenizer's plain decode."""
+def split_words(
+    decode, token_ids: list[int], language: str | None = None,
+) -> list[tuple[str, list[int]]]:
+    """Group text tokens into words, as openai-whisper's ``split_to_word_tokens``:
+    first into pieces that decode to whole characters (a token ending inside a
+    multi-byte character continues into the next), then, unless ``language``
+    is written without spaces, into words that begin at a leading space or a
+    lone punctuation mark. ``decode(ids) -> str`` is the tokenizer's plain decode,
+    without clean-up, so the pieces' texts add up to ``decode(token_ids)``."""
+    full = decode(token_ids)
     pieces: list[tuple[str, list[int]]] = []
     pending: list[int] = []
+    offset = 0
     for tok in token_ids:
         pending.append(tok)
         text = decode(pending)
-        if "�" not in text:
+        # a replacement character the whole transcript also has there is in the
+        # text itself, not an unfinished character, and must not swallow the rest
+        at = offset + text.index("�") if "�" in text else None
+        if at is None or (at < len(full) and full[at] == "�"):
             pieces.append((text, pending))
             pending = []
+            offset += len(text)
     if pending:
+        # the transcript ends inside a character (cut at the position table)
         pieces.append((decode(pending), pending))
+    if language in CHARACTER_SPLIT_LANGUAGES:
+        return pieces
     words: list[tuple[str, list[int]]] = []
     for text, toks in pieces:
         if not words or text.startswith(" ") or text.strip() in string.punctuation:
@@ -177,41 +195,47 @@ def split_words(decode, token_ids: list[int]) -> list[tuple[str, list[int]]]:
 
 
 def merge_punctuation(words: list[dict]) -> list[dict]:
-    """Attach opening marks to the word after them and closing marks to the
-    word before them, keeping the neighbour's timing (openai-whisper does the
-    same before reporting words)."""
-    merged: list[dict] = []
-    for w in words:
-        text = w["word"]
-        if merged and not merged[-1]["word"].endswith(" ") and text.strip() in APPENDED_PUNCTUATION:
-            merged[-1]["word"] += text
-            merged[-1]["end"] = w["end"]
-            continue
-        merged.append(dict(w))
-    out: list[dict] = []
-    for w in merged:
-        if out and out[-1]["word"].startswith(" ") and out[-1]["word"].strip() in PREPENDED_PUNCTUATION:
-            opener = out.pop()
-            w = {"word": opener["word"] + w["word"], "start": opener["start"], "end": w["end"]}
-        out.append(w)
-    return out
+    """openai-whisper's ``merge_punctuations``: opening marks join the word
+    after them (scanning right to left), then closing marks join the word
+    before them. A word keeps its own timing; the mark's is dropped."""
+    words = [dict(w) for w in words]
+    i, j = len(words) - 2, len(words) - 1
+    while i >= 0:
+        prev, following = words[i], words[j]
+        if prev["word"].startswith(" ") and prev["word"].strip() in PREPENDED_PUNCTUATION:
+            following["word"] = prev["word"] + following["word"]
+            prev["word"] = ""
+        else:
+            j = i
+        i -= 1
+    i, j = 0, 1
+    while j < len(words):
+        prev, following = words[i], words[j]
+        if not prev["word"].endswith(" ") and following["word"] in APPENDED_PUNCTUATION:
+            prev["word"] += following["word"]
+            following["word"] = ""
+        else:
+            i = j
+        j += 1
+    return [w for w in words if w["word"]]
 
 
 def word_timings(
     weights: torch.Tensor, text_tokens: list[int], decode, num_frames: int,
+    language: str | None = None,
 ) -> list[dict]:
     """Words with ``start`` / ``end`` seconds for one window.
 
     ``weights`` holds the alignment heads' attention for the rows that
     predict ``text_tokens`` plus the final row that predicts end-of-text
     (``len(text_tokens) + 1`` rows); ``num_frames`` is how many mel frames
-    of the window carry audio.
+    of the window carry audio; ``language`` is the transcript's language code.
     """
     if not text_tokens:
         return []
     matrix = alignment_matrix(weights, num_frames)
     starts = token_start_frames(matrix) / FRAMES_PER_SECOND  # one per row
-    words = split_words(decode, text_tokens)
+    words = split_words(decode, text_tokens, language)
     bounds = np.concatenate([[0], np.cumsum([len(toks) for _, toks in words])])
     timed = [
         {"word": text, "start": float(starts[b0]), "end": float(starts[b1])}

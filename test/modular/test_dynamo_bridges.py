@@ -312,11 +312,12 @@ def test_realtime_joins_samples_split_across_appends(tmp_path):
     assert _committed_pcm(server) == [first, second]
 
 
-def test_realtime_malformed_append_is_a_client_error(tmp_path):
+@pytest.mark.parametrize("audio", ["%%%", None])
+def test_realtime_malformed_append_is_a_client_error(tmp_path, audio):
     server = _FakeRealtimeServer([_chunk("text", b"ok")], tmp_path)
     out = _run_connection(server, [
         {"type": "session.update", "session": {"type": "realtime", "model": "q3o"}},
-        {"type": "input_audio_buffer.append", "audio": "%%%"},
+        {"type": "input_audio_buffer.append", "audio": audio},
         _append(PCM),
         {"type": "input_audio_buffer.commit"},
     ])

@@ -42,7 +42,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, PrefixStream
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -145,7 +145,7 @@ class OrpheusModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.max_position_embeddings,
             outputs=[],
         )
 
@@ -289,10 +289,13 @@ class OrpheusModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         # Orpheus is text-only; raw multimodal tensors are unused.
-        if prompt is None:
-            return {}
+        # Refused here, where it is a 400 before admission: the LLM's prefill
+        # has no input without text, and blank text would generate from the voice
+        # prefix alone.
+        if prompt is None or not prompt.strip():
+            raise ValueError("Orpheus requires a non-empty text prompt")
 
         # An explicit empty/None voice keeps the unprefixed prompt.
         voice = kwargs.get("voice", self.config.default_voice)
@@ -313,7 +316,11 @@ class OrpheusModel(Model):
         end_tokens = torch.tensor(self.config.end_token_ids, dtype=torch.long)
         all_input_ids = torch.cat([start_token, prompt_tokens.input_ids[0], end_tokens])
 
-        return {"text_inputs": [all_input_ids]}
+        length = all_input_ids.numel()
+        layout = LabelLayout(
+            spans=(Span("ids", "prefill", length, length, "text_inputs"),), growth=(("decode_loop", 1),),
+        )
+        return ProcessPromptOutput({"text_inputs": [all_input_ids]}, {"kv_layout": {KV_CACHE: {"main": layout}}})
 
     # -------------------------------------------------------------------
     # Model ABC: forward pass args
@@ -369,10 +376,16 @@ class OrpheusModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
-    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         """The LLM's prompt is its token ids. Its generated audio codes never
         come back in a prompt, so they are not keyed."""
-        return {KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill")}}
+        return {KV_CACHE: {"main": KVLabel(
+            growth=(("decode", "decode_loop"),),
+            keys=PrefixKeys("text_inputs", ("prefill",)),
+        )}}
 
     def checkpoint_path(self) -> str:
         return _resolve_local_hf_snapshot(

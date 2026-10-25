@@ -168,20 +168,3 @@ def test_without_a_wakeup_the_thread_keeps_the_sleep():
     stop.set()
     t.join(timeout=1.0)
     assert not t.is_alive()
-
-
-def test_a_queued_chunk_signals_the_results_wakeup():
-    """The other direction: the API server's message thread polls on
-    ``results_wakeup``, so a chunk landing on out_queue must signal it."""
-    comm, wakeup, results = _PollingComm(), EventWakeup(), EventWakeup()
-    worker, stop, t = _thread(comm, wakeup, idle_wait_ms=2000)
-    worker.results_wakeup = results
-    assert _wait_until(lambda: comm.waits >= 1, 1.0)
-    worker.result_tensor_queue.put(InlineToken("req", 5, _loop(0), "text"))
-    wakeup.signal()
-    ready, _, _ = select.select([results.fd], [], [], 1.0)
-    assert ready and worker.out_queue.get(timeout=1.0).data == b"<5>"
-    stop.set()
-    wakeup.signal()
-    t.join(timeout=1.0)
-    assert not t.is_alive()

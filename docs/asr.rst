@@ -100,33 +100,54 @@ transcript.
 Serving notes
 -------------
 
-Launch the API server with ``OMP_WAIT_POLICY=PASSIVE``. That process only
-decodes uploads and stages tensors, and torch's default intra-op pool (one
-thread per core) spins after every CPU tensor op it does; under load the
-spinning threads starve the event loop and the transport threads (at
-concurrency 32 the process sat at 600-1000% CPU while the worker was idle
-two thirds of the time). A passive wait policy keeps the pool but lets its
-threads sleep. Shrinking the pool instead (``OMP_NUM_THREADS=1`` or
-``torch.set_num_threads(1)`` in the process) is not recommended: it was in
-place during several unexplained request hangs in our runs.
+The ASR models cap the API server's torch intra-op pool at 4 threads
+(``PREPROCESS_TORCH_THREADS``; ``preprocess_torch_threads:`` in the config
+overrides it). That process only decodes uploads and stages tensors, and a
+pool of one thread per core spins after each of those small ops and starves
+the event loop and transport threads. On a 192-core H200 host the cap matched
+``OMP_WAIT_POLICY=PASSIVE`` on RTFx and latency at concurrency 1 to 64 for both
+models, where the default pool lost 4-9 % (up to 29 % with the server pinned
+to 16 cores), so no launch setting is needed.
+
+Serve with the shared-memory arena, ``MSTAR_SHM_ARENA=1`` (needs the ``rust/``
+extension; see :doc:`environment_variables`). The default SHM transport creates
+and removes one file per tensor, and a transcription moves its audio, encoder
+states and output tokens as many small tensors; the arena places them in
+preallocated segments instead. Qwen3-ASR 1.7B in one run: RTFx 81, 218, 350 and
+412 at concurrency 1, 8, 32 and 64 on the file transport, 87, 252, 494 and 558
+on the arena, with the same 1.41 % WER.
 
 Every ASR config sets ``max_concurrent_requests``. Whisper's decoder caches
 hold 64 requests (12 cross-attention pages and 4 self-attention pages each),
 and the model refuses at startup a cap they cannot hold. Requests past the cap
 wait in the conductor. Qwen3-ASR's requests vary far more in size: a 20 minute
-file holds about 122 pages for its prompt and up to 32 more for its transcript,
-so ``kv_cache.max_num_pages: 2048`` decodes about 13 of them at once. More
-concurrent long files than the pool holds offload to the host pool and, once
-that is full too, wait on each other until they time out: serve many long files
-with a lower ``max_concurrent_requests`` or more pages.
+file holds about 122 pages of 128 tokens for its prompt and up to 32 more for
+its transcript, so the shipped config's 2048 pages (``kv_cache.max_num_pages``)
+hold about 13 of them at full size at once. More concurrent long files than
+the pool holds offload to the host pool and, once that is full too, wait on
+each other until they time out: 16 concurrent single-window 20 minute files
+stalled on 2048 pages, and peaked at 2352 pages with 4096 in the pool.
+
+``qwen3_asr.yaml`` therefore caps Qwen3-ASR at 12 concurrent requests, which
+any mix of files up to 20 minutes fits. The cap costs short-utterance
+throughput: on LibriSpeech test-clean (one H200, Qwen3-ASR 1.7B) RTFx was
+about 420 at 8 concurrent requests, 900 at 32 and 1280 at 64. A deployment
+that only serves short audio can raise ``max_concurrent_requests`` (64 fits
+the default pool); one that serves many long files at once can raise
+``kv_cache.max_num_pages`` with the cap. Admission that sizes the cap by each
+request's pages instead is planned.
 
 Both decode loops stream their transcript token by token. A decode step
-keeps its rows' tokens on the device for the next step (the sampler's
-device loop-back), and the worker sends the batch's tokens to the client in
-one frame per step from the stop check's host copy, rather than one tensor
-message per request. A streaming request therefore receives one delta per
-token. Each chunk is one byte-level BPE token, which can end inside a UTF-8
-character; the server decodes the joined bytes.
+keeps its rows' tokens on the device for the next step (the sampler's device
+loop-back, ``device_loopback_signals``), and the worker sends the batch's
+tokens to the client in one frame per step from the stop check's host copy
+(``inline_client_signals``), rather than one tensor message per request. A
+streaming request therefore receives one delta per token, and tokens reach
+the API server while the window decodes: a 20 minute Qwen3-ASR window is
+about 3,450 tokens, which, sent as one tensor apiece when the loop ended,
+could miss the API server's 15 s delivery deadline under load. Each chunk is
+one byte-level BPE token, which can end inside a UTF-8 character; the server
+decodes the joined bytes.
 
 The ``*_split`` configs (``whisper_large_split.yaml``,
 ``whisper_large_v3_turbo_split.yaml``, ``qwen3_asr_split.yaml``,

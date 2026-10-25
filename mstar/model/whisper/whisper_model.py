@@ -60,7 +60,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.submodule_base import NodeSubmodule
@@ -137,9 +137,17 @@ class WhisperDetokenizer(ByteLevelDetokenizer):
 class WhisperModel(Model):
     """Whisper ASR: native batched encoder + native AR decoder."""
 
+    # A requested length is cut to the room the prompt leaves in the position
+    # table rather than refused, as a length past the table is clamped below:
+    # long-form windows carry the transcript so far as <|startofprev|> context.
+    LENGTH_KWARGS = ()
+
     # Requests the default decoder caches hold at once, each at full length.
     # A deployment retunes the page counts under ``resources:`` in its YAML.
     MAX_CONCURRENT_REQUESTS = 64
+    # The API server decodes uploads and stages their tensors with small CPU
+    # ops; a thread per core spins between them and starves its event loop.
+    PREPROCESS_TORCH_THREADS = 4
     # Set from the deployment by validate_config_yaml: the align walk re-runs
     # the decoder unsharded, so word timestamps need tp_size 1.
     _decoder_tp_size = 1
@@ -340,8 +348,7 @@ class WhisperModel(Model):
     def get_max_output_tokens(self, **model_kwargs):
         # The learned position table caps prompt + generated tokens at
         # max_target_positions (448), the shortest forced prompt takes 4.
-        # A longer prompt (``<|startofprev|>`` context) is accounted per
-        # request in the decoder's ``check_stop``.
+        # The conductor cuts a longer prompt's cap to what is left.
         limit = self.config.max_target_positions - 4
         return min(checked_request_kwargs(model_kwargs).get("max_output_tokens", limit), limit)
 
@@ -597,7 +604,7 @@ class WhisperModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Extract the log-mel window and build the forced decoder prompt.
 
         The text ``prompt`` is unused — Whisper is conditioned via its forced
@@ -642,11 +649,37 @@ class WhisperModel(Model):
             # mel frames that carry audio, word timestamps align within them
             "audio_frames": [torch.tensor([self.log_mel.num_frames(window.numel())], dtype=torch.long)],
         }
+        # the encoder takes the padded window whole, so its context is always this long
+        context = self.config.max_source_positions
         if language is None:
-            out["prompt_tail"] = [torch.tensor(
-                self.config.prompt_tail_ids(task=task, timestamps=timestamps), dtype=torch.long,
-            )]
-        return out
+            tail = self.config.prompt_tail_ids(task=task, timestamps=timestamps)
+            out["prompt_tail"] = [torch.tensor(tail, dtype=torch.long)]
+            # detection commits the prompt up to <|sot|>; the prompt walk commits the
+            # detected language token and the tail
+            spans = (
+                Span("ids", DETECT_LANGUAGE_WALK, len(prompt_ids), len(prompt_ids), "text_inputs"),
+                Span("rows", PREFILL_PROMPT_WALK, 1 + len(tail), 1 + len(tail), "prompt_tail"),
+            )
+            encoder_walk = DETECT_LANGUAGE_WALK
+        else:
+            spans = (Span("ids", PREFILL_WALK, len(prompt_ids), len(prompt_ids), "text_inputs"),)
+            encoder_walk = PREFILL_WALK
+        kv_layout = {
+            KV_CACHE: {"main": LabelLayout(spans=spans, growth=((DECODE_LOOP, 1),))},
+            CROSS_KV_CACHE: {CONTEXT_LABEL: LabelLayout(
+                spans=(Span("rows", encoder_walk, context, context, "encoder_states"),),
+            )},
+        }
+        return ProcessPromptOutput(out, {"kv_layout": kv_layout})
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {
+            KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))},
+            CROSS_KV_CACHE: {CONTEXT_LABEL: KVLabel()},
+        }
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

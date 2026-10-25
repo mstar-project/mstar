@@ -13,7 +13,9 @@ import queue
 import threading
 import time
 
+import pytest
 from api_server_helpers import make_test_api_server
+from fastapi import HTTPException
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.entrypoint import PendingRequest
@@ -137,6 +139,10 @@ class _StubPreprocessWorker:
         self.final = final
         self.cleaned = []
         self.drained_flags = []
+        self.aborted = []
+
+    def abort_request(self, rid):
+        self.aborted.append(rid)
 
     def has_pending_tensors(self, rid):
         return self.pending
@@ -151,9 +157,9 @@ class _StubPreprocessWorker:
         self.drained_flags.append(drained)
 
 
-def _pending_request():
+def _pending_request(streaming=True):
     return PendingRequest(
-        streaming=True,
+        streaming=streaming,
         input_modalities=["text"],
         output_modalities=["text"],
         profile=None,
@@ -275,63 +281,124 @@ def test_a_chunk_from_another_thread_wakes_the_stream_at_once():
         assert t_got - t_put < 0.05, f"chunk took {1000 * (t_got - t_put):.1f} ms"
 
 
-def test_collect_results_is_woken_by_the_completion(monkeypatch):
-    """The non-streaming wait sleeps on the same event as the stream, set when
-    the request completes; it does not ask to be woken for every chunk."""
-    from mstar.api_server import entrypoint
+class _Client:
+    """The ``Request`` that ``collect_results`` asks whether the client left;
+    counts the asks."""
 
-    # a backstop far longer than the bound below: only the wake can meet it
-    monkeypatch.setattr(entrypoint, "WAKE_BACKSTOP_S", 5.0)
+    def __init__(self, gone=False):
+        self.gone = gone
+        self.checks = 0
+
+    async def is_disconnected(self):
+        self.checks += 1
+        return self.gone
+
+
+def test_a_finish_from_another_thread_wakes_collect_results_at_once():
+    """A non-streaming handler sleeps on the same wake as a streaming one: the
+    finish reaches it at once, and while it waits the client's connection is
+    checked on the 100 ms backstop, not every few ms (polling each waiting
+    request every 5 ms held the event loop at a few hundred in flight)."""
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
-    req = _pending_request()
-    _register(server, "r5", req)
-    seen = {}
+    req = _pending_request(streaming=False)
+    _register(server, "r7", req)
+    client = _Client()
 
-    def producer():
-        time.sleep(0.2)
-        with server.request_lock:
-            seen["per_chunk"] = req.wake_per_chunk
-            req.chunks.append(ResultChunk(request_id="r5", modality="text", data=b"done"))
-            req.event.set()
-            req.notify()
-        seen["t"] = time.perf_counter()
+    async def _collect():
+        finished = []
 
-    threading.Thread(target=producer, daemon=True).start()
-    chunks = asyncio.run(server.collect_results("r5"))
-    took = time.perf_counter() - seen["t"]
+        def producer():
+            time.sleep(0.5)
+            with server.request_lock:
+                req.chunks.append(ResultChunk(request_id="r7", modality="text", data=b"done"))
+                req.event.set()
+                finished.append(time.perf_counter())
+                req.notify()
+
+        start = time.perf_counter()
+        threading.Thread(target=producer, daemon=True).start()
+        chunks = await server.collect_results("r7", client)
+        end = time.perf_counter()
+        return chunks, end - finished[0], end - start
+
+    chunks, lag, waited = asyncio.run(_collect())
     assert [c.data for c in chunks] == [b"done"]
-    assert seen["per_chunk"] is False
-    assert took < 0.05, f"completion took {1000 * took:.1f} ms"
+    assert lag < 0.05, f"the finish took {1000 * lag:.1f} ms to reach the handler"
+    assert client.checks <= waited / 0.1 + 1, f"{client.checks} disconnect checks in {waited:.2f} s"
+    assert "r7" not in server.pending_requests
 
 
-def test_the_message_thread_polls_on_the_socket_and_the_data_worker():
-    """Between passes the message thread waits at most 1 ms, ended early by
-    the communicator (a message, or the data worker's chunk signal)."""
-    from mstar.communication.event import EventWakeup
+def _feed_tokens(server, req, rid, every=0.02, until=3.0):
+    """The message thread's per-token path: a chunk and a ``notify_many`` every
+    ``every`` s, until the request leaves ``pending_requests`` (or ``until``)."""
+    from mstar.api_server.entrypoint import notify_many
 
-    class _Comm:
-        def __init__(self):
-            self.registered, self.polls = [], []
+    def run():
+        end = time.time() + until
+        while time.time() < end and rid in server.pending_requests:
+            with server.request_lock:
+                req.chunks.append(ResultChunk(request_id=rid, modality="text", data=b"t"))
+            notify_many([req])
+            time.sleep(every)
 
-        def register_event_for_poll(self, event):
-            self.registered.append(event)
+    threading.Thread(target=run, daemon=True).start()
 
-        def poll_for_messages(self, timeout_ms):
-            self.polls.append(timeout_ms)
 
+@pytest.mark.parametrize("generating", [False, True], ids=["idle", "generating"])
+def test_collect_results_still_releases_a_request_whose_client_left(generating):
+    """Also while the request keeps producing tokens: a wake per token must
+    not keep the handler from asking whether the client left."""
     pw = _StubPreprocessWorker()
-    pw.results_wakeup = EventWakeup()
     server = _api_server_stub(pw)
-    server.communicator = _Comm()
-    server._pass_wait()()
-    assert server.communicator.registered == [pw.results_wakeup]
-    assert server.communicator.polls == [1]
-    # without a poll to block on, the 1 ms sleep stays
-    server.communicator = object()
-    t0 = time.perf_counter()
-    server._pass_wait()()
-    assert time.perf_counter() - t0 >= 0.001
+    req = _pending_request(streaming=False)
+    _register(server, "r8", req)
+    if generating:
+        _feed_tokens(server, req, "r8")
+
+    start = time.perf_counter()
+    assert asyncio.run(server.collect_results("r8", _Client(gone=True))) == []
+    assert time.perf_counter() - start < 1.0
+    assert pw.aborted == ["r8"]
+    assert "r8" not in server.pending_requests
+
+
+@pytest.mark.parametrize("generating", [False, True], ids=["idle", "generating"])
+def test_collect_results_still_times_out(generating):
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    server.timeout_seconds = 0.3
+    req = _pending_request(streaming=False)
+    _register(server, "r9", req)
+    if generating:
+        _feed_tokens(server, req, "r9")
+
+    start = time.perf_counter()
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(server.collect_results("r9", _Client()))
+    assert time.perf_counter() - start < 1.5
+    assert e.value.status_code == 500
+    assert pw.aborted == ["r9"]
+    assert "r9" not in server.pending_requests
+
+
+def test_tokens_do_not_wake_a_handler_waiting_for_the_finish():
+    """``collect_results`` reads no chunk before the finish, so a chunk's
+    notification leaves its wake alone; the finish sets it."""
+    from mstar.api_server.entrypoint import notify_many
+
+    class _Loop:
+        def call_soon_threadsafe(self, fn, *args):
+            fn(*args)
+
+    req = _pending_request(streaming=False)
+    req.loop, req.wake, req.wake_on_finish = _Loop(), asyncio.Event(), True
+    notify_many([req])
+    req.notify()
+    assert not req.wake.is_set()
+    req.event.set()
+    notify_many([req])
+    assert req.wake.is_set()
 
 
 def test_notify_many_wakes_every_handler_with_one_loop_call():
