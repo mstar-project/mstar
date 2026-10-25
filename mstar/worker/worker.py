@@ -600,10 +600,10 @@ class Worker:
         self.tp_async_sched, self.tp_async_nodes = _tp_async_sched_setting(
             os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
         )
-        # Leader: monotonic seq stamped on every ScheduleTPNode it sends, and the
-        # followers it last sent one to, for a step with no rows.
+        # Leader: monotonic seq stamped on every ScheduleTPNode it sends, and each
+        # node's followers it last sent one to, for a step with no rows.
         self._tp_broadcast_seq = 0
-        self._tp_followers: list[str] = []
+        self._tp_followers: dict[str, list[str]] = {}
         # Follower: leader steps that will NOT be followed by a head; the
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
@@ -2105,10 +2105,10 @@ class Worker:
         ctx = node_batch.step_context
         if node_batch.request_ids:
             sample_rid = node_batch.request_ids[0]
-            self._tp_followers = self._graph_runtime.get_sharding_config(sample_rid).get_sharding_group(
-                node_batch.node_name, ctx.walk_of(sample_rid)
-            )._workers[1:]
-        workers = self._tp_followers
+            self._tp_followers[node_batch.node_name] = self._graph_runtime.get_sharding_config(
+                sample_rid
+            ).get_sharding_group(node_batch.node_name, ctx.walk_of(sample_rid))._workers[1:]
+        workers = self._tp_followers.get(node_batch.node_name, [])
         rebuild, request_ids, rebuild_ids = node_batch.rebuild_rids, node_batch.request_ids, []
         if rebuild:
             request_ids = [rid for rid in request_ids if rid not in rebuild]

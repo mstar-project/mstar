@@ -634,6 +634,7 @@ class _Leader:
         self.parallel_nodes = {"node"}
         self.parallel_leader_nodes = {"node"}
         self._tp_broadcast_seq = 0
+        self._tp_followers = {}
         self._victims = {}
         group = SimpleNamespace(_workers=["rank0", *followers])
         # The runtime owns both the sharding config and the handle table now.
