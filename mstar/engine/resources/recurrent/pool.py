@@ -24,6 +24,7 @@ from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitOutcome,
+    AdmitRuntimeError,
     AllocationFailed,
     Segment,
     StepContext,
@@ -288,14 +289,14 @@ class RecurrentStatePool(Resource):
                 # it neither reads nor writes its own slot
                 continue
             if self._alloc(segment.request_id, segment.label) is None:
-                return self._out_of_slots(segment.request_id, segment.label)
+                return self._out_of_slots(step, ctx, segment.request_id, segment.label)
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
                 continue
             for _, to_label in (*step.pre_forks, *step.post_forks):
                 if self._alloc(rid, to_label) is None:
-                    return self._out_of_slots(rid, to_label)
+                    return self._out_of_slots(step, ctx, rid, to_label)
         return ADMIT_OK
 
     def rollback_admit(self, step: RecurrentStep, ctx: StepContext) -> None:
@@ -318,7 +319,35 @@ class RecurrentStatePool(Resource):
                 self._zero_slot(index)
                 self._free.append(index)
 
-    def _out_of_slots(self, rid: str, label: str) -> AdmitOutcome:
+    def _out_of_slots(self, step: RecurrentStep, ctx: StepContext, rid: str, label: str) -> AdmitOutcome:
+        """The refusal, with how many of the step's real rows, in its order, come
+        before ``rid`` (``rows_fit``) and fit the pool with nothing else
+        resident (``rows_fit_alone``): a row needs a slot per label it addresses
+        and per fork target, so the worker sizes the retry from them. A first
+        row that does not fit alone never will, so that refusal is terminal."""
+        labels: dict[str, set[str]] = {}
+        for segment in step.segments or ():
+            if segment.span > 0 and not ctx.is_padding_row(segment.request_id):
+                labels.setdefault(segment.request_id, set()).add(segment.label)
+        for fork_rid in self._fork_rids(step):
+            if not ctx.is_padding_row(fork_rid):
+                labels.setdefault(fork_rid, set()).update(to for _, to in (*step.pre_forks, *step.post_forks))
+        rows = list(labels)
+        alone = held = 0
+        for row in rows:
+            held += len(labels[row])
+            if held > self.config.usable_slots:
+                break
+            alone += 1
+        if rows and alone == 0:
+            # the client reads this text, and the rid is the worker's handle
+            return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
+                message=(
+                    f"The request needs {len(labels[rows[0]])} recurrent state slots for this "
+                    f"step, more than the {self.config.usable_slots} the pool holds; raise max_slots."
+                ),
+                request_ids=frozenset({rows[0]}),
+            ))
         return AdmitOutcome(
             ok=False,
             reason=AllocationFailed(
@@ -330,6 +359,9 @@ class RecurrentStatePool(Resource):
                 pages_short=1,
                 label=label,
                 request_id=rid,
+                rows_fit=rows.index(rid) if rid in labels else None,
+                rows_fit_alone=alone,
+                rows_sized=len(rows),
             ),
         )
 
@@ -421,6 +453,12 @@ class RecurrentStatePool(Resource):
                 continue
             for from_label, to_label in step.post_forks:
                 self._apply_fork(rid, from_label, to_label)
+
+        for rid in step.release:
+            if not ctx.is_padding_row(rid):
+                # after this step's writes on the same stream; the request
+                # keeps its entry, and its next step takes a fresh slot
+                self.reset_request(rid, free=True)
 
     def _apply_fork(
         self, rid: str, from_label: str, to_label: str,

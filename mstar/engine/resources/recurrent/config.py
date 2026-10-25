@@ -322,7 +322,14 @@ class RecurrentStep(ResourceStep):
 
     Forks mirror ``KVStep``'s: ``(from_label, to_label)`` pairs, reserved at
     admit and copied at plan (pre) or commit (post).
+
+    ``release`` names requests whose slots, every label's, are zeroed and
+    handed back when this step commits, because nothing reads that state
+    again: a chunked encoder's attachment ends on this step. The request
+    stays in the pool, and a later step of it takes a fresh slot, reading
+    as empty.
     """
 
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+    release: frozenset[str] = frozenset()

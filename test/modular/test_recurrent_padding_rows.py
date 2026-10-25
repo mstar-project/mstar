@@ -145,3 +145,34 @@ def test_a_real_request_padding_and_release_across_the_rotation():
     assert pool.num_free_slots == 1
     pool.remove_request("r")
     assert pool.num_free_slots == 2
+
+
+def test_a_released_request_s_slots_are_freed_at_commit():
+    """``RecurrentStep.release`` zeroes and frees its requests' slots when the
+    step commits and leaves the other rows' alone. The request's next step,
+    planned a step ahead as the async worker plans one, takes a fresh slot
+    that reads as empty; removing a released request frees nothing twice."""
+    pool = build_pool(max_slots=4)  # 3 usable
+    eager = StepContext(request_ids=["a", "b"], graph_walk="decode", slot=0, capture=False)
+    step = decode_step(["a", "b"])
+    pool.admit(step, eager)
+    pool.plan(step, eager)
+    pool.scatter_("conv", torch.ones(2, 96, 3))
+    pool.commit(step, eager)
+    slot_a, slot_b = (pool._slots[r]["main"].index for r in ("a", "b"))
+
+    release_b = RecurrentStep(segments=step.segments, release=frozenset({"b"}))
+    pool.admit(release_b, eager)
+    pool.plan(release_b, eager)
+    pool.commit(release_b, eager)
+    assert pool.num_free_slots == 2
+    conv = pool.block("conv", 0)
+    assert not conv[slot_b].any() and bool((conv[slot_a] == 1).all())
+
+    ahead = StepContext(request_ids=["a", "b"], graph_walk="decode", slot=0, capture=False, is_preplan=True)
+    assert pool.admit(release_b, ahead).ok
+    assert pool.plan(release_b, ahead)["main"].has_state[:2].tolist() == [True, False]
+    pool.plan(release_b, eager)
+    pool.commit(release_b, eager)
+    pool.remove_request("b")
+    assert pool.num_free_slots == 2

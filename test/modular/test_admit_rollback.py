@@ -34,6 +34,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import (
+    AdmitRuntimeError,
     AllocationFailed,
     Segment,
     StepContext,
@@ -326,6 +327,28 @@ def test_a_refused_recurrent_admit_returns_the_slots_it_took():
     pool.rollback_admit(step, ctx)
 
     assert pool.num_free_slots == free
+
+
+def test_a_full_recurrent_pool_says_how_many_rows_fit():
+    """The worker sizes its retry from ``rows_fit`` and ``rows_fit_alone``."""
+    rids = ("a", "b", "c")
+    pool = _pool(max_slots=3)  # the sink plus 2 usable
+    for r in rids:
+        pool.ingest_request(r)
+    outcome = pool.admit(RecurrentStep(segments=tuple(Segment(r, "main", 4) for r in rids)), _ctx(*rids))
+    assert not outcome.ok
+    reason = outcome.reason
+    assert (reason.rows_fit, reason.rows_fit_alone, reason.rows_sized) == (2, 2, 3)
+
+
+def test_a_row_the_recurrent_pool_cannot_hold_alone_fails():
+    """A row needs a slot per label and per fork target; one that needs more
+    than the pool holds alone fails instead of retrying forever."""
+    pool = _pool(max_slots=2)  # the sink plus 1 usable
+    pool.ingest_request("a")
+    outcome = pool.admit(_forking_step(["a"]), _ctx("a"))
+    assert not outcome.ok
+    assert isinstance(outcome.reason, AdmitRuntimeError) and outcome.reason.request_ids == {"a"}
 
 
 def test_each_forking_request_fits_alone_after_a_refused_pair():

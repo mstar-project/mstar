@@ -616,7 +616,10 @@ The spec types are:
        addressing to fetch, and eager and captured steps reach the same slots. A row with
        no saved state (a request's first step, or a padding row) reads ``start``, zeros
        when none is given. ``gather`` / ``scatter_`` need the sink, so leave
-       ``disable_sink_slot`` unset. Parakeet's transducer decode is the example.
+       ``disable_sink_slot`` unset. Parakeet's transducer decode is the example. A
+       request holds its slots until it is removed, or until a step that names it in
+       ``RecurrentStep(release=...)`` commits; a later step of it then takes a fresh slot,
+       which reads as empty.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
