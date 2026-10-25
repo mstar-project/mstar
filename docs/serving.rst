@@ -404,7 +404,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
        kv_pinned_indptrs: true}``, or ``knobs: {pre_plan: false}``
-       (``whisper_large_v3_turbo.yaml``).
+       (``whisper_large_v3_turbo.yaml``). A platform can set its own knob defaults
+       (``Platform.knob_defaults``), which the config's ``knobs:`` block and an exported
+       variable both override.
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /

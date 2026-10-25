@@ -246,6 +246,10 @@ def test_only_rocm_turns_off_miopens_split_k_conv_solvers(solver):
         assert solver not in platform.process_env_defaults()
 
 
+def test_platform_knob_defaults_are_empty_but_for_rocm():
+    assert isinstance(RocmPlatform().knob_defaults(), dict)
+    for platform in (CudaPlatform(), XpuPlatform(), CpuPlatform()):
+        assert platform.knob_defaults() == {}
 @pytest.mark.parametrize("solver", MIOPEN_SPLIT_K)
 @pytest.mark.parametrize(("exported", "expected"), [(None, "0"), ("1", "1")])
 def test_the_miopen_solver_default_keeps_an_exported_value(monkeypatch, solver, exported, expected):
