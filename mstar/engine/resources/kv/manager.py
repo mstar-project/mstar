@@ -745,7 +745,7 @@ class KVManager(AttentionResource):
             )
             return False
         self._prefix_root = root
-        self._index = PrefixIndex(self._arena, one_rank=self._world_size == 1)
+        self._index = PrefixIndex(self._arena)
         # every rank counts the evictable set, since the ranks admit each step from the same room
         self._arena.index = self._index
         return True
@@ -1113,7 +1113,10 @@ class KVManager(AttentionResource):
         while chain.cursor < filled:
             key = fingerprint(self._prefix_root, chain.keys[chain.cursor])
             page = stream.page_indices[chain.cursor]
-            if not self._index.insert(key, page, parent):
+            # The index files a page under a parent only something else holds. Above one rank the owner counts can
+            # differ between ranks, so only a parent this stream holds is offered there.
+            held = chain.cursor > 0 and stream.page_indices[chain.cursor - 1] == parent
+            if not self._index.insert(key, page, parent if self._world_size == 1 or held else None):
                 # another request filled this page first and its copy is the
                 # one the index names; ours stays private to this stream
                 page = self._index.page_for(key)

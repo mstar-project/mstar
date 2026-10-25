@@ -20,9 +20,8 @@ if TYPE_CHECKING:
 
 
 class PrefixIndex:
-    def __init__(self, arena: "PageArena", one_rank: bool = True) -> None:
+    def __init__(self, arena: "PageArena") -> None:
         num_pages = arena.allocator.max_num_pages
-        self._one_rank = one_rank
         self._arena = arena
         self._by_key: dict[bytes, int] = {}
         self._key: list[bytes | None] = [None] * num_pages
@@ -50,11 +49,9 @@ class PrefixIndex:
                 self._stamp[page] = self._clock
 
     def insert(self, key: bytes, page: int, parent: int | None = None) -> bool:
-        """Name ``page`` by ``key`` under ``parent``; the first writer wins. At one rank, when the arena reports
-        to this index and the index alone holds ``parent``, ``page`` is filed with no parent. Filed under
-        ``parent``, a held ``page`` would keep `evict` from freeing ``parent``, which the pool counts as
-        evictable. Above one rank the owner counts can differ between ranks, so every page is filed under its
-        parent."""
+        """Name ``page`` by ``key`` under ``parent``; the first writer wins. When the arena reports to this
+        index and the index alone holds ``parent``, ``page`` is filed with no parent. Filed under ``parent``,
+        a held ``page`` would keep `evict` from freeing ``parent``, which the pool counts as evictable."""
         assert parent is None or self._key[parent] is not None, (
             f"page {page} indexed under parent page {parent}, which the index "
             "does not hold; a parent must outlive its children"
@@ -66,7 +63,7 @@ class PrefixIndex:
             f"indexed under {self._key[page].hex()[:16]}; evicting one entry "
             "would free a page the other still names"
         )
-        if parent is not None and self._one_rank and self._arena.index is self and self._arena.num_owners[parent] == 1:
+        if parent is not None and self._arena.index is self and self._arena.num_owners[parent] == 1:
             parent = None
         self._clock += 1
         self._by_key[key] = page
