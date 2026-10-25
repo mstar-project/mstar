@@ -420,7 +420,7 @@ def test_pi05_process_prompt_tokenizes_openpi_text():
         "Put_the Cup\naway", ["image", "text"], ["action"], robot_state=[0.5, -1.2, 1.0],
     )
     assert seen == ["Task: Put the Cup away, State: 192 -1 255;\nAction: "]
-    assert result["text_inputs"][0].tolist() == [2, 7, 9]
+    assert result.new_input_tensors["text_inputs"][0].tolist() == [2, 7, 9]
 
 
 # ----------------------------------------------------------------------
