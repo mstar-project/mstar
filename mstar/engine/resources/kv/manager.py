@@ -3744,6 +3744,7 @@ class KVManager(AttentionResource):
             int(state.total_tokens),
         )
 
+    @torch.compiler.disable
     def layer_view(self, layer_idx: int=None) -> torch.Tensor:
         """layer pages as needed by attention kernel
 
