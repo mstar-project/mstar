@@ -409,9 +409,11 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     (template,) = prefill_cfg.get_node_inputs(1, 4)
     assert template.tensor_inputs["ts_rules"].tolist() == inactive_state()
     assert template.tensor_inputs["encoder_states"].shape[0] == cfg.max_source_positions
-    # a replay's padding rows are stacked with real prefill rows, whose rule state is on the host
-    _, meta_prefill = sub.get_accelerator_graph_configs(torch.device("meta"))
+    # a replay's padding rows are stacked with real rows: a prefill row's rule
+    # state is on the host, a decode row's on the device
+    meta_decode, meta_prefill = sub.get_accelerator_graph_configs(torch.device("meta"))
     assert meta_prefill.get_node_inputs(1, 4)[0].tensor_inputs["ts_rules"].device.type == "cpu"
+    assert meta_decode.single_request_inputs.tensor_inputs["ts_rules"].device.type == "meta"
     # prompt buckets give every row 3 to 8 tokens
     assert all(3 * bs <= n <= 8 * bs for bs in (1, 2, 32) for n in prefill_cfg.get_total_tokens(bs))
     assert prefill_cfg.get_total_tokens(32) == [128]

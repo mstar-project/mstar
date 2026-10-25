@@ -335,8 +335,10 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=1,
-                    # the timestamp rule state rides along as a staged row
-                    tensor_inputs={"ts_rules": torch.tensor(inactive_state(), device=device)},
+                    # the timestamp rule state rides along as a staged row,
+                    # on the device like a real decode row's: padding rows
+                    # are stacked with those in `preprocess`
+                    tensor_inputs={"ts_rules": self._inactive_rules(device)},
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
