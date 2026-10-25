@@ -923,7 +923,14 @@ class Worker:
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
         if drained:
             self.scheduler.fail_rids({request_id})
-            self._process_unprocessed(body.request_id)
+            # its parked inputs are never read, so they are ACKed unread as for a removed request
+            parked = self._unprocessed_messages.pop(body.request_id, [])
+            for message in parked:
+                if message.message_type == WorkerMessageType.INPUT_SIGNALS:
+                    self._drop_for_removed(message)
+            rest = [message for message in parked if message.message_type != WorkerMessageType.INPUT_SIGNALS]
+            if rest:
+                self._process_message_list(rest)
             return
 
         # Create StreamBuffers for consumer connections on this worker. A request
@@ -977,8 +984,8 @@ class Worker:
     def _mark_removed(self, wire_rid: str) -> None:
         """Remember a request that will not be admitted here again, and drop
         what was parked for it. Clears the wire-keyed drain state too: a
-        request drained before its NEW_REQUEST (which was then refused) is
-        never admitted, so no later teardown would."""
+        request whose DRAIN and REMOVE arrive with no NEW_REQUEST between them
+        is never taken in, so no later teardown would."""
         self._draining_rids.discard(wire_rid)
         self._pending_drains.discard(wire_rid)
         self._reads_done_sent.discard(wire_rid)
