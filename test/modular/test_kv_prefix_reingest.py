@@ -17,8 +17,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
@@ -56,7 +57,7 @@ def _manager() -> KVManager:
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    kv.enable_prefix_cache(b"a root", walks={"main": (WALK,)})
+    kv.enable_prefix_cache(b"a root", walks={"main": KeyedWalks(writes=(WALK,))})
     return kv
 
 
@@ -65,7 +66,7 @@ def _config(n_tokens: int) -> KVReqConfig:
     keys = chain([tokens[at:at + PAGE_SIZE] for at in range(0, n_tokens, PAGE_SIZE)])
     return KVReqConfig(
         prefix_keys={"main": keys},
-        prefix_layout={"main": [PrefixSpan(n_tokens, n_tokens, WALK)]},
+        kv_layout={"main": StreamLayout(spans=(PrefixSpan(n_tokens, n_tokens, WALK),), keyed_spans=1)},
     )
 
 
@@ -87,6 +88,7 @@ def test_a_repeat_ingest_keeps_a_dropped_chain_dropped():
 
     # the second partition's NewRequest
     kv.ingest_request(RID, config)
+    assert kv._streams[RID]["main"].chain is None
     _step(kv, PAGE_SIZE, WALK)
 
     assert kv._streams[RID]["main"].chain is None
