@@ -23,6 +23,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
@@ -302,7 +303,7 @@ def test_a_stream_with_no_window_indexes_every_page_it_fills():
 
 # ── a walk the keys never described ─────────────────────────────────────
 
-WALKS = {"main": ("prefill_text", "decode")}
+WALKS = {"main": KeyedWalks(("prefill_text",), ("decode",))}
 
 
 def _first_write(walk: str) -> KVManager:

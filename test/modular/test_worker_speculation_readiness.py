@@ -1,4 +1,4 @@
-"""A speculative step carries a request onto the next node only once the next node would run the request.
+"""A speculative step carries a request onto the next node only once that node's readiness check passes.
 
 Otherwise the request reaches that node's admit without a readiness check, so it never joins
 the node's KV pool queue and holds no allotment there. A request left out of the

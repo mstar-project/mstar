@@ -487,6 +487,27 @@ def test_ack_unread_tensors_lets_producer_reclaim_buffer():
         assert not os.path.isfile(shm_path)  # reclaimed -> no leak
 
 
+def test_a_worker_acks_unread_tensors_under_the_wire_id():
+    """A worker installs a handle-to-string ``rid_to_str``, and a removed
+    request has no handle, so the unread ack must carry the wire id as is."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        producer = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        edges, uuid = _produce_registered_output(producer, "req1")
+
+        consumer = _make_manager(tmpdir, entity_id="worker_1")
+
+        def _released(handle):
+            raise KeyError(f"no live request has handle {handle}")
+
+        consumer.rid_to_str = _released
+        consumer.ack_unread_tensors("req1", edges)
+
+        [(entity_id, msg)] = consumer.communicator.sent
+        assert entity_id == "worker_0"
+        assert msg.body.request_id == "req1"
+        assert msg.body.successful_tensors == {uuid: 1}
+
+
 # ---------------------------------------------------------------------------
 # Teardown: cleanup_request (soft) vs force_cleanup_request (hard) + drain gate
 # ---------------------------------------------------------------------------
@@ -884,6 +905,33 @@ def test_host_copy_follows_a_renamed_output():
             cpu_tensors={7: {"new_token": [host]}},
         )
         assert mgr.tensor_store.get_cpu_tensor(stored.flat_uuids[0]) is host
+
+
+def test_a_tensor_sent_after_its_step_is_read_from_its_own_memory():
+    """A loop's accumulated output is stored on its own iteration and sent when
+    the loop ends. Its host copy is a view of a buffer every later step writes
+    over, so the worker drops host copies once a step's sends are done and the
+    late send reads each step's own tensor."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sender = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        receiver = _make_manager(tmpdir, entity_id="worker_1", request_id="req1")
+        reused = torch.empty(1, 4)  # the producer's host buffer, rewritten every step
+        infos = []
+        for step in range(3):
+            out = torch.full((1, 4), float(step))
+            reused.copy_(out)
+            infos += sender.store_and_return_tensor_info(
+                "req1", {"pred": [out]}, cpu_tensors={"pred": [reused]},
+            )["pred"]
+            sender.drop_host_copies()
+            assert sender.tensor_store.get_cpu_tensor(infos[-1].uuid) is None
+
+        edges = [GraphEdge(next_node="client", name="pred", tensor_info=infos)]
+        sender.register_for_send("req1", infos)
+        receiver.start_read_tensors("req1", edges, graph_walk="rollout")
+        receiver.get_ready_tensors(graph_walk="rollout")
+        got = [receiver.get_tensor(info.uuid) for info in infos]
+        assert [t.flatten().tolist() for t in got] == [[float(k)] * 4 for k in range(3)]
 
 
 def test_host_copies_not_kept_for_device_transports():

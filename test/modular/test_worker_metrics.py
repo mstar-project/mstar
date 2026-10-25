@@ -327,6 +327,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
     w.tp_async_sched, w.is_tp_follower = False, False
+    w.parallel_nodes, w.parallel_leader_nodes = set(), set()
     w._in_flight_rids, w._rebuild_rows, w._dropped, w._victims, w._preempted = set(), {}, {}, {}, {}
     w._logged_pools = []
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
@@ -670,6 +671,8 @@ def test_the_worker_process_hands_the_interval_to_the_worker(monkeypatch):
     built = []
 
     class _Worker:
+        tensor_manager = SimpleNamespace(names_unique_per_launch=False)  # owns no files
+
         def __init__(self, **kwargs):
             built.append(kwargs)
 
@@ -678,7 +681,7 @@ def test_the_worker_process_hands_the_interval_to_the_worker(monkeypatch):
 
     monkeypatch.setattr(worker_mod, "Worker", _Worker)
     monkeypatch.setattr(conductor_mod, "apply_process_env_defaults", lambda: None)
-    monkeypatch.setattr(conductor_mod, "_exit_when_orphaned", lambda worker_id: None)
+    monkeypatch.setattr(conductor_mod, "_exit_when_orphaned", lambda *a, **k: None)
     monkeypatch.setattr(conductor_mod.signal, "signal", lambda *a: None)
     monkeypatch.setattr(conductor_mod.logging, "basicConfig", lambda **k: None)
     conductor_mod._worker_process_target(

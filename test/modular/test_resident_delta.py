@@ -37,6 +37,7 @@ from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig,
 from mstar.engine.resources.kv.manager import Allotment, KVManager
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import FULL_ADMIT_OK, Segment, StepContext
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     Move,
     MoveKind,
@@ -785,7 +786,7 @@ def _oom(rank, referenced_rids=frozenset()):
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
-    node_batch = SimpleNamespace(node_name="node", failed_resource=None)
+    node_batch = SimpleNamespace(node_name="node", failed_resource=None, admit_error=None)
     rank._handle_allocation_failure(batch, node_batch, referenced_rids)
 
 
@@ -971,6 +972,7 @@ class _ForwardingLeader:
     _remove_request = Worker._remove_request
     _removal_step_reached = Worker._removal_step_reached
     _rid = Worker._rid
+    _mark_removed = Worker._mark_removed
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False
@@ -989,6 +991,8 @@ class _ForwardingLeader:
         self._draining_rids: set[str] = set()
         self._pending_drains: set[str] = set()
         self._reads_done_sent: set[str] = set()
+        self._removed_rids: RecentSet[str] = RecentSet(16)
+        self._unprocessed_messages: dict = {}
         group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
         # The runtime owns the handle table and the sharding config now, and
         # ``remove_request`` there is what frees the handle.

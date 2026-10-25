@@ -96,6 +96,13 @@ class CachedPrefix(NamedTuple):
     position: int
 
 
+class KeyedWalks(NamedTuple):
+    """A keyed label's walks, as a resource's prefix cache takes them: the walks whose
+    writes are keyed, and the growth walks whose sampled ids extend the keys."""
+    writes: tuple[str, ...]
+    growth: tuple[str, ...] = ()
+
+
 class MoveKind(IntEnum):
     """A kind of move that rank 0 of a TP node makes on a request and each TP follower replays."""
     OFFLOAD = 0
@@ -105,6 +112,7 @@ class MoveKind(IntEnum):
     EARMARK = 4
     DROP = 5
     REBUILD = 6
+    ALLOT = 7
 
 
 class Resource(ABC):
@@ -124,14 +132,9 @@ class Resource(ABC):
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
-    def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
-    ) -> bool:
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
         """Open whatever this resource keeps across requests, under ``root``;
-        True if anything opened.
-
-        ``walks`` names, per label, the walks that write the keyed stream.
-        """
+        True if anything opened."""
         return False
 
     def resolve_cached_prefix(

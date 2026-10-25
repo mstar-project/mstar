@@ -36,7 +36,7 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -909,7 +909,9 @@ class Engine:
                     if mark is not None:
                         parts.append(mark)
             opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
-                label: (*kv_label.keys.walks, *(walk for walk, _ in kv_label.growth if kv_label.keys.growth))
+                label: KeyedWalks(
+                    kv_label.keys.walks, tuple(walk for walk, _ in kv_label.growth if kv_label.keys.growth),
+                )
                 for label, kv_label in declared.get(key, {}).items()
             })
             if not opened or not declared.get(key):
@@ -2241,7 +2243,7 @@ class Engine:
         rather than scan it again forever.
         """
         if not self.is_resident(node_name, request_id):
-            if not allow_reload:
+            if not allow_reload or not self.is_offloaded(node_name, request_id):
                 return FULL_ADMIT_NOT_READY
             if not self.reload_request(node_name, request_id):
                 return FULL_ADMIT_NOT_READY
@@ -2533,10 +2535,6 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction and resource.is_offloaded(request_id)
         ]
-        if not offloaded:
-            # A dropped request, which `check_ready` sends here, has nothing offloaded, and `all()` over
-            # nothing would report it reloaded.
-            return False
         # check every resource fits first, so a refusal doesn't reload and re-offload whatever did
         if not all(resource.can_reload(request_id) for resource in offloaded):
             return False

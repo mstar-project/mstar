@@ -131,6 +131,7 @@ def _rank(
     w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
+    w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
     w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}, {}
     w._logged_pools = []

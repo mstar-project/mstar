@@ -367,7 +367,7 @@ class KVReqConfig(ResourceReqConfig):
         return ["main"]
 
     def opened_labels(self, nodes: Collection[str] | None = None) -> set[str]:
-        """The labels the request opens on ``nodes``, or on any node."""
+        """The labels the request opens on ``nodes``, or on every node when ``nodes`` is None."""
         labels = set(self.needed_labels or ["main"])
         for node, named in self.needed_labels_per_node.items():
             if nodes is None or node in nodes:
@@ -434,8 +434,8 @@ def mark_guaranteed(
 
 
 def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, ResourceReqConfig]:
-    """Only the ingest reads the layouts, caps and prompt ids, so they are dropped
-    before the configs go out with every frame between workers."""
+    """Only the worker reads the layouts, caps and prompt ids, when it ingests the NewRequest, so
+    they are dropped before the configs go out with every frame between workers."""
     return {
         key: replace(config, kv_layout=None, loop_caps=None, prompt_ids=None) if isinstance(config, KVReqConfig)
         else config
@@ -446,7 +446,7 @@ def without_layouts(configs: Mapping[str, ResourceReqConfig]) -> dict[str, Resou
 class KVSpec(NodeResourceSpec):
     config: KVConfig
     # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
-    # more per request than the leader's pool, as long as the leader offloads nothing.
+    # more pages per request than the leader's, as long as the leader offloads nothing.
     leader: str | None = None
 
     @property

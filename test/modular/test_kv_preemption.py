@@ -87,7 +87,7 @@ def test_a_dropped_request_rejoins_the_queue_at_its_arrival():
 
 
 def _short(kv, rid: str) -> int:
-    """``rid``'s next token, which needs a page past its allotment. Returns the pages it is short."""
+    """Step ``rid``'s next token, which needs a page past its allotment, and return how many pages ``rid`` is short."""
     outcome = _step(kv, rid, 1)
     assert not outcome.ok
     return outcome.reason.pages_short
@@ -121,7 +121,7 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     assert kv.waits("r") == (then != "drops itself"), "r waits only when it can't drop itself"
     if then == "waits, then is dropped":
         kv.drop("r")
-        # readmitting r takes the rest of the room, so the room is no larger than when r first waited
+        # readmitting r takes the rest of the room, so only the drop can end r's wait
         assert kv.readmit("r", 4 * PAGE_SIZE) and not kv.waits("r"), "r's wait for room outlived its drop"
     elif then == "waits":
         kv.remove_request("older")
@@ -221,3 +221,14 @@ def test_a_guaranteed_lease_of_pages_another_request_holds_gives_their_charge_ba
     kv.apply_cached_prefix("g", NODE, WALK, inputs, kv.resolve_cached_prefix("g", NODE, WALK, inputs))
     leased = len(kv._streams["g"]["main"].lease or ())
     assert leased and kv._room() == room + leased, "g's charge for the pages it leases stayed out of the room"
+
+
+@pytest.mark.parametrize("decides", [True, False])
+def test_only_a_deciding_pool_keeps_a_guaranteed_request_from_the_offload(decides):
+    kv = _pool()
+    _running(kv, "p", 2, arrival=0)
+    _running(kv, "g", 2, arrival=1, guaranteed=True)
+    kv._decides = decides
+    # Only a deciding pool reserves a guaranteed request's pages and drops requests to free room.
+    # Any other pool frees room only through the offload, which has to be able to take any request.
+    assert kv.reclaimable("p") and bool(kv.reclaimable("g")) is not decides, "the offload saw the wrong class"

@@ -329,26 +329,27 @@ a page only the prefix index holds counts as a page the request takes. A request
 can't fit in its pool at its full output length gets a 400 if it asked for that length,
 and otherwise has the model's default length cut until it fits. A request that can be
 rebuilt reserves only its prompt, so a decode step can find no page outside the reservations. The
-worker then drops the newest requests it can rebuild from their token ids and gives their
-pages to the request that ran short. A dropped request waits at its place in the queue
-until its history and one more page fit, then recomputes its KV in one prefill row. A
+worker then moves the least recently active request to the host if ``cpu_offload_pages`` has
+room for it. Otherwise it drops the newest requests it can rebuild from their token ids. Either
+way, the request that ran short gets the pages freed, up to its shortage, unless it was the request
+moved to the host or dropped. A dropped request waits at its place in the queue until its history and
+one more page fit, then recomputes its KV in one prefill row. A
 request that streams audio out, or holds KV made from media or another node's outputs,
 reserves its whole footprint in every pool, with every cache hit counted, and is never
-dropped. So does a request in the pools of a node that keeps no token ids to rebuild it.
+dropped or moved to the host. So does a request in the pools of a node that keeps no token ids to rebuild it.
 Voice requests then queue when the pool is short and are never preempted mid-stream.
 
 Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before
 the step that follows, so every rank admits each step from the same reservations.
-A request that runs short and can't be dropped waits for room when dropping
-newer requests wouldn't cover its shortage. That is the case for every request under
+A request that runs short and can't be dropped waits for room when nothing can be offloaded and
+dropping newer requests wouldn't cover its shortage. That is the case for every request under
 ``MSTAR_SAMPLER_INGRAPH_SCATTER=1``, since the sampler then refuses every drop. Several such
 requests can wait on each other.
 ``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
 pool's pages divided by the pages one request needs, prompt and output together, is a
-safe value. ``cpu_offload_pages`` moves a request to the host only where a full pool holds
-its requests. Where the worker drops requests, or a request waits for room, nothing is
-offloaded. An offload frees only the device pages no other running request reads, though, so
-a request that shares most of its prompt frees little.
+safe value. ``cpu_offload_pages`` lets a full pool move a request to the host, and an offload
+comes before any drop. An offload frees only the device pages no other running request reads,
+though, so a request that shares most of its prompt frees little.
 Offload helps a pool that runs short now and then. It doesn't replace the cap.
 
 **Single GPU.** Everything on rank 0:
