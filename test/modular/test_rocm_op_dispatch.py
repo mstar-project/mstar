@@ -33,6 +33,9 @@ _DISPATCHES = (
     rope_ops._rope,
     sampler_utils._top_p_sampling_from_probs,
     sampler_utils._top_k_top_p_sampling_from_probs,
+    sampler_utils._sampling_from_probs,
+    sampler_utils._top_k_renorm_probs,
+    sampler_utils._top_p_renorm_probs,
 )
 
 
@@ -72,9 +75,24 @@ def _fake_flashinfer(rec: _Recorder, rocm: bool, seeded: bool = True) -> types.M
     def unseeded(probs, top_k, top_p, deterministic=True):
         return "drawn"
 
+    def sampling_from_probs(probs, deterministic=True, seed=None, offset=None):
+        rec.calls.append(("sampling.from_probs", (probs,), dict(seed=seed, offset=offset)))
+        return "drawn"
+
+    def top_k_renorm_probs(probs, top_k):
+        rec.calls.append(("sampling.top_k_renorm", (probs, top_k), {}))
+        return probs
+
+    def top_p_renorm_probs(probs, top_p):
+        rec.calls.append(("sampling.top_p_renorm", (probs, top_p), {}))
+        return probs
+
     fi.sampling = types.SimpleNamespace(
         top_p_sampling_from_probs=top_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs=top_k_top_p_sampling_from_probs if seeded else unseeded,
+        sampling_from_probs=sampling_from_probs,
+        top_k_renorm_probs=top_k_renorm_probs,
+        top_p_renorm_probs=top_p_renorm_probs,
     )
     if rocm:
         fi.rocm = types.ModuleType("flashinfer.rocm")
@@ -386,6 +404,45 @@ def test_amd_sampling_runs_outside_dynamo(stack):
 
     def step(probs):
         return sampler_utils._top_p_sampling_from_probs(probs, None, seed=None, offset=None) * 2
+
+    torch._dynamo.reset()
+    out = torch.compile(step, backend="eager")(torch.ones(3))
+    assert torch.equal(out, torch.full((3,), 4.0)) and seen == [False]
+
+
+@pytest.mark.parametrize("platform", [CudaPlatform(), RocmPlatform()], ids=repr)
+def test_the_filtered_draw_reaches_flashinfers_kernels(stack, platform):
+    """Off the fused filter's path, the HF-order draw renorms and draws with
+    FlashInfer's kernels, the fork's on AMD."""
+    rec = stack(platform, rocm_fork=platform.is_rocm())
+    probs = torch.full((2, 8), 0.125)
+    seed, offset = torch.zeros(2, dtype=torch.long), torch.ones(2, dtype=torch.long)
+    order = sampler_utils.FilterOrder(
+        top_p_first=torch.tensor([True, False]), min_keep=torch.ones(2, dtype=torch.int32),
+    )
+    out = sampler_utils._filter_floor_and_draw(
+        probs, torch.full((2,), 4), torch.full((2,), 0.5), seed, offset, None, order,
+    )
+    assert out == "drawn"
+    assert [name for name, _, _ in rec.calls] == [
+        "sampling.top_k_renorm", "sampling.top_p_renorm", "sampling.top_k_renorm", "sampling.from_probs",
+    ]
+    assert rec.calls[-1][2] == {"seed": seed, "offset": offset}
+
+
+def test_amd_renorms_run_outside_dynamo(stack):
+    stack(RocmPlatform())
+    seen = []
+
+    def renorm(probs, top_k):
+        seen.append(torch.compiler.is_compiling())
+        return probs + 1
+
+    sys.modules["flashinfer"].sampling.top_k_renorm_probs = renorm
+    sampler_utils._top_k_renorm_probs._resolve()
+
+    def step(probs):
+        return sampler_utils._top_k_renorm_probs(probs, 2) * 2
 
     torch._dynamo.reset()
     out = torch.compile(step, backend="eager")(torch.ones(3))
