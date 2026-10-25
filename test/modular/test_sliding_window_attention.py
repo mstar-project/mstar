@@ -73,10 +73,10 @@ class SlidingWindowTests(unittest.TestCase):
 
     def test_unbounded_dense_backend_and_fallback_are_unchanged(self):
         module = "mstar.engine.resources.attn.dense"
-        with patch(f"{module}._fa3_unavailable_reason", return_value=None), \
+        with patch(f"{module}._varlen_unavailable_reason", return_value=None), \
                 patch(f"{module}.DenseAttentionManager") as constructor:
             self.assertIs(build_manager(None, backend=AttnBackend.DENSE), constructor.return_value)
-        with patch(f"{module}._fa3_unavailable_reason", return_value="test"), \
+        with patch(f"{module}._varlen_unavailable_reason", return_value="test"), \
                 patch(f"{module}._warn_dense_fallback"):
             manager = build_manager(None, backend=AttnBackend.DENSE)
         self.assertIsInstance(manager, FlashInferManager)
