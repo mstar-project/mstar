@@ -55,9 +55,10 @@ class FusedMoEBackend:
         alignment=None,
     ) -> torch.Tensor:
         """``(tokens, hidden)`` sum of the ``top_k`` experts' outputs, each
-        scaled by its routing weight. ``skip_invalid`` and ``alignment`` are
-        ``fused_experts``'s: the EP sentinel, and a block alignment the router
-        already computed."""
+        scaled by its routing weight. With ``skip_invalid``, ``topk_ids`` may
+        hold the id ``E`` (one past the last expert), and those slots add
+        nothing. ``alignment`` is a block alignment the router already computed
+        (``fused_experts``'s)."""
         raise NotImplementedError
 
     def __repr__(self) -> str:
