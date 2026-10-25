@@ -2935,34 +2935,33 @@ class KVManager(AttentionResource):
         (label,) = overrides.prompt_ids
         prompt, page_size = ids[:-1], self.config.page_size
         length = len(prompt)
-        pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
+        layout = overrides.kv_layout[label]
+        ((loop, slots),) = layout.growth
+        # Only this call replaces `rid`'s overrides, so the spans and keys are worked out before the lock, as
+        # `resolve_cached_prefix` hashes outside it.
+        _, spans = self._rebuilt_spans(rid, length)
+        grown = sum(span.length for span in spans) - sum(span.length for span in layout.spans)
         keyed = bool((overrides.prefix_keys or {}).get(label))
-        media = any(span.kind == "digest" for span in overrides.kv_layout[label].spans)
-        # hashed before the lock, as `resolve_cached_prefix` hashes outside it
-        keys = chain(pages) if keyed and not media else None
+        changes = {}
+        if keyed and any(span.kind == "digest" for span in layout.spans):
+            # Extend the keys by the samples, as the decode steps that sampled them did, and key the last
+            # partial page as a prompt's last page.
+            extended = PrefixChain.seed(
+                overrides.prefix_keys[label], list(overrides.prefix_tail[label]), layout.spans, page_size,
+            )
+            extended.extend(list(prompt[length - grown:]), page_size)
+            keys = extended.keys[:extended.keyed_pages]
+            if extended.unkeyed:
+                keys.append(page_key(keys[-1] if keys else b"", extended.unkeyed, extended.unkeyed_items))
+            changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
+            changes["prefix_tail"] = {**overrides.prefix_tail, label: extended.unkeyed}
+        elif keyed:
+            pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
+            changes["prefix_keys"] = {**overrides.prefix_keys, label: chain(pages)}
+            changes["prefix_tail"] = {
+                **(overrides.prefix_tail or {}), label: list(pages[-1]) if length % page_size else [],
+            }
         with self._lock:
-            _, spans = self._rebuilt_spans(rid, length)
-            layout = overrides.kv_layout[label]
-            ((loop, slots),) = layout.growth
-            grown = sum(span.length for span in spans) - sum(span.length for span in layout.spans)
-            changes = {}
-            if keyed and media:
-                # Extend the keys by the samples, as the decode steps that sampled them did, and key the last
-                # partial page as a prompt's last page.
-                extended = PrefixChain.seed(
-                    overrides.prefix_keys[label], list(overrides.prefix_tail[label]), layout.spans, page_size,
-                )
-                extended.extend(list(prompt[length - grown:]), page_size)
-                keys = extended.keys[:extended.keyed_pages]
-                if extended.unkeyed:
-                    keys.append(page_key(keys[-1] if keys else b"", extended.unkeyed, extended.unkeyed_items))
-                changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
-                changes["prefix_tail"] = {**overrides.prefix_tail, label: extended.unkeyed}
-            elif keyed:
-                changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
-                changes["prefix_tail"] = {
-                    **(overrides.prefix_tail or {}), label: list(pages[-1]) if length % page_size else [],
-                }
             self._overrides[rid] = replace(
                 overrides,
                 kv_layout={
