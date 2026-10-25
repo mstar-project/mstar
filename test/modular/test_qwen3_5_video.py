@@ -214,7 +214,7 @@ def sampled(video: torch.Tensor, fps: float, video_processor) -> tuple[torch.Ten
     (`test_mp4_matches_processor` checks the decode itself)."""
     from transformers.video_utils import VideoMetadata
 
-    from mstar.model.base import video_metadata_dict
+    from mstar.model.components.media_io import video_metadata_dict
 
     metadata = VideoMetadata(total_num_frames=video.shape[0], fps=fps)
     indices = video_processor.sample_frames(
