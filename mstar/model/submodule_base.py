@@ -464,6 +464,13 @@ class ModelInputsFromEngine:
     # ``capture_forward_method``, so most submodules never need this.
     captured: bool = False
 
+    # Every row is a dummy request (CUDA-graph capture or warmup), not real traffic.
+    synthetic: bool = False
+
+    # Real requests' token count; they lead the batch, later rows are replay padding.
+    # None: no padding.
+    real_seq_len: int | None = None
+
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 

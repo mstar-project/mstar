@@ -108,50 +108,56 @@ def flatten_messages(
             return
         parts.append(PromptPart(modality="text", text=text, role=role))
 
-    for msg in messages or []:
-        # Messages may be pydantic ChatMessage objects or plain dicts.
-        if isinstance(msg, dict):
-            role, content = msg.get("role"), msg.get("content")
-        else:
-            role, content = getattr(msg, "role", None), getattr(msg, "content", None)
-        if role == "developer":  # OpenAI's newer name for system
-            role = "system"
-        elif role not in ("system", "user", "assistant"):
-            raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
-        if content is None:
-            continue
-        if isinstance(content, str):
-            if content:
-                add_text(content, role)
-            continue
-        for part in content:
-            if not isinstance(part, dict):
+    try:
+        for msg in messages or []:
+            # Messages may be pydantic ChatMessage objects or plain dicts.
+            if isinstance(msg, dict):
+                role, content = msg.get("role"), msg.get("content")
+            else:
+                role, content = getattr(msg, "role", None), getattr(msg, "content", None)
+            if role == "developer":  # OpenAI's newer name for system
+                role = "system"
+            elif role not in ("system", "user", "assistant"):
+                raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
+            if content is None:
                 continue
-            ptype = part.get("type")
-            if ptype == "text":
-                if part.get("text"):
-                    add_text(part["text"], role)
-            elif ptype == "image_url":
-                url = (part.get("image_url") or {}).get("url", "")
-                if url:
-                    mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "image", path)
-            elif ptype == "video_url":  # extension for video-capable models
-                url = (part.get("video_url") or {}).get("url", "")
-                if url:
-                    mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "video", path)
-            elif ptype == "audio_url":  # data:/http audio input (vllm-omni content style)
-                url = (part.get("audio_url") or {}).get("url", "")
-                if url:
-                    mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "audio", path)
-            elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
-                ia = part.get("input_audio") or {}
-                data, fmt = ia.get("data"), ia.get("format", "wav")
-                if data:
-                    mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
-                    add_file(mod, path)
+            if isinstance(content, str):
+                if content:
+                    add_text(content, role)
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    if part.get("text"):
+                        add_text(part["text"], role)
+                elif ptype == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    if url:
+                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
+                        add_file(mod or "image", path)
+                elif ptype == "video_url":  # extension for video-capable models
+                    url = (part.get("video_url") or {}).get("url", "")
+                    if url:
+                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
+                        add_file(mod or "video", path)
+                elif ptype == "audio_url":  # data:/http audio input in an ``audio_url`` content part
+                    url = (part.get("audio_url") or {}).get("url", "")
+                    if url:
+                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
+                        add_file(mod or "audio", path)
+                elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
+                    ia = part.get("input_audio") or {}
+                    data, fmt = ia.get("data"), ia.get("format", "wav")
+                    if data:
+                        mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
+                        add_file(mod, path)
+    except BaseException:
+        # A refused chat is never submitted, so no deferred cleanup covers
+        # the attachments saved before the refusal.
+        media_io.remove_uploads(file_paths, upload_dir)
+        raise
 
     text_parts = [p.text for p in parts if p.modality == "text"]
     text = "\n".join(text_parts) if text_parts else None
@@ -434,7 +440,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 
 
 class Qwen3_5Adapter(OpenAIAdapter):
-    """Qwen3.5: text-and-image chat, text out.
+    """Qwen3.5: text, image and video chat (``image_url`` / ``video_url`` parts), text out.
 
     Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
     ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
@@ -565,7 +571,7 @@ class Qwen3TTSAdapter(OpenAIAdapter):
             mk.setdefault("instruct", instructions)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
         # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL (when
-        # the server allows it) or bare base64 (vLLM-Omni's field). It becomes the
+        # the server allows it) or bare base64. It becomes the
         # request's audio input for one request; ``ref_text`` and
         # ``x_vector_only_mode`` ride along as model kwargs. Named, persisted
         # voices come with the shared voice registry (engine/voice-registry).
@@ -679,6 +685,46 @@ class ChatterboxAdapter(OpenAIAdapter):
         )
 
 
+class FishS2ProAdapter(OpenAIAdapter):
+    """Fish Audio S2-Pro: text-to-speech with optional reference-audio voice cloning.
+
+    The voice comes from a reference clip: ``ref_audio`` in ``extra_body`` (a
+    data URL, bare base64, or, when the server allows remote fetch, an http(s)
+    URL; paths on the server are refused) with its transcript in ``ref_text``. Without
+    one the model picks a voice. ``voice`` and ``speed`` are not S2-Pro
+    controls and are dropped; inline ``[tag]`` prosody control is part of
+    the input text. ``temperature`` / ``top_p`` / ``seed`` are the standard
+    fields; ``top_k``, ``repetition_penalty``, ``do_sample`` and
+    ``max_new_tokens`` pass through ``extra_body``. Long inputs are
+    synthesized as ordered sentence chunks, as for Qwen3-TTS.
+    """
+
+    supports_speech = True
+    speech_chunk_min_chars = 600
+    speech_chunk_max_chars = 400
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")
+            return SubmitArgs(
+                text=req.input,
+                file_paths={"audio": [path]},
+                input_modalities=["text", "audio"],
+                output_modalities=["audio"],
+                model_kwargs=mk,
+            )
+        mk.pop("ref_text", None)
+        return SubmitArgs(
+            text=req.input,
+            input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 class Cosmos3Adapter(OpenAIAdapter):
     """NVIDIA Cosmos3: text-to-image and text/image-to-video generation.
 
@@ -765,14 +811,16 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         _refuse_tool_calls(req)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
-        # ``chat_template_kwargs`` is how the vLLM recipe toggles thinking;
-        # accept it alongside a flat ``enable_thinking``.
+        # Clients written for the Edge model's serving recipe toggle thinking
+        # through ``chat_template_kwargs``; accept it alongside a flat
+        # ``enable_thinking``. Read before the attachments are saved, since a
+        # malformed value refuses the request.
         template_kwargs = mk.pop("chat_template_kwargs", None) or {}
         if "enable_thinking" in template_kwargs:
             mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,
             file_paths=file_paths or None,
@@ -1254,6 +1302,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "chatterbox": ChatterboxAdapter(),
     "chatterbox_multilingual": ChatterboxAdapter(),
     "chatterbox_turbo": ChatterboxAdapter(),
+    "fish_s2_pro": FishS2ProAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),

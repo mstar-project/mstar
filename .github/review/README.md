@@ -1,6 +1,6 @@
 # Automated PR review
 
-An advisory LLM reviewer runs on contributors' non-draft PRs, including PRs from forks. It posts each finding as an inline comment, tagged P0-P3, plus a summary comment that covers the PR description and any open questions. Each run, including each `/review`, posts a new summary comment, so a re-review shows up at the bottom of the conversation. It is not a merge gate and does not submit GitHub reviews. Each review also sets the PR's `type/*` labels, one to three of `new-model`, `bug`, `perf`, `feature`, `refactor`, `test`, `docs` and `ci`, replacing any earlier ones; the `area/*`, `model/*` and `size/*` labels come from [`../workflows/pr-labels.yml`](../workflows/pr-labels.yml).
+An advisory LLM reviewer runs on contributors' non-draft PRs, including PRs from forks. It posts each finding as an inline comment, tagged P0-P3, plus a summary comment that covers the PR description and any open questions. The summary opens with a status line: 🔴 for any open P0 or P1, 🟡 for anything else to report, 🟢 for nothing, then the head commit and the mode. An inline finding stays open until its thread is resolved or a commit changes its lines. Each run, including each `/review`, posts a new summary comment at the bottom of the conversation and hides the earlier ones as outdated. It is not a merge gate and does not submit GitHub reviews. Each review also sets the PR's `type/*` labels, one to three of `new-model`, `bug`, `perf`, `feature`, `refactor`, `test`, `docs` and `ci`, replacing any earlier ones; the `area/*`, `model/*` and `size/*` labels come from [`../workflows/pr-labels.yml`](../workflows/pr-labels.yml).
 
 "Contributor" means the PR author's GitHub author association is `OWNER`, `MEMBER`, `COLLABORATOR` or `CONTRIBUTOR`: the team, plus anyone who has had a PR merged here. Their PRs are reviewed automatically, and they can comment `/review` on their own PR. Any other request (`/review` on someone else's PR, `/review thorough`, or the label) takes write access to this repo, which the workflow checks against the user's actual permission. Someone with write access can `/review` any PR, including a first-timer's.
 
@@ -27,6 +27,7 @@ Running out of turns is handled in two ways. A review that finished but went pas
 | [`../../AGENTS.md`](../../AGENTS.md) | **The substance.** Numbered invariants the reviewer checks and cites. Also read by contributors' own coding agents. |
 | [`review-prompt.md`](review-prompt.md) | How the reviewer behaves: trust boundary, path routing, reporting bar, output format. |
 | [`../workflows/claude-review.yml`](../workflows/claude-review.yml) | The workflow, and the safety rules that come with `pull_request_target`. |
+| [`render_summary.py`](render_summary.py) | The summary's fields (its `--schema`), and the comment they render to. |
 | [`replay.sh`](replay.sh) | Run the reviewer locally against a past PR, to tune before trusting it. |
 | [`../../.claude/skills/benchmarking/SKILL.md`](../../.claude/skills/benchmarking/SKILL.md) | Benchmarking methodology. The reviewer reads it to judge performance claims; contributors follow it to produce them. |
 | [`../../.claude/skills/async-worker/SKILL.md`](../../.claude/skills/async-worker/SKILL.md) | The worker's async step loop, stage by stage. The reviewer reads it before judging any worker-loop change. |
@@ -40,9 +41,10 @@ Procedural knowledge — how to run a benchmark, how to debug a hang — belongs
 
 1. Add `ANTHROPIC_API_KEY` as an **organization** secret on `mstar-project` (Settings → Secrets and variables → Actions), scoped to this repository. Bill it to a project account rather than a personal one so usage is attributable.
 2. Create a `skip-ai-review` label (applying it to a PR skips the automatic review) and an `ai-review-thorough` label (applying it runs one thorough review).
-3. Nothing else. The workflow is advisory, so it needs no branch-protection change.
+3. Give the bot its own name and logo with the `mstar-review` GitHub App, owned by `mstar-project` and installed on this repository only, with contents read and issues and pull requests write. Add its client ID as the repository variable `REVIEW_APP_CLIENT_ID` and a private key as the secret `REVIEW_APP_PRIVATE_KEY`. This workflow and [`../workflows/pr-labels.yml`](../workflows/pr-labels.yml) post with the app's token, and with the job's own token as `github-actions[bot]` until both are set.
+4. Nothing else. The workflow is advisory, so it needs no branch-protection change.
 
-Until the secret exists the job logs a warning and exits green, so the workflow can land first.
+Until the API key exists the job logs a warning and exits green, so the workflow can land first.
 
 ## Tuning loop
 

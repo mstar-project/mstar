@@ -33,6 +33,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_torch_config
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
+from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -56,6 +57,7 @@ from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
+from mstar.utils import knobs
 from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
@@ -77,7 +79,14 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.profiler import PHASE_PERIOD, nvtx_enabled, phase_buffer, range_pop, range_push
+from mstar.utils.profiler import (
+    PHASE_PERIOD,
+    PhaseLaps,
+    nvtx_enabled,
+    phase_buffer,
+    range_pop,
+    range_push,
+)
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -92,6 +101,25 @@ _HOLD_LOG_INTERVAL = 5.0
 # ``_await_admit_settled``'s safety net, not a tuning knob: the GPU thread
 # releases the event on every exit, so this only fires if that thread died.
 _ADMIT_FENCE_TIMEOUT_S = 10.0
+
+# How many torn-down request keys a worker remembers, so that a message landing
+# after the teardown (a duplicate REMOVE, a peer's late stream chunk or
+# STOP_LOOPS) is dropped rather than parked for a NEW_REQUEST that never comes.
+# Such a message trails its teardown by about a loop iteration and a socket hop,
+# far fewer teardowns than this; a count, not a time, so a stalled worker that
+# reads both late still matches them. Every submission has its own key, so a
+# remembered key never gets another NEW_REQUEST.
+_REMOVED_RIDS_KEEP = 4096
+
+
+def _thread_role() -> str:
+    """The worker thread this runs on, by the executors' name prefixes."""
+    name = threading.current_thread().name
+    if name.startswith("mstar-gpu-"):
+        return "gpu"
+    if name.startswith("mstar-plan-"):
+        return "plan"
+    return "main" if threading.current_thread() is threading.main_thread() else "other"
 
 
 def _make_graph_runtime(
@@ -372,6 +400,8 @@ class Worker:
         dist_init_method=None,
         status_interval_s: float | None = None,
     ):
+        # before anything below builds a resource or a submodule that reads one
+        knobs.configure((model_config or {}).get("knobs"))
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
@@ -587,6 +617,10 @@ class Worker:
         # Keyed by the string: these arrive before the NEW_REQUEST that mints
         # the handle.
         self._unprocessed_messages: dict[str, list[WorkerMessage]] = {}
+        # Wire ids of requests torn down here (or that the conductor removed
+        # without this worker admitting them): a message for one of these is
+        # dropped instead of parked. Keyed by the string: the handle is gone.
+        self._removed_rids: RecentSet[str] = RecentSet(_REMOVED_RIDS_KEEP)
 
         # CPU offloading: LRU tracking and eviction policy
         self._last_active: dict[tuple[int, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
@@ -599,9 +633,10 @@ class Worker:
         # from _process_messages on any iter — reads/writes them.
         # _in_flight_rids: rids referenced by an in-flight GPU step or its
         #   speculation; REMOVE_REQUEST for these is deferred.
-        # _pending_removes: deferred REMOVE_REQUESTs.
+        # _pending_removes: deferred REMOVE_REQUESTs, in the order they were
+        #   deferred (a dict for that order: a follower's is rank 0's).
         self._in_flight_rids: set[int] = set()
-        self._pending_removes: set[int] = set()
+        self._pending_removes: dict[int, None] = {}
 
         # step seq -> rids rank 0 released after that step, held until this rank
         # has consumed it. See ``_removal_step_reached``.
@@ -794,6 +829,7 @@ class Worker:
             graph_walk=body.request_info.graph_walk,
             partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
+            loop_caps=body.loop_caps,
         )
         body.request_info.rid_handle = request_id
 
@@ -815,6 +851,7 @@ class Worker:
             self._fail_requests({request_id: f"Error in worker: {type(err).__name__}: {err}"})
             self._process_unprocessed(body.request_id)
             return
+        body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         # Create StreamBuffers for consumer connections on this worker. A request
         # with several partitions here arrives once per partition: keep the
@@ -858,12 +895,49 @@ class Worker:
 
     def _process_unprocessed(self, wire_rid: str) -> None:
         """Process messages for ``wire_rid`` that came in before its NEW_REQUEST."""
-        if wire_rid in self._unprocessed_messages:
-            self._process_message_list(self._unprocessed_messages[wire_rid])
-            del self._unprocessed_messages[wire_rid]
+        # Popped first: a REMOVE among them purges whatever is still parked
+        # for the id, which must not include the messages replayed here.
+        messages = self._unprocessed_messages.pop(wire_rid, None)
+        if messages:
+            self._process_message_list(messages)
+
+    def _mark_removed(self, wire_rid: str) -> None:
+        """Remember a request that will not be admitted here again, and drop
+        what was parked for it. Clears the wire-keyed drain state too: a
+        request drained before its NEW_REQUEST (which was then refused) is
+        never admitted, so no later teardown would."""
+        self._draining_rids.discard(wire_rid)
+        self._pending_drains.discard(wire_rid)
+        self._reads_done_sent.discard(wire_rid)
+        self._removed_rids.add(wire_rid)
+        for message in self._unprocessed_messages.pop(wire_rid, ()):
+            self._drop_for_removed(message)
+
+    def _drop_for_removed(self, message: WorkerMessage) -> None:
+        """Drop a message for a removed request. Inputs are ACKed unread so the
+        producer can free its source buffers."""
+        logger.debug(
+            "Worker %s: dropping %s for removed request %s",
+            self.worker_id, message.message_type.value, message.body.request_id,
+        )
+        if message.message_type == WorkerMessageType.INPUT_SIGNALS:
+            self.tensor_manager.ack_unread_tensors(
+                message.body.request_id, message.body.inputs,
+            )
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
+        request_id = self._rid(body.request_id)
+        if request_id is None:
+            # Never admitted here, or already removed: no handle-keyed state to
+            # clear. Before the follower guard: the conductor sends a request's
+            # NEW_REQUESTs and its REMOVE down one FIFO socket and forgets it
+            # after, so on any rank no NEW_REQUEST follows. The wire-string-keyed
+            # TP-follow count can be non-empty for a rid that never got a
+            # handle, and no later message would ever pop it.
+            self._mark_removed(body.request_id)
+            self.scheduler.clear_wire_rid(body.request_id)
+            return
         if self.is_tp_follower:
             if body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
                 return # wait for rank 0's forward, to avoid race conditions
@@ -877,6 +951,11 @@ class Worker:
                     body.after_tp_seq, []
                 ).append(body.request_id)
                 return
+            if body.source == MessageSource.TP_RANK_0:
+                # Removals held above came from rank 0 before this one, so the ones
+                # whose step has landed go first. The free list hands pages back out
+                # in the order they were freed.
+                self._apply_removes_whose_step_landed()
 
         # Async-scheduling deferral: if this rid is currently held by an
         # in-flight GPU step (or its speculation), tearing down engine /
@@ -884,16 +963,14 @@ class Worker:
         # / KV pages. Queue the remove and apply it once no in-flight step
         # references the rid (see _apply_pending_removes_safe_to_drop in
         # the run loop).
-        request_id = self._rid(body.request_id)
-        if request_id is None:
-            # Never admitted here, or already removed: no handle-keyed state to
-            # clear. The wire-string-keyed TP-follow count is the exception --
-            # it can be non-empty for a rid that never got a handle, and no
-            # later message would ever pop it.
-            self.scheduler.clear_wire_rid(body.request_id)
-            return
-        if request_id in self._in_flight_rids:
-            self._pending_removes.add(request_id)
+        # A follower tears down in rank 0's order, so never ahead of one it deferred
+        # earlier.
+        behind = (
+            self.is_tp_follower
+            and next(iter(self._pending_removes), request_id) != request_id
+        )
+        if request_id in self._in_flight_rids or behind:
+            self._pending_removes.setdefault(request_id)
             return
 
         # If we are the TP leader for this request, signal the followers to
@@ -928,9 +1005,7 @@ class Worker:
         # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
         # on the abort/fail path via a prior DrainRequest, on the happy path
         # once the api server finished reading the outputs.
-        self._draining_rids.discard(body.request_id)
-        self._pending_drains.discard(body.request_id)
-        self._reads_done_sent.discard(body.request_id)
+        self._mark_removed(body.request_id)
         self.engine_manager.remove_request(request_id)
         if self._stream_buffer_rids:
             self._stream_buffer_rids.discard(request_id)
@@ -939,7 +1014,7 @@ class Worker:
         self.profile_info.pop_request(request_id)
         self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
-        self._pending_removes.discard(request_id)
+        self._pending_removes.pop(request_id, None)
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
@@ -1067,8 +1142,9 @@ class Worker:
         )
         request_id = self._rid(body.request_id)
         if request_id is None:
-            # _process_message_list parks signals for an unknown request, so
-            # this only happens if that changes; there is nothing to route into.
+            # _process_message_list parks or drops signals for an unknown
+            # request, so this only happens if that changes; there is nothing
+            # to route into.
             logger.warning(
                 "Worker %s: dropping input signals for unknown request %s",
                 self.worker_id, body.request_id,
@@ -1173,15 +1249,25 @@ class Worker:
         for message in list(messages):
             # per_request_info is handle-keyed, so resolve the wire string
             # first; an unknown one has no handle and is parked the same way.
+            # The conductor's REMOVE is never parked: ``_remove_request``
+            # handles an id this worker does not hold.
             if (
                 message.message_type in msg_types_needing_active_request and \
+                not (
+                    message.message_type == WorkerMessageType.REMOVE_REQUEST
+                    and message.body.source == MessageSource.CONDUCTOR
+                ) and \
                 self._rid(message.body.request_id)
                 not in self.request_state.per_request_info
             ):
-                # got an out-of-order request
-                self._unprocessed_messages.setdefault(
-                    message.body.request_id, []
-                ).append(message)
+                wire_rid = message.body.request_id
+                if wire_rid in self._removed_rids:
+                    self._drop_for_removed(message)
+                else:
+                    # got an out-of-order request
+                    self._unprocessed_messages.setdefault(
+                        wire_rid, []
+                    ).append(message)
                 continue
             if message.message_type == WorkerMessageType.NEW_REQUEST:
                 self._add_new_request(message.body)
@@ -1413,7 +1499,7 @@ class Worker:
         if not engine.evictable(node_name):
             return None
 
-        candidates = [
+        active = [
             rid for (rid, node) in self._last_active
             if node == node_name and not engine.is_offloaded(node_name, rid)
         ]
@@ -1421,20 +1507,16 @@ class Worker:
         # a request admitted but not yet run holds no pages: offloading it
         # frees nothing and the retry would re-pick it
         candidates = [
-            rid for rid in candidates if engine.reclaimable(node_name, rid, affected_resources)
+            rid for rid in active if engine.reclaimable(node_name, rid, affected_resources)
         ]
 
         if not candidates:
-            # Nothing holds pages of the resource that ran out. Eviction is the
-            # wrong tool here — the working set does not fit — and saying so
-            # separates it from the host pool being full, which looks identical
-            # from the caller and wants the opposite response.
             logger.warning(
-                "No eviction candidate on %s for %s: nothing holds reclaimable "
-                "pages of it. The working set does not fit; eviction cannot "
-                "help.", node_name,
+                "No eviction candidate on %s for %s: %d active requests, none "
+                "with pages of it to reclaim now.", node_name,
                 "any resource" if affected_resources is None
                 else ", ".join(sorted(affected_resources)),
+                len(active),
             )
             return None
 
@@ -1444,7 +1526,7 @@ class Worker:
         freed = engine.offload_request(node_name, victim_id)
         if freed <= 0:
             # A victim was found and would not move. The usual cause is the host
-            # pool being full (see ``CPUPagePool.offload_stream``) — different
+            # pool being full (see ``CPUPagePool.place``) - different
             # from having no candidate, and fixed by a larger
             # ``cpu_offload_pages`` rather than by scheduling less.
             logger.warning(
@@ -1654,6 +1736,8 @@ class Worker:
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
         resident_delta = engine.take_resident_delta(node_batch.node_name)
+        prefix_hits = engine.decide_cached_prefix(node_batch)
+        page_trails = engine.page_trails(node_batch.node_name)
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -1682,6 +1766,8 @@ class Worker:
                         resident_delta=resident_delta.copy(),
                         walks=walks,
                         walk_idx=walk_idx,
+                        prefix_hits=prefix_hits,
+                        page_trails=page_trails,
                     )
                 )
             )
@@ -1891,7 +1977,10 @@ class Worker:
                 leased = engine.reserve_replay_slot(spec_batch) is not None
             if not leased:
                 return False  # eager, or no batched capture for this shape
-            with self._span("worker.plan_thread.pre_plan"):
+            with self._span(
+                "worker.plan_thread.pre_plan",
+                cpu="worker.plan_thread.pre_plan.cpu",
+            ):
                 return engine.pre_plan_for_batch(spec_batch)
         except Exception:
             logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
@@ -1927,8 +2016,12 @@ class Worker:
         apply_torch_config()
 
     @contextmanager
-    def _span(self, name: str):
+    def _span(self, name: str, cpu: str | None = None):
         """One NVTX range plus one MSTAR_PHASE_TIMING sample, same name.
+
+        ``cpu`` names a second sample: this thread's CPU time over the span.
+        Wall minus CPU is time spent blocked -- on an event, a lock or the
+        GIL -- which a wall-clock span alone cannot tell from work.
 
         Safe off the main thread: the append is the only shared mutation and
         run()'s flush snapshots before it clears.
@@ -1936,14 +2029,37 @@ class Worker:
         nvtx = self.enable_nvtx
         if nvtx:
             range_push(name, synchronize=False)
-        t0 = _time.perf_counter() if self._phase_period else 0.0
+        timed = self._phase_period
+        t0 = _time.perf_counter() if timed else 0.0
+        c0 = _time.thread_time() if timed and cpu else 0.0
         try:
             yield
         finally:
-            if self._phase_period:
+            if timed:
                 self._phase_buf[name].append(_time.perf_counter() - t0)
+                if cpu:
+                    self._phase_buf[cpu].append(_time.thread_time() - c0)
             if nvtx:
                 range_pop(synchronize=False)
+
+    # wall time of each collection by generation, on whichever thread ran it;
+    # a per-thread start stamp because collections on two threads can interleave
+    _GC_PHASES = ("gc.gen0", "gc.gen1", "gc.gen2")
+    _gc_t0 = threading.local()
+
+    def _gc_phase_callback(self, phase: str, info: dict) -> None:
+        if phase == "start":
+            self._gc_t0.t = _time.perf_counter()
+        else:
+            t0 = getattr(self._gc_t0, "t", None)
+            if t0 is not None:
+                dt = _time.perf_counter() - t0
+                name = self._GC_PHASES[info["generation"]]
+                self._phase_buf[name].append(dt)
+                # and by thread: a collection is charged to whatever span
+                # allocated when it triggered, so this says whose spans
+                # carry it (gc.gen0.main / .gpu / .plan)
+                self._phase_buf[f"{name}.{_thread_role()}"].append(dt)
 
     def _phase_record(self, name: str, dt: float) -> None:
         if self._phase_period > 0:
@@ -1978,6 +2094,10 @@ class Worker:
         """
         from mstar.utils.profiler import range_pop, range_push
 
+        timed = self._phase_period
+        t_start = _time.perf_counter() if timed else 0.0
+        c_start = _time.thread_time() if timed else 0.0
+        laps = PhaseLaps("worker.gpu_thread.")
         engine = self.engine_manager.get_engine(batch.node_name)
         # Every output of this step stays on the device: the engine keeps the
         # rows and skips the per-request dicts and tail (cached per node and
@@ -1997,6 +2117,7 @@ class Worker:
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
+        laps.lap("setup")
         # The plan thread wrote this batch's plan into the resources; wait for
         # it before the forward reads them. Waiting releases the GIL — which is
         # the point: running prepare_inputs here instead just puts the two
@@ -2004,6 +2125,7 @@ class Worker:
         if plan_future is not None:
             with self._span("worker.gpu_thread.await_plan"):
                 plan_future.result()
+        laps.skip()
         if self.enable_nvtx:
             range_push(
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
@@ -2011,7 +2133,10 @@ class Worker:
             )
         try:
             try:
-                with self._span("worker.gpu_thread.prepare_inputs"):
+                with self._span(
+                    "worker.gpu_thread.prepare_inputs",
+                    cpu="worker.gpu_thread.prepare_inputs.cpu",
+                ):
                     engine.prepare_inputs(node_batch)
             except Exception:
                 if plan_future is not None and node_batch.preplanned_rids is not None:
@@ -2019,6 +2144,7 @@ class Worker:
                     engine.reset_pre_plan_for_batch(node_batch)
                 raise
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
+            laps.skip()
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
             execution_stream = (
@@ -2038,18 +2164,25 @@ class Worker:
                 self._phase_record(
                     f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
                 )
-            with self._span("worker.gpu_thread.exec"):
+            laps.lap("pre_exec")
+            with self._span(
+                "worker.gpu_thread.exec", cpu="worker.gpu_thread.exec.cpu",
+            ):
                 outputs = engine.exec_and_postprocess(node_batch)
+            laps.skip()
             if execution_stream is not None:
                 self._stage_host_rows(outputs)
+                laps.lap("stage_host_rows")
                 event = torch.Event(device=self.device)
                 event.record(execution_stream)
                 node_batch.completion_event = event
+                laps.lap("completion_event")
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
                     self._gpu_spans.append((gpu_start, gpu_end))
                     self._drain_gpu_spans()
+                    laps.lap("gpu_exec_events")
             return outputs
         finally:
             # Safety net: a step that raised before the forward would otherwise
@@ -2065,10 +2198,19 @@ class Worker:
             # the next iter's prep and the conductor see it. Runs regardless
             # of success, allocation failure, or an uncaught raise —
             # finalize_batch reads whatever state the engine actually reached.
+            laps.skip()
             publish_rids = self._publishable_request_ids(node_batch)
             node_batch.resource_publish_info = engine.finalize_batch(
                 node_batch, publish_request_ids=publish_rids,
             )
+            laps.lap("finalize_batch")
+            if timed:
+                self._phase_record(
+                    "worker.gpu_thread.total", _time.perf_counter() - t_start,
+                )
+                self._phase_record(
+                    "worker.gpu_thread.total.cpu", _time.thread_time() - c_start,
+                )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2213,10 +2355,11 @@ class Worker:
         # rid torn down here cannot be pushed onto queues that have just been dismantled.
         self._apply_removes_whose_step_landed()
 
-        # ``referenced_rids``, not ``_in_flight_rids``: this step's admit refused,
-        # so no forward ran and its own pages are fair game. Empty in practice —
+        # ``referenced_rids``: what a speculation still touches. Empty in practice —
         # nothing is speculated on a refusal — so it only guards a future caller
-        # that broadcasts something here.
+        # that broadcasts something here. This step's own rids stay in
+        # ``_in_flight_rids`` until the loop clears the pending step, and their
+        # removals wait for that.
         self._apply_pending_removes_safe_to_drop(referenced_rids)
 
         if self._is_tp_follower_node(batch.node_name):
@@ -2297,6 +2440,16 @@ class Worker:
                 and batch.node_name in self.parallel_leader_nodes
             )
         return True
+
+    def _plans_ahead(self, spec: Speculation) -> bool:
+        """With the prefix cache open, a TP leader admits a yield-away step at exec, as its followers
+        do. A pre-plan refused on rank 0 alone puts its pages back at the end of rank 0's free list,
+        and the ranks then hand out different page ids, which only the cache reads."""
+        node = spec.node_batch.node_name
+        return not (spec.is_yield_away and node in self.parallel_nodes and self._prefix_cache_open(node))
+
+    def _prefix_cache_open(self, node_name: str) -> bool:
+        return self.engine_manager.get_engine(node_name).prefix_cache_open(node_name)
 
     def _is_tp_follower_node(self, node_name: str) -> bool:
         """This rank follows ``node_name``: rank 0 of its instance decides both
@@ -2487,6 +2640,8 @@ class Worker:
         # The kept rids' chunks now belong to the step; nothing is left to undo.
         speculation.spec_id = 0
         speculation.consumed_streaming_edges.clear()
+        if not success:
+            self.engine_manager.get_engine(batch.node_name).release_cached_prefix(speculation.node_batch)
 
     @staticmethod
     def _speculated_rids(speculation: Speculation | None) -> frozenset[int]:
@@ -2548,6 +2703,7 @@ class Worker:
             Without this merge, new rids have to wait for the entire
             current speculation chain to drain before they can be scheduled.
         """
+        laps = PhaseLaps("speculate.")
         batch_N = pending.batch
         spec_target_info, walk_rids = target
         graph_walk = spec_target_info.graph_walk
@@ -2567,6 +2723,7 @@ class Worker:
         if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid):
             return None
         max_continuing = self.scheduler.room_for_continuing(spec_target)
+        laps.lap("backlog_check")
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
         # assumes that.
@@ -2598,6 +2755,7 @@ class Worker:
             streaming_edges_per_rid=per_rid_counts,
         ))
 
+        laps.lap("prep_spec_rids")
         # Anything not consumed goes back to its StreamBuffer, so a later
         # scheduling of this node picks it up normally.
         consumed = set(prep.consumed_streaming_edge_idxs)
@@ -2617,6 +2775,7 @@ class Worker:
         for i, r in enumerate(prep.ready_rids):
             per_request_inputs[r] = prepped_inputs[r]
             new_request_to_worker_graph[r] = prep.wg_ids[i]
+        laps.lap("continuing_inputs")
 
         if not continuing:
             return None
@@ -2633,6 +2792,7 @@ class Worker:
             pre_existing_batch_size=len(continuing),
             capture_group_of=prep.ready_rids[0],
         )
+        laps.lap("fresh_schedule")
 
         if fresh_batch is not None:
             # The merge below relabels these node objects with the spec
@@ -2668,8 +2828,9 @@ class Worker:
                 if walk != graph_walk:
                     other_walks[rid] = walk
 
+        laps.lap("fresh_merge")
         logger.debug("Speculating: %s %s", spec_node_name, continuing)
-        return self._assemble_speculation(
+        speculation = self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
@@ -2679,6 +2840,8 @@ class Worker:
                 **dict.fromkeys(new_request_to_worker_graph, graph_walk), **other_walks,
             } if other_walks else None,
         )
+        laps.lap("assemble")
+        return speculation
 
     def _thread_outputs_to_speculative(
         self, speculation: Speculation,
@@ -2782,7 +2945,10 @@ class Worker:
         # state that is still mid-replay. Every poll retries the owed moves, so
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
-        if not self.scheduler.settle_tp_follow_delta():
+        if not self.scheduler.settle_tp_follow_delta(
+            # Of the steps before the head, only N may still index a page of the head's hit
+            caught_up=pending.node_batch.commit_done.is_set(),
+        ):
             return None
 
         batch_N = pending.batch
@@ -2946,6 +3112,8 @@ class Worker:
         head = self.scheduler.peek_tp_follow()
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
             self.scheduler.pop_tp_follow_head()
+            # settle may have adopted some of the head's hit, and the leader releases the whole lease
+            self.engine_manager.get_engine(head.node_name).drop_cached_prefix(head)
 
     @staticmethod
     def _step_voids_head(pending: PendingBatch) -> str | None:
@@ -2975,7 +3143,7 @@ class Worker:
             head = self.scheduler.peek_tp_follow()
             if head is not None and head.speculative and head.spec_from_seq == s:
                 void = self._step_voids_head(pending) if outputs is not None else None
-                if void is not None:
+                if void is not None and not self._prefix_cache_open(head.node_name):
                     # The leader clears its speculation on this verdict too.
                     self.scheduler.pop_tp_follow_head()
                     logger.debug(
@@ -2983,6 +3151,8 @@ class Worker:
                         self.worker_id, head.spec_seq, s, void,
                     )
                     return outputs, None
+                # With the prefix cache open, build the head even when N's verdict voids it, since the
+                # leader pre-plans every head it sends and this rank's pages must move as the leader's do.
                 spec = self._try_follow_speculation(pending)
                 if spec is not None:
                     arm(spec)
@@ -3284,6 +3454,8 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
         self._register_outputs(route_output)
+        # Those sends were the last readers of this step's host copies.
+        self.tensor_manager.drop_host_copies()
         _pp_stage("register_outputs")
 
         # send outputs
@@ -3343,7 +3515,7 @@ class Worker:
         # share one (refuse_combined_walks_across_tp_groups).
         # Pass the stop check's host copies so a host-memory transport needn't
         # copy the rows again. They are views of pinned buffers the next step
-        # reuses; safe because the sends below are their last reader.
+        # reuses, so they are dropped once this step's sends are done.
         # Row views of one batch clone (a decode step) are described from one
         # row; anything else goes through the general per-tensor path. Both
         # take the real walk, not the combined label: the runtime keys the
@@ -3787,7 +3959,7 @@ class Worker:
         The host tensors are views of pinned buffers the next step reuses. Their
         one other reader, a ``needs_cpu_tensor`` transport, gets them through
         the store and sends in ``_register_outputs`` later in the same
-        ``_postprocess_batch``, never reading them after.
+        ``_postprocess_batch``, which then drops them from the store.
         """
         source = outputs.get_check_stop_input()
         # Rows are in forward order, which the engine stamped on the output.
@@ -3883,14 +4055,19 @@ class Worker:
         self, in_flight_rids: set[int]
     ) -> None:
         """Apply ``REMOVE_REQUEST`` for any rid that is not currently held by
-        an in-flight GPU step. Removes for in-flight rids stay deferred and
-        are reattempted next iter."""
-        to_apply = [r for r in self._pending_removes if r not in in_flight_rids]
-        for rid in to_apply:
-            self._pending_removes.discard(rid)
+        an in-flight GPU step, in the order they were deferred. Removes for
+        in-flight rids stay deferred and are reattempted next iter; on a
+        follower, so do the ones after them, which rank 0 tore down later."""
+        for rid in list(self._pending_removes):
+            if rid in in_flight_rids or rid in self._in_flight_rids:
+                if self.is_tp_follower:
+                    break
+                continue
             self._remove_request(RemoveRequest(
                 request_id=self._rid_str(rid), source=MessageSource.SELF,
             ))
+            # torn down above, unless its handle was already gone
+            self._pending_removes.pop(rid, None)
 
     def _drop_failed_rids(
         self, pending: PendingBatch,
@@ -4197,6 +4374,11 @@ class Worker:
             "Worker %s: gc.freeze() after warmup — %d objects moved to the "
             "permanent generation", self.worker_id, gc.get_freeze_count(),
         )
+        if gen0 := knobs.gc_gen0_threshold():
+            gc.set_threshold(gen0, *gc.get_threshold()[1:])
+            logger.info("Worker %s: gc thresholds %s", self.worker_id, gc.get_threshold())
+        if self._phase_period:
+            gc.callbacks.append(self._gc_phase_callback)
 
         # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main
@@ -4269,7 +4451,7 @@ class Worker:
             # commit event, then reserves a slot and pre-plans —
             # while the main thread sits in await_gpu with the GIL
             # released and N's kernels are still running.
-            if plan_executor is not None:
+            if plan_executor is not None and self._plans_ahead(spec):
                 spec.plan_future = plan_executor.submit(
                     self._preplan_spec, pending, spec,
                 )
@@ -4314,8 +4496,8 @@ class Worker:
                 p95 = vs[min(n - 1, int(n * 0.95))] * scale
                 mean = (sum(vs) / n) * scale
                 parts.append(
-                    f"{name}: p50={p50:.2f}{unit} p95={p95:.2f}{unit} "
-                    f"mean={mean:.2f}{unit} n={n}"
+                    f"{name}: p50={p50:.3f}{unit} p95={p95:.3f}{unit} "
+                    f"mean={mean:.3f}{unit} n={n}"
                 )
             bs = (sum(phase_bs) / len(phase_bs)) if phase_bs else 0.0
             logger.info(
@@ -4340,11 +4522,14 @@ class Worker:
                 batch = None
                 spec_pending = None
                 _iter_start = _time.perf_counter() if phase_period else 0.0
+                _iter_cpu = _time.thread_time() if phase_period else 0.0
+                laps = PhaseLaps("worker.main.")
                 # Everything below moves pages — the removes and drains directly,
                 # ``_process_messages`` through a follower's delta, the readiness
                 # scans through ``check_ready``'s reload — and none of it may run
                 # while N's admit is outstanding. See ``_await_admit_settled``.
                 self._await_admit_settled(pending)
+                laps.skip()
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
@@ -4353,6 +4538,7 @@ class Worker:
                 # ever fail them.
                 self._fail_requests(self.scheduler.take_admit_errors())
                 self._apply_pending_drains(self._in_flight_rids)
+                laps.lap("teardown")
 
                 # 1. CPU preamble — overlaps with GPU(N).
                 # synchronize=False on every range so torch.cuda.synchronize()
@@ -4364,22 +4550,26 @@ class Worker:
                 self._apply_removes_whose_step_landed()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+                laps.lap("process_messages")
 
                 if self.enable_nvtx:
                     range_push("worker.check_ready_tensors", synchronize=False)
                 self._check_ready_tensors()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+                laps.lap("check_ready_tensors")
 
                 if self.enable_nvtx:
                     range_push("worker.poll_stream_buffers", synchronize=False)
                 self._poll_stream_buffers()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+                laps.lap("poll_stream_buffers")
 
                 # Reads only: whether a rank sends this changes nothing it runs.
                 if metrics is not None:
                     metrics.maybe_report()
+                    laps.lap("metrics")
 
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.
@@ -4388,8 +4578,11 @@ class Worker:
                 speculation, yield_away_from_target = self._build_speculation(
                     pending, consecutive_spec_steps, fair,
                 )
+                # inclusive of `speculate` and `worker.schedule_yield_away`
+                laps.lap("build_speculation")
                 if speculation is not None:
                     _arm_speculation(speculation)
+                    laps.lap("arm_speculation")
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
                 # asap, then post-process N (fast then slow) overlapping
@@ -4421,9 +4614,11 @@ class Worker:
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
 
+                    laps.skip()
                     # set node._in_flight to false, since
                     # the node has just completed
                     self._clear_in_flight_flag(pending.batch)
+                    laps.lap("clear_in_flight")
 
                     def _maybe_clear_spec():
                         nonlocal speculation
@@ -4492,8 +4687,10 @@ class Worker:
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
                         spec_node_batch = speculation.node_batch
+                        laps.lap("failure_checks")
                         if not speculation.is_yield_away:
                             self._thread_outputs_to_speculative(speculation, outputs)
+                            laps.lap("thread_outputs")
                         # The one settle for a step that runs: marks the batch
                         # speculatively scheduled (so its nodes are not put back
                         # on the ready queue while it executes -- not the dropped
@@ -4506,6 +4703,7 @@ class Worker:
                             speculation, success=True,
                             dropped_rids=speculation.dropped,
                         )
+                        laps.lap("settle_speculation")
 
                         if spec_batch.request_to_worker_graph:
                             if self.enable_nvtx:
@@ -4565,9 +4763,14 @@ class Worker:
                     # failure since the output tensors aren't valid;
                     # ``_handle_admit_failure`` already rehabilitated the
                     # failed rids upstream.
+                    laps.skip()
                     if pending.node_batch.admit_error is None:
-                        with self._span("worker.postprocess_batch"):
+                        with self._span(
+                            "worker.postprocess_batch",
+                            cpu="worker.postprocess_batch.cpu",
+                        ):
                             self._postprocess_batch(pending, outputs)
+                        laps.skip()
                         if metrics is not None:
                             metrics.step_done(
                                 pending.node_name, pending.graph_walk,
@@ -4576,10 +4779,20 @@ class Worker:
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
+                    laps.lap("step_done")
                     in_flight = set(spec_pending.batch.request_to_worker_graph) if spec_pending else set()
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     self._apply_pending_drains(in_flight)
+                    laps.lap("post_removes")
                     _set_pending(None)
+                    if spec_pending is None and self.is_tp_follower:
+                        # N is done and nothing runs. Rank 0 tore down what N held
+                        # here, and what it stamped with a step this rank dropped,
+                        # before it sent the next step, so this rank does too, before
+                        # it takes that step.
+                        self._apply_removes_whose_step_landed()
+                        self._apply_pending_removes_safe_to_drop(set())
+                    laps.lap("set_pending")
 
                 if spec_pending is not None:
                     if speculation.is_yield_away:
@@ -4588,6 +4801,7 @@ class Worker:
                         consecutive_spec_steps += 1
                     if phase_period:
                         _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                        _phase_record("iter_total.cpu", _time.thread_time() - _iter_cpu)
                         phase_bs.append(len(spec_pending.batch.request_to_worker_graph))
                         phase_iter[0] += 1
                         _phase_flush()
@@ -4650,6 +4864,7 @@ class Worker:
                 # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    _phase_record("iter_total.cpu", _time.thread_time() - _iter_cpu)
                     phase_bs.append(len(batch.request_to_worker_graph))
                     phase_iter[0] += 1
                     _phase_flush()

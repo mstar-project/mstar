@@ -44,6 +44,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_tts_1p7b": "qwen3tts_1p7b.yaml",
     "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
     "qwen3_tts_base": "qwen3tts_base.yaml",
+    "fish_s2_pro": "fish_s2_pro.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -182,6 +183,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model == "qwen3_tts_base":
         lines.append("    client.tts(\"Hello there\", reference_audio=\"ref.wav\", "
                      "ref_text=\"...\").to_wav(\"out.wav\")")
+    if model == "fish_s2_pro":
+        lines.append("    client.tts(\"Hello there\").to_wav(\"out.wav\")")
+        lines.append("    # clone a voice: reference_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
@@ -226,6 +230,8 @@ def _serve(args: argparse.Namespace) -> None:
     config = _resolve_config(args.model, args.config)
     if args.gpus is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    if args.compile_level is not None:
+        os.environ["MSTAR_COMPILE_LEVEL"] = str(args.compile_level)
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
     socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
@@ -281,6 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
              "and /metrics (default: MSTAR_API_KEY; unset means no check)",
     )
     serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
+    serve.add_argument(
+        # unset leaves MSTAR_COMPILE_LEVEL alone, whose own default is 1
+        "-O", "--compile-level", dest="compile_level", type=int, default=None, choices=[0, 1, 2],
+        help="how much captured forwards' compiles tune (sets MSTAR_COMPILE_LEVEL): -O0 no tuning, "
+             "fastest start; -O1 (default) coordinate descent; -O2 full max-autotune",
+    )
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")
     serve.add_argument("--socket-path-prefix", default=None, help="ZMQ IPC socket prefix")

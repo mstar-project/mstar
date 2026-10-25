@@ -57,10 +57,15 @@ class AttentionManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
+        backend = resolve_attn_backend(spec.config.backend, info.device)
+        if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
+            raise ValueError(
+                f"sliding_window is unsupported for attention backend {backend!r}; "
+                "use the flashinfer backend"
+            )
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
-        backend = resolve_attn_backend(spec.config.backend, info.device)
         # Before `shard`, so a mismatch is reported rather than half-applied to
         # a config the KV resource also holds.
         if backend not in _BACKEND_KV_CONFIG:
@@ -126,6 +131,7 @@ class AttentionManager(AttentionResource):
                 backend=spec.config.flashinfer_backend,
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
+                sliding_window=spec.config.sliding_window,
             )
 
         if backend == AttnBackend.FLEX:
@@ -198,6 +204,20 @@ class EagerSlotKey(NamedTuple):
 
 
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
+
+
+def captured_page_capacity(num_rows: int, num_tokens: int, kv_config: KVConfig) -> int:
+    """Page ids a captured wrapper's index buffer holds for a bucket of
+    ``num_rows`` rows and ``num_tokens`` tokens.
+
+    Per row, not per pool: rows that matched one cached prefix all name its
+    pages, so a step can name more page ids than the pool holds. And at least
+    the bucket's own pages: a capture's rows name a SINK_PAGE per page of span,
+    whatever the pool's size."""
+    return max(
+        num_rows * kv_config.max_num_pages,
+        -(-num_tokens // kv_config.page_size) + num_rows,
+    )
 
 
 class WorkspacePool:

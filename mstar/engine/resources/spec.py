@@ -90,6 +90,11 @@ class ResourceReqConfig:
     def apply_conductor_config(self, **kwargs):
         return
 
+    def loop_room(self, spec: "NodeResourceSpec | None" = None) -> dict[str, int]:
+        """The most iterations each loop can run before the request outgrows the
+        resource built from ``spec``. A loop the resource doesn't bound is left out."""
+        return {}
+
     def validate(self, spec: "NodeResourceSpec | None" = None) -> None:
         """Raise ``ValueError`` if a client-supplied value is out of range, or
         one the resource built from ``spec`` cannot honour.

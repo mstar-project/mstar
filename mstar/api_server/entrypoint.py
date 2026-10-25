@@ -38,6 +38,7 @@ from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.tensors import ensure_deployment_token
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -202,6 +203,10 @@ def _shutdown_conductor_process(
 #: The Rust frontend waits the same (``DUPLICATE_ID_GRACE`` in serving.rs).
 DUPLICATE_ID_GRACE_S = 0.5
 
+#: How often a non-streaming handler (``collect_results``) asks whether its
+#: client left while it waits for the request to finish.
+DISCONNECT_CHECK_S = 0.1
+
 
 def _client_text(text: str, key: str, request_id: str | None) -> str:
     """``text`` with the submission key ``key`` (``<request_id>#<n>``) shown
@@ -244,6 +249,9 @@ class PendingRequest:
     # sleeps between chunks instead of polling every millisecond per request.
     wake: Any | None = None
     loop: Any | None = None
+    # Set by collect_results, which reads no chunk before the request ends:
+    # the wake then waits for the finish instead of firing on every chunk.
+    wake_on_finish: bool = False
     # The client's request_id. The engine knows the request by its key, so
     # the message thread restamps each chunk with this before the client sees it.
     request_id: str | None = None
@@ -253,7 +261,7 @@ class PendingRequest:
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
         loop, wake = self.loop, self.wake
-        if loop is None or wake is None:
+        if loop is None or wake is None or (self.wake_on_finish and not self.event.is_set()):
             return
         try:
             loop.call_soon_threadsafe(wake.set)
@@ -274,7 +282,7 @@ def notify_many(reqs) -> None:
     by_loop: dict[int, tuple[Any, list]] = {}
     for req in reqs:
         loop, wake = req.loop, req.wake
-        if loop is None or wake is None:
+        if loop is None or wake is None or (req.wake_on_finish and not req.event.is_set()):
             continue
         entry = by_loop.get(id(loop))
         if entry is None:
@@ -364,6 +372,8 @@ class APIServer:
         self.model = model
         self.model_name = model_name
 
+        # Before any tensor manager; the conductor and workers inherit it.
+        ensure_deployment_token()
         self.preprocess_worker = PreprocessWorker(
             model=model,
             model_config=model_config,
@@ -1156,19 +1166,41 @@ class APIServer:
         return its chunks. Disconnecting or timing out releases engine state."""
         start = time.time()
         key = self.submission_key(request_id)
+        # Woken by the message thread (PendingRequest.notify) when the request
+        # finishes, not on each chunk (wake_on_finish). Polling every 5 ms per
+        # request (lock, cancel scope, timer) held the event loop at high
+        # concurrency; the timeout is checked on each pass and a disconnect
+        # every DISCONNECT_CHECK_S.
+        wake = asyncio.Event()
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is not None:
+                req.loop = asyncio.get_running_loop()
+                req.wake = wake
+                req.wake_on_finish = True
+        checked = start
         while True:
+            # Cleared before the read: a notification that lands after this
+            # point stays set and the wait below returns at once.
+            wake.clear()
             with self.request_lock:
                 req = self.pending_requests.get(key)
                 done = req.event.is_set() if req else True
             if done:
                 break
-            if time.time() - start > self.timeout_seconds:
+            now = time.time()
+            if now - start > self.timeout_seconds:
                 self.abort_submission(key, outcome="timeout")
                 raise HTTPException(status_code=500, detail="Request timed out")
-            if raw_request is not None and await raw_request.is_disconnected():
-                self.abort_submission(key)
-                return []
-            await asyncio.sleep(0.005)
+            if raw_request is not None and now - checked >= DISCONNECT_CHECK_S:
+                checked = now
+                if await raw_request.is_disconnected():
+                    self.abort_submission(key)
+                    return []
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=DISCONNECT_CHECK_S)
+            except asyncio.TimeoutError:
+                pass
 
         with self.request_lock:
             req = self.pending_requests.pop(key, None)
@@ -1519,18 +1551,16 @@ def _ws_modalities(value, key: str) -> list[str] | None:
     raise ValueError(f"{key} must be a comma-separated string or a list of strings")
 
 
-def _schedule_upload_cleanup(file_paths: dict[str, list[str]], delay_s: float = 60.0) -> None:
+def _remove_uploads(file_paths: dict[str, list[str]]) -> None:
+    if file_paths:
+        media_io.remove_uploads(file_paths, api_server.upload_dir)
+
+
+def _schedule_upload_cleanup(file_paths: dict[str, list[str]]) -> None:
     """Delete a request's uploaded files once the preprocess worker has had
     time to read them. Shared by the HTTP and WebSocket routes."""
-    def _cleanup(paths: dict[str, list[str]]) -> None:
-        time.sleep(delay_s)
-        for ps in paths.values():
-            for p in ps:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except OSError:
-                    pass
-    threading.Thread(target=_cleanup, args=(file_paths,), daemon=True).start()
+    if file_paths:
+        media_io.schedule_upload_cleanup(file_paths, api_server.upload_dir)
 
 
 def _ws_input_layout(
@@ -1551,6 +1581,11 @@ def _ws_input_layout(
     return [p.modality for p in parts], parts
 
 
+def _pass_turn(turn: asyncio.Future) -> None:
+    if not turn.done():
+        turn.set_result(None)
+
+
 @app.websocket("/generate/ws")
 async def generate_ws(websocket: WebSocket):
     """``/generate`` over one persistent WebSocket, for control loops.
@@ -1567,7 +1602,8 @@ async def generate_ws(websocket: WebSocket):
     for a ``request_id`` still in flight, as on ``/generate``); no finish
     follows an error. Messages may be pipelined: a client can
     send the next observation before the previous action chunk has returned,
-    and the ``request_id`` tells the replies apart. Closing the socket aborts
+    and the ``request_id`` tells the replies apart. They are submitted in the
+    order they were sent; their replies may interleave. Closing the socket aborts
     whatever is still in flight.
     """
     if api_server is None:
@@ -1587,7 +1623,11 @@ async def generate_ws(websocket: WebSocket):
                     payload = {**payload, "data": base64.b64encode(payload["data"]).decode("ascii")}
                 await websocket.send_text(json.dumps(payload))
 
-    async def serve_one(message: dict, binary: bool) -> None:
+    async def serve_one(
+        message: dict, binary: bool, after: asyncio.Future | None, turn: asyncio.Future,
+    ) -> None:
+        """``after`` is done once the message before this one was submitted or
+        refused; ``turn`` is this message's, for the one after it."""
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
         try:
@@ -1610,6 +1650,10 @@ async def generate_ws(websocket: WebSocket):
                 model_kwargs = json.loads(model_kwargs)
             if model_kwargs is not None and not isinstance(model_kwargs, dict):
                 raise ValueError("model_kwargs must be a JSON object")
+            # Messages decode side by side but are submitted in the order they
+            # were sent; a message that decodes faster waits here.
+            if after is not None:
+                await asyncio.shield(after)
             await api_server.wait_for_request_id(request_id)
             request_id = api_server.submit_request(
                 text=text,
@@ -1621,6 +1665,7 @@ async def generate_ws(websocket: WebSocket):
                 streaming=True,
                 request_id=request_id,
             )
+            _pass_turn(turn)
             # Cancelling this task (socket closed mid-stream) tears the
             # iterator down, and its ``finally`` aborts the engine request.
             failed = False
@@ -1662,7 +1707,14 @@ async def generate_ws(websocket: WebSocket):
         finally:
             if file_paths:
                 _schedule_upload_cleanup(file_paths)
+            if not turn.done():
+                # refused: the next message still waits for the ones before this one
+                if after is None:
+                    _pass_turn(turn)
+                else:
+                    after.add_done_callback(lambda _: _pass_turn(turn))
 
+    previous_turn: asyncio.Future | None = None
     try:
         while True:
             frame = await websocket.receive()
@@ -1680,7 +1732,9 @@ async def generate_ws(websocket: WebSocket):
             if not isinstance(message, dict):
                 await send({"request_id": None, "error": "message must be an object"}, binary)
                 continue
-            task = asyncio.create_task(serve_one(message, binary))
+            turn = asyncio.get_running_loop().create_future()
+            task = asyncio.create_task(serve_one(message, binary, previous_turn, turn))
+            previous_turn = turn
             tasks.add(task)
             task.add_done_callback(tasks.discard)
     except WebSocketDisconnect:
@@ -1747,6 +1801,9 @@ async def generate(
         for f in files:
             modality = _detect_modality(f.filename or "")
             if modality == "unknown":
+                # a refused request is never submitted, so the deferred cleanup
+                # below never sees what it saved
+                _remove_uploads(file_paths)
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
@@ -1783,6 +1840,7 @@ async def generate(
         in_mods = [p.modality for p in parts]
 
     if "video_frame" in in_mods:
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="'video_frame' is an output-only modality",
@@ -1791,12 +1849,14 @@ async def generate(
     try:
         parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
     except json.JSONDecodeError as e:
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="model_kwargs must be valid JSON",
         ) from e
 
     if parsed_kwargs is not None and not isinstance(parsed_kwargs, dict):
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="model_kwargs must be a JSON object",

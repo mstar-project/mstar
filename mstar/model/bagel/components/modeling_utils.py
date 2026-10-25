@@ -305,13 +305,23 @@ class ImageTransform:
 
 
 def vllm_vit_resize(image: torch.Tensor, size: int) -> torch.Tensor:
-    """vllm-omni's SigLIP ViT preprocessing: resize to a fixed ``size``x``size``
-    square, discarding aspect ratio. Mirrors HF ``SiglipImageProcessor`` with
-    ``size={"height": size, "width": size}`` (BICUBIC, antialias), which is what
-    vllm-omni feeds BAGEL for image understanding. ``image`` is a CHW float
+    """Fixed-square SigLIP ViT preprocessing: resize to a fixed
+    ``size``x``size`` square, discarding aspect ratio. Mirrors HF
+    ``SiglipImageProcessor`` with ``size={"height": size, "width": size}``
+    (BICUBIC, antialias). ``image`` is a CHW float
     tensor in [0, 1]; normalization is applied separately by the caller.
     """
     return F.resize(image, (size, size), InterpolationMode.BICUBIC, antialias=True)
+
+
+def vllm_vae_size(h: int, w: int, stride: int, max_img_size: int, min_img_size: int = 256) -> tuple[int, int]:
+    """The ``(height, width)`` `vllm_vae_resize` resizes an ``h`` x ``w`` image to."""
+    scale = min(max_img_size / max(w, h), 1.0)
+    min_size = min(min_img_size, max_img_size)
+    scale = max(scale, min_size / min(w, h))
+    new_w = max(stride, int(round(w * scale / stride) * stride))
+    new_h = max(stride, int(round(h * scale / stride) * stride))
+    return min(new_h, max_img_size), min(new_w, max_img_size)
 
 
 def vllm_vae_resize(
@@ -320,19 +330,12 @@ def vllm_vae_resize(
     max_img_size: int,
     min_img_size: int = 256,
 ) -> torch.Tensor:
-    """vllm-omni's img2img VAE input resize (``_resize_to_stride`` in
-    vllm_omni/diffusion/models/bagel/pipeline_bagel.py): aspect-preserving,
+    """Stride-multiple img2img VAE input resize: aspect-preserving,
     longest edge <= ``max_img_size``, shortest edge >= ``min_img_size``, both
     rounded to a multiple of ``stride`` and clamped to ``max_img_size``
     (BICUBIC, antialias). ``image`` is a CHW float tensor in [0, 1];
     normalization is applied separately by the caller.
     """
     _, h, w = image.shape
-    scale = min(max_img_size / max(w, h), 1.0)
-    min_size = min(min_img_size, max_img_size)
-    scale = max(scale, min_size / min(w, h))
-    new_w = max(stride, int(round(w * scale / stride) * stride))
-    new_h = max(stride, int(round(h * scale / stride) * stride))
-    new_w = min(new_w, max_img_size)
-    new_h = min(new_h, max_img_size)
-    return F.resize(image, (new_h, new_w), InterpolationMode.BICUBIC, antialias=True)
+    size = vllm_vae_size(h, w, stride, max_img_size, min_img_size)
+    return F.resize(image, size, InterpolationMode.BICUBIC, antialias=True)

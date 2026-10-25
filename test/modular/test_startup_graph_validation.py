@@ -285,6 +285,7 @@ class _ChunkWalkRuntime:
         self.rid = self.rt.add_request(
             request_id="r", partition="C", graph_walk="chunk", partition_worker_graph_ids=ids,
             worker_graph_to_workers=ParallelList(ids, [["worker_0"]] * len(ids)),
+            loop_caps={},
         )
         self.minter = TensorUuidMinter("worker_0")
 
@@ -502,6 +503,7 @@ class _LoopWorker:
         self.rid = self.rt.add_request(
             request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+            loop_caps={},
         )
         self.minter = TensorUuidMinter("worker_0")
         _ingest(self.rt, self.rid, [GraphEdge(next_node="step", name="x")])
@@ -578,7 +580,7 @@ def _constructed(name, model_kwargs, **overrides):
 
 def _bagel(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.bagel.bagel_model import BagelModel
-    return _bare(BagelModel, config=SimpleNamespace(num_timesteps=50))
+    return _bare(BagelModel, config=SimpleNamespace(num_timesteps=50, max_position_embeddings=32768))
 
 
 def _chatterbox(name, model_kwargs, tmp_path, monkeypatch):
@@ -603,6 +605,12 @@ def _cosmos3(name, model_kwargs, tmp_path, monkeypatch):
         # the checkpoint's transformer config has no sound pathway
         return _constructed(name, model_kwargs, sound_gen=False)
     return _constructed(name, model_kwargs)
+
+
+def _fish_s2_pro(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.fish_s2_pro.config import FishS2ProConfig
+    from mstar.model.fish_s2_pro.fish_s2_pro_model import FishS2ProModel
+    return _bare(FishS2ProModel, config=FishS2ProConfig())
 
 
 def _flux2(name, model_kwargs, tmp_path, monkeypatch):
@@ -707,6 +715,7 @@ _FACTORIES = {
     "CanaryQwenModel": _canary_qwen,
     "ChatterboxModel": _chatterbox,
     "Cosmos3Model": _cosmos3,
+    "FishS2ProModel": _fish_s2_pro,
     "Flux2KleinModel": _flux2,
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,

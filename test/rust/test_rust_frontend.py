@@ -303,8 +303,9 @@ def test_sigterm_drains_and_exits(stack):
 
 
 class _GatedStub(_StubAPIServer):
-    """Holds each request open until a shared gate is released, so a request's
-    admission permit is observably held for its whole (streaming) body."""
+    """Sends the first chunk, then holds each request open until a shared gate
+    is released, so a request's admission permit is observably held for its
+    whole (streaming) body."""
 
     def __init__(self, gate):
         super().__init__()
@@ -312,9 +313,9 @@ class _GatedStub(_StubAPIServer):
 
     async def iter_result_chunks(self, request_id):
         import asyncio
+        yield _Chunk("text", b"Hello ")
         while not self.gate.is_set():
             await asyncio.sleep(0.02)
-        yield _Chunk("text", b"Hello ")
         yield _Chunk("text", b"world")
 
 
@@ -347,8 +348,8 @@ def test_admission_permit_is_held_through_streaming_body():
     resp_a = None
     try:
         assert _wait_healthy(port)
-        # A: a streaming chat. The role-delta head event flushes immediately;
-        # the body then blocks on the gate, so A holds its permit open.
+        # A: a streaming chat. Its first delta flushes immediately; the body
+        # then blocks on the gate, so A holds its permit open.
         body = {"model": "qwen3_omni", "stream": True,
                 "messages": [{"role": "user", "content": "hi"}]}
         req_a = urllib.request.Request(
@@ -356,7 +357,8 @@ def test_admission_permit_is_held_through_streaming_body():
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
         resp_a = urllib.request.urlopen(req_a, timeout=15)
-        assert resp_a.readline()  # head event received: A is being served
+        # Not just any line: an SSE keep-alive comment would also be one.
+        assert b"Hello" in resp_a.readline()  # first delta: A is being served
         # B: A holds the only permit, so B is refused with 503.
         with pytest.raises(urllib.error.HTTPError) as e:
             _chat(port, "second", timeout=5)

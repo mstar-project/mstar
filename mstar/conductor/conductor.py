@@ -32,6 +32,8 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
+from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
@@ -39,6 +41,7 @@ from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.utils import knobs
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import check_seed
@@ -141,7 +144,9 @@ def keep_bootstrap_sockets_on_loopback() -> None:
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
 
 
-def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> None:
+def _exit_when_orphaned(
+    worker_id: str, parent=None, poll_s: float = 0.5, before_hard_exit=None,
+) -> None:
     """Worker-side watchdog that leaves once the conductor is gone.
 
     So no worker outlives it holding GPU memory. That includes a worker still
@@ -152,8 +157,20 @@ def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> Non
     """
     exit_when_orphaned(
         f"Worker {worker_id}", "conductor", signal.SIGTERM,
-        parent=parent, poll_s=poll_s,
+        parent=parent, poll_s=poll_s, before_hard_exit=before_hard_exit,
     )
+
+
+def _unlink_owned_files(tensor_manager) -> None:
+    """Unlink the files ``tensor_manager`` still owns, if no later launch can
+    be writing the same names: under a launch token it names its own, so this
+    holds even once the conductor is gone. Without one (a Conductor built
+    directly, not under an API server) the names are the endpoint's alone, a
+    restart on the same prefix reuses them, and no check of the conductor
+    covers the unlinks that follow it (#767); the files stay for a later
+    start to sweep or reclaim instead."""
+    if tensor_manager.names_unique_per_launch:
+        tensor_manager.unlink_owned_files()
 
 
 def _run_worker(worker) -> None:
@@ -161,28 +178,28 @@ def _run_worker(worker) -> None:
 
     A stop (the conductor's SIGTERM, a Ctrl-C) leaves the files of requests in
     flight waiting for a TENSOR_RECEIVED or REMOVE_REQUEST that will not come,
-    in a RAM-backed dir. Only while the conductor lives: it holds the
-    deployment's IPC lock and ports until it has joined its workers, so no
-    other deployment can be using these names yet. An orphaned worker leaves
-    them, as a new deployment on the same prefix may already reuse them.
+    in a RAM-backed dir. Then leave with the first stop or error ``run()``
+    ended on.
     """
+    stop = None
     try:
         worker.run()
-    finally:
-        # A Ctrl-C reaches the conductor too, and its SIGTERM lands here within
-        # milliseconds, often already pending. Finish unlinking (it resumes
-        # where it was cut), then leave with that stop.
-        stop = None
-        while True:
-            try:
-                parent = mp.parent_process()
-                if parent is not None and parent.is_alive():
-                    worker.tensor_manager.unlink_owned_files()
-                break
-            except (KeyboardInterrupt, SystemExit) as e:
-                stop = e
-        if stop is not None:
-            raise stop
+    except BaseException as e:
+        stop = e
+    while True:
+        try:
+            # A Ctrl-C reaches the conductor too, and its SIGTERM lands here
+            # within milliseconds, often already pending. One that fires before
+            # these are ignored is caught below, and the unlinks start over
+            # (each file is untracked only once it is gone).
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            _unlink_owned_files(worker.tensor_manager)
+            break
+        except (KeyboardInterrupt, SystemExit) as e:
+            stop = stop or e
+    if stop is not None:
+        raise stop
 
 
 def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
@@ -239,8 +256,10 @@ def _worker_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    built: list = []  # the Worker, once it exists
     threading.Thread(
         target=_exit_when_orphaned, args=(worker_id,), daemon=True, name="parent-watch",
+        kwargs={"before_hard_exit": lambda: [_unlink_owned_files(w.tensor_manager) for w in built]},
     ).start()
 
     from mstar.worker.worker import Worker
@@ -274,6 +293,7 @@ def _worker_process_target(
     except BaseException as e:
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
         raise e
+    built.append(worker)
     _run_worker(worker)
 
 
@@ -432,6 +452,8 @@ class Conductor:
 
         with open(model_config_file, "r") as f:
             self.model_config = yaml.safe_load(f)
+        # fail here, once, rather than in every worker
+        knobs.check(self.model_config.get("knobs"))
         accelerator = torch.accelerator.current_accelerator(check_available=True)
         self.device_type = accelerator.type if accelerator is not None else "cpu"
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
@@ -559,32 +581,64 @@ class Conductor:
         )
 
     def _max_output_tokens(self, model_kwargs: dict) -> int:
-        """The request's output cap: an int >= 1 within the model's published
-        limit, else ``ValueError`` (a 400). Checked here because the cap is
-        compared inside the run loop, where a non-int would raise and the
-        request would hang."""
+        """The request's output cap: an int >= 1, else ``ValueError`` (a 400).
+        Checked here because the cap is compared inside the run loop, where a
+        non-int would raise and the request would hang."""
         requested = model_kwargs.get("max_output_tokens")
         if requested is not None and (
             isinstance(requested, bool) or not isinstance(requested, int) or requested < 1
         ):
             raise ValueError(f"max_output_tokens must be an integer >= 1; got {requested!r}")
-        limit = self.model.get_max_output_tokens_limit()
-        if requested is not None and limit is not None and requested > limit:
-            raise ValueError(
-                f"max_output_tokens is {requested}; this model produces at most {limit}"
-            )
         cap = self.model.get_max_output_tokens(**model_kwargs)
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
             raise ValueError(f"max_output_tokens must be an integer >= 1; got {cap!r}")
         return cap
 
+    def _loop_caps(self, model_kwargs: dict) -> dict[str, int]:
+        """Each named loop's cap for the request. A cap past its loop's ``max_iters``
+        would end the request short of what it asked for, so it is a ``ValueError`` (a 400)."""
+        caps = self.model.get_loop_caps(**model_kwargs)
+        for name, cap in caps.items():
+            max_iters = self._loop_max_iters.get(name)
+            if max_iters is not None and cap > max_iters:
+                raise ValueError(
+                    f"this request needs {cap} iterations of {name!r}, and this model runs at most {max_iters}"
+                )
+        return {name: caps.get(name, n) for name, n in self._loop_max_iters.items()}
+
     def _resource_specs(self) -> dict:
-        """The model's resource specs by key, for admission-time capability checks."""
+        """The model's resource specs by key, after this deployment's YAML, for admission-time checks."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
-            specs = {s.resource_key: s for s in (self.model.get_node_resources() or [])}
+            built = self.model.get_node_resources() or []
+            apply_yaml_overrides(built, self.model_config)
+            specs = {s.resource_key: s for s in built}
             self._resource_specs_cache = specs
         return specs
+
+    def _fit_loop_caps(self, model_kwargs: dict, configs: dict, cap: int) -> tuple[int, dict[str, int]]:
+        """The largest ``max_output_tokens`` up to ``cap``, and its loop caps, that keeps every loop
+        within what the request's resources hold. A loop that ``max_output_tokens`` doesn't drive is
+        left as it is, and ``validate`` then refuses the request if it doesn't fit."""
+        specs = self._resource_specs()
+        room: dict[str, int] = {}
+        for key, cfg in configs.items():
+            for name, n in cfg.loop_room(specs.get(key)).items():
+                room[name] = min(n, room.get(name, n))
+
+        def overrun(caps: dict[str, int]) -> int:
+            return max((caps[name] - n for name, n in room.items() if name in caps), default=0)
+
+        caps = self._loop_caps({**model_kwargs, "max_output_tokens": cap})
+        over = overrun(caps)
+        while over > 0 and cap > 1:
+            cap = max(1, cap - over)
+            caps = self._loop_caps({**model_kwargs, "max_output_tokens": cap})
+            over, last = overrun(caps), over
+            if over >= last:
+                # the loop that overruns is one max_output_tokens doesn't drive
+                break
+        return cap, caps
 
     def _get_resource_configs(
         self, model_kwargs: dict,
@@ -596,14 +650,14 @@ class Conductor:
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
 
-        A declared stream gets a config even when the model returned none, or its
-        keys would have nowhere to go.
+        A KV resource with declared labels gets a config even when the model
+        returned none, or its keys and layout would have nowhere to go.
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
-        for key, streams in self.model.prefix_key_streams().items():
-            configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
+        for key, labels in self._kv_labels.items():
+            configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
         return configs
 
     def _derive_worker_info(self):
@@ -640,6 +694,13 @@ class Conductor:
         self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
+        }
+        self._loop_max_iters: dict[str, int] = {}
+        for worker_graph in self.worker_graphs.values():
+            for name, loop in worker_graph.section.get_loops().items():
+                self._loop_max_iters[name] = max(loop.max_iters, self._loop_max_iters.get(name, 0))
+        self._kv_labels: dict[str, tuple[str, ...]] = {
+            key: tuple(labels) for key, labels in self.model.kv_labels().items()
         }
 
         # set each group's _tp_rank (the worker's instance rank) per worker
@@ -1107,6 +1168,7 @@ class Conductor:
 
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
+        loop_caps = self._loop_caps(model_kwargs)
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
         # otherwise derive a stable seed from the request id. ``_ingest_request``
         # already rejected a bad one.
@@ -1191,16 +1253,14 @@ class Conductor:
         request_data.resource_configs = self._get_resource_configs(
             model_kwargs, partition_fwd_args
         )
-        specs = self._resource_specs()
-        for key, cfg in request_data.resource_configs.items():
-            cfg.validate(specs.get(key))
         # keyed by resource, so each config is handed only its own chain
         kwargs = model_kwargs or {}
         prefix_keys = kwargs.get("prefix_keys") or {}
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
-        prefix_layout = kwargs.get("prefix_layout") or {}
         prefix_cache = kwargs.get("prefix_cache")
+        kv_layout = kwargs.get("kv_layout") or {}
+        refuse_undeclared_labels(type(self.model).__name__, self._kv_labels, kv_layout, request_data.resource_configs)
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
                 seed=seed,
@@ -1208,9 +1268,19 @@ class Conductor:
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
-                prefix_layout=prefix_layout.get(key),
                 prefix_cache=prefix_cache,
+                kv_layout=kv_layout.get(key),
+                loop_caps=loop_caps,
             )
+        if not any(model_kwargs.get(key) is not None for key in self.model.LENGTH_KWARGS):
+            request_data.max_output_tokens, loop_caps = self._fit_loop_caps(
+                model_kwargs, request_data.resource_configs, max_output_tokens,
+            )
+            for key, cfg in request_data.resource_configs.items():
+                cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
+        specs = self._resource_specs()
+        for key, cfg in request_data.resource_configs.items():
+            cfg.validate(specs.get(key))
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True
@@ -1237,6 +1307,7 @@ class Conductor:
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
+                    loop_caps=loop_caps,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
@@ -1255,6 +1326,8 @@ class Conductor:
                         body=message,
                     ),
                 )
+
+        request_data.resource_configs = without_layouts(request_data.resource_configs)
 
         # After the loop: a tensor's reader count must cover every worker and
         # partition it went to before the producer may free it.
