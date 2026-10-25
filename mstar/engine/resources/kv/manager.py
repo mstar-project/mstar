@@ -147,7 +147,7 @@ class PrefixChain:
     # `unkeyed_items` are the items on the page `unkeyed` fills.
     spans: list[PrefixSpan]
     unkeyed_items: list[PageItem]
-    # The prompt's keys hashed under the root, kept from `_hold_back` or the first probe, so a repeated
+    # The prompt's keys hashed under the root, kept from whichever call hashes them first, so a repeated
     # probe hashes nothing.
     # `rooted` has one key per page.
     # `rooted_ends` has one key per image that ends inside a page, with the token the image ends at.
@@ -1704,9 +1704,10 @@ class KVManager(AttentionResource):
         copy those pages back so its probe finds them. Returns the label whose
         stream waits on the copy.
 
-        Pages come only from the free list, since evicting cached pages for a copy
-        could drop pages a running request hits next. The walk computes whatever
-        isn't copied.
+        On a pool that decides admission the copy can take more pages than are free, and `_grant`
+        evicts for the rest, since the walk would take as many pages to compute them. Any other pool
+        has no allotment to bound the copy, so the copy takes free pages only. The walk computes
+        whatever isn't copied.
         """
         if self._cpu_pool is None or self._index is None or not self._cpu_pool.index.num_pages():
             return None
@@ -1735,10 +1736,12 @@ class KVManager(AttentionResource):
                 or stream.offloaded or stream.read_pending
             ):
                 return None
-            keys, rooted = list(chain.keys), chain.rooted
-            spans, ends = chain.spans, chain.rooted_ends
-        if rooted is None:
-            rooted, ends = self._root(keys, spans)
+            if self._overrides[rid].get_labels(node_name, graph_walk) != [label]:
+                # The engine doesn't probe a walk that writes two labels, so no probe would read a copy.
+                # The chain is marked looked up, so later readiness checks return before taking the lock.
+                chain.looked_up = True
+                return None
+        self._root_chain(chain)
         with self._lock:
             # a probe on the GPU thread may have looked the prompt up or taken a lease while the lock was dropped
             if (
@@ -1746,8 +1749,7 @@ class KVManager(AttentionResource):
                 or chain.looked_up or stream.lease is not None
             ):
                 return None
-            chain.rooted = rooted
-            chain.rooted_ends = ends
+            rooted = chain.rooted
             chain.looked_up = True
             # one page short of the whole prompt, as the probe matches
             cap = len(rooted) - 1
@@ -1761,12 +1763,14 @@ class KVManager(AttentionResource):
             if self._decides:
                 # the copy and the run's evictable pages come out of the allowance
                 evictable = self._index.evictable()
-                budget = min(budget, self._allowance(rid) - sum(page in evictable for page in run))
+                budget = self._allowance(rid) - sum(page in evictable for page in run)
             host = self._cpu_pool.retain_run(rooted[at:min(cap, at + budget)])
             if not host:
                 return None
-            fresh = self._arena.acquire(len(host))
-            stream.hold = self._retain_cached(rid, stream, run) + fresh
+            # retained before the grant, whose eviction could drop the run's index-only pages
+            held = self._retain_cached(rid, stream, run)
+            fresh = self._grant(rid, label, len(host), 0)
+            stream.hold = held + fresh
             stream.read_pending = True
             # listed before the lock drops, so `assert_pages_conserved` on another thread finds a record
             # for every page the copy holds
@@ -3736,17 +3740,15 @@ class KVManager(AttentionResource):
                 return failed
             if next(iter(self._waiting)) != rid:
                 return _WAIT
-            todo = [] if self._index is None else [
-                (stream.chain, list(stream.chain.keys), stream.chain.spans) for stream in self._streams[rid].values()
+            chains = [] if self._index is None else [
+                stream.chain for stream in self._streams[rid].values()
                 if stream.chain is not None and stream.chain.rooted is None
             ]
-        # hashed outside the lock, similar to `resolve_cached_prefix`, so other threads don't wait on it.
         # Requests are queued and removed on one thread only, so ``rid`` is still first in `_waiting`
         # once the lock is taken again.
-        hashed = [self._root(keys, spans) for _, keys, spans in todo]
+        for prefix_chain in chains:
+            self._root_chain(prefix_chain)
         with self._lock:
-            for (chain, _, _), (rooted, ends) in zip(todo, hashed, strict=True):
-                chain.rooted, chain.rooted_ends = rooted, ends
             # A guaranteed request takes no cache hit off its allotment, since the request holding a hit page can
             # release it and the index evict it before the lease.
             whole = charged = 0

@@ -34,6 +34,7 @@ from mstar.engine.resources.kv.config import (
     RetentionPolicy,
     StreamLayout,
 )
+from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
@@ -548,6 +549,46 @@ def test_a_copy_from_the_host_waits_for_the_join_and_comes_out_of_the_allotment(
     assert kv._room() == room - pages, "the copy took room past \"b\"'s allotment"
     host._land(kv)
     assert kv._allotments["b"].pages == pages and kv._room() == room - pages, "the landed copy moved \"b\"'s room"
+
+
+def _full_of_cache_with_a_prefix_on_the_host():
+    kv = host._manager(max_num_pages=20)
+    host._serve(kv, "a", host.A_PROMPT + [1, 2])
+    assert kv.offload("a") > 0
+    # the index keeps the first four of the six pages the host holds, and "c" fills the pool after them, so those
+    # four are the leaves an eviction takes first
+    kv._index.evict(2)
+    host._serve(kv, "c", list(range(500, 500 + 15 * host.PAGE_SIZE)))
+    kv.remove_request("c")
+    assert kv._arena.num_free == 0 and kv._index.num_pages() == 19
+    return kv
+
+
+def test_a_head_in_a_pool_with_no_free_page_copies_its_prefix_back_from_the_host():
+    kv = _full_of_cache_with_a_prefix_on_the_host()
+    host._ingest(kv, "b", host.A_PROMPT + [7, 8])
+
+    assert not _ready(kv, "b"), "\"b\" recomputes a prefix the host holds"
+    host._land(kv)
+    assert host._probe(kv, "b", host.A_PROMPT + [7, 8]) == 6 * host.PAGE_SIZE, (
+        "the copy evicted the index's pages of \"b\"'s prefix, or \"b\"'s probe missed the copied pages"
+    )
+
+
+def test_a_guided_head_copies_nothing_from_the_host():
+    kv = _full_of_cache_with_a_prefix_on_the_host()
+    tokens = host.A_PROMPT + [7, 8]
+    spans = (PrefixSpan(len(tokens), len(tokens), WALK),)
+    kv.ingest_request("g", KVReqConfig(
+        prefix_keys={"main": chain([tokens[at:at + host.PAGE_SIZE] for at in range(0, len(tokens), host.PAGE_SIZE)])},
+        kv_layout={"main": StreamLayout(spans=spans, keyed_spans=1), "cfg_img": StreamLayout(spans=spans)},
+        needed_labels_per_node_walk={(NODE, WALK): ["main", "cfg_img"]},
+    ))
+
+    # the engine doesn't probe a walk that writes two labels
+    assert _ready(kv, "g") and not kv._host_copies, "a guided head waits for a copy its walk never reads"
+    assert kv._index.num_pages() == 19, "a guided head's copy evicted cached pages"
+    assert kv._streams["g"]["main"].chain.looked_up, "every readiness check of a guided head takes the pool's lock"
 
 
 def test_a_reload_counts_the_evictable_index_pages_it_keeps_as_room():
