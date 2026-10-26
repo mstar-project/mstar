@@ -28,7 +28,7 @@ from mstar.model.command_a_plus.config import (
     SAMPLER,
     CommandAPlusConfig,
 )
-from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
+from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule, CommandAPlusVisionSubmodule
 from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
 from mstar.model.command_a_plus.tests.test_weight_loading import checkpoint
 from mstar.model.multimodal import PromptPart
@@ -256,6 +256,26 @@ class ModelIntegrationTests(unittest.TestCase):
         with torch.inference_mode():
             outputs = node.forward("prefill_image", None, **node.preprocess("prefill_image", None, [inputs]))
         self.assertEqual(tuple(outputs["image_embeds"][0].shape), (3 * 4, self.model.config.hidden_size))
+
+    def test_vision_node_batches_requests_and_hands_each_its_own_embeddings(self):
+        from mstar.model.command_a_plus.tests.test_vision import tiny_encoder
+
+        torch.manual_seed(0)
+        node = CommandAPlusVisionSubmodule(tiny_encoder()).eval()
+        node.TILES_PER_CALL = 2  # a chunk straddles the two requests
+        tiles = {"b": torch.rand(3, 3, 32, 32), "a": torch.rand(1, 3, 32, 32)}
+        inputs = [node.prepare_inputs("prefill_image", info("prefill_image"), {"pixel_values": [t]})
+                  for t in tiles.values()]
+        engine = ModelInputsFromEngine(list(tiles), {})
+        self.assertTrue(node.can_batch(None, inputs))
+        with torch.inference_mode():
+            batched = node.forward_batched("prefill_image", engine, **node.preprocess("prefill_image", engine, inputs))
+            alone = [node.forward("prefill_image", None, **node.preprocess("prefill_image", None, [inp]))
+                     for inp in inputs]
+        self.assertEqual(list(batched), ["b", "a"])
+        for rid, single in zip(tiles, alone, strict=True):
+            self.assertEqual(len(batched[rid]["image_embeds"][0]), len(tiles[rid]) * 4)
+            torch.testing.assert_close(batched[rid]["image_embeds"][0], single["image_embeds"][0])
 
     def test_load_dtype_and_reject_sequence_parallelism(self):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")
