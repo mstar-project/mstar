@@ -98,6 +98,10 @@ class AudioEncoderSubmodule(NodeSubmodule):
     Runs once per request (not batched across requests).
     """
 
+    # Eager: under torch.compile each new input shape recompiles the HF encoder,
+    # which stalls the worker for seconds.
+    disable_torch_compile = True
+
     def __init__(self, audio_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
         self.audio_encoder = audio_encoder
@@ -169,6 +173,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
 
     Runs once per request (not batched across requests).
     """
+
+    # Eager, as AudioEncoderSubmodule.
+    disable_torch_compile = True
 
     def __init__(self, vision_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
