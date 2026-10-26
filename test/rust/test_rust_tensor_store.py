@@ -30,6 +30,7 @@ from mstar.communication.tensor_store import (
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import TensorPointerInfo
+from mstar.graph.runtime.base import InlineColumn, PostprocessNeed, PostprocessRequest
 from mstar.utils.containers import ParallelList
 
 
@@ -356,7 +357,7 @@ def test_the_runtime_reports_a_registered_input_and_keeps_it_for_the_transport(t
 
 
 def test_a_tensor_freed_with_the_gil_released_is_gone_on_return(tmp_path):
-    """``route_and_send_inline`` routes inside ``allow_threads``, so a consumed
+    """The native postprocess routes inside ``allow_threads``, so a consumed
     input its completion frees is dropped without the GIL. pyo3 defers that
     decref to its pool and drains the pool when the GIL comes back at the end
     of the call -- so the tensor is gone by the time the call returns, and the
@@ -368,11 +369,12 @@ def test_a_tensor_freed_with_the_gil_released_is_gone_on_return(tmp_path):
     rt.pop_rids("LLM", "decode", [rid])
 
     column = torch.tensor([5], dtype=torch.int64)
-    out = rt.route_and_send_inline(
-        "default", "decode", "LLM", ["tok"], [rid], "tok", column, [rid],
-    )
-    status, route = out.status, out.route_output
-    assert status == 1, "nothing left for Python to tear down"
-    assert route is None
+    step = rt.begin_postprocess(PostprocessRequest(
+        partition="default", node_name="LLM", graph_walk="decode", output_signals=["tok"],
+        wg_ids=ParallelList([rid], [0]), row_rids=[rid], inline=InlineColumn("tok", column),
+    ))
+    assert step.need is PostprocessNeed.STOPS  # no declared policies: check_stop decides
+    step = rt.resume_postprocess(stops={})
+    assert step.need is PostprocessNeed.DONE, "nothing left for Python to tear down"
     assert ref() is None
     assert store.stored_counts() == (0, 0)

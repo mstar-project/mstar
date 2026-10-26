@@ -2627,10 +2627,10 @@ impl GraphRuntime {
         &mut self, input: RouteArg,
     ) -> PyResult<RouteOut> {
         // Tensors freed outright below, dropped when this returns -- after
-        // every bookkeeping guard, since it is declared before them. Under
-        // `route_and_send_inline` that is inside `allow_threads`, where pyo3
-        // defers the decrefs to its pool and drains it when the GIL comes back
-        // at the end of that call.
+        // every bookkeeping guard, since it is declared before them. Under the
+        // native postprocess (`begin_postprocess` / `resume_postprocess_*`)
+        // that is inside `allow_threads`, where pyo3 defers the decrefs to its
+        // pool and drains it when the GIL comes back at the end of that call.
         let mut freed_objects: Vec<StoredTensor> = Vec::new();
         let n_sig = input.output_signals.len();
         if input.rids.len() * n_sig != input.num_tensors.len() {
