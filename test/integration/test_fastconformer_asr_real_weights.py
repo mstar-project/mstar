@@ -75,10 +75,10 @@ def _frame_by_frame(head, states: torch.Tensor, prompt: torch.Tensor | None) -> 
 def _greedy(head, states: torch.Tensor, prompt: torch.Tensor | None, step=None) -> list[int]:
     """One clip through ``advance`` a chunk at a time from the start state, as
     the decode loop runs it, in full fp32 as the node does."""
+    from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
     from mstar.model.components.transducer import CHUNK
-    from mstar.utils.precision import ieee_fp32_matmul
 
-    with ieee_fp32_matmul():
+    with fp32_precision_scope(Fp32Precision("highest", None)):
         frames = head.project_frames(states, prompt)
         lengths = torch.tensor([frames.shape[1]], device=frames.device)
         state = {name: start[None].clone() for name, start in head.initial_state().items()}
