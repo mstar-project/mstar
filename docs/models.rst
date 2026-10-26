@@ -1580,8 +1580,8 @@ has checked, not that it fails.
    * - ``wan22``
      - Works, caveat
      - Text embeddings and the CFG trajectory match the reference bit for bit, and the
-       video is 27.9 dB from the reference mp4. The VAE decode isn't bit-repeatable from
-       call to call (MIOpen's split-K conv solver).
+       video is 27.9 dB from the reference mp4. The VAE decode repeats bit for bit now that
+       the ROCm env defaults turn off MIOpen's split-K conv solver.
      -
    * - ``waypoint`` (``waypoint_360p``)
      - Works
@@ -1593,17 +1593,23 @@ has checked, not that it fails.
      - Predictor output cosine 0.998 against transformers in fp32, but the encoder's only
        0.93 (transformers' own bf16 run gets 0.97).
      -
-   * - ``bagel``, ``nemotron_duplex``, ``pi05``, ``vjepa2_ac``, ``flux2_klein_9b``,
-       ``cosmos3_super``, ``qwen3_tts_base``, ``qwen3_tts_voicedesign``, ``waypoint``
-       (720p), and every multi-GPU config
-     - Not yet run
+   * - ``bagel``, ``pi05``, ``vjepa2_ac``, ``flux2_klein_9b``, ``cosmos3_super`` (TP2),
+       ``qwen3_tts_base``, ``qwen3_tts_voicedesign``, ``waypoint`` (720p)
+     - Runs
+     - Self-consistency or reference checks pass (flux2_klein_9b 26.3 dB against diffusers,
+       calibrated; cosmos3_super_tp2 t2v passes calibrated on MI325X and fails on MI300X).
+       pi05's actions were all NaN until the SigLIP weight-loading fix (#696).
      -
+   * - ``nemotron_duplex``
+     - Works, caveat
+     - Text replies identical across instances; the spoken reply's WER isn't validated.
      -
 
 A few things apply to every model on AMD GPUs:
 
-- Only single-GPU configs have been run so far. Tensor-parallel ones, including the fused
-  all-reduce + RMSNorm, haven't been checked on AMD GPUs yet.
+- Multi-GPU configs have been run too (Qwen3.5 9B TP2 with the fused all-reduce + RMSNorm,
+  ``whisper_large_tp2``, ``orpheus_tp2``, ``qwen3omni_2gpu``, Cosmos3 nano TP2/SP2/TP4/SP4) and
+  pass the same checks as their single-GPU configs.
 - Greedy output can differ between two server processes at near-tied tokens. For
   Qwen3.5, two instances agreed on 16 to 31 of 32 prompts, and every difference was a
   near tie.
