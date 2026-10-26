@@ -710,8 +710,8 @@ HiFT vocoder, PerTh watermark. 24 kHz. Multilingual covers 23 languages.</p></td
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">command_a_plus</span></code> <em>(Experimental)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">CohereLabs/command-a-plus-05-2026-bf16</span></code></p></td>
-<td><p>Command A+ text chat: a 218B-parameter MoE (25B active) with sliding-window
-attention. Tested on 4x GB200 at TP4; see the notes below.</p></td>
+<td><p>Command A+ text and image chat: a 218B-parameter MoE (25B active) with
+sliding-window attention. Tested on 4x GB200 at TP4; see the notes below.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cosmos3</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Nano</span></code></p></td>
@@ -1015,13 +1015,18 @@ client sends.</p>
 </section>
 <section id="command-a-command-a-plus">
 <h2>Command A+ (<code class="docutils literal notranslate"><span class="pre">command_a_plus</span></code>)<a class="headerlink" href="#command-a-command-a-plus" title="Link to this heading">#</a></h2>
-<p>Text chat on Command A+: 32 MoE layers (128 routed experts, top-8, plus an
-always-on shared expert), with three sliding-window (4096) layers for every
-global one. Only the text backbone is loaded. Served on <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code>
-(there is no OpenAI adapter yet):</p>
+<p>Text and image chat on Command A+: 32 MoE layers (128 routed experts, top-8,
+plus an always-on shared expert), with three sliding-window (4096) layers for
+every global one. Served on <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code> (there is no OpenAI adapter
+yet):</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">mstar</span> <span class="n">serve</span> <span class="n">command_a_plus</span> <span class="o">--</span><span class="n">gpus</span> <span class="mi">0</span><span class="p">,</span><span class="mi">1</span><span class="p">,</span><span class="mi">2</span><span class="p">,</span><span class="mi">3</span>
+<span class="n">curl</span> <span class="o">-</span><span class="n">s</span> <span class="n">http</span><span class="p">:</span><span class="o">//</span><span class="n">localhost</span><span class="p">:</span><span class="mi">8000</span><span class="o">/</span><span class="n">generate</span> <span class="o">-</span><span class="n">F</span> <span class="s1">'text=What is in this image?'</span> <span class="o">-</span><span class="n">F</span> <span class="s1">'files=@cat.jpg'</span>
 </pre></div>
 </div>
+<p>Images are tiled like transformers’ <code class="docutils literal notranslate"><span class="pre">Cohere2VisionProcessor</span></code> (up to 12
+512x512 tiles plus a thumbnail, 256 tokens each) and encoded on the first LLM
+rank. In <code class="docutils literal notranslate"><span class="pre">messages</span></code>, an image is a <code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;image&quot;}</span></code> item; the uploaded
+files fill them in order.</p>
 <p>Install the <code class="docutils literal notranslate"><span class="pre">command_a_plus</span></code> extra, and point <code class="docutils literal notranslate"><span class="pre">CUDA_HOME</span></code> at a toolkit
 matching PyTorch’s CUDA version so the fused-MoE alignment op can JIT-build.
 The ~437 GB of BF16 weights are never downloaded automatically: download the
@@ -1042,9 +1047,9 @@ give it a generous <code class="docutils literal notranslate"><span class="pre">
 Triton kernels, and one all-reduce per layer (<code class="docutils literal notranslate"><span class="pre">tp_allreduce:</span> <span class="pre">flashinfer</span></code> at TP4).
 On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
 64 (<code class="docutils literal notranslate"><span class="pre">benchmark/command_a_plus/bench_http.py</span></code>); <code class="docutils literal notranslate"><span class="pre">validate_checkpoint.py</span></code>
-there checks parity against Hugging Face. Not supported yet: image input, FP8
-weights, prefill CUDA graphs, and reclaiming KV pages outside the sliding
-window.</p>
+there checks parity against Hugging Face, with <code class="docutils literal notranslate"><span class="pre">--images</span></code> for image prompts.
+Not supported yet: FP8 weights, prefill CUDA graphs, and reclaiming KV pages
+outside the sliding window.</p>
 </section>
 <section id="kokoro-notes">
 <h2>Kokoro notes<a class="headerlink" href="#kokoro-notes" title="Link to this heading">#</a></h2>

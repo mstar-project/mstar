@@ -940,6 +940,7 @@ window.runMermaid = runMermaid;</script>
   <h1>Source code for mstar.model.command_a_plus.tests.test_config</h1><div class="highlight"><pre>
 <span></span><span class="sd">"""Offline config contract tests; run with unittest, without model dependencies."""</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">copy</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">unittest</span>
@@ -1039,6 +1040,20 @@ window.runMermaid = runMermaid;</script>
             <span class="n">CommandAPlusConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">assertRaisesRegex</span><span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="s2">"JSON object"</span><span class="p">):</span>
             <span class="n">CommandAPlusConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">([])</span></div>
+
+
+<div class="viewcode-block" id="ConfigTests.test_vision_config_and_unsupported_architectures">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.command_a_plus.tests.test_config.html#mstar.model.command_a_plus.tests.test_config.ConfigTests.test_vision_config_and_unsupported_architectures">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">test_vision_config_and_unsupported_architectures</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">assertEqual</span><span class="p">(</span><span class="n">CommandAPlusConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">vision_config</span><span class="o">.</span><span class="n">tokens_per_tile</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">in_vision</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="p">(</span>
+            <span class="p">(</span><span class="kc">True</span><span class="p">,</span> <span class="s2">"hidden_act"</span><span class="p">,</span> <span class="s2">"gelu"</span><span class="p">),</span> <span class="p">(</span><span class="kc">False</span><span class="p">,</span> <span class="s2">"alignment_activation_fn"</span><span class="p">,</span> <span class="s2">"gelu"</span><span class="p">),</span>
+            <span class="p">(</span><span class="kc">False</span><span class="p">,</span> <span class="s2">"vision_feature_layer"</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">),</span> <span class="p">(</span><span class="kc">False</span><span class="p">,</span> <span class="s2">"vision_feature_select_strategy"</span><span class="p">,</span> <span class="s2">"default"</span><span class="p">),</span>
+        <span class="p">):</span>
+            <span class="n">data</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
+            <span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="s2">"vision_config"</span><span class="p">]</span> <span class="k">if</span> <span class="n">in_vision</span> <span class="k">else</span> <span class="n">data</span><span class="p">)[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>
+            <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">subTest</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="n">name</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">assertRaisesRegex</span><span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+                <span class="n">CommandAPlusConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">data</span><span class="p">)</span></div>
 </div>
 
 

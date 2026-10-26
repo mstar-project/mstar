@@ -34,5 +34,6 @@ mstar.model.command\_a\_plus.tests
    test_integration
    test_reference
    test_registration
+   test_vision
    test_weight_loading
 

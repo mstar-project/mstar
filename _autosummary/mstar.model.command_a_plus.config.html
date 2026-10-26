@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.model.command_a_plus.tests" href="mstar.model.command_a_plus.tests.html" />
-    <link rel="prev" title="mstar.model.command_a_plus.components" href="mstar.model.command_a_plus.components.html" />
+    <link rel="prev" title="mstar.model.command_a_plus.components.vision" href="mstar.model.command_a_plus.components.vision.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -651,6 +651,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.from_dict"><code class="docutils literal notranslate"><span class="pre">CommandAPlusConfig.from_dict()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.from_json"><code class="docutils literal notranslate"><span class="pre">CommandAPlusConfig.from_json()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.text_config"><code class="docutils literal notranslate"><span class="pre">CommandAPlusConfig.text_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.vision_config"><code class="docutils literal notranslate"><span class="pre">CommandAPlusConfig.vision_config</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig"><code class="docutils literal notranslate"><span class="pre">CommandAPlusTextConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -677,6 +678,21 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig.vocab_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusTextConfig.vocab_size</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.alignment_intermediate_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.alignment_intermediate_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.downsample_factor"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.downsample_factor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.from_dict"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.from_dict()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.hidden_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.hidden_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.image_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.image_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.image_token_id"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.image_token_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.intermediate_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.intermediate_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.layer_norm_eps"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.layer_norm_eps</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.num_attention_heads"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.num_attention_heads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.num_hidden_layers"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.num_hidden_layers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.patch_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.patch_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.tokens_per_tile"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.tokens_per_tile</span></code></a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -693,23 +709,29 @@
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusConfig" title="mstar.model.command_a_plus.config.CommandAPlusConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CommandAPlusConfig</span></code></a>(text_config)</p></td>
-<td><p>Text-only view of the outer Cohere2 Vision checkpoint configuration.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusConfig" title="mstar.model.command_a_plus.config.CommandAPlusConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CommandAPlusConfig</span></code></a>(text_config, vision_config)</p></td>
+<td><p>The outer Cohere2 Vision checkpoint configuration.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig" title="mstar.model.command_a_plus.config.CommandAPlusTextConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CommandAPlusTextConfig</span></code></a>(vocab_size, ...)</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig" title="mstar.model.command_a_plus.config.CommandAPlusVisionConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig</span></code></a>(hidden_size, ...)</p></td>
+<td><p>The SigLIP tower, pixel shuffle and SwiGLU projector that feed image tiles to the LLM.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusConfig">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.command_a_plus.config.</span></span><span class="sig-name descname"><span class="pre">CommandAPlusConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">text_config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/command_a_plus/config.html#CommandAPlusConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusConfig" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.command_a_plus.config.</span></span><span class="sig-name descname"><span class="pre">CommandAPlusConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">text_config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vision_config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/command_a_plus/config.html#CommandAPlusConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusConfig" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>Text-only view of the outer Cohere2 Vision checkpoint configuration.</p>
+<p>The outer Cohere2 Vision checkpoint configuration.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>text_config</strong> (<a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig" title="mstar.model.command_a_plus.config.CommandAPlusTextConfig"><em>CommandAPlusTextConfig</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>text_config</strong> (<a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig" title="mstar.model.command_a_plus.config.CommandAPlusTextConfig"><em>CommandAPlusTextConfig</em></a>)</p></li>
+<li><p><strong>vision_config</strong> (<a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig" title="mstar.model.command_a_plus.config.CommandAPlusVisionConfig"><em>CommandAPlusVisionConfig</em></a>)</p></li>
+</ul>
 </dd>
 </dl>
 <dl class="py method">
@@ -742,6 +764,11 @@
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusConfig.text_config">
 <span class="sig-name descname"><span class="pre">text_config</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig" title="mstar.model.command_a_plus.config.CommandAPlusTextConfig"><span class="pre">CommandAPlusTextConfig</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.text_config" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusConfig.vision_config">
+<span class="sig-name descname"><span class="pre">vision_config</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig" title="mstar.model.command_a_plus.config.CommandAPlusVisionConfig"><span class="pre">CommandAPlusVisionConfig</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.vision_config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -892,6 +919,98 @@
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.command_a_plus.config.</span></span><span class="sig-name descname"><span class="pre">CommandAPlusVisionConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_hidden_layers</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_attention_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">image_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">patch_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer_norm_eps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">downsample_factor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">alignment_intermediate_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">image_token_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/command_a_plus/config.html#CommandAPlusVisionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>The SigLIP tower, pixel shuffle and SwiGLU projector that feed image tiles to the LLM.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_hidden_layers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_attention_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>image_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>patch_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>layer_norm_eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>downsample_factor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>alignment_intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>image_token_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.alignment_intermediate_size">
+<span class="sig-name descname"><span class="pre">alignment_intermediate_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.alignment_intermediate_size" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.downsample_factor">
+<span class="sig-name descname"><span class="pre">downsample_factor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.downsample_factor" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.from_dict">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">from_dict</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">data</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/command_a_plus/config.html#CommandAPlusVisionConfig.from_dict"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.from_dict" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">data</span></code> is the whole checkpoint config; the tower’s own fields sit in <code class="docutils literal notranslate"><span class="pre">vision_config</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>data</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig" title="mstar.model.command_a_plus.config.CommandAPlusVisionConfig"><em>CommandAPlusVisionConfig</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.hidden_size">
+<span class="sig-name descname"><span class="pre">hidden_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.hidden_size" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.image_size">
+<span class="sig-name descname"><span class="pre">image_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.image_size" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.image_token_id">
+<span class="sig-name descname"><span class="pre">image_token_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.image_token_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.intermediate_size">
+<span class="sig-name descname"><span class="pre">intermediate_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.intermediate_size" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.layer_norm_eps">
+<span class="sig-name descname"><span class="pre">layer_norm_eps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.layer_norm_eps" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.num_attention_heads">
+<span class="sig-name descname"><span class="pre">num_attention_heads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.num_attention_heads" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.num_hidden_layers">
+<span class="sig-name descname"><span class="pre">num_hidden_layers</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.num_hidden_layers" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.patch_size">
+<span class="sig-name descname"><span class="pre">patch_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.patch_size" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.model.command_a_plus.config.CommandAPlusVisionConfig.tokens_per_tile">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">tokens_per_tile</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.tokens_per_tile" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
 </section>
 
 
@@ -906,12 +1025,12 @@
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.model.command_a_plus.components.html"
+       href="mstar.model.command_a_plus.components.vision.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.model.command_a_plus.components</p>
+        <p class="prev-next-title">mstar.model.command_a_plus.components.vision</p>
       </div>
     </a>
     <a class="right-next"
@@ -945,6 +1064,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.from_dict"><code class="docutils literal notranslate"><span class="pre">CommandAPlusConfig.from_dict()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.from_json"><code class="docutils literal notranslate"><span class="pre">CommandAPlusConfig.from_json()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.text_config"><code class="docutils literal notranslate"><span class="pre">CommandAPlusConfig.text_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusConfig.vision_config"><code class="docutils literal notranslate"><span class="pre">CommandAPlusConfig.vision_config</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig"><code class="docutils literal notranslate"><span class="pre">CommandAPlusTextConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -969,6 +1089,21 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig.shared_intermediate_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusTextConfig.shared_intermediate_size</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig.sliding_window"><code class="docutils literal notranslate"><span class="pre">CommandAPlusTextConfig.sliding_window</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusTextConfig.vocab_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusTextConfig.vocab_size</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.alignment_intermediate_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.alignment_intermediate_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.downsample_factor"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.downsample_factor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.from_dict"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.from_dict()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.hidden_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.hidden_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.image_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.image_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.image_token_id"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.image_token_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.intermediate_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.intermediate_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.layer_norm_eps"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.layer_norm_eps</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.num_attention_heads"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.num_attention_heads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.num_hidden_layers"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.num_hidden_layers</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.patch_size"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.patch_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.tokens_per_tile"><code class="docutils literal notranslate"><span class="pre">CommandAPlusVisionConfig.tokens_per_tile</span></code></a></li>
 </ul>
 </li>
 </ul>

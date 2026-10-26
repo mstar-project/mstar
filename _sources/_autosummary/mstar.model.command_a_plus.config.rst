@@ -19,6 +19,7 @@ mstar.model.command\_a\_plus.config
    
       CommandAPlusConfig
       CommandAPlusTextConfig
+      CommandAPlusVisionConfig
    
    
 

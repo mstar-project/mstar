@@ -28,4 +28,5 @@ mstar.model.command\_a\_plus.components
    :recursive:
 
    language_model
+   vision
 

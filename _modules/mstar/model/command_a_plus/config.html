@@ -949,6 +949,8 @@ window.runMermaid = runMermaid;</script>
 <span class="n">ROPE</span> <span class="o">=</span> <span class="s2">"rope"</span>
 <span class="n">SAMPLER</span> <span class="o">=</span> <span class="s2">"sampler"</span>
 
+<span class="n">PREFILL_WALKS</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"prefill"</span><span class="p">,</span> <span class="s2">"prefill_image"</span><span class="p">)</span>
+
 
 <div class="viewcode-block" id="CommandAPlusTextConfig">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.command_a_plus.config.html#mstar.model.command_a_plus.config.CommandAPlusTextConfig">[docs]</a>
@@ -1019,13 +1021,63 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="CommandAPlusVisionConfig">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.command_a_plus.config.html#mstar.model.command_a_plus.config.CommandAPlusVisionConfig">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">CommandAPlusVisionConfig</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The SigLIP tower, pixel shuffle and SwiGLU projector that feed image tiles to the LLM."""</span>
+
+    <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">intermediate_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">num_attention_heads</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">image_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">patch_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">layer_norm_eps</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">downsample_factor</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">alignment_intermediate_size</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">image_token_id</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">tokens_per_tile</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">image_size</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">patch_size</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">downsample_factor</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span>
+
+<div class="viewcode-block" id="CommandAPlusVisionConfig.from_dict">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.command_a_plus.config.html#mstar.model.command_a_plus.config.CommandAPlusVisionConfig.from_dict">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"CommandAPlusVisionConfig"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``data`` is the whole checkpoint config; the tower's own fields sit in ``vision_config``."""</span>
+        <span class="n">vision</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="s2">"vision_config"</span><span class="p">]</span>
+        <span class="c1"># Shapes are checked when weights load; these would load fine and compute the wrong thing.</span>
+        <span class="k">for</span> <span class="n">source</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">supported</span> <span class="ow">in</span> <span class="p">(</span>
+            <span class="p">(</span><span class="n">vision</span><span class="p">,</span> <span class="s2">"hidden_act"</span><span class="p">,</span> <span class="s2">"gelu_pytorch_tanh"</span><span class="p">),</span>
+            <span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="s2">"alignment_activation_fn"</span><span class="p">,</span> <span class="s2">"swiglu"</span><span class="p">),</span>
+            <span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="s2">"vision_feature_layer"</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">),</span>
+            <span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="s2">"vision_feature_select_strategy"</span><span class="p">,</span> <span class="s2">"full"</span><span class="p">),</span>
+        <span class="p">):</span>
+            <span class="k">if</span> <span class="n">source</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span> <span class="o">!=</span> <span class="n">supported</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be </span><span class="si">{</span><span class="n">supported</span><span class="si">!r}</span><span class="s2">; got </span><span class="si">{</span><span class="n">source</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="o">**</span><span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">vision</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span>
+                <span class="s2">"hidden_size"</span><span class="p">,</span> <span class="s2">"intermediate_size"</span><span class="p">,</span> <span class="s2">"num_hidden_layers"</span><span class="p">,</span> <span class="s2">"num_attention_heads"</span><span class="p">,</span>
+                <span class="s2">"image_size"</span><span class="p">,</span> <span class="s2">"patch_size"</span><span class="p">,</span> <span class="s2">"layer_norm_eps"</span><span class="p">,</span>
+            <span class="p">)},</span>
+            <span class="n">downsample_factor</span><span class="o">=</span><span class="n">data</span><span class="p">[</span><span class="s2">"downsample_factor"</span><span class="p">],</span>
+            <span class="n">alignment_intermediate_size</span><span class="o">=</span><span class="n">data</span><span class="p">[</span><span class="s2">"alignment_intermediate_size"</span><span class="p">],</span>
+            <span class="n">image_token_id</span><span class="o">=</span><span class="n">data</span><span class="p">[</span><span class="s2">"image_token_id"</span><span class="p">],</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="CommandAPlusConfig">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.command_a_plus.config.html#mstar.model.command_a_plus.config.CommandAPlusConfig">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">CommandAPlusConfig</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Text-only view of the outer Cohere2 Vision checkpoint configuration."""</span>
+<span class="w">    </span><span class="sd">"""The outer Cohere2 Vision checkpoint configuration."""</span>
 
     <span class="n">text_config</span><span class="p">:</span> <span class="n">CommandAPlusTextConfig</span>
+    <span class="n">vision_config</span><span class="p">:</span> <span class="n">CommandAPlusVisionConfig</span>
 
 <div class="viewcode-block" id="CommandAPlusConfig.from_dict">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.command_a_plus.config.html#mstar.model.command_a_plus.config.CommandAPlusConfig.from_dict">[docs]</a>
@@ -1039,7 +1091,10 @@ window.runMermaid = runMermaid;</script>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Outer tie_word_embeddings must be True"</span><span class="p">)</span>
         <span class="k">if</span> <span class="s2">"text_config"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">data</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Missing required text_config"</span><span class="p">)</span>
-        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">text_config</span><span class="o">=</span><span class="n">CommandAPlusTextConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="s2">"text_config"</span><span class="p">]))</span></div>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">text_config</span><span class="o">=</span><span class="n">CommandAPlusTextConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="s2">"text_config"</span><span class="p">]),</span>
+            <span class="n">vision_config</span><span class="o">=</span><span class="n">CommandAPlusVisionConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">data</span><span class="p">),</span>
+        <span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="CommandAPlusConfig.from_json">
