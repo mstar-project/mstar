@@ -1164,7 +1164,8 @@ methods are:
    eos_tokens=..., sampler=...)`` stops its loop on an EOS token (unless the ``sampler``
    resource's request config sets ``ignore_eos``) or when the loop's iteration count plus
    one reaches ``max_iters`` (``info.max_tokens`` unless given). ``StopKind.ITER`` checks
-   only the count. The limits are computed once per request and walk. Return ``{}`` for a
+   only the count. The limits are computed from the request's forward-pass info whenever
+   the worker receives it, not per step. Return ``{}`` for a
    walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
    calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
    ``test/modular/test_stop_policies.py`` checks the models that declare them.

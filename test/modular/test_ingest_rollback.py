@@ -50,6 +50,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     processed, failed, registered = [], [], []
     w._graph_runtime = SimpleNamespace(
         add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
+        register_stop_limits=lambda rid, info: None,
     )
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),

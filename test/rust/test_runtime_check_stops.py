@@ -1,5 +1,6 @@
-"""Each graph runtime's stop check (``GraphRuntime.check_stops``) stops what
-the declared policy does (``StopPolicy.stops``) on the loop count the step was
+"""Each graph runtime's stop check (``GraphRuntime.check_stops``), over the
+token column the worker's ``PostprocessRequest`` hands it, stops what the
+declared policy does (``StopPolicy.stops``) on the loop count the step was
 built with, through the worker's async decode loop.
 
 A runtime reads each loop's count from its walk state at postprocess time, by
@@ -32,10 +33,18 @@ SAMPLER = "sampler"
 POLICY = StopPolicy(StopKind.AR, token_signal="new_token", eos_tokens=(EOS,), sampler=SAMPLER)
 
 
+# no signal stays on the device, so nothing rides inline
+_ENGINE = SimpleNamespace(
+    device_loopback_signals=lambda node, walk: (), inline_client_signals=lambda node, walk: {},
+)
+
+
 def _declared_worker(kind, policy=POLICY):
     w = _worker(kind)
     w._graph_runtime.set_stop_policies(NODE, WALK, {LOOP: policy})
     w._stop_token_signal = {(NODE, WALK): policy.token_signal}
+    w._device_loopback = {}
+    w._innermost_loop_by_node = {}
     return w
 
 
@@ -61,6 +70,7 @@ def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(kind, 
         info = w.request_state.get_fwd_info(rid, PART)
         info.max_tokens = 2 + i
         info.resource_configs[SAMPLER] = SimpleNamespace(ignore_eos=bool(rng.integers(2)))
+        w._graph_runtime.register_stop_limits(rid, info)
     pending = _first_step(w, rids)
     stopped = 0
     for _ in range(8):
@@ -75,7 +85,12 @@ def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(kind, 
         order = rng.permutation(len(ids))[: len(ids) - int(rng.random() < 0.5)]
         tokens = torch.tensor(rng.choice([EOS, 1, 2], size=len(order)))[:, None]
         host_rows = HostRows(tuple(ids[i] for i in order), {"new_token": tokens})
-        got = w._check_stops_in_runtime(pending, host_rows)
+        req = w._postprocess_request(pending, host_rows, _ENGINE)
+        assert req.runtime_stops and req.inline is None
+        got = w._graph_runtime.check_stops(
+            req.partition, req.node_name, req.graph_walk, list(req.wg_ids.keys),
+            req.tokens, list(req.row_rids),
+        )
         assert got == _expected(nb, host_rows)
         stopped += len(got)
         pending = _advance(w, pending, spec)
@@ -83,27 +98,15 @@ def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(kind, 
 
 
 @pytest.mark.parametrize("kind", KINDS)
-def test_limits_are_taken_once_per_request_and_walk_and_dropped_with_it(kind):
-    calls = []
-
-    def max_iters(info):
-        calls.append(info.rid_handle)
-        return 3
-
-    w = _declared_worker(kind, StopPolicy(StopKind.ITER, max_iters=max_iters))
+def test_limits_are_dropped_with_the_request(kind):
+    w = _declared_worker(kind, StopPolicy(StopKind.ITER, max_iters=lambda info: 3))
     rt = w._graph_runtime
-
-    def check(rid):
-        infos = {rid: w.request_state.get_fwd_info(rid, PART)}
-        return rt.check_stops(PART, NODE, WALK, [rid], None, [], infos)
-
     (rid,) = _admit(w, 1)
-    check(rid)
-    check(rid)
-    assert calls == [rid]
+    rt.register_stop_limits(rid, w.request_state.get_fwd_info(rid, PART))
+    assert rt.check_stops(PART, NODE, WALK, [rid], None, []) == {}
     rt.remove_request(rid)
     w.request_state.remove_request(rid)
     (again,) = _admit(w, 1, start=1)
     assert again == rid, "the handle is recycled"
-    check(again)
-    assert calls == [rid, rid], "a recycled handle takes its own limits"
+    # until its own limits are registered, the runtime decides nothing
+    assert rt.check_stops(PART, NODE, WALK, [again], None, []) is None

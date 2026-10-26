@@ -1,5 +1,6 @@
+import logging
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, NamedTuple
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
     import torch
 
     from mstar.model.submodule_base import StopPolicy
+
+logger = logging.getLogger(__name__)
 
 
 class SpeculationOutput(NamedTuple):
@@ -429,33 +432,6 @@ class SpecRows(NamedTuple):
     input_edges: ColumnarEdgeSpecs | None
 
 
-class InlineRouteStatus(IntEnum):
-    """What ``route_and_send_inline`` did."""
-    # nothing (a rid with no host row, an unsupported dtype): the caller takes
-    # the general path
-    NOT_ROUTED = 0
-    # routed and sent
-    SENT = 1
-    # routed, but the send needs Python-side payloads: the caller finishes
-    # with ``send_outputs``
-    ROUTED = 2
-    # with ``stop_infos``: rows stop, so nothing is routed; ``stops`` has them
-    # and the caller stops them before routing on the general path
-    STOPS = 3
-
-
-class InlineRoute(NamedTuple):
-    """``route_and_send_inline``'s result."""
-    status: InlineRouteStatus
-    completion_id: int
-    # ``send_outputs``' return, under SENT
-    sent_rids: list[int]
-    # the route for ``send_outputs`` to finish, under ROUTED
-    route_output: "RouteOutput | None"
-    # per rid, the loops it stops, under STOPS
-    stops: dict[int, set[str]] | None = None
-
-
 class ReadyNodeSpec(NamedTuple):
     node_name: str
     graph_walk: str
@@ -568,7 +544,258 @@ class SendInput(NamedTuple):
     failed_rids: frozenset[int] = frozenset()
 
 
-class GraphRuntime(ABC):
+class PostprocessNeed(IntEnum):
+    """What a step's postprocess (``begin_postprocess``) waits on from the
+    worker, or that it is done."""
+    DONE = 0
+    # the step's stops, which the runtime cannot check (the model's own
+    # check_stop): resume with ``stops`` and the ``dropped`` rows
+    STOPS = 1
+    # the outputs stored as tensors, to route: resume with ``stored``
+    STORE = 2
+    # the send's Python payloads (forward-pass info, publication, new-token
+    # counts, stream consumption, profiling): resume with ``send``
+    SEND = 3
+
+
+class InlineColumn(NamedTuple):
+    """A device-loopback step's client signal, one host scalar per row: its
+    emit edge rides inline, and nothing is stored."""
+    signal: str
+    # 1-D host view, row i for ``PostprocessRequest.row_rids[i]``
+    column: "torch.Tensor"
+
+
+class PostprocessRequest(NamedTuple):
+    """One step's postprocess: check its stops, route its outputs, send them."""
+    partition: str
+    node_name: str
+    graph_walk: str
+    output_signals: list[str]
+    # rid -> the worker graph it ran this node in
+    wg_ids: ParallelList[int, int]
+    # several walks in one step: wg_ids.keys[i] ran walks[rid_walk_idx[i]]
+    walks: list[str] | None = None
+    rid_walk_idx: list[int] | None = None
+    # stops known before the check: stream-terminated loops
+    stops: Mapping[int, set[str]] | None = None
+    # whether the runtime checks the walk's declared stop policies itself
+    runtime_stops: bool = False
+    # the token column they read (None when none does) and the rid of each
+    # row of the step's host rows; the caller keeps them alive for the step
+    tokens: "torch.Tensor | None" = None
+    row_rids: tuple[int, ...] | list[int] = ()
+    # a device-loopback step: routed without storing anything
+    inline: InlineColumn | None = None
+    # rids whose consuming pass reports their stream partition done
+    stream_partition_done: tuple[int, ...] | list[int] = ()
+    # the send needs Python whatever the route needs (profiling)
+    python_send: bool = False
+
+
+class RouteTensors(NamedTuple):
+    """``resume_postprocess(stored=...)``: what ``RouteInput`` takes of the
+    stored outputs."""
+    tensors: list[int]
+    num_tensors: list[int]
+    inline_signal: str | None = None
+    inline_values: tuple[int, ...] | list[int] = ()
+    logprobs: tuple[float | None, ...] | list[float | None] = ()
+
+
+class PostprocessStep(NamedTuple):
+    """Where a step's postprocess stands."""
+    need: PostprocessNeed
+    # the rows it routes, without the dropped ones (STORE and SEND)
+    wg_ids: ParallelList[int, int] | None = None
+    rid_walk_idx: list[int] | None = None
+    # the rows whose loops it stopped (from STORE on)
+    stopped_rids: list[int] | tuple[()] = ()
+    # the route, for SEND's payloads (SEND)
+    route_output: RouteOutput | None = None
+    # the rids a WORKER_GRAPHS_DONE went out for (DONE)
+    completed_rids: list[int] | tuple[()] = ()
+
+
+class _PostprocessPhase(IntEnum):
+    STOPS = 0
+    ROUTE = 1
+    SEND = 2
+
+
+@dataclass(slots=True)
+class _Postprocess:
+    """A step's postprocess between ``begin`` and ``resume``."""
+    request: PostprocessRequest
+    phase: _PostprocessPhase = _PostprocessPhase.STOPS
+    stops: dict[int, set[str]] | None = None
+    wg_ids: ParallelList[int, int] | None = None
+    rid_walk_idx: list[int] | None = None
+    stopped: list[int] = field(default_factory=list)
+    stored: RouteTensors | None = None
+    route: RouteOutput | None = None
+    send: SendInput | None = None
+
+    def step(self, need: PostprocessNeed, completed: list[int] | None = None) -> PostprocessStep:
+        if need is PostprocessNeed.DONE:
+            return PostprocessStep(need, stopped_rids=self.stopped, completed_rids=completed or [])
+        return PostprocessStep(need, self.wg_ids, self.rid_walk_idx, self.stopped, self.route)
+
+
+def _merged_stops(*parts: Mapping[int, set[str]] | None) -> dict[int, set[str]]:
+    out: dict[int, set[str]] = {}
+    for part in parts:
+        for rid, loops in (part or {}).items():
+            out.setdefault(rid, set()).update(loops)
+    return out
+
+
+def _route_needs_python(route: RouteOutput) -> bool:
+    """Whether the send of ``route`` needs what only the worker has."""
+    return bool(
+        route.rids_needing_request_info is None or route.rids_needing_request_info
+        or route.register_uuids or route.new_token_output_idxs
+        or route.local_streaming_by_signal or route.freed_inputs.uuids
+    )
+
+
+class PhasedPostprocess:
+    """A step's postprocess as ``begin_postprocess`` / ``resume_postprocess``
+    over a runtime's three phases: the stops (``check_stops``, then
+    ``stop_loops_batched``), the route (``complete_and_route_batch``) and the
+    send (``send_outputs``). It stops for the worker where a phase needs
+    Python (``PostprocessNeed``). The Python runtime's postprocess, and the
+    reference the Rust runtime's own follows."""
+
+    _postprocess: _Postprocess | None = None
+
+    def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
+        self._postprocess = _Postprocess(request)
+        return self._run_postprocess()
+
+    def resume_postprocess(
+        self, stops: Mapping[int, set[str]] | None = None, dropped: Iterable[int] = (),
+        stored: RouteTensors | None = None, send: SendInput | None = None,
+    ) -> PostprocessStep:
+        """Continue the waiting step with what it asked for: ``stops`` and the
+        rows ``dropped`` (STOPS), ``stored`` (STORE) or ``send`` (SEND)."""
+        pp = self._postprocess
+        if pp is None:
+            raise RuntimeError("resume_postprocess: no step is waiting")
+        if stops is not None:
+            pp.stops = _merged_stops(pp.request.stops, stops)
+            self._keep_rows(pp, set(dropped))
+        if stored is not None:
+            pp.stored = stored
+        if send is not None:
+            pp.send = send
+        return self._run_postprocess()
+
+    def _run_postprocess(self) -> PostprocessStep:
+        pp = self._postprocess
+        req = pp.request
+        if pp.phase is _PostprocessPhase.STOPS:
+            if pp.stops is None:
+                found = None
+                if req.runtime_stops:
+                    # a check that fails, or misses a row's limits, leaves
+                    # the decision to check_stop
+                    try:
+                        found = self.check_stops(
+                            req.partition, req.node_name, req.graph_walk,
+                            list(req.wg_ids.keys), req.tokens, list(req.row_rids),
+                        )
+                    except Exception:
+                        logger.debug("runtime stop check failed (node=%s)", req.node_name,
+                                     exc_info=True)
+                if found is None:
+                    return pp.step(PostprocessNeed.STOPS)
+                pp.stops = _merged_stops(req.stops, found)
+                self._keep_rows(pp, set())
+            pp.stopped = self._stop_step_loops(pp)
+            pp.phase = _PostprocessPhase.ROUTE
+        if pp.phase is _PostprocessPhase.ROUTE:
+            if not pp.wg_ids.keys:
+                self._postprocess = None  # every row was dropped
+                return pp.step(PostprocessNeed.DONE)
+            inline_values = None if req.inline is None else self._inline_values(pp)
+            if inline_values is None and pp.stored is None:
+                return pp.step(PostprocessNeed.STORE)
+            n = len(pp.wg_ids.keys) * len(req.output_signals)
+            stored = pp.stored or RouteTensors([], [0] * n, req.inline.signal, inline_values)
+            pp.route = self.complete_and_route_batch(RouteInput(
+                partition=req.partition, graph_walk=req.graph_walk, node_name=req.node_name,
+                output_signals=req.output_signals, wg_ids=pp.wg_ids,
+                tensors=stored.tensors, num_tensors=stored.num_tensors,
+                inline_signal=stored.inline_signal, inline_values=stored.inline_values,
+                logprobs=stored.logprobs,
+                walks=req.walks if pp.rid_walk_idx is not None else None,
+                rid_walk_idx=pp.rid_walk_idx,
+            ))
+            pp.phase = _PostprocessPhase.SEND
+        if pp.send is None:
+            if req.python_send or pp.stopped or _route_needs_python(pp.route):
+                return pp.step(PostprocessNeed.SEND)
+            pp.send = SendInput(
+                pp.route.completion_id, ParallelList([], []), ParallelList([], []),
+            )
+        # the consuming pass reports the partition done, on its WORKER_GRAPHS_DONE
+        for rid in req.stream_partition_done:
+            self.mark_stream_partition_done(rid, req.partition)
+        completed = self.send_outputs(pp.send)
+        self._postprocess = None
+        return pp.step(PostprocessNeed.DONE, completed)
+
+    @staticmethod
+    def _keep_rows(pp: _Postprocess, dropped: set[int]) -> None:
+        """The rows the step routes: the request's, less ``dropped``."""
+        req = pp.request
+        keys, values = req.wg_ids.keys, req.wg_ids.values
+        idx = req.rid_walk_idx
+        keep = [i for i, rid in enumerate(keys) if rid not in dropped]
+        pp.wg_ids = ParallelList([keys[i] for i in keep], [values[i] for i in keep])
+        pp.rid_walk_idx = None if idx is None else [idx[i] for i in keep]
+        for rid in dropped:
+            pp.stops.pop(rid, None)
+
+    def _stop_step_loops(self, pp: _Postprocess) -> list[int]:
+        """Stop the step's loops, per walk; the rids whose loops stopped."""
+        req = pp.request
+        if not pp.stops:
+            return []
+        walk_of = dict.fromkeys(pp.wg_ids.keys, req.graph_walk)
+        if pp.rid_walk_idx is not None:
+            walk_of = {
+                rid: req.walks[w] for rid, w in zip(pp.wg_ids.keys, pp.rid_walk_idx, strict=True)
+            }
+        by_walk: dict[str, dict[int, set[str]]] = {}
+        for rid, loops in pp.stops.items():
+            if rid in walk_of:
+                by_walk.setdefault(walk_of[rid], {})[rid] = loops
+        stopped: list[int] = []
+        for walk, walk_stops in by_walk.items():
+            stopped += self.stop_loops_batched(
+                partition=req.partition, graph_walk=walk, last_node_run=req.node_name,
+                loop_names=ParallelList(list(walk_stops), [list(v) for v in walk_stops.values()]),
+            )
+        return stopped
+
+    @staticmethod
+    def _inline_values(pp: _Postprocess) -> list[int] | None:
+        """The inline column in route order; None when a row has no value."""
+        req = pp.request
+        values = req.inline.column.tolist()
+        row_of = {rid: i for i, rid in enumerate(req.row_rids)}
+        out = []
+        for rid in pp.wg_ids.keys:
+            i = row_of.get(rid)
+            if i is None or i >= len(values):
+                return None
+            out.append(values[i])
+        return out
+
+
+class GraphRuntime(PhasedPostprocess, ABC):
     """Owns a worker's graph state: its worker graphs' per-request queues,
     the routing and sharding derived from them, loop state, and the request
     id <-> handle table. The worker drives it through this contract and keeps
@@ -709,21 +936,25 @@ class GraphRuntime(ABC):
         (``NodeSubmodule.get_stop_policies``). Once, at startup."""
 
     @abstractmethod
+    def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
+        """A request's limits (``StopPolicy.limits``) under every declared
+        walk's policies, from its forward-pass info as it arrives. Dropped
+        with the request."""
+
+    @abstractmethod
     def check_stops(
         self, partition: str, node_name: str, graph_walk: str, rids: list[int],
         tokens: "torch.Tensor | None", row_rids: list[int],
-        infos: Mapping[int, CurrentForwardPassInfo],
-    ) -> dict[int, set[str]]:
+    ) -> dict[int, set[str]] | None:
         """(node, walk)'s declared stop policies over a step's rows: per rid,
-        the loops it stops (``StopPolicy.stops``).
+        the loops it stops (``StopPolicy.stops``); None when a row has no
+        limits for the walk, and the worker's ``check_stop`` decides.
 
         Each loop's count is this runtime's as of the step: counts move when
         the step is routed, which comes after. ``tokens`` is the step's token
         column, row i for ``row_rids[i]``, a 1-D host view the caller keeps
         alive, or None when no policy reads a token; a rid with no row is
-        skipped, as ``check_stop`` skips a request with no output. A request's
-        limits (``StopPolicy.limits``) come from ``infos`` the first time it
-        is checked on the walk, and are dropped with the request.
+        skipped, as ``check_stop`` skips a request with no output.
         """
 
     @abstractmethod

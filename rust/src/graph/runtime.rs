@@ -15,6 +15,9 @@ use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+mod postprocess;
+
+pub use postprocess::PostprocessOut;
 
 /// Python's `NestedLoopIndices`.
 #[pyclass]
@@ -188,6 +191,9 @@ pub struct GraphRuntime {
     /// handed back to Python one at a time. None where the worker built the
     /// pyzmq communicator, which has no shareable object.
     communicator: Option<Arc<RawZmqCommunicator>>,
+
+    /// A postprocess parked at a break (`begin_postprocess`).
+    postprocess: Option<postprocess::Postprocess>,
 }
 
  impl GraphRuntime {
@@ -1313,68 +1319,6 @@ struct StopRule {
     eos: Vec<i64>,
 }
 
-/// `route_and_send_inline`'s result; see there.
-#[pyclass]
-#[derive(Default)]
-pub struct FusedRouteOut {
-    #[pyo3(get)] pub status: u8,
-    #[pyo3(get)] pub completion_id: u64,
-    #[pyo3(get)] pub sent_rids: Vec<u32>,
-    /// Wall time spent with the GIL released, for measuring the overlap.
-    #[pyo3(get)] pub nogil_ns: u64,
-    pub route: Option<RouteOut>,
-    /// Status 3: the stops found, as `check_stops_inline` returns them.
-    #[pyo3(get)] pub stop_rids: Vec<u32>,
-    #[pyo3(get)] pub stop_rules: Vec<u32>,
-    #[pyo3(get)] pub missing: Vec<u32>,
-}
-
-/// A step's token column, read in place: `rows` integers of `itemsize`
-/// bytes, `stride` elements apart, row i belonging to the caller's
-/// `row_rids[i]`. The caller holds the tensor for the duration of the call.
-struct TokenColumn {
-    ptr: usize,
-    rows: usize,
-    stride: usize,
-    itemsize: usize,
-}
-
-impl TokenColumn {
-    /// None for a null pointer or a dtype other than int32 / int64.
-    fn new(ptr: usize, rows: usize, stride: usize, dtype: &str) -> Option<Self> {
-        let itemsize = match dtype {
-            "int64" => 8,
-            "int32" => 4,
-            _ => return None,
-        };
-        (ptr != 0).then_some(TokenColumn { ptr, rows, stride, itemsize })
-    }
-
-    /// Row `row`'s value; the callers check `row < self.rows`.
-    fn read(&self, row: usize) -> i64 {
-        debug_assert!(row < self.rows);
-        // SAFETY: row < rows, which the callers check against the column the
-        // caller holds for the call.
-        unsafe {
-            let at = (self.ptr as *const u8).add(row * self.stride * self.itemsize);
-            if self.itemsize == 8 {
-                std::ptr::read_unaligned(at as *const i64)
-            } else {
-                i64::from(std::ptr::read_unaligned(at as *const i32))
-            }
-        }
-    }
-}
-
-#[pymethods]
-impl FusedRouteOut {
-    /// The parked route, for a status-2 caller to finish with send_outputs.
-    /// Taken, not cloned: it is read once.
-    fn take_route(&mut self) -> Option<RouteOut> {
-        self.route.take()
-    }
-}
-
 /// Routing parked between complete_and_route_batch and send_outputs.
 pub struct Completion {
     pub partition: String,
@@ -1687,6 +1631,7 @@ impl GraphRuntime {
             staged_specs: FxHashMap::default(),
             spec_counter: 0,
             combined_walk_of,
+            postprocess: None,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
         })
@@ -3244,11 +3189,11 @@ impl GraphRuntime {
         Ok(())
     }
 
-    /// Each rid's limits for `graph_walk`'s rules: `max_iters[k][i]` and
+    /// Each rid's limits for (node, walk)'s rules: `max_iters[k][i]` and
     /// `ignore_eos[k][i]` are rule k's for `rids[i]`. Kept on the request, so
     /// `remove_request` drops them with it.
     fn set_stop_limits(
-        &mut self, graph_walk: &str, rids: Vec<u32>,
+        &mut self, node_name: &str, graph_walk: &str, rids: Vec<u32>,
         max_iters: Vec<Vec<u32>>, ignore_eos: Vec<Vec<bool>>,
     ) -> PyResult<()> {
         if max_iters.len() != ignore_eos.len()
@@ -3257,14 +3202,14 @@ impl GraphRuntime {
         {
             return Err(PyValueError::new_err("set_stop_limits: columns differ in length"));
         }
-        let walk = self.interner.intern(graph_walk);
+        let key = (self.interner.intern(node_name), self.interner.intern(graph_walk));
         for (i, &rid) in rids.iter().enumerate() {
             let limits: Vec<(u32, bool)> =
                 max_iters.iter().zip(&ignore_eos).map(|(m, e)| (m[i], e[i])).collect();
             let Some(Some(info)) = self.requests.get_mut(rid as usize) else { continue };
-            match info.stop_limits.iter_mut().find(|(w, _)| *w == walk) {
+            match info.stop_limits.iter_mut().find(|(k, _)| *k == key) {
                 Some(entry) => entry.1 = limits,
-                None => info.stop_limits.push((walk, limits)),
+                None => info.stop_limits.push((key, limits)),
             }
         }
         Ok(())
@@ -3296,138 +3241,96 @@ impl GraphRuntime {
         token_dtype: &str,
         row_rids: Vec<u32>,
     ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
-        let tokens = TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
+        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
         self.stops_over(partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids)
     }
 
 
-    /// `complete_and_route_batch` then `send_outputs`, in one crossing and
-    /// with the GIL released throughout, for a step whose every output stays
-    /// on the device and whose client copy rides inline (a device-loopback
-    /// decode step). Exactly the two calls the worker would make, with the
-    /// arguments its device-loopback branch builds: no tensors, and the
-    /// inline values read here from the stop check's host rows rather than
-    /// handed over as a list.
-    ///
-    /// The inline column is ``inline_rows`` scalars of ``inline_dtype`` at
-    /// ``inline_ptr`` with ``inline_stride`` elements between rows, row i
-    /// belonging to ``row_rids[i]``. The caller keeps the tensor alive and
-    /// landed for the call (it has waited on the step's completion event).
-    ///
-    /// Returns ``status``:
-    ///   0 -- nothing done (a rid has no row, or an unsupported dtype): take
-    ///        the general path, exactly as ``_inline_emit_values`` falling
-    ///        back does;
-    ///   1 -- routed and sent; ``sent_rids`` are send_outputs' return;
-    ///   2 -- routed, but the send needs Python-side payloads (a frame
-    ///        carries ``per_request_info``, a tensor to register, new-token
-    ///        counts, local streaming, freed inputs): ``route`` holds the
-    ///        RouteOut and the caller finishes with ``send_outputs``;
-    ///   3 -- with ``check_stops``: the walk's declared stop rules, run first
-    ///        over the same column, stop a row or lack a row's limits.
-    ///        Nothing is routed; ``stop_rids`` / ``stop_rules`` / ``missing``
-    ///        are ``check_stops_inline``'s answer.
+    /// Begin a step's postprocess (`PostprocessRequest`): check its stops,
+    /// route its outputs, send them, in one crossing with the GIL released,
+    /// stopping where a phase needs Python. `stop_rids[i]` stops
+    /// `stop_loops[i]` before any check (stream-terminated loops). The token
+    /// and inline columns are host views the caller keeps alive until the
+    /// step is done: `rows` integers of `dtype`, `stride` elements apart, row
+    /// i belonging to `row_rids[i]`; a null pointer is no column.
     #[pyo3(signature = (
-        partition, graph_walk, node_name, output_signals, rids,
+        partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
+        stop_rids, stop_loops, runtime_stops,
+        token_ptr, token_rows, token_stride, token_dtype, row_rids,
         inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
-        row_rids, check_stops=false,
+        stream_done, python_send,
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn route_and_send_inline(
-        &mut self,
-        py: Python<'_>,
-        partition: String,
-        graph_walk: String,
-        node_name: String,
-        output_signals: Vec<String>,
-        rids: Vec<u32>,
-        inline_signal: String,
-        inline_ptr: usize,
-        inline_rows: usize,
-        inline_stride: usize,
-        inline_dtype: &str,
+    fn begin_postprocess(
+        &mut self, py: Python<'_>,
+        partition: String, node_name: String, graph_walk: String, output_signals: Vec<String>,
+        rids: Vec<u32>, walks: Option<Vec<String>>, rid_walk_idx: Option<Vec<u32>>,
+        stop_rids: Vec<u32>, stop_loops: Vec<Vec<String>>, runtime_stops: bool,
+        token_ptr: usize, token_rows: usize, token_stride: usize, token_dtype: &str,
         row_rids: Vec<u32>,
-        check_stops: bool,
-    ) -> PyResult<FusedRouteOut> {
-        let Some(column) = TokenColumn::new(inline_ptr, inline_rows, inline_stride, inline_dtype)
-        else {
-            return Ok(FusedRouteOut::default());
-        };
-        if row_rids.len() > inline_rows {
-            return Ok(FusedRouteOut::default());
-        }
-        let t_nogil = std::time::Instant::now();
-        let outcome = py.detach(|| -> PyResult<FusedRouteOut> {
-            if check_stops {
-                let (stop_rids, stop_rules, missing) = self.stops_over(
-                    &partition, &node_name, &graph_walk, &rids, Some(&column), &row_rids,
-                )?;
-                if !stop_rids.is_empty() || !missing.is_empty() {
-                    return Ok(FusedRouteOut {
-                        status: 3, stop_rids, stop_rules, missing, ..Default::default()
-                    });
-                }
-            }
-            // The inline values in `rids` order: a slice when the rows are in
-            // the batch's order (the usual case), else looked up per rid.
-            let read = |row: usize| column.read(row);
-            let n = rids.len();
-            let in_order = row_rids.len() >= n && row_rids[..n] == rids[..];
-            let values: Vec<i64> = if in_order {
-                (0..n).map(read).collect()
-            } else {
-                let row_of: FxHashMap<u32, usize> =
-                    row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect();
-                let mut v = Vec::with_capacity(n);
-                for r in &rids {
-                    match row_of.get(r) {
-                        Some(&i) => v.push(read(i)),
-                        None => return Ok(FusedRouteOut::default()),
-                    }
-                }
-                v
-            };
-            let n_sig = output_signals.len();
-            let route = self.complete_and_route_batch(RouteArg {
-                partition,
-                graph_walk,
-                node_name,
-                output_signals,
-                rids,
-                tensors: Vec::new(),
-                num_tensors: vec![0; n * n_sig],
-                inline_signal: Some(inline_signal),
-                inline_values: values,
-                logprobs: Vec::new(),
-                walks: None,
-                rid_walk_idx: None,
-            })?;
-            let completion_id = route.completion_id;
-            let needs_python = !route.register_uuids.is_empty()
-                || !route.new_token_output_idxs.is_empty()
-                || !route.local_streaming_signals.is_empty()
-                || !route.rids_needing_request_info.is_empty()
-                || !route.freed_input_uuids.is_empty();
-            if needs_python {
-                return Ok(FusedRouteOut {
-                    status: 2, completion_id, route: Some(route), ..Default::default()
-                });
-            }
-            // Nothing in the frames comes from Python: no rid carries
-            // per_request_info, so none completes a worker graph, and the
-            // count, consumption, profiling and publication payloads are all
-            // read only for those.
-            let (sent_rids, frames) = self.build_send_frames(
-                completion_id, vec![], vec![], vec![], vec![],
-                vec![], vec![], vec![], vec![], vec![], vec![], vec![],
-            )?;
-            self.dispatch_frames_nogil(frames)?;
-            Ok(FusedRouteOut { status: 1, completion_id, sent_rids, ..Default::default() })
+        inline_signal: Option<String>, inline_ptr: usize, inline_rows: usize,
+        inline_stride: usize, inline_dtype: &str,
+        stream_done: Vec<u32>, python_send: bool,
+    ) -> PyResult<postprocess::PostprocessOut> {
+        let tokens = postprocess::TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
+        let inline = inline_signal.and_then(|signal| {
+            postprocess::TokenColumn::new(inline_ptr, inline_rows, inline_stride, inline_dtype)
+                .map(|col| (signal, col))
         });
-        let nogil_ns = t_nogil.elapsed().as_nanos() as u64;
-        let mut outcome = outcome?;
-        outcome.nogil_ns = nogil_ns;
-        Ok(outcome)
+        let pp = postprocess::Postprocess::new(
+            partition, node_name, graph_walk, output_signals, rids, walks, rid_walk_idx,
+            stop_rids.into_iter().zip(stop_loops).collect(), runtime_stops,
+            tokens, row_rids, inline, stream_done, python_send,
+        );
+        self.postprocess = None;
+        let t = std::time::Instant::now();
+        let mut out = py.detach(|| self.pp_run(pp))?;
+        out.nogil_ns = t.elapsed().as_nanos() as u64;
+        Ok(out)
+    }
+
+    /// Resume a step parked for its stops (STOPS): the loops each rid stops,
+    /// and the rows to drop (their stop check failed).
+    fn resume_postprocess_stops(
+        &mut self, py: Python<'_>, rids: Vec<u32>, loops: Vec<Vec<String>>, dropped: Vec<u32>,
+    ) -> PyResult<postprocess::PostprocessOut> {
+        py.detach(|| self.pp_resume_stops(rids, loops, dropped))
+    }
+
+    /// Resume a step parked for its stored outputs (STORE): `RouteTensors`.
+    #[pyo3(signature = (tensors, num_tensors, inline_signal, inline_values, logprobs = Vec::new()))]
+    fn resume_postprocess_store(
+        &mut self, py: Python<'_>, tensors: Vec<u64>, num_tensors: Vec<usize>,
+        inline_signal: Option<String>, inline_values: Vec<i64>, logprobs: Vec<Option<f64>>,
+    ) -> PyResult<postprocess::PostprocessOut> {
+        let stored = postprocess::Stored {
+            tensors, num_tensors, inline_signal, inline_values, logprobs,
+        };
+        py.detach(|| self.pp_resume_store(stored))
+    }
+
+    /// Resume a step parked for its send's Python payloads (SEND), given as
+    /// `send_outputs` takes them.
+    #[pyo3(signature = (
+        info_rids, request_infos, ntc_rids, new_token_counts,
+        consumed_rids, stream_tokens_consumed, prof_rids, profiling,
+        publish_rids, publications, skip_rids = Vec::new(),
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn resume_postprocess_send(
+        &mut self, py: Python<'_>,
+        info_rids: Vec<u32>, request_infos: Vec<Option<Vec<u8>>>,
+        ntc_rids: Vec<u32>, new_token_counts: Vec<FxHashMap<String, i64>>,
+        consumed_rids: Vec<u32>, stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
+        prof_rids: Vec<u32>, profiling: Vec<Option<Vec<u8>>>,
+        publish_rids: Vec<u32>, publications: Vec<Option<Vec<u8>>>,
+        skip_rids: Vec<u32>,
+    ) -> PyResult<postprocess::PostprocessOut> {
+        let args = postprocess::SendArgs {
+            info_rids, request_infos, ntc_rids, new_token_counts, consumed_rids,
+            stream_tokens_consumed, prof_rids, profiling, publish_rids, publications, skip_rids,
+        };
+        py.detach(|| self.pp_resume_send(args))
     }
 
     /// Stop loops, record the pending stops, notify peers, and return the rids
@@ -3442,65 +3345,9 @@ impl GraphRuntime {
         rids: Vec<u32>,
         loop_names: Vec<Vec<String>>,
     ) -> PyResult<Vec<u32>> {
-        // One release for the whole batch; see send_outputs.
         // bookkeeping with the GIL held; the frames go out through send_frames
-        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
-        let out = (|| -> PyResult<Vec<u32>> {
-            if rids.len() != loop_names.len() {
-                return Err(PyValueError::new_err(
-                    "stop_loops_batched: rids and loop_names must be the same length",
-                ));
-            }
-            let Some(walk) = self.interner.get(graph_walk) else {
-                return Ok(Vec::new());
-            };
-            let mut stopped_rids = Vec::new();
-            for (rid, names) in rids.into_iter().zip(loop_names) {
-                let wanted: Vec<String> = names
-                    .into_iter()
-                    .filter(|n| self.check_dyn_loop(rid, partition, n))
-                    .collect();
-                if wanted.is_empty() {
-                    continue;
-                }
-                self.stop_loops_for_rid(rid, partition, &wanted, Some(last_node_run));
-                for name in &wanted {
-                    if let Some(l) = self.interner.get(name) {
-                        self.pending_loop_stops.insert((rid, walk, l));
-                    }
-                }
-                let mut per_worker: FxHashMap<Sym, Vec<String>> = FxHashMap::default();
-                for name in &wanted {
-                    for w in self.dyn_loop_workers(rid, partition, name) {
-                        per_worker.entry(w).or_default().push(name.clone());
-                    }
-                }
-                // Never to ourselves: this rank originated the stop and has
-                // already applied it. A self-send would land in apply_peer_loop_stops
-                // and stop the loops a second time.
-                let me = self.shard.me;
-                let request_id = self.rid_name(rid)?;
-                // Snapshotted BEFORE the sends: stop_loops_for_rid above already
-                // recorded this stop, and every peer must see the same context.
-                let stop_times = self.loop_stop_times_of(rid);
-                for (worker, names) in per_worker {
-                    if worker == me {
-                        continue;
-                    }
-                    let bytes = frames::StopLoops {
-                        request_id: &request_id,
-                        partition_name: partition,
-                        loop_names: &names,
-                        loop_stop_times: stop_times.clone(),
-                    }
-                    .encode(&self.interner);
-                    frames.push((self.interner.name(worker).to_string(), bytes));
-                }
-                stopped_rids.push(rid);
-            }
-            Ok(stopped_rids)
-        })();
-        let out = out?;
+        let (out, frames) =
+            self.stop_loops_frames(partition, graph_walk, last_node_run, rids, loop_names)?;
         self.send_frames(py, frames)?;
         Ok(out)
     }
@@ -4168,66 +4015,6 @@ impl GraphRuntime {
     }
 }
 
-impl GraphRuntime {
-    /// `check_stops_inline`'s check, for it and `route_and_send_inline`.
-    #[allow(clippy::type_complexity)]
-    fn stops_over(
-        &self, partition: &str, node_name: &str, graph_walk: &str, rids: &[u32],
-        tokens: Option<&TokenColumn>, row_rids: &[u32],
-    ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
-        let (Some(node), Some(walk)) = (self.interner.get(node_name), self.interner.get(graph_walk))
-        else {
-            return Err(PyKeyError::new_err("check_stops_inline: no rules for this (node, walk)"));
-        };
-        let Some(rules) = self.stop_rules.get(&(node, walk)) else {
-            return Err(PyKeyError::new_err("check_stops_inline: no rules for this (node, walk)"));
-        };
-        let (mut stop_rids, mut stop_rules, mut missing) = (Vec::new(), Vec::new(), Vec::new());
-        if rules.is_empty() {
-            return Ok((stop_rids, stop_rules, missing));
-        }
-        let tokens = if rules.iter().any(|r| r.ar) {
-            match tokens {
-                Some(t) if row_rids.len() <= t.rows => Some(t),
-                _ => return Err(PyValueError::new_err(
-                    "check_stops_inline: no int32 / int64 token column covering the rows",
-                )),
-            }
-        } else {
-            None
-        };
-        let in_order = row_rids.len() >= rids.len() && row_rids[..rids.len()] == rids[..];
-        let row_of: FxHashMap<u32, usize> = if in_order || tokens.is_none() {
-            FxHashMap::default()
-        } else {
-            row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect()
-        };
-        let p = self.interner.get(partition);
-        for (i, &rid) in rids.iter().enumerate() {
-            let token = match tokens {
-                None => 0,
-                Some(t) if in_order => t.read(i),
-                Some(t) => match row_of.get(&rid) {
-                    Some(&row) => t.read(row),
-                    None => continue,
-                },
-            };
-            let Some(info) = self.info(rid) else { continue };
-            let Some((_, limits)) = info.stop_limits.iter().find(|(w, _)| *w == walk) else {
-                missing.push(rid);
-                continue;
-            };
-            for (k, (rule, &(max_iters, ignore_eos))) in rules.iter().zip(limits).enumerate() {
-                let count = p.map_or(0, |p| self.loop_count(rid, p, rule.lp));
-                if count + 1 >= max_iters || (rule.ar && !ignore_eos && rule.eos.contains(&token)) {
-                    stop_rids.push(rid);
-                    stop_rules.push(k as u32);
-                }
-            }
-        }
-        Ok((stop_rids, stop_rules, missing))
-    }
-}
 
 #[cfg(test)]
 mod tests {

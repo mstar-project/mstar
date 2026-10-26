@@ -324,9 +324,24 @@ def test_row_logprobs_follow_the_batch_order():
     assert Worker._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []
 
 
-def test_a_step_with_logprobs_skips_the_fused_route():
-    # the fused route builds no route input, which is where log-probs ride
-    worker = _worker(SimpleNamespace(supports_route_and_send_inline=True))
-    rows = HostRows((7,), {"new_token": torch.tensor([70]), SAMPLED_LOGPROB: torch.tensor([-0.5])})
-    batch_N = SimpleNamespace(batch=SimpleNamespace(output_signals=["text_inputs"]))
-    assert worker._route_and_send_fast(batch_N, rows, None, [7], set()) is False
+def test_a_step_with_logprobs_routes_through_the_store():
+    # the in-runtime route builds no log-probs: such a step stores, and STORE
+    # passes them on with the route tensors
+    w = _worker()
+    w._stop_token_signal, w._device_loopback, w._innermost_loop_by_node = {}, {}, {}
+    w.enable_prof = False
+    engine = SimpleNamespace(
+        device_loopback_signals=lambda node, walk: ("text_inputs",),
+        inline_client_signals=lambda node, walk: {"text_inputs": "new_token"},
+    )
+    batch = _Batch()
+    batch.partition = "p"
+    batch.batch.output_signals = ["text_inputs"]
+    batch.batch.request_to_worker_graph = {7: 0}
+    batch.node_batch = SimpleNamespace(final_stream_rids=(), stream_partition_done_rids=())
+    batch.batch.rids_by_walk = lambda: {"decode": [7]}
+    tokens = torch.tensor([70])
+    plain = w._postprocess_request(batch, HostRows((7,), {"new_token": tokens}), engine)
+    assert plain.inline is not None and plain.inline.signal == "text_inputs"
+    rows = HostRows((7,), {"new_token": tokens, SAMPLED_LOGPROB: torch.tensor([-0.5])})
+    assert w._postprocess_request(batch, rows, engine).inline is None
