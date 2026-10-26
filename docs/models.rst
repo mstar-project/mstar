@@ -308,9 +308,11 @@ matching PyTorch's CUDA version so the fused-MoE alignment op can JIT-build.
 The ~437 GB of BF16 weights are never downloaded automatically: download the
 checkpoint and set ``model_kwargs.checkpoint_dir`` in
 ``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
-``max_seq_len``). Tokenizer and config metadata are pinned to one checkpoint
-revision. ``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs
-and keeps NCCL's all-reduce until FlashInfer's is measured there.
+``max_seq_len``). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as
+H200, set ``resources.kv_cache.max_num_pages`` to 2048. Tokenizer and config
+metadata are pinned to one checkpoint revision.
+``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs and keeps NCCL's
+all-reduce until FlashInfer's is measured there.
 
 ``model_kwargs={"messages": [{"role": ..., "content": ...}, ...]}`` with
 ``system`` / ``user`` / ``assistant`` turns goes through the chat template; a

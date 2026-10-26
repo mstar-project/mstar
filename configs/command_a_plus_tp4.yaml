@@ -10,7 +10,8 @@ tp_allreduce_max_kb: 16384
 
 resources:
   kv_cache:
-    max_num_pages: 8192  # 1M cached tokens shared by all requests, ~32 GB per GPU
+    # 1M cached tokens shared by all requests, ~32 GB per GPU on GB200; 2048 fits on 141 GB GPUs
+    max_num_pages: 8192
 
 node_groups:
   - node_names: [LLM]
