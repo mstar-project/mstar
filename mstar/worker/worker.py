@@ -3505,7 +3505,7 @@ class Worker:
         if signal is None:
             return False
         buf = host_rows.buffers.get(inline[signal])
-        if buf is None or buf.dim() == 0 or buf.numel() == 0:
+        if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
             return False
         column = buf.reshape(buf.shape[0], -1)[:, 0]
         inline = rt.route_and_send_inline(

@@ -880,7 +880,7 @@ class GraphRuntime(ABC):
     ) -> "SpecRows":
         """``prep_spec_rids`` with no stream chunks to ingest, as columns, in
         a form a runtime can serve in one crossing (the worker uses it where
-        ``Worker._spec_rows_eligible`` allows). This default is that
+        ``SpeculationPreparer.rows_eligible`` allows). This default is that
         composition over ``prep_spec_rids``; a runtime with a cheaper form
         overrides it and must return the same.
         """

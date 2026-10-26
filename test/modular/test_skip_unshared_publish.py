@@ -53,6 +53,16 @@ def test_a_key_never_published_leaves_every_step():
     assert not any(c.startswith("publish") for c in kv.calls)
 
 
+def test_a_publisher_counts_the_nodes_that_declare_it_on_other_workers():
+    """BAGEL's CFG branches declare the main LLM's KV under their own node
+    names, on other workers, and read it through ``admit_retrieve``."""
+    runner = StepRunner(
+        {"kv": _Stub("kv", published="kv-info")}, node_resources={"LLM": ["kv"]},
+        declared_by={"kv": {"LLM", "LLM_cfg_text", "LLM_cfg_img"}},
+    )
+    assert runner.publisher_nodes == {"kv": frozenset({"LLM", "LLM_cfg_text", "LLM_cfg_img"})}
+
+
 def test_removal_purges_the_handle_so_a_recycled_one_publishes_again():
     runner, _, _ = _runner()
     runner.skip_publish(1, ["kv"])
@@ -115,3 +125,16 @@ def test_a_resource_with_one_instance_in_the_deployment_is_never_published(
     worker, engine = _worker(worker_id, WG_NODES, PUBLISHERS)
     worker._never_publish_unshared(instances)
     assert engine.never == never
+
+
+# BAGEL CFG-parallel: the CFG branches run as their own nodes on other workers
+CFG_PUBLISHERS = {"kv": frozenset({"LLM", "LLM_cfg_text", "LLM_cfg_img"})}
+CFG_WG_NODES = {0: {"LLM"}, 1: {"LLM_cfg_text"}, 2: {"LLM_cfg_img"}}
+CFG_WORKERS = {0: ["worker_0"], 1: ["worker_1"], 2: ["worker_2"]}
+
+
+def test_a_resource_another_worker_declares_under_another_name_is_published():
+    worker, engine = _worker("worker_0", CFG_WG_NODES, CFG_PUBLISHERS)
+    worker._never_publish_unshared({wg: [w] for wg, w in CFG_WORKERS.items()})
+    worker._skip_unshared_publish(7, CFG_WORKERS)
+    assert engine.never == [] and engine.skipped == {}
