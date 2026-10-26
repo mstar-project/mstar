@@ -40,10 +40,10 @@ logger = logging.getLogger(__name__)
 class Pi05ViTEncoderSubmodule(NodeSubmodule):
     """SigLIP encoder for camera images.
 
-    Receives raw image tensors of shape ``(num_cameras, 3, H, W)`` per request
-    in ``image_inputs``. Resizes/normalizes them to the SigLIP input format,
-    runs SigLIP, and emits ``img_emb`` of shape
-    ``(num_cameras * tokens_per_image, hidden_size)`` for the LLM node.
+    Receives one raw ``[3, H, W]`` image per camera in ``image_inputs``, at
+    most ``num_cameras`` of them. Resizes/normalizes them to the SigLIP input
+    format, runs SigLIP, and emits ``img_emb`` of shape
+    ``(num_images * tokens_per_image, hidden_size)`` for the LLM node.
     """
 
     disable_autocast = True
@@ -189,10 +189,17 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        # One [C, H, W] tensor per camera; every camera goes to SigLIP, in order.
-        images = inputs["image_inputs"]
-        pixels = images[0] if len(images) == 1 else torch.stack(list(images))
-        return NodeInputs(tensor_inputs={"pixel_values": self._prepare_one(pixels)})
+        # Cameras can differ in resolution, so each one is letterboxed on its own.
+        pixels = torch.cat([self._prepare_one(image) for image in inputs["image_inputs"]])
+        num_images, num_cameras = pixels.shape[0], self.config.num_cameras
+        if num_images > num_cameras:
+            raise ValueError(f"{num_images} camera images; this deployment takes at most {num_cameras}")
+        if num_images < num_cameras:
+            # Blank frames fill the missing slots so the captured ViT always sees num_cameras
+            # images; postprocess drops their tokens, as openpi's image mask does.
+            blank = pixels.new_full((num_cameras - num_images, *pixels.shape[1:]), -1.0)
+            pixels = torch.cat([pixels, blank])
+        return NodeInputs(tensor_inputs={"pixel_values": pixels}, kwargs={"num_images": num_images})
 
     def preprocess(
         self,
@@ -259,6 +266,22 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
             rid: {"img_emb": [features[i]]}
             for i, rid in enumerate(engine_inputs.request_ids)
         }
+
+    def postprocess(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+        inputs: NodeInputs | None = None,
+        **kwargs
+    ):
+        """Drop the tokens of the blank frames ``prepare_inputs`` padded in. The real cameras
+        come first, so the prefix keeps their tokens in order."""
+        if "img_emb" not in outputs:
+            return
+        if inputs is None:
+            raise ValueError("the pi0.5 ViT postprocess needs the pass's inputs for its camera count")
+        emb = outputs["img_emb"][0]
+        outputs["img_emb"][0] = emb[: emb.shape[0] // self.config.num_cameras * inputs.kwargs["num_images"]]
 
 
 class Pi05LLMSubmodule(ARNodeSubmodule):

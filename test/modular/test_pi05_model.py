@@ -108,9 +108,112 @@ def test_pi05_vision_gets_every_camera():
     """The server hands one [C, H, W] tensor per camera; all of them reach SigLIP, in order."""
     submodule = Pi05ViTEncoderSubmodule(torch.nn.Identity(), Pi05Config(vit_image_size=4, num_cameras=3))
     cameras = [torch.full((3, 4, 4), v) for v in (0.0, 0.5, 1.0)]
-    pixels = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras}).tensor_inputs["pixel_values"]
+    inputs = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras})
+    pixels = inputs.tensor_inputs["pixel_values"]
     assert pixels.shape == (3, 3, 4, 4)
     assert torch.equal(pixels, torch.stack(cameras) * 2 - 1)
+    assert inputs.kwargs == {"num_images": 3}
+
+
+class _PerImageEncoder(torch.nn.Module):
+    """Stands in for SigLIP: two tokens per image, each image encoded on its own."""
+
+    def forward(self, pixels):
+        return pixels.reshape(pixels.shape[0], 2, -1) * 2 + 1
+
+
+def _stage_into(static, preprocessed, seq_dims=None):
+    """`AcceleratorGraphRunner._stage` against one slot holding ``static``."""
+    from types import SimpleNamespace
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    slot = SimpleNamespace(static_inputs=static, static_input_keys=tuple(static), config_idx=0)
+    runner = SimpleNamespace(
+        slot_for=lambda lease: slot,
+        _static_buffer_seq_dims={(0, key): dim for key, dim in (seq_dims or {}).items()},
+    )
+    AcceleratorGraphRunner._stage(runner, None, preprocessed)
+
+
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_pi05_vision_pads_to_the_captured_cameras_and_drops_the_blank_tokens(num_images):
+    """A request with fewer cameras than the ViT was captured for is padded with blank frames,
+    so it stages into the captured buffer as it is, and only its own cameras' tokens go on to
+    the LLM, as openpi's image mask does. Its cameras differ in size."""
+    submodule = Pi05ViTEncoderSubmodule(_PerImageEncoder(), Pi05Config(vit_image_size=4, num_cameras=3))
+    cameras = [torch.rand(3, 4, 4), torch.rand(3, 6, 8)][:num_images]
+    inputs = submodule.prepare_inputs("prefill", None, {"image_inputs": cameras})
+    pixels = inputs.tensor_inputs["pixel_values"]
+    assert pixels.shape == (3, 3, 4, 4)
+    assert torch.equal(pixels[num_images:], torch.full((3 - num_images, 3, 4, 4), -1.0))
+
+    # the captured ViT's input buffer, built from the config's template row the way a capture builds it
+    (config,) = submodule.get_accelerator_graph_configs(torch.device("cpu"))
+    engine_inputs = ModelInputsFromEngine(request_ids=[0], per_request_info={})
+    static = submodule.preprocess("prefill", engine_inputs, config.get_node_inputs(1, 0))
+    _stage_into(static, submodule.preprocess("prefill", engine_inputs, [inputs]))
+    assert torch.equal(static["pixel_values"][0], pixels)
+
+    replayed = submodule.forward_batched("prefill", engine_inputs, static["pixel_values"])
+    outputs = {"img_emb": [replayed[0]["img_emb"][0].clone()]}
+    submodule.postprocess(0, None, outputs, inputs=inputs)
+    own = torch.cat([submodule._prepare_one(camera) for camera in cameras])
+    assert torch.equal(outputs["img_emb"][0], submodule.encoder(own).reshape(-1, 24))
+
+
+def test_pi05_vision_refuses_more_cameras_than_captured():
+    submodule = Pi05ViTEncoderSubmodule(_PerImageEncoder(), Pi05Config(vit_image_size=4, num_cameras=2))
+    with pytest.raises(ValueError, match="3 camera images; this deployment takes at most 2"):
+        submodule.prepare_inputs("prefill", None, {"image_inputs": [torch.rand(3, 4, 4)] * 3})
+
+
+@pytest.mark.parametrize("num_images", [3, 4])
+def test_pi05_data_worker_takes_at_most_num_cameras_images(tmp_path, num_images):
+    """A request with more images than cameras is a 400 before any file is decoded."""
+    import queue
+
+    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.request_types import PreprocessInput
+    from mstar.model.base import TensorAndMetadata
+
+    class ReachedPromptError(Exception):
+        pass
+
+    def load_image(path, device):
+        loaded.append(path)
+        return TensorAndMetadata(torch.zeros(3, 4, 4))
+
+    def reached_prompt(*args, **kwargs):
+        raise ReachedPromptError
+
+    loaded = []
+    model = _make_model()
+    model.load_image = load_image
+    model.process_prompt = reached_prompt
+    wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    wt.out_queue = queue.Queue()
+    wt.in_flight_requests = set()
+    wt.request_output_state = {}
+    wt.device = "cpu"
+    wt._keyed_labels = {}
+    wt._live_requests = {}
+    wt.model = model
+    paths = [str(tmp_path / f"camera{i}.png") for i in range(num_images)]
+    request = PreprocessInput(
+        request_id="r1", text="pick up the block", file_paths={"image": paths},
+        input_modalities=["image", "text"], output_modalities=["action"], model_kwargs={},
+    )
+    if num_images <= model.config.num_cameras:
+        with pytest.raises(ReachedPromptError):
+            wt._process_input(request)
+        assert loaded == paths
+        return
+    with pytest.raises(ValueError, match="attaches 4 image files; this model takes at most 3") as info:
+        wt._process_input(request)
+    assert loaded == []
+    wt._fail_request("r1", info.value, "preprocessing", abort=False)
+    assert wt.out_queue.get_nowait().metadata["status"] == 400
 
 
 def test_pi05_prefix_scaling_follows_openpi():
@@ -383,6 +486,20 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
     ).new_input_tensors
     assert "text_inputs" in result
     assert stub.last_prompt == "hello world"
+
+
+@pytest.mark.parametrize("num_images", [1, 2, 3])
+def test_pi05_kv_layout_counts_the_request_cameras(num_images):
+    """The prefix holds the tokens of the cameras the request sent; the ViT drops its blank frames."""
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    out = model.process_prompt(
+        prompt="pick up the block", input_modalities=["image", "text"], output_modalities=["action"],
+        tensors={"image_inputs": [torch.zeros(3, 8, 8)] * num_images},
+    )
+    images, text = out.metadata["kv_layout"]["kv"]["main"].spans
+    assert images.length == images.advance == num_images * 256
+    assert text.length == 1
 
 
 # ----------------------------------------------------------------------
