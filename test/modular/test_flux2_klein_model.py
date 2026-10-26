@@ -17,6 +17,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  # noqa: E402
 from mstar.model.flux2_klein.config import DENOISE_LOOP, DIT_ATTN, Flux2KleinConfig  # noqa: E402
@@ -143,7 +144,6 @@ def test_process_prompt_tokenizes_with_chat_template_to_fixed_length():
 @pytest.mark.parametrize("kwargs,message", [
     ({"height": 1000}, "multiple of 16"),
     ({"width": 0}, "multiple of 16"),
-    ({"num_inference_steps": 0}, "num_inference_steps"),
 ])
 def test_process_prompt_rejects_bad_geometry(kwargs, message):
     with pytest.raises(ValueError, match=message):
@@ -163,12 +163,15 @@ def test_process_prompt_rejects_missing_prompt_or_wrong_modality():
         model.process_prompt("x", ["image", "text"], ["image"], tensors=too_many)
 
 
-def test_steps_are_clamped_to_the_loop_ceiling():
+def test_steps_past_the_loop_ceiling_are_refused_not_clamped():
     model = _make_model()
-    args = model.get_initial_forward_pass_args(
-        "default", ["text"], ["image"], _text_signals(), model_kwargs={"num_inference_steps": 10_000},
-    )
-    assert args.step_metadata["num_inference_steps"] == model.config.max_denoise_steps
+    ceiling = model.config.max_denoise_steps
+    assert model.get_loop_caps(num_inference_steps=8) == {DENOISE_LOOP: 8}
+    conductor = Conductor.__new__(Conductor)
+    conductor.model, conductor._loop_max_iters = model, {DENOISE_LOOP: ceiling}
+    assert conductor._loop_caps({"num_inference_steps": ceiling}) == {DENOISE_LOOP: ceiling}
+    with pytest.raises(ValueError, match=f"at most {ceiling}"):
+        conductor._loop_caps({"num_inference_steps": ceiling + 1})
 
 
 # ----------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""The client-facing generation knobs, checked once where every endpoint submits.
+"""The client-facing generation knobs, sampling and output geometry, checked once where every endpoint submits.
 
 One meaning per knob on every model: ``null`` is the
 same as leaving the key out, a value is coerced to the knob's type only when it
@@ -32,10 +32,16 @@ _REAL_RULES = {
     "top_p": ("in (0, 1] (1 is off; greedy is temperature 0)", lambda v: 0 < v <= 1),
     "min_p": ("in [0, 1] (0 is off)", lambda v: 0 <= v <= 1),
     "repetition_penalty": ("> 0 (1 is off)", lambda v: v > 0),
+    "fps": ("> 0", lambda v: v > 0),
+    "guidance_scale": ("of any sign", lambda v: True),
 }
 _INT_RULES = {
     "top_k": (">= 0 (0 is off)", lambda v: v >= 0),
     "max_output_tokens": (">= 1", lambda v: v >= 1),
+    "num_inference_steps": (">= 1", lambda v: v >= 1),
+    "num_frames": (">= 1", lambda v: v >= 1),
+    "height": (">= 1", lambda v: v >= 1),
+    "width": (">= 1", lambda v: v >= 1),
 }
 _BOOL_KNOBS = ("ignore_eos", "penalize_prompt", "do_sample")
 

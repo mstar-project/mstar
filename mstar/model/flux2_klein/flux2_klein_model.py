@@ -285,8 +285,8 @@ class Flux2KleinModel(Model):
         default_h, default_w = self.config.default_height, self.config.default_width
         if ref_dims:
             default_h, default_w = ref_dims[0]
-        height = int(model_kwargs.get("height", default_h))
-        width = int(model_kwargs.get("width", default_w))
+        height = model_kwargs.get("height", default_h)
+        width = model_kwargs.get("width", default_w)
         align = self.config.spatial_alignment
         for name, value in (("height", height), ("width", width)):
             if value <= 0 or value % align:
@@ -302,13 +302,11 @@ class Flux2KleinModel(Model):
         return height, width
 
     def _resolve_steps(self, model_kwargs: dict) -> int:
-        steps = int(model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps))
-        if steps < 1:
-            raise ValueError(f"num_inference_steps must be >= 1, got {steps}")
-        if steps > self.config.max_denoise_steps:
-            logger.info("clamping num_inference_steps %d to the loop ceiling %d", steps, self.config.max_denoise_steps)
-            steps = self.config.max_denoise_steps
-        return steps
+        return model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps)
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # past the loop's max_iters the conductor refuses the request
+        return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
 
     def request_kwargs(self) -> frozenset[str]:
         # guidance_scale is read only to warn that the distilled checkpoint ignores it
@@ -335,7 +333,7 @@ class Flux2KleinModel(Model):
         # needed telling, and it was the one case that stayed silent. Only distilled
         # checkpoints load at all now (Flux2KleinConfig.from_snapshot), so this fires
         # whenever a caller's guidance_scale is about to be dropped.
-        if float(kwargs.get("guidance_scale", 1.0)) != 1.0:
+        if kwargs.get("guidance_scale", 1.0) != 1.0:
             logger.warning("guidance_scale is ignored: FLUX.2 klein is step-distilled and runs without CFG")
         ids, mask = self.tokenize(prompt)
         return {TEXT_INPUTS: [ids], TEXT_MASK: [mask]}
