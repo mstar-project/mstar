@@ -798,8 +798,8 @@ same transformer instance and KV pool as the generator. ``/v1/chat/completions``
 takes image and video content parts (URLs or data URIs) and streams tokens; the
 chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
 ``enable_thinking`` (or ``chat_template_kwargs.enable_thinking``), ``top_k``,
-``repetition_penalty``, ``penalize_prompt`` (``min_p`` is refused; ``max_tokens`` is
-at most 2048), and for video attachments ``video_fps`` / ``video_num_frames``
+``repetition_penalty``, ``penalize_prompt`` (``min_p`` is refused; ``max_tokens``
+defaults to 2048), and for video attachments ``video_fps`` / ``video_num_frames``
 (frames are sampled at 2 fps by default, each frame a timestamped span).
 
 .. code-block:: bash

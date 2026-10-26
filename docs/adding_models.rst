@@ -292,10 +292,10 @@ contract:
   fall back silently. A ``SamplerSpec`` without ``enable_repetition_penalty`` or
   ``enable_min_p`` refuses those knobs at admission, so do not default a penalty onto it.
 - Declare every ``model_kwargs`` key you read in ``request_kwargs()``; any other key a
-  client sends is logged as ignored by the server.
-- If a decode ``Loop`` takes ``max_iters`` from the kwarg-less ``get_max_output_tokens()``,
-  return that value from ``get_max_output_tokens_limit()``, so a request above it is
-  refused instead of cut short.
+  client sends is logged as ignored by the server. ``test_model_contracts.py`` fails for a
+  registered model that does not override it.
+- Bound a request's length through ``get_loop_caps``: the conductor refuses a cap past the
+  loop's ``max_iters`` instead of cutting the request short, so do not clamp it yourself.
 - Draw any model-local randomness from the request's seed (``random_seed`` on the
   forward-pass info), never the global RNG.
 
