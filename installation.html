@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 26, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -274,6 +274,13 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.html">mstar.model.command_a_plus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.assets.html">mstar.model.command_a_plus.assets</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.components.html">mstar.model.command_a_plus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.config.html">mstar.model.command_a_plus.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.tests.html">mstar.model.command_a_plus.tests</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -785,34 +792,43 @@ mstar<span class="w"> </span>serve<span class="w"> </span>bagel<span class="w"> 
 batched token sampling with per-request RNG state on the device.
 Install the matching XPU build of PyTorch.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[qwen3_omni]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[command_a_plus]</span></code></p></td>
+<td><p>Command A+ runtime: <code class="docutils literal notranslate"><span class="pre">flashinfer-python&gt;=0.6.18</span></code> (its one-kernel all-reduce),
+<code class="docutils literal notranslate"><span class="pre">transformers&gt;=5.17</span></code> (the version its Hugging Face parity checks use),
+<code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>, and <code class="docutils literal notranslate"><span class="pre">ninja</span></code>
+(speeds up the JIT build of the vendored MoE align kernel). Set <code class="docutils literal notranslate"><span class="pre">CUDA_HOME</span></code> to a
+CUDA toolkit matching PyTorch’s so that kernel can build. <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> allows older
+FlashInfer and Transformers for the other models, so add <code class="docutils literal notranslate"><span class="pre">.[command_a_plus]</span></code>
+when installing both.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[qwen3_omni]</span></code></p></td>
 <td><p>Qwen3-Omni runtime: the BAGEL set plus <code class="docutils literal notranslate"><span class="pre">qwen-omni-utils</span></code>, <code class="docutils literal notranslate"><span class="pre">datasets</span></code>, and
 <code class="docutils literal notranslate"><span class="pre">ninja</span></code> (speeds up the JIT build of the vendored MoE align kernel).
 <strong>Also needs</strong> <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>, which is installed separately —
 see <a class="reference internal" href="#flash-attn-qwen3-omni-lingbot-world">flash-attn (Qwen3-Omni, LingBot-World)</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[orpheus]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[orpheus]</span></code></p></td>
 <td><p>Orpheus TTS runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
 <code class="docutils literal notranslate"><span class="pre">einops</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[fish_s2_pro]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[fish_s2_pro]</span></code></p></td>
 <td><p>Fish Audio S2-Pro runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
 <code class="docutils literal notranslate"><span class="pre">soundfile</span></code> (reference-clip decoding), <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[omnivoice]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[omnivoice]</span></code></p></td>
 <td><p>OmniVoice TTS. The extra is empty on purpose: the runtime is the
 <code class="docutils literal notranslate"><span class="pre">omnivoice</span></code> package, installed separately from git —
 see <a class="reference internal" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[pi05]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[pi05]</span></code></p></td>
 <td><p>Pi0.5 runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
 <code class="docutils literal notranslate"><span class="pre">triton</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[vjepa2]</span></code> / <code class="docutils literal notranslate"><span class="pre">.[vjepa2_ac]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[vjepa2]</span></code> / <code class="docutils literal notranslate"><span class="pre">.[vjepa2_ac]</span></code></p></td>
 <td><p>V-JEPA 2 runtime: <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>, <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>,
 <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code> (<code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code> also adds <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[waypoint]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[waypoint]</span></code></p></td>
 <td><p>Index-hosted Waypoint dependencies: <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
 and <code class="docutils literal notranslate"><span class="pre">tensordict</span></code> for reference validation. The pinned TAEHV implementation
 must be installed separately as shown below; keeping its direct URL out of
@@ -820,26 +836,26 @@ package metadata allows <code class="docutils literal notranslate"><span class="
 <code class="docutils literal notranslate"><span class="pre">flash-attn-4</span></code>, which is installed separately —
 see <a class="reference internal" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[audio]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[audio]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">soundfile</span></code> — only needed to return <strong>non-WAV</strong> audio containers (mp3/flac/…)
 from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[audioseal]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[audioseal]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">audioseal</span></code> (<code class="docutils literal notranslate"><span class="pre">&gt;=0.2,&lt;0.3</span></code>, MIT code and weights) for the opt-in AudioSeal
 watermark on generated speech (Qwen3-TTS <code class="docutils literal notranslate"><span class="pre">audio_watermark</span></code>, see the
 Qwen3-TTS notes in <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>). Not part of <code class="docutils literal notranslate"><span class="pre">.[all]</span></code>; a deployment that
 enables the watermark without it fails at startup with this install hint.
 The <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.model.audio_watermark</span> <span class="pre">detect</span></code> CLI also needs <code class="docutils literal notranslate"><span class="pre">.[audio]</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[metrics]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[metrics]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">prometheus-client</span></code> for <code class="docutils literal notranslate"><span class="pre">--enable-metrics</span></code> (Prometheus metrics at
 <code class="docutils literal notranslate"><span class="pre">/metrics</span></code>, see <a class="reference internal" href="serving.html#serving-metrics"><span class="std std-ref">Metrics</span></a>). A serving feature rather than a
 model’s runtime, so not part of <code class="docutils literal notranslate"><span class="pre">.[all]</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[dev]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[dev]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">ruff</span></code> + <code class="docutils literal notranslate"><span class="pre">pytest</span></code> for linting and the test suite.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[all]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[all]</span></code></p></td>
 <td><p>The union of the index-hosted dependencies from every model extra above.
 Convenient for a machine that serves multiple models; heavier and slower to
 install than a single family’s extra. It excludes the separately installed
@@ -1311,7 +1327,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 25, 2026.
+  Last updated on Oct 26, 2026.
   <br/>
 </p>
   </div>

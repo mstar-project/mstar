@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 26, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -274,6 +274,13 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.html">mstar.model.command_a_plus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.assets.html">mstar.model.command_a_plus.assets</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.components.html">mstar.model.command_a_plus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.config.html">mstar.model.command_a_plus.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.command_a_plus.tests.html">mstar.model.command_a_plus.tests</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -999,19 +1006,21 @@ JIT or CUDA-graph capture can exceed that default.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
 <td><p><em>(optional)</em> Small-message all-reduce path of every TP and SP group:
-<code class="docutils literal notranslate"><span class="pre">nccl</span></code> (default), <code class="docutils literal notranslate"><span class="pre">symm_oneshot</span></code> or <code class="docutils literal notranslate"><span class="pre">symm_multimem</span></code>; any other value
-fails at startup. The last two send
+<code class="docutils literal notranslate"><span class="pre">nccl</span></code> (default), <code class="docutils literal notranslate"><span class="pre">symm_oneshot</span></code>, <code class="docutils literal notranslate"><span class="pre">symm_multimem</span></code> or <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>;
+any other value fails at startup. <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> sends 2-D bf16 CUDA messages
+up to <code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code> through FlashInfer’s one-kernel all-reduce.
+The symmetric-memory modes send
 contiguous bf16 and fp32 CUDA messages up to <code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code> through
 torch symmetric memory: one-shot reads every peer’s buffer over NVLink and
 reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
 Larger messages stay on NCCL, and so does one-shot inside a
 <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’d forward. Both are CUDA-graph capturable. Reduction order
 differs from NCCL’s, so bf16 results can differ at the last bit. Falls back
-to NCCL, with a warning, where symmetric memory cannot be set up on every
+to NCCL, with a warning, where the chosen path cannot be set up on every
 rank of the group.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
-<td><p><em>(optional)</em> Largest message, in KiB, the symmetric-memory path takes;
+<td><p><em>(optional)</em> Largest message, in KiB, the non-NCCL path takes;
 larger ones go to NCCL. It is also the size of the buffer each group
 rendezvouses. Default 512.</p></td>
 </tr>
@@ -1573,7 +1582,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 25, 2026.
+  Last updated on Oct 26, 2026.
   <br/>
 </p>
   </div>

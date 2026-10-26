@@ -28,6 +28,7 @@
    :recursive:
 
    adarms_norm
+   add_layernorm
    attention
    causal_conv1d
    containers

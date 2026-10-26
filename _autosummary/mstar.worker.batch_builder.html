@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 26, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -274,6 +274,13 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.command_a_plus.html">mstar.model.command_a_plus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.command_a_plus.assets.html">mstar.model.command_a_plus.assets</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.command_a_plus.components.html">mstar.model.command_a_plus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.command_a_plus.config.html">mstar.model.command_a_plus.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.command_a_plus.tests.html">mstar.model.command_a_plus.tests</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -791,7 +798,7 @@ batch lands. None for an uncapped node: nothing is displaced.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">BatchBuildRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">node_name:</span> <span class="pre">str,</span> <span class="pre">graph_walk:</span> <span class="pre">str,</span> <span class="pre">backlog:</span> <span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">fresh:</span> <span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">blocked_rids:</span> <span class="pre">set[int]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">capture_group_of:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">walk_caps:</span> <span class="pre">dict[str,</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">walk_row_caps:</span> <span class="pre">dict[str,</span> <span class="pre">int]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">pre_existing_batch_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">pre_existing_walk:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">capture_group:</span> <span class="pre">collections.abc.Callable[[int],</span> <span class="pre">typing.Any]</span> <span class="pre">=</span> <span class="pre">&lt;function</span> <span class="pre">BatchBuildRequest.&lt;lambda&gt;</span> <span class="pre">at</span> <span class="pre">0x7f14e6ef1260&gt;</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BatchBuildRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.batch_builder.</span></span><span class="sig-name descname"><span class="pre">BatchBuildRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">node_name:</span> <span class="pre">str,</span> <span class="pre">graph_walk:</span> <span class="pre">str,</span> <span class="pre">backlog:</span> <span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">fresh:</span> <span class="pre">'ScheduledBatch</span> <span class="pre">|</span> <span class="pre">None'</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">blocked_rids:</span> <span class="pre">set[int]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">capture_group_of:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">walk_caps:</span> <span class="pre">dict[str,</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">None]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">walk_row_caps:</span> <span class="pre">dict[str,</span> <span class="pre">int]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">pre_existing_batch_size:</span> <span class="pre">int</span> <span class="pre">=</span> <span class="pre">0,</span> <span class="pre">pre_existing_walk:</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">capture_group:</span> <span class="pre">collections.abc.Callable[[int],</span> <span class="pre">typing.Any]</span> <span class="pre">=</span> <span class="pre">&lt;function</span> <span class="pre">BatchBuildRequest.&lt;lambda&gt;</span> <span class="pre">at</span> <span class="pre">0x7f2f5dd89300&gt;</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/batch_builder.html#BatchBuildRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1107,7 +1114,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 25, 2026.
+  Last updated on Oct 26, 2026.
   <br/>
 </p>
   </div>

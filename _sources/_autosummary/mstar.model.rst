@@ -30,6 +30,7 @@
    audio_watermark
    base
    chatterbox
+   command_a_plus
    components
    cosmos3
    fish_s2_pro

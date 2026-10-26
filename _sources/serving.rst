@@ -279,18 +279,20 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        JIT or CUDA-graph capture can exceed that default.
    * - ``tp_allreduce``
      - *(optional)* Small-message all-reduce path of every TP and SP group:
-       ``nccl`` (default), ``symm_oneshot`` or ``symm_multimem``; any other value
-       fails at startup. The last two send
+       ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
+       any other value fails at startup. ``flashinfer`` sends 2-D bf16 CUDA messages
+       up to ``tp_allreduce_max_kb`` through FlashInfer's one-kernel all-reduce.
+       The symmetric-memory modes send
        contiguous bf16 and fp32 CUDA messages up to ``tp_allreduce_max_kb`` through
        torch symmetric memory: one-shot reads every peer's buffer over NVLink and
        reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
        Larger messages stay on NCCL, and so does one-shot inside a
        ``torch.compile``'d forward. Both are CUDA-graph capturable. Reduction order
        differs from NCCL's, so bf16 results can differ at the last bit. Falls back
-       to NCCL, with a warning, where symmetric memory cannot be set up on every
+       to NCCL, with a warning, where the chosen path cannot be set up on every
        rank of the group.
    * - ``tp_allreduce_max_kb``
-     - *(optional)* Largest message, in KiB, the symmetric-memory path takes;
+     - *(optional)* Largest message, in KiB, the non-NCCL path takes;
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
    * - ``tp_async_sched``
