@@ -234,6 +234,12 @@ model, so they are named for it.
      - ``refs/Qwen3-ASR``
      - ``test/asr/test_qwen3_asr_parity.py``: a checkout of the qwen-asr SDK,
        the reference transcripts come from.
+   * - ``MSTAR_QWEN_ASR_REF_SITE``
+     - unset
+     - ``test/asr/test_qwen3_asr_parity.py``: a directory holding transformers
+       4.57, put first on the path of the subprocess that runs the SDK (whose
+       model code does not run on transformers 5). Unset under transformers 5,
+       the SDK comparison skips.
 
 Serving (Python frontend)
 -------------------------

@@ -10,6 +10,14 @@ WER can be compared against the same reference on the same files:
     # Qwen3-ASR: the Qwen3-ASR SDK's transformers backend (refs/Qwen3-ASR)
     python -m benchmark.asr_reference --model Qwen/Qwen3-ASR-1.7B --sdk refs/Qwen3-ASR \\
         --output-json results/2026-09-18/sdk_reference_qwen3_asr.json
+
+The SDK's model code needs transformers 4.57. Under transformers 5, install
+that into a directory of its own (without its dependencies, so torch and
+accelerate stay the environment's) and put it first on the path:
+
+    pip install --target /opt/qwen-asr-site --no-deps transformers==4.57.3 \\
+        "huggingface-hub>=0.34,<1.0" "tokenizers>=0.22,<=0.23"
+    PYTHONPATH=/opt/qwen-asr-site python -m benchmark.asr_reference ...
 """
 
 from __future__ import annotations
@@ -98,6 +106,7 @@ def main() -> None:
     p.add_argument("--sdk", default=None, help="Qwen3-ASR SDK checkout (selects the Qwen3-ASR reference)")
     p.add_argument("--data-dir", default="data/asr", help="the set benchmark.asr_data built")
     p.add_argument("--short-set", default="test_clean_200")
+    p.add_argument("--limit", type=int, default=None, help="only the set's first N files")
     p.add_argument("--language", default="en")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
@@ -105,7 +114,7 @@ def main() -> None:
     p.add_argument("--output-json", required=True)
     args = p.parse_args()
 
-    items = load_set(Path(args.data_dir) / args.short_set)
+    items = load_set(Path(args.data_dir) / args.short_set)[:args.limit]
     dtype = getattr(torch, args.dtype)
     t0 = time.perf_counter()
     if args.sdk:

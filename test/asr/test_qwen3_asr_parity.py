@@ -7,20 +7,25 @@ set (``python -m benchmark.asr_data``, under ``MSTAR_ASR_DATA``).
     against transformers' ``Qwen3OmniMoeAudioEncoder`` built from the same
     weights, on real utterances shorter than one 8 s window (HF's SDPA path
     is un-windowed, so longer clips are not comparable on that path);
-  * end to end: the reference ``qwen_asr`` SDK (transformers backend) and
-    ``mstar serve`` with the shipped config transcribe the same files, greedy
-    with the language forced; the texts must match (see
-    ``_served.assert_greedy_parity``). Needs ``MSTAR_QWEN_ASR_REF`` pointing at
-    the SDK checkout and the GPU to itself (the server takes most of it).
+  * end to end: the reference ``qwen_asr`` SDK (transformers backend, run by
+    ``benchmark.asr_reference`` in a subprocess) and ``mstar serve`` with the
+    shipped config transcribe the same files, greedy with the language forced;
+    the texts must match (see ``_served.assert_greedy_parity``). Needs
+    ``MSTAR_QWEN_ASR_REF`` pointing at the SDK checkout and the GPU to itself
+    (the server takes most of it). The SDK's model code needs transformers
+    4.57, so under transformers 5 ``MSTAR_QWEN_ASR_REF_SITE`` names a directory
+    holding it, which goes first on the subprocess's path:
 
-    MSTAR_QWEN_ASR_REPO=Qwen/Qwen3-ASR-1.7B pytest test/asr/test_qwen3_asr_parity.py -q
+    pip install --target /opt/qwen-asr-site --no-deps transformers==4.57.3 \\
+        "huggingface-hub>=0.34,<1.0" "tokenizers>=0.22,<=0.23"
+    MSTAR_QWEN_ASR_REF_SITE=/opt/qwen-asr-site pytest test/asr/test_qwen3_asr_parity.py -q
 """
 
 import gc
-import importlib
+import json
 import os
+import subprocess
 import sys
-import types
 from pathlib import Path
 
 import _served
@@ -32,6 +37,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 REPO = os.environ.get("MSTAR_QWEN_ASR_REPO", "Qwen/Qwen3-ASR-1.7B")
 KEY = "qwen3_asr_realtime" if REPO.endswith("0.6B") else "qwen3_asr"
 SDK = os.environ.get("MSTAR_QWEN_ASR_REF", "refs/Qwen3-ASR")
+SDK_SITE = os.environ.get("MSTAR_QWEN_ASR_REF_SITE")
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _snapshot():
@@ -88,11 +95,15 @@ def test_aut_encoder_matches_hf_on_real_audio(model):
     assert worst < 0.1, worst
 
 
-def test_served_greedy_text_matches_the_sdk(model):
+def test_served_greedy_text_matches_the_sdk(tmp_path):
     """The served model against the reference SDK (transformers backend, the
     benchmark's WER reference), greedy and bf16, on the benchmark's first files."""
     if not Path(SDK, "qwen_asr").is_dir():
         pytest.skip(f"reference SDK not found at {SDK}")
+    import transformers
+
+    if SDK_SITE is None and int(transformers.__version__.split(".")[0]) >= 5:
+        pytest.skip("the SDK needs transformers 4.57: set MSTAR_QWEN_ASR_REF_SITE (see the module docstring)")
     from mstar.model.qwen3_asr.repetition import fix_repetitions
 
     def norm(text: str) -> str:
@@ -100,32 +111,16 @@ def test_served_greedy_text_matches_the_sdk(model):
         return fix_repetitions(text.strip()).strip()
 
     paths = _served.utterances(8)
-    pkg = types.ModuleType("qwen_asr")
-    pkg.__path__ = [str(Path(SDK) / "qwen_asr")]
-    sys.modules.setdefault("qwen_asr", pkg)
-    core = types.ModuleType("qwen_asr.core")
-    core.__path__ = [str(Path(SDK) / "qwen_asr" / "core")]
-    sys.modules.setdefault("qwen_asr.core", core)
-    backend = importlib.import_module("qwen_asr.core.transformers_backend")
-    ref = backend.Qwen3ASRForConditionalGeneration.from_pretrained(
-        model.local_dir, dtype=torch.bfloat16, device_map="cuda", attn_implementation="sdpa",
-    ).eval()
-    processor = backend.Qwen3ASRProcessor.from_pretrained(model.local_dir, fix_mistral_regex=True)
-    # the served route maps language="en" the same way (Qwen3ASRModel.process_prompt)
-    prompt = model.prompt_text(1, context="", language=model.config.language_name("en"))
-    reference = {}
-    for path in paths:
-        wave = model.load_audio(str(path), "cpu").data.numpy()
-        inputs = processor(text=[prompt], audio=[wave], return_tensors="pt", padding=True).to("cuda")
-        inputs["input_features"] = inputs["input_features"].to(torch.bfloat16)
-        with torch.no_grad():
-            out = ref.generate(**inputs, max_new_tokens=512)
-        reference[path.name] = norm(processor.batch_decode(
-            out.sequences[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True,
-        )[0])
-    del ref, processor, inputs, out
-    gc.collect()
-    torch.cuda.empty_cache()
+    out = tmp_path / "reference.json"
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [SDK_SITE, str(ROOT)])))
+    # batch 1 as served; the language is forced the way the served route maps language="en"
+    subprocess.run([
+        sys.executable, "-m", "benchmark.asr_reference", "--model", _snapshot(), "--sdk", str(Path(SDK).resolve()),
+        "--data-dir", str(_served.DATA.resolve()), "--limit", str(len(paths)), "--batch-size", "1",
+        "--language", "en", "--output-json", str(out),
+    ], cwd=ROOT, env=env, check=True)
+    hyps = json.loads(out.read_text())["hypotheses"]
+    reference = {path.name: norm(hyps[path.stem]) for path in paths}
 
     with _served.serving(KEY) as base:
         served = {path.name: norm(_served.transcribe(base, path, "en")) for path in paths}
