@@ -13,6 +13,7 @@ what both a leak and a double-free break.
 
 from __future__ import annotations
 
+import ctypes
 import sys
 import threading
 import time
@@ -842,6 +843,16 @@ def test_a_copier_checks_each_pair_of_caches_once():
     copier._layouts[id(later), id(device)] = copier._layouts.pop((id(other), id(device)))
     copier.copy(later, [0], device, [1], stream)
     assert len(checked) == 3, "a cache at a reused id got the freed cache's pitches and strides"
+
+
+@requires_cuda
+@requires_nvidia
+def test_copies_on_cuda_keep_the_gil():
+    """Beside a thread running Python, queueing four page copies took 15 ms dropping the GIL and 28 µs keeping it."""
+    _loadable(page_copier.CudartCopier)
+    copier = page_copier.make_page_copier.__wrapped__()
+    fn = getattr(copier, "_fn", None)
+    assert fn is not None and fn._flags_ & ctypes._FUNCFLAG_PYTHONAPI, f"{copier.name} drops the GIL on every copy"
 
 
 @requires_cuda

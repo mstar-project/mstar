@@ -8,8 +8,8 @@ instead one ``cudaMemcpy2DAsync`` / ``hipMemcpy2DAsync`` with the layer stride
 as its pitch: async, and run on the copy engines.
 
 `make_page_copier` picks the first copier that loads and passes a round trip,
-once per process: on CUDA `CudaBindingsCopier`, then `CudartCopier`; on ROCm
-`HipCopier`; then `TorchCopier`.
+once per process: on CUDA `CudartCopier`, then `CudaBindingsCopier`, whose calls
+drop the GIL; on ROCm `HipCopier`; then `TorchCopier`.
 """
 
 from __future__ import annotations
@@ -134,6 +134,7 @@ class _MappedRuntimeCopier(_Memcpy2DCopier):
     happens to be on the library path."""
 
     _lib = _symbol = ""
+    _dll = ctypes.CDLL
 
     def __init__(self):
         super().__init__()
@@ -144,7 +145,7 @@ class _MappedRuntimeCopier(_Memcpy2DCopier):
             }
         if len(paths) != 1:
             raise OSError(f"expected one {self._lib} mapped by torch, found {sorted(paths)}")
-        fn = getattr(ctypes.CDLL(paths.pop()), self._symbol)
+        fn = getattr(self._dll(paths.pop()), self._symbol)
         fn.restype = ctypes.c_int
         fn.argtypes = [
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
@@ -159,10 +160,13 @@ class _MappedRuntimeCopier(_Memcpy2DCopier):
 
 
 class CudartCopier(_MappedRuntimeCopier):
-    """libcudart, for torch 2.9, which ships no ``cuda.bindings``."""
+    """libcudart, the runtime torch loaded, through ``ctypes.PyDLL`` so each call keeps the GIL. Dropping it
+    costs up to a switch interval per call while another thread runs Python. A call that waits on the
+    driver stalls every Python thread."""
 
     name = "libcudart"
     _lib, _symbol = "libcudart", "cudaMemcpy2DAsync"
+    _dll = ctypes.PyDLL
 
 
 class HipCopier(_MappedRuntimeCopier):
@@ -189,7 +193,7 @@ def _round_trips(copier: PageCopier) -> bool:
 def make_page_copier() -> PageCopier:
     """The fastest copier that works here; `TorchCopier` off CUDA and ROCm."""
     if current_platform.is_cuda():
-        candidates = (CudaBindingsCopier, CudartCopier)
+        candidates = (CudartCopier, CudaBindingsCopier)
     elif current_platform.is_rocm():
         candidates = (HipCopier,)
     else:
