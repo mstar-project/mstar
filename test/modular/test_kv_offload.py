@@ -803,7 +803,7 @@ def test_pool_copies_keep_every_layer_and_element(copier_cls):
     device = mgr.kv_cache.tensor
     device.copy_(torch.randn_like(device))
     expected = device.clone()
-    src, dst, host = [5, 2, 9], [3, 11, 7], [0, 1, 2]
+    src, dst, host = [5, 6, 9], [3, 4, 7], [0, 1, 2]
 
     pool.copy_out(device, PageCopies(gpu=src, cpu=host))
     pool.sync()
@@ -843,6 +843,26 @@ def test_a_copier_checks_each_pair_of_caches_once():
     copier._layouts[id(later), id(device)] = copier._layouts.pop((id(other), id(device)))
     copier.copy(later, [0], device, [1], stream)
     assert len(checked) == 3, "a cache at a reused id got the freed cache's pitches and strides"
+
+
+def test_pages_adjacent_in_both_caches_go_as_one_copy():
+    """A call per page costs a 60-page reload about 160 µs of host time, and adjacent pages are one block
+    per layer."""
+    calls = []
+
+    class _Recording(page_copier._Memcpy2DCopier):
+        def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
+            calls.append((dst, dpitch, src, spitch, width, height))
+            return 0
+
+    # float32, [layers, pages, 3]: a page is 12 bytes, a layer 96 bytes on the host and 72 on the device
+    host, device = torch.zeros(2, 8, 3), torch.zeros(2, 6, 3)
+    # pages as (host, device): (5, 2) to (6, 4) is adjacent on the host only, and (6, 4) to (0, 5) on the device only
+    _Recording().copy(host, [4, 5, 6, 0], device, [1, 2, 4, 5], SimpleNamespace(cuda_stream=0))
+
+    h, d = host.data_ptr(), device.data_ptr()
+    want = [(h + 48, 96, d + 12, 72, 24, 2), (h + 72, 96, d + 48, 72, 12, 2), (h, 96, d + 60, 72, 12, 2)]
+    assert calls == want, "a copy didn't cover exactly a run of pages adjacent in both caches"
 
 
 @requires_cuda

@@ -4,7 +4,7 @@ How fast the paged KV cache moves pages to and from host memory (`CPUPagePool`),
 
 ## Copy microbenchmark
 
-`copy_bench.py` drives `CPUPagePool` directly, on one GPU, through each copier in `mstar/engine/resources/kv/page_copier.py` that loads: one `cudaMemcpy2DAsync` per page through `cuda.bindings` or through the libcudart torch loaded, one `hipMemcpy2DAsync` per page through torch's libamdhip64 on ROCm, and the per-page `copy_` that is the fallback (and was the only path before). For each direction and page count it reports:
+`copy_bench.py` drives `CPUPagePool` directly, on one GPU, through each copier in `mstar/engine/resources/kv/page_copier.py` that loads: one `cudaMemcpy2DAsync` per run of adjacent pages through `cuda.bindings` or through the libcudart torch loaded, one `hipMemcpy2DAsync` per run through torch's libamdhip64 on ROCm, and the per-page `copy_` that is the fallback (and was the only path before). The pages it copies are adjacent, so each 2D copier makes one call per copy. For each direction and page count it reports:
 
 - **host ms**: from issuing the copies to `sync()` returning, with `--queued-ms` of compute already queued on the current stream. A path that makes the host wait for that compute reports at least `--queued-ms`.
 - **copy ms / GB/s**: CUDA-event time of the copies alone on the pool's stream.

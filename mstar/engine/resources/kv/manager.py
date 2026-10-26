@@ -70,7 +70,7 @@ _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 # writes behind the step's own output copy.
 # `_WRITE_BYTES_PER_STEP` bounds how long the writes hold the copy engine before the next step's output
 # copy can run (about 1 ms on an H100).
-# `_WRITE_PAGES_PER_STEP` bounds the copies launched from the host, one per page (about 0.1 ms of host
+# `_WRITE_PAGES_PER_STEP` bounds the copies launched from the host, one per page at most (about 0.1 ms of host
 # time at 16).
 _WRITE_BYTES_PER_STEP = 32 << 20
 _WRITE_PAGES_PER_STEP = 16

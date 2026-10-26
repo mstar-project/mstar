@@ -3,9 +3,9 @@
 Both caches are laid out ``[layers, pages, ...]``, so a page is one contiguous
 block per layer, a layer stride apart. ``copy_`` of that strided view between
 device and pinned host memory blocks the host until the copy stream drains and
-runs at a fraction of the link's bandwidth. On CUDA and ROCm each page is
-instead one ``cudaMemcpy2DAsync`` / ``hipMemcpy2DAsync`` with the layer stride
-as its pitch: async, and run on the copy engines.
+runs at a fraction of the link's bandwidth. On CUDA and ROCm each run of pages
+adjacent in both caches is instead one ``cudaMemcpy2DAsync`` / ``hipMemcpy2DAsync``
+with the layer stride as its pitch: async, and run on the copy engines.
 
 `make_page_copier` picks the first copier that loads and passes a round trip,
 once per process: on CUDA `CudartCopier`, then `CudaBindingsCopier`, whose calls
@@ -71,7 +71,7 @@ class _Layout(NamedTuple):
 
 
 class _Memcpy2DCopier(PageCopier):
-    """One ``cudaMemcpy2DAsync`` per page; subclasses supply the call."""
+    """One ``cudaMemcpy2DAsync`` per run of adjacent pages; subclasses supply the call."""
 
     def __init__(self):
         # Each pair of caches is checked once, keyed by the two tensors' ids. The tensors are held weakly, so
@@ -86,6 +86,9 @@ class _Memcpy2DCopier(PageCopier):
         assert dst[0, 0].is_contiguous() and src[0, 0].is_contiguous()
         assert dst.dtype == src.dtype and dst.shape[0] == src.shape[0]
         assert dst.shape[2:] == src.shape[2:]
+        assert dst.stride(1) == dst[0, 0].numel() and src.stride(1) == src[0, 0].numel(), (
+            "pages must sit back to back in each layer for a run of adjacent pages to be one copy"
+        )
         elt = dst.element_size()
         return _Layout(
             weakref.ref(dst), weakref.ref(src), dst[0, 0].numel() * elt, dst.shape[0],
@@ -98,12 +101,18 @@ class _Memcpy2DCopier(PageCopier):
         if layout is None or layout.dst() is not dst or layout.src() is not src:
             layout = self._layouts[id(dst), id(src)] = self._check(dst, src)
         _, _, width, height, dst_ptr, dst_pitch, dst_page, src_ptr, src_pitch, src_page = layout
-        handle = stream.cuda_stream
+        runs: list[list[int]] = []
         for dst_idx, src_idx in zip(dst_pages, src_pages, strict=True):
+            if runs and dst_idx == runs[-1][0] + runs[-1][2] and src_idx == runs[-1][1] + runs[-1][2]:
+                runs[-1][2] += 1
+            else:
+                runs.append([dst_idx, src_idx, 1])
+        handle = stream.cuda_stream
+        for dst_idx, src_idx, pages in runs:
             err = self._memcpy_2d(
                 dst_ptr + dst_idx * dst_page, dst_pitch,
                 src_ptr + src_idx * src_page, src_pitch,
-                width, height, handle,
+                pages * width, height, handle,
             )
             if err != 0:
                 raise RuntimeError(f"cudaMemcpy2DAsync failed with error {err}")
@@ -177,16 +186,16 @@ class HipCopier(_MappedRuntimeCopier):
 
 
 def _round_trips(copier: PageCopier) -> bool:
-    """Two strided pages to pinned host memory and back, bit for bit."""
+    """Three strided pages, two of them adjacent, to pinned host memory and back, bit for bit."""
     device = torch.arange(3 * 4 * 6, dtype=torch.float32, device="cuda").view(3, 4, 6)
     host = torch.zeros(3, 3, 6).pin_memory()
     back = torch.zeros_like(device)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    copier.copy(host, [2, 0], device, [1, 3], stream)
-    copier.copy(back, [0, 2], host, [2, 0], stream)
+    copier.copy(host, [0, 1, 2], device, [1, 2, 0], stream)
+    copier.copy(back, [2, 3, 1], host, [0, 1, 2], stream)
     stream.synchronize()
-    return torch.equal(back[:, 0], device[:, 1]) and torch.equal(back[:, 2], device[:, 3])
+    return torch.equal(back[:, 1:], device[:, :3])
 
 
 @functools.cache
@@ -202,7 +211,7 @@ def make_page_copier() -> PageCopier:
         try:
             copier = cls()
             if _round_trips(copier):
-                logger.info("KV page copies: one 2D async memcpy a page, via %s", cls.name)
+                logger.info("KV page copies: one 2D async memcpy a run of pages, via %s", cls.name)
                 return copier
             logger.warning("KV page copies: %s returned wrong data; not using it", cls.name)
         except (ImportError, OSError, AttributeError, RuntimeError) as e:
