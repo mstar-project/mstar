@@ -1,10 +1,10 @@
 """Fused MoE on an AMD GPU against torch references.
 
 Covers the hipified align op (vs the torch version), the Triton backend with
-default, ROCm-default and every shipped tuned config, and AITER's fused MoE,
-each vs an fp32 torch MoE at Qwen3-Omni's expert sizes (E=128, Thinker hidden
-2048 / inter 768 / top-8, Talker 1024 / 384 / top-6). Eager, graph replay and
-compiled.
+default, ROCm-default and every tuned config shipped for this GPU, and
+AITER's fused MoE, each vs an fp32 torch MoE at Qwen3-Omni's expert sizes
+(E=128, Thinker hidden 2048 / inter 768 / top-8, Talker 1024 / 384 / top-6).
+Eager, graph replay and compiled.
 
     pytest test/rocm/test_fused_moe.py
 """
@@ -12,7 +12,6 @@ compiled.
 from __future__ import annotations
 
 import importlib.util
-import json
 
 import pytest
 import torch
@@ -34,7 +33,7 @@ def _seed():
 
 
 def _problem(dims):
-    from mstar.utils.fused_moe.config import MoEProblem
+    from mstar.utils.fused_moe.backend import MoEProblem
 
     return MoEProblem(*dims)
 
@@ -138,13 +137,16 @@ def test_align_op_uses_torchs_hip_runtime():
 @pytest.mark.parametrize("num_tokens", [1, 3, 16, 64, 256, 1024])
 def test_triton_backend_matches_reference(dims, num_tokens):
     from mstar.utils.fused_moe.backend import TritonFusedMoE
+    from mstar.utils.fused_moe.kernels import get_default_config
     from mstar.utils.fused_moe.runner import fused_experts
 
     x, w1, w2, weights, ids = _inputs(dims, num_tokens)
     ref = _reference(x, w1, w2, weights, ids)
     backend = TritonFusedMoE(_problem(dims))
     _assert_matches(backend(x, w1, w2, weights, ids), ref)
-    _assert_matches(fused_experts(x, w1, w2, weights, ids), ref)  # the kernel's own default
+    e, inter, hidden, top_k = dims
+    default = get_default_config(M=num_tokens, E=e, N=2 * inter, K=hidden, top_k=top_k)
+    _assert_matches(fused_experts(x, w1, w2, weights, ids, config=(default, default)), ref)
 
 
 @pytest.mark.parametrize("dims", [THINKER, TALKER], ids=["thinker", "talker"])
@@ -160,17 +162,37 @@ def test_triton_backend_is_bitwise_reproducible(dims, num_tokens):
         assert torch.equal(backend(x, w1, w2, weights, ids), first)
 
 
-def _shipped_tables():
-    from mstar.utils.fused_moe.config import CONFIG_DIR, MoEProblem, config_file_name, device_config_name
+def _table_entry(dims):
+    """This GPU's moe_gemm table entry at ``dims``, or None."""
+    from mstar.utils.fused_moe.kernels import MOE_GEMM
 
-    name = device_config_name()
+    e, inter, hidden, top_k = dims
+    return MOE_GEMM.lookup(torch.bfloat16, {"E": e, "N": 2 * inter, "K": hidden, "top_k": top_k})
+
+
+def _shipped_tables():
+    """(dims, M, get_config's pick) for each row of this GPU's tables at Qwen3-Omni's sizes:
+    M is the row's upper bound (the last row is read at twice the bound before it)."""
+    from mstar.utils.fused_moe import kernels
+
     out = []
     for dims in (THINKER, TALKER):
-        path = CONFIG_DIR / config_file_name(MoEProblem(*dims), name)
-        if path.is_file():
-            table = json.loads(path.read_text())
-            out += [(dims, int(m), cfg) for m, cfg in table.items() if m.isdigit()]
+        entry = _table_entry(dims)
+        if entry is None:
+            continue
+        e, inter, hidden, top_k = dims
+        bounds = [m for m, _ in entry.rows if m is not None]
+        for m in [*bounds, 2 * bounds[-1] if bounds else 1]:
+            out.append((dims, m, kernels.get_config(M=m, E=e, N=2 * inter, K=hidden, top_k=top_k)))
     return out
+
+
+def test_qwen3_omni_tables_load_here():
+    name = torch.cuda.get_device_name().removesuffix(" VF")
+    if name not in ("AMD Instinct MI300X", "AMD Instinct MI325X"):
+        pytest.skip(f"no Qwen3-Omni tables ship for {name}")
+    for dims in (THINKER, TALKER):
+        assert _table_entry(dims) is not None, (name, dims)
 
 
 def test_every_shipped_config_matches_reference():
@@ -215,8 +237,8 @@ def test_aiter_backend_matches_reference(dims, num_tokens):
 
 @pytest.mark.skipif(not HAS_AITER, reason="aiter not installed")
 def test_aiter_backend_refuses_unaligned_intermediate():
+    from mstar.utils.fused_moe.backend import MoEProblem
     from mstar.utils.fused_moe.backend_aiter import AiterFusedMoE
-    from mstar.utils.fused_moe.config import MoEProblem
 
     with pytest.raises(ValueError, match="multiple of 128"):
         AiterFusedMoE(MoEProblem(128, 192, 1024, 6))  # the Talker's experts at TP2
