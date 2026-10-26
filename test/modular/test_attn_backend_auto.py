@@ -8,6 +8,7 @@ first plan.
 """
 
 import dataclasses
+import inspect
 import logging
 import types
 
@@ -396,6 +397,44 @@ def test_rocm_ragged_builds_aiter(rocm, spec_class, manager_class):
     spec = spec_class(resource_key="ragged", nodes={"node"}, config=ragged_config())
     manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
     assert type(manager) is manager_class
+
+
+def public_surface(manager) -> dict:
+    """What a model or the engine can reach on ``manager``: every public
+    property or attribute with its value, every method with its parameters."""
+    surface = {}
+    for name in dir(manager):
+        if name.startswith("_"):
+            continue
+        value = getattr(manager, name)
+        if callable(value) and not isinstance(inspect.getattr_static(manager, name), property):
+            value = [(p.name, p.kind, p.default) for p in inspect.signature(value).parameters.values()]
+        surface[name] = value
+    return surface
+
+
+@pytest.mark.parametrize(
+    ("spec_class", "manager_class"),
+    [(RaggedAttentionSpec, AiterRaggedManager), (RaggedCrossAttentionSpec, AiterRaggedCrossManager)],
+)
+def test_rocm_ragged_managers_are_drop_ins_for_flashinfers(rocm, spec_class, manager_class):
+    """Models are written against the FlashInfer managers, so whatever AUTO
+    builds on ROCm has to offer the same properties, with the same values for
+    the same config, and the same methods."""
+    rocm()
+
+    def build(backend):
+        spec = spec_class(resource_key="ragged", nodes={"node"}, config=ragged_config(backend=backend))
+        apply_yaml_overrides([spec], {"resources": {"ragged": {"max_segments_per_request": 3}}})
+        return build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+
+    flashinfer, rocm_default = build(RaggedAttnBackend.FLASHINFER), build(RaggedAttnBackend.AUTO)
+    assert type(rocm_default) is manager_class
+    expected = public_surface(flashinfer)
+    # the FlashInfer wrapper type the manager builds, not something callers use
+    del expected["wrapper_class"]
+    assert expected["max_segments_per_request"] == 3
+    assert public_surface(rocm_default) == expected
 
 
 def test_yaml_names_the_aiter_backends():
