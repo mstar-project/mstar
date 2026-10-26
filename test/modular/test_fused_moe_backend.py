@@ -1,8 +1,8 @@
-"""Fused-MoE backend choice and launch-config tables, without a GPU.
+"""Fused-MoE backend choice, without a GPU.
 
-AUTO is Triton everywhere. Without a tuned table NVIDIA runs the kernel's own
-default config (same as before backends existed) and AMD adds num_stages=2.
-Tuned tables are found by GPU name and nearest token count. The AITER backend
+AUTO is Triton everywhere. The Triton backend takes get_config's tuned table
+(test_fused_moe_config.py covers the lookup). Without one NVIDIA runs the
+kernel's own default config and AMD adds num_stages=2. The AITER backend
 refuses unsupported platforms and sizes up front.
 """
 
@@ -16,41 +16,30 @@ import torch
 
 from mstar import platforms
 from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform
-from mstar.utils.fused_moe import backend as backend_module
-from mstar.utils.fused_moe import config as config_module
+from mstar.utils.fused_moe import kernels
 from mstar.utils.fused_moe.backend import (
     FusedMoEBackend,
     MoEBackend,
+    MoEProblem,
     TritonFusedMoE,
     make_moe_backend,
-)
-from mstar.utils.fused_moe.config import (
-    CONFIG_DIR,
-    MoEProblem,
-    config_file_name,
-    load_tuned_configs,
-    nearest_config,
 )
 from mstar.utils.fused_moe.kernels import get_default_config
 
 THINKER = MoEProblem(num_experts=128, intermediate_size=768, hidden_size=2048, top_k=8)
 TALKER_TP2 = MoEProblem(num_experts=128, intermediate_size=192, hidden_size=1024, top_k=6)
-LAUNCH_KEYS = {
-    "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M", "num_warps", "num_stages",
-    "waves_per_eu", "matrix_instr_nonkdim", "kpack",
-}
 
 
 @pytest.fixture
 def on_platform(monkeypatch):
     def use(platform: Platform, device_name: str | None = None) -> Platform:
         monkeypatch.setattr(platforms, "resolve_platform", lambda: platform)
-        monkeypatch.setattr(backend_module, "device_config_name", lambda: device_name)
-        backend_module._tuned_configs.cache_clear()
+        monkeypatch.setattr(kernels, "device_config_name", lambda: device_name)
+        kernels.tuned_configs.cache_clear()
         return platform
 
     yield use
-    backend_module._tuned_configs.cache_clear()
+    kernels.tuned_configs.cache_clear()
 
 
 def _default(m: int, p: MoEProblem = THINKER) -> dict:
@@ -81,72 +70,47 @@ def test_untuned_size_on_nvidia_runs_the_kernel_default(on_platform, m):
 def test_untuned_size_on_amd_pins_two_stages(on_platform, m):
     on_platform(RocmPlatform(), device_name="AMD_Instinct_MI300X")
     backend = make_moe_backend("auto", TALKER_TP2)  # no table ships for these sizes
-    assert backend.config(m) == {**_default(m, TALKER_TP2), "num_stages": 2}
+    config = {**_default(m, TALKER_TP2), "num_stages": 2}
+    assert backend.config(m) == (config, config)
 
 
-def test_tuned_table_is_found_by_device_name_and_nearest_count(on_platform, monkeypatch, tmp_path):
-    table = {
-        "triton_version": "3.7.1",
-        "1": {"BLOCK_SIZE_M": 16, "num_warps": 1},
-        "16": {"BLOCK_SIZE_M": 16, "num_warps": 2},
-        "64": {"BLOCK_SIZE_M": 32, "num_warps": 4},
-    }
-    (tmp_path / config_file_name(THINKER, "Some_GPU")).write_text(json.dumps(table))
-    monkeypatch.setattr(config_module, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(
-        backend_module, "load_tuned_configs",
-        lambda problem, name: load_tuned_configs(problem, name, config_dir=tmp_path),
-    )
+@pytest.fixture
+def thinker_table(monkeypatch, tmp_path):
+    """A tuned table for THINKER's experts on a GPU called Some_GPU."""
+    tile = {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1}
+    monkeypatch.setattr(kernels, "CONFIG_DIR", tmp_path)
+    kernels.config_path(128, 1536, 2048, "Some_GPU").write_text(json.dumps({
+        "1": {**tile, "num_warps": 1, "down": {"BLOCK_SIZE_K": 128}},
+        "64": {**tile, "BLOCK_SIZE_M": 32, "num_warps": 4},
+    }))
+
+
+@pytest.mark.parametrize("platform", [CudaPlatform(), RocmPlatform()], ids=repr)
+def test_tuned_table_gives_get_configs_pick(on_platform, thinker_table, platform):
+    on_platform(platform, device_name="Some_GPU")
+    backend = make_moe_backend("triton", THINKER)
+    for m in (1, 8, 40, 1000):
+        assert backend.config(m) == kernels.get_config(M=m, E=128, N=1536, K=2048, top_k=8)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_tuned_pick_compiles_in_one_graph(on_platform, thinker_table, dynamic):
+    """The backend runs inside compiled forwards, so its per-call pick must
+    trace (get_config's file lookup doesn't)."""
+    import torch._dynamo
+
     on_platform(CudaPlatform(), device_name="Some_GPU")
     backend = make_moe_backend("triton", THINKER)
-    assert backend.config(1)["num_warps"] == 1
-    assert backend.config(8)["num_warps"] == 1  # |8 - 1| < |8 - 16|
-    assert backend.config(9)["num_warps"] == 2
-    assert backend.config(40)["num_warps"] == 2  # tie between 16 and 64 goes to the smaller
-    assert backend.config(1000)["num_warps"] == 4
 
-    on_platform(CudaPlatform(), device_name="Other_GPU")
-    assert make_moe_backend("triton", THINKER).config(1) is None
+    def pick(x):
+        up, down = backend.config(x.shape[0])
+        return x * up["BLOCK_SIZE_M"] + down["BLOCK_SIZE_K"]
 
-
-def test_nearest_config_ties_go_to_the_smaller_count():
-    table = {1: {"a": 1}, 3: {"a": 3}}
-    assert nearest_config(table, 2) == {"a": 1}
-    assert nearest_config(table, 0) == {"a": 1}
-    assert nearest_config(table, 10) == {"a": 3}
-
-
-def test_no_gpu_means_no_table():
-    assert load_tuned_configs(THINKER, None) is None
-
-
-def test_file_name_names_the_whole_problem():
-    assert config_file_name(THINKER, "AMD_Instinct_MI300X") == (
-        "E=128,N=768,K=2048,topk=8,device_name=AMD_Instinct_MI300X.json"
-    )
-
-
-def _shipped():
-    # get_config's tables (mstar.utils.fused_moe.tune) share the directory, named without topk
-    return sorted(p for p in CONFIG_DIR.glob("*.json") if ",topk=" in p.name)
-
-
-@pytest.mark.parametrize("path", _shipped(), ids=lambda p: p.name)
-def test_shipped_tables_are_well_formed(path):
-    raw = json.loads(path.read_text())
-    entries = {k: v for k, v in raw.items() if k.isdigit()}
-    assert entries and set(raw) - set(entries) <= {"triton_version"}
-    for m, cfg in entries.items():
-        assert set(cfg) <= LAUNCH_KEYS, (m, cfg)
-        assert {"BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M"} <= set(cfg)
-        assert cfg.get("num_warps", 4) <= 16  # 64-wide waves, so 1024 threads max
-        # compiles but computes garbage on gfx942 with Triton 3.7
-        assert not (cfg.get("kpack") == 2 and cfg["BLOCK_SIZE_K"] < 32), (m, cfg)
-    name = path.name
-    problem = MoEProblem(*(int(part.split("=")[1]) for part in name.split(",")[:4]))
-    device = name.split("device_name=")[1].removesuffix(".json")
-    assert config_file_name(problem, device) == name
-    assert load_tuned_configs(problem, device) == {int(m): c for m, c in entries.items()}
+    x = torch.ones(40, 2)
+    if dynamic:
+        torch._dynamo.mark_dynamic(x, 0)
+    torch._dynamo.reset()
+    assert torch.equal(torch.compile(pick, fullgraph=True, backend="eager")(x), pick(x))
 
 
 def test_aiter_refuses_non_amd_platforms(on_platform):

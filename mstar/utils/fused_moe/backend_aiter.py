@@ -17,8 +17,7 @@ import importlib.util
 import torch
 from torch import nn
 
-from mstar.utils.fused_moe.backend import FusedMoEBackend
-from mstar.utils.fused_moe.config import MoEProblem
+from mstar.utils.fused_moe.backend import FusedMoEBackend, MoEProblem
 
 # CK's two-stage MoE GEMMs tile the intermediate dimension by 128.
 _INTER_ALIGN = 128

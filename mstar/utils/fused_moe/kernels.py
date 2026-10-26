@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict
 
@@ -35,6 +36,8 @@ import triton
 import triton.language as tl
 
 from mstar.utils.quant_fp8 import FP8_DTYPE
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Main grouped-GEMM kernel (used for both gate_up and down projections)
@@ -617,42 +620,74 @@ def moe_sum_reduce_triton(
 
 
 # ---------------------------------------------------------------------------
-# Block-size / warp-count configuration (shape-only; the fp8 runner overrides
-# BLOCK_SIZE_K and the decode tiles on top of it)
+# Launch configs. configs/E=..,N=..,K=..,device_name=<GPU>.json is a table
+# tuned for one expert shape (N is w1's rows, 2 x intermediate) on one GPU
+# model, written by mstar.utils.fused_moe.tune. It maps a token count to the
+# gate/up GEMM's launch params (tiles, num_warps, num_stages, and on AMD
+# waves_per_eu, matrix_instr_nonkdim and kpack), with an optional "down"
+# block overriding some of them for the down GEMM. Shapes without a table get
+# get_default_config (shape-only; the fp8 runner overrides BLOCK_SIZE_K and
+# the decode tiles on top of it).
 # ---------------------------------------------------------------------------
 
+CONFIG_DIR = Path(__file__).parent / "configs"
 
-def config_path(E: int, N: int, K: int, device_name: str | None = None) -> Path:
-    """Where ``mstar.utils.fused_moe.tune`` writes configs for this shape and GPU."""
-    if device_name is None:
-        device_name = torch.cuda.get_device_name()
-    device_name = device_name.replace(" ", "_")
-    return Path(__file__).parent / "configs" / f"E={E},N={N},K={K},device_name={device_name}.json"
+
+def device_config_name() -> str | None:
+    """This GPU's name as table files spell it, or None without a GPU."""
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_name().replace(" ", "_")
+
+
+def config_path(E: int, N: int, K: int, device_name: str) -> Path:
+    """Where the table for this shape on one GPU model goes, with
+    ``device_name`` spelled as :func:`device_config_name` spells it."""
+    return CONFIG_DIR / f"E={E},N={N},K={K},device_name={device_name}.json"
 
 
 @functools.lru_cache(maxsize=None)
-def _tuned_configs(E: int, N: int, K: int) -> dict[int, dict] | None:
-    path = config_path(E, N, K)
+def tuned_configs(E: int, N: int, K: int) -> dict[int, dict] | None:
+    """This GPU's tuned table for the shape, keyed by token count, or None."""
+    device_name = device_config_name()
+    if device_name is None:
+        return None
+    path = config_path(E, N, K, device_name)
     if not path.is_file():
         return None
+    logger.info("fused MoE: tuned Triton configs from %s", path.name)
     return {int(m): cfg for m, cfg in json.loads(path.read_text()).items()}
+
+
+def nearest_config(tuned: dict[int, dict], M: int) -> tuple[Dict[str, int], Dict[str, int]]:
+    """Gate/up and down configs from the entry for the token count nearest
+    ``M`` (ties go to the smaller). The two GEMMs share ``BLOCK_SIZE_M``
+    because they share one alignment.
+
+    A plain loop rather than ``min(key=...)``, so dynamo can trace it.
+    """
+    best = None
+    for m in sorted(tuned):
+        if best is None or abs(m - M) < abs(best - M):
+            best = m
+    up = dict(tuned[best])
+    down_overrides = up.pop("down", {})
+    down = {**up, **down_overrides, "BLOCK_SIZE_M": up["BLOCK_SIZE_M"]}
+    return up, down
 
 
 def get_config(M: int, E: int, N: int, K: int, top_k: int) -> tuple[Dict[str, int], Dict[str, int]]:
     """Tile configs for the gate/up GEMM and the down GEMM.
 
     Uses the tuned table for this shape and GPU when present, taking the entry
-    for the nearest tuned batch size, else :func:`get_default_config` for both.
-    The two GEMMs share ``BLOCK_SIZE_M`` because they share one alignment.
+    for the nearest tuned batch size (:func:`nearest_config`), else
+    :func:`get_default_config` for both.
     """
-    tuned = _tuned_configs(E, N, K)
+    tuned = tuned_configs(E, N, K)
     if tuned is None:
         config = get_default_config(M, E, N, K, top_k)
         return config, config
-    up = dict(tuned[min(tuned, key=lambda m: abs(m - M))])
-    down_overrides = up.pop("down", {})
-    down = {**up, **down_overrides, "BLOCK_SIZE_M": up["BLOCK_SIZE_M"]}
-    return up, down
+    return nearest_config(tuned, M)
 
 
 def get_default_config(M: int, E: int, N: int, K: int, top_k: int) -> Dict[str, int]:
