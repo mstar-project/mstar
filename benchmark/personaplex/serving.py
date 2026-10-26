@@ -200,17 +200,35 @@ class Server:
             raise
 
     def close(self):
+        """Stop the server's whole process group, even when the launcher already exited.
+
+        The conductor and workers are spawned children in the launcher's session
+        (``start_new_session=True``), so they can outlive it and keep holding the
+        GPU and the port; signalling only a live launcher would leave them behind.
+        """
         if hasattr(self, "stop_monitor"):
             self.stop_monitor.set()
-        if self.process and self.process.poll() is None:
-            os.killpg(self.process.pid, signal.SIGTERM)
-            try:
-                self.process.wait(timeout=25)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait(timeout=10)
+        if self.process:
+            group = self.process.pid
+            for sig, grace in ((signal.SIGTERM, 25), (signal.SIGKILL, 10)):
+                if not self._group_alive(group):
+                    break
+                os.killpg(group, sig)
+                deadline = time.monotonic() + grace
+                while time.monotonic() < deadline and self._group_alive(group):
+                    time.sleep(0.2)
+            if self._group_alive(group):
+                raise RuntimeError(f"server process group {group} survived SIGKILL")
         if hasattr(self, "log"):
             self.log.close()
+
+    def _group_alive(self, group):
+        self.process.poll()  # reap the launcher, so a zombie does not keep the group alive
+        try:
+            os.killpg(group, 0)
+        except ProcessLookupError:
+            return False
+        return True
 
     def __exit__(self, *args):
         self.close()

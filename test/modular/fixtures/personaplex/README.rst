@@ -43,8 +43,9 @@ The replay covers both raw events and production ``prepare_embedding()`` replay.
 The latter observes every internal prepare call, comparing its supplied dummies,
 state and forward input/target/mask directly with NVIDIA's recorded events.
 
-The served path runs batch size 1. B=2 traces use synthetic B=2 presets; loading a real B=1 preset
-into a B=2 cache via broadcasting is deferred. The cache currently requires
+Each request keeps its own B=1 token cache, even when the server batches several
+requests into one LM step. B=2 traces use synthetic B=2 presets; loading a real
+B=1 preset into a B=2 cache via broadcasting is not supported. The cache currently requires
 the preset batch to match the live batch, unlike NVIDIA's broadcasting ``copy_``.
 
 Fixtures are not committed: generate traces outside the checkout and pass the

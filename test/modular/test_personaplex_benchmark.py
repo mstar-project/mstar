@@ -406,6 +406,55 @@ def test_word_error_rate_ignores_case_and_punctuation():
     assert word_error_rate("", "anything") is None
 
 
+def test_judge_passes_only_when_every_stage_was_transcribed():
+    from benchmark.personaplex.judge import summarize
+
+    judged = {"transcripts": {"mstar": "hi", "nvidia": "hi"}, "agent_wer_mstar_vs_nvidia": 0.0}
+    assert summarize({"a": judged}, "asr")["status"] == "PASS"
+    blocked = summarize({"a": judged, "b": {"missing": True}}, "asr")
+    assert blocked["status"] == "BLOCKED" and "b" in blocked["reason"]
+    assert summarize({}, "asr")["status"] == "BLOCKED"
+
+
+def test_server_close_stops_workers_whose_launcher_already_exited(tmp_path):
+    """The launcher can die first; its spawned workers must still be stopped."""
+    import os
+    import signal
+    import time
+
+    from benchmark.personaplex.serving import Server
+
+    child_pid = tmp_path / "child.pid"
+    launcher = subprocess.Popen(
+        [sys.executable, "-c",
+         "import subprocess, sys; "
+         "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+         f"open({str(child_pid)!r}, 'w').write(str(c.pid))"],
+        start_new_session=True,
+    )
+    launcher.wait(timeout=30)  # the launcher exits; its child keeps running in the same session
+    pid = int(child_pid.read_text())
+    os.kill(pid, 0)  # alive
+    server = Server.__new__(Server)
+    server.process = launcher
+    try:
+        server.close()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("worker outlived Server.close()")
+    finally:
+        try:
+            os.killpg(launcher.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def test_serving_config_override_copies_the_yaml_with_one_batch_size(tmp_path):
     import yaml
 

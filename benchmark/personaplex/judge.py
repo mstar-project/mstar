@@ -42,6 +42,17 @@ def read_wav(path):
         return pcm.astype(np.float32) / 32768, wav.getframerate()
 
 
+def summarize(rows, asr_model):
+    """PASS only when every requested stage was transcribed; a stage without recordings is BLOCKED."""
+    missing = sorted(name for name, row in rows.items() if row.get("missing"))
+    summary = {"status": "BLOCKED" if missing or not rows else "PASS", "asr_model": asr_model, "stages": rows,
+               "scope": "Transcript agreement between the two agents; not an audio quality measure. "
+                        "Whisper invents text for near-silence."}
+    if missing or not rows:
+        summary["reason"] = f"No recordings to judge for {', '.join(missing) or 'any stage'}"
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--asr-model", required=True, help="local Whisper checkpoint directory")
@@ -64,9 +75,7 @@ def main():
             texts[label] = result["text"].strip()
         rows[directory.name] = {"transcripts": texts, "agent_wer_mstar_vs_nvidia": word_error_rate(
             texts["nvidia"], texts["mstar"])}
-    summary = {"status": "PASS", "asr_model": args.asr_model, "stages": rows,
-               "scope": "Transcript agreement between the two agents; not an audio quality measure. "
-                        "Whisper invents text for near-silence."}
+    summary = summarize(rows, args.asr_model)
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
 

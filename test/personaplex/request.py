@@ -9,8 +9,9 @@ Usage:
 
 The response is the agent's side of a full-duplex conversation, time-aligned to
 the input: it has the input's length and lags it by one 80 ms frame. Input is
-decoded at 24 kHz and channel 0 is used. The server runs each request at batch
-size 1: concurrent requests share the GPU but are not batched together.
+decoded at 24 kHz and channel 0 is used. Concurrent requests can share the
+server's LM steps (up to its ``max_batch_size``), which changes rounding, so a
+greedy reply can differ slightly from the same request served alone.
 """
 
 import argparse

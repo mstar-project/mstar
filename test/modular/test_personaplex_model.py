@@ -250,6 +250,15 @@ def test_worker_graphs_from_yaml_keep_accumulated_edges():
     assert all(wg.ranks == [0] for wg in graphs)
 
 
+@pytest.fixture
+def triton_int64(monkeypatch):
+    """The Mac conftest's fake triton lacks ``int64``, which an upstream kernel module
+    annotates with when the worker graph path imports it. Provide only that annotation."""
+    language = sys.modules.get("triton.language")
+    if language is not None and not hasattr(language, "int64"):
+        monkeypatch.setattr(language, "int64", int, raising=False)
+
+
 def _personaplex_runtime(tensor_manager):
     model = _model()
     graphs = model.get_worker_graphs(CONFIG_PATH)
@@ -270,7 +279,7 @@ def _personaplex_runtime(tensor_manager):
     return runtime, rid
 
 
-def test_python_graph_runtime_admits_personaplex_generate_walk():
+def test_python_graph_runtime_admits_personaplex_generate_walk(triton_int64):
     """The new runtime must accept the split PersonaPlex worker graphs."""
     runtime, rid = _personaplex_runtime(_Comm())
     assert runtime.get_rid_string(rid) == "request"
@@ -280,7 +289,7 @@ def test_python_graph_runtime_admits_personaplex_generate_walk():
     runtime.remove_request(rid)
 
 
-def test_python_runtime_routes_accumulated_personaplex_frames(tmp_path):
+def test_python_runtime_routes_accumulated_personaplex_frames(tmp_path, triton_int64):
     """Do not defer text backed by the worker's reused stop-check host buffer.
 
     Real Python graph routing and SHM: emulate the GPU worker's borrowed
@@ -646,6 +655,9 @@ def test_kv_declarations_pass_the_worker_startup_checks():
     (dict(voice="missing"), r"available presets: \['NATF2'\]"),
     (dict(temp_text=-1.0), "temp_text"),
     (dict(temp_audio=True), "temp_audio"),
+    # float() overflows on these; an OverflowError would be a 500 at the data worker
+    (dict(temp_text=10**400), "temp_text"),
+    (dict(temp_audio=-(10**400)), "temp_audio"),
     (dict(topk_audio=0), "topk_audio"),
     (dict(greedy="yes"), "greedy"),
     (dict(samples=1920 * 2966), "context budget"),

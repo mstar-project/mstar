@@ -132,7 +132,8 @@ def main():
         {
             "status": status,
             "cells": cells,
-            "scope": "Buffered audio latency/RTF from benchmark.runner; concurrency is B=1 requests.",
+            "scope": "Buffered audio latency/RTF from benchmark.runner; concurrent requests may share LM steps "
+                     "(up to the server's max_batch_size).",
         },
     )
     return 0 if status == "PASS" else 1

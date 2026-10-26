@@ -285,8 +285,14 @@ class PersonaPlexModel(Model):
     def _validate_sampling(kwargs: dict) -> None:
         for name in ("temp_text", "temp_audio"):
             value = kwargs.get(name)
-            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
-                                      or not math.isfinite(value) or value < 0):
+            if value is None:
+                continue
+            try:
+                # float() of a huge JSON integer overflows; that is still the client's error
+                finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value))
+            except OverflowError:
+                finite = False
+            if not finite or value < 0:
                 raise ValueError(f"PersonaPlex {name} must be a finite number >= 0, got {value!r}")
         for name in ("topk_text", "topk_audio"):
             value = kwargs.get(name)

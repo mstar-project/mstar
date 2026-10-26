@@ -29,7 +29,8 @@ STOP_RESERVE_S = {"smoke": 120, "full": 900}
 # ones (the 16 GB checkpoint) are identified by size and modification time.
 HASH_LIMIT_BYTES = 256 << 20
 ASSET_FILES = ("model.safetensors", "tokenizer-e351c8d8-checkpoint125.safetensors", "tokenizer_spm_32k_3.model")
-# The batching check alternates these presets, so a batch mixes voice lengths.
+# The batching check alternates these presets, so rows of a batch carry different
+# voices. (Their conditioning lengths can be equal; offsets differ by the stagger.)
 VOICES = ("NATF2", "NATM1")
 INTERRUPTED = False
 
@@ -305,7 +306,8 @@ def report(root):
     lines += [
         "",
         "Deferred: injected worker errors, supported NVIDIA runtime, accepted near-limit",
-        "requests, broad quality claims, CUDA graphs, live ingress and streamed audio.",
+        "requests, broad quality claims, live ingress and streamed audio. The parity stages",
+        "drive the LM node directly (eager); served stages replay its captured generate step.",
         "A completed comparison does not approve numerical divergence or establish quality.",
     ]
     (root / "REPORT.rst").write_text("\n".join(lines) + "\n")
