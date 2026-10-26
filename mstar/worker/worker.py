@@ -3255,8 +3255,6 @@ class Worker:
             request_ids=batch_N.node_batch.request_ids,
         )
         _pp_stage("prematerialize")
-        engine.after_output_copy(batch_N.node_batch)
-        _pp_stage("after_output_copy")
         stops = engine.check_stop_for_batch(
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
         )
@@ -3413,6 +3411,8 @@ class Worker:
         _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
+        engine.after_output_copy(batch_N.node_batch)
+        _pp_stage("after_output_copy")
 
     def _store_and_route(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,
