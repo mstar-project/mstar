@@ -5,7 +5,9 @@ Two runtimes are driven through the same decode steps, one per path, and
 everything observable is compared: the frames each sends (read off real
 inboxes), the next pop, and the loop counters. The loop is short, so the last
 step completes the worker graph and exercises the fallback (``ROUTED``) where a
-frame needs Python's per-request payloads.
+frame needs Python's per-request payloads. With the walk's stop policies
+checked in the same call, a step no row stops on is unchanged, and one a row
+stops on routes nothing.
 """
 import sys
 from types import SimpleNamespace
@@ -28,10 +30,13 @@ from mstar.graph.runtime import rust as rust_runtime
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, InlineRouteStatus, RouteInput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
+from mstar.model.submodule_base import StopKind, StopPolicy
 from mstar.utils.containers import ParallelList
 
 WALK, NODE, LOOP, SIG, PART, ME = "decode", "LLM", "decode_loop", "text_inputs", "default", "w0"
 MAX_ITERS = 4
+EOS = 7
+POLICY = StopPolicy(StopKind.AR, token_signal=SIG, eos_tokens=(EOS,))
 
 
 def _runtime(sock_dir):
@@ -97,11 +102,16 @@ def _general_step(rt, rids, values):
     ))
 
 
-def _fused_step(rt, rids, column, row_rids):
-    status, _cid, sent, route = rt.route_and_send_inline(
-        PART, WALK, NODE, [SIG], rids, SIG, column, row_rids,
+def _infos(rids):
+    # limits a decode step never reaches: only EOS stops a row here
+    return {rid: SimpleNamespace(max_tokens=1 << 20, resource_configs={}) for rid in rids}
+
+
+def _fused_step(rt, rids, column, row_rids, stop_infos=None):
+    status, _cid, sent, route, stops = rt.route_and_send_inline(
+        PART, WALK, NODE, [SIG], rids, SIG, column, row_rids, stop_infos=stop_infos,
     )
-    assert status in (InlineRouteStatus.SENT, InlineRouteStatus.ROUTED)
+    assert status in (InlineRouteStatus.SENT, InlineRouteStatus.ROUTED) and stops is None
     if status is InlineRouteStatus.SENT:
         assert route is None
         return sent
@@ -114,9 +124,10 @@ def _fused_step(rt, rids, column, row_rids):
     ))
 
 
+@pytest.mark.parametrize("check_stops", [False, True], ids=["route", "stops_and_route"])
 @pytest.mark.parametrize("dtype", [torch.int64, torch.int32])
 @pytest.mark.parametrize("reverse_rows", [False, True], ids=["in_order", "permuted"])
-def test_fused_matches_route_then_send(tmp_path, dtype, reverse_rows):
+def test_fused_matches_route_then_send(tmp_path, dtype, reverse_rows, check_stops):
     n = 5
     dirs = {k: tmp_path / k for k in ("g", "f")}
     boxes = {}
@@ -128,6 +139,10 @@ def test_fused_matches_route_then_send(tmp_path, dtype, reverse_rows):
     rids = {k: _start(rt, n) for k, rt in rts.items()}
     assert rids["g"] == rids["f"]
     rids = rids["g"]
+    stop_infos = None
+    if check_stops:
+        rts["f"].set_stop_policies(NODE, WALK, {LOOP: POLICY})
+        stop_infos = _infos(rids)
     statuses = []
     for step in range(MAX_ITERS):
         for rt in rts.values():
@@ -138,7 +153,7 @@ def test_fused_matches_route_then_send(tmp_path, dtype, reverse_rows):
         rows = torch.tensor([values[rids.index(r)] for r in row_rids], dtype=dtype)
         column = rows.reshape(-1, 1).reshape(rows.shape[0], -1)[:, 0]
         sent_g = _general_step(rts["g"], rids, values)
-        sent_f = _fused_step(rts["f"], rids, column, row_rids)
+        sent_f = _fused_step(rts["f"], rids, column, row_rids, stop_infos)
         assert sent_g == sent_f
         statuses.append(bool(sent_f))
         assert (
@@ -159,10 +174,26 @@ def test_a_rid_without_a_row_does_nothing(tmp_path):
     rids = _start(rt, 3)
     assert rt.pop_rids(NODE, WALK, rids) is not None
     column = torch.tensor([7, 8], dtype=torch.int64)
-    status, _cid, sent, route = rt.route_and_send_inline(
+    status, _cid, sent, route, _ = rt.route_and_send_inline(
         PART, WALK, NODE, [SIG], rids, SIG, column, rids[:2],
     )
     assert (status, sent, route) == (InlineRouteStatus.NOT_ROUTED, [], None)
     # nothing was routed: the general path still completes this step
     assert rt._rust.num_parked_completions() == 0
     assert _general_step(rt, rids, [1, 2, 3]) == []
+
+
+
+def test_a_row_that_stops_routes_nothing_and_comes_back(tmp_path):
+    rt = _runtime(str(tmp_path))
+    rt.set_stop_policies(NODE, WALK, {LOOP: POLICY})
+    rids = _start(rt, 3)
+    assert rt.pop_rids(NODE, WALK, rids) is not None
+    column = torch.tensor([1, EOS, 2], dtype=torch.int64)
+    out = rt.route_and_send_inline(
+        PART, WALK, NODE, [SIG], rids, SIG, column, rids, stop_infos=_infos(rids),
+    )
+    assert out.status is InlineRouteStatus.STOPS and out.stops == {rids[1]: {LOOP}}
+    # nothing was routed: the general path still completes this step
+    assert rt._rust.num_parked_completions() == 0
+    assert _general_step(rt, rids, [1, EOS, 2]) == []

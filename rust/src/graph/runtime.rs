@@ -1338,6 +1338,47 @@ pub struct FusedRouteOut {
     /// Wall time spent with the GIL released, for measuring the overlap.
     #[pyo3(get)] pub nogil_ns: u64,
     pub route: Option<RouteOut>,
+    /// Status 3: the stops found, as `check_stops_inline` returns them.
+    #[pyo3(get)] pub stop_rids: Vec<u32>,
+    #[pyo3(get)] pub stop_rules: Vec<u32>,
+    #[pyo3(get)] pub missing: Vec<u32>,
+}
+
+/// A step's token column, read in place: `rows` integers of `itemsize`
+/// bytes, `stride` elements apart, row i belonging to the caller's
+/// `row_rids[i]`. The caller holds the tensor for the duration of the call.
+struct TokenColumn {
+    ptr: usize,
+    rows: usize,
+    stride: usize,
+    itemsize: usize,
+}
+
+impl TokenColumn {
+    /// None for a null pointer or a dtype other than int32 / int64.
+    fn new(ptr: usize, rows: usize, stride: usize, dtype: &str) -> Option<Self> {
+        let itemsize = match dtype {
+            "int64" => 8,
+            "int32" => 4,
+            _ => return None,
+        };
+        (ptr != 0).then_some(TokenColumn { ptr, rows, stride, itemsize })
+    }
+
+    /// Row `row`'s value; the callers check `row < self.rows`.
+    fn read(&self, row: usize) -> i64 {
+        debug_assert!(row < self.rows);
+        // SAFETY: row < rows, which the callers check against the column the
+        // caller holds for the call.
+        unsafe {
+            let at = (self.ptr as *const u8).add(row * self.stride * self.itemsize);
+            if self.itemsize == 8 {
+                std::ptr::read_unaligned(at as *const i64)
+            } else {
+                i64::from(std::ptr::read_unaligned(at as *const i32))
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -3355,72 +3396,10 @@ impl GraphRuntime {
         token_dtype: &str,
         row_rids: Vec<u32>,
     ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
-        let (Some(node), Some(walk)) = (self.interner.get(node_name), self.interner.get(graph_walk))
-        else {
-            return Err(PyKeyError::new_err("check_stops_inline: no rules for this (node, walk)"));
-        };
-        let Some(rules) = self.stop_rules.get(&(node, walk)) else {
-            return Err(PyKeyError::new_err("check_stops_inline: no rules for this (node, walk)"));
-        };
-        let (mut stop_rids, mut stop_rules, mut missing) = (Vec::new(), Vec::new(), Vec::new());
-        if rules.is_empty() {
-            return Ok((stop_rids, stop_rules, missing));
-        }
-        let reads_token = rules.iter().any(|r| r.ar);
-        let itemsize = match token_dtype {
-            "int64" => 8,
-            "int32" => 4,
-            _ if !reads_token => 0,
-            _ => return Err(PyValueError::new_err("check_stops_inline: token dtype must be int32 or int64")),
-        };
-        if reads_token && (token_ptr == 0 || row_rids.len() > token_rows) {
-            return Err(PyValueError::new_err("check_stops_inline: no token column"));
-        }
-        let read = |row: usize| -> i64 {
-            // SAFETY: row < row_rids.len() <= token_rows, checked above; the
-            // caller holds the buffer for the duration of the call.
-            unsafe {
-                let at = (token_ptr as *const u8).add(row * token_stride * itemsize);
-                if itemsize == 8 {
-                    std::ptr::read_unaligned(at as *const i64)
-                } else {
-                    i64::from(std::ptr::read_unaligned(at as *const i32))
-                }
-            }
-        };
-        let in_order = row_rids.len() >= rids.len() && row_rids[..rids.len()] == rids[..];
-        let row_of: FxHashMap<u32, usize> = if in_order || !reads_token {
-            FxHashMap::default()
-        } else {
-            row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect()
-        };
-        let p = self.interner.get(partition);
-        for (i, &rid) in rids.iter().enumerate() {
-            let token = if !reads_token {
-                0
-            } else if in_order {
-                read(i)
-            } else {
-                match row_of.get(&rid) {
-                    Some(&row) => read(row),
-                    None => continue,
-                }
-            };
-            let Some(info) = self.info(rid) else { continue };
-            let Some((_, limits)) = info.stop_limits.iter().find(|(w, _)| *w == walk) else {
-                missing.push(rid);
-                continue;
-            };
-            for (k, (rule, &(max_iters, ignore_eos))) in rules.iter().zip(limits).enumerate() {
-                let count = p.map_or(0, |p| self.loop_count(rid, p, rule.lp));
-                if count + 1 >= max_iters || (rule.ar && !ignore_eos && rule.eos.contains(&token)) {
-                    stop_rids.push(rid);
-                    stop_rules.push(k as u32);
-                }
-            }
-        }
-        Ok((stop_rids, stop_rules, missing))
+        let tokens = TokenColumn::new(token_ptr, token_rows, token_stride, token_dtype);
+        self.stops_over(partition, node_name, graph_walk, &rids, tokens.as_ref(), &row_rids)
     }
+
 
     /// `complete_and_route_batch` then `send_outputs`, in one crossing and
     /// with the GIL released throughout, for a step whose every output stays
@@ -3443,11 +3422,15 @@ impl GraphRuntime {
     ///   2 -- routed, but the send needs Python-side payloads (a frame
     ///        carries ``per_request_info``, a tensor to register, new-token
     ///        counts, local streaming, freed inputs): ``route`` holds the
-    ///        RouteOut and the caller finishes with ``send_outputs``.
+    ///        RouteOut and the caller finishes with ``send_outputs``;
+    ///   3 -- with ``check_stops``: the walk's declared stop rules, run first
+    ///        over the same column, stop a row or lack a row's limits.
+    ///        Nothing is routed; ``stop_rids`` / ``stop_rules`` / ``missing``
+    ///        are ``check_stops_inline``'s answer.
     #[pyo3(signature = (
         partition, graph_walk, node_name, output_signals, rids,
         inline_signal, inline_ptr, inline_rows, inline_stride, inline_dtype,
-        row_rids,
+        row_rids, check_stops=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn route_and_send_inline(
@@ -3464,30 +3447,30 @@ impl GraphRuntime {
         inline_stride: usize,
         inline_dtype: &str,
         row_rids: Vec<u32>,
+        check_stops: bool,
     ) -> PyResult<FusedRouteOut> {
-        let itemsize = match inline_dtype {
-            "int64" | "int32" => if inline_dtype == "int64" { 8 } else { 4 },
-            _ => return Ok(FusedRouteOut::default()),
+        let Some(column) = TokenColumn::new(inline_ptr, inline_rows, inline_stride, inline_dtype)
+        else {
+            return Ok(FusedRouteOut::default());
         };
-        if inline_ptr == 0 || row_rids.len() > inline_rows {
+        if row_rids.len() > inline_rows {
             return Ok(FusedRouteOut::default());
         }
         let t_nogil = std::time::Instant::now();
         let outcome = py.detach(|| -> PyResult<FusedRouteOut> {
+            if check_stops {
+                let (stop_rids, stop_rules, missing) = self.stops_over(
+                    &partition, &node_name, &graph_walk, &rids, Some(&column), &row_rids,
+                )?;
+                if !stop_rids.is_empty() || !missing.is_empty() {
+                    return Ok(FusedRouteOut {
+                        status: 3, stop_rids, stop_rules, missing, ..Default::default()
+                    });
+                }
+            }
             // The inline values in `rids` order: a slice when the rows are in
             // the batch's order (the usual case), else looked up per rid.
-            let read = |row: usize| -> i64 {
-                // SAFETY: row < inline_rows, checked by the callers below;
-                // the caller holds the buffer for the duration of the call.
-                unsafe {
-                    let at = (inline_ptr as *const u8).add(row * inline_stride * itemsize);
-                    if itemsize == 8 {
-                        std::ptr::read_unaligned(at as *const i64)
-                    } else {
-                        i64::from(std::ptr::read_unaligned(at as *const i32))
-                    }
-                }
-            };
+            let read = |row: usize| column.read(row);
             let n = rids.len();
             let in_order = row_rids.len() >= n && row_rids[..n] == rids[..];
             let values: Vec<i64> = if in_order {
@@ -3526,8 +3509,7 @@ impl GraphRuntime {
                 || !route.freed_input_uuids.is_empty();
             if needs_python {
                 return Ok(FusedRouteOut {
-                    status: 2, completion_id, sent_rids: Vec::new(), nogil_ns: 0,
-                    route: Some(route),
+                    status: 2, completion_id, route: Some(route), ..Default::default()
                 });
             }
             // Nothing in the frames comes from Python: no rid carries
@@ -3539,9 +3521,7 @@ impl GraphRuntime {
                 vec![], vec![], vec![], vec![], vec![], vec![], vec![],
             )?;
             self.dispatch_frames_nogil(frames)?;
-            Ok(FusedRouteOut {
-                status: 1, completion_id, sent_rids, nogil_ns: 0, route: None,
-            })
+            Ok(FusedRouteOut { status: 1, completion_id, sent_rids, ..Default::default() })
         });
         let nogil_ns = t_nogil.elapsed().as_nanos() as u64;
         let mut outcome = outcome?;
@@ -4276,6 +4256,67 @@ impl GraphRuntime {
             Ok(sent_rids)
         })()?;
         Ok((sent, frames))
+    }
+}
+
+impl GraphRuntime {
+    /// `check_stops_inline`'s check, for it and `route_and_send_inline`.
+    #[allow(clippy::type_complexity)]
+    fn stops_over(
+        &self, partition: &str, node_name: &str, graph_walk: &str, rids: &[u32],
+        tokens: Option<&TokenColumn>, row_rids: &[u32],
+    ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+        let (Some(node), Some(walk)) = (self.interner.get(node_name), self.interner.get(graph_walk))
+        else {
+            return Err(PyKeyError::new_err("check_stops_inline: no rules for this (node, walk)"));
+        };
+        let Some(rules) = self.stop_rules.get(&(node, walk)) else {
+            return Err(PyKeyError::new_err("check_stops_inline: no rules for this (node, walk)"));
+        };
+        let (mut stop_rids, mut stop_rules, mut missing) = (Vec::new(), Vec::new(), Vec::new());
+        if rules.is_empty() {
+            return Ok((stop_rids, stop_rules, missing));
+        }
+        let tokens = if rules.iter().any(|r| r.ar) {
+            match tokens {
+                Some(t) if row_rids.len() <= t.rows => Some(t),
+                _ => return Err(PyValueError::new_err(
+                    "check_stops_inline: no int32 / int64 token column covering the rows",
+                )),
+            }
+        } else {
+            None
+        };
+        let in_order = row_rids.len() >= rids.len() && row_rids[..rids.len()] == rids[..];
+        let row_of: FxHashMap<u32, usize> = if in_order || tokens.is_none() {
+            FxHashMap::default()
+        } else {
+            row_rids.iter().enumerate().map(|(i, &r)| (r, i)).collect()
+        };
+        let p = self.interner.get(partition);
+        for (i, &rid) in rids.iter().enumerate() {
+            let token = match tokens {
+                None => 0,
+                Some(t) if in_order => t.read(i),
+                Some(t) => match row_of.get(&rid) {
+                    Some(&row) => t.read(row),
+                    None => continue,
+                },
+            };
+            let Some(info) = self.info(rid) else { continue };
+            let Some((_, limits)) = info.stop_limits.iter().find(|(w, _)| *w == walk) else {
+                missing.push(rid);
+                continue;
+            };
+            for (k, (rule, &(max_iters, ignore_eos))) in rules.iter().zip(limits).enumerate() {
+                let count = p.map_or(0, |p| self.loop_count(rid, p, rule.lp));
+                if count + 1 >= max_iters || (rule.ar && !ignore_eos && rule.eos.contains(&token)) {
+                    stop_rids.push(rid);
+                    stop_rules.push(k as u32);
+                }
+            }
+        }
+        Ok((stop_rids, stop_rules, missing))
     }
 }
 
