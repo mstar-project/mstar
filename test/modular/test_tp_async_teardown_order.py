@@ -57,7 +57,7 @@ def _batch(seq: int, rids: list[int]):
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
-        launch_started_event=None,
+        launch_started_event=None, read_check_rids=None,
     )
     return scheduled, executing
 
