@@ -1,10 +1,9 @@
 """A second ingest of a request leaves its resource state alone.
 
-The conductor sends one NewRequest per partition, all with the same request id,
-and the worker ingests engine resources on each, so a worker serving two
-partitions of a request ingests it twice. The second can arrive after a node of
-the first partition has already committed a step: a reset there would put the
-next decode back at position 0 with an empty penalty mask, and nothing raises.
+The worker ingests a request once, on its first NewRequest, but resources stay
+idempotent so a repeat can't reset live state: a reset after a node committed a
+step would put the next decode back at position 0 with an empty penalty mask,
+and nothing raises.
 """
 
 from __future__ import annotations
@@ -89,7 +88,7 @@ def test_a_second_ingest_keeps_the_position_counter():
     runner.ingest_request(RID)
     assert _step(runner, 4) == [0, 1, 2, 3]
 
-    runner.ingest_request(RID)  # the request's second partition on this worker
+    runner.ingest_request(RID)
 
     assert _step(runner, 2) == [4, 5], "the second ingest reset the position counter"
 

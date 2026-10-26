@@ -175,7 +175,6 @@ class RopeManager(PositionManager):
 
     def ingest_request(self, rid: str, overrides=None):
         del overrides
-        # setdefault: a worker serving two partitions ingests the rid twice
         self._counters.setdefault(rid, {})
 
     def remove_request(self, rid: str):

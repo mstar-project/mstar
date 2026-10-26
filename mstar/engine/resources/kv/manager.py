@@ -1457,11 +1457,8 @@ class KVManager(AttentionResource):
         # guards `_streams`/`_overrides` against a concurrent admit/plan/commit
         # or reset/remove on another thread (see `_lock`)
         with self._lock:
-            # Idempotent: the conductor sends one NewRequest per partition, all
-            # carrying the same rid, so a worker serving two partitions ingests
-            # twice. Replacing the streams here reset `stored_len` under a node
-            # that had already filled them, and the request's publish info then
-            # named more tokens than the stream held.
+            # Idempotent (see Resource.ingest_request): replacing the streams
+            # would reset `stored_len` under a node that had already filled them.
             self._streams.setdefault(rid, {"main": CacheStream()})
             self._overrides.setdefault(rid, overrides)
             for label, stream in self._streams[rid].items():
