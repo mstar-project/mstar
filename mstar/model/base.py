@@ -441,9 +441,10 @@ class Model(ABC):
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
 
     # Intra-op threads for the API server's preprocessing of this model's
-    # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
-    # default of one per core; ``preprocess_torch_threads`` in the model's
-    # config.yaml overrides either. See ``entrypoint._set_preprocess_threads``.
+    # inputs (``load_image``, ``process_prompt``, ...). None takes a default
+    # sized from the CPUs the process may use; ``preprocess_torch_threads`` in
+    # the model's config.yaml overrides either. See
+    # ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
 
     def _get_worker_graphs_for_graph_walk(

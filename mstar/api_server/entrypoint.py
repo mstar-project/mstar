@@ -2392,16 +2392,35 @@ def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     )
 
 
+def default_preprocess_threads(cpus: int | None = None) -> int:
+    """Intra-op threads for the API server when neither the config nor the model sets them.
+
+    Torch's default is one per host core, which inside a container can be several
+    times the CPUs the cgroup quota lets run; a fork-join op then waits for its
+    parked threads. A quarter of the usable CPUs, at most 4: the process shares
+    them with the engine workers, and its per-request ops are a few MB.
+    """
+    if cpus is None:
+        from mstar.utils.cpus import usable_cpus
+
+        cpus = usable_cpus()
+    return max(1, min(4, cpus // 4))
+
+
 def _set_preprocess_threads(model, config: dict) -> None:
     """Size torch's intra-op pool for this process's media preprocessing.
 
-    ``config.yaml``'s ``preprocess_torch_threads`` wins, else the model's
-    ``PREPROCESS_TORCH_THREADS``; None keeps torch's default. Affects only this
-    process: the conductor and workers are spawned fresh.
+    ``config.yaml``'s ``preprocess_torch_threads`` wins (``null`` keeps torch's
+    default), else the model's ``PREPROCESS_TORCH_THREADS``, else
+    :func:`default_preprocess_threads`. Affects only this process: the conductor
+    and workers are spawned fresh.
     """
-    threads = config.get("preprocess_torch_threads", model.PREPROCESS_TORCH_THREADS)
-    if threads is None:
-        return
+    if "preprocess_torch_threads" in config:
+        threads = config["preprocess_torch_threads"]
+        if threads is None:
+            return
+    else:
+        threads = model.PREPROCESS_TORCH_THREADS or default_preprocess_threads()
     import torch
 
     torch.set_num_threads(int(threads))
