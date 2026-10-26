@@ -1511,9 +1511,7 @@ class TensorCommunicationManager(ABC):
         self, request_id: Rid, sharding_config: ShardingConfig
     ):
         self.sharding_configs[request_id] = sharding_config
-        # once per partition on a worker serving several: keep shards that
-        # already arrived for the first
-        self.buffered_shards.setdefault(request_id, {})
+        self.buffered_shards[request_id] = {}
 
     # ---- shared: profiling (tx/rx) ----
 

@@ -1462,15 +1462,12 @@ class KVManager(AttentionResource):
             # twice. Replacing the streams here reset `stored_len` under a node
             # that had already filled them, and the request's publish info then
             # named more tokens than the stream held.
-            first = rid not in self._overrides
             self._streams.setdefault(rid, {"main": CacheStream()})
             self._overrides.setdefault(rid, overrides)
             for label, stream in self._streams[rid].items():
                 if stream.span_cursor is None:
                     self._lay_out(rid, label, stream)
-                # a chain that is None by now was dropped on purpose, and seeding
-                # it again would index pages under keys that don't describe them
-                if first and stream.chain is None:
+                if stream.chain is None:
                     self._seed_keys(rid, label, stream)
 
     def _lay_out(self, rid: str, label: str, stream: CacheStream) -> None:
