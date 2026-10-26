@@ -165,15 +165,14 @@ the record too. Input resets the request timeout. A rejected append (an unknown 
 say) ends the call with its error (``status`` 400), and no finish follows, since the input
 it carried is lost. So does an append the server then fails to load or process (a corrupt
 file, say), with that failure's status, as for a request's own files, and so does input
-past a limit the model or the deployment sets on a stream (how much a call may send, or
-how far it may run ahead of the model, unless the stream keeps only its newest input instead;
-``client_streams`` in :doc:`serving`), with a 400 that names the limit. An append after
+past a limit the model or the deployment sets on how much a stream may carry over a call
+(``client_streams`` in :doc:`serving`), with a 400 that names the limit. An append after
 ``end_input``, or after the model has ended the call, or to a request this socket has no
 live call under, gets ``{"request_id", "append": true, "error"}``: a reply to that append,
-not the end of a request, and the call goes on. A call still waiting for a slot
-(``max_concurrent_requests``) holds at most 256 messages of input meanwhile, one per append
-plus one each for the opening message's media and the end of input; the next ends the call
-with ``status`` 503. Other models ignore ``end_input``, and an append to them is rejected.
+not the end of a request, and the call goes on. A live call that opens while the server
+is at ``max_concurrent_requests`` ends at once with ``status`` 503, rather than wait for a
+slot and start that far behind its input; a one-shot request waits in the queue. Other
+models ignore ``end_input``, and an append to them is rejected.
 Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``.
 
 .. code-block:: python

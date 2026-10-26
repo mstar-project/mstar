@@ -722,6 +722,8 @@ class PreprocessWorkerThread:
 
         self.request_model_kwargs[input.request_id] = model_kwargs
         self.request_output_state[input.request_id] = RequestOutputState()
+        if input.ends:
+            self._ended_streams[input.request_id] = set(input.ends)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -734,11 +736,12 @@ class PreprocessWorkerThread:
                 input_metadata=input_metadata,
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
+                client_input=ClientStreamInput(
+                    request_id=input.request_id, signals=stream_signals, ended=sorted(input.ends),
+                ) if self._client_edges else None,
             ),
         )
         self.communicator.send("conductor", msg)
-        if stream_signals:
-            self._send_stream_input(input.request_id, stream_signals, ended=())
 
         # Record preprocess-side profiling: the moment the fully preprocessed
         # request was handed off to the conductor, plus the per-modality sizes of

@@ -156,10 +156,10 @@ def _bodies(sent, kind):
     return [msg.body for _entity, msg in sent if msg.message_type == kind]
 
 
-def _open(wt, files=None):
+def _open(wt, files=None, ends=frozenset()):
     wt._process_input(PreprocessInput(
         request_id="r", text="hi", file_paths=files, input_modalities=["text"],
-        output_modalities=["text"], model_kwargs={"voice": "a"},
+        output_modalities=["text"], model_kwargs={"voice": "a"}, ends=ends,
     ))
 
 
@@ -247,15 +247,18 @@ def test_a_text_only_append_to_a_model_that_takes_none_is_refused_with_a_400():
 
 
 def test_prompt_tensors_named_after_a_client_stream_are_its_first_chunk(tmp_path):
+    """A one-shot's opening carries its stream's only chunk and its end, so
+    the conductor can tell it from a live call while it waits for a slot."""
     wt, sent, _tm = _thread()
-    _open(wt, files={"audio": [_audio_file(tmp_path, "clip.raw", 8)]})
+    _open(wt, files={"audio": [_audio_file(tmp_path, "clip.raw", 8)]}, ends=END)
 
     kinds = [msg.message_type for _entity, msg in sent]
-    assert kinds == [ConductorMessageType.NEW_REQUEST, ConductorMessageType.CLIENT_STREAM_INPUT]
+    assert kinds == [ConductorMessageType.NEW_REQUEST]
     (new,) = _bodies(sent, ConductorMessageType.NEW_REQUEST)
     assert "audio_in" not in new.initial_signals and "text_inputs" in new.initial_signals
-    (chunk,) = _bodies(sent, ConductorMessageType.CLIENT_STREAM_INPUT)
-    assert chunk.signals["audio_in"][0].dims == [8]
+    assert new.client_input.signals["audio_in"][0].dims == [8]
+    assert new.client_input.ended == ["audio_in"]
+    assert wt._ended_streams["r"] == {"audio_in"}
 
 
 def test_an_append_for_a_finished_request_is_dropped(tmp_path):
@@ -479,11 +482,11 @@ def test_a_one_shot_request_ends_its_input_at_once(tmp_path):
     server = _server()
     key = _submit(server)
 
-    first, second = server.preprocess_worker.items
-    assert isinstance(first, PreprocessInput) and first.request_id == key
-    assert second == ClientAppend(key, ends=END)
+    (opening,) = server.preprocess_worker.items
+    assert isinstance(opening, PreprocessInput) and opening.request_id == key
+    assert opening.ends == END
     assert server.stream_input(key, {"audio": ["a.wav"]}) is False
-    assert len(server.preprocess_worker.items) == 2
+    assert len(server.preprocess_worker.items) == 1
 
 
 def test_an_open_request_takes_appends_until_it_ends(tmp_path):
@@ -853,8 +856,8 @@ def test_an_opening_can_end_some_of_its_streams_at_once():
     server = _two_stream_server()
     key = _submit(server, end_input=["video_in"])
 
-    opening, end = server.preprocess_worker.items
-    assert isinstance(opening, PreprocessInput) and end == ClientAppend(key, ends=frozenset({"video_in"}))
+    (opening,) = server.preprocess_worker.items
+    assert isinstance(opening, PreprocessInput) and opening.ends == {"video_in"}
     assert server.pending_requests[key].open_streams == {"audio_in"}
     with pytest.raises(ValueError, match="no client stream named 'nope'"):
         _submit(server, "other", end_input=["nope"])
