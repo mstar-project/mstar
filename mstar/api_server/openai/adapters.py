@@ -171,6 +171,14 @@ def _passthrough(req) -> dict:
     return dict(extra)
 
 
+def _forward_sent_speed(req, mk: dict) -> None:
+    """A client-sent ``speed`` into ``model_kwargs`` for a model with no speed
+    control, so the server logs it as ignored. ``SpeechRequest.speed`` defaults
+    to 1.0, so an unsent one stays out; it would warn on every request."""
+    if "speed" in getattr(req, "model_fields_set", ()):
+        mk.setdefault("speed", req.speed)
+
+
 def _refuse_tool_calls(req) -> None:
     """Refuse a chat that asks the model to call a tool.
 
@@ -410,7 +418,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
     over a plain one. Everything
     except temperature/top_p is not an OpenAI field (``talker_top_k``,
     ``talker_repetition_penalty``, ``code_predictor_top_k``, …) — pass those
-    via ``extra_body``.
+    via ``extra_body``. A speech request's ``speed`` is reported as ignored.
     """
 
     supports_chat = True
@@ -452,6 +460,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
             mk["voice"] = req.voice
         # Talker (speech) sampling; max_tokens is not an OpenAI speech field.
         _apply_sampling(req, mk, temperature_key="talker_temperature", top_p_key="talker_top_p", max_tokens_key=None)
+        _forward_sent_speed(req, mk)
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
@@ -494,7 +503,8 @@ class Qwen3_5Adapter(OpenAIAdapter):
 class OrpheusAdapter(OpenAIAdapter):
     """Orpheus: text-to-speech (audio out only). ``temperature`` / ``top_p`` /
     ``seed`` map directly; ``top_k``, ``repetition_penalty`` and
-    ``penalize_prompt`` travel through ``extra_body``."""
+    ``penalize_prompt`` travel through ``extra_body``. ``speed`` is not an
+    Orpheus control and is reported as ignored."""
 
     supports_speech = True
 
@@ -503,6 +513,7 @@ class OrpheusAdapter(OpenAIAdapter):
         if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        _forward_sent_speed(req, mk)
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
@@ -574,6 +585,7 @@ class Qwen3TTSAdapter(OpenAIAdapter):
     ``language``, ``non_streaming_mode``, ``top_k``, ``repetition_penalty``,
     the residual-group ``code_predictor_*`` sampling, ``max_output_tokens``.
     ``temperature`` / ``top_p`` / ``seed`` map onto the Talker sampler.
+    ``speed`` is not a Qwen3-TTS control and is reported as ignored.
 
     Inputs of 600+ characters are synthesized as ordered sentence chunks
     (``serving_speech``): each Talker request stays near the lengths the
@@ -594,6 +606,7 @@ class Qwen3TTSAdapter(OpenAIAdapter):
         if instructions:
             mk.setdefault("instruct", instructions)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        _forward_sent_speed(req, mk)
         # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL (when
         # the server allows it) or bare base64. It becomes the
         # request's audio input for one request; ``ref_text`` and
@@ -692,6 +705,7 @@ class ChatterboxAdapter(OpenAIAdapter):
         if getattr(req, "voice", None) is not None:
             mk.setdefault("voice", req.voice)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        _forward_sent_speed(req, mk)
         file_paths = None
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
@@ -825,7 +839,7 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
 
     Chat requests take the OpenAI ``messages`` layout with image / video
     attachments in order; ``temperature`` / ``top_p`` / ``max_tokens`` map to
-    the reasoner's sampler (``max_tokens`` at most 2048), and ``extra_body``
+    the reasoner's sampler (``max_tokens`` defaults to 2048), and ``extra_body``
     knobs (``enable_thinking``, ``top_k``, ``repetition_penalty``,
     ``penalize_prompt``, ``video_fps`` / ``video_num_frames``) pass through;
     ``min_p`` is refused.
