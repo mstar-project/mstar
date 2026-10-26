@@ -27,6 +27,30 @@ def _refuse_split_combined_walks(submodules: dict, model: Model) -> None:
             )
 
 
+def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
+    """A spanned output is cut after its step ends, but speculation hands a
+    step's outputs to the next step before then: no spanned output may feed a
+    node this worker speculates into (see ``NodeSubmodule.spanned_outputs``)."""
+    for walk, section in model.get_graph_walk_graphs().items():
+        nodes = section.get_nodes()
+        for name, node in nodes.items():
+            submodule = submodules.get(name)
+            if submodule is None or not node.enable_async_scheduling:
+                continue
+            spanned = submodule.spanned_outputs(walk)
+            for edge in node.outputs:
+                target = nodes.get(edge.next_node)
+                if (
+                    edge.name in spanned and edge.next_node in submodules
+                    and target is not None and target.enable_async_scheduling
+                ):
+                    raise ValueError(
+                        f"{type(model).__name__}: {name!r} spans {edge.name!r}, which "
+                        f"feeds {edge.next_node!r} on the same worker in walk {walk!r}; "
+                        "set enable_async_scheduling=False on one of them"
+                    )
+
+
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
     """The TP group ``node`` runs ``walk`` in, from the static config; None
     when it has none or one of size 1."""
@@ -137,6 +161,7 @@ class EngineManager:
             node_dtype = submodule.get_autocast_dtype() or autocast_dtype
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
+        _refuse_speculated_spans(submodules, model)
 
         engine = Engine(
             graph_runtime=graph_runtime,
