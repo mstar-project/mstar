@@ -19,8 +19,9 @@ Selected via ``model_kwargs={"skip_predictor": True}`` at request time.
 
 Video preprocessing matches HF ``VJEPA2VideoProcessor`` semantics:
 resize-shortest-edge to ``crop_size * 256 / 224``, center-crop to
-``crop_size``, normalize with ImageNet mean/std.  Implemented inline in
-``process_prompt`` (no external dep).
+``crop_size``, normalize with ImageNet mean/std, in ``process_prompt``.
+The AC model takes upstream's DROID transform instead (the centred square,
+resized), see ``_preprocess_video_droid``.
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ import logging
 from pathlib import Path
 
 import torch
-from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
@@ -123,6 +123,39 @@ def _sample_frames_uniform(frames: torch.Tensor, target_t: int) -> torch.Tensor:
     return frames[indices]
 
 
+def _preprocess_video_droid(
+    frames: torch.Tensor,
+    crop_size: int,
+    target_frames: int,
+) -> torch.Tensor:
+    """Upstream V-JEPA 2-AC's DROID transform: the centred square of the short
+    side, resized to ``crop_size`` and ImageNet-normalized. In and out as
+    ``_preprocess_video``.
+
+    HF hosts no processor for the AC checkpoint. Upstream's notebook and its
+    ``WorldModel`` use ``make_transforms`` at scale and aspect ratio 1, whose
+    random crop falls back to the centred square on any non-square frame, then
+    resize the float pixels bilinearly with no antialiasing. The encoders'
+    resize-and-crop reads only the middle half of a 16:9 frame's width.
+    """
+    import torch.nn.functional as F
+
+    if frames.dim() != 4:
+        raise ValueError(f"Expected [T,C,H,W] video; got {tuple(frames.shape)}")
+    _, c, h, w = frames.shape
+    if c != 3:
+        raise ValueError(f"Expected 3-channel RGB video; got {c} channels")
+    frames = _sample_frames_uniform(frames, target_frames)
+    side = min(h, w)
+    top, left = (h - side) // 2, (w - side) // 2
+    # load_video's frames are uint8 / 255; upstream resizes the uint8 values as floats
+    pixels = (frames[:, :, top : top + side, left : left + side] * 255.0).round().clamp(0, 255)
+    pixels = F.interpolate(pixels, size=(crop_size, crop_size), mode="bilinear", align_corners=False)
+    mean = torch.tensor(_IMAGENET_MEAN, device=pixels.device).view(1, 3, 1, 1) * 255.0
+    std = torch.tensor(_IMAGENET_STD, device=pixels.device).view(1, 3, 1, 1) * 255.0
+    return (pixels - mean) / std
+
+
 def _preprocess_video(
     frames: torch.Tensor,
     crop_size: int,
@@ -135,7 +168,14 @@ def _preprocess_video(
 
     Pipeline: temporal subsample → spatial resize (shortest edge) → center
     crop → normalize.  Sampling first keeps intermediate memory small.
+
+    The resize runs on the uint8 frames through torchvision, as HF's processor
+    does, so its output is rounded the same way. V-JEPA 2's embeddings move a
+    lot with that rounding: resizing the floats instead (one uint8 step at
+    most per pixel) gave a cosine of 0.84-0.94 against HF in fp32.
     """
+    from torchvision.transforms.v2 import functional as tvF
+
     if frames.dim() != 4:
         raise ValueError(f"Expected [T,C,H,W] video; got {tuple(frames.shape)}")
     _, c, h, w = frames.shape
@@ -147,19 +187,22 @@ def _preprocess_video(
 
     resize_short = int(crop_size * 256 / 224)
     if h < w:
-        new_h, new_w = resize_short, int(round(w * resize_short / h))
+        new_h, new_w = resize_short, int(w * resize_short / h)
     else:
-        new_h, new_w = int(round(h * resize_short / w)), resize_short
-    frames = nn.functional.interpolate(frames, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        new_h, new_w = int(h * resize_short / w), resize_short
+    # load_video's frames are uint8 / 255, so this round trip is exact
+    pixels = (frames * 255.0).round().clamp(0, 255).to(torch.uint8)
+    pixels = tvF.resize(pixels, [new_h, new_w], interpolation=tvF.InterpolationMode.BILINEAR, antialias=True)
 
     # Center crop to crop_size x crop_size.
     top = (new_h - crop_size) // 2
     left = (new_w - crop_size) // 2
-    frames = frames[:, :, top : top + crop_size, left : left + crop_size]
+    pixels = pixels[:, :, top : top + crop_size, left : left + crop_size]
 
-    mean = torch.tensor(_IMAGENET_MEAN, device=frames.device, dtype=frames.dtype).view(1, 3, 1, 1)
-    std = torch.tensor(_IMAGENET_STD, device=frames.device, dtype=frames.dtype).view(1, 3, 1, 1)
-    return (frames - mean) / std
+    # rescale and normalize in one step, like HF
+    mean = torch.tensor(_IMAGENET_MEAN, device=pixels.device).view(1, 3, 1, 1) * 255.0
+    std = torch.tensor(_IMAGENET_STD, device=pixels.device).view(1, 3, 1, 1) * 255.0
+    return (pixels.to(torch.float32) - mean) / std
 
 
 class VJepa2Model(Model):
@@ -665,7 +708,8 @@ class VJepa2Model(Model):
         Expects the data worker to have populated ``tensors["video_inputs"]``
         via :meth:`Model.load_video` (returns ``[T, C, H, W]`` float in
         ``[0, 1]``).  We run HF-style resize + center crop + ImageNet
-        normalization to produce the ``video_frames`` edge the encoder wants.
+        normalization (upstream's DROID transform for the AC model) to produce
+        the ``video_frames`` edge the encoder wants.
 
         For V-JEPA 2-AC, callers pass per-timestep ``actions``, ``states``
         (and optionally ``extrinsics``) through ``**kwargs``.
@@ -684,7 +728,10 @@ class VJepa2Model(Model):
             # ship 8-frame clips).
             target_frames = int(kwargs.get("num_frames", self.config.frames_per_clip))
             target_frames = min(target_frames, int(raw.size(0)))
-            processed = _preprocess_video(
+            preprocess = (
+                _preprocess_video_droid if self.config.predictor_kind == "ac" else _preprocess_video
+            )
+            processed = preprocess(
                 raw.to(torch.float32),
                 crop_size=self.config.crop_size,
                 target_frames=target_frames,
