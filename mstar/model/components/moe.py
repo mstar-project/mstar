@@ -91,8 +91,7 @@ _MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 # the ``is_cuda`` check below.
 try:
     from mstar.utils.fused_moe import MoeAlignment, moe_block_m
-    from mstar.utils.fused_moe.backend import make_moe_backend
-    from mstar.utils.fused_moe.config import MoEProblem
+    from mstar.utils.fused_moe.backend import MoEProblem, make_moe_backend
     from mstar.utils.fused_moe.route import ROUTE_ALIGN_MAX_SLOTS, route_align
     from mstar.utils.fused_moe.runner import runs_per_pair
 
