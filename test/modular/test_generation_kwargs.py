@@ -25,7 +25,7 @@ def test_null_is_unset():
 @pytest.mark.parametrize("kwargs", [
     {"temperature": 0}, {"temperature": 1e6}, {"top_p": 1}, {"top_p": 1e-6},
     {"min_p": 0}, {"min_p": 1}, {"repetition_penalty": 0.5}, {"top_k": 0},
-    {"max_output_tokens": 1}, {"seed": -(2**63)}, {"ignore_eos": False},
+    {"max_output_tokens": 1}, {"seed": -(2**63)}, {"ignore_eos": False}, {"do_sample": False},
     {"talker_temperature": 0.9}, {"code_predictor_top_k": 50},
     {"class_temperature": 0}, {"cfg_weight": "anything: not a knob"},
 ])
@@ -54,6 +54,7 @@ def test_in_contract_values_pass(kwargs):
     ({"seed": 2**64}, "seed"),
     ({"seed": 1e20}, "seed"),
     ({"ignore_eos": "false"}, "ignore_eos"),
+    ({"do_sample": "false"}, "do_sample"),
     ({"talker_top_p": 0}, "talker_top_p"),
     ({"thinker_temperature": -0.1}, "thinker_temperature"),
 ])
