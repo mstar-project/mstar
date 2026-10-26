@@ -99,7 +99,7 @@ def _worker(tmp_path):
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
         check_stop_for_batch=lambda batch, outputs, **kwargs: {},
         after_output_copy=lambda batch: None,
-        extend_prefix_chains=lambda batch, outputs, **kwargs: None,
+        step_finished=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
     ))
     w.request_state = SimpleNamespace(

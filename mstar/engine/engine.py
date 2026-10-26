@@ -1144,6 +1144,15 @@ class Engine:
         if batch.committed is not None:
             self._runner.after_output_copy(batch.committed)
 
+    def step_finished(
+        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        host_rows: HostRows | None = None,
+    ) -> None:
+        """A step's outputs are on the host (the stop check's copy) and its
+        stops not yet decided: so a request ending here has its state up to
+        date, e.g. its pages indexed for prefix reuse."""
+        self.extend_prefix_chains(batch, outputs, host_rows=host_rows)
+
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
         host_rows: HostRows | None = None,

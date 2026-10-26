@@ -3415,9 +3415,8 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        # the same host copy, before stops, so a request ending here still indexes its pages
-        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
-        request = self._postprocess_request(batch_N, host_rows, engine)
+        engine.step_finished(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
+        request = self._get_postprocess_request(batch_N, host_rows, engine)
         _pp_stage("prematerialize")
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -3478,7 +3477,7 @@ class Worker:
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 
-    def _postprocess_request(
+    def _get_postprocess_request(
         self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
     ) -> PostprocessRequest:
         """The step's ``PostprocessRequest``: its rows, its stops known before
