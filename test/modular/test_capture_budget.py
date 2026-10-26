@@ -22,6 +22,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.distributed.ar_fusion import GraphCaptureScope
 from mstar.engine import accelerator_graph_runner
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_runner import (
@@ -744,6 +745,9 @@ class _PeerGroup:
 
     def barrier(self):
         pass
+
+    def graph_capture(self):
+        return GraphCaptureScope()
 
     def all_gather(self, tensor, dim=0):
         return torch.cat([tensor, torch.tensor(self._peer, dtype=tensor.dtype)])
