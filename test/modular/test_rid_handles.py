@@ -238,9 +238,12 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w, t = _worker()
     got: dict[str, object] = {}
     cfg = SimpleNamespace(sharding_config="cfg", stream_buffers={})
-    w.request_state.add_request = (
-        lambda request_id, request_info: got.__setitem__("state", request_id)
-    )
+
+    def _state_add(request_id, request_info):
+        got["state"] = request_id
+        w.request_state.per_request_info[request_id] = cfg
+
+    w.request_state.add_request = _state_add
     w.engine_manager = SimpleNamespace(
         add_request=lambda rid, cfgs: got.__setitem__("engine", rid),
         evictable_nodes=lambda: [],
@@ -263,8 +266,6 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
         partition_worker_graph_ids={}, worker_graph_to_workers={},
         initial_inputs=[], loop_caps={},
     )
-    w.request_state.per_request_info = {0: cfg}
-
     Worker._add_new_request(w, body)
 
     handle = t.handle("wire-1")

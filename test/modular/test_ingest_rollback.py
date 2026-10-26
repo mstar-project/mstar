@@ -55,7 +55,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
         evictable_nodes=lambda: [],
         add_request=lambda rid, cfg: (_ for _ in ()).throw(RuntimeError("over capacity")),
     )
-    w.request_state = SimpleNamespace(add_request=lambda rid, info: None)
+    w.request_state = SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None)
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sharding: registered.append(rid),
         start_read_tensors=lambda *a, **kw: pytest.fail("no reads for a failed request"),

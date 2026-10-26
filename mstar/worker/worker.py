@@ -837,20 +837,26 @@ class Worker:
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active[(request_id, node_name)] = now
 
+        # Every partition's NewRequest carries the same resource configs and
+        # worker graph map, so tensor and resource state is opened on the first
+        # only. A later one can arrive after a step ran, and opening again would
+        # reset what the step left.
+        first = request_id not in self.request_state.per_request_info
         self.request_state.add_request(request_id, body.request_info)
-        self.tensor_manager.register_request(
-            request_id, self._graph_runtime.get_sharding_config(request_id),
-        )
-        try:
-            self.engine_manager.add_request(
-                request_id, body.request_info.resource_configs,
+        if first:
+            self.tensor_manager.register_request(
+                request_id, self._graph_runtime.get_sharding_config(request_id),
             )
-        except Exception as err:
-            # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
-            logger.exception("Worker %s: ingest of request %s failed", self.worker_id, body.request_id)
-            self._fail_requests({request_id: f"Error in worker: {type(err).__name__}: {err}"})
-            self._process_unprocessed(body.request_id)
-            return
+            try:
+                self.engine_manager.add_request(
+                    request_id, body.request_info.resource_configs,
+                )
+            except Exception as err:
+                # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
+                logger.exception("Worker %s: ingest of request %s failed", self.worker_id, body.request_id)
+                self._fail_requests({request_id: f"Error in worker: {type(err).__name__}: {err}"})
+                self._process_unprocessed(body.request_id)
+                return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         # Create StreamBuffers for consumer connections on this worker. A request
