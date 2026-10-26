@@ -732,7 +732,7 @@ console scripts, <code class="docutils literal notranslate"><span class="pre">ms
 <div class="admonition important">
 <p class="admonition-title">Important</p>
 <p><strong>For CUDA installs, always pass</strong> <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar</span></code> floors
-PyTorch at 2.9 (<code class="docutils literal notranslate"><span class="pre">torch&gt;=2.9.1</span></code> / <code class="docutils literal notranslate"><span class="pre">torchvision&gt;=0.24.1</span></code> / <code class="docutils literal notranslate"><span class="pre">torchaudio&gt;=2.9.1</span></code>).
+PyTorch at 2.10 (<code class="docutils literal notranslate"><span class="pre">torch&gt;=2.10.0</span></code> / <code class="docutils literal notranslate"><span class="pre">torchvision&gt;=0.25.0</span></code> / <code class="docutils literal notranslate"><span class="pre">torchaudio&gt;=2.10.0</span></code>).
 The flag tells
 <code class="docutils literal notranslate"><span class="pre">uv</span></code> to detect your driver’s CUDA version and fetch the <strong>matching</strong> torch build
 — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
@@ -918,7 +918,9 @@ extra</strong>; install it separately (see <a class="reference internal" href="#
 <li><p><strong>mooncake-transfer-engine</strong> (0.3.13.post1 or newer) — RDMA tensor transport for
 multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory
 (<code class="docutils literal notranslate"><span class="pre">SHM</span></code>) or <code class="docutils literal notranslate"><span class="pre">TCP</span></code> transport instead (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>, which also covers the network
-it needs).</p></li>
+it needs). The extras install Mooncake’s CUDA 12 wheel; next to a CUDA 13 torch
+(<code class="docutils literal notranslate"><span class="pre">+cu130</span></code>) swap in its CUDA 13 build, as the Docker images do (see
+<a class="reference internal" href="#mooncake-cuda13"><span class="std std-ref">libcudart.so.12: cannot open shared object file</span></a>).</p></li>
 </ul>
 <p>Apart from <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> and <code class="docutils literal notranslate"><span class="pre">flash-attn-4</span></code>, these are installed by the extras above. Your
 installed <code class="docutils literal notranslate"><span class="pre">torch</span></code> must match your system CUDA toolkit — <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code> handles
@@ -968,28 +970,23 @@ slow. When a prebuilt GitHub wheel matches your stack, use it to skip the build;
 build from source (see <a class="reference internal" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a> below).</p>
 <p>The wheels live on flash-attn’s <a class="reference external" href="https://github.com/Dao-AILab/flash-attention/releases">GitHub releases</a>, named by CUDA major, torch
 <strong>minor</strong> version, Python tag, and C++ ABI. <code class="docutils literal notranslate"><span class="pre">mstar</span></code> no longer pins torch (floor
-<code class="docutils literal notranslate"><span class="pre">&gt;=2.9.1</span></code>), so the wheel’s <code class="docutils literal notranslate"><span class="pre">torchX.Y</span></code> tag must match <strong>whatever torch you actually
+<code class="docutils literal notranslate"><span class="pre">&gt;=2.10.0</span></code>), so the wheel’s <code class="docutils literal notranslate"><span class="pre">torchX.Y</span></code> tag must match <strong>whatever torch you actually
 installed</strong>, and its <code class="docutils literal notranslate"><span class="pre">cu1x</span></code> must match that torch’s CUDA build — not your system toolkit.
 Check both first:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import torch; print(torch.__version__, torch.version.cuda)"</span>
 <span class="c1"># e.g. 2.12.1+cu130 13.0  -&gt;  torch2.12 / cu13</span>
-<span class="c1">#      2.9.1+cu128  12.8  -&gt;  torch2.9  / cu12</span>
+<span class="c1">#      2.10.0+cu130 13.0  -&gt;  torch2.10 / cu13</span>
 </pre></div>
 </div>
 <p>Pick the release that has a wheel for your torch minor (each flash-attn release lists which
 <code class="docutils literal notranslate"><span class="pre">torchX.Y</span></code> tags it ships), then install it by <strong>direct URL</strong> (don’t use <code class="docutils literal notranslate"><span class="pre">--find-links</span></code> —
 uv sorts the <code class="docutils literal notranslate"><span class="pre">+cu13…</span></code> local version above <code class="docutils literal notranslate"><span class="pre">+cu12…</span></code> and will grab cu13 even on a CUDA 12
-box). The examples below are for <strong>torch 2.9</strong>; substitute the <code class="docutils literal notranslate"><span class="pre">torch2.9</span></code> segment with your
-own tag. Note the prebuilt wheels <strong>top out at</strong> <code class="docutils literal notranslate"><span class="pre">torch2.10</span></code> (<code class="docutils literal notranslate"><span class="pre">cu13</span></code>, in release
-<code class="docutils literal notranslate"><span class="pre">v2.8.3</span></code>) — there is <strong>no</strong> <code class="docutils literal notranslate"><span class="pre">torch2.11+</span></code> wheel, so on newer torch (e.g. 2.12) you must
-build from source instead:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># torch built for CUDA 12.x (cu12)</span>
+box). The example below is for <strong>torch 2.10</strong>, the floor. The prebuilt wheels <strong>top out at</strong>
+<code class="docutils literal notranslate"><span class="pre">torch2.10</span></code>, and only for <code class="docutils literal notranslate"><span class="pre">cu13</span></code> (release <code class="docutils literal notranslate"><span class="pre">v2.8.3</span></code>): on a cu12 torch, or on torch 2.11+,
+you must build from source instead:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># torch 2.10 built for CUDA 13.x (cu13)</span>
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="s2">"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"</span>
-
-<span class="c1"># torch built for CUDA 13.x (cu13)</span>
-uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="s2">"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"</span>
+<span class="w">  </span><span class="s2">"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"</span>
 </pre></div>
 </div>
 <p>Because it’s a binary wheel nothing compiles, so your <em>system</em> CUDA version is irrelevant —
@@ -1074,30 +1071,27 @@ works unchanged across machines. (Needs a recent <code class="docutils literal n
 look for <code class="docutils literal notranslate"><span class="pre">--torch-backend</span></code> if unsure; <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">UV_TORCH_BACKEND=auto</span></code> is equivalent.)</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
-<p><strong>Mooncake on a CUDA 13 torch.</strong> The extras install <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>,
-Mooncake’s default wheel, which is built for CUDA 12 and links <code class="docutils literal notranslate"><span class="pre">libcudart.so.12</span></code>. An extra
-can’t choose a dependency by CUDA version, so it installs that wheel next to a cu130 torch
-too. A CUDA 13 torch doesn’t bring the CUDA 12 runtime, so <code class="docutils literal notranslate"><span class="pre">TCP</span></code> and <code class="docutils literal notranslate"><span class="pre">RDMA</span></code> transport
-fail at startup with <code class="docutils literal notranslate"><span class="pre">libcudart.so.12:</span> <span class="pre">cannot</span> <span class="pre">open</span> <span class="pre">shared</span> <span class="pre">object</span> <span class="pre">file</span></code>; <code class="docutils literal notranslate"><span class="pre">SHM</span></code> is not
-affected. Swap in Mooncake’s CUDA 13 build, which installs the same <code class="docutils literal notranslate"><span class="pre">mooncake</span></code> package:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>uninstall<span class="w"> </span>mooncake-transfer-engine
-uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--reinstall<span class="w"> </span>--no-deps<span class="w"> </span>mooncake-transfer-engine-cuda13
-</pre></div>
-</div>
-<p>Installing an extra again puts the CUDA 12 build back, so repeat the swap afterwards.</p>
+<p><strong>Mooncake on a CUDA 13 torch.</strong> The extras install Mooncake’s CUDA 12 wheel, which can’t
+load next to a cu130 torch, so <code class="docutils literal notranslate"><span class="pre">TCP</span></code> and <code class="docutils literal notranslate"><span class="pre">RDMA</span></code> transport fail at startup; <code class="docutils literal notranslate"><span class="pre">SHM</span></code> is
+not affected. Swap in its CUDA 13 build as described in <a class="reference internal" href="#mooncake-cuda13"><span class="std std-ref">libcudart.so.12: cannot open shared object file</span></a>.</p>
 </div>
 <p><strong>Manual fallback.</strong> If you can’t use the flag, install the pinned torch trio from the
 matching CUDA index <strong>first</strong>, then install <code class="docutils literal notranslate"><span class="pre">mstar</span></code> (the resolver then treats the
 requirement as already satisfied):</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># pick the index for your CUDA toolkit: cu128 (CUDA 12.8), cu130 (CUDA 13.x), …</span>
-uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">torch</span><span class="o">==</span><span class="m">2</span>.9.1<span class="w"> </span><span class="nv">torchvision</span><span class="o">==</span><span class="m">0</span>.24.1<span class="w"> </span><span class="nv">torchaudio</span><span class="o">==</span><span class="m">2</span>.9.1<span class="w"> </span><span class="se">\</span>
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">torch</span><span class="o">==</span><span class="m">2</span>.10.0<span class="w"> </span><span class="nv">torchvision</span><span class="o">==</span><span class="m">0</span>.25.0<span class="w"> </span><span class="nv">torchaudio</span><span class="o">==</span><span class="m">2</span>.10.0<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/cu128
-uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[all]"</span>
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[all]"</span><span class="w"> </span><span class="s2">"torchcodec==0.10.*"</span>
 </pre></div>
 </div>
 <p>Check your driver’s CUDA version with <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> and pick the closest build at
-<a class="reference external" href="https://pytorch.org/get-started/locally/">https://pytorch.org/get-started/locally/</a>. Keep all three packages on the same <code class="docutils literal notranslate"><span class="pre">2.9</span></code> /
-<code class="docutils literal notranslate"><span class="pre">0.24</span></code> line — <code class="docutils literal notranslate"><span class="pre">torchvision</span></code> and <code class="docutils literal notranslate"><span class="pre">torchaudio</span></code> are versioned in lockstep with <code class="docutils literal notranslate"><span class="pre">torch</span></code>.</p>
+<a class="reference external" href="https://pytorch.org/get-started/locally/">https://pytorch.org/get-started/locally/</a>. Keep all three packages on the same <code class="docutils literal notranslate"><span class="pre">2.10</span></code> /
+<code class="docutils literal notranslate"><span class="pre">0.25</span></code> line — <code class="docutils literal notranslate"><span class="pre">torchvision</span></code> and <code class="docutils literal notranslate"><span class="pre">torchaudio</span></code> are versioned in lockstep with <code class="docutils literal notranslate"><span class="pre">torch</span></code>.
+<code class="docutils literal notranslate"><span class="pre">torchcodec</span></code> doesn’t declare its <code class="docutils literal notranslate"><span class="pre">torch</span></code> version, so the resolver otherwise picks the
+newest release (0.17 at the time of writing), which fails to load next to torch 2.10; 0.10
+is the release built against it.
+The <code class="docutils literal notranslate"><span class="pre">[asr]</span></code> extra pins that pair itself (<code class="docutils literal notranslate"><span class="pre">torch</span></code> 2.10 with <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code> 0.10, as in the
+Docker images), so installing it puts <code class="docutils literal notranslate"><span class="pre">torch</span></code> on 2.10.</p>
 </section>
 <section id="verify-the-install">
 <h2>Verify the install<a class="headerlink" href="#verify-the-install" title="Link to this heading">#</a></h2>
@@ -1203,7 +1197,7 @@ Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 in
 <code class="docutils literal notranslate"><span class="pre">9.20.0.48</span></code>. cuDNN is ABI-compatible within the v9 series, so the newer patch runs fine.</p>
 </section>
 <section id="libcudart-so-12-cannot-open-shared-object-file">
-<h3><code class="docutils literal notranslate"><span class="pre">libcudart.so.12:</span> <span class="pre">cannot</span> <span class="pre">open</span> <span class="pre">shared</span> <span class="pre">object</span> <span class="pre">file</span></code><a class="headerlink" href="#libcudart-so-12-cannot-open-shared-object-file" title="Link to this heading">#</a></h3>
+<span id="mooncake-cuda13"></span><h3><code class="docutils literal notranslate"><span class="pre">libcudart.so.12:</span> <span class="pre">cannot</span> <span class="pre">open</span> <span class="pre">shared</span> <span class="pre">object</span> <span class="pre">file</span></code><a class="headerlink" href="#libcudart-so-12-cannot-open-shared-object-file" title="Link to this heading">#</a></h3>
 <p>Symptom: with <code class="docutils literal notranslate"><span class="pre">--tensor-comm-protocol</span> <span class="pre">TCP</span></code> or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>, startup fails with:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="ne">RuntimeError</span><span class="p">:</span> <span class="n">Mooncake</span> <span class="n">TransferEngine</span> <span class="ow">is</span> <span class="n">required</span> <span class="k">for</span> <span class="n">RDMA</span><span class="o">/</span><span class="n">TCP</span> <span class="n">protocol</span><span class="o">.</span> <span class="n">Failed</span> <span class="n">to</span> <span class="n">load</span>
 <span class="n">mooncake</span><span class="p">:</span> <span class="ne">ImportError</span><span class="p">:</span> <span class="n">libcudart</span><span class="o">.</span><span class="n">so</span><span class="mf">.12</span><span class="p">:</span> <span class="n">cannot</span> <span class="nb">open</span> <span class="n">shared</span> <span class="nb">object</span> <span class="n">file</span><span class="p">:</span> <span class="o">...</span>
