@@ -316,7 +316,7 @@ def test_qwen3_5_defers_the_embedding_prepare_inputs_runs():
         lm.embed(ids)
     with torch.device("meta"):
         root = Qwen3_5ForCausalLM(config)
-    eager = module_lora_spec(root, resource_key=LORA_RESOURCE_KEY, nodes={"LLM"}, root_path="model",
+    eager = module_lora_spec(root, nodes={"LLM"}, root_path="model",
                              rules=generic.module_map.rules, rows={"lm_head": PER_SEGMENT}, embeddings=True)
     with pytest.raises(RuntimeError, match="outside"):
         bound(eager).embed_tokens(ids)

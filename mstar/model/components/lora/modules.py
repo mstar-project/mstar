@@ -204,7 +204,6 @@ def module_lora_spec(
     *,
     nodes: set[str],
     root_path: str,
-    resource_key: str = LORA_RESOURCE_KEY,
     rules: CheckpointRules | None = None,
     adapter_stacked_params: Sequence[StackedParamRule] = (),
     adapter_roots: Sequence[AdapterRoot | tuple[str, str]] = (),
@@ -217,7 +216,9 @@ def module_lora_spec(
     embeddings: bool = False,
     convert_keys: Callable | None = None,
 ) -> LoraSpec:
-    """A node's LoRA spec, a target per role of the LoRA-capable modules under ``root``.
+    """A node's LoRA spec, a target per role of the LoRA-capable modules under ``root``,
+    keyed ``LORA_RESOURCE_KEY``: the key the serving config's ``resources: lora:`` block
+    and the API server's adapter selection name.
 
     ``root`` is the module the node's weight loader fills, at one rank (built on the meta
     device is enough), and ``root_path`` its attribute path in the node's submodule
@@ -320,8 +321,8 @@ def module_lora_spec(
         raise ValueError(f"`deferred` patterns {unmatched} match no LoRA target module")
     if unservable:
         logger.info(
-            "LoRA %s: %d module(s) take no delta, e.g. %s",
-            resource_key, len(unservable), [f"{p} ({r})" for p, r in list(unservable.items())[:3]],
+            "LoRA on %s: %d module(s) take no delta, e.g. %s",
+            sorted(nodes), len(unservable), [f"{p} ({r})" for p, r in list(unservable.items())[:3]],
         )
 
     module_map = ModuleLoraMap(
@@ -330,7 +331,7 @@ def module_lora_spec(
         root_path=root_path, deferred=deferred_paths,
     )
     return LoraSpec(
-        resource_key=resource_key, nodes=set(nodes), num_layers=num_layers, targets=targets,
+        resource_key=LORA_RESOURCE_KEY, nodes=set(nodes), num_layers=num_layers, targets=targets,
         module_map=module_map, ignored_modules=module_map.ignores, convert_keys=convert_keys,
     )
 

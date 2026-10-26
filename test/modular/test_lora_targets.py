@@ -258,7 +258,7 @@ def _spec(case: Case):
     with torch.device("meta"):
         root = _Root(case, CommGroup.trivial())
     return module_lora_spec(
-        root, resource_key="lora", nodes={"N"}, root_path="inner",
+        root, nodes={"N"}, root_path="inner",
         rules=CheckpointRules(stacked_params=case.stacked), embeddings=True, rows=case.rows,
     )
 
@@ -482,7 +482,7 @@ def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name
         root.layers = nn.ModuleList([nn.Module()])
         root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
         root.layers[0].bad = make()
-    spec = module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path="")
+    spec = module_lora_spec(root, nodes={"N"}, root_path="")
     assert set(spec.targets) == {"fc"} and reason in spec.module_map.unservable["layers.0.bad"]
     path = write_peft(tmp_path / "a.safetensors", {
         "layers.0.fc": (rand(2, HIDDEN, seed=1), rand(HIDDEN, 2, seed=2)),
@@ -559,7 +559,7 @@ def test_header_refusals_reach_the_client_as_themselves():
         root = nn.Module()
         root.layers = nn.ModuleList([nn.Module()])
         root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
-    spec = serve(module_lora_spec(root, resource_key="lora", nodes={"N"}, root_path=""), {})
+    spec = serve(module_lora_spec(root, nodes={"N"}, root_path=""), {})
     key = "base_model.model.layers.0.fc.lora_{}.weight"
     bad = inspect_keys(spec, [(key.format("A"), (4, 2 * HIDDEN)), (key.format("B"), (HIDDEN, 4))])
     with pytest.raises(ValueError, match="does not fit") as misfit:
