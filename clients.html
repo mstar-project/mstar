@@ -723,6 +723,10 @@ drops a stream can resubmit its id at once).</p></td>
 </tbody>
 </table>
 </div>
+<p>A client <code class="docutils literal notranslate"><span class="pre">request_id</span></code> is at most 128 characters from <code class="docutils literal notranslate"><span class="pre">[A-Za-z0-9._:-]</span></code>; any other is
+refused with <code class="docutils literal notranslate"><span class="pre">400</span></code> (on <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, with the in-band error below). An empty
+<code class="docutils literal notranslate"><span class="pre">request_id</span></code> counts as none: the server mints a fresh one, on both frontends and on
+<code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>.</p>
 <p>A non-streaming response groups outputs by modality, each payload base64-encoded:</p>
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
 <span class="w">  </span><span class="nt">"request_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"…"</span><span class="p">,</span>
