@@ -21,7 +21,8 @@ max_seq_len: 12288
 # raise the cap, raise their max_slots (cap + 1 for the recurrent pools, for the
 # sink; cap for encoder_kv) and the KV pools' max_num_pages with it.
 # The server refuses to start with a cap one of them cannot hold.
-max_concurrent_requests: 32
+# 16 keeps every live call in real time on one H200; at 32 the calls fall behind.
+max_concurrent_requests: 16
 
 # No per-message deflate on the WebSocket routes: compressing 32 live calls'
 # 80 ms appends cost the event loop ~8% on /generate/ws (H100, 2026-10-17).
