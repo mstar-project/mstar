@@ -1464,28 +1464,8 @@ def test_media_rows_hold_one_of_the_nodes_media_lanes(tmp_path, monkeypatch):
     assert peak[0] == 3
 
 
-def test_aspectcrop_arm_runs_after_mstar_on_cosmos3_nano_only(tmp_path, monkeypatch):
-    import yaml
-
-    video = list(tables.TABLES["video"].arms)
-    assert "mstar-aspectcrop" not in [a.name for a in catalog.arms_for(catalog.ROWS["wan22"], video)]
-    seen = []
-    monkeypatch.setattr(sweep, "run_arm", lambda plan, row, arm, gpus, port, lane: seen.append(arm.name))
-    sweep.run_row(type("P", (), {"arms": video, "trees": {}})(), catalog.ROWS["cosmos3_nano"], 0, [5], 8640)
-    assert seen[:3] == ["mstar", "mstar-aspectcrop", "vllm-omni"]
-    wt = tmp_path / "wt"
-    (wt / "configs").mkdir(parents=True)
-    (wt / "configs" / "cosmos3_nano.yaml").write_text("model: cosmos3\nmodel_kwargs:\n  accelerator_graph: true\n")
-    cfg = Launch(catalog.ARMS["mstar-aspectcrop"], catalog.ROWS["cosmos3_nano"], [5], 8640, tmp_path / "s",
-                 worktree=wt).mstar_config()
-    assert yaml.safe_load(cfg.read_text())["model_kwargs"] == {"accelerator_graph": True,
-                                                                "conditioning_resize": "aspect_crop"}
-    # Its image-to-video requests carry the raw set frames, so it does the crop itself; mstar gets the reference's.
+def test_cosmos3_nano_i2v_cells_send_the_reference_frames(tmp_path, monkeypatch):
     nano, i2v = catalog.ROWS["cosmos3_nano"], tables.WORKLOADS["video-i2v"]
-    raw = sweep.SETS_ROOT / "sets" / "video_v1"
-    assert sweep.workload_set_dir(nano, i2v, tmp_path / "ac", "mstar-aspectcrop") == raw
-    assert not (tmp_path / "ac").exists()
-    assert sweep.workload_set_dir(nano, i2v, tmp_path / "m", "mstar") == tmp_path / "m" / "set-video-i2v"
     sent = []
 
     def fake_client(cmd, env, log_path, timeout_s=None):
@@ -1499,10 +1479,8 @@ def test_aspectcrop_arm_runs_after_mstar_on_cosmos3_nano_only(tmp_path, monkeypa
     monkeypatch.setattr(sweep, "run_client", fake_client)
     monkeypatch.setattr(sweep, "cotenants", lambda job: {})
     plan = type("P", (), {"resume": False, "repeats": 1, "table": tables.TABLES["video"], "log": print})()
-    for name, frames in (("mstar-aspectcrop", raw / "image"), ("mstar", Path(nano.i2v_frames))):
-        sent.clear()
-        arm, arm_dir = catalog.ARMS[name], tmp_path / "run" / name
-        sweep.first_size_requests(plan, arm, nano, i2v, 8640, arm_dir, [5], None, {"height": 480, "width": 832})
-        sweep.run_cell(plan, arm, nano, i2v, 1, 8640, arm_dir, [5])
-        assert Path(sent[0][1]) == (frames / "00.png").resolve()  # the first-size request's frame
-        assert sent[1][0] == (raw if name == "mstar-aspectcrop" else arm_dir / "set-video-i2v")
+    arm, arm_dir = catalog.ARMS["mstar"], tmp_path / "run" / "mstar"
+    sweep.first_size_requests(plan, arm, nano, i2v, 8640, arm_dir, [5], None, {"height": 480, "width": 832})
+    sweep.run_cell(plan, arm, nano, i2v, 1, 8640, arm_dir, [5])
+    assert Path(sent[0][1]) == (Path(nano.i2v_frames) / "00.png").resolve()  # the first-size request's frame
+    assert sent[1][0] == arm_dir / "set-video-i2v"

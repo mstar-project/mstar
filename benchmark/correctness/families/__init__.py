@@ -175,8 +175,8 @@ class Cosmos3WindowedVideo(Cosmos3Video):
 
 
 class Cosmos3I2V(Cosmos3Video):
-    """Image-to-video. diffusers 0.41 resizes the frame by cover-scale and center crop, so serve with
-    --override model_kwargs.conditioning_resize=aspect_crop (the Nano default is a plain stretch)."""
+    """Image-to-video. diffusers 0.41 resizes the frame by cover-scale and center crop, as mstar's default
+    conditioning_resize (aspect_crop) does."""
 
     image_to_video = True
 
