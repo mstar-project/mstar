@@ -485,9 +485,9 @@ def test_one_arms_scoring_error_keeps_the_others(tmp_path, monkeypatch):
 def test_moe_configs_reach_the_table(tmp_path):
     from benchmark.amd.launch import moe_configs_in_log
 
-    thinker = "E=128,N=768,K=2048,topk=8,device_name=AMD_Instinct_MI325X.json"
+    thinker = "E=128,N=1536,K=2048,device_name=AMD_Instinct_MI325X.json"
     log = tmp_path / "server.log"
-    log.write_text(f"INFO [worker_0] mstar.utils.fused_moe.config: fused MoE: tuned Triton configs from {thinker}\n"
+    log.write_text(f"INFO [worker_0] mstar.utils.fused_moe.kernels: fused MoE: tuned Triton configs from {thinker}\n"
                    "INFO Using configuration from /v/configs/E=128,N=768,device_name=AMD_Instinct_MI325X.json for "
                    "MoE layer.\nWARNING Using default MoE config. Performance might be sub-optimal! Config file not "
                    "found at /u/E=128,N=384,device_name=AMD_Instinct_MI325X.json, "
@@ -508,8 +508,8 @@ def test_moe_configs_reach_the_table(tmp_path):
         {"arm": "mstar", "row": "qwen3omni_colocated", "workload": "omni-text-speech", "concurrency": 1,
          "summary": {}, "flags": [], "errors": [], "status": "done"}))
     md = table.write(run).read_text()
-    assert "MoE E=128,N=768,K=2048,topk=8: AMD_Instinct_MI325X table" in md
-    assert "MoE E=128,N=384,K=1024,topk=6: NO tuned table, default launch config" in md and "moe-untuned" in md
+    assert "MoE E=128,N=1536,K=2048: AMD_Instinct_MI325X table" in md
+    assert "MoE E=128,N=768,K=1024: NO tuned table, default launch config" in md and "moe-untuned" in md
 
 
 def test_aitermoe_arm_serves_a_config_copy_with_its_model_kwargs_right_after_mstar(tmp_path, monkeypatch):
