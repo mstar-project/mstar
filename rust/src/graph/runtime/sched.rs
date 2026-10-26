@@ -102,31 +102,19 @@ struct Entry {
     group: i64,
 }
 
+/// `_Stage`: the pass's current attempt. Each backlogged key is tried on
+/// its backlog alone (when that fills a step), then with the scan's fresh
+/// rows; after them, the round-robin pick over the scan.
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
-    KeyLoop,
-    KeyScan,
-    KeyFresh,
-    FinalScan,
-    FinalPick,
-    /// `_park_other_walks`: a mixing chain at its cap parks its combined
-    /// walk's other ready rows
-    ParkScan,
+    BacklogOnly,
+    WithFresh,
+    Pick,
+    /// a mixing chain at its cap: park its combined walk's other ready rows
     Park,
 }
 
-/// Where a `_schedule_key` result goes.
-#[derive(Clone, Copy)]
-enum After {
-    /// the backlog-only attempt of `keys[ki]`
-    BacklogOnly,
-    /// `keys[ki]` with its fresh rows
-    KeyFresh,
-    /// the round-robin pick
-    Final,
-}
-
-/// A `_schedule_key` paused at its backlog's check.
+/// `_BacklogCheck`: a key's attempt paused at its backlog's check.
 struct KeyCtx {
     key: Key,
     entries: Vec<Entry>,
@@ -135,13 +123,13 @@ struct KeyCtx {
     batch: SBatch,
     waiting_rows: FxHashSet<u32>,
     cands: Vec<u32>,
-    after: After,
 }
 
+/// The check the pass waits on.
 enum Await {
-    /// the fresh scan: (rid, key, real walk) per requested row, and whether
-    /// it named an anchor
-    Scan { rows: Vec<(u32, Key, Sym)>, anchored: bool, then: Stage },
+    /// the scan: (rid, key, real walk) per requested row, and whether it
+    /// named an anchor
+    Scan { rows: Vec<(u32, Key, Sym)>, anchored: bool },
     Backlog(KeyCtx),
 }
 
@@ -374,9 +362,10 @@ impl GraphRuntime {
         (rids, node_idx, nodes, limit, Some(walks), anchor, by_anchor)
     }
 
-    /// `_schedule_key` up to its backlog's check; the rest is `sched_key_finish_ctx`.
+    /// `_start_key`: a key's attempt up to its backlog's check; the rest is
+    /// `sched_key_finish_ctx`.
     fn sched_key_start(
-        &mut self, p: &Pass, key: Key, entries: Vec<Entry>, anchor_group: Option<i64>, after: After,
+        &mut self, p: &Pass, key: Key, entries: Vec<Entry>, anchor_group: Option<i64>,
     ) -> PyResult<KeyStep> {
         if self.sched_room_left(key, p.pre_walk, p.pre)? == Some(0) {
             // the caller already holds a full batch
@@ -405,7 +394,7 @@ impl GraphRuntime {
             .map(|r| r.rid)
             .filter(|rid| !waiting_rows.contains(rid))
             .collect();
-        let ctx = KeyCtx { key, entries, anchor_group, batch, waiting_rows, cands, after };
+        let ctx = KeyCtx { key, entries, anchor_group, batch, waiting_rows, cands };
         if ctx.cands.is_empty() || limit <= 0 {
             return Ok(KeyStep::Done(self.sched_key_finish_ctx(p, ctx, &[], None)?));
         }
@@ -414,7 +403,7 @@ impl GraphRuntime {
         Ok(KeyStep::Check(ctx, req))
     }
 
-    /// The rest of `_schedule_key` for a key with a backlog: `_backlog_blocked`
+    /// `_finish_key`: the rest of a key's attempt: `_backlog_blocked`
     /// on the verdicts, then the build.
     fn sched_key_finish_ctx(
         &mut self, p: &Pass, ctx: KeyCtx, verdicts: &[u8], checked_anchor: Option<i64>,
@@ -668,7 +657,7 @@ impl GraphRuntime {
             keys: Vec::new(),
             ki: 0,
             ready: None,
-            stage: Stage::KeyLoop,
+            stage: Stage::BacklogOnly,
             awaiting: None,
         };
         if let Some(t) = p.target {
@@ -683,7 +672,7 @@ impl GraphRuntime {
                     // rows pay no check.
                     p.scan_target = Some(key_strings(self, t));
                     p.scan_exclude = Some(key_strings(self, (t.0, pre_walk.unwrap_or(t.1))));
-                    p.stage = Stage::ParkScan;
+                    p.stage = Stage::Park;
                     return self.sched_run(p, None, None, None);
                 }
                 // otherwise another walk's rows wait on their queues for the yield
@@ -723,136 +712,139 @@ impl GraphRuntime {
         Ok(())
     }
 
+    /// `_run`: advance the pass until it waits on a check or is done.
     fn sched_run(
         &mut self, mut p: Pass, verdicts: Option<&[u8]>, groups: Option<&[i64]>,
         anchor_group: Option<i64>,
     ) -> PyResult<(bool, Option<CheckOut>, Option<BatchOut>)> {
-        // a _schedule_key result still to act on, with where it goes
-        let mut result: Option<(Option<SBatch>, After)> = None;
         if let Some(aw) = p.awaiting.take() {
             let v = verdicts.ok_or_else(|| PyRuntimeError::new_err("sched_resume: verdicts missing"))?;
             match aw {
-                Await::Scan { rows, anchored, then } => {
+                Await::Scan { rows, anchored } => {
                     let rids: Vec<u32> = rows.iter().map(|r| r.0).collect();
                     self.sched_note_failed(&mut p, &rids, v)?;
                     p.ready = Some(Self::sched_ready_from(&rows, v, groups));
                     // the anchor's group only when the scan named one;
                     // otherwise the step anchors on its own first row
                     p.scan_anchor = if anchored { anchor_group } else { None };
-                    p.stage = then;
                 }
                 Await::Backlog(ctx) => {
                     self.sched_note_failed(&mut p, &ctx.cands.clone(), v)?;
-                    let after = ctx.after;
-                    result = Some((self.sched_key_finish_ctx(&p, ctx, v, anchor_group)?, after));
+                    let scheduled = self.sched_key_finish_ctx(&p, ctx, v, anchor_group)?;
+                    if let Some(done) = Self::sched_attempted(&mut p, scheduled) {
+                        return Ok(self.sched_done(done));
+                    }
                 }
             }
         }
         loop {
-            if let Some((scheduled, after)) = result.take() {
-                match after {
-                    After::BacklogOnly => {
-                        if scheduled.is_some() {
-                            return Ok(self.sched_done(scheduled));
-                        }
-                        p.stage = Stage::KeyScan;
-                    }
-                    After::KeyFresh => {
-                        if scheduled.is_some() {
-                            return Ok(self.sched_done(scheduled));
-                        }
-                        p.ki += 1;
-                        p.stage = Stage::KeyLoop;
-                    }
-                    After::Final => return Ok(self.sched_done(scheduled)),
-                }
-            }
-            match p.stage {
-                Stage::KeyLoop => {
-                    if p.ki >= p.keys.len() {
-                        p.stage = Stage::FinalScan;
+            let (key, entries, anchor_group) = match p.stage {
+                Stage::BacklogOnly => {
+                    if p.ki == p.keys.len() {
+                        p.stage = Stage::Pick;
                         continue;
                     }
-                    let key = p.keys[p.ki];
                     // no fresh row could join a step its backlog fills,
                     // unless every backlogged row is blocked
-                    if self.sched_backlog_fills(&p, key)? {
-                        match self.sched_key_start(&p, key, Vec::new(), None, After::BacklogOnly)? {
-                            KeyStep::Done(b) => result = Some((b, After::BacklogOnly)),
-                            KeyStep::Check(ctx, req) => return Ok(self.sched_suspend(p, Await::Backlog(ctx), req)),
-                        }
-                    } else {
-                        p.stage = Stage::KeyScan;
+                    if !self.sched_backlog_fills(&p, p.keys[p.ki])? {
+                        p.stage = Stage::WithFresh;
+                        continue;
                     }
+                    (p.keys[p.ki], Vec::new(), None)
                 }
-                Stage::KeyScan | Stage::FinalScan | Stage::ParkScan => {
-                    let then = match p.stage {
-                        Stage::KeyScan => Stage::KeyFresh,
-                        Stage::FinalScan => Stage::FinalPick,
-                        _ => Stage::Park,
+                _ => {
+                    // scanned once, when a step could first take fresh rows
+                    if p.ready.is_none() {
+                        if let Some((aw, req)) = self.sched_scan(&mut p) {
+                            return Ok(self.sched_suspend(p, aw, req));
+                        }
+                    }
+                    let key = match p.stage {
+                        Stage::Park => {
+                            self.sched_park_other_walks(&p)?;
+                            return Ok(self.sched_done(None));
+                        }
+                        Stage::WithFresh => p.keys[p.ki],
+                        _ => match self.sched_rr_pick(&p)? {
+                            Some(key) => key,
+                            None => return Ok(self.sched_done(None)),
+                        },
                     };
-                    if p.ready.is_some() {
-                        p.stage = then;
-                        continue;
-                    }
-                    let rows = self.sched_scan_rows(&p);
-                    if rows.is_empty() {
-                        p.ready = Some(Vec::new());
-                        p.stage = then;
-                        continue;
-                    }
-                    let rids: Vec<u32> = rows.iter().map(|r| r.0).collect();
-                    let keys: Vec<Key> = rows.iter().map(|r| r.1).collect();
-                    // the anchor's group, for a step the scan was narrowed to
-                    let anchor = if p.target.is_some() { p.anchor } else { None };
-                    let req = self.check_out(rids, &keys, -1, anchor, false);
-                    let aw = Await::Scan { rows, anchored: anchor.is_some(), then };
-                    return Ok(self.sched_suspend(p, aw, req));
+                    (key, Self::ready_for(&p, key), p.scan_anchor)
                 }
-                Stage::Park => {
-                    let key = p.target.expect("a park pass has a target");
-                    let entries = Self::ready_for(&p, key);
-                    if !entries.is_empty() {
-                        if let Some(parked) = self.sched_assemble(key, &entries)? {
-                            self.sched_park(key, parked)?;
-                        }
-                    }
-                    return Ok(self.sched_done(None));
-                }
-                Stage::KeyFresh => {
-                    let key = p.keys[p.ki];
-                    let entries = Self::ready_for(&p, key);
-                    match self.sched_key_start(&p, key, entries, p.scan_anchor, After::KeyFresh)? {
-                        KeyStep::Done(b) => result = Some((b, After::KeyFresh)),
-                        KeyStep::Check(ctx, req) => return Ok(self.sched_suspend(p, Await::Backlog(ctx), req)),
-                    }
-                }
-                Stage::FinalPick => {
-                    // A walk with no room (a cap of 0) takes nothing, so it
-                    // stays the least recent; picked anyway, it would starve
-                    // the walk that frees the room.
-                    let mut best: Option<(Key, u64)> = None;
-                    for (key, _) in p.ready.as_deref().unwrap_or(&[]) {
-                        if self.sched_cfg(*key)?.cap(key.1) == Some(0) {
-                            continue;
-                        }
-                        let last = self.sched.last_batch.get(key).copied().unwrap_or(0);
-                        if best.is_none_or(|(_, b)| last < b) {
-                            best = Some((*key, last));
-                        }
-                    }
-                    let Some((rr, _)) = best else { return Ok(self.sched_done(None)) };
-                    if p.keys.contains(&rr) {
-                        return Ok(self.sched_done(None));
-                    }
-                    let entries = Self::ready_for(&p, rr);
-                    match self.sched_key_start(&p, rr, entries, p.scan_anchor, After::Final)? {
-                        KeyStep::Done(b) => result = Some((b, After::Final)),
-                        KeyStep::Check(ctx, req) => return Ok(self.sched_suspend(p, Await::Backlog(ctx), req)),
+            };
+            match self.sched_key_start(&p, key, entries, anchor_group)? {
+                KeyStep::Check(ctx, req) => return Ok(self.sched_suspend(p, Await::Backlog(ctx), req)),
+                KeyStep::Done(scheduled) => {
+                    if let Some(done) = Self::sched_attempted(&mut p, scheduled) {
+                        return Ok(self.sched_done(done));
                     }
                 }
             }
         }
+    }
+
+    /// `_attempted`: where an attempt leaves the pass. `Some(step)` when it
+    /// is done (the round-robin pick is the last attempt); None when it goes
+    /// on to the key's fresh attempt or the next key.
+    fn sched_attempted(p: &mut Pass, scheduled: Option<SBatch>) -> Option<Option<SBatch>> {
+        if scheduled.is_some() || p.stage == Stage::Pick {
+            return Some(scheduled);
+        }
+        if p.stage == Stage::BacklogOnly {
+            p.stage = Stage::WithFresh;
+        } else {
+            p.ki += 1;
+            p.stage = Stage::BacklogOnly;
+        }
+        None
+    }
+
+    /// `_scan_request`: the scan's check, or None (and an empty scan) when
+    /// no row is graph-ready.
+    fn sched_scan(&self, p: &mut Pass) -> Option<(Await, CheckOut)> {
+        let rows = self.sched_scan_rows(p);
+        if rows.is_empty() {
+            p.ready = Some(Vec::new());
+            return None;
+        }
+        let rids: Vec<u32> = rows.iter().map(|r| r.0).collect();
+        let keys: Vec<Key> = rows.iter().map(|r| r.1).collect();
+        // the anchor's group, for a step the scan was narrowed to
+        let anchor = if p.scan_target.is_some() { p.anchor } else { None };
+        let req = self.check_out(rids, &keys, -1, anchor, false);
+        Some((Await::Scan { rows, anchored: anchor.is_some() }, req))
+    }
+
+    /// `_rr_pick`: the least recently scheduled key with fresh rows, unless
+    /// the pass already tried it as a backlogged key. A walk with no room (a
+    /// cap of 0) takes nothing, so it stays the least recent; picked anyway,
+    /// it would starve the walk that frees the room.
+    fn sched_rr_pick(&self, p: &Pass) -> PyResult<Option<Key>> {
+        let mut best: Option<(Key, u64)> = None;
+        for (key, _) in p.ready.as_deref().unwrap_or(&[]) {
+            if self.sched_cfg(*key)?.cap(key.1) == Some(0) {
+                continue;
+            }
+            let last = self.sched.last_batch.get(key).copied().unwrap_or(0);
+            if best.is_none_or(|(_, b)| last < b) {
+                best = Some((*key, last));
+            }
+        }
+        Ok(best.map(|(key, _)| key).filter(|key| !p.keys.contains(key)))
+    }
+
+    /// `_park_other_walks`: backlog the scan's rows of the target's combined
+    /// walk (the scan left out the chain's own walk).
+    fn sched_park_other_walks(&mut self, p: &Pass) -> PyResult<()> {
+        let key = p.target.expect("a park pass has a target");
+        let entries = Self::ready_for(p, key);
+        if !entries.is_empty() {
+            if let Some(parked) = self.sched_assemble(key, &entries)? {
+                self.sched_park(key, parked)?;
+            }
+        }
+        Ok(())
     }
 
     fn ready_for(p: &Pass, key: Key) -> Vec<Entry> {
