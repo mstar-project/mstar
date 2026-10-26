@@ -26,6 +26,7 @@ import dataclasses
 import fnmatch
 import logging
 import re
+from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, NamedTuple
@@ -61,7 +62,29 @@ class AdapterRoot(NamedTuple):
     checkpoint_prefix: str
 
 
-class ModuleLoraMap:
+class LoraMap(ABC):
+    """A ``LoraSpec.module_map`` declared from a model's modules, which binding reads:
+    places a checkpoint module on the spec's targets, says why one lands on none, and
+    gives the map that binds each node's modules."""
+
+    @abstractmethod
+    def __call__(self, module: str) -> LoraModuleRef | None:
+        ...
+
+    @abstractmethod
+    def explain(self, module: str) -> str | None:
+        """Why ``module`` lands on no target, when the walk recorded a reason."""
+
+    @abstractmethod
+    def ignores(self, module: str) -> bool:
+        """``LoraSpec.ignored_modules``: a module the model never runs."""
+
+    @abstractmethod
+    def part(self, node: str) -> ModuleLoraMap:
+        """The map that binds ``node``'s modules."""
+
+
+class ModuleLoraMap(LoraMap):
     """Places a checkpoint module on the spec's targets, through the module the weight
     loader fills: the module path (or its rewrite under each ``AdapterRoot``, then
     ``aliases``) goes through the loader's ``CheckpointRules`` (prefix, remap, stacked
@@ -143,15 +166,13 @@ class ModuleLoraMap:
         )
 
     def ignores(self, module: str) -> bool:
-        """``LoraSpec.ignored_modules``: a module the model never runs (``ignore``)."""
         return any(fnmatch.fnmatchcase(module, p) for p in self._ignore)
 
     def part(self, node: str) -> ModuleLoraMap:
-        """The map that binds ``node``'s modules: this one, for one node's spec."""
         return self
 
 
-class _JoinedLoraMap:
+class _JoinedLoraMap(LoraMap):
     """Several nodes' ``ModuleLoraMap``s as one spec's (``join_lora_specs``): a
     checkpoint module goes to the node whose adapter roots claim it most specifically,
     which places or refuses it."""
@@ -452,7 +473,7 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> None
         if not isinstance(pool, LoraAdapterPool):
             continue
         spec = pool.spec
-        if not isinstance(spec.module_map, ModuleLoraMap | _JoinedLoraMap):
+        if not isinstance(spec.module_map, LoraMap):
             raise ValueError(
                 f"LoRA resource {key!r} was not declared with `module_lora_spec`, so nothing "
                 "binds the node's modules to it; build the node's spec with `module_lora_spec`"

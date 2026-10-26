@@ -297,7 +297,7 @@ class LoraSpec(NodeResourceSpec):
     it, requests on other adapters are held back until a slot drains (counted in the
     pool's steps). ``module_map`` places each checkpoint module on a target; a node's
     spec comes from ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose
-    ``ModuleLoraMap`` is what binds the node's modules, and a pool built with any other
+    ``LoraMap`` is what binds the node's modules, and a pool built with any other
     resolver is refused at bind. ``convert_keys`` rewrites a model-native checkpoint
     layout first. ``declare`` gives ``num_layers``, ``targets``, ``module_map`` and
     ``ignored_modules`` in place of passing them, on their first read: ``module_lora_spec``
