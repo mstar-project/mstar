@@ -1154,7 +1154,15 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">AllocationFailed</span><span class="p">(</span><span class="n">AdmitFailedReason</span><span class="p">):</span>
     <span class="n">pages_short</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">label</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span></div>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="c1"># How many of the step's requests, in its order, the free pages held, and</span>
+    <span class="c1"># how many the pool would hold with nothing else resident, out of the</span>
+    <span class="c1"># ``rows_sized`` it counted; None when the resource does not say. The</span>
+    <span class="c1"># worker sizes the retry from them. A row the prefix cache served whole</span>
+    <span class="c1"># runs no step, so it is in the worker's batch but not in ``rows_sized``.</span>
+    <span class="n">rows_fit</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">rows_fit_alone</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">rows_sized</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
