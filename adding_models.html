@@ -246,6 +246,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -1600,6 +1601,17 @@ that is numerically sensitive. Such a submodule sets <code class="docutils liter
 engine then does not cast its parameters to the autocast dtype, does not wrap its
 forward in autocast, and explicitly disables any enclosing autocast. These two class
 attributes replace the removed <code class="docutils literal notranslate"><span class="pre">get_stateless_flavor</span></code> method.</p>
+<p>The engine runs float32 matmuls as TF32 in every process
+(<code class="docutils literal notranslate"><span class="pre">torch.set_float32_matmul_precision(&quot;high&quot;)</span></code>). A node that needs full fp32, for
+example a flow solve that amplifies TF32 rounding, sets
+<code class="docutils literal notranslate"><span class="pre">float32_matmul_precision</span> <span class="pre">=</span> <span class="pre">&quot;highest&quot;</span></code>, and <code class="docutils literal notranslate"><span class="pre">cudnn_allow_tf32</span> <span class="pre">=</span> <span class="pre">False</span></code> for cuDNN
+convolutions and RNNs. The engine applies these around that node’s forward, its
+compile and its CUDA-graph capture, and restores the default afterwards, so other
+nodes keep TF32. <code class="docutils literal notranslate"><span class="pre">None</span></code> (the default) keeps the process setting. Don’t flip
+<code class="docutils literal notranslate"><span class="pre">torch.backends</span></code> flags in model code: they are process-wide, and a CUDA graph keeps
+the precision it was captured with. The setting covers <code class="docutils literal notranslate"><span class="pre">forward</span></code> and
+<code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> only, not <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> or <code class="docutils literal notranslate"><span class="pre">postprocess</span></code>. It can also be set
+per instance in <code class="docutils literal notranslate"><span class="pre">__init__</span></code>, for example only when the model loads in fp32.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">postprocess(...)</span></code> (optional)</dt><dd><p>Metadata-only fixups that run on the GPU thread. This method must not read tensor
 values. Do not call <code class="docutils literal notranslate"><span class="pre">.item()</span></code>, <code class="docutils literal notranslate"><span class="pre">.cpu()</span></code> or <code class="docutils literal notranslate"><span class="pre">.tolist()</span></code> here. This is a

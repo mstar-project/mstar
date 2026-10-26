@@ -600,6 +600,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_runner.html">mstar.engine.accelerator_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
@@ -1223,6 +1224,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.engine.html#mstar.engine.apply_dynamo_config">apply_dynamo_config() (in module mstar.engine)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.sampler.config.SamplerStep.apply_filters">apply_filters (mstar.engine.resources.sampler.config.SamplerStep attribute)</a>
 
       <ul>
@@ -2707,6 +2710,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.page_copier.html#mstar.engine.resources.kv.page_copier.CudartCopier">CudartCopier (class in mstar.engine.resources.kv.page_copier)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.fp32_precision.html#mstar.engine.fp32_precision.Fp32Precision.cudnn_allow_tf32">cudnn_allow_tf32 (mstar.engine.fp32_precision.Fp32Precision attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.cudnn_allow_tf32">(mstar.model.submodule_base.NodeSubmodule attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.curr_iter">curr_iter (mstar.graph.base.Loop attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.current">current (mstar.engine.resources.kv.bounded.manager.BoundedKVManager property)</a>
@@ -3693,6 +3702,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.flex.html#mstar.engine.resources.attn.flex.FlexAttentionManager">FlexAttentionManager (class in mstar.engine.resources.attn.flex)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.float32_matmul_precision">float32_matmul_precision (mstar.model.submodule_base.NodeSubmodule attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#mstar.engine.accelerator_graph_runner.CapturePlan.floor">floor (mstar.engine.accelerator_graph_runner.CapturePlan attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3SchedulerConfig.flow_shift">flow_shift (mstar.model.cosmos3.config.Cosmos3SchedulerConfig attribute)</a>
@@ -3974,6 +3985,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TransferReadInfo.fp">fp (mstar.communication.tensors.TransferReadInfo attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.components.layers.html#mstar.model.waypoint.components.layers.fp32_matmul_highest">fp32_matmul_highest() (in module mstar.model.waypoint.components.layers)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.fp32_precision.html#mstar.engine.fp32_precision.fp32_precision_scope">fp32_precision_scope() (in module mstar.engine.fp32_precision)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.fp32_precision.html#mstar.engine.fp32_precision.Fp32Precision">Fp32Precision (class in mstar.engine.fp32_precision)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.VideoGenerationRequest.fps">fps (mstar.api_server.openai.protocol.VideoGenerationRequest attribute)</a>
 
@@ -5739,6 +5754,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.waypoint.components.html#mstar.model.waypoint.components.WaypointDiT.materialize_runtime_tables">(mstar.model.waypoint.components.WaypointDiT method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.fp32_precision.html#mstar.engine.fp32_precision.Fp32Precision.matmul">matmul (mstar.engine.fp32_precision.Fp32Precision attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.max_action_dim">max_action_dim (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -6262,6 +6279,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.accelerator_graph_config.html#module-mstar.engine.accelerator_graph_config">mstar.engine.accelerator_graph_config</a>
 </li>
         <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#module-mstar.engine.accelerator_graph_runner">mstar.engine.accelerator_graph_runner</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.fp32_precision.html#module-mstar.engine.fp32_precision">mstar.engine.fp32_precision</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.html#module-mstar.engine.resources">mstar.engine.resources</a>
 </li>
@@ -6890,6 +6909,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.accelerator_graph_runner.html#module-mstar.engine.accelerator_graph_runner">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.engine.fp32_precision
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.fp32_precision.html#module-mstar.engine.fp32_precision">module</a>
 </li>
       </ul></li>
       <li>
@@ -8438,6 +8464,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.no_timestamps_token_id">no_timestamps_token_id (mstar.model.whisper.config.WhisperModelConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.NodeAndGraphWalk.node">node (mstar.graph.base.NodeAndGraphWalk attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.fp32_precision.html#mstar.engine.fp32_precision.node_fp32_precision">node_fp32_precision() (in module mstar.engine.fp32_precision)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.node_name">node_name (mstar.graph.base.ReadySignals attribute)</a>
 

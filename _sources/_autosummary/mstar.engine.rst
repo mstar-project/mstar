@@ -13,6 +13,7 @@
 
    .. autosummary::
    
+      apply_dynamo_config
       apply_torch_config
       recompile_limit
    
@@ -38,6 +39,7 @@
    accelerator_graph_config
    accelerator_graph_runner
    engine
+   fp32_precision
    resources
    windowing
 
