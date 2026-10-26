@@ -987,6 +987,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return None
 
+    def on_request_added(self, request_id: int, request_info: CurrentForwardPassInfo) -> None:
+        """The request has reached this worker; none of its steps has run yet.
+
+        Runs on the worker's main thread, so host work worth starting early
+        belongs on a thread of the submodule's own, and nothing here may touch
+        the device. State goes in :meth:`request_state`, which the removal of
+        the request frees. Default: nothing.
+        """
+
     def cleanup_request(self, request_id: str):
         """Remove per-request state when a request completes. The engines call
         this on request removal; overrides with extra internal state should
