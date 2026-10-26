@@ -72,41 +72,50 @@ def _state(w):
     )
 
 
-def _drive(replayed: _Wrapper, steps: int, change_at: int | None = None):
+def _drive(replayed: _Wrapper, steps: int, change_at: int | None = None, synthetic=_synthetic):
     """Plan the same random steps on ``replayed`` through ``PlanReplay`` and
-    on a twin through its own plan; their states must agree every step."""
+    on a twin through its own plan; their states must agree every step.
+    Returns the replay and how many of the steps the wrapper planned itself."""
     twin = _Wrapper(replayed.extra)
-    replay = PlanReplay(replayed, _synthetic)
+    replay = PlanReplay(replayed, synthetic)
     rng = np.random.default_rng(0)
+    own = 0
     for i in range(steps):
         if i == change_at:
             replayed.extra = twin.extra = lambda lens: int(lens[0]) * 3
         arrays = _step(rng)
 
-        def own_plan(a):
+        def own_plan(a, arrays=arrays):
+            nonlocal own
+            own += a is arrays
             replayed.plan(a["kv_indptr"], a["kv_lens"], causal=True)
 
-        replay.plan((torch.bfloat16, True), arrays, own_plan)
+        replay.plan((torch.bfloat16, True), lambda a=arrays: a, own_plan)
         twin.plan(arrays["kv_indptr"], arrays["kv_lens"], causal=True)
         assert _state(replayed) == _state(twin), f"step {i}"
-    return replay
+    return replay, own
 
 
 def test_a_replay_plans_as_the_wrapper_does():
-    w = _Wrapper()
-    steps = plan_replay._CHECK_FIRST + 40
-    _drive(w, steps)
-    # learning and the checked steps used the wrapper's plan; the rest replayed
-    assert w.plans[0] == plan_replay._N_SYNTHETIC + plan_replay._CHECK_FIRST
+    _, own = _drive(_Wrapper(), plan_replay._CHECK_FIRST + 40)
+    # the checked steps used the wrapper's plan; the rest replayed
+    assert own == plan_replay._CHECK_FIRST
 
 
 def test_what_cannot_be_learned_keeps_the_wrappers_plan():
     w = _Wrapper(extra=lambda lens: float(lens.sum()) / 7)  # no derivation gives this
-    replay = _drive(w, 30)
-    assert all(r is None for r in replay._replays.values())
+    replay, own = _drive(w, 30)
+    assert all(r is None for r in replay._replays.values()) and own == 30
 
 
 def test_a_plan_that_changes_turns_the_replay_off():
-    w = _Wrapper()
-    replay = _drive(w, plan_replay._CHECK_FIRST + 10, change_at=3)
+    replay, own = _drive(_Wrapper(), plan_replay._CHECK_FIRST + 10, change_at=3)
     assert all(r is None for r in replay._replays.values())
+    assert own == plan_replay._CHECK_FIRST + 10
+
+
+def test_steps_that_repeat_an_array_teach_nothing():
+    """A buffer holding the same array every step cannot be told from a
+    copy of it, so nothing is learned from such steps."""
+    replay, own = _drive(_Wrapper(), 10, synthetic=lambda n: [_step(np.random.default_rng(0))] * n)
+    assert all(r is None for r in replay._replays.values()) and own == 10
