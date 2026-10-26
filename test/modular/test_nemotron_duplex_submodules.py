@@ -187,14 +187,14 @@ def test_nano_captures_the_decode_step():
     only, whose dummy row is a fused frame (host-only prepare_inputs shape)
     and whose largest bucket fits the model's default recurrent-pool sizing
     (padding rows take a slot each during the step)."""
-    from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
     from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 
     nano = _make_nano()
-    configs = nano.get_cuda_graph_configs(torch.device("cpu"))
+    configs = nano.get_accelerator_graph_configs(torch.device("cpu"))
     assert len(configs) == 1
     cfg = configs[0]
-    assert isinstance(cfg, BatchedCudaGraphConfig)
+    assert isinstance(cfg, BatchedAcceleratorGraphConfig)
     assert cfg.capture_graph_walk == "decode" and cfg.replay_graph_walks == ["decode"]
     assert cfg.compile is False and cfg.additional_key_info == nano.DECODE_KEY
     assert max(cfg.capture_batch_sizes) <= NemotronDuplexModel.DEFAULT_MAMBA_SLOTS

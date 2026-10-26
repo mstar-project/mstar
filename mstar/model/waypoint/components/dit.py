@@ -154,6 +154,9 @@ class WaypointDiT(nn.Module):
         )
         # Per (device, dtype) sigma schedule; see _sigma_schedule.
         self._sigma_cache: dict[tuple[torch.device, torch.dtype], Tensor] = {}
+        # [S, 1, D] noise embedding per scheduled sigma, built eagerly by
+        # materialize_runtime_tables; forward reads its row instead of the island
+        self._cond_rows: Tensor | None = None
         self._regions_compiled = False
 
         # Tie now so a plain (non-meta) build is already correct; retie after
@@ -228,13 +231,16 @@ class WaypointDiT(nn.Module):
 
         Each cond is built at M=1, exactly as ``forward`` receives it, so
         cached rows are bit-identical to the live projection they replace.
-        Runs after weight load, before ``compile_regions``.
+        Runs after weight load, before ``compile_regions``. The conds are kept
+        too: built eagerly they get the island's IEEE fp32, which a compiled
+        region cannot pin.
         """
         sigmas = self._sigma_schedule(device, self.dtype)
         with torch.no_grad():
             conds = torch.cat(
                 [self.denoise_step_emb(s.view(1, 1)) for s in sigmas], dim=0
             )  # [S, 1, D], one M=1 embedding per scheduled sigma
+        self._cond_rows = conds
         for block in self.blocks:
             block.cond_head.build_cache(conds)
 
@@ -299,7 +305,10 @@ class WaypointDiT(nn.Module):
             x_pos=pos_ids.x_pos, y_pos=pos_ids.y_pos, t_pos=pos_ids.t_pos
         )
 
-        cond = self.denoise_step_emb(sigma)  # [B, N, D], fp32 island
+        if self._cond_rows is not None:
+            cond = self._cond_rows[cond_idx].expand(B, N, -1)  # the island's row for this sigma
+        else:
+            cond = self.denoise_step_emb(sigma)  # [B, N, D], fp32 island
         # Positional, and in this order — see ControllerInputEmbedding.
         ctrl_emb = self.ctrl_emb(mouse, button, scroll)  # [B, N, D]
 

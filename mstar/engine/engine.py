@@ -4,21 +4,23 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
-from mstar.engine.cuda_graph_runner import (
-    CudaGraphRunner,
-    PiecewiseCudaGraphRunner,
+from mstar.engine.accelerator_graph_runner import (
+    AcceleratorGraphRunner,
+    CapturePlan,
+    PiecewiseAcceleratorGraphRunner,
     autocast_scope,
     fail_if_graphs_required,
+    plan_captures,
 )
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -32,7 +34,7 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
@@ -42,6 +44,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.graph.runtime.base import GraphRuntime
+from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
@@ -53,18 +56,22 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
-from mstar.utils.ipc_format import OffloadDelta
+from mstar.utils.device import DeviceCapability
+from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
-    PHASE_PERIOD,
+    PhaseLaps,
     mark,
     nvtx_enabled,
-    phase_record,
+    phase_end,
+    phase_start,
     range_pop,
     range_push,
 )
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.kv.manager import KVManager
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
@@ -105,6 +112,13 @@ def checkpoint_identity(path: str | Path) -> bytes:
     return fingerprint(*parts)
 
 
+class PagedKVCache(NamedTuple):
+    key: str
+    # the nodes on this engine that use it
+    nodes: frozenset[str]
+    cache: "KVManager"
+
+
 @dataclass
 class SubmoduleManagement:
     submodule: NodeSubmodule
@@ -112,7 +126,10 @@ class SubmoduleManagement:
     forward_batched: Callable
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
-    cuda_graph_runner: CudaGraphRunner | None = None
+    accelerator_graph_runner: AcceleratorGraphRunner | None = None
+    # the runner capture ran with, graphs or none: a bucket it didn't capture
+    # runs eager, and the floor covers eager steps only up to its largest
+    capture_runner: AcceleratorGraphRunner | None = None
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -127,7 +144,7 @@ class SubmoduleManagement:
 
     # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
-    piecewise_runners: dict[str, PiecewiseCudaGraphRunner] = field(
+    piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
 
@@ -258,7 +275,7 @@ class ExecutingBatch:
     cg_key_info: Any | None = None
 
     # Populated on preplan
-    preplan_event: torch.cuda.Event | None = None
+    preplan_event: Any | None = None
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
@@ -274,22 +291,25 @@ class ExecutingBatch:
     )
     # rids for which this step ends every finite stream into the node; the
     # consumer flushes what it held back
-    final_stream_rids: set[str] = field(default_factory=set)
+    final_stream_rids: set[int] = field(default_factory=set)
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
     # rids for which this step ends every finite stream into the partition;
     # this step reports the partition done
-    stream_partition_done_rids: set[str] = field(default_factory=set)
+    stream_partition_done_rids: set[int] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
-    skipped_rids: set[str] = field(default_factory=set)
+    skipped_rids: set[int] = field(default_factory=set)
+    # rids whose whole walk this node's resources already hold. They run no
+    # forward, but their node still completes so the request reaches its next walk.
+    cached_rids: set[str] = field(default_factory=set)
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
-    failed_requests: dict[str, str] = field(default_factory=dict)
+    failed_requests: dict[int, str] = field(default_factory=dict)
 
     admit_error: AdmitFailedReason | None = None
     # the resource that ran out, so an eviction can be scoped to it
@@ -300,6 +320,11 @@ class ExecutingBatch:
     # dicts and the per-request ``postprocess`` is skipped; the stop check,
     # the inline emit and the speculation splice read the rows instead.
     rows_only: bool = False
+
+    # A mixed step's rows whose own walk keeps every output signal on the
+    # device: such a row loops back as it would in a step of its walk alone,
+    # while the step's other rows route tensors.
+    loopback_rids: frozenset = frozenset()
 
     # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
@@ -322,7 +347,7 @@ class ExecutingBatch:
 
     # Recorded on the default stream once this step's GPU work is submitted;
     # what a reader of the output values has to wait on.
-    completion_event: torch.cuda.Event | None = None
+    completion_event: Any | None = None
 
     # Set by exec right before the forward's CUDA launch (where torch drops the
     # GIL). A worker that submitted this batch to the GPU thread and then wants
@@ -374,14 +399,18 @@ class ExecutingBatch:
         self.outputs_ready.set()
         self.commit_done.set()
 
-    def register_failure(self, rid: str, error: Exception):
+    def register_failure(self, rid: int, error: Exception):
         self.failed_requests[rid] = f"{type(error).__name__}: {error}"
 
-    def drop_rids(self, rids: set[str]):
+    def drop_rids(self, rids: set[int]):
         """Take rids out of the step, leaving the rest of the batch intact."""
         if not rids:
             return
         self.request_ids = [rid for rid in self.request_ids if rid not in rids]
+        # A row that does not run this step must not end its streams on it:
+        # the worker would stop its loop and finalize a row it no longer has.
+        self.final_stream_rids.difference_update(rids)
+        self.stream_partition_done_rids.difference_update(rids)
         self.per_request_info = {
             rid: info for rid, info in self.per_request_info.items()
             if rid not in rids
@@ -409,15 +438,33 @@ class ExecutingBatch:
 
 
 class Engine:
+    @property
+    def device_capability(self) -> DeviceCapability:
+        capability = getattr(self, "_device_capability", None)
+        if capability is None:
+            capability = self._device_capability = DeviceCapability.of(self._device or "cpu")
+        return capability
+
     def __init__(
         self, graph_runtime: GraphRuntime,
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
         enable_profile: bool=False,
+        gpu_memory_fraction: float | None = None,
+        device_capability: DeviceCapability | None = None,
     ):
+        assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
+            f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
+        )
         self._device = None
+        self._device_capability = device_capability
         self._autocast_dtype = autocast_dtype
+        # the share of the device this worker's allocations may hold once
+        # capture is done, None for whatever is free
+        self._gpu_memory_fraction = gpu_memory_fraction
         self._resources: dict[str, Resource] = {}
+        # resource key -> the nodes on this engine that use it
+        self._resource_nodes: dict[str, frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
@@ -446,6 +493,8 @@ class Engine:
         model: "Model | None" = None,
     ):
         self._device = device
+        if self._device_capability is None or self._device_capability.device != device:
+            self._device_capability = DeviceCapability.of(device)
         self._enable_nvtx = nvtx_enabled(self._enable_nvtx, device)
         if kv_cache_type is None:
             kv_cache_type = self._autocast_dtype
@@ -497,11 +546,15 @@ class Engine:
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
+                    max_rows_in_combined=self._max_rows_in_combined(
+                        spec.resource_key, relevant_nodes, submodules, model,
+                    ),
                 ),
             )
 
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
+            self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -541,14 +594,29 @@ class Engine:
                     if enable is not None:
                         enable()
 
+    def paged_kv_caches(self) -> list[PagedKVCache]:
+        """Every paged KV cache this engine built, with the nodes that use it."""
+        from mstar.engine.resources.kv.manager import KVManager
+
+        return [
+            PagedKVCache(key, self._resource_nodes[key], resource)
+            for key, resource in self._resources.items()
+            if isinstance(resource, KVManager)
+        ]
+
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
 
         Compiles each submodule's ``forward`` and ``forward_batched`` with the
         default mode (fullgraph=False, dynamic=None), which in general provides
         performance gains without frequent slow recompiles.
+
+        A node in ``_item_encoders`` is compiled with dynamic=True instead. Under
+        the default it recompiles on its second input shape and the new graph
+        rounds differently, so the KV cached from its earlier outputs would no
+        longer match what it computes.
         """
-        if not torch.cuda.is_available():
+        if not self.device_capability.is_available:
             return
 
         for node_name, submodule_mgmt in self._submodules.items():
@@ -558,17 +626,19 @@ class Engine:
                 logger.info("Engine: torch.compile disabled for %s (submodule opt-out)", node_name)
                 continue
 
+            dynamic = True if node_name in self._item_encoders else None
             try:
-                submodule_mgmt.forward = torch.compile(
+                # no token count, these serve eager batches of any size
+                submodule_mgmt.forward = with_inductor_overrides(torch.compile(
                     submodule.forward,
                     fullgraph=False,
-                    dynamic=None,
-                )
-                submodule_mgmt.forward_batched = torch.compile(
+                    dynamic=dynamic,
+                ))
+                submodule_mgmt.forward_batched = with_inductor_overrides(torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
-                    dynamic=None,
-                )
+                    dynamic=dynamic,
+                ))
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
                 logger.warning(
@@ -581,11 +651,11 @@ class Engine:
         return None if submodule.disable_autocast else self._autocast_dtype
 
     def warmup(self) -> None:
-        cg_runners: dict[str, CudaGraphRunner] = {}
-        piecewise: dict[str, dict[str, PiecewiseCudaGraphRunner]] = {}
+        ag_runners: dict[str, AcceleratorGraphRunner] = {}
+        piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
-            cg_runners[node_name] = CudaGraphRunner(
+            ag_runners[node_name] = AcceleratorGraphRunner(
                 submodule_name=node_name,
                 submodule=submodule,
                 resources=submodule_mgmt.resources,
@@ -594,7 +664,8 @@ class Engine:
                 autocast_dtype=self._autocast_dtype_for(submodule),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
-                enable_nvtx=self._enable_nvtx
+                enable_nvtx=self._enable_nvtx,
+                device_capability=self.device_capability,
             )
             piecewise[node_name] = self._build_piecewise_runners(
                 node_name, submodule_mgmt
@@ -604,26 +675,44 @@ class Engine:
         # nodes share resources, so a build driven by a later node would move
         # buffers an earlier node's graphs already recorded the address of.
         for node_name in self._submodules:
-            cg_runners[node_name].prepare_for_capture()
+            ag_runners[node_name].prepare_for_capture()
             for runner in piecewise[node_name].values():
                 runner.prepare_for_capture()
 
-        for node_name, submodule_mgmt in self._submodules.items():
-            runner = cg_runners[node_name]
-            runner.warmup_and_capture()
-            if runner.any_graphs:
-                submodule_mgmt.cuda_graph_runner = runner
+        # every bucket sized before any is captured, so one plan weighs them all
+        # against the largest eager step on the device
+        plan = self._plan_captures(ag_runners, piecewise)
 
-            captured: dict[str, PiecewiseCudaGraphRunner] = {}
-            for label, pw_runner in piecewise[node_name].items():
-                pw_runner.warmup_and_capture()
-                if pw_runner.any_graphs:
-                    captured[label] = pw_runner
+        for node_name, submodule_mgmt in self._submodules.items():
+            runner = ag_runners[node_name]
+            with self._capture_into(plan, node_name) as planned:
+                runner.warmup_and_capture(planned)
+            if plan is not None or runner.any_graphs:
+                submodule_mgmt.capture_runner = runner
+            if runner.any_graphs:
+                submodule_mgmt.accelerator_graph_runner = runner
+
+            captured: dict[str, PiecewiseAcceleratorGraphRunner] = {}
+            with self._capture_into(plan, f"{node_name} piecewise") as planned:
+                for label, pw_runner in piecewise[node_name].items():
+                    pw_runner.warmup_and_capture(
+                        None if planned is None else {bucket for region, bucket in planned if region == label}
+                    )
+                    if pw_runner.any_graphs:
+                        captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
+        if plan is not None:
+            torch.cuda.empty_cache()
+            free = torch.cuda.mem_get_info(self._device)[0]
+            logger.log(
+                logging.WARNING if free < plan.floor else logging.INFO,
+                "CapturePlan[%s]: %.0f MiB free after capture, %.0f for the largest eager step",
+                self._device, free / 2**20, plan.floor / 2**20,
+            )
 
         fail_if_graphs_required([
             f"{node_name} {key}"
-            for node_name, runner in cg_runners.items()
+            for node_name, runner in ag_runners.items()
             for key in runner.dropped_buckets
         ] + [
             f"{node_name} {label} bs={bs} total_tokens={tokens}"
@@ -639,32 +728,112 @@ class Engine:
         for resource in self._resources.values():
             resource.post_warmup_validate()
 
+    def _plan_captures(
+        self, ag_runners: dict[str, AcceleratorGraphRunner],
+        piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]],
+    ) -> CapturePlan | None:
+        """Size every bucket on the device, then plan which to capture.
+
+        None off CUDA: sizing reads CUDA's allocator, and asking the driver for
+        memory would fail a CPU worker at start. With no plan, an XPU worker
+        captures every bucket.
+        """
+        if self._device is None or self._device.type != "cuda":
+            return None
+        def planned(size: Callable[[Any], dict]) -> tuple[dict[str, dict], int, CapturePlan]:
+            """A plan over what ``size`` says each runner's buckets cost."""
+            pools: dict[str, dict] = {}
+            for node_name in self._submodules:
+                pools[node_name] = size(ag_runners[node_name])
+                # one pool for all of a node's regions (see `_build_piecewise_runners`)
+                pools[f"{node_name} piecewise"] = {
+                    (label, bucket): cost
+                    for label, runner in piecewise[node_name].items()
+                    for bucket, cost in size(runner).items()
+                }
+            torch.cuda.empty_cache()
+            free, total = torch.cuda.mem_get_info(self._device)
+            reusable = None
+            if self._gpu_memory_fraction is not None:
+                # shortcut: counts this worker's PyTorch allocations, not its CUDA
+                # context or NCCL buffers; add those if a capped worker still crowds another
+                capped = int(self._gpu_memory_fraction * total) - torch.cuda.memory_reserved(self._device)
+                # Free memory already excludes what sizing holds outside the allocator, and `capped`
+                # doesn't, so the plan counts graphs as reusing that memory only up to the gap between them.
+                reusable = max(capped - free, 0)
+                free = min(free, capped)
+            return pools, free, plan_captures(pools, free, reusable)
+
+        pools, free, plan = planned(lambda runner: runner.size_captures())
+        # a walk's smaller buckets were sized by its largest, which is enough
+        # while every graph fits. If one doesn't, here or on another rank of a
+        # runner's group, each is sized by its own capture, and the plan made again
+        short = any(
+            cost.graph is not None and bucket not in plan.buckets[pool]
+            for pool, costs in pools.items() for bucket, cost in costs.items()
+        )
+        pools, free, plan = planned(lambda runner: runner.size_lent_captures(short))
+        logger.info(
+            "CapturePlan[%s]: %.0f MiB free, %.0f for the largest eager step",
+            self._device, free / 2**20, plan.floor / 2**20,
+        )
+        if free < plan.floor:
+            logger.warning(
+                "CapturePlan[%s]: no room for graphs beside the largest eager step "
+                "(gpu_memory_fraction %s)", self._device, self._gpu_memory_fraction,
+            )
+        for pool, costs in pools.items():
+            if costs:
+                logger.info(
+                    "CapturePlan[%s] %s: %d of %d buckets, %.0f MiB predicted, %.0f outside the allocator",
+                    self._device, pool, len(plan.buckets[pool]), len(costs), plan.predicted[pool] / 2**20,
+                    plan.outside[pool] / 2**20,
+                )
+        return plan
+
+    @contextmanager
+    def _capture_into(self, plan: CapturePlan | None, pool: str) -> Iterator[set | None]:
+        """Yield what ``plan`` captures into ``pool``, then log what capturing it took."""
+        if plan is None:
+            yield None
+            return
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_reserved(self._device)
+        yield plan.buckets[pool]
+        torch.cuda.empty_cache()
+        took = torch.cuda.memory_reserved(self._device) - before
+        logger.log(
+            logging.WARNING if took > plan.predicted[pool] else logging.INFO,
+            "CapturePlan[%s] %s: capture took %.0f MiB, %.0f predicted", self._device, pool,
+            took / 2**20, plan.predicted[pool] / 2**20,
+        )
+
     def _build_piecewise_runners(
         self, node_name: str, submodule_mgmt: SubmoduleManagement,
-    ) -> dict[str, PiecewiseCudaGraphRunner]:
+    ) -> dict[str, PiecewiseAcceleratorGraphRunner]:
         """One runner per region the submodule declares, not yet captured.
 
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
         """
         node_dtype = self._autocast_dtype_for(submodule_mgmt.submodule)
-        configs = submodule_mgmt.submodule.get_piecewise_cuda_graph_configs(
+        configs = submodule_mgmt.submodule.get_piecewise_accelerator_graph_configs(
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
             node_dtype or torch.float32,
             submodule_mgmt.joint_comm_group.world_size,
         )
-        runners: dict[str, PiecewiseCudaGraphRunner] = {}
+        runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
         # One graph memory pool for all of the node's regions (see
         # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes
         # the largest region's rather than the sum over regions.
-        memory_pool = (
-            torch.cuda.graphs.graph_pool_handle()
-            if configs and getattr(self._device, "type", None) == "cuda" and torch.cuda.is_available()
-            else None
-        )
+        memory_pool = None
+        if configs and self.device_capability.graph_backend is not None:
+            backend = self.device_capability.graph_backend
+            if backend.is_available():
+                memory_pool = backend.graph_pool_handle()
         for label, config in configs.items():
-            runner = PiecewiseCudaGraphRunner(
+            runner = PiecewiseAcceleratorGraphRunner(
                 label=f"{node_name}_{label}",
                 config=config,
                 resources=submodule_mgmt.resources,
@@ -675,6 +844,7 @@ class Engine:
                 num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
                 memory_pool=memory_pool,
+                device_capability=self.device_capability,
             )
             runners[label] = runner
         return runners
@@ -687,16 +857,20 @@ class Engine:
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
             model.preprocess_fingerprint() if model is not None else "",
         ]
-        declared = model.prefix_key_streams() if model is not None else {}
+        declared = keyed_labels(model) if model is not None else {}
         self._prefix_model = type(model).__name__
-        # node -> the walks a probe may run on: the keyed walk of every stream
-        # declared on a cache the node uses
+        # node -> the walks a probe may run on, from the keys of every label on a cache the node uses
         self._keyed_walks: dict[str, set[str]] = {}
         for key, by_label in declared.items():
             for node in specs_by_key[key].nodes:
                 self._keyed_walks.setdefault(node, set()).update(
-                    stream.walk for stream in by_label.values()
+                    walk for label in by_label.values() for walk in label.keys.walks
                 )
+        # a cache another engine holds is taken as open when its config says so
+        opened_keys = {
+            key for key in declared
+            if key not in self._resources and specs_by_key[key].config.prefix_cache
+        }
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config
@@ -718,11 +892,14 @@ class Engine:
                     if mark is not None:
                         parts.append(mark)
             opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
-                label: (stream.walk, stream.decode_walk)
-                for label, stream in declared.get(key, {}).items()
+                label: KeyedWalks(
+                    kv_label.keys.walks, tuple(walk for walk, _ in kv_label.growth if kv_label.keys.growth),
+                )
+                for label, kv_label in declared.get(key, {}).items()
             })
             if not opened or not declared.get(key):
                 continue
+            opened_keys.add(key)
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
@@ -738,6 +915,14 @@ class Engine:
                     "prompt frees little",
                     key,
                 )
+        # the nodes of a keyed walk that don't use the label's cache, such as an image
+        # encoder. The KV computed from their output is cached under their input's digest.
+        self._item_encoders: set[str] = set()
+        for key in opened_keys:
+            for label in declared[key].values():
+                for walk in label.keys.walks:
+                    nodes = model.get_graph_walk_graphs()[walk].get_nodes()
+                    self._item_encoders.update(set(nodes) - specs_by_key[key].nodes)
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
@@ -759,7 +944,6 @@ class Engine:
         submodule = mgmt.submodule
         node_inputs: list[NodeInputs] = []
         # hoisted out of the per-request loop: the same for every row
-        walk = batch.step_context.graph_walk
         prepare = submodule.prepare_inputs
         resources = mgmt.resources
         wrapped = batch.per_request_info_wrapped
@@ -767,11 +951,17 @@ class Engine:
         metadata = batch.per_request_input_metadata
         final_rids = batch.final_stream_rids
         # only a keyed walk probes the prefix cache (see _skip_cached_prefix);
-        # read leniently, as the probe itself was only reached per prepared row
-        keyed = getattr(self, "_keyed_walks", None)
-        probe_prefix = bool(keyed) and walk in keyed.get(batch.node_name, ())
+        # read leniently, as the probe itself was only reached per prepared row.
+        # Under a combined walk each row has its own walk, so a mixed step
+        # probes, prepares and stamps per row, and takes no uniform path.
+        walk = batch.step_context.graph_walk
+        mixed = bool(batch.step_context.request_walks)
+        walk_of = batch.step_context.walk_of
+        keyed_walks = (getattr(self, "_keyed_walks", None) or {}).get(
+            batch.node_name, (),
+        )
         loopback = self._loopback_rows(batch)
-        if not probe_prefix:
+        if not mixed and walk not in keyed_walks:
             uniform = submodule.uniform_row_inputs(
                 walk, has_loopback=loopback is not None and all(loopback),
             )
@@ -785,10 +975,14 @@ class Engine:
                     batch=batch, model_inputs=node_inputs
                 )
                 return
+        # a step of one walk probes (or not) for every row alike
+        step_probes = not mixed and walk in keyed_walks
         for i, rid in enumerate(batch.request_ids):
+            row_walk = walk_of(rid) if mixed else walk
+            probe_prefix = (row_walk in keyed_walks) if mixed else step_probes
             try:
                 req_inputs = prepare(
-                    graph_walk=walk,
+                    graph_walk=row_walk,
                     fwd_info=wrapped[rid],
                     inputs=tensors.get(rid, {}),
                     resources=resources,
@@ -801,10 +995,13 @@ class Engine:
                 )
                 if req_inputs is not None and probe_prefix:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
+                if req_inputs is not None and (probe_prefix or mixed):
+                    # the submodule reads a mixed step's rows by their own walk
+                    req_inputs.graph_walk = row_walk
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, batch.step_context.graph_walk,
+                    rid, batch.node_name, row_walk,
                 )
                 batch.register_failure(rid, error)
                 continue
@@ -825,8 +1022,14 @@ class Engine:
         steps = self._loopback_steps
         if not steps:
             return None
-        key = (batch.node_name, batch.step_context.graph_walk)
         get = steps.get
+        ctx = batch.step_context
+        if ctx.request_walks:
+            # a mixed step: a row's token is on the device if its own walk's
+            # last step kept it there, whatever this step is labelled
+            node, walk_of = batch.node_name, ctx.walk_of
+            return [get(rid) == (node, walk_of(rid)) for rid in batch.request_ids]
+        key = (batch.node_name, ctx.graph_walk)
         return [get(rid) == key for rid in batch.request_ids]
 
     def _record_loopback(self, batch: ExecutingBatch) -> None:
@@ -835,6 +1038,17 @@ class Engine:
             steps.update(dict.fromkeys(
                 batch.request_ids, (batch.node_name, batch.step_context.graph_walk),
             ))
+        elif batch.loopback_rids:
+            # a mixed step: a row looped back under its own walk, so the next
+            # step of that walk finds its token on the device
+            keep, node, walk_of = (
+                batch.loopback_rids, batch.node_name, batch.step_context.walk_of,
+            )
+            for rid in batch.request_ids:
+                if rid in keep:
+                    steps[rid] = (node, walk_of(rid))
+                else:
+                    steps.pop(rid, None)
         elif steps:
             for rid in batch.request_ids:
                 steps.pop(rid, None)
@@ -866,43 +1080,123 @@ class Engine:
         keys = self._runner.prefix_chain_keys(batch.node_name)
         if not keys:
             return
-        walk = batch.step_context.graph_walk
+        # The batch call keys each row under its own walk, so a combined-walk
+        # step takes it too; only the absence of host rows falls through.
         if host_rows is not None:
+            ctx = batch.step_context
             self._runner.extend_prefix_chains_batch(
-                batch.request_ids, batch.node_name, walk, host_rows, outputs,
-                keys=keys,
+                batch.request_ids, batch.node_name,
+                # a step of one walk passes the walk: no call per row
+                ctx.walk_of if ctx.request_walks else ctx.graph_walk,
+                host_rows, outputs, keys=keys,
             )
             return
         for rid in batch.request_ids:
             per_rid = outputs.get(rid)
             if isinstance(per_rid, dict):
                 self._runner.extend_prefix_chains(
-                    rid, batch.node_name, walk, per_rid, keys=keys,
+                    rid, batch.node_name, batch.step_context.walk_of(rid), per_rid,
+                    keys=keys,
+                )
+
+    def decide_cached_prefix(self, batch: ExecutingBatch) -> dict[str, dict[str, list[int]]]:
+        """Rank 0's cached-prefix leases for the step it is sending, by wire id, taken now so the
+        followers can take the same pages before they build it."""
+        keyed = self._keyed_walks.get(batch.node_name)
+        ctx = batch.step_context
+        if (
+            not keyed or (not ctx.request_walks and ctx.graph_walk not in keyed)
+            or not self._runner.prefix_chain_keys(batch.node_name)
+        ):
+            return {}
+        hits = {}
+        for rid in batch.request_ids:
+            walk = ctx.walk_of(rid)
+            if walk not in keyed:
+                continue
+            leases = self._runner.lease_cached_prefix(rid, batch.node_name, walk)
+            if leases:
+                hits[self._graph_runtime.get_rid_string(rid)] = leases
+        return hits
+
+    def prefix_cache_open(self, node_name: str) -> bool:
+        return bool(self._runner.prefix_chain_keys(node_name))
+
+    def adopt_cached_prefix(self, head: ScheduleTPNode, caught_up: bool) -> bool:
+        """On a TP follower, take rank 0's leases before building the step. False until this rank holds them all."""
+        ready = True
+        for rid, walk, leases in self._resolve_hits(head):
+            ready &= self._runner.adopt_cached_prefix(rid, head.node_name, walk, leases, caught_up)
+        return ready
+
+    def release_cached_prefix(self, batch: ExecutingBatch) -> None:
+        """Give back the leases of a step this rank built and won't run."""
+        ctx = batch.step_context
+        for rid in batch.request_ids:
+            self._runner.release_cached_prefix(rid, batch.node_name, ctx.walk_of(rid))
+
+    def drop_cached_prefix(self, head: ScheduleTPNode) -> None:
+        """On a TP follower, give back the leases of a head it drops without building."""
+        for rid, walk, _ in self._resolve_hits(head):
+            self._runner.release_cached_prefix(rid, head.node_name, walk)
+
+    def _resolve_hits(self, head: ScheduleTPNode):
+        """Yield (handle, walk, leases) per request in ``head``'s hits, skipping a request this rank
+        hasn't ingested or has removed."""
+        walk_idx = dict(zip(head.request_ids, head.walk_idx, strict=True)) if head.walks else None
+        for wire_rid, leases in head.prefix_hits.items():
+            rid = self._graph_runtime.get_rid_handle(wire_rid)
+            if rid is not None:
+                walk = head.walks[walk_idx[wire_rid]] if walk_idx else head.graph_walk
+                yield rid, walk, leases
+
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+        return self._runner.page_trails(node_name)
+
+    def check_page_trails(
+        self, node_name: str, graph_walk: str, tp_seq: int, trails: dict[str, tuple[int, int]],
+    ) -> None:
+        """On a TP follower, raise if a resource's page allocations differ from rank 0's when it
+        sent this step."""
+        for pool, mine in self._runner.page_trails(node_name).items():
+            if trails.get(pool, mine) != mine:
+                raise RuntimeError(
+                    f"KV {pool}: this rank's page allocations {mine} (count, hash) differ from "
+                    f"rank 0's {trails[pool]} before {node_name}/{graph_walk}, tp seq {tp_seq}"
                 )
 
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
-    ) -> NodeInputs:
-        """Cut the leading tokens this node's resources already hold.
+    ) -> NodeInputs | None:
+        """Cut the leading tokens this node's resources already hold, or return
+        None when they hold the whole walk.
 
-        Only the keyed walk is probed, and only when `split_inputs` can cut its
-        inputs; a guided walk writes two labels from one input, so it is skipped.
+        Only the walks a keyed stream names are probed, and only when
+        `split_inputs` can cut their inputs; a guided walk writes two labels
+        from one input, so it is skipped. A skipped walk is still passed to
+        `apply_cached_prefix` with no prefix, because it writes over whatever
+        the resources hold for it.
         """
-        walk = batch.step_context.graph_walk
+        walk = batch.step_context.walk_of(rid)
         if walk not in self._keyed_walks.get(batch.node_name, ()):
             return inputs
-        assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
+        assert isinstance(inputs, ARNodeInputs), (
             f"{self._prefix_model} keys the {walk!r} walk of {batch.node_name} "
-            "for prefix reuse, but that walk places positions of its own"
+            "for prefix reuse, but that walk's inputs are not a sequence to cut"
         )
         if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
+            self._runner.apply_cached_prefix(rid, batch.node_name, walk, inputs, None)
             return inputs
-        matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
+        prefix = self._runner.resolve_cached_prefix(rid, batch.node_name, walk, inputs)
         self._runner.apply_cached_prefix(
-            rid, batch.node_name, walk, inputs, matched,
+            rid, batch.node_name, walk, inputs, prefix,
         )
+        matched = prefix.tokens if prefix is not None else 0
         if matched <= 0:
             return inputs
+        if matched >= inputs.input_seq_len:
+            batch.cached_rids.add(rid)
+            return None
         return self._submodules[batch.node_name].submodule.split_inputs(
             walk, batch.per_request_info_wrapped[rid], inputs,
             matched, inputs.input_seq_len,
@@ -942,21 +1236,27 @@ class Engine:
                 self._autocast_dtype_for(self._submodules[batch.node_name].submodule),
                 device_type=self._device.type,
             ):
+                laps = PhaseLaps("engine.exec.")
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
+                laps.lap("reserve_slot")
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
                 # request runs its own full cycle and merges.
                 if not batch.running_batched and lease is None:
                     # the unbatched forward has per-request outputs: no rows to stay on
                     batch.rows_only = False
+                    batch.loopback_rids = frozenset()
                 if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
+            laps = PhaseLaps("engine.exec.")
             if batch.admit_error is None:
                 self._record_loopback(batch)
+                batch.outputs.loopback_rids = batch.loopback_rids
             batch.outputs_ready.set()
+            laps.lap("record_loopback")
             return batch.outputs
         except Exception:
             # A raise before the plan was promoted (declare, admit) would leave
@@ -977,11 +1277,12 @@ class Engine:
     ) -> BatchedModelOutput:
         """The one-forward path: batched (a lease replay or ``forward_batched``)
         or a single eager request."""
+        laps = PhaseLaps("engine.exec.")
         submodule_mgmt = self._submodules[batch.node_name]
         # On the GPU thread, right before the forward: point the region runners
         # at this batch's slot so the piecewise lease and replay agree with it.
         submodule_mgmt.set_piecewise_slot(batch.slot or 0)
-        cg_runner = submodule_mgmt.cuda_graph_runner
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         lease = batch.step_context.slot_lease
         real_bs = len(batch.request_ids)
 
@@ -995,6 +1296,7 @@ class Engine:
             batch.step_context.set_padded_rids(
                 cg_runner.step_ids(lease, batch.request_ids)
             )
+        laps.lap("pad")
 
         try:
             admit, batch.step = self._declare_and_admit(
@@ -1024,7 +1326,7 @@ class Engine:
             batch.commit_done.set()
             if self._enable_nvtx:
                 range_push("engine.collect_outputs")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 out = self._collect_outputs(
                     submodule_mgmt, lease, raw, inputs, req_info,
@@ -1033,8 +1335,7 @@ class Engine:
                     rows_only=batch.rows_only,
                 )
             finally:
-                if PHASE_PERIOD:
-                    phase_record("engine.collect_outputs", perf_counter() - t0)
+                phase_end("engine.collect_outputs", t0)
                 if self._enable_nvtx:
                     range_pop()
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
@@ -1043,18 +1344,24 @@ class Engine:
             # holds the GPU thread until the step drains, tightening the 2-step
             # launch bound to 1. Must stay after `commit_done`, which the plan
             # thread gates on. Skipped during capture: you can't sync mid-capture.
-            if _ENGINE_STEP_SYNC and not torch.cuda.is_current_stream_capturing():
+            if (
+                _ENGINE_STEP_SYNC
+                and self.device_capability.is_accelerator
+                and not self.device_capability.is_capturing()
+            ):
                 if self._enable_nvtx:
                     range_push("engine.await_outputs")
                 try:
-                    torch.cuda.current_stream().synchronize()
+                    torch.accelerator.current_stream(self._device).synchronize()
                 finally:
                     if self._enable_nvtx:
                         range_pop()
             return out
         finally:
+            laps.skip()
             if lease is not None:
                 cg_runner.release(lease, real_bs)
+            laps.lap("release")
 
     def _exec_per_request(
         self, batch: ExecutingBatch
@@ -1099,14 +1406,22 @@ class Engine:
                 ctx=ctxs[rid], nvtx=nvtx
             )
             if not admit_outcome.ok:
+                # all or nothing, as a batched step's admit is: the requests
+                # admitted ahead of this one will not run either
+                for earlier in reversed(batch.request_ids[:i]):
+                    if steps[earlier] is not None:
+                        self._runner.rollback_admit(steps[earlier])
                 return merged
 
         # Step 2: drive step, plan -> forward -> commit loop.
         # Nothing stages before here, so only this loop fences, in two places:
         # on reuse inside the loop (the rotation wraps after `num_slots`
         # requests), and on the way out — see below.
-        fence = submodule_mgmt.needs_slot_fence and self._device.type == "cuda"
-        slot_events: dict[int, torch.cuda.Event] = {}
+        fence = (
+            submodule_mgmt.needs_slot_fence
+            and self.device_capability.is_accelerator
+        )
+        slot_events: dict[int, Any] = {}
 
         for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
             req_info = {rid: batch.per_request_info_wrapped[rid]}
@@ -1128,7 +1443,7 @@ class Engine:
                     continue
                 launched = True
                 if fence:
-                    slot_events[slot] = torch.cuda.Event()
+                    slot_events[slot] = torch.Event(device=self._device)
                     slot_events[slot].record()
 
                 merged.update(self._collect_outputs(
@@ -1150,11 +1465,15 @@ class Engine:
         batch.commit_done.set()
         # Same optional 1-step launch throttle as _exec_single. This path is
         # always eager (never capturing), but the guard is kept for parity.
-        if _ENGINE_STEP_SYNC and not torch.cuda.is_current_stream_capturing():
+        if (
+            _ENGINE_STEP_SYNC
+            and self.device_capability.is_accelerator
+            and not self.device_capability.is_capturing()
+        ):
             if nvtx:
                 range_push("engine.await_outputs")
             try:
-                torch.cuda.current_stream().synchronize()
+                torch.accelerator.current_stream(self._device).synchronize()
             finally:
                 if nvtx:
                     range_pop()
@@ -1174,7 +1493,7 @@ class Engine:
             self._maybe_lease_piecewise_regions(batch.node_name, ctx, inputs)
             if nvtx:
                 range_push("engine.declare_step")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 step = submodule.declare_step(
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
@@ -1183,8 +1502,7 @@ class Engine:
                     per_request_info=batch.per_request_info,
                 )
             finally:
-                if PHASE_PERIOD:
-                    phase_record("engine.declare_step", perf_counter() - t0)
+                phase_end("engine.declare_step", t0)
                 if nvtx:
                     range_pop()
         if step is None:
@@ -1197,12 +1515,11 @@ class Engine:
 
         if nvtx:
             range_push("engine.admit")
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        t0 = phase_start()
         try:
             admit_outcome = self._runner.admit(step)
         finally:
-            if PHASE_PERIOD:
-                phase_record("engine.admit", perf_counter() - t0)
+            phase_end("engine.admit", t0)
             if nvtx:
                 range_pop()
 
@@ -1234,7 +1551,8 @@ class Engine:
         total_tokens = sum(inp.input_seq_len for inp in inputs)
         leases = {}
         for label, runner in runners.items():
-            if not runner.lease_before_step:
+            # a batch the region refuses runs it eagerly, with no slot
+            if not runner.lease_before_step or not runner.can_lease(inputs):
                 continue
             lease = runner.lease_slot(bs, total_tokens)
             if lease is not None:
@@ -1262,7 +1580,7 @@ class Engine:
         ``(raw_outputs, step)``; ``raw_outputs`` is None when admit failed.
         """
         nvtx = self._enable_nvtx
-        cg_runner = submodule_mgmt.cuda_graph_runner
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         submodule = submodule_mgmt.submodule
         rids = list(ctx.padded_request_ids)
 
@@ -1286,19 +1604,19 @@ class Engine:
                     "engine.plan.promoted" if batch.preplan_event is not None
                     else "engine.plan.fresh"
                 )
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 self._runner.plan(step)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(
-                        "engine.plan.promoted" if batch.preplan_event is not None
-                        else "engine.plan.fresh",
-                        perf_counter() - t0,
-                    )
+                phase_end(
+                    "engine.plan.promoted" if batch.preplan_event is not None
+                    else "engine.plan.fresh",
+                    t0,
+                )
                 if nvtx:
                     range_pop()
 
+        laps = PhaseLaps("engine.")
         engine_inputs = ModelInputsFromEngine(
             request_ids=rids,
             per_request_info=req_info,
@@ -1308,19 +1626,21 @@ class Engine:
             # the submodule indexes this by step id, not by real rid
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
+            # `inputs` is padded after the real rows under a lease
+            real_seq_len=sum(inp.input_seq_len for inp in inputs[:len(request_ids)]),
             step=step,
             per_request_input_metadata=batch.per_request_input_metadata,
         )
+        laps.lap("engine_inputs")
         if nvtx:
             range_push("engine.preprocess")
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        t0 = phase_start()
         try:
             preprocessed = submodule.preprocess(
                 ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs,
             )
         finally:
-            if PHASE_PERIOD:
-                phase_record("engine.preprocess", perf_counter() - t0)
+            phase_end("engine.preprocess", t0)
             if nvtx:
                 range_pop()
 
@@ -1334,27 +1654,25 @@ class Engine:
             # the launch/enqueue span, not the GPU work: `synchronize=True`
             # here would drain the stream and destroy the overlap
             range_push("engine.forward")
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        t0 = phase_start()
         try:
             raw = self._forward(
                 batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
                 lease, running_batched, request_ids, release_event,
             )
         finally:
-            if PHASE_PERIOD:
-                phase_record("engine.forward", perf_counter() - t0)
+            phase_end("engine.forward", t0)
             if nvtx:
                 range_pop()
 
         if step is not None:
             if nvtx:
                 range_push("engine.commit")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 self._runner.commit(step)
             finally:
-                if PHASE_PERIOD:
-                    phase_record("engine.commit", perf_counter() - t0)
+                phase_end("engine.commit", t0)
                 if nvtx:
                     range_pop()
         return raw, step
@@ -1410,19 +1728,19 @@ class Engine:
         """
         if self._enable_nvtx:
             range_push("engine.postprocess")
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        t0 = phase_start()
         try:
             self._postprocess_batch(batch, outputs)
         finally:
-            if PHASE_PERIOD:
-                phase_record("engine.postprocess", perf_counter() - t0)
+            phase_end("engine.postprocess", t0)
             if self._enable_nvtx:
                 range_pop()
 
     def _postprocess_batch(
         self, batch: ExecutingBatch, outputs: BatchedModelOutput,
     ) -> None:
-        submodule = self._submodules[batch.node_name].submodule
+        submodule_mgmt = self._submodules[batch.node_name]
+        submodule = submodule_mgmt.submodule
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
             try:
                 submodule.postprocess(
@@ -1437,6 +1755,29 @@ class Engine:
                     rid, batch.node_name, batch.step_context.graph_walk,
                 )
                 batch.register_failure(rid, error)
+        if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
+            live = [
+                (rid, node_inputs)
+                for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True)
+                if rid not in batch.failed_requests
+            ]
+            if not live:
+                return
+            rids = [rid for rid, _ in live]
+            try:
+                submodule.batch_postprocess(
+                    outputs,
+                    {rid: batch.per_request_info_wrapped[rid] for rid in rids},
+                    [node_inputs for _, node_inputs in live],
+                    piecewise_runners=submodule_mgmt.piecewise_runners,
+                )
+            except Exception as error:
+                logger.exception(
+                    "batch_postprocess failed for requests %s (node=%s, walk=%s)",
+                    rids, batch.node_name, batch.step_context.graph_walk,
+                )
+                for rid in rids:
+                    batch.register_failure(rid, error)
 
     def exec_and_postprocess(
         self, batch: ExecutingBatch
@@ -1448,6 +1789,7 @@ class Engine:
         place those itself.
         """
         outputs = self.exec(batch)
+        laps = PhaseLaps("engine.")
         # A failed admit means no forward ran and every rid's outputs are empty,
         # so the tail has nothing to consume; the worker re-drives the step.
         # A rows-only step has no per-request outputs; only a batch tail runs.
@@ -1455,12 +1797,16 @@ class Engine:
             if not batch.rows_only:
                 self.postprocess_batch(batch, outputs)
             else:
-                submodule = self._submodules[batch.node_name].submodule
-                # no submodule overrides it as of now
+                submodule_mgmt = self._submodules[batch.node_name]
+                submodule = submodule_mgmt.submodule
                 if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
                     submodule.batch_postprocess(
                         outputs, batch.per_request_info_wrapped, batch.inputs,
+                        piecewise_runners=submodule_mgmt.piecewise_runners,
                     )
+            for rid in batch.cached_rids:
+                self._runner.complete_cached_walk(rid, batch.node_name, batch.step_context.walk_of(rid))
+        laps.lap("tail")
         return outputs
 
     def check_stop_for_batch(
@@ -1483,8 +1829,10 @@ class Engine:
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
             try:
+                ctx = batch.step_context
                 batched = submodule.check_stop_batched(
                     batch.request_ids, batch.per_request_info_wrapped, host_rows,
+                    step_walk=None if ctx.request_walks else ctx.graph_walk,
                 )
             except Exception:
                 logger.debug(
@@ -1533,6 +1881,7 @@ class Engine:
                     rids,
                     node_name=batch.node_name,
                     graph_walk=batch.step_context.graph_walk,
+                    request_walks=batch.step_context.request_walks,
                 )
                 return batch.resource_publish_info
             # Returns rid -> {resource label -> published info}
@@ -1540,6 +1889,7 @@ class Engine:
                 rids,
                 node_name=batch.node_name,
                 graph_walk=batch.step_context.graph_walk,
+                request_walks=batch.step_context.request_walks,
             )
             for rid, info in batch.per_request_info.items():
                 if rid not in published:
@@ -1568,6 +1918,7 @@ class Engine:
             snaps, todo,
             node_name=batch.node_name,
             graph_walk=batch.step_context.graph_walk,
+            request_walks=batch.step_context.request_walks,
         )
         for rid in todo:
             per_key = published.get(rid) or {}
@@ -1586,6 +1937,7 @@ class Engine:
             request_ids,
             node_name=batch.node_name,
             graph_walk=batch.step_context.graph_walk,
+            request_walks=batch.step_context.request_walks,
         )
         for rid in request_ids:
             rid_published = published.get(rid, {})
@@ -1639,7 +1991,7 @@ class Engine:
             )
         out_ids = (
             step_request_ids if lease is None
-            else submodule_mgmt.cuda_graph_runner.slot_for(lease).dummy_rids
+            else submodule_mgmt.accelerator_graph_runner.slot_for(lease).dummy_rids
         )
         outputs: dict[str, NameToTensorList] = {}
 
@@ -1773,9 +2125,19 @@ class Engine:
             outputs.setdefault(rid, {}).update(rid_out)
 
 
+    def splits_by_capture_key(self, node_name: str, graph_walk: str) -> bool:
+        """Whether ``capture_group`` can tell this walk's requests apart: the
+        submodule opts in and the walk has a capture."""
+        submodule_mgmt = self._submodules[node_name]
+        if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
+            return False
+        cg_runner = submodule_mgmt.accelerator_graph_runner
+        return cg_runner is not None and cg_runner.captures_walk(graph_walk)
+
     def capture_group(
         self, node_name: str, graph_walk: str, request_id: int,
         request_info: CurrentForwardPassInfo,
+        input_metadata: InputMetadata | None = None,
     ) -> Any | None:
         """The capture bucket this one request would replay, by
         ``cg_key_info``; None when the walk has no capture or the submodule
@@ -1783,32 +2145,65 @@ class Engine:
 
         A batch spanning two groups matches no capture and runs eager, so the
         scheduler batches each group on its own when the submodule opts in
-        (``split_batches_by_capture_key``).
+        (``split_batches_by_capture_key``). ``input_metadata`` is the step's
+        input facts the lease will see, e.g. the stream chunk it consumes.
         """
         submodule_mgmt = self._submodules[node_name]
         if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
             return None
-        cg_runner = submodule_mgmt.cuda_graph_runner
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         if cg_runner is None or not cg_runner.captures_walk(graph_walk):
             return None
+        if input_metadata is None:
+            return submodule_mgmt.submodule.cg_key_info(graph_walk, {request_id: request_info})
         return submodule_mgmt.submodule.cg_key_info(
             graph_walk, {request_id: request_info},
+            per_request_input_metadata={request_id: input_metadata},
         )
+
+    @staticmethod
+    def _max_rows_in_combined(
+        resource_key: str,
+        nodes: set[str],
+        submodules: dict[str, NodeSubmodule],
+        model: "Model | None",
+    ) -> dict[str, int | None]:
+        """Each walk of ``nodes`` to its ``max_rows_in_combined``, one value a
+        walk across the nodes a resource serves."""
+        if model is None:
+            return {}
+        caps: dict[str, int | None] = {}
+        for walk, graph in model.get_graph_walk_graphs().items():
+            for node in sorted(nodes & set(graph.get_nodes())):
+                cap = submodules[node].max_rows_in_combined(walk)
+                if walk in caps and caps[walk] != cap:
+                    raise ValueError(
+                        f"resource {resource_key!r}: the nodes it serves cap "
+                        f"walk {walk!r} differently in a combined step "
+                        f"({caps[walk]} and {cap})"
+                    )
+                caps[walk] = cap
+        return caps
+
+    def get_max_rows_in_combined(self, node_name: str, graph_walk: str) -> int | None:
+        """Rows of ``graph_walk`` a step mixing it with another walk may hold."""
+        return self._submodules[node_name].submodule.max_rows_in_combined(graph_walk)
 
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.
 
         Two sources: what the submodule says it can batch, and the largest
-        batch this walk captured a graph for — going past that would drop the
-        step to eager, so the scheduler splits instead. Splitting is the
-        scheduler's job, not the engine's: the pieces then pipeline like any
-        other batch instead of running back to back.
+        bucket this walk has a capture config for, captured or not — past it a
+        step runs eager at a size the capture budget never measured, so the
+        scheduler splits instead. Splitting is the scheduler's job, not the
+        engine's: the pieces then pipeline like any other batch instead of
+        running back to back.
         """
         submodule_mgmt = self._submodules[node_name]
         caps = [submodule_mgmt.submodule.max_batch_size(graph_walk)]
-        if submodule_mgmt.cuda_graph_runner is not None:
+        if submodule_mgmt.capture_runner is not None:
             caps.append(
-                submodule_mgmt.cuda_graph_runner.max_batch_size_for(graph_walk)
+                submodule_mgmt.capture_runner.max_batch_size_for(graph_walk)
             )
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
@@ -1857,7 +2252,7 @@ class Engine:
         if batch.slot is None:
             batch.set_slot(submodule_mgmt.lease_slot())
 
-        cg_runner = submodule_mgmt.cuda_graph_runner
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         if cg_runner is None:
             return None
         # Which of the walk's captures this batch belongs to. The engine can't
@@ -1881,6 +2276,7 @@ class Engine:
         )
         if lease is not None:
             batch.lease_slot(lease)
+            batch.step_context.force_prefill = cg_runner.is_packed(lease)
         return lease
 
     def can_pre_plan(self, node_name: str) -> bool:
@@ -1892,7 +2288,7 @@ class Engine:
         a stateless node does not pay that wait to reach a foregone conclusion.
         """
         mgmt = self._submodules.get(node_name)
-        if mgmt is None or mgmt.cuda_graph_runner is None:
+        if mgmt is None or mgmt.accelerator_graph_runner is None:
             return False
         return any(r.supports_preplan for r in mgmt.resources.values())
 
@@ -1921,7 +2317,7 @@ class Engine:
         plans inline.
         """
         submodule_mgmt = self._submodules[batch.node_name]
-        cg_runner = submodule_mgmt.cuda_graph_runner
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         lease = batch.step_context.slot_lease
         if cg_runner is None or lease is None:
             return False
@@ -1938,6 +2334,7 @@ class Engine:
         cg_runner, lease: SlotLease,
     ) -> bool:
 
+        laps = PhaseLaps("engine.pre_plan.")
         # Declare-only, so the unprepared case takes the bucket's shared
         # template rows rather than cloning a fresh set per pre-plan.
         inputs = (
@@ -1948,7 +2345,8 @@ class Engine:
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
         )
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        laps.lap("pad")
+        t0 = phase_start()
         step = submodule_mgmt.submodule.declare_step(
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,
@@ -1956,8 +2354,7 @@ class Engine:
             slot_lease=lease,
             per_request_info=batch.per_request_info,
         )
-        if PHASE_PERIOD:
-            phase_record("engine.pre_declare", perf_counter() - t0)
+        phase_end("engine.pre_declare", t0)
         if step is None:
             return False
         if batch.inputs is not None or (
@@ -1973,20 +2370,21 @@ class Engine:
         batch.step_context.is_preplan = True
         step.set_ctx(batch.step_context)
         try:
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             admit_outcome = self._runner.pre_admit(step)
-            if PHASE_PERIOD:
-                phase_record("engine.pre_admit", perf_counter() - t0)
+            phase_end("engine.pre_admit", t0)
             if not admit_outcome.ok:
                 # exec re-drives the step and reports the failure from there
                 self.reset_pre_plan_for_batch(batch)
                 return False
             stream = cg_runner.plan_stream()
-            with torch.cuda.stream(stream):
+            with stream if stream is not None else nullcontext():
                 self._runner.pre_plan(step)
-            batch.preplan_event = torch.cuda.Event()
+            laps.skip()
+            batch.preplan_event = torch.Event(device=self._device)
             batch.preplan_event.record(stream)
             batch.preplanned_rids = tuple(batch.request_ids)
+            laps.lap("event")
         finally:
             batch.step_context.is_preplan = False
         return True
@@ -2020,7 +2418,7 @@ class Engine:
             # kept step would go to admit unchecked.
             batch.step = None
             lease = batch.step_context.slot_lease
-            cg_runner = self._submodules[batch.node_name].cuda_graph_runner
+            cg_runner = self._submodules[batch.node_name].accelerator_graph_runner
             if lease is not None and cg_runner is not None:
                 cg_runner.release(lease, len(batch.request_ids))
         # through the runner, so its record of the staged step goes too

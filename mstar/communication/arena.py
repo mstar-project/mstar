@@ -13,8 +13,9 @@ land. Segments are mapped once and never move, so the one-time
 holds for its lifetime and keeps the side-stream copies truly async.
 
 Capacity degrades in layers: grow by segments up to
-``MSTAR_SHM_ARENA_MAX_SEGMENTS``; at the cap, briefly backpressure for
-consumer ACKs; then spill the tensor to the per-uuid file protocol
+``MSTAR_SHM_ARENA_MAX_SEGMENTS`` (or until /dev/shm cannot back another
+segment: segments commit their pages when created); at the cap, briefly
+backpressure for consumer ACKs; then spill the tensor to the per-uuid file protocol
 (``MSTAR_SHM_ARENA_SPILL``, default on) — slower, never fails, like the old
 transport at saturation. ``stats_summary()`` exposes occupancy and the
 fragmentation gauge (largest contiguous free block); ``--log-stats`` logs it
@@ -122,17 +123,21 @@ def _cudart():
     """libcudart via ctypes: unlike the torch binding, a ctypes call
     RELEASES the GIL, so registering a 256 MiB segment (tens of ms) on the
     send path cannot stall the process's other Python threads (serve loop,
-    stream relays, the wake watcher)."""
+    stream relays, the wake watcher). Loaded by the soname of torch's CUDA
+    major, which reaches the copy torch already loaded even where it is not
+    on the loader path (a pip install of torch)."""
     global _CUDART
     if _CUDART is None:
         import ctypes
-        import ctypes.util
 
-        name = ctypes.util.find_library("cudart") or "libcudart.so"
-        lib = ctypes.CDLL(name)
+        if not torch.version.cuda:
+            raise OSError("torch is not built with CUDA")
+        lib = ctypes.CDLL(f"libcudart.so.{torch.version.cuda.split('.')[0]}")
         lib.cudaHostRegister.argtypes = [
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
         lib.cudaHostRegister.restype = ctypes.c_int
+        lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+        lib.cudaHostUnregister.restype = ctypes.c_int
         _CUDART = lib
     return _CUDART
 
@@ -157,14 +162,32 @@ def _unpin(ptr: int) -> bool:
         return False
     try:
         lib = _cudart()
-        import ctypes
-
-        lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
-        lib.cudaHostUnregister.restype = ctypes.c_int
-        rc = lib.cudaHostUnregister(ptr)
     except OSError:
-        rc = torch.cuda.cudart().cudaHostUnregister(ptr)
+        return False
+    rc = lib.cudaHostUnregister(ptr)
+    if rc != 0:
+        # Left set, the thread's next torch kernel launch raises it.
+        lib.cudaGetLastError()
     return rc == 0
+
+
+def _unpin_live(own_pinned: list, peers: dict) -> None:
+    """Unregister every pinned own and peer segment (weakref.finalize
+    target -- must not reference the manager). Runs before the arena
+    objects unmap: a mapping torn down while still registered leaves the
+    registration behind, and a later mapping at the same address then gets
+    ``cudaHostRegister`` rc 712."""
+    for ptr in own_pinned:
+        if not _unpin(ptr):
+            logger.warning("ARENA: cudaHostUnregister failed for own "
+                           "segment %#x", ptr)
+    own_pinned.clear()
+    for name, (arena, view, pinned) in list(peers.items()):
+        if pinned:
+            if not _unpin(arena.ptr_len()[0]):
+                logger.warning("ARENA: cudaHostUnregister failed for peer "
+                               "%s", name)
+            peers[name] = (arena, view, 0)
 
 
 def _pin(ptr: int, nbytes: int) -> bool:
@@ -173,9 +196,15 @@ def _pin(ptr: int, nbytes: int) -> bool:
     if not torch.cuda.is_available():
         return False
     try:
-        rc = _cudart().cudaHostRegister(ptr, nbytes, 0)
-    except OSError:  # no loadable libcudart: fall back to the torch binding
-        rc = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0)
+        lib = _cudart()
+    except OSError as e:
+        logger.warning("ARENA: cannot load libcudart (%s); copies fall back "
+                       "to pageable bandwidth", e)
+        return False
+    rc = lib.cudaHostRegister(ptr, nbytes, 0)
+    if rc != 0:
+        # Set by an already-registered range (accepted below) too.
+        lib.cudaGetLastError()
     ok = rc in (0, _CUDA_HOST_ALREADY_REGISTERED)
     if not ok:
         logger.warning("cudaHostRegister(%#x, %d) failed rc=%d — copies fall "
@@ -185,6 +214,8 @@ def _pin(ptr: int, nbytes: int) -> bool:
 
 class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     """Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""
+
+    _namespace_file_dirs = ("/dev/shm",)
 
     # Staging writes the segment and offset onto the descriptor the store
     # holds, which routing may already have copied -- so every outgoing edge
@@ -242,6 +273,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self._spill_after_s = float(
             os.getenv("MSTAR_SHM_ARENA_SPILL_AFTER_S", "0"))
         self._frag_warned = False
+        self._spill_warned = False
         # h2d completion watcher: turns a CUDA event into a real Future so
         # the worker's eventfd wakes the moment reads finish (no 10 ms tick).
         self._wake_q: queue.Queue | None = None
@@ -307,12 +339,17 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # and across users (permission-denied at startup). pid + random
         # token makes each instance's names unique; wire-compatibility is
         # free because consumers open whatever segment name the descriptor
-        # carries. The pid embedded in the name also enables the orphan
-        # sweep below.
+        # carries. Under a deployment namespace the segments are named like
+        # its tensor files, so its lock marks them live and the dead-
+        # namespace sweep reclaims them; a pid cannot, since /proc is per
+        # PID namespace and containers can share /dev/shm. Without one, the
+        # pid in the name drives the orphan sweep below.
         import secrets
 
         self._sweep_orphans()
-        base = (f"mstar_arena_{my_entity_id}_{os.getpid()}_"
+        ns = self._shm_namespace
+        base = (f"mstar_{ns}_arena_{my_entity_id}_{secrets.token_hex(4)}"
+                if ns else f"mstar_arena_{my_entity_id}_{os.getpid()}_"
                 f"{secrets.token_hex(4)}")
         self._arena = SegmentedShmArena.create(
             base, segment_mb << 20, max_segments)
@@ -336,6 +373,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # cannot resolve.
         self._segments_named_to = None
         self._pinned_segments = 0
+        # Base pointers of own segments that are registered, for the
+        # unregister finalizer below.
+        self._own_pinned: list[int] = []
         self._sync_segments()
         # uuid -> (segment_idx, offset) for sender-side reclaim.
         # (register_for_send receives the TensorPointerInfos directly and
@@ -362,6 +402,12 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # bound on any long-lived consumer.
         self._peer_segments: dict[str, tuple[object, memoryview, int]] = {}
         self._peer_evict_last = 0.0
+        # Unregister before the arenas unmap (close(), or when the manager
+        # is collected). Not at interpreter exit: the driver drops every
+        # registration with the process.
+        self._unpin_finalizer = weakref.finalize(
+            self, _unpin_live, self._own_pinned, self._peer_segments)
+        self._unpin_finalizer.atexit = False
 
     # -- segments --------------------------------------------------------
 
@@ -391,16 +437,22 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 logger.debug("ARENA: cannot sweep %s: %s", name, e)
 
     def _maybe_pin(self, ptr: int, nbytes: int) -> int:
-        """Pin within budget; returns the bytes actually pinned (0 if
-        skipped/failed). Runs under _pin_lock: _pin releases the GIL, so
-        budget check + register + accounting must be one atomic unit."""
+        """Pin an own segment within budget; returns the bytes actually
+        pinned (0 if skipped/failed). Runs under _pin_lock: _pin releases
+        the GIL, so budget check + register + accounting must be one atomic
+        unit, and close() must see the segment either unpinned or tracked."""
         # Oversized dedicated segments ARE pinned (within budget): freed
         # segments are reused for later large tensors, so the registration
         # amortizes over the segment's lifetime, not one transfer.
         if not self._pin_segments:
             return 0
         with self._pin_lock:
-            return self._pin_locked(ptr, nbytes)
+            if not self._pin_segments:
+                return 0
+            pinned = self._pin_locked(ptr, nbytes)
+            if pinned:
+                self._own_pinned.append(ptr)
+            return pinned
 
     def _pin_locked(self, ptr: int, nbytes: int) -> int:
         if self._pinned_bytes + nbytes > self._pin_budget:
@@ -572,7 +624,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         while True:
             try:
                 seg, off = self._arena.reserve(max(nbytes, 1))
-            except RuntimeError:
+            # Both the segment cap and a failed growth (no room in
+            # /dev/shm for a new segment) land here as "full".
+            except RuntimeError as e:
                 if self._reclaim_expired():
                     continue   # expired slots freed: retry the reserve
                 total, free, largest = self._arena.stats()
@@ -587,12 +641,18 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     self._frag_warned = True
                 if time.monotonic() > deadline:
                     if self._spill:
+                        if not self._spill_warned:
+                            logger.warning(
+                                "ARENA: spilling sends to the file "
+                                "transport (%s)", e)
+                            self._spill_warned = True
                         return None
                     raise RuntimeError(
                         f"SHM arena full for >{self._full_timeout_s}s "
-                        f"({self._arena.num_segments} segments); raise "
-                        "MSTAR_SHM_ARENA_MAX_SEGMENTS / _SEGMENT_MB or check "
-                        "for consumers not ACKing") from None
+                        f"({self._arena.num_segments} segments: {e}); raise "
+                        "MSTAR_SHM_ARENA_MAX_SEGMENTS / _SEGMENT_MB, free "
+                        "/dev/shm space, or check for consumers not "
+                        "ACKing") from None
                 if not warned:
                     logger.warning(
                         "SHM arena at capacity; backpressuring sends until "
@@ -793,7 +853,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     def _start_read_tensors(self, request_id, graph_edges, graph_walk):
         self._evict_dead_peers()
         h2d_did_work = False
-        read_edges: list[tuple[GraphEdge, float]] = []
+        stats = self.transfer_stats
+        # one per edge read; the future is filled in once every copy is queued
+        reads: list[FutureAndPointers] = []
         ctx = (
             torch.cuda.stream(self._h2d_stream)
             if self._h2d_stream is not None
@@ -804,6 +866,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 if len(graph_edge.tensor_info) == 0:
                     continue
                 rx_t0 = time.perf_counter()
+                fp = FutureAndPointers(
+                    future=None, graph_edges=[graph_edge], request_id=request_id,
+                )
                 for info in graph_edge.tensor_info:
                     if info.source_entity == self.my_entity_id:
                         self._slice_existing_tensor(
@@ -834,8 +899,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     # +1 transit (released by get_ready_tensors), +1 usage
                     # (released by _cleanup_consumed_inputs).
                     self.tensor_store.increment_ref(info.uuid, 2)
-                read_edges.append(
-                    (graph_edge, time.perf_counter() - rx_t0))
+                    if stats is not None:
+                        fp.count_read(info)
+                fp.rx_time = time.perf_counter() - rx_t0
+                reads.append(fp)
         future = None
         if h2d_did_work and self._h2d_stream is not None:
             # Downstream kernels see the data (device-side ordering only).
@@ -848,13 +915,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             # queued on the h2d stream in program order. get_ready_tensors
             # polls it — no host block here.
             future = _CudaEventFuture(self._h2d_stream)
-        for graph_edge, rx_time in read_edges:
-            self.pending.append(
-                FutureAndPointers(
-                    future=future, graph_edges=[graph_edge],
-                    request_id=request_id, rx_time=rx_time,
-                )
-            )
+        for fp in reads:
+            fp.future = future
+        self.pending.extend(reads)
         if future is None:
             return []
         # A real Future for the worker's eventfd (EventWakeup.register_
@@ -917,13 +980,28 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
 
     # -- reclaim ----------------------------------------------------------
 
+    def unlink_owned_files(self) -> None:
+        """The spill files, then this arena's own segments, for a process that
+        is stopping: its exit-time finalizer never runs when a hung teardown
+        ends in SIGKILL or the watchdog's hard exit. Peers keep the mappings
+        they have; the finalizer still runs at a normal exit and finds them
+        gone, and unlinks any segment grown after this call."""
+        super().unlink_owned_files()
+        _unlink_paths(list(self._own_segment_paths))
+
     def close(self) -> None:
-        """Stop the wake watcher (segments/pins release with the arena's
-        Drop once the manager is garbage collected)."""
+        """Stop the wake watcher and unregister every pinned segment (the
+        segments themselves unmap with the arena's Drop once the manager is
+        garbage collected). Segments mapped after this stay unpinned."""
         with self._wake_lock:
             if self._wake_q is not None:
                 self._wake_q.put(None)
                 self._wake_q = None
+        with self._pin_lock:
+            self._pin_segments = False
+            self._unpin_finalizer()
+            self._pinned_bytes = 0
+            self._pinned_segments = 0
 
     def cleanup_collectable(
         self, collectable: list[int], registered: list[bool],

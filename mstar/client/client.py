@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -79,6 +80,19 @@ def _load_nvtx():
     return (range_push, range_pop) if nvtx_enabled(True) else None
 
 
+class _BearerAuth(requests.auth.AuthBase):
+    """``Authorization: Bearer <key>``, the key as UTF-8 bytes as both servers
+    compare it. As ``auth``, not a header: requests replaces an explicit
+    Authorization header with ``.netrc`` credentials when no auth is given."""
+
+    def __init__(self, key: str):
+        self.value = b"Bearer " + key.encode("utf-8")
+
+    def __call__(self, r):
+        r.headers["Authorization"] = self.value
+        return r
+
+
 class MStarClient:
     def __init__(
         self,
@@ -87,10 +101,16 @@ class MStarClient:
         session: requests.Session | None = None,
         enable_nvtx: bool = False,
         prefer_binary: bool = False,
+        api_key: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._session = session or requests.Session()
+        # The server's key (``--api-key`` / ``MSTAR_API_KEY``), sent as a bearer
+        # token on every request. Per request rather than on the session, so a
+        # caller's own session is left as it was passed in.
+        api_key = api_key if api_key is not None else os.environ.get("MSTAR_API_KEY")
+        self._auth = _BearerAuth(api_key) if api_key else None
         # Ask for length-framed binary payloads. ``video_frame`` requests ask
         # by default (base64 NDJSON is not realtime at 720p); other modalities
         # opt in here. How to parse is decided from the response's
@@ -163,7 +183,8 @@ class MStarClient:
         url = f"{self.base_url}/generate"
         if stream:
             return self._stream(url, data, files, output_modalities=output_modalities)
-        resp = self._session.post(url, data=data, files=files or None, timeout=self.timeout)
+        resp = self._session.post(url, data=data, files=files or None, timeout=self.timeout,
+                                  auth=self._auth)
         _raise_for_status(resp)
         return self._parse_result(resp.json())
 
@@ -266,7 +287,8 @@ class MStarClient:
 
     def voices(self) -> list[str]:
         """The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``)."""
-        r = self._session.get(f"{self.base_url}/v1/audio/voices", timeout=self.timeout)
+        r = self._session.get(f"{self.base_url}/v1/audio/voices", timeout=self.timeout,
+                              auth=self._auth)
         r.raise_for_status()
         return [v["id"] for v in r.json().get("voices", [])]
 
@@ -362,6 +384,7 @@ class MStarClient:
             stream=True,
             timeout=self.timeout,
             headers=self._stream_headers(output_modalities),
+            auth=self._auth,
         ) as resp:
             _raise_for_status(resp)
             # Branch on what the server actually sent, not on what was asked
@@ -449,7 +472,7 @@ class MStarClient:
         text_parts: list[str] = []
         images: list[bytes] = []
         audio_pcm: list[bytes] = []
-        sample_rate = 24000
+        sample_rate, num_channels = 24000, 1
         raw: list[dict] = []
         for modality, entries in outputs.items():
             for e in entries:
@@ -463,7 +486,8 @@ class MStarClient:
                 elif modality == "audio":
                     audio_pcm.append(b)
                     sample_rate = int(meta.get("sample_rate", sample_rate))
-        audio = AudioBuffer(b"".join(audio_pcm), sample_rate) if audio_pcm else None
+                    num_channels = int(meta.get("num_channels", num_channels))
+        audio = AudioBuffer(b"".join(audio_pcm), sample_rate, num_channels) if audio_pcm else None
         return GenerateResult(
             request_id=payload.get("request_id"),
             text="".join(text_parts) if text_parts else None,

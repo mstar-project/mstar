@@ -20,11 +20,13 @@ import sys
 from pathlib import Path
 
 import mstar
+from mstar.utils.socket_prefix import per_port_socket_prefix
 
 # Model name -> default config (relative to the repo's configs/).
 DEFAULT_CONFIGS: dict[str, str] = {
     "bagel": "bagel_single_gpu.yaml",
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
+    "command_a_plus": "command_a_plus_tp4.yaml",
     "cosmos3": "cosmos3_nano.yaml",
     "cosmos3_droid": "cosmos3_droid.yaml",
     "cosmos3_edge": "cosmos3_edge.yaml",
@@ -43,17 +45,24 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_tts_1p7b": "qwen3tts_1p7b.yaml",
     "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
     "qwen3_tts_base": "qwen3tts_base.yaml",
+    "fish_s2_pro": "fish_s2_pro.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
     # ASR (Beta, un-optimized) — audio in, transcript out.
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
+    "omnilingual_asr_ctc_300m": "omnilingual_asr_ctc_300m.yaml",
+    "omnilingual_asr_ctc_1b": "omnilingual_asr_ctc_1b.yaml",
+    "omnilingual_asr_ctc_3b": "omnilingual_asr_ctc_3b.yaml",
+    "omnilingual_asr_ctc_7b": "omnilingual_asr_ctc_7b.yaml",
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
+    "lingbot_world_1_3b": "lingbot_world_1_3b.yaml",
     # Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B).
     "nemotron_duplex": "nemotron_duplex.yaml",
     "flux2_klein": "flux2_klein.yaml",
+    "ltx2_5": "ltx2_5.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
 }
@@ -66,6 +75,8 @@ DEFAULT_CONFIGS.update({
 })
 # 27B has no single-GPU form
 DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
+# Qwen3.8-27B runs on the Qwen3.5 code; TP4 like the 3.5 27B
+DEFAULT_CONFIGS["qwen3_8_27b"] = "qwen3_8_27b_tp4.yaml"
 
 
 def _repo_root() -> Path:
@@ -111,17 +122,20 @@ def _client_host(host: str) -> str:
     return "localhost" if host in ("0.0.0.0", "") else host
 
 
-def _next_steps(model: str, host: str, port: int) -> str:
+def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> str:
     base = f"http://{_client_host(host)}:{port}"
+    # Never echo the key itself; the SDK reads MSTAR_API_KEY when not passed one.
+    sdk_key = ", api_key=\"<your key>\"" if api_key_set else ""
+    oai_key = "<your key>" if api_key_set else "none"
     lines = [
         "",
         f"  ✓ mstar serving '{model}' on {base}",
         "",
         "  Python SDK:",
         "    from mstar import MStarClient",
-        f"    client = MStarClient(\"{base}\")",
+        f"    client = MStarClient(\"{base}\"{sdk_key})",
     ]
-    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni"):
+    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus"):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
@@ -131,6 +145,10 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
         lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
         lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
+    if model == "ltx2_5":
+        lines.append("    res = client.generate(text=\"a dog barking on a beach at sunset\",")
+        lines.append("                          output_modalities=(\"video\", \"audio\"),")
+        lines.append("                          height=544, width=960, num_frames=121)")
     if model == "cosmos3_droid":
         lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
         lines.append("                           images=[\"frame.jpg\"], output_modalities=(\"action\",),")
@@ -161,20 +179,23 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model == "qwen3_tts_base":
         lines.append("    client.tts(\"Hello there\", reference_audio=\"ref.wav\", "
                      "ref_text=\"...\").to_wav(\"out.wav\")")
+    if model == "fish_s2_pro":
+        lines.append("    client.tts(\"Hello there\").to_wav(\"out.wav\")")
+        lines.append("    # clone a voice: reference_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
-    if model in ("whisper_large", "higgs_audio"):
+    if model in ("whisper_large", "higgs_audio") or model.startswith("omnilingual_asr_ctc_"):
         lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
                      "input_modalities=(\"audio\",\"text\"))")
         lines.append("    print(res.text)  # transcript")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
-                 "flux2_klein", "flux2_klein_9b", "z_image_turbo"):
+                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
-                  f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")"]
+                  f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"{oai_key}\")"]
         if model in ("bagel", "qwen3_omni"):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
@@ -187,6 +208,14 @@ def _next_steps(model: str, host: str, port: int) -> str:
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a red cube\", size=\"320x192\")")
         if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a cat in a hat\", size=\"1024x1024\")")
+        if model == "ltx2_5":
+            lines.append("    oai.post(\"/videos/generations\", cast_to=dict, body={\"model\": \"ltx2_5\",")
+            lines.append("             \"prompt\": \"a dog barking on a beach\", \"size\": \"960x544\"})")
+    if model.startswith("omnilingual_asr_ctc_"):
+        lines += ["", "  OpenAI-compatible:",
+                  "    from openai import OpenAI",
+                  f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")",
+                  f"    oai.audio.transcriptions.create(model=\"{model}\", file=open(\"speech.wav\", \"rb\")).text"]
     lines.append("")
     return "\n".join(lines)
 
@@ -195,9 +224,11 @@ def _serve(args: argparse.Namespace) -> None:
     config = _resolve_config(args.model, args.config)
     if args.gpus is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    if args.compile_level is not None:
+        os.environ["MSTAR_COMPILE_LEVEL"] = str(args.compile_level)
 
     who = getpass.getuser() if hasattr(getpass, "getuser") else "mstar"
-    socket_prefix = args.socket_path_prefix or f"/tmp/mstar_{who}/"
+    socket_prefix = args.socket_path_prefix or per_port_socket_prefix(args.port)
     upload_dir = args.upload_dir or f"/tmp/mstar_uploads_{who}/"
 
     argv = [
@@ -211,10 +242,14 @@ def _serve(args: argparse.Namespace) -> None:
     ]
     if args.cache_dir:
         argv += ["--cache-dir", args.cache_dir]
+    if args.api_key is not None:
+        argv += ["--api-key", args.api_key]
     if args.log_stats:
         argv += ["--log-stats"]
     if args.log_stats_file:
         argv += ["--log-stats-file", args.log_stats_file]
+    if args.enable_metrics:
+        argv += ["--enable-metrics"]
     # Passing --rust-frontend-bin implies --rust-frontend: naming a binary but
     # silently staying on uvicorn would be a footgun.
     if args.rust_frontend or args.rust_frontend_bin:
@@ -222,7 +257,10 @@ def _serve(args: argparse.Namespace) -> None:
     if args.rust_frontend_bin:
         argv += ["--rust-frontend-bin", args.rust_frontend_bin]
 
-    print(_next_steps(args.model, args.host, args.port), file=sys.stderr)
+    from mstar.api_server.auth import resolve_api_key
+
+    print(_next_steps(args.model, args.host, args.port,
+                      api_key_set=resolve_api_key(args.api_key) is not None), file=sys.stderr)
 
     from mstar.api_server.entrypoint import main as serve_main
 
@@ -237,7 +275,18 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("model", help=f"model name ({', '.join(sorted(DEFAULT_CONFIGS))}) or use --config")
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--api-key", default=None,
+        help="require 'Authorization: Bearer <key>' on every route except /health "
+             "and /metrics (default: MSTAR_API_KEY; unset means no check)",
+    )
     serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
+    serve.add_argument(
+        # unset leaves MSTAR_COMPILE_LEVEL alone, whose own default is 1
+        "-O", "--compile-level", dest="compile_level", type=int, default=None, choices=[0, 1, 2],
+        help="how much captured forwards' compiles tune (sets MSTAR_COMPILE_LEVEL): -O0 no tuning, "
+             "fastest start; -O1 (default) coordinate descent; -O2 full max-autotune",
+    )
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")
     serve.add_argument("--socket-path-prefix", default=None, help="ZMQ IPC socket prefix")
@@ -256,6 +305,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--log-stats-file", default=None,
         help="append per-request profiling stats to this file (implies --log-stats)",
+    )
+    serve.add_argument(
+        "--enable-metrics", action="store_true",
+        help="serve Prometheus metrics at /metrics (needs mstar[metrics])",
     )
     serve.add_argument(
         "--rust-frontend", action="store_true",

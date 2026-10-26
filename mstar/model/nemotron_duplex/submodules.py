@@ -25,7 +25,10 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+)
 from mstar.engine.resources import (
     AttentionStep,
     KVStep,
@@ -104,9 +107,9 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Capture the frame-synchronous decode step.
 
         ``prepare_inputs`` is host-only and ``preprocess`` (embedding + AddFusion)
@@ -126,7 +129,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             kwargs={"mode": _MODE_FRAME},
         )
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=frame,
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
@@ -586,15 +589,15 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     def can_batch(self, batch, model_inputs) -> bool:
         return True
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Capture the steady-state step (one token per label per session).
         ``preprocess`` (text conditioning, noise, warm-up assembly) runs eagerly
         before the graph; the captured region is the 2N-row backbone over the
         pool and the MaskGIT sampling loop."""
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="talker_decode",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.tensor([self.config.text_pad_id], dtype=torch.long, device=device),

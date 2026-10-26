@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -16,17 +16,37 @@ if TYPE_CHECKING:
 
 
 class AttnBackend(Enum):
+    # the platform's default, decided when the resource is built
+    AUTO = "auto"
     FLASHINFER = "flashinfer"
     DENSE = "dense"
     FLEX = "flex"
     XPU_PAGED = "xpu_paged"
+    # Multi-head Latent Attention over a ``KVLayout.MLA`` cache (FlashInfer's
+    # ``BatchMLAPagedAttentionWrapper``); queries are the absorbed latent form
+    FLASHINFER_MLA = "flashinfer_mla"
 
 
 @dataclass
 class AttentionConfig:
     kv_cache: str # name of the KV cache
-    backend: AttnBackend = AttnBackend.FLASHINFER
+    backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
+    # softmax scale; None means the kernel default (head_dim ** -0.5). MLA must
+    # pass the *original* qk head dim's scale, not the latent width's. Only the MLA
+    # backend reads it; the others refuse it at build
+    sm_scale: float | None = None
+    # FlashInfer only: combined walks whose captured steps plan their
+    # one-token rows on the decode wrapper and their prompt rows on a prefill
+    # wrapper sized to them (`FlashInferMixedWrapper`)
+    splits: tuple[CombinedSplit, ...] = ()
+    sliding_window: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.sliding_window is not None and (
+            type(self.sliding_window) is not int or self.sliding_window <= 0
+        ):
+            raise ValueError("sliding_window must be a positive integer or None")
 
 
 @dataclass
@@ -80,7 +100,7 @@ class CrossAttentionConfig:
     kv_cache: str  # name of the KV cache holding the context
     query_kv_cache: str | None = None  # KV cache driving the queries, if any
     context_label: str = "context"
-    backend: AttnBackend = AttnBackend.FLASHINFER
+    backend: AttnBackend = AttnBackend.AUTO
     flashinfer_backend: str = "auto"
 
 
@@ -116,3 +136,18 @@ class CrossAttentionSpec(NodeResourceSpec):
 @dataclass(frozen=True)
 class AttentionStep(ResourceStep):
     causal: bool = True
+    # queries attend to the stream's stored context only, not to the tokens this step appends
+    # (a draft block over the context the target has produced so far); the step's own
+    # `segments` then carry the query counts, the cache's segments the appended counts.
+    # Only the MLA backend reads it; the others refuse it (`refuse_context_only`).
+    context_only: bool = False
+
+
+def refuse_context_only(step: AttentionStep, manager: str) -> None:
+    """For the attention resources that don't read ``context_only``: planned without it,
+    the step's queries would attend to the tokens it appends as well."""
+    if step.context_only:
+        raise ValueError(
+            f"{manager} does not read AttentionStep.context_only; only the "
+            f"{AttnBackend.FLASHINFER_MLA.value!r} backend does"
+        )

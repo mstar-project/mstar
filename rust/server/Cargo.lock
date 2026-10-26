@@ -860,6 +860,7 @@ dependencies = [
 name = "mstar-rust"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "memmap2",
  "pyo3",
  "rmp",
@@ -884,8 +885,10 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "subtle",
  "tokenizers",
  "tokio",
+ "tower",
  "tower-http",
  "ureq",
  "uuid",
@@ -1230,9 +1233,9 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -1254,9 +1257,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",

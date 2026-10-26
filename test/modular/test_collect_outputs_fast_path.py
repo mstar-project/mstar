@@ -148,7 +148,7 @@ def test_rows_only_collect_takes_no_clone():
     raw = _raw(bs=4)
     eng = Engine.__new__(Engine)
     out = eng._collect_outputs(
-        SimpleNamespace(submodule=_Sub(), cuda_graph_runner=None), None, raw,
+        SimpleNamespace(submodule=_Sub(), accelerator_graph_runner=None), None, raw,
         [], {}, request_ids=rids, step_request_ids=tuple(rids), rows_only=True,
     )
     assert out.rows_only and out.per_rid_outputs == {} and out.row_views is None

@@ -526,7 +526,8 @@ def test_missing_language_backend_is_reported_once(monkeypatch):
     assert frontend.available("j") is False  # cached: not retried
     with pytest.raises(ImportError, match="misaki\\[ja\\]"):
         frontend.backend("j")
-    assert frontend.available("a") is (importlib.util.find_spec("misaki.en") is not None)
+    has_misaki_en = importlib.util.find_spec("misaki") is not None and importlib.util.find_spec("misaki.en") is not None
+    assert frontend.available("a") is has_misaki_en
 
 
 def test_warmup_builds_the_default_language_backend(voices_dir):
@@ -573,8 +574,13 @@ def test_state_machine_and_postprocess(voices_dir):
 # --------------------------------------------------------------------------
 
 
+HANDLES = {"r1": 1, "r2": 2}
+
+
 def _fwd_info(rid: str, iteration: int) -> CurrentForwardPassInfo:
-    info = CurrentForwardPassInfo(request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=0, max_tokens=0)
+    info = CurrentForwardPassInfo(
+        request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=0, max_tokens=0, rid_handle=HANDLES[rid]
+    )
     info.dynamic_loop_iter_counts[CHUNK_LOOP] = iteration
     return info
 
@@ -597,9 +603,10 @@ def test_submodule_iterates_chunks_and_stops():
     # iteration 1 exists only for r1; iteration 2 for nobody
     assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r1", 1), requests["r1"]).input_seq_len == 5
     assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r2", 1), requests["r2"]) is None
-    assert submodule.check_stop("r1", _fwd_info("r1", 0), {}) == set()
-    assert submodule.check_stop("r1", _fwd_info("r1", 1), {}) == {CHUNK_LOOP}
-    assert submodule.check_stop("r2", _fwd_info("r2", 0), {}) == {CHUNK_LOOP}
+    # the engine passes the rid handle, not the request id string
+    assert submodule.check_stop(HANDLES["r1"], _fwd_info("r1", 0), {}) == set()
+    assert submodule.check_stop(HANDLES["r1"], _fwd_info("r1", 1), {}) == {CHUNK_LOOP}
+    assert submodule.check_stop(HANDLES["r2"], _fwd_info("r2", 0), {}) == {CHUNK_LOOP}
 
     engine_inputs = ModelInputsFromEngine(request_ids=["r1", "r2"], per_request_info={})
     batch = submodule.preprocess(SYNTH_WALK, engine_inputs, [prepared["r1"], prepared["r2"]])
@@ -618,8 +625,8 @@ def test_submodule_iterates_chunks_and_stops():
     # the same chunk alone and inside a padded batch agree to rounding
     assert single.shape == out["r2"][AUDIO_CHUNK][0].shape
     assert rel_l2(single.float(), out["r2"][AUDIO_CHUNK][0].float()) < 5e-3
-    submodule.cleanup_request("r1")
-    assert "r1" not in submodule.request_states
+    submodule.cleanup_request(HANDLES["r1"])
+    assert HANDLES["r1"] not in submodule.request_states
 
 
 def test_openai_adapter_maps_speech_request():
@@ -680,7 +687,7 @@ def test_bf16_decoder_keeps_source_and_head_in_fp32():
 def test_piecewise_regions_match_the_eager_halves():
     """Each captured half, run as the runner would run it (padded to its bucket,
     padding rows zeroed), reproduces the eager computation on the real rows."""
-    from mstar.engine.cuda_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
+    from mstar.engine.accelerator_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
     from mstar.model.kokoro.submodules import frame_region, text_region
     from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -690,7 +697,7 @@ def test_piecewise_regions_match_the_eager_halves():
     config.capture_batch_sizes = [1, 2, 4]
     config.max_batch_frames = 128
     submodule = KokoroSynthSubmodule(tiny_model(), config)
-    regions = submodule.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.float32)
+    regions = submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
     assert set(regions) == {text_region(8), text_region(16)} | {frame_region(f) for f in (16, 32, 64)}
     assert regions[text_region(16)].seq_len == 16 and regions[text_region(16)].capture_batch_sizes == [1, 2, 4]
     # bs * frames <= max_batch_frames caps the decoder's batch per bucket
@@ -746,7 +753,7 @@ def test_synthesize_uses_runners_when_they_fit():
     config.text_buckets = [8]
     config.frame_buckets = [16, 64]
     submodule = KokoroSynthSubmodule(tiny_model(), config)
-    regions = submodule.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.float32)
+    regions = submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
 
     class FakeRunner:
         def __init__(self, config):
@@ -757,7 +764,7 @@ def test_synthesize_uses_runners_when_they_fit():
             return bs <= max(self.config.capture_batch_sizes)
 
         def run(self, static_inputs, real_bs):
-            from mstar.engine.cuda_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
+            from mstar.engine.accelerator_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
 
             bs = next(b for b in self.config.capture_batch_sizes if b >= real_bs)
             seq_len = self.config.seq_len

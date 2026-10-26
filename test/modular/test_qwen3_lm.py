@@ -13,6 +13,7 @@ pytest.importorskip("transformers")
 
 from transformers import Qwen3Config, Qwen3ForCausalLM  # noqa: E402
 
+from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig  # noqa: E402
 
 ATTN, KV, POS = "attn", "kv", "rope"
@@ -126,6 +127,18 @@ def test_weights_load_completely_and_tied_head_is_copied():
         Qwen3DenseLM(Qwen3LMConfig.from_hf(TINY), attn_key=ATTN, kv_key=KV, pos_key=POS).load_weights(
             [(k.removeprefix("model."), v) for k, v in hf.state_dict().items() if k != "lm_head.weight"]
         )
+
+
+def test_tp_rank_ties_its_own_vocab_shard():
+    values = dict(TINY, vocab_size=96, tie_word_embeddings=True)
+    torch.manual_seed(0)
+    hf = Qwen3ForCausalLM(Qwen3Config(**values, attn_implementation="eager")).eval()
+    rank1 = CommGroup(my_global_rank=1, my_group_rank=1, group_members=[0, 1])
+    ours = Qwen3DenseLM(Qwen3LMConfig.from_hf(values), attn_key=ATTN, kv_key=KV, pos_key=POS, comm_group=rank1)
+    state = {k.removeprefix("model."): v for k, v in hf.state_dict().items()}
+    del state["lm_head.weight"]
+    ours.load_weights(list(state.items()))
+    assert torch.equal(ours.lm_head.weight, state["embed_tokens.weight"][48:])
 
 
 def test_prefill_and_decode_logits_match_hf():

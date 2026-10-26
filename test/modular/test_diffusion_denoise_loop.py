@@ -190,9 +190,9 @@ def test_cg_key_info_and_declare_step_agree():
     assert ToyDenoise().declare_step(WALK, ["a"], [a]) is None  # no resource declared -> nothing to plan
 
 
-def test_cuda_graph_configs_one_bucket_per_shape():
+def test_accelerator_graph_configs_one_bucket_per_shape():
     sub = ToyDenoise(capture_buckets=[(WALK, (8, 3)), (WALK, (16, 3))], capture_batch_sizes=(4, 1))
-    configs = sub.get_cuda_graph_configs(torch.device("cpu"))
+    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert [c.additional_key_info for c in configs] == [(8, 3), (16, 3)]
     cfg = configs[0]
     assert cfg.capture_graph_walk == WALK and cfg.capture_batch_sizes == [1, 4]
@@ -202,7 +202,30 @@ def test_cuda_graph_configs_one_bucket_per_shape():
     assert cfg.get_total_tokens(4) == [44]
     assert cfg.caps_eager_batch_size is False and cfg.compile is False
     assert cfg.input_seq_dims == {key: 0 for key in cfg.single_request_inputs.tensor_inputs}
-    assert ToyDenoise().get_cuda_graph_configs(torch.device("cpu")) == []
+    assert ToyDenoise().get_accelerator_graph_configs(torch.device("cpu")) == []
+
+
+
+def test_captured_layouts_are_kept_and_the_rest_are_lru_bounded():
+    built = []
+
+    class Layouts(ToyDenoise):
+        def build_layout(self, bucket_key, device):
+            built.append(bucket_key)
+            return object()
+
+    sub = Layouts(capture_buckets=[(WALK, (8, 3))], max_uncaptured_layouts=2)
+    cpu = torch.device("cpu")
+    captured = sub.layout((8, 3), cpu)
+    a, b = sub.layout((1, 3), cpu), sub.layout((2, 3), cpu)
+    assert sub.layout((1, 3), cpu) is a             # a hit refreshes (1, 3)
+    sub.layout((4, 3), cpu)                         # evicts (2, 3), the least recent
+    assert sub.layout((1, 3), cpu) is a
+    assert sub.layout((2, 3), cpu) is not b         # rebuilt
+    for tokens in range(10, 20):
+        sub.layout((tokens, 3), cpu)
+    assert sub.layout((8, 3), cpu) is captured      # never evicted
+    assert built.count((8, 3)) == 1 and built.count((2, 3)) == 2
 
 
 class TwoSpanDenoise(ToyDenoise):
@@ -221,7 +244,7 @@ def test_declare_step_lists_every_attention_span_per_row():
         ("a", "image", 8), ("a", "main", 11), ("b", "image", 8), ("b", "main", 11),
     ]
     # a capture bucket's rows carry the shape key, so their spans match the real rows'
-    cfg = TwoSpanDenoise(attn_resource_key="dit_attn", capture_buckets=[(WALK, (8, 3))]).get_cuda_graph_configs(
+    cfg = TwoSpanDenoise(attn_resource_key="dit_attn", capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(
         torch.device("cpu"),
     )[0]
     pad = cfg.single_request_inputs
@@ -289,7 +312,7 @@ def test_a_mapping_from_denoise_is_split_across_rows_and_edges():
 
 def test_capture_buckets_stage_every_loop_back_edge():
     sub = UniPCDenoise(capture_buckets=[(WALK, (8, 3))])
-    tensor_inputs = sub.get_cuda_graph_configs(torch.device("cpu"))[0].single_request_inputs.tensor_inputs
+    tensor_inputs = sub.get_accelerator_graph_configs(torch.device("cpu"))[0].single_request_inputs.tensor_inputs
     assert set(tensor_inputs) == {LATENTS, "history", "cond", "sigma", "sigma_next", "timestep"}
 
 
@@ -341,7 +364,7 @@ def test_a_declared_step_scalar_is_sliced_reshaped_and_popped():
     assert out["a"][LATENTS][0].shape == (8, 4)
 
     # and the capture bucket stages it at the declared fill
-    cfg = GuidedDenoise(capture_buckets=[(WALK, (8, 3))]).get_cuda_graph_configs(torch.device("cpu"))[0]
+    cfg = GuidedDenoise(capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(torch.device("cpu"))[0]
     assert torch.equal(cfg.single_request_inputs.tensor_inputs["guidance"], torch.tensor([3.5]))
     # the base staged it off the schedule, so nothing had to touch the state
     assert torch.equal(sub.request_state(_handle("a"))["guidances"], torch.arange(4.0))
@@ -437,3 +460,51 @@ def test_check_stop_finds_the_schedule_under_the_engines_key():
     # the wire string is NOT the key: a lookup by it finds nothing, and the
     # scaffold warns rather than silently declining to stop
     assert info.request_id not in sub.request_states
+
+
+class ToyRefine(ToyDenoise):
+    """A loop that starts from the latents routed to it (a refinement stage)."""
+
+    def initial_loop_back(self, fwd_info, inputs, bucket_key, generator):
+        return {LATENTS: inputs["init"][0] + 0.1 * torch.randn(bucket_key[0], 4, generator=generator)}
+
+
+def test_initial_loop_back_defaults_to_seeding_from_noise():
+    sub = ToyDenoise()
+    gen = torch.Generator().manual_seed(7)
+    got = sub.prepare_inputs(WALK, _info("ra", 0, seed=7), _inputs()).tensor_inputs[LATENTS]
+    assert torch.equal(got, torch.randn(8, 4, generator=gen))
+
+
+def test_initial_loop_back_sees_the_steps_inputs_on_iteration_zero_only():
+    sub = ToyRefine()
+    init = torch.full((8, 4), 3.0)
+    first = sub.prepare_inputs(WALK, _info("rb", 0, seed=1), {**_inputs(), "init": [init]})
+    expected = init + 0.1 * torch.randn(8, 4, generator=torch.Generator().manual_seed(1))
+    assert torch.equal(first.tensor_inputs[LATENTS], expected)
+    # past iteration 0 the loop-back edge is carried as usual; "init" is not read again
+    carried = torch.zeros(8, 4)
+    later = sub.prepare_inputs(WALK, _info("rb", 1, seed=1), _inputs(carried))
+    assert torch.equal(later.tensor_inputs[LATENTS], carried)
+
+
+def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
+    """Two stages of one request run the node in successive walks (draft, then refine);
+    the second must not reuse the first's cached schedule or bucket."""
+    sub = ToyDenoise()
+    sub.prepare_inputs(WALK, _info("rs", 0, steps=4, tokens=8), _inputs())
+    refine = CurrentForwardPassInfo(
+        request_id="rs", graph_walk="refine", fwd_index=0, random_seed=0, max_tokens=0, rid_handle=_handle("rs"),
+        step_metadata={"tokens": 16, "num_inference_steps": 2}, dynamic_loop_iter_counts={LOOP: 0},
+    )
+    out = sub.prepare_inputs("refine", refine, _inputs())
+    state = sub.request_state(_handle("rs"))
+    assert state["num_steps"] == 2 and state["bucket_key"] == (16, 3)
+    assert out.tensor_inputs[LATENTS].shape == (16, 4)
+    assert sub.check_stop(_handle("rs"), dataclasses_replace(refine, dynamic_loop_iter_counts={LOOP: 1}), {}) == {LOOP}
+
+
+def dataclasses_replace(info, **changes):
+    import dataclasses
+
+    return dataclasses.replace(info, **changes)

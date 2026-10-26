@@ -882,3 +882,46 @@ def test_two_frames_advance_the_ring_clock_together():
     assert bool((pos.t_pos == 3 * config.ts_mult).all())
     assert bool((pos.y_pos == torch.arange(TPF).div(config.width, rounding_mode="floor")).all())
     assert bool((pos.x_pos == torch.arange(TPF).remainder(config.width)).all())
+
+
+def test_the_noise_island_runs_at_highest_and_restores_the_setting():
+    """Eager calls of the fp32 island run its GEMMs at ``'highest'``, whatever
+    the process-wide setting, and hand the caller's setting back."""
+    from mstar.model.waypoint.components.layers import NoiseConditioner
+
+    island = NoiseConditioner(64).eval()
+    seen = []
+    island.mlp.register_forward_pre_hook(lambda *_: seen.append(torch.get_float32_matmul_precision()))
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("medium")
+        with torch.no_grad():
+            island(torch.full((1, 1), 0.5))
+        assert seen == ["highest"]
+        assert torch.get_float32_matmul_precision() == "medium"
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
+def test_a_materialized_dit_reads_the_noise_island_rows_instead_of_running_it():
+    """After ``materialize_runtime_tables`` the forward takes its noise
+    embedding from the eagerly built per-sigma rows (where the precision pin
+    holds), never from the island inside what would be a compiled region, and
+    the frame does not change."""
+    config = reduced_config()
+    noise, mouse, button, scroll = frame_inputs(config)
+    fp = torch.tensor([0], dtype=torch.int64)
+
+    live, _ = bound_dit(config, seed=0)
+    cached, _ = bound_dit(config, seed=0)
+    cached.materialize_runtime_tables("cpu")
+    assert tuple(cached._cond_rows.shape) == (len(config.scheduler_sigmas), 1, config.d_model)
+
+    def no_island(*_args, **_kwargs):
+        raise AssertionError("the materialized forward ran the noise island")
+
+    cached.denoise_step_emb.forward = no_island
+    with torch.no_grad():
+        x_live = live.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
+        x_cached = cached.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
+    assert torch.equal(x_live, x_cached)

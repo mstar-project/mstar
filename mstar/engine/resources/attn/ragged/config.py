@@ -5,20 +5,49 @@ a submodule can declare a step without pulling FlashInfer in behind it.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import torch
 
 from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
 
+def cross_label(q_label: str, kv_label: str) -> str:
+    """The plan a cross-attention pair runs under: ``q_label``'s spans attending
+    ``kv_label``'s."""
+    return f"{q_label}<-{kv_label}"
+
+
+class RaggedAttnBackend(Enum):
+    # the platform's default, decided when the resource is built
+    AUTO = "auto"
+    FLASHINFER = "flashinfer"
+
+
+@dataclass(frozen=True)
+class RaggedCrossAttentionStep(ResourceStep):
+    """A ragged cross-attention step: which spans attend which.
+
+    Each label in ``segments`` is one span per request (video tokens, text tokens,
+    ...). Each ``(q_label, kv_label)`` in ``pairs`` is one attention: every request's
+    ``q_label`` span attends that request's ``kv_label`` span, so both labels must be
+    declared for the same requests in the same order. Never causal.
+    """
+
+    pairs: tuple[tuple[str, str], ...] = ()
+
+
 @dataclass
 class RaggedAttentionConfig:
-    """Varlen self-attention over segments packed into one forward, with no KV
+    """Varlen attention over segments packed into one forward, with no KV
     cache: the whole layout is this step's, and nothing carries to the next.
+    The config of both ``RaggedAttentionSpec`` (self-attention within each span)
+    and ``RaggedCrossAttentionSpec`` (one span attending another).
 
     Head counts are **pre-sharding**; the engine narrows them to the rank's
     slice at build, as it does for a ``KVConfig``.
@@ -41,6 +70,7 @@ class RaggedAttentionConfig:
     # bucket's own token count is the ceiling and this stays None.
     max_tokens_per_request: int | None = None
 
+    backend: RaggedAttnBackend = RaggedAttnBackend.AUTO
     flashinfer_backend: str = "auto"
 
     # Activation dtype of the q / k / v the node hands the kernel (and of its
@@ -79,17 +109,14 @@ class RaggedAttentionConfig:
 
 
 @dataclass
-class RaggedAttentionSpec(NodeResourceSpec):
+class _RaggedSpecBase(NodeResourceSpec):
+    """The config and deployment overrides both ragged specs share."""
+
     config: RaggedAttentionConfig
-
-    @property
-    def resource_class(self) -> "type[Resource]":
-        from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
-
-        return RaggedAttnManager
 
     def apply_yaml_overrides(
         self,
+        backend: str | RaggedAttnBackend | None = None,
         flashinfer_backend: str | None = None,
         max_segments_per_request: int | None = None,
         max_tokens_per_request: int | None = None,
@@ -100,9 +127,59 @@ class RaggedAttentionSpec(NodeResourceSpec):
         The two ceilings are here rather than on the model because they size
         CUDA-graph buckets, which is a deployment's memory/coverage trade.
         """
+        if backend is not None:
+            self.config.backend = RaggedAttnBackend(backend)
         if flashinfer_backend is not None:
             self.config.flashinfer_backend = flashinfer_backend
         if max_segments_per_request is not None:
             self.config.max_segments_per_request = max_segments_per_request
         if max_tokens_per_request is not None:
             self.config.max_tokens_per_request = max_tokens_per_request
+
+
+@dataclass
+class RaggedAttentionSpec(_RaggedSpecBase):
+    """Cacheless self-attention within each declared span (``AttentionStep``)."""
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
+
+        return RaggedAttnManager
+
+
+@dataclass
+class RaggedCrossAttentionSpec(_RaggedSpecBase):
+    """Cacheless cross-attention between two spans of each request: a forward's
+    ``(q_label, kv_label)`` pairs (``RaggedCrossAttentionStep``), each run through
+    ``RaggedAttentionCallable(resource, cross_label(q_label, kv_label))``.
+
+    Separate from ``RaggedAttentionSpec`` so a resource is one kind of attention:
+    a model with both declares one of each per head geometry.
+    """
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.ragged.base import RaggedCrossAttnManager
+
+        return RaggedCrossAttnManager
+
+
+@dataclass
+class RaggedBlockCausalAttentionSpec(_RaggedSpecBase):
+    """Cacheless block-causal self-attention within each declared span: a token in
+    block ``b`` of its span (``block_size`` tokens a block, from the span's start)
+    attends every key of blocks ``0..b``. Declared with ``AttentionStep(causal=False)``,
+    since the block structure is the whole mask.
+
+    Its own kind, not a flag on ``RaggedAttentionSpec``: it runs a different kernel
+    (paged prefill over one-token pages, see ``attn.ragged.block_causal``).
+    """
+
+    block_size: int
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.ragged.base import RaggedBlockCausalAttnManager
+
+        return RaggedBlockCausalAttnManager

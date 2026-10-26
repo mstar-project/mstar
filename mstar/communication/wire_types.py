@@ -9,6 +9,7 @@ breaks compatibility with a peer running the old build.
 """
 from mstar.api_server.request_types import (
     APIServerMessage,
+    ConductorStatus,
     DataWorkerProfile,
     PreprocessInput,
     PromptPart,
@@ -36,6 +37,7 @@ from mstar.utils.ipc_format import (
     AbortRequest,
     ConductorMessage,
     DrainRequest,
+    EnableMetrics,
     FailRequests,
     InputSignals,
     MessageBody,
@@ -51,6 +53,7 @@ from mstar.utils.ipc_format import (
     UnpersistTensors,
     WorkerGraphsDone,
     WorkerMessage,
+    WorkerStatus,
 )
 
 # The abstract field types; a value of one of these carries [tag, body].
@@ -78,11 +81,14 @@ _TYPES: dict[str, type] = {
     "new_request_conductor": NewRequestConductor,
     "reads_done": ReadsDone,
     "fail_requests": FailRequests,
+    "worker_status": WorkerStatus,
+    "enable_metrics": EnableMetrics,
     # api-server bodies
     "result_tensors": ResultTensors,
     "result_tokens": ResultTokens,
     "request_complete": RequestComplete,
     "request_failed": RequestFailed,
+    "conductor_status": ConductorStatus,
     "result_chunk": ResultChunk,
     "preprocess_input": PreprocessInput,
     "data_worker_profile": DataWorkerProfile,

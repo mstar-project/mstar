@@ -292,5 +292,6 @@ def test_video_postprocess_falls_back_to_pyav(monkeypatch) -> None:
     with av.open(io.BytesIO(data)) as container:
         stream = container.streams.video[0]
         frames = [f for f in container.decode(stream)]
+        codec, rate = stream.codec_context.name, float(stream.average_rate)
     assert len(frames) == 9 and (frames[0].width, frames[0].height) == (64, 48)
-    assert stream.codec_context.name == "h264" and float(stream.average_rate) == 12.0
+    assert codec == "h264" and rate == 12.0

@@ -19,6 +19,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class CombinedSplit:
+    """A combined walk run on two kernels: decode for one-token rows, prefill
+    for the rows of ``prefill_walks``, captured for as many as
+    ``max_rows_in_combined`` lets in (an uncapped walk: the bucket's rows)."""
+    combined_walk: str
+    prefill_walks: tuple[str, ...]
+
+    def max_prefill_rows(
+        self, max_rows_in_combined: Mapping[str, "int | None"], bucket_rows: int,
+    ) -> int:
+        total = 0
+        for walk in self.prefill_walks:
+            cap = max_rows_in_combined.get(walk)
+            total += bucket_rows if cap is None else cap
+        return min(total, bucket_rows)
+
+
 @dataclass
 class NodeResourceSpec(ABC):
     resource_key: str
@@ -71,6 +89,11 @@ class ResourceReqConfig:
 
     def apply_conductor_config(self, **kwargs):
         return
+
+    def loop_room(self, spec: "NodeResourceSpec | None" = None) -> dict[str, int]:
+        """The most iterations each loop can run before the request outgrows the
+        resource built from ``spec``. A loop the resource doesn't bound is left out."""
+        return {}
 
     def validate(self, spec: "NodeResourceSpec | None" = None) -> None:
         """Raise ``ValueError`` if a client-supplied value is out of range, or

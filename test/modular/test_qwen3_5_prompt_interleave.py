@@ -16,6 +16,7 @@ import os
 import pytest
 import torch
 
+from mstar.api_server.openai.adapters import flatten_messages
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -61,6 +62,7 @@ def test_segments_rebuild_the_prompt(model, modalities):
         tensors={"image_inputs": [an_image()] * n_images},
         prompt_parts=None,
     )
+    out = out.new_input_tensors
     segments = out["text_inputs"]
     assert len(out["image_grid_thw"]) == n_images
     assert len(out["pixel_values"]) == n_images
@@ -111,6 +113,7 @@ def test_schedule_matches_the_split(model):
         tensors={"image_inputs": [an_image(), an_image()]},
         prompt_parts=parts,
     )
+    out = out.new_input_tensors
     # the conductor passes tensor handles; the identity is all that matters
     signals = {
         "text_inputs": list(out["text_inputs"]),
@@ -154,6 +157,7 @@ def test_schedule_matches_the_split(model):
 def test_text_only_prompt_still_uses_prefill_text(model):
     """No images, no merged walk: the plain text path is unchanged."""
     out = model.process_prompt("just text", ["text"], ["text"], tensors={})
+    out = out.new_input_tensors
     signals = {"text_inputs": list(out["text_inputs"])}
     schedule = model._prefill_schedule(["text"], signals)
 
@@ -183,15 +187,6 @@ def test_empty_prompt_fails_legibly(model):
         model.get_initial_forward_pass_args("LLM", ["text"], ["text"], {})
 
 
-def test_video_is_refused_rather_than_run_as_an_image(model):
-    # a ValueError, so the server answers 400 rather than 500
-    with pytest.raises(ValueError, match="video"):
-        model.process_prompt(
-            "What happens?", ["video", "text"], ["text"],
-            tensors={"video_inputs": [an_image()]},
-        )
-
-
 def test_image_only_message_renders_an_empty_text_span(model):
     """A chat message with just an image arrives with no text at all; that is
     still a prompt, so it must render (an empty span around the image) rather
@@ -199,6 +194,7 @@ def test_image_only_message_renders_an_empty_text_span(model):
     out = model.process_prompt(
         None, ["image"], ["text"], tensors={"image_inputs": [an_image()]},
     )
+    out = out.new_input_tensors
     assert len(out["pixel_values"]) == 1 and len(out["image_grid_thw"]) == 1
     # the template's framing around the image: a span before it and one after
     assert len(out["text_inputs"]) == 2
@@ -215,6 +211,7 @@ def test_rgba_image_is_accepted(model):
     out = model.process_prompt(
         "Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [rgba]},
     )
+    out = out.new_input_tensors
     assert out["pixel_values"][0].shape[0] > 0
 
 
@@ -224,3 +221,19 @@ def test_attachment_count_mismatch_is_caught(model):
             "Describe these.", ["image", "image", "text"], ["text"],
             tensors={"image_inputs": [an_image()]},
         )
+
+
+CHAT = [
+    {"role": "system", "content": "Be brief."},
+    {"role": "user", "content": "My name is Ada."},
+    {"role": "assistant", "content": "Hello Ada."},
+    {"role": "user", "content": "What is my name?"},
+]
+
+
+def test_a_chat_the_template_refuses_is_a_bad_request(model, tmp_path):
+    """The model re-raises the template's error as a ValueError, which the data worker answers with a 400, not a 500."""
+    messages = [CHAT[1], CHAT[0], CHAT[3]]
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    with pytest.raises(ValueError, match="System message must be at the beginning"):
+        model.process_prompt(text, in_mods, ["text"], prompt_parts=parts)

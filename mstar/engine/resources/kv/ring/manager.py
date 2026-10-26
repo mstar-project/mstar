@@ -20,6 +20,7 @@ from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitOutcome,
     AdmitRuntimeError,
+    AllocationFailed,
     ResourceStep,
     StepContext,
 )
@@ -253,8 +254,8 @@ class RingKVManager(AttentionResource):
         self._known_rids.add(rid)
 
     def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:
-        """Claim a session for this step's request, or refuse it terminally.
-        Does not support eviction for now
+        """Claim a session for this step's request. A full pool is retried; a
+        malformed step is refused terminally. Does not support eviction for now
         """
         # `request_ids`, not `padded_request_ids` as the paged manager uses: a
         # padding row is a dummy rid a replay pads a bucket out to, and it must
@@ -286,19 +287,28 @@ class RingKVManager(AttentionResource):
                         "`remove_request`, which only ever runs for a request the "
                         "engine opened -- so a session claimed here would never "
                         "return to the pool and the node would lose capacity with "
-                        "nothing raised."
+                        "nothing raised.",
+                        request_ids=frozenset({rid}),
                     ),
                 )
         if len(wanted) > len(self._free_sessions):
+            # Retryable, not terminal: config validation keeps
+            # `max_concurrent_requests` within `num_sessions`, so a full pool
+            # is a finished request whose teardown is still deferred behind an
+            # in-flight step. The worker holds the request named here and
+            # retries once that session is back.
             return AdmitOutcome(
                 ok=False, ready=False,
-                reason=AdmitRuntimeError(
-                    f"ring KV {self.name!r} holds all {self.num_sessions} of its "
-                    f"sessions ({sorted(self._sessions)}); request(s) {sorted(wanted)} "
-                    "cannot be served concurrently. The rings are a fixed "
-                    "physical buffer and there is nothing to evict -- raise "
-                    "`resources.kv.num_sessions` (and `max_concurrent_requests` "
-                    "with it) to serve more."
+                reason=AllocationFailed(
+                    message=(
+                        f"ring KV {self.name!r} holds all {self.num_sessions} of "
+                        f"its sessions ({sorted(self._sessions)}); request(s) "
+                        f"{sorted(wanted)} wait for one to be released"
+                    ),
+                    pages_short=len(wanted) - len(self._free_sessions),
+                    label="session",
+                    # the latest arrival waits, so the earlier ones still run
+                    request_id=[rid for rid in rids if rid in wanted][-1],
                 ),
             )
 
@@ -312,7 +322,8 @@ class RingKVManager(AttentionResource):
                         f"clock for request {rid!r} (it names {sorted(frames)}). "
                         "Every admitted request needs one: the continuity check is "
                         "the only thing standing between a stalled clock and a "
-                        "session that rewrites its own history."
+                        "session that rewrites its own history.",
+                        request_ids=frozenset({rid}),
                     ),
                 )
             last = self._last_frames.get(rid)
@@ -326,7 +337,8 @@ class RingKVManager(AttentionResource):
                         "The ring clock advances by exactly one per committed frame "
                         "-- a skipped or repeated frame selects the wrong ring slot "
                         "and hides the wrong one, which rewrites history rather than "
-                        "raising."
+                        "raising.",
+                        request_ids=frozenset({rid}),
                     ),
                 )
 
@@ -392,7 +404,7 @@ class RingKVManager(AttentionResource):
 
     # `supports_preplan` stays the inherited False.
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int
     ) -> None:
         """No-op: every buffer a replay touches was allocated at ``build``,
@@ -406,20 +418,20 @@ class RingKVManager(AttentionResource):
         if self._sessions:
             raise RuntimeError(
                 f"ring KV {self.name!r} is still claimed by {sorted(self._sessions)} "
-                "after CUDA graph capture; a capture dummy rid was never reset, "
+                "after accelerator graph capture; a capture dummy rid was never reset, "
                 "and the session it holds is gone from the pool for good."
             )
         if len(self._free_sessions) != self.num_sessions:
             raise RuntimeError(
                 f"ring KV {self.name!r} has {len(self._free_sessions)} of "
-                f"{self.num_sessions} sessions free after CUDA graph capture; a session "
+                f"{self.num_sessions} sessions free after accelerator graph capture; a session "
                 "was zeroed and never returned to the pool, so the node has "
                 "silently lost concurrency."
             )
         if self._last_frames:
             raise RuntimeError(
                 f"ring KV {self.name!r} recorded committed frames "
-                f"({sorted(self._last_frames.items())}) during CUDA graph capture; "
+                f"({sorted(self._last_frames.items())}) during accelerator graph capture; "
                 "capture drives admit and plan but must never commit, and the "
                 "first real request will be refused at admit unless it happens to "
                 "declare the very next frame."

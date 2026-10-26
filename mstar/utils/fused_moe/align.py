@@ -15,8 +15,10 @@ it exists so the path is always *available*, not fast.
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import os
+import time
 
 import torch
 import triton
@@ -75,6 +77,32 @@ def _clear_stale_build_lock(name: str) -> None:
             pass
 
 
+def _jit_source() -> tuple[str, str]:
+    """(extension name, source path), both keyed by the .cu's content.
+
+    ``cpp_extension``'s ninja file names the source by absolute path, so the same source in
+    another checkout (a worktree, a staged copy) rebuilds the op, and two checkouts booting
+    in turn rebuild it every time. A copy under the extensions root named by its hash gives
+    every checkout of one source the same build, and each version its own.
+    """
+    from torch.utils.cpp_extension import _get_build_directory
+
+    with open(_CSRC, "rb") as f:
+        data = f.read()
+    digest = hashlib.sha256(data).hexdigest()[:12]
+    name = f"_mstar_moe_C_{digest}"
+    src_dir = os.path.join(
+        os.path.dirname(_get_build_directory(name, verbose=False)), "_mstar_moe_C_src")
+    path = os.path.join(src_dir, f"{digest}.cu")
+    if not os.path.exists(path):
+        os.makedirs(src_dir, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)  # atomic: a racing rank sees the whole file or none
+    return name, path
+
+
 @functools.lru_cache(maxsize=1)
 def _cuda_op_available() -> bool:
     """JIT-compile and load the vendored CUDA op; return whether it worked.
@@ -85,21 +113,36 @@ def _cuda_op_available() -> bool:
     """
     if not torch.cuda.is_available():
         return False
-    try:
-        from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import load
 
-        _clear_stale_build_lock("_mstar_moe_C")
-        load(name="_mstar_moe_C", sources=[_CSRC], is_python_module=False, verbose=False)
-        # Touch the op so a registration failure surfaces here, not at call time.
-        _ = torch.ops._mstar_moe_C.moe_align_block_size
-        return True
-    except Exception as e:  # pragma: no cover -- depends on the build toolchain
-        logger.warning(
-            "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
-            "using the slower torch fallback.",
-            e,
-        )
-        return False
+    # TP workers building together can race on the stale-lock
+    # sweep and fail a build that did write the .so. The fallback is not
+    # graph-capturable, so one losing rank would run the whole group eager.
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            name, source = _jit_source()
+            if attempt == 0:
+                _clear_stale_build_lock(name)
+            else:
+                time.sleep(2.0)
+            load(
+                name=name,
+                sources=[source],
+                is_python_module=False,
+                verbose=False,
+            )
+            # Touch the op so a registration failure surfaces here, not at call time.
+            _ = torch.ops._mstar_moe_C.moe_align_block_size
+            return True
+        except Exception as e:  # pragma: no cover -- depends on the build toolchain
+            last_error = e
+    logger.warning(
+        "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
+        "using the slower torch fallback (NOT CUDA-graph capturable).",
+        last_error,
+    )
+    return False
 
 
 def moe_align_block_size(
@@ -110,6 +153,8 @@ def moe_align_block_size(
     """Sort ``topk_ids`` into expert-aligned blocks.
 
     ``topk_ids`` must be int32 and contiguous (the CUDA op reads it directly).
+    Ids ``>= num_experts`` mark skipped slots: they are never placed in
+    ``sorted_token_ids``, so no GEMM tile reads or writes them.
 
     Returns
     -------
@@ -136,7 +181,10 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
 
-    if _cuda_op_available():
+    # CPU inputs (host-side tests) take the torch fallback even on a GPU box, and so does
+    # an empty step: the CUDA op launches a grid of 0 blocks for it without checking, and
+    # the next unrelated launch reports the error.
+    if _cuda_op_available() and topk_ids.is_cuda and topk_ids.numel():
         torch.ops._mstar_moe_C.moe_align_block_size(
             topk_ids,
             num_experts,
@@ -147,7 +195,12 @@ def moe_align_block_size(
         )
     else:
         _moe_align_block_size_torch(
-            topk_ids, block_size, num_experts, sorted_ids, expert_ids, num_tokens_post_pad
+            topk_ids,
+            block_size,
+            num_experts,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
         )
 
     return sorted_ids, expert_ids, num_tokens_post_pad
@@ -164,19 +217,22 @@ def _moe_align_block_size_torch(
     """Vectorized PyTorch equivalent of the CUDA op, filling the buffers
     in place with the same semantics.
 
-    Assumes every entry of ``topk_ids`` is a valid expert in
-    ``[0, num_experts)`` (always true for mstar's routed dispatch).
+    Ids ``>= num_experts`` are skipped slots, excluded from the counts and
+    the scatter, matching the CUDA kernels.
     """
     device = topk_ids.device
     flat = topk_ids.reshape(-1)
     numel = flat.numel()
 
-    # Padding slots hold ``numel``; unused expert-id blocks hold 0.
-    sorted_ids.fill_(numel)
+    # Unused expert-id blocks hold 0; padding slots hold ``numel`` via ``staged``.
     expert_ids.zero_()
 
+    # Skipped slots go to an extra bucket num_experts, which is never scattered.
+    valid = flat < num_experts
+    bucketed = torch.where(valid, flat, num_experts).to(torch.int64)
+
     # Per-expert token counts, each rounded up to a multiple of block_size.
-    counts = torch.bincount(flat, minlength=num_experts)[:num_experts]
+    counts = torch.bincount(bucketed, minlength=num_experts + 1)[:num_experts]
     padded = ((counts + block_size - 1) // block_size) * block_size
 
     # Exclusive prefix sum of padded counts -> first slot of each expert.
@@ -193,10 +249,17 @@ def _moe_align_block_size_torch(
 
     # sorted_token_ids: group original token indices by expert into the
     # padded slot ranges. Intra-expert order is irrelevant to the GEMM kernel.
-    order = torch.argsort(flat, stable=True)
-    sorted_experts = flat[order].to(torch.int64)
+    order = torch.argsort(bucketed, stable=True)
+    sorted_experts = bucketed[order]
     ucounts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     ucounts[1:] = torch.cumsum(counts, dim=0)  # unpadded prefix over sorted tokens
-    local_rank = torch.arange(numel, device=device, dtype=torch.int64) - ucounts[sorted_experts]
+    local_rank = (
+        torch.arange(numel, device=device, dtype=torch.int64) - ucounts[sorted_experts]
+    )
     dest = cumsum[sorted_experts] + local_rank
-    sorted_ids[dest] = order.to(torch.int32)
+    # Skipped slots write to a trailing dump slot, dropped on copy back.
+    n = sorted_ids.numel()
+    dest = torch.where(sorted_experts < num_experts, dest, n)
+    staged = torch.full((n + 1,), numel, dtype=torch.int32, device=device)
+    staged[dest] = order.to(torch.int32)
+    sorted_ids.copy_(staged[:n])

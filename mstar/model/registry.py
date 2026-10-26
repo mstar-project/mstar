@@ -7,6 +7,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "chatterbox": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_multilingual": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_turbo": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
+    "command_a_plus": ("mstar.model.command_a_plus.command_a_plus_model", "CommandAPlusModel"),
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_edge": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
@@ -16,10 +17,17 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
+    "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
+    "omnilingual_asr_ctc_300m": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
+    "omnilingual_asr_ctc_1b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
+    "omnilingual_asr_ctc_3b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
+    "omnilingual_asr_ctc_7b": ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
+    "ltx2_5": ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
+    "lingbot_world_1_3b": ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
@@ -46,6 +54,7 @@ HF_MODELS: dict[str, dict] = {
     "chatterbox": {"model_path_hf": "ResembleAI/chatterbox"},
     "chatterbox_multilingual": {"model_path_hf": "ResembleAI/chatterbox", "variant": "multilingual"},
     "chatterbox_turbo": {"model_path_hf": "ResembleAI/chatterbox-turbo"},
+    "command_a_plus": {"model_path_hf": "CohereLabs/command-a-plus-05-2026-bf16"},
     # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
     # Cosmos3-Nano-Policy-DROID — Nano-sized action-policy fine-tune for the
@@ -74,7 +83,14 @@ HF_MODELS: dict[str, dict] = {
     # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
     # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
     "flux2_klein": {"model_path_hf": "black-forest-labs/FLUX.2-klein-4B"},
+    # Lightricks LTX-2.5: 22B joint audio-video DiT (distilled), Gemma-4 12B text
+    # encoder, video + audio VAEs and a 48 kHz vocoder. Gated on Hugging Face.
+    "ltx2_5": {"model_path_hf": "Lightricks/LTX-2.5-Diffusers"},
     "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
+    # Fish Audio S2-Pro: dual-AR TTS (Qwen3-4B Slow AR + 4-layer Fast AR over
+    # 10 codebooks) with a 44.1 kHz causal DAC codec and reference-audio voice
+    # cloning. Weights under the Fish Audio Research License (non-commercial).
+    "fish_s2_pro": {"model_path_hf": "fishaudio/s2-pro"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
@@ -82,6 +98,15 @@ HF_MODELS: dict[str, dict] = {
     # encoder + Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B) + EarTTS
     # (Gemma3 talker + RVQ codec). Single composite ``model.safetensors``.
     "nemotron_duplex": {"model_path_hf": "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"},
+    # Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, 1,600+
+    # languages, no language code needed. Apache-2.0. Meta's own .pt files: v2
+    # from dl.fbaipublicfiles.com (pinned sha256), or v1 from the
+    # facebook/omniASR-CTC-* Hub repos with weights_version: v1 (config.py).
+    # No HF repo id: the size picks the checkpoint.
+    "omnilingual_asr_ctc_300m": {"model_path_hf": None, "size": "300m"},
+    "omnilingual_asr_ctc_1b": {"model_path_hf": None, "size": "1b"},
+    "omnilingual_asr_ctc_3b": {"model_path_hf": None, "size": "3b"},
+    "omnilingual_asr_ctc_7b": {"model_path_hf": None, "size": "7b"},
     # OmniVoice — masked-diffusion TTS, 600+ languages. A Qwen3-0.6B body read
     # bidirectionally over an 8-codebook canvas, plus the Higgs-Audio-v2 codec
     # shipped in the checkpoint's audio_tokenizer/ subfolder (~3.3 GB total).
@@ -115,6 +140,9 @@ HF_MODELS: dict[str, dict] = {
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
+    # LingBot-World-V2 1.3B causal-fast (weights CC-BY-NC-SA-4.0): the DiT repo only;
+    # UMT5 and the Wan2.1 VAE load from the diffusers repos mstar already uses.
+    "lingbot_world_1_3b": {"model_path_hf": "robbyant/lingbot-world-v2-1.3b-causal-fast"},
     # Waypoint owns a variant -> Hub repository mapping. None is intentional:
     # it lets WaypointModel distinguish the registry default from an explicit
     # local path or Hub ID, then select the 720P or 360P repository named by the
@@ -138,6 +166,9 @@ HF_MODELS.update({
     f"qwen3_5_{size}b": {"model_path_hf": f"Qwen/Qwen3.5-{size}B"} \
         for size in qwen_3_5_dense_sizes
 })
+# Qwen3.8-27B is the Qwen3.5 architecture (same config.json geometry)
+MODEL_REGISTRY["qwen3_8_27b"] = ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel")
+HF_MODELS["qwen3_8_27b"] = {"model_path_hf": "Qwen/Qwen3.8-27B"}
 
 
 def model_init_kwargs(name: str) -> dict:
