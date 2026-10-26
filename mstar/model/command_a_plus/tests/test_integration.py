@@ -383,6 +383,20 @@ class ModelIntegrationTests(unittest.TestCase):
             self.model.process_prompt(None, ["image"], ["text"], tensors={"image_inputs": photos[:1]},
                                       messages=[{"role": "user", "content": [{"type": "image"}] * 2}])
 
+    def test_overlong_image_prompt_stops_before_the_next_image(self):
+        self.model._tokenizer = SimpleNamespace(
+            apply_chat_template=Mock(return_value=[2, 120, 11, 120]),
+            convert_tokens_to_ids=Mock(return_value=[117, 118, 119]),
+        )
+        processor = Mock(return_value={"pixel_values": torch.rand(2, 3, 32, 32)})
+        self.model._image_processor = processor
+        # 2 text tokens plus the first image's 12 already overflow
+        self.model.max_seq_len = MAX_OUTPUT_TOKENS + 13
+        parts = [PromptPart(modality="image", index=0), PromptPart(modality="image", index=1)]
+        with self.assertRaisesRegex(ValueError, r"at least 14 tokens.*exceeds max_seq_len"):
+            self.model.process_prompt(None, ["image", "image"], ["text"],
+                                      tensors={"image_inputs": [torch.rand(3, 8, 8)] * 2}, prompt_parts=parts)
+        self.assertEqual(processor.call_count, 1)
 
 if __name__ == "__main__":
     unittest.main()

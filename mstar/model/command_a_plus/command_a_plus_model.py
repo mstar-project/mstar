@@ -237,10 +237,10 @@ class CommandAPlusModel(Model):
                 self._chat_messages(prompt, input_modalities, prompt_parts, kwargs.get("messages")),
                 tokenize=True, add_generation_prompt=True, return_dict=False,
             ), dtype=torch.long)
-        ids, pixel_values = self._expand_images(ids, tensors.get("image_inputs", []))
+        max_output_tokens = self.get_max_output_tokens(**kwargs)
+        ids, pixel_values = self._expand_images(ids, tensors.get("image_inputs", []), max_output_tokens)
         if ids.ndim != 1 or ids.numel() == 0 or ids.numel() > self.max_seq_len:
             raise ValueError("Prompt must contain 1..max_seq_len token IDs")
-        max_output_tokens = self.get_max_output_tokens(**kwargs)
         if ids.numel() + max_output_tokens > self.max_seq_len:
             raise ValueError(
                 f"prompt ({ids.numel()} tokens) + max_output_tokens ({max_output_tokens}) "
@@ -278,7 +278,7 @@ class CommandAPlusModel(Model):
             raise ValueError("Expected a text prompt")
         return [{"role": "user", "content": prompt}]
 
-    def _expand_images(self, ids, images):
+    def _expand_images(self, ids, images, max_output_tokens):
         """Tile each image and widen its one ``<|IMG_PATCH|>`` placeholder to the tiles' tokens."""
         image_token = self.vision_config.image_token_id
         positions = (ids == image_token).nonzero().flatten().tolist()
@@ -291,10 +291,17 @@ class CommandAPlusModel(Model):
         )
         tile = [image_token] * self.vision_config.tokens_per_tile + [line_break]
         pieces, pixel_values, start = [], [], 0
+        length = ids.numel() - len(images)
         for position, image in zip(positions, images, strict=True):
             # load_image gives floats in [0, 1]; the processor expects the image's bytes.
             image = (image.cpu() * 255).round().clamp(0, 255).to(torch.uint8)
             tiles = self._get_image_processor()(images=[image], return_tensors="pt")["pixel_values"]
+            length += len(tiles) * len(tile) + 2
+            if length + max_output_tokens > self.max_seq_len:
+                raise ValueError(
+                    f"prompt (at least {length} tokens) + max_output_tokens ({max_output_tokens}) "
+                    f"exceeds max_seq_len ({self.max_seq_len})"
+                )
             pieces += [ids[start:position], torch.tensor([start_of_image, *tile * len(tiles), end_of_image])]
             pixel_values.append(tiles.to(torch.bfloat16))
             start = position + 1
