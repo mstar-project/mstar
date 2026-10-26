@@ -25,8 +25,8 @@ import torch
 from torch import nn
 
 from mstar.api_server.media_io import check_resample_rate
+from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
 from mstar.utils.h2d import to_device_nonblocking
-from mstar.utils.precision import ieee_fp32_matmul
 
 
 def _hertz_to_mel(freq: np.ndarray | float) -> np.ndarray | float:
@@ -247,8 +247,9 @@ class NemoLogMel:
         )
         # sqrt then square, as the reference does: it rounds differently
         power = torch.view_as_real(stft).pow(2).sum(-1).sqrt().pow(2)
-        with ieee_fp32_matmul():
-            mel = torch.log(self.mel_filters @ power + 2.0 ** -24)[:, :, :max(frames)]
+        # full fp32, as the reference: the process default is TF32
+        with fp32_precision_scope(Fp32Precision(matmul="highest", cudnn_allow_tf32=None)):
+            mel =torch.log(self.mel_filters @ power + 2.0 ** -24)[:, :, :max(frames)]
         if self.normalize:
             # the mean taken as an offset from the first frame: the plain mean up
             # to rounding, and exact for a constant bin, so digital silence stays
