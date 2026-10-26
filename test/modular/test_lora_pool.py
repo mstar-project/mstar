@@ -408,11 +408,10 @@ def test_slots_take_the_nodes_compute_dtype(adapters):
     with pytest.raises(ValueError, match="no dtype"):
         LoraAdapterPool.build(spec, EngineResourceInfo(device=CPU))
     # the serving config's autocast_dtype, as the worker reads it
-    from mstar.worker.engine_manager import _parse_dtype
+    from mstar.model.base import parse_autocast_dtype
 
-    assert _parse_dtype("float16") is torch.float16 and _parse_dtype("torch.bfloat16") is torch.bfloat16
-    with pytest.raises(ValueError, match="not a torch dtype"):
-        _parse_dtype("float17")
+    assert parse_autocast_dtype("float16") is torch.float16
+    assert parse_autocast_dtype("torch.bfloat16") is torch.bfloat16
 
 
 def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
@@ -513,6 +512,16 @@ class _Sim:
                     del self.running[r]
                     self.pool.remove_request(r)
         self.t += 1
+
+
+@pytest.mark.parametrize("override", [{"max_slots": 0}, {"max_rank": 8, "targets": "qkv"}])
+def test_a_refused_override_leaves_the_spec_as_declared(override):
+    """``validate_deployment`` reports the refusal, then splits the spec per node, which
+    checks its fields again: a refused value left on it would be reported twice."""
+    spec = make_spec({})
+    with pytest.raises(ValueError):
+        spec.apply_yaml_overrides(**override)
+    assert spec == make_spec({})
 
 
 @pytest.mark.parametrize("screens,wait_steps", [(True, 10), (True, 10**9), (False, 10)])

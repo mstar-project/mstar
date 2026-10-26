@@ -158,10 +158,11 @@ def adapter_prefix_roots(
     """
     if model is None or not model_config or not keyed_labels(model):
         return None
-    if not _kv_page_sizes(model, model_config):
-        return None
+    # LoRA first: a deployment without it leaves its `resources:` block to the conductor
     lora = lora_specs(model, model_config)
-    return AdapterPrefixRoots.read(lora[0], digests) if lora else None
+    if not lora or not _kv_page_sizes(model, model_config):
+        return None
+    return AdapterPrefixRoots.read(lora[0], digests)
 
 
 class PreprocessWorker:

@@ -9,7 +9,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs, serving_resources
+from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -60,17 +60,6 @@ def refuse_combined_walks_across_tp_groups(
             )
 
 
-def _parse_dtype(value) -> torch.dtype | None:
-    """A dtype from the serving YAML, which spells it as a string (``float16``).
-    ``null`` stays None, as the serving config passed it before dtypes were parsed."""
-    if value is None or isinstance(value, torch.dtype):
-        return value
-    dtype = getattr(torch, str(value).removeprefix("torch."), None)
-    if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"autocast_dtype {value!r} is not a torch dtype (e.g. bfloat16, float16)")
-    return dtype
-
-
 @dataclass
 class EngineManager:
     """Owns the worker's engine.
@@ -110,7 +99,7 @@ class EngineManager:
         # without forcing every config file to set the same value).
         autocast_dtype = model.get_autocast_dtype()
         if "autocast_dtype" in model_config:
-            autocast_dtype = _parse_dtype(model_config["autocast_dtype"])
+            autocast_dtype = parse_autocast_dtype(model_config["autocast_dtype"])
 
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before

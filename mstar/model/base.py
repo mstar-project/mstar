@@ -418,9 +418,12 @@ def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
     (``mstar.engine.resources.lora.serving``)."""
-    from mstar.engine.resources.lora.serving import declared_lora_specs
+    from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
 
-    return list(model.get_node_resources() or []) + declared_lora_specs(model, model_config)
+    specs = list(model.get_node_resources() or [])
+    lora = declared_lora_specs(model, model_config)
+    size_lora_specs(lora, model_config)
+    return specs + lora
 
 
 def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
@@ -429,6 +432,17 @@ def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
     from mstar.engine.resources.lora.serving import drop_lora_specs_without_targets
 
     return drop_lora_specs_without_targets(specs)
+
+
+def parse_autocast_dtype(value) -> torch.dtype | None:
+    """The serving YAML's ``autocast_dtype``, spelled as a string (``float16``). ``null``
+    stays None, as the serving config passed it before dtypes were parsed."""
+    if value is None or isinstance(value, torch.dtype):
+        return value
+    dtype = getattr(torch, str(value).removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"autocast_dtype {value!r} is not a torch dtype (e.g. bfloat16, float16)")
+    return dtype
 
 
 def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:

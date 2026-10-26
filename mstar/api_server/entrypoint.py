@@ -400,7 +400,9 @@ class APIServer:
         lora_spec = specs[0] if specs else None
         # Every adapter the serving config names, checked against every LoRA spec and
         # read once before anything else starts. Their digests key the prefix cache here
-        # and travel to the conductor, which pins them for the workers' reads.
+        # and travel to the conductor, which pins them for the workers' reads. So a LoRA
+        # deployment's `resources:` block is read here, before the conductor's
+        # validate_deployment; one without LoRA reads nothing here.
         self.lora_adapter_digests: dict[str, bytes] = (
             check_adapters(lora_spec, others=specs[1:])
             if lora_spec is not None and lora_spec.adapters else {}

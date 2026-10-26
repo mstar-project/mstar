@@ -32,6 +32,7 @@ except ImportError:  # collected without package context
     from test_lora_tp_lockstep import _Barrier
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
+from mstar.api_server.data_worker import adapter_prefix_roots  # noqa: E402
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
@@ -43,9 +44,11 @@ from mstar.engine.resources.lora import LORA_ADAPTER_KWARG, LORA_RESOURCE_KEY, L
 from mstar.engine.resources.lora.config import ADAPTER_WEIGHTS_FILE  # noqa: E402
 from mstar.engine.resources.lora.identity import adapter_prefix_root, read_adapter_digest  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
+from mstar.engine.resources.lora.serving import lora_specs  # noqa: E402
 from mstar.engine.resources.lora.store import check_adapter_file, check_adapters  # noqa: E402
 from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import AdmitRuntimeError  # noqa: E402
+from mstar.model.base import KVLabel, PrefixKeys  # noqa: E402
 from mstar.utils.ipc_format import InputSignals, WorkerMessage, WorkerMessageType  # noqa: E402
 
 BASE = "qwen3_5_0.8b"
@@ -166,6 +169,27 @@ def test_models_lists_adapters_with_their_parent(monkeypatch):
     client, stub = _client(monkeypatch, LORA_CONFIG)
     cards = client.get("/v1/models").json()["data"]
     assert [(c["id"], c.get("parent")) for c in cards] == [(BASE, None), ("sql", BASE)]
+
+
+@pytest.mark.parametrize("resources", [{"typo": {}}, ["kv"], ["lora"]], ids=["typo", "list", "list_naming_lora"])
+def test_a_deployment_without_lora_leaves_its_resources_block_to_the_conductor(resources):
+    """The API server reads the config before the conductor's ``validate_deployment``,
+    which reports a bad ``resources:`` block with the deployment's other problems."""
+    config = {"resources": resources}
+    served = ServedModels.of(BASE, config)
+    assert not served.lora and served.adapters == ()
+    assert lora_specs(object(), config) == []
+    keyed = SimpleNamespace(
+        kv_labels=lambda: {"kv": {"main": KVLabel(keys=PrefixKeys("ids", ("prefill",)))}},
+        get_node_resources=list,
+    )
+    assert adapter_prefix_roots(keyed, config) is None
+
+
+@pytest.mark.parametrize("block", [None, ["sql"]], ids=["bare", "list"])
+def test_a_lora_block_that_is_not_a_mapping_is_left_to_the_conductor(block):
+    """``validate_deployment`` reports it: `resources: lora:` must be a mapping."""
+    assert lora_specs(object(), {"resources": {LORA_RESOURCE_KEY: block}}) == []
 
 
 def test_submit_request_refuses_an_unserved_adapter_kwarg():

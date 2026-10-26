@@ -18,12 +18,14 @@ if TYPE_CHECKING:
 
 def declared_lora_specs(model: Model, model_config: Mapping[str, Any]) -> list[LoraSpec]:
     """The model's LoRA specs, the one keyed ``lora`` first, when the YAML has a ``lora:``
-    block; none otherwise. The block sizes every spec (one per node that serves adapters);
-    a block under another LoRA spec's own key overrides it there (applied with the other
-    ``resources:`` overrides)."""
-    block = (model_config.get("resources") or {}).get(LORA_RESOURCE_KEY)
-    if block is None:
+    block; none otherwise. The block sizes every spec (one per node that serves adapters):
+    the ``lora`` one with the other ``resources:`` overrides, the others before them
+    (``size_lora_specs``), so a block under another LoRA spec's own key overrides it there."""
+    if not lora_enabled(model_config):
         return []
+    block = model_config["resources"][LORA_RESOURCE_KEY]
+    if not isinstance(block, Mapping):
+        raise ValueError(f"`resources: {LORA_RESOURCE_KEY}:` must be a mapping; got {block!r}")
     lora = list(model.get_lora_specs())
     if not lora:
         raise ValueError(
@@ -42,9 +44,13 @@ def declared_lora_specs(model: Model, model_config: Mapping[str, Any]) -> list[L
             f"`resources: {LORA_RESOURCE_KEY}: targets:` names {unknown}, which "
             f"{type(model).__name__} does not declare; it declares {sorted(declared)}"
         )
-    for spec in lora[1:]:
-        spec.apply_yaml_overrides(**block)
     return lora
+
+
+def size_lora_specs(lora: list[LoraSpec], model_config: Mapping[str, Any]) -> None:
+    """Apply the YAML's ``lora:`` block to the LoRA specs keyed apart from ``lora``."""
+    for spec in lora[1:]:
+        spec.apply_yaml_overrides(**model_config["resources"][LORA_RESOURCE_KEY])
 
 
 def drop_lora_specs_without_targets(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
@@ -106,9 +112,10 @@ def lora_specs(model: Model | None, model_config: Mapping[str, Any] | None) -> l
     its config turns LoRA on nowhere. Built once per model and ``resources:`` block in a
     process (building one reads the model's module tree), so its callers there share the
     specs, and with them a runtime load or unload recorded on one."""
-    if model is None or not model_config:
+    if model is None or not model_config or not lora_enabled(model_config):
         return []
-    if not lora_enabled(model_config):
+    # validate_deployment reports a `lora:` value that is not a mapping
+    if not isinstance(model_config["resources"][LORA_RESOURCE_KEY], Mapping):
         return []
     from mstar.model.base import serving_resources
 

@@ -31,14 +31,17 @@ LORA_ADAPTER_KWARG = "lora_adapter"
 
 
 def lora_enabled(model_config: Mapping[str, Any]) -> bool:
-    """Whether a deployment's YAML turns LoRA on (a ``resources: lora:`` block)."""
-    return LORA_RESOURCE_KEY in (model_config.get("resources") or {})
+    """Whether a deployment's YAML turns LoRA on (a ``resources: lora:`` block). A
+    ``resources:`` value that is not a mapping turns nothing on: the conductor's
+    ``validate_deployment`` reports it with the deployment's other problems."""
+    resources = model_config.get("resources")
+    return isinstance(resources, Mapping) and LORA_RESOURCE_KEY in resources
 
 
 def served_lora_adapters(model_config: Mapping[str, Any]) -> tuple[str, ...]:
     """The adapter names a deployment's YAML serves; empty when it does not turn LoRA on."""
-    block = (model_config.get("resources") or {}).get(LORA_RESOURCE_KEY) or {}
-    return tuple(block.get("adapters") or ())
+    block = model_config["resources"][LORA_RESOURCE_KEY] if lora_enabled(model_config) else None
+    return tuple(block.get("adapters") or ()) if isinstance(block, Mapping) else ()
 
 
 def describe_load_error(exc: BaseException) -> str:
@@ -326,13 +329,7 @@ class LoraSpec(NodeResourceSpec):
         super().__post_init__()
         if not self.targets:
             raise ValueError(f"LoRA resource {self.resource_key!r} declares no targets")
-        self._check_sizes()
-
-    def _check_sizes(self) -> None:
-        for name in ("max_slots", "max_rank", "cpu_capacity", "slot_wait_steps"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"{name} must be an integer >= 1; got {value!r}")
+        _check_sizes({name: getattr(self, name) for name in _SIZES})
 
     @property
     def num_slots(self) -> int:
@@ -361,37 +358,47 @@ class LoraSpec(NodeResourceSpec):
         LoRA spec of the model, so a name another spec declares is not an error here;
         ``serving_resources`` checks the list as a whole): dropping the LM head and
         embedding saves their vocabulary-sized slots, and an adapter that touches a
-        dropped target is refused."""
-        if max_slots is not None:
-            self.max_slots = max_slots
-        if max_rank is not None:
-            self.max_rank = max_rank
-        if cpu_capacity is not None:
-            self.cpu_capacity = cpu_capacity
-        if slot_wait_steps is not None:
-            self.slot_wait_steps = slot_wait_steps
+        dropped target is refused.
+
+        Every value is checked before any is set, so a refused override leaves the spec
+        as declared."""
+        sizes = {
+            name: value
+            for name, value in zip(_SIZES, (max_slots, max_rank, cpu_capacity, slot_wait_steps), strict=True)
+            if value is not None
+        }
+        _check_sizes(sizes)
         if adapters is not None:
             if not isinstance(adapters, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in adapters.items()
             ):
                 raise ValueError(f"adapters must map names to paths; got {adapters!r}")
             # a PEFT directory names its adapter_model.safetensors, as at a runtime load
-            self.adapters = {name: resolve_adapter_path(path) for name, path in adapters.items()}
+            adapters = {name: resolve_adapter_path(path) for name, path in adapters.items()}
+        if adapter_digests is not None:
+            served = self.adapters if adapters is None else adapters
+            # hex, as the conductor writes them into the config it spawns workers with
+            adapter_digests = {
+                name: bytes.fromhex(digest) for name, digest in adapter_digests.items()
+                if name in served
+            }
+        if targets is not None and (
+            not isinstance(targets, list) or not all(isinstance(t, str) for t in targets)
+        ):
+            raise ValueError(f"targets must be a list of target names; got {targets!r}")
+
+        for name, value in sizes.items():
+            setattr(self, name, value)
+        if adapters is not None:
+            self.adapters = adapters
             self.adapter_digests = {}
             self._info.clear()
         if adapter_digests is not None:
-            # hex, as the conductor writes them into the config it spawns workers with
-            self.adapter_digests = {
-                name: bytes.fromhex(digest) for name, digest in adapter_digests.items()
-                if name in self.adapters
-            }
+            self.adapter_digests = adapter_digests
         if targets is not None:
-            if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
-                raise ValueError(f"targets must be a list of target names; got {targets!r}")
             self.dropped_targets = self.dropped_targets | (set(self.targets) - set(targets))
             self.targets = {name: t for name, t in self.targets.items() if name in targets}
             self._info.clear()
-        self._check_sizes()
 
     def stop_ignoring(self, modules: Callable[[str], bool]) -> None:
         """Refuse, rather than ignore, the checkpoint modules ``modules`` matches: those
@@ -451,6 +458,15 @@ class LoraSpec(NodeResourceSpec):
         self.adapters.pop(name, None)
         self.adapter_digests.pop(name, None)
         self._info.pop(name, None)
+
+
+_SIZES = ("max_slots", "max_rank", "cpu_capacity", "slot_wait_steps")
+
+
+def _check_sizes(sizes: Mapping[str, Any]) -> None:
+    for name, value in sizes.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be an integer >= 1; got {value!r}")
 
 
 def _some(items: tuple[str, ...], n: int = 5) -> str:
