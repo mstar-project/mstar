@@ -61,8 +61,18 @@ from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.noise import NoiseStager
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
+
+
+def _queue_to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """``tensor`` on ``device`` without a host sync. A blocking copy synchronizes the
+    stream, so on the GPU thread it waits out the step still running there; one
+    from pinned memory is only queued behind it."""
+    if tensor.device == device or not DeviceCapability.of(device).is_accelerator:
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)
 
 
 class StepScalar(NamedTuple):
@@ -408,7 +418,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                     f"entries for {schedule.num_steps} steps, but "
                     f"{scalar.source} has {tensor.shape[0]}."
                 )
-            staged.setdefault(scalar.source, tensor.to(device))
+            staged.setdefault(scalar.source, _queue_to_device(tensor, device))
         return staged
 
     def _carried_inputs(
