@@ -526,7 +526,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="torchcodec")
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile+torchcodec")
             # Keyed by modality: the data worker iterates the dict and
             # loads each group through the matching loader.
             file_paths = {"audio": [path]}
@@ -649,8 +649,9 @@ class ChatterboxAdapter(OpenAIAdapter):
     ``voice`` is either ``"default"`` (the voice shipped with the checkpoint)
     or the name of a preset clip in the deployment's ``voices_dir``. A
     reference clip for cloning comes through ``ref_audio`` in ``extra_body``
-    (a data URL or, when the server allows it, an http(s) URL; paths on the
-    server are refused) and is loaded by the worker like an uploaded file.
+    (a data URL, bare base64 or, when the server allows it, an http(s) URL;
+    paths on the server are refused, and so is a clip over 60 s or below
+    8 kHz) and is loaded by the worker like an uploaded file.
     The model's own knobs --
     ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
     ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for
@@ -670,10 +671,7 @@ class ChatterboxAdapter(OpenAIAdapter):
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            if not isinstance(ref_audio, str):
-                raise ValueError(f"ref_audio must be a data URL, got {type(ref_audio).__name__}")
-            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
-            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir)
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile+torchcodec")
             file_paths = {"audio": [path]}
             input_modalities = ["text", "audio"]
         return SubmitArgs(

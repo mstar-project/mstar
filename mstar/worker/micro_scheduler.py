@@ -73,6 +73,9 @@ class ScheduledBatch:
     request_walks: dict[int, str] = field(default_factory=dict)
     # real walk -> its output edge names, under a combined walk
     walk_output_signals: dict[str, list[str]] = field(default_factory=dict)
+    # A TP follower's copy of ``ScheduleTPNode.read_check``: the leader's rows,
+    # in its order, including those this rank could not read; None for no check
+    read_check_rids: tuple[int, ...] | None = None
     # `rids_by_walk`, computed once; `merge` and `discard_rid` reset it
     _by_walk: dict[str, list[int]] | None = field(default=None, repr=False, compare=False)
 
@@ -254,6 +257,12 @@ class MicroScheduler:
         # rid -> message, for requests a resource declared unservable during a
         # readiness check. Drained by the worker, which reports them onward.
         self.admit_errors: dict[int, str] = {}
+        # Rids an input read of which failed on this rank. A TP follower never
+        # gets those inputs, so it builds the leader's step without the row and
+        # the step's read check takes it out on every rank (see
+        # ``Worker._drop_rows_whose_read_failed``).
+        self.read_failed_rids: set[int] = set()
+        self._warned_read_check = False
 
         # lockstep-parallel (TP / SP instance) scheduling
         self.parallel_leader_nodes = parallel_leader_nodes
@@ -522,14 +531,24 @@ class MicroScheduler:
         # leader's graph walk. No step of the node is in flight on this path.
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
+        rids = self.tp_rids(first_tp_node)
+        unread = self.unread_rows(first_tp_node, rids)
         popped = self.pop_ready_rids(
-            request_state, first_tp_node.node_name,
-            first_tp_node.graph_walk, self.tp_rids(first_tp_node),
-            walks=first_tp_node.walks, walk_idx=first_tp_node.walk_idx,
+            request_state, first_tp_node.node_name, first_tp_node.graph_walk,
+            [r for r in rids if r not in unread],
+            walks=first_tp_node.walks,
+            walk_idx=[
+                w for r, w in zip(rids, first_tp_node.walk_idx, strict=True) if r not in unread
+            ] if first_tp_node.walks else None,
         )
         if popped is None:
+            self.warn_unchecked_read_failure(first_tp_node, rids)
             return
         request_to_worker_graph, input_edges, output_signals, request_walks, walk_signals = popped
+        if unread:
+            request_to_worker_graph, request_walks = self.with_unread_rows(
+                first_tp_node, rids, unread, request_to_worker_graph, request_walks,
+            )
 
         self.pop_tp_follow_head()
 
@@ -542,6 +561,53 @@ class MicroScheduler:
             tp_seq=first_tp_node.spec_seq,
             request_walks=request_walks,
             walk_output_signals=walk_signals,
+            read_check_rids=tuple(rids) if first_tp_node.read_check else None,
+        )
+
+    def unread_rows(self, head: ScheduleTPNode, rids: list[int]) -> set[int]:
+        """The rows of ``head`` whose input read failed on this rank, which a
+        follower puts in the step it builds with no inputs, for the step's read
+        check to take out on every rank. Only under a read check: without one no
+        rank takes the row out, so the follower pops it like any other (the
+        failed read may have been for another step)."""
+        failed = self.read_failed_rids
+        if not head.read_check or not failed:
+            return set()
+        return {r for r in rids if r in failed}
+
+    def with_unread_rows(
+        self, head: ScheduleTPNode, rids: list[int], unread: set[int],
+        request_to_worker_graph: dict[int, int], request_walks: dict[int, str],
+    ) -> tuple[dict[int, int], dict[int, str]]:
+        """``request_to_worker_graph`` and ``request_walks`` with ``unread``'s
+        rows put back, in the leader's order: the step has rank 0's rows on
+        every rank until its read check, so it is built, submitted, voided and
+        settled alike. The unread rows were never popped."""
+        walk_of = dict(zip(rids, (head.walks[w] for w in head.walk_idx), strict=True)) if head.walks else {}
+        request_walks = dict(request_walks)
+        rows = {}
+        for rid in rids:
+            if rid not in unread:
+                rows[rid] = request_to_worker_graph[rid]
+                continue
+            walk = walk_of.get(rid, head.graph_walk)
+            rows[rid] = self.runtime.get_worker_graph_id_for_node(head.node_name, walk)
+            if walk_of:
+                request_walks[rid] = walk
+        return rows, request_walks
+
+    def warn_unchecked_read_failure(self, head: ScheduleTPNode, rids: list[int]) -> None:
+        """Once: a head with no read check waits on a row whose read failed
+        here, which it never gets. Only a read rank 0 did not mark gets here."""
+        if self._warned_read_check or head.read_check or not self.read_failed_rids:
+            return
+        if self.read_failed_rids.isdisjoint(rids):
+            return
+        self._warned_read_check = True
+        logger.error(
+            "Node %s walk %s: a TP head with no read check names a request whose "
+            "input read failed on this rank; the instance waits on it",
+            head.node_name, head.graph_walk,
         )
 
 
@@ -1325,6 +1391,7 @@ class MicroScheduler:
         Takes both identities because ``pending_tp_follow_count`` is keyed by
         the wire string and everything else by the handle."""
         self.failed_rids.discard(rid)
+        self.read_failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)

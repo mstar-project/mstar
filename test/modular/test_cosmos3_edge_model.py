@@ -136,7 +136,7 @@ def test_edge_recipe_defaults_from_the_checkpoint(tmp_path) -> None:
     assert over.conditioning_resize == "stretch" and over.flow_shift_video == 9.0
     # Nano keeps its defaults.
     nano = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
-    assert nano.conditioning_resize == "stretch" and nano.flow_shift_video is None
+    assert nano.conditioning_resize == "aspect_crop" and nano.flow_shift_video is None
 
 
 def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:

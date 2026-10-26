@@ -683,9 +683,10 @@ Chatterbox notes
 - Requests: ``/v1/audio/speech`` with ``input``, ``voice`` (``default`` = the
   voice shipped in the checkpoint, or a preset name resolved under the
   deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
-  ``ref_audio`` (data URL of a reference clip, 5-30 s, cloning; an http(s)
-  URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the
-  server are refused), ``exaggeration`` (0-2, emotion intensity, default 0.5),
+  ``ref_audio`` (data URL or bare base64 of a reference clip, 5-30 s,
+  cloning; an http(s) URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``;
+  paths on the server, clips over 60 s and clips below 8 kHz are refused),
+  ``exaggeration`` (0-2, emotion intensity, default 0.5),
   ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
   ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
   whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;
@@ -808,6 +809,16 @@ Cosmos3 environment requirements
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
+
+Cosmos3 image-to-video conditioning
+-----------------------------------
+
+An image-to-video request's conditioning image is scaled to cover the output
+size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
+NVIDIA's cosmos-framework and diffusers 0.40 and later. Setting
+``conditioning_resize: stretch`` under the config YAML's ``model_kwargs``
+resizes it to the output size instead (antialiased bilinear, aspect ratio not
+kept), as diffusers 0.39 did. Action requests ignore the setting.
 
 Cosmos3-Edge reasoner and action loop
 -------------------------------------
