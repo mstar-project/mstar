@@ -11,7 +11,7 @@ Earlier PR (#400) proposed admission control that reserves each request's worst 
 This design adds slim version of admission control by default (A1). A request reserves only its prompt's pages and waits in a queue until they fit. On top of it, the requests are classified as either:
 
 1. **Guaranteed.** A request that streams audio, or whose KV can't be rebuilt from token ids, also reserves pages for the most it can generate, and is never preempted.
-2. **Preemptible.** When a request runs out of pages, newer preemptible requests are dropped to free pages for it, and later rebuild their KV from token ids.
+2. **Preemptible.** When a request runs out of pages, newer preemptible requests free pages for it. Each moves to the host when the host pool can hold all of its pages, and is otherwise dropped and later rebuilds its KV from token ids.
 
 A host tier for the prefix cache, which was on the roadmap regardless, is built alongside, and aims to cut that recompute by copying pages between host and device asynchronously, hiding the offload and reload cost.
 
@@ -115,7 +115,7 @@ Why this shape:
 
 ## 3. Preemption
 
-Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads the least recently active request first, as it does today, since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
+Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker moves victims to the host or drops them, moves or drops the request itself, or makes it wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
 
 Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request that finds no free slot waits for one, as it does today.
 
@@ -137,24 +137,24 @@ A number set by each worker won't work, since requests reach workers on separate
 
 Say request R's grant is short by `pages_short` pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.
 
-- **Candidates.** The preemptible requests that arrived after R, newest first, minus any whose drop is refused for a lasting reason (§4).
-- **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose drop wouldn't change what the set frees.
+- **Candidates.** The preemptible requests that arrived after R, newest first. Each fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
+- **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose move wouldn't change what the set frees.
 
 Then:
 
-1. If the victims free enough, the worker earmarks `pages_short` for R (§3.3) and drops each victim (§4).
-2. Otherwise, if R can be dropped and that frees any page, R drops itself and is requeued.
+1. If the victims free enough, the worker earmarks `pages_short` for R (§3.3), and moves each victim to the host or drops it (§4).
+2. Otherwise, if R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
 3. Otherwise, R waits until the pool's room grows past what its failed grant saw.
 
 The choice is one `KVManager.preempt` call under the pool's lock.
 
 Why this shape:
 
-- **Newest first.** No request is dropped for a newer one's page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
+- **Newest first.** No request loses its pages so that a newer request gets a page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
 - **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
 - **A waiting request watches the room.** The pool records the room each failed grant saw, so no timer decides when to retry.
 - **Not the least recently active request.** Today's offload picks it, but it can be the oldest request in the pool, so nothing guarantees progress.
-- **Not the largest request.** A long request would be dropped every time it grows.
+- **Not the largest request.** A long request would be preempted every time it grows.
 
 ### 3.3 Earmarks
 
@@ -163,17 +163,17 @@ Why this shape:
 class Earmark:
     rid: str            # R, the request whose grant failed
     pages: int          # what R was short
-    victims: set[str]   # the victims whose drops cover it
+    victims: set[str]   # the victims whose moves cover it
 ```
 
-When the victims' drops land, the earmark joins R's reservation, so R's next grant can't fail again. Without it, the head of the queue could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
+When the victims' moves land, the earmark joins R's reservation, so R's next grant can't fail again. Without it, the head of the queue could be admitted into the freed pages before R's next step, and R would fail again, as it does today.
 
-A victim with a step or a KV read in flight is dropped once that lands, and the worker composes it into no further step until then.
+A victim with a step or a KV read in flight moves or is dropped once that lands, and the worker composes it into no further step until then.
 
 Lifecycle:
 
 1. Created with its victims when the worker handles R's failed grant.
-2. Joins R's reservation when its victims' drops land.
+2. Joins R's reservation when its victims' moves land.
 3. Removed with R.
 
 ---
@@ -212,7 +212,7 @@ At a drop, the other resources:
 Why this shape:
 
 - **A drop needs no host pool.** `cpu_offload_pages` is 0 by default, and a full host pool would stall preemption as it stalls offload today.
-- **The whole reservation goes.** Keeping its unused part, as an offload does, would leave pages counted that nothing can use until the victim returns.
+- **The whole reservation goes.** Keeping its unused part, as the offload of the least recently active request does, would leave pages counted that nothing can use until the victim returns.
 
 > Note: a dropped request's keyed pages stay in the index as evictable cache. With write-ahead (H1b) and a host pool, they reach the host once no request holds them, so a later request with that prefix copies them back. A rebuild row doesn't read the host index, though, so it recomputes what only the host holds.
 
@@ -225,15 +225,16 @@ Why this shape:
 | State | Held as |
 |---|---|
 | running | resident, out of the queue |
+| on the host | its pages on the host, in the queue at its arrival position, no reservation |
 | dropped | not resident, in the queue at its arrival position, no reservation |
 | rebuilding | not resident, out of the queue, holding its return reservation, its rebuild row queued or in a step |
 
-No field holds the state: residency, the queue and the rebuild queue tell the three apart.
+No field holds the state: residency, the host pool, the queue and the rebuild queue tell the four apart.
 
 Lifecycle:
 
 - A rebuilding request can be chosen again. Its queued row leaves the queue, and it gives up its return reservation and waits in the queue again.
-- Removing a request in any state releases its earmark, its place in the queue, its return reservation, its queued rebuild row and its kept ids. A removal during a rebuild step waits for the step.
+- Removing a request in any state releases its earmark, its pages on the host, its place in the queue, its return reservation, its queued rebuild row and its kept ids. A removal during a rebuild step waits for the step.
 
 ### 5.2 The return check
 
@@ -248,6 +249,8 @@ return when _unused + need(V) <= free + evictable,
 ```
 
 When it passes, V reserves `need(V)` and its rebuild row is queued.
+
+A request on the host returns through `KVManager.can_reload` and `reload` instead, once it is first in the queue and its return reservation fits. That reservation is its pages plus one page per stream, capped at its footprint, or its queued prompt if that is larger. It makes that reservation as its pages are copied back. The readiness check for its next step reloads it, and so does `Worker._reload_from_host` once per scheduling pass, since that step may not come before the request's REMOVE.
 
 Why this shape:
 
@@ -286,13 +289,13 @@ In 24 cases on Qwen3.5, Bagel, Orpheus and the Qwen3-Omni Thinker, greedy and se
 
 ### 5.5 Why every request finishes
 
-A guaranteed request reserves its whole footprint and is never dropped, so it finishes.
+A guaranteed request reserves its whole footprint and is never preempted, so it finishes.
 
 Take the oldest preemptible request:
 
-1. When it runs short, newer requests are dropped first, and it drops itself only when none of them can free a page for it.
+1. When it runs short, newer requests move to the host or are dropped first, and it gives up its own pages only when none of them can free a page for it.
 2. It then waits at the head of its queue, where nothing newer is admitted past it.
-3. It returns with its whole history and one more page reserved, so each time it is dropped again it has grown by at least a page.
+3. It returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page.
 4. Its footprint fits the pool, so it finishes after a bounded number of returns.
 
 The next oldest request then takes its place in the argument.
@@ -332,20 +335,20 @@ Why this shape:
 
 Always on:
 
-- A victim is preemptible, droppable and never older than the request whose grant failed. A breach raises, and so does a forced drop of a guaranteed request.
+- A victim is preemptible, can move to the host or be dropped, and is never older than the request whose grant failed. A breach raises, and so does a forced drop of a guaranteed request.
 - A grant that a reservation covers and that can't take its pages raises.
 - Counters per node: preemptions, drops, tokens rebuilt, and requests dropped more than once.
 
 Under `MSTAR_KV_DEBUG_ASSERTS`:
 
 - The invariant of §2, on each grant.
-- After a drop, the victim holds no page in the pool, and the pool's pages are conserved.
+- After a drop or a move to the host, the victim holds no page in the pool, and the pool's pages are conserved.
 
 ---
 
 ## 8. Trade-offs
 
-- **Drops cost a rebuild.** Once nothing can be offloaded, every victim is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307's workload one request was dropped four times, although that was a contrived test.
+- **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again and again: on #307's workload one request was dropped four times, although that was a contrived test.
 - **Rebuild steps.** A rebuild runs in a step of its own, so the node's decode rows wait one step. A long uncached history rebuilds in one step, eager past the capture buckets, until chunked prefill (#365) splits it. One step of delay on decode rows is small next to a request that never finishes.
 - **Kept ids.** Every request's prompt ids ride its first frame to each worker, which keeps them at 4 B per token, 128 KB for a 32K-token request. Carrying them adds 0.5 to 1.8 ms of TTFT per request at Bagel c16 and Qwen3.5 c32. Keeping the ids any other way would mean a d2h copy of every prefill.
 - **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages took 1.49x to 1.66x as long as they do today.
