@@ -162,6 +162,29 @@ def test_pi05_vision_pads_to_the_captured_cameras_and_drops_the_blank_tokens(num
     assert torch.equal(outputs["img_emb"][0], submodule.encoder(own).reshape(-1, 24))
 
 
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_stage_refuses_cameras_that_do_not_fill_the_captured_vit(num_images):
+    """Unpadded, one camera was broadcast into all three slots of the captured ViT's buffer, and
+    two failed inside copy_. Staging refuses both before it copies anything."""
+    static = {"pixel_values": torch.zeros(1, 3, 3, 4, 4)}
+    expected = rf"'pixel_values' is \(1, {num_images}, 3, 4, 4\) but its captured buffer is \(1, 3, 3, 4, 4\)"
+    with pytest.raises(RuntimeError, match=expected):
+        _stage_into(static, {"pixel_values": torch.ones(1, num_images, 3, 4, 4)})
+    assert not static["pixel_values"].any()
+
+
+def test_stage_takes_a_prefill_shorter_than_its_bucket_and_nothing_else():
+    """A packed prefill may be shorter than its bucket along the seq dim and nowhere else."""
+    static = {"prefix_embs": torch.zeros(16, 8)}
+    _stage_into(static, {"prefix_embs": torch.ones(10, 8)}, seq_dims={"prefix_embs": 0})
+    assert static["prefix_embs"][:10].eq(1).all() and not static["prefix_embs"][10:].any()
+    _stage_into(static, {}, seq_dims={"prefix_embs": 0})  # a key the step leaves out keeps its buffer
+    for wrong in (torch.full((10, 1), 2.0), torch.full((10, 4), 2.0), torch.full((8,), 2.0)):
+        with pytest.raises(RuntimeError, match="only dim 0 may be shorter"):
+            _stage_into(static, {"prefix_embs": wrong}, seq_dims={"prefix_embs": 0})
+    assert not static["prefix_embs"].eq(2).any()
+
+
 def test_pi05_vision_refuses_more_cameras_than_captured():
     submodule = Pi05ViTEncoderSubmodule(_PerImageEncoder(), Pi05Config(vit_image_size=4, num_cameras=2))
     with pytest.raises(ValueError, match="3 camera images; this deployment takes at most 2"):

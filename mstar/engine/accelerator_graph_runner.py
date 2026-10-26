@@ -1483,7 +1483,9 @@ class AcceleratorGraphRunner:
         Each key is sliced along the dim ``_intern_static_buffer`` recorded as
         its seq dim, so mrope-style ``[.., seq, ..]`` inputs land on the right
         axis. Trailing slots beyond the real length keep capture-time contents;
-        the plan's indptrs keep attention off them.
+        the plan's indptrs keep attention off them. Any other difference from
+        the captured buffer raises, where ``copy_`` would broadcast a size-1 or
+        missing dim across it.
         """
         slot = self.slot_for(lease)
         for key in slot.static_input_keys:
@@ -1492,7 +1494,14 @@ class AcceleratorGraphRunner:
                 continue
             static_buf = slot.static_inputs[key]
             seq_dim = self._static_buffer_seq_dims.get((slot.config_idx, key), 0)
-            static_buf.narrow(seq_dim, 0, value.shape[seq_dim]).copy_(value)
+            shape = value.shape
+            staged = static_buf.narrow(seq_dim, 0, shape[seq_dim])
+            if staged.shape != shape:
+                raise RuntimeError(
+                    f"{key!r} is {tuple(shape)} but its captured buffer is "
+                    f"{tuple(static_buf.shape)}; only dim {seq_dim} may be shorter"
+                )
+            staged.copy_(value)
 
     def _replay(self, lease: SlotLease) -> dict:
         slot = self.slot_for(lease)
