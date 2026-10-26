@@ -234,6 +234,7 @@ Notes
   ``moe_gemm`` table for the GPU (``mstar/kernels/tables/moe_gemm/``) when it has
   the expert shape, and default tiles otherwise. The server logs the sweep command
   for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
+  On AMD GPUs the sweep tunes Triton's HIP compiler options too.
 - To add a new family, see :doc:`adding_models`.
 
 OmniVoice notes
