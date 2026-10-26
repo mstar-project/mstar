@@ -1132,16 +1132,16 @@ methods are:
    starting early on a thread of the submodule's own; it must not touch the device. The
    DiT scaffold draws a request's seeded noise here (``PREFETCH_SEEDS``).
 
-``get_stop_policies(self, graph_walk) -> tuple[StopPolicy, ...] | None`` (optional)
-   Declare what ``check_stop`` amounts to on a walk, when it is only the common checks,
-   and the engine runs them over the whole batch without calling ``check_stop``.
-   ``StopPolicy(StopKind.AR, loop, token_signal=..., eos_tokens=..., sampler=...)`` stops
-   ``loop`` on an EOS token (unless the ``sampler`` resource's request config sets
-   ``ignore_eos``) or when the loop's iteration count plus one reaches ``max_iters``
-   (``info.max_tokens`` unless given). ``StopKind.ITER`` checks only the count. The
-   limits are computed once per request and walk. Return ``()`` for a walk on which
-   ``check_stop`` never stops a loop, and ``None`` (the default) to keep calling
-   ``check_stop``. The policies must agree with ``check_stop`` for every row;
+``get_stop_policies(self, graph_walk) -> dict[str, StopPolicy] | None`` (optional)
+   Declare what ``check_stop`` amounts to on a walk, per loop it can stop, when it is
+   only the common checks; the graph runtime then runs them over the step's token column
+   without calling ``check_stop``. ``StopPolicy(StopKind.AR, token_signal=...,
+   eos_tokens=..., sampler=...)`` stops its loop on an EOS token (unless the ``sampler``
+   resource's request config sets ``ignore_eos``) or when the loop's iteration count plus
+   one reaches ``max_iters`` (``info.max_tokens`` unless given). ``StopKind.ITER`` checks
+   only the count. The limits are computed once per request and walk. Return ``{}`` for a
+   walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
+   calling ``check_stop``. The policies must agree with ``check_stop`` for every row;
    ``test/modular/test_stop_policies.py`` checks the models that declare them.
 
 ``cleanup_request(self, request_id)`` (optional)

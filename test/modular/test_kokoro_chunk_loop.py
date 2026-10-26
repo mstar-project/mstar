@@ -69,8 +69,6 @@ def _engine(submodule: KokoroSynthSubmodule) -> Engine:
     engine._submodules = {SYNTH_NODE: type("Mgmt", (), {"submodule": submodule, "resources": {}})()}
     engine._enable_nvtx = False
     engine._loopback_steps = {}
-    engine._stop_policies = {}
-    engine._stop_limits = {}
     return engine
 
 

@@ -525,6 +525,7 @@ class Worker:
             device_capability=self.device_capability,
         )
         self._never_publish_unshared(all_worker_graph_ids_to_instances)
+        self._declare_stop_policies(my_walks)
 
         self.request_state = RequestStateManager(
             node_to_partition=node_to_partition,
@@ -606,8 +607,6 @@ class Worker:
 
         # CPU offloading: LRU tracking and eviction policy
         self._last_active: dict[tuple[int, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
-        # (node, walk)s whose stop policies the graph runtime has been given
-        self._stop_rules_declared: set[tuple[str, str]] = set()
         self.eviction_policy = EvictionPolicy.LRU
         # (node, walk) -> when its last hold was logged, and the holds since
         self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
@@ -3328,7 +3327,7 @@ class Worker:
             request_ids=batch_N.node_batch.request_ids,
         )
         _pp_stage("prematerialize")
-        stops = self._check_stops_in_runtime(batch_N, engine, host_rows)
+        stops = self._check_stops_in_runtime(batch_N, host_rows)
         if stops is None:
             stops = engine.check_stop_for_batch(
                 batch_N.node_batch, cpu_outputs, host_rows=host_rows,
@@ -3507,66 +3506,56 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
+    def _declare_stop_policies(self, walks: set[tuple[str, str]]) -> None:
+        """Give the graph runtime each local (node, walk)'s declared stop
+        policies (``NodeSubmodule.get_stop_policies``), and note the token
+        signal each one reads. A walk whose policies read two token signals
+        keeps ``check_stop``."""
+        # (node, walk) -> the token signal its policies read, or None
+        self._stop_token_signal: dict[tuple[str, str], str | None] = {}
+        for node, walk in sorted(walks):
+            policies = self.engine_manager.get_engine(node).get_stop_policies(node, walk)
+            if policies is None:
+                continue
+            signals = {p.token_signal for p in policies.values() if p.kind is StopKind.AR}
+            if len(signals) > 1:
+                logger.warning(
+                    "%s/%s: stop policies read several token signals %s; check_stop decides",
+                    node, walk, sorted(signals),
+                )
+                continue
+            self._graph_runtime.set_stop_policies(node, walk, policies)
+            self._stop_token_signal[(node, walk)] = next(iter(signals), None)
+
     def _check_stops_in_runtime(
-        self, batch_N: PendingBatch, engine, host_rows: "HostRows | None",
+        self, batch_N: PendingBatch, host_rows: "HostRows | None",
     ) -> dict[int, set[str]] | None:
-        """The step's declared stop policies (``Engine.stop_policies``),
-        checked by the graph runtime over the token column in place, with
-        each loop's count from the walk state. None, having decided nothing,
-        when the runtime can't: no declared policies, a step that mixes walks,
-        no token column, or a runtime without the call. The engine's check
-        is the reference and makes the same decisions.
-        """
-        rt = self._graph_runtime
+        """The step's declared stop policies, checked by the graph runtime
+        over the token column in place. None, having decided nothing, for a
+        step ``check_stop`` decides: no declared policies, a step that mixes
+        walks, or no token column."""
         nb = batch_N.node_batch
         ctx = nb.step_context
-        if ctx.request_walks or not getattr(rt, "supports_check_stops_inline", False):
+        key = (batch_N.node_name, ctx.graph_walk)
+        if ctx.request_walks or key not in self._stop_token_signal:
             return None
-        node, walk = batch_N.node_name, ctx.graph_walk
-        policies = engine.stop_policies(node, walk)
-        if policies is None:
-            return None
-        if not policies:
-            return {}
-        signals = {p.token_signal for p, _ in policies if p.kind is StopKind.AR}
+        signal = self._stop_token_signal[key]
         tokens = None
-        if signals:
-            if len(signals) > 1 or host_rows is None:
-                return None
-            buf = host_rows.buffers.get(next(iter(signals)))
+        if signal is not None:
+            buf = None if host_rows is None else host_rows.buffers.get(signal)
             if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
                 return None
             tokens = buf.reshape(buf.shape[0], -1)[:, 0]
         row_rids = list(host_rows.request_ids) if host_rows is not None else []
         try:
-            if (node, walk) not in self._stop_rules_declared:
-                rt.set_stop_rules(
-                    node, walk, [p.loop for p, _ in policies],
-                    [p.kind is StopKind.AR for p, _ in policies],
-                    [list(p.eos_tokens) for p, _ in policies],
-                )
-                self._stop_rules_declared.add((node, walk))
-            stop_rids, stop_rules, missing = rt.check_stops_inline(
-                batch_N.partition, node, walk, nb.request_ids, tokens, row_rids,
+            return self._graph_runtime.check_stops(
+                batch_N.partition, *key, nb.request_ids, tokens, row_rids,
+                nb.per_request_info_wrapped,
             )
-            if missing:
-                # first check of these requests on this walk
-                infos = nb.per_request_info_wrapped
-                rt.set_stop_limits(walk, missing, [
-                    engine.stop_limits(rid, walk, infos[rid], policies) for rid in missing
-                ])
-                more_rids, more_rules, _ = rt.check_stops_inline(
-                    batch_N.partition, node, walk, missing, tokens, row_rids,
-                )
-                stop_rids += more_rids
-                stop_rules += more_rules
         except Exception:
-            logger.debug("runtime stop check failed (node=%s)", node, exc_info=True)
+            # check_stop then decides, and attributes a failure to its request
+            logger.debug("runtime stop check failed (node=%s)", key[0], exc_info=True)
             return None
-        stops: dict[int, set[str]] = {}
-        for rid, k in zip(stop_rids, stop_rules, strict=True):
-            stops.setdefault(rid, set()).add(policies[k][0].loop)
-        return stops
 
     def _route_and_send_fast(
         self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,

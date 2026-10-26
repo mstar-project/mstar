@@ -643,14 +643,14 @@ class LLMSubmodule(ARNodeSubmodule):
             "last_prefill", False,
         )
 
-    def get_stop_policies(self, graph_walk: str) -> tuple[StopPolicy, ...]:
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy]:
         # as check_stop: only a decode row's stop can end decode_loop
         if graph_walk != "decode":
-            return ()
-        return (StopPolicy(
-            StopKind.AR, "decode_loop", token_signal="new_token",
-            eos_tokens=tuple(self.config.stop_token_ids), sampler=SAMPLER,
-        ),)
+            return {}
+        return {"decode_loop": StopPolicy(
+            StopKind.AR, token_signal="new_token",
+            eos_tokens=self.config.stop_token_ids, sampler=SAMPLER,
+        )}
 
     def check_stop(
         self,

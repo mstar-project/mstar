@@ -19,6 +19,7 @@ Build: ``maturin develop --release`` in ``rust/`` (see ``docs/installation.rst``
 from __future__ import annotations
 
 import time as _time
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, get_args
 
@@ -53,6 +54,7 @@ from mstar.graph.runtime.base import (
     SpeculationPrepOutput,
 )
 from mstar.model.base import WorkerGraph
+from mstar.model.submodule_base import StopKind, StopPolicy
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 if TYPE_CHECKING:
@@ -240,6 +242,9 @@ class RustGraphRuntime(GraphRuntime):
     ):
         mine = {wg.worker_graph_id for wg in my_worker_graphs}
         combined_walk_of = combined_walk_of or {}
+        # (node, walk) -> its declared stop policies, per loop, in the order
+        # the Rust rules index them
+        self._stop_policies: dict[tuple[str, str], dict[str, StopPolicy]] = {}
         self._rust = _RustGraphRuntime(
             worker_graphs=[worker_graph_args(wg) for wg in my_worker_graphs],
             remote_worker_graphs=[
@@ -655,43 +660,54 @@ class RustGraphRuntime(GraphRuntime):
             ),
         )
 
-    supports_check_stops_inline = True
-
-    def set_stop_rules(
-        self, node_name: str, graph_walk: str,
-        loops: list[str], ar: list[bool], eos: list[list[int]],
+    def set_stop_policies(
+        self, node_name: str, graph_walk: str, policies: Mapping[str, StopPolicy],
     ) -> None:
-        """(node, walk)'s declared stop rules, one entry per policy."""
-        self._rust.set_stop_rules(node_name, graph_walk, loops, ar, eos)
-
-    def set_stop_limits(
-        self, graph_walk: str, rids: list[int], limits: list[tuple[tuple[int, bool], ...]],
-    ) -> None:
-        """Per rid, its (max_iters, ignore_eos) for each of the walk's rules."""
-        n_rules = len(limits[0]) if limits else 0
-        cap = (1 << 32) - 1
-        self._rust.set_stop_limits(
-            graph_walk, rids,
-            [[min(row[k][0], cap) for row in limits] for k in range(n_rules)],
-            [[row[k][1] for row in limits] for k in range(n_rules)],
+        self._stop_policies[(node_name, graph_walk)] = dict(policies)
+        self._rust.set_stop_rules(
+            node_name, graph_walk, list(policies),
+            [p.kind is StopKind.AR for p in policies.values()],
+            [sorted(p.eos_tokens) for p in policies.values()],
         )
 
-    def check_stops_inline(
+    def check_stops(
         self, partition: str, node_name: str, graph_walk: str, rids: list[int],
         tokens: torch.Tensor | None, row_rids: list[int],
-    ) -> tuple[list[int], list[int], list[int]]:
-        """The declared stop rules over a step's rows; see the Rust side.
-        ``tokens`` is a 1-D host view (row i for ``row_rids[i]``) the caller
-        keeps alive, or None when no rule reads a token."""
+        infos: Mapping[int, CurrentForwardPassInfo],
+    ) -> dict[int, set[str]]:
+        policies = self._stop_policies[(node_name, graph_walk)]
+        if not policies:
+            return {}
         if tokens is None:
             ptr = rows = stride = 0
             dtype = ""
         else:
             ptr, rows, stride = tokens.data_ptr(), tokens.shape[0], tokens.stride(0)
             dtype = _dtype_name(tokens.dtype)
-        return self._rust.check_stops_inline(
-            partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids,
-        )
+
+        def check(rids):
+            return self._rust.check_stops_inline(
+                partition, node_name, graph_walk, rids, ptr, rows, stride, dtype, row_rids,
+            )
+
+        stop_rids, stop_rules, missing = check(rids)
+        if missing:
+            # first check of these requests on this walk: give their limits
+            cap = (1 << 32) - 1
+            limits = [[p.limits(infos[rid]) for rid in missing] for p in policies.values()]
+            self._rust.set_stop_limits(
+                graph_walk, missing,
+                [[min(lim.max_iters, cap) for lim in col] for col in limits],
+                [[lim.ignore_eos for lim in col] for col in limits],
+            )
+            more_rids, more_rules, _ = check(missing)
+            stop_rids += more_rids
+            stop_rules += more_rules
+        loops = list(policies)
+        stops: dict[int, set[str]] = {}
+        for rid, k in zip(stop_rids, stop_rules, strict=True):
+            stops.setdefault(rid, set()).add(loops[k])
+        return stops
 
     supports_route_and_send_inline = True
 
