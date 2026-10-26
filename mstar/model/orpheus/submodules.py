@@ -193,9 +193,9 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             engine_inputs=engine_inputs,
             text_inputs=text_inputs
         )
-        # row i is request i; a per-rid dict here would guard the compiled frame on the ids.
-        # As stop buffers too, the stop check reads one host copy of the rows
-        # instead of one per request.
+        # Row i is request i; a per-rid dict here would guard the compiled frame
+        # on the ids. As the stop buffers too, the stop check reads one host
+        # copy of the rows, and the declared stop policies run in the runtime.
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
             check_stop_buffers={"new_token": new_tokens},

@@ -3487,7 +3487,11 @@ class Worker:
         walks = list(by_walk) or [batch_N.graph_walk]
         if len(by_walk) <= 1:
             rids, rid_walk_idx = list(by_walk.get(walks[0], ())), None
-            signals = batch.output_signals
+            # a combined batch keeps its first walk's names, which may not be this walk's
+            signals = (
+                list(self._walk_signals(batch, walks[0])) if batch.request_walks
+                else batch.output_signals
+            )
         else:
             rids, rid_walk_idx = [], []
             for i, walk_rids in enumerate(by_walk.values()):

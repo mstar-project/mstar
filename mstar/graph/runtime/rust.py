@@ -256,6 +256,7 @@ class RustGraphRuntime(GraphRuntime):
         # the Rust rules index them
         self._stop_policies: dict[tuple[str, str], dict[str, StopPolicy]] = {}
         self._postprocess_request: PostprocessRequest | None = None
+        self._postprocess_nogil_ns = 0
         self._rust = _RustGraphRuntime(
             worker_graphs=[worker_graph_args(wg) for wg in my_worker_graphs],
             remote_worker_graphs=[
@@ -709,8 +710,9 @@ class RustGraphRuntime(GraphRuntime):
         return stops
 
     def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
-        """In one crossing with the GIL released (``postprocess.rs``)."""
+        """Natively (``postprocess.rs``)."""
         self._postprocess_request = request
+        self._postprocess_nogil_ns = 0
         stops = request.stops or {}
         inline = request.inline
         ptr, rows, stride, dtype = _column(request.tokens)
@@ -753,10 +755,12 @@ class RustGraphRuntime(GraphRuntime):
         return self._postprocess_step(out)
 
     def _postprocess_step(self, out) -> PostprocessStep:
-        if PHASE_PERIOD:  # per crossing
-            phase_record("rust.postprocess.nogil", out.nogil_ns * 1e-9)
+        self._postprocess_nogil_ns += out.nogil_ns
         need = PostprocessNeed(out.need)
         if need is PostprocessNeed.DONE:
+            if PHASE_PERIOD:  # per step
+                phase_record("rust.postprocess.nogil", self._postprocess_nogil_ns * 1e-9)
+            self._postprocess_nogil_ns = 0
             self._postprocess_request = None
             return PostprocessStep(need, stopped_rids=out.stopped_rids,
                                    completed_rids=out.completed_rids)

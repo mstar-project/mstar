@@ -1,5 +1,10 @@
-//! A step's postprocess -- its stops, its route, its send -- run here in one
-//! crossing, stopping for the worker where a phase needs Python.
+//! A step's postprocess -- its stops, its route, its send -- run here,
+//! stopping for the worker where a phase needs Python.
+//!
+//! The GIL stays held where the separate calls held it (the stop check, a
+//! stored step's route and send), with peer frames sent try-first
+//! (`send_frames`). Only an inline step's route and send release it, as the
+//! one call they replaced did: nothing in them touches Python.
 //!
 //! Python's `PhasedPostprocess` (`mstar/graph/runtime/base.py`) is the
 //! reference: the phases below follow it, and
@@ -131,6 +136,40 @@ impl Postprocess {
         if let Some(stops) = &mut self.stops {
             stops.retain(|(rid, _)| !dropped.contains(rid));
         }
+        // a dropped row's streams do not end here
+        self.stream_done.retain(|rid| !dropped.contains(rid));
+    }
+
+    /// Whether the send needs what only the worker has (`_route_needs_python`).
+    fn send_needs_python(&self, route: &RouteOut) -> bool {
+        self.python_send
+            || !self.stopped.is_empty()
+            || !route.register_uuids.is_empty()
+            || !route.new_token_output_idxs.is_empty()
+            || !route.local_streaming_signals.is_empty()
+            || !route.rids_needing_request_info.is_empty()
+            || !route.freed_input_uuids.is_empty()
+    }
+
+    fn route_arg(&self, s: Stored) -> RouteArg {
+        RouteArg {
+            partition: self.partition.clone(),
+            graph_walk: self.graph_walk.clone(),
+            node_name: self.node_name.clone(),
+            output_signals: self.output_signals.clone(),
+            rids: self.rids.clone(),
+            tensors: s.tensors,
+            num_tensors: s.num_tensors,
+            inline_signal: s.inline_signal,
+            inline_values: s.inline_values,
+            logprobs: s.logprobs,
+            walks: if self.rid_walk_idx.is_some() { self.walks.clone() } else { None },
+            rid_walk_idx: self.rid_walk_idx.clone(),
+        }
+    }
+
+    fn done(&self, completed: Vec<u32>) -> PostprocessOut {
+        PostprocessOut { completed_rids: completed, ..self.out(NEED_DONE) }
     }
 
     fn out(&self, need: u8) -> PostprocessOut {
@@ -174,7 +213,8 @@ pub struct PostprocessOut {
     #[pyo3(get)] pub rid_walk_idx: Option<Vec<u32>>,
     #[pyo3(get)] pub stopped_rids: Vec<u32>,
     #[pyo3(get)] pub completed_rids: Vec<u32>,
-    /// Wall time spent with the GIL released.
+    /// Wall time this crossing ran with the GIL released (an inline route
+    /// and send).
     #[pyo3(get)] pub nogil_ns: u64,
     pub route: Option<RouteOut>,
 }
@@ -325,7 +365,7 @@ impl GraphRuntime {
 
     /// `_stop_step_loops`: stop the step's loops, per walk, and send the
     /// peers' STOP_LOOPS; the rids whose loops stopped.
-    fn pp_stop_loops(&mut self, pp: &Postprocess) -> PyResult<Vec<u32>> {
+    fn pp_stop_loops(&mut self, py: Python<'_>, pp: &Postprocess) -> PyResult<Vec<u32>> {
         let stops = pp.stops.as_deref().unwrap_or(&[]);
         if stops.is_empty() {
             return Ok(Vec::new());
@@ -351,16 +391,15 @@ impl GraphRuntime {
         for (walk, rids, names) in by_walk {
             let walk = walk.to_string();
             let (rids, frames) = self.stop_loops_frames(&pp.partition, &walk, &pp.node_name, rids, names)?;
-            self.dispatch_frames_nogil(frames)?;
+            self.send_frames(py, frames)?;
             stopped.extend(rids);
         }
         Ok(stopped)
     }
 
     /// `_run_postprocess`, from wherever `pp` stands: DONE, or a break with
-    /// the step parked in `self.postprocess`. Nothing here touches Python,
-    /// so the caller runs it with the GIL released.
-    pub(super) fn pp_run(&mut self, mut pp: Postprocess) -> PyResult<PostprocessOut> {
+    /// the step parked in `self.postprocess`.
+    pub(super) fn pp_run(&mut self, py: Python<'_>, mut pp: Postprocess) -> PyResult<PostprocessOut> {
         if pp.phase == Phase::Stops {
             if pp.stops.is_none() && pp.runtime_stops {
                 // a check that fails, or misses a row's limits, leaves the
@@ -382,58 +421,53 @@ impl GraphRuntime {
             if pp.stops.is_none() {
                 return Ok(self.pp_park(pp, NEED_STOPS));
             }
-            pp.stopped = self.pp_stop_loops(&pp)?;
+            pp.stopped = self.pp_stop_loops(py, &pp)?;
             pp.phase = Phase::Route;
         }
         if pp.rids.is_empty() {
             return Ok(pp.out(NEED_DONE)); // every row was dropped
         }
-        let inline_values = match (&pp.inline, &pp.stored) {
-            (Some((_, col)), None) => col.values_for(&pp.rids, &pp.row_rids),
-            _ => None,
-        };
-        let (tensors, num_tensors, inline_signal, inline_values, logprobs) = match (pp.stored.take(), inline_values) {
-            (Some(s), _) => (s.tensors, s.num_tensors, s.inline_signal, s.inline_values, s.logprobs),
-            (None, Some(values)) => (
-                Vec::new(), vec![0; pp.rids.len() * pp.output_signals.len()],
-                pp.inline.as_ref().map(|(s, _)| s.clone()), values, Vec::new(),
-            ),
-            (None, None) => return Ok(self.pp_park(pp, NEED_STORE)),
-        };
-        let route = self.complete_and_route_batch(RouteArg {
-            partition: pp.partition.clone(),
-            graph_walk: pp.graph_walk.clone(),
-            node_name: pp.node_name.clone(),
-            output_signals: pp.output_signals.clone(),
-            rids: pp.rids.clone(),
-            tensors,
-            num_tensors,
-            inline_signal,
-            inline_values,
-            logprobs,
-            walks: if pp.rid_walk_idx.is_some() { pp.walks.clone() } else { None },
-            rid_walk_idx: pp.rid_walk_idx.clone(),
-        })?;
-        pp.completion_id = route.completion_id;
-        let needs_python = pp.python_send
-            || !pp.stopped.is_empty()
-            || !route.register_uuids.is_empty()
-            || !route.new_token_output_idxs.is_empty()
-            || !route.local_streaming_signals.is_empty()
-            || !route.rids_needing_request_info.is_empty()
-            || !route.freed_input_uuids.is_empty();
-        if needs_python {
-            let mut out = self.pp_park(pp, NEED_SEND);
-            out.route = Some(route);
-            return Ok(out);
+        if let Some(s) = pp.stored.take() {
+            let route = self.complete_and_route_batch(pp.route_arg(s))?;
+            pp.completion_id = route.completion_id;
+            if pp.send_needs_python(&route) {
+                return Ok(self.pp_park_route(pp, route));
+            }
+            let (completed, frames) = self.pp_send_frames(&pp, SendArgs::default())?;
+            self.send_frames(py, frames)?;
+            return Ok(pp.done(completed));
         }
-        // Nothing in the frames comes from Python: no rid carries
-        // per_request_info, so none completes a worker graph, and the count,
-        // consumption, profiling and publication payloads are all read only
-        // for those.
-        let completed = self.pp_send(&pp, SendArgs::default())?;
-        let mut out = pp.out(NEED_DONE);
-        out.completed_rids = completed;
+        let values = pp.inline.as_ref().and_then(|(_, col)| col.values_for(&pp.rids, &pp.row_rids));
+        let Some(values) = values else {
+            return Ok(self.pp_park(pp, NEED_STORE));
+        };
+        // Inline: nothing stored, so nothing here touches Python.
+        let n = pp.rids.len() * pp.output_signals.len();
+        let signal = pp.inline.as_ref().map(|(s, _)| s.clone());
+        let t = std::time::Instant::now();
+        let sent = py.detach(|| -> PyResult<Result<Vec<u32>, RouteOut>> {
+            let route = self.complete_and_route_batch(pp.route_arg(Stored {
+                tensors: Vec::new(), num_tensors: vec![0; n], inline_signal: signal,
+                inline_values: values, logprobs: Vec::new(),
+            }))?;
+            pp.completion_id = route.completion_id;
+            if pp.send_needs_python(&route) {
+                return Ok(Err(route));
+            }
+            // Nothing in the frames comes from Python: no rid carries
+            // per_request_info, so none completes a worker graph, and the
+            // count, consumption, profiling and publication payloads are all
+            // read only for those.
+            let (completed, frames) = self.pp_send_frames(&pp, SendArgs::default())?;
+            self.dispatch_frames_nogil(frames)?;
+            Ok(Ok(completed))
+        })?;
+        let nogil_ns = t.elapsed().as_nanos() as u64;
+        let mut out = match sent {
+            Ok(completed) => pp.done(completed),
+            Err(route) => self.pp_park_route(pp, route),
+        };
+        out.nogil_ns = nogil_ns;
         Ok(out)
     }
 
@@ -443,19 +477,27 @@ impl GraphRuntime {
         out
     }
 
-    /// The send: the stream partitions this pass reports done, then the
-    /// frames; the rids a WORKER_GRAPHS_DONE went out for.
-    pub(super) fn pp_send(&mut self, pp: &Postprocess, args: SendArgs) -> PyResult<Vec<u32>> {
+    /// Park a routed step for its send's Python payloads (SEND).
+    fn pp_park_route(&mut self, pp: Postprocess, route: RouteOut) -> PostprocessOut {
+        let mut out = self.pp_park(pp, NEED_SEND);
+        out.route = Some(route);
+        out
+    }
+
+    /// The send: the stream partitions this pass reports done, then its
+    /// frames; the rids a WORKER_GRAPHS_DONE goes out for.
+    #[allow(clippy::type_complexity)]
+    fn pp_send_frames(
+        &mut self, pp: &Postprocess, args: SendArgs,
+    ) -> PyResult<(Vec<u32>, Vec<(String, Vec<u8>)>)> {
         for &rid in &pp.stream_done {
             self.mark_stream_partition_done(rid, &pp.partition);
         }
-        let (completed, frames) = self.build_send_frames(
+        self.build_send_frames(
             pp.completion_id, args.info_rids, args.request_infos, args.ntc_rids,
             args.new_token_counts, args.consumed_rids, args.stream_tokens_consumed,
             args.prof_rids, args.profiling, args.publish_rids, args.publications, args.skip_rids,
-        )?;
-        self.dispatch_frames_nogil(frames)?;
-        Ok(completed)
+        )
     }
 
     /// The parked step, for a resume.
@@ -466,27 +508,26 @@ impl GraphRuntime {
     }
 
     pub(super) fn pp_resume_stops(
-        &mut self, rids: Vec<u32>, loops: Vec<Vec<String>>, dropped: Vec<u32>,
+        &mut self, py: Python<'_>, rids: Vec<u32>, loops: Vec<Vec<String>>, dropped: Vec<u32>,
     ) -> PyResult<PostprocessOut> {
         let mut pp = self.pp_take()?;
         let given: Vec<(u32, Vec<String>)> = rids.into_iter().zip(loops).collect();
         pp.stops = Some(merged_stops([&pp.known_stops, &given]));
         pp.keep_rows(&dropped.into_iter().collect());
-        self.pp_run(pp)
+        self.pp_run(py, pp)
     }
 
-    pub(super) fn pp_resume_store(&mut self, stored: Stored) -> PyResult<PostprocessOut> {
+    pub(super) fn pp_resume_store(&mut self, py: Python<'_>, stored: Stored) -> PyResult<PostprocessOut> {
         let mut pp = self.pp_take()?;
         pp.stored = Some(stored);
-        self.pp_run(pp)
+        self.pp_run(py, pp)
     }
 
-    pub(super) fn pp_resume_send(&mut self, args: SendArgs) -> PyResult<PostprocessOut> {
+    pub(super) fn pp_resume_send(&mut self, py: Python<'_>, args: SendArgs) -> PyResult<PostprocessOut> {
         let pp = self.pp_take()?;
-        let completed = self.pp_send(&pp, args)?;
-        let mut out = pp.out(NEED_DONE);
-        out.completed_rids = completed;
-        Ok(out)
+        let (completed, frames) = self.pp_send_frames(&pp, args)?;
+        self.send_frames(py, frames)?;
+        Ok(pp.done(completed))
     }
 }
 
@@ -505,4 +546,22 @@ pub(super) struct SendArgs {
     pub publications: Vec<Option<Vec<u8>>>,
     /// rids that failed after routing: none of their frames go out
     pub skip_rids: Vec<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keep_rows_drops_a_rows_stops_and_stream_done() {
+        let mut pp = Postprocess::new(
+            "p".into(), "n".into(), "w".into(), vec!["s".into()], vec![1, 2, 3], None, None,
+            vec![(2, vec!["l".into()])], false, None, Vec::new(), None, vec![1, 2], false,
+        );
+        pp.stops = Some(vec![(2, vec!["l".into()]), (3, vec!["l".into()])]);
+        pp.keep_rows(&[2].into_iter().collect());
+        assert_eq!(pp.rids, vec![1, 3]);
+        assert_eq!(pp.stops, Some(vec![(3, vec!["l".to_string()])]));
+        assert_eq!(pp.stream_done, vec![1]);
+    }
 }

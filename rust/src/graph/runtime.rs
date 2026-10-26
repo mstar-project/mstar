@@ -3247,8 +3247,8 @@ impl GraphRuntime {
 
 
     /// Begin a step's postprocess (`PostprocessRequest`): check its stops,
-    /// route its outputs, send them, in one crossing with the GIL released,
-    /// stopping where a phase needs Python. `stop_rids[i]` stops
+    /// route its outputs, send them, stopping where a phase needs Python
+    /// (`postprocess.rs`). `stop_rids[i]` stops
     /// `stop_loops[i]` before any check (stream-terminated loops). The token
     /// and inline columns are host views the caller keeps alive until the
     /// step is done: `rows` integers of `dtype`, `stride` elements apart, row
@@ -3283,10 +3283,7 @@ impl GraphRuntime {
             tokens, row_rids, inline, stream_done, python_send,
         );
         self.postprocess = None;
-        let t = std::time::Instant::now();
-        let mut out = py.detach(|| self.pp_run(pp))?;
-        out.nogil_ns = t.elapsed().as_nanos() as u64;
-        Ok(out)
+        self.pp_run(py, pp)
     }
 
     /// Resume a step parked for its stops (STOPS): the loops each rid stops,
@@ -3294,7 +3291,7 @@ impl GraphRuntime {
     fn resume_postprocess_stops(
         &mut self, py: Python<'_>, rids: Vec<u32>, loops: Vec<Vec<String>>, dropped: Vec<u32>,
     ) -> PyResult<postprocess::PostprocessOut> {
-        py.detach(|| self.pp_resume_stops(rids, loops, dropped))
+        self.pp_resume_stops(py, rids, loops, dropped)
     }
 
     /// Resume a step parked for its stored outputs (STORE): `RouteTensors`.
@@ -3306,7 +3303,7 @@ impl GraphRuntime {
         let stored = postprocess::Stored {
             tensors, num_tensors, inline_signal, inline_values, logprobs,
         };
-        py.detach(|| self.pp_resume_store(stored))
+        self.pp_resume_store(py, stored)
     }
 
     /// Resume a step parked for its send's Python payloads (SEND), given as
@@ -3330,7 +3327,7 @@ impl GraphRuntime {
             info_rids, request_infos, ntc_rids, new_token_counts, consumed_rids,
             stream_tokens_consumed, prof_rids, profiling, publish_rids, publications, skip_rids,
         };
-        py.detach(|| self.pp_resume_send(args))
+        self.pp_resume_send(py, args)
     }
 
     /// Stop loops, record the pending stops, notify peers, and return the rids
