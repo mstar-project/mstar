@@ -69,14 +69,13 @@ def client_for(arm: Arm, row: Row) -> str:
     return arm.client
 
 
-def workload_set_dir(row: Row, wl: tables.Workload, arm_dir: Path, arm: str | None = None) -> Path | None:
+def workload_set_dir(row: Row, wl: tables.Workload, arm_dir: Path) -> Path | None:
     """The sample set a row's cells send: the workload's, or for an image-to-video workload on a row with its own
-    first frames (Row.i2v_frames) a copy of its manifest that points at those frames, unless the arm is one of the
-    row's i2v_own_frames_arms. None for a text-file set."""
+    first frames (Row.i2v_frames) a copy of its manifest that points at those frames. None for a text-file set."""
     if not wl.prompts.startswith("set:"):
         return None
     src = SETS_ROOT / "sets" / wl.prompts[4:]
-    if wl.request_type != "image_to_video" or not row.i2v_frames or arm in row.i2v_own_frames_arms:
+    if wl.request_type != "image_to_video" or not row.i2v_frames:
         return src
     manifest = json.loads((src / "manifest.json").read_text())
     for it in manifest["items"]:
@@ -346,7 +345,7 @@ def run_cell(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, c: int, port: 
             rdir.mkdir(parents=True, exist_ok=True)
             warm = wl.warmup_waves_first if k == 1 else wl.warmup_waves_next
             cmd = runner_command(arm, row, wl, c, port, rdir, warm, request_kwargs=request_kwargs,
-                                 set_dir=workload_set_dir(row, wl, arm_dir, arm.name))
+                                 set_dir=workload_set_dir(row, wl, arm_dir))
             if numa is not None:
                 cmd = ["numactl", f"--cpunodebind={numa}", f"--membind={numa}", *cmd]
             (rdir / "cotenants.json").write_text(json.dumps(cotenants(os.environ.get("SLURM_JOB_ID")), indent=1))
@@ -534,7 +533,7 @@ def first_size_requests(plan: Plan, arm: Arm, row: Row, wl: tables.Workload, por
     """One untimed request per size of the workload's set, after startup and before any cell: an engine's first
     request at a new size can pay minutes of JIT, autotune and VAE builds, which would otherwise land in the first
     cell's warmup. Each is the row's first-size cost at that size (client e2e seconds, or the error)."""
-    set_dir = workload_set_dir(row, wl, arm_dir, arm.name)
+    set_dir = workload_set_dir(row, wl, arm_dir)
     manifest = json.loads((set_dir / "manifest.json").read_text())
     pinned = bool(request_kwargs and request_kwargs.get("height") and request_kwargs.get("width"))
     need = "image" if wl.request_type == "image_to_video" else None
