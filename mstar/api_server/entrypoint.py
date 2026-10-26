@@ -106,13 +106,13 @@ def _detect_modality(filename: str) -> str:
     return _EXT_TO_MODALITY.get(Path(filename).suffix.lower(), "unknown")
 
 
-def resolve_serving_config(model, model_config: dict | None) -> LoraSpec | None:
-    """Settle ``model_config`` as every process reads it, before the conductor is
-    spawned: each LoRA adapter it names is checked and read once, and its digest and the
-    targets the adapters touch are written into it (``resolve_lora_adapters``). The
-    conductor gets this config and spawns the workers with it, so their reads serve the
-    weights whose digests key the API server's prefix cache. Returns the deployment's
-    LoRA spec, resolved likewise; None without one."""
+def resolve_lora_spec(model, model_config: dict | None) -> LoraSpec | None:
+    """The deployment's LoRA spec, None without one, resolved before the conductor is
+    spawned: each adapter ``model_config`` names is checked and read once, and its digest
+    and the targets the adapters touch are written into the spec and the config
+    (``resolve_lora_adapters``). The conductor gets this config and spawns the workers
+    with it, so their reads serve the weights whose digests key the API server's prefix
+    cache."""
     if model is None or not model_config:
         return None
     spec = lora_spec(declared_resources(model, model_config))
@@ -414,9 +414,9 @@ class APIServer:
         # tokenizer-only model the API server already builds for preprocessing.
         self.model = model
         self.model_name = model_name
-        # the serving config as every other process reads it (``resolve_serving_config``)
+        # the serving config as every other process reads it (``resolve_lora_spec``)
         self.model_config = model_config
-        lora = resolve_serving_config(model, model_config)
+        lora = resolve_lora_spec(model, model_config)
         # what an OpenAI request's `model` field may name: the base model, or an adapter
         self.served_models = ServedModels.of(
             model_name, model_config, lora.adapter_digests if lora is not None else None,
