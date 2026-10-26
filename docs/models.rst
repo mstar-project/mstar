@@ -888,8 +888,8 @@ own ``window_decoder`` partition; a request opts in per call:
        new frames are delivered — a new prompt steers the same world.
    * - ``session_timeout_s``
      - 600
-     - Seconds an idle session is kept after its request finishes, capped at the
-       deployment's ``session_timeout_max_s`` (3600). An expired session resumes
+     - Seconds an idle session is kept after its request finishes, at most the
+       deployment's ``session_timeout_max_s`` (3600); more is a 400. An expired session resumes
        like an unknown one: the request is rejected.
    * - ``end_session``
      - ``false``
