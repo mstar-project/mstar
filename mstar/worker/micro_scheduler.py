@@ -765,9 +765,8 @@ class MicroScheduler:
         waiting = frozenset(self.pending_removes.keys() | self.held_until.keys())
         core = self.core
         step = core.begin(PassRequest(
-            target, exclude_target, pre_existing_batch_size, capture_group_of, now,
+            target, exclude_target, pre_existing_batch_size, capture_group_of,
             waiting=waiting, failed=self.failed_rids,
-            scan_exclude=waiting.union(self.failed_rids),
         ))
         while step.check is not None:
             step = core.resume(self._run_checks(request_state, step.check))

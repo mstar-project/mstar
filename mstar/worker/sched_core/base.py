@@ -73,13 +73,10 @@ class PassRequest(NamedTuple):
     exclude_target: tuple[str, str] | None
     pre_existing_batch_size: int
     capture_group_of: int | None
-    now: float
-    # rows that wait without a check: deferred removes and held rows
+    # rows that wait without a check: deferred removes and unexpired holds
     waiting: frozenset[int]
     # the scheduler's failed rows, live: a check can fail a row mid-pass
     failed: AbstractSet[int]
-    # rows the ready scan skips, as the pass starts: failed, waiting
-    scan_exclude: frozenset[int]
 
 
 class PassStep(NamedTuple):

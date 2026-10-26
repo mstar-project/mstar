@@ -40,7 +40,6 @@ class RustSchedCore(SchedCore):
             pre_existing=request.pre_existing_batch_size,
             capture_group_of=request.capture_group_of,
             waiting=list(request.waiting), failed=list(request.failed),
-            scan_exclude=list(request.scan_exclude),
         ))
 
     def resume(self, result: CheckResult) -> PassStep:
@@ -67,11 +66,7 @@ class RustSchedCore(SchedCore):
     def live_backlog(
         self, key: tuple[str, str], waiting: Iterable[int], failed: Iterable[int],
     ) -> list[int]:
-        skip = set(waiting).union(failed)
-        for node, label, rids, _walks in self._rt.sched_state()[0]:
-            if (node, label) == key:
-                return [rid for rid in rids if rid not in skip]
-        return []
+        return self._rt.sched_live_backlog(*key, list(waiting), list(failed))
 
     def state(self):
         """``(backlog, rr)`` for tests: backlog as ``[(node, label, rids,

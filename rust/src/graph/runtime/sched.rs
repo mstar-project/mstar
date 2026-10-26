@@ -142,7 +142,6 @@ pub(super) struct Begin {
     pub anchor: Option<u32>,
     pub waiting: Vec<u32>,
     pub failed: Vec<u32>,
-    pub scan_exclude: Vec<u32>,
 }
 
 pub(super) struct Pass {
@@ -161,8 +160,8 @@ pub(super) struct Pass {
     scan_target: Option<(String, String)>,
     scan_exclude: Option<(String, String)>,
     waiting: FxHashSet<u32>,
+    /// grows as checks fail rows mid-pass
     failed: FxHashSet<u32>,
-    scan_excl: FxHashSet<u32>,
     keys: Vec<Key>,
     ki: usize,
     ready: Option<Vec<(Key, Vec<Entry>)>>,
@@ -327,7 +326,7 @@ impl GraphRuntime {
     fn sched_scan_rows(&self, p: &Pass) -> Vec<(u32, Key, Sym)> {
         let mut out = Vec::new();
         // the rows failed earlier in this pass are out too
-        let excl: FxHashSet<u32> = p.scan_excl.union(&p.failed).copied().collect();
+        let excl: FxHashSet<u32> = p.waiting.union(&p.failed).copied().collect();
         for (node, walk, rids) in self.ready_groups(&excl, p.scan_target.as_ref(), p.scan_exclude.as_ref()) {
             if !self.sched.leaders.contains(&node) {
                 continue; // only rank 0 can initiate scheduling
@@ -609,7 +608,7 @@ impl GraphRuntime {
     pub(super) fn sched_begin_impl(
         &mut self, b: Begin,
     ) -> PyResult<(bool, Option<CheckOut>, Option<BatchOut>)> {
-        let Begin { target, exclude_target, pre, anchor, waiting, failed, scan_exclude } = b;
+        let Begin { target, exclude_target, pre, anchor, waiting, failed } = b;
         let sym_pair = |rt: &Self, t: &(String, String)| (rt.sym_or_none(&t.0), rt.sym_or_none(&t.1));
         let key_strings = |rt: &Self, k: Key| (
             rt.interner.try_name(k.0).unwrap_or("").to_string(),
@@ -653,7 +652,6 @@ impl GraphRuntime {
             scan_exclude: scan_exclude_target,
             waiting: waiting.into_iter().collect(),
             failed: failed.into_iter().collect(),
-            scan_excl: scan_exclude.into_iter().collect(),
             keys: Vec::new(),
             ki: 0,
             ready: None,
@@ -975,6 +973,18 @@ impl GraphRuntime {
             }
         }
         false
+    }
+
+    /// `live_backlog`: `(node, label)`'s backlogged rows not waiting or failed.
+    pub(super) fn sched_live_backlog_impl(
+        &self, node: &str, label: &str, waiting: Vec<u32>, failed: Vec<u32>,
+    ) -> Vec<u32> {
+        let key = (self.sym_or_none(node), self.sym_or_none(label));
+        let Some((_, batch)) = self.sched.backlog.iter().find(|(k, _)| *k == key) else {
+            return Vec::new();
+        };
+        let skip: FxHashSet<u32> = waiting.into_iter().chain(failed).collect();
+        batch.rows.iter().map(|r| r.rid).filter(|rid| !skip.contains(rid)).collect()
     }
 
     /// Per backlogged chunk, its node and how many of its rows are not in
