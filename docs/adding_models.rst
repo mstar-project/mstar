@@ -2012,12 +2012,7 @@ streams (audio and video, say): each has its own buffer and its own end.
   (``mstar.streaming.topology``), which the client-stream layer enforces before any of
   the model's code runs: ``max_items``, what the stream may carry over a call's life,
   each item counting ``item_size(item)`` (1 by default; a stream of variable-length
-  chunks counts their frames or samples, named by ``unit``); and ``max_pending_items``,
-  how many items its consumer may have been sent and not consumed, with
-  ``pending_overflow`` ``"refuse"`` (the call ends with a 400) or ``"keep_newest"``
-  (what fits is sent; of the rest the newest item waits for room and the others are
-  dropped). The consumer's worker reports what it has taken after each step that took
-  any, so a consumer reading inside a loop makes room as it reads. A call past
+  chunks counts their frames or samples, named by ``unit``). A call past
   ``max_items`` ends with a 400 that names the limit, so the consumer need not check a
   session cap of its own. Declare the most the consumer can take: a deployment may
   lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise

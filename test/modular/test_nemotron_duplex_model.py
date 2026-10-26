@@ -498,7 +498,7 @@ def test_duplex_audio_in_caps_a_call_at_the_session_in_samples():
     limits = client_stream_limits(model.get_partition_topology(), None)["audio_in"]
     assert limits == client.limits
     assert (limits.max_items, limits.unit) == (2 * 16000, "samples")
-    assert limits.item_size(torch.zeros(1280)) == 1280 and limits.max_pending_items is None
+    assert limits.item_size(torch.zeros(1280)) == 1280
     lowered = client_stream_limits(model.get_partition_topology(),
                                    {"client_streams": {"audio_in": {"max_items": 16000}}})["audio_in"]
     assert lowered.max_items == 16000
