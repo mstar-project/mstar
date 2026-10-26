@@ -22,6 +22,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
        for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
        HiFT vocoder, PerTh watermark. 24 kHz. Multilingual covers 23 languages.
+   * - ``command_a_plus`` *(Experimental)*
+     - ``CohereLabs/command-a-plus-05-2026-bf16``
+     - Command A+ text chat: a 218B-parameter MoE (25B active) with sliding-window
+       attention. Tested on 4x GB200 at TP4; see the notes below.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -340,6 +344,42 @@ refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends.
+
+Command A+ (``command_a_plus``)
+-------------------------------
+
+Text chat on Command A+: 32 MoE layers (128 routed experts, top-8, plus an
+always-on shared expert), with three sliding-window (4096) layers for every
+global one. Only the text backbone is loaded. Served on ``POST /generate``
+(there is no OpenAI adapter yet)::
+
+    mstar serve command_a_plus --gpus 0,1,2,3
+
+Install the ``command_a_plus`` extra, and point ``CUDA_HOME`` at a toolkit
+matching PyTorch's CUDA version so the fused-MoE alignment op can JIT-build.
+The ~437 GB of BF16 weights are never downloaded automatically: download the
+checkpoint and set ``model_kwargs.checkpoint_dir`` in
+``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
+``max_seq_len``). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as
+H200, set ``resources.kv_cache.max_num_pages`` to 2048. Tokenizer and config
+metadata are pinned to one checkpoint revision.
+``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs and keeps NCCL's
+all-reduce until FlashInfer's is measured there.
+
+``model_kwargs={"messages": [{"role": ..., "content": ...}, ...]}`` with
+``system`` / ``user`` / ``assistant`` turns goes through the chat template; a
+plain ``text`` prompt is one user turn. Sampling defaults to temperature 0.9,
+top-p 0.95 and repetition penalty 1.04. The model reasons before answering, so
+give it a generous ``max_output_tokens``; a prompt plus ``max_output_tokens``
+(2048 when unset) longer than ``max_seq_len`` is rejected.
+
+On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
+Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer`` at TP4).
+On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
+64 (``benchmark/command_a_plus/bench_http.py``); ``validate_checkpoint.py``
+there checks parity against Hugging Face. Not supported yet: image input, FP8
+weights, prefill CUDA graphs, and reclaiming KV pages outside the sliding
+window.
 
 Kokoro notes
 ------------

@@ -593,6 +593,13 @@ def _chatterbox(name, model_kwargs, tmp_path, monkeypatch):
                  voices_dir=None, local_dir="/nonexistent", _shared={})
 
 
+def _command_a_plus(name, model_kwargs, tmp_path, monkeypatch):
+    # The tiny test config stands in for the pinned checkpoint metadata; the graph doesn't depend on its sizes.
+    fixture = ROOT / "mstar/model/command_a_plus/tests/fixtures/tiny_config.json"
+    (tmp_path / "config.json").write_text(fixture.read_text())
+    return _constructed(name, model_kwargs, checkpoint_dir=str(tmp_path), max_seq_len=64)
+
+
 def _cosmos3(name, model_kwargs, tmp_path, monkeypatch):
     if name in ("cosmos3_edge", "cosmos3_edge_droid"):
         from test_cosmos3_edge_model import _fake_edge_dir
@@ -714,6 +721,7 @@ _FACTORIES = {
     "CanaryModel": _canary,
     "CanaryQwenModel": _canary_qwen,
     "ChatterboxModel": _chatterbox,
+    "CommandAPlusModel": _command_a_plus,
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
     "Flux2KleinModel": _flux2,
