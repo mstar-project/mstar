@@ -101,7 +101,7 @@ PREFIX_CACHE_HIT_TOKENS = Family(
 )
 KV_PREEMPTIONS = Family(
     "mstar_kv_preemptions_total", COUNTER,
-    "Requests chosen to drop when an older request's grant, or their own, ran short of KV pages.",
+    "Requests chosen to move to the host or drop when an older request's grant, or their own, ran short of KV pages.",
     ("component",),
 )
 KV_DROPS = Family(
@@ -126,7 +126,7 @@ KV_PREEMPTED_AGAIN = Family(
 )
 KV_RETURNS_PREEMPTED = Family(
     "mstar_kv_returns_preempted_total", COUNTER,
-    "Returned requests preempted again before they kept another token.",
+    "Dropped requests preempted again after their return, before they kept another token.",
     ("component",),
 )
 COMPONENT_PENDING_STEPS = Family(

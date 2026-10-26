@@ -126,6 +126,7 @@ def _rank(
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
     w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}, {}
+    w._kv_caches = {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
