@@ -119,9 +119,9 @@ class GraphRuntimeRequestInfo:
     # stream edge -> destination worker -> items sent, local ones included
     pending_stream_items: dict[str, dict[str, int]] = field(default_factory=dict)
     current_output_chunks: list[str] = field(default_factory=list)
-    # walk -> loop -> this request's limits under the walk's declared stop
-    # policies, set the first time it is checked on the walk
-    stop_limits: dict[str, dict[str, StopLimits]] = field(default_factory=dict)
+    # (node, walk) -> loop -> this request's limits under its declared stop
+    # policies (``register_stop_limits``)
+    stop_limits: dict[tuple[str, str], dict[str, StopLimits]] = field(default_factory=dict)
 
 
 class PythonGraphRuntime(GraphRuntime):
@@ -399,11 +399,15 @@ class PythonGraphRuntime(GraphRuntime):
     ) -> None:
         self._stop_policies[(node_name, graph_walk)] = dict(policies)
 
+    def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
+        limits = self._request_info[rid].stop_limits
+        for key, policies in self._stop_policies.items():
+            limits[key] = {loop: p.limits(info) for loop, p in policies.items()}
+
     def check_stops(
         self, partition: str, node_name: str, graph_walk: str, rids: list[int],
         tokens: "torch.Tensor | None", row_rids: list[int],
-        infos: Mapping[int, CurrentForwardPassInfo],
-    ) -> dict[int, set[str]]:
+    ) -> dict[int, set[str]] | None:
         policies = self._stop_policies[(node_name, graph_walk)]
         stops: dict[int, set[str]] = {}
         if not policies:
@@ -420,11 +424,9 @@ class PythonGraphRuntime(GraphRuntime):
                 if i is None or i >= len(values):
                     continue
                 token = values[i]
-            limits = info.stop_limits.get(graph_walk)
+            limits = info.stop_limits.get((node_name, graph_walk))
             if limits is None:
-                limits = info.stop_limits[graph_walk] = {
-                    loop: p.limits(infos[rid]) for loop, p in policies.items()
-                }
+                return None
             counts = self._loop_counts(rid, partition)
             for loop, p in policies.items():
                 if p.stops(counts.get(loop, 0), token, limits[loop]):

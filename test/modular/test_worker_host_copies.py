@@ -23,7 +23,7 @@ from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.base import GraphEdge
-from mstar.graph.runtime.base import FreedTensors, RouteOutput
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -40,8 +40,10 @@ class _Communicator(BaseCommunicator):
         return []
 
 
-class _AccumulatingRuntime:
+class _AccumulatingRuntime(PhasedPostprocess):
     """Holds every iteration's output and registers all of them on the last."""
+
+    supports_inline_emit = False
 
     def __init__(self):
         self.held: list[int] = []

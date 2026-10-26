@@ -13,7 +13,7 @@ import torch
 from mstar.communication.tensors import StoredOutputs
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
-from mstar.graph.runtime.base import FreedTensors, RouteOutput
+from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
@@ -29,6 +29,12 @@ from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
+
+class _StubRuntime(SimpleNamespace, PhasedPostprocess):
+    """Stubbed phase methods under the reference begin / resume."""
+
+    supports_inline_emit = False
+
 
 def _worker(
     known_rids=("X",), in_flight=(), draining=(), reads_done=(),
@@ -55,8 +61,9 @@ def _worker(
     w._pending_removes = {}
     # Identity interning: these tests use the rid string as its own handle, so
     # the string/handle split is exercised without a real runtime.
-    w._graph_runtime = SimpleNamespace(
+    w._graph_runtime = _StubRuntime(
         get_rid_handle=lambda r: r if r in known_rids else None,
+        register_stop_limits=lambda rid, info: None,
         get_rid_string=lambda h: h,
         remove_request=lambda h: None,
         # The TP fan-out reads the sharding config off the runtime now; no
@@ -412,6 +419,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         add_request=lambda request_id, **kw: rids.intern(request_id),
         get_rid_handle=rids.handle, get_rid_string=rids.name,
         get_sharding_config=lambda h: None,
+        register_stop_limits=lambda rid, info: None,
     )
     seen = {}
 

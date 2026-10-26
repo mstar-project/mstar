@@ -24,6 +24,7 @@ torch = pytest.importorskip("torch")
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
+from mstar.graph.runtime.base import PhasedPostprocess  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
@@ -62,9 +63,11 @@ class _Sub:
         return set()
 
 
-class _Runtime:
+class _Runtime(PhasedPostprocess):
     """Answers ``stop_loops_batched`` like the real runtime for a running
     dynamic loop: it does not know a rid failed until the REMOVE arrives."""
+
+    supports_inline_emit = False
 
     def __init__(self, pending_stops=()):
         self.stopped: list[int] = []
@@ -77,6 +80,9 @@ class _Runtime:
         return [], []
 
     def clear_pending_loop_stops(self):
+        pass
+
+    def mark_stream_partition_done(self, rid, partition):
         pass
 
     def stop_loops_batched(self, partition, graph_walk, last_node_run, loop_names):

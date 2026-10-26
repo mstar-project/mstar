@@ -224,7 +224,7 @@ enum KeyStep {
 }
 
 impl GraphRuntime {
-    fn sym_or_none(&self, s: &str) -> Sym {
+    pub(super) fn sym_or_none(&self, s: &str) -> Sym {
         // a name no graph has matches nothing
         self.interner.get(s).unwrap_or(Sym::MAX)
     }
