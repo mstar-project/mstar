@@ -189,6 +189,8 @@ class PreprocessWorker:
         self.discard_tensor_queue = queue.Queue()
         self.output_queue = queue.Queue()
         self.profile_queue = queue.Queue()
+        # ConductorMessages from other threads (runtime LoRA loads), sent by this one
+        self.conductor_outbox = queue.Queue()
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
         # Set by enable_worker_metrics(); the worker thread tells the conductor.
@@ -221,7 +223,7 @@ class PreprocessWorker:
             enable_prof=enable_prof,
         )
 
-        # the serving config's adapters' prefix-cache roots
+        # registered adapters' prefix-cache roots; a runtime load or unload updates it
         self.adapter_prefix_roots = adapter_prefix_roots(model, model_config, adapter_digests)
 
         self.thread = threading.Thread(
@@ -246,6 +248,7 @@ class PreprocessWorker:
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
                 adapter_roots=self.adapter_prefix_roots,
+                conductor_outbox=self.conductor_outbox,
             )
         )
         self.thread.start()
@@ -263,6 +266,12 @@ class PreprocessWorker:
         submission, so it reaches the conductor before any request submitted
         after this call."""
         self.worker_metrics_requested.set()
+        self._signal()
+
+    def send_to_conductor(self, message) -> None:
+        """Send ``message`` to the conductor from the thread that owns the socket, on
+        the socket every submission goes out on."""
+        self.conductor_outbox.put(message)
         self._signal()
 
     def queue_depth(self) -> int:
@@ -481,6 +490,8 @@ class PreprocessWorkerThread:
     _next_transfer_publish = 0.0
     # class-level so a thread built without __init__ never sends ENABLE_METRICS
     worker_metrics_requested: threading.Event | None = None
+    # class-level so a thread built without __init__ has nothing to send
+    conductor_outbox: queue.Queue | None = None
 
     def __init__(
         self,
@@ -504,8 +515,10 @@ class PreprocessWorkerThread:
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
         adapter_roots: AdapterPrefixRoots | None = None,
+        conductor_outbox: queue.Queue | None = None,
     ):
         self._adapter_roots = adapter_roots
+        self.conductor_outbox = conductor_outbox
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
@@ -1245,6 +1258,14 @@ class PreprocessWorkerThread:
                 self._hard_cleanup(body.request_id)
         return did_work
 
+    def _send_conductor_outbox(self) -> bool:
+        outbox = self.conductor_outbox
+        if outbox is None or outbox.empty():
+            return False
+        while not outbox.empty():
+            self.communicator.send("conductor", outbox.get())
+        return True
+
     def _send_enable_metrics_if_requested(self) -> None:
         requested = self.worker_metrics_requested
         if requested is not None and requested.is_set():
@@ -1359,6 +1380,7 @@ class PreprocessWorkerThread:
             try:
                 did_work = self._process_messages()
                 self._send_enable_metrics_if_requested()
+                did_work = self._send_conductor_outbox() or did_work
                 # Output delivery is latency-sensitive: the API server holds a
                 # finished request open for its final chunks only briefly, so
                 # queued read-starts / acks / cleanups must never wait behind a
