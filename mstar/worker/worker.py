@@ -310,6 +310,7 @@ class SpeculationTarget(NamedTuple):
 
 # pinned host-row buffers in flight at once (see Worker._stage_host_rows)
 _HOST_ROWS_RING = 4
+_HOST_SPANS_PURPOSE = tuple(f"output_spans{slot}" for slot in range(_HOST_ROWS_RING))
 
 
 class _LazyPerRid:
@@ -3316,6 +3317,11 @@ class Worker:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
 
         _pp_stage("completion_event_sync")
+        # Waited on above, so the spans have landed; cut before anything reads
+        # the outputs: the stop check, the store, a streaming edge.
+        if outputs.output_spans and batch_N.batch.request_to_worker_graph:
+            self._crop_to_spans(outputs)
+            _pp_stage("crop_spans")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.check_stop", synchronize=False)
@@ -3844,11 +3850,28 @@ class Worker:
         A small ring of pinned buffers: step N's rows are read by the main
         thread while this thread already stages N+1's (the pipeline is one
         step deep, the ring leaves slack).
+
+        The step's output spans (``BatchedModelOutput.output_spans``) take the
+        same path, so cutting the outputs to them costs no wait of its own.
         """
         buffers = outputs.check_stop_buffers
-        if not buffers or outputs.row_request_ids is None:
+        rows = bool(buffers) and outputs.row_request_ids is not None
+        if not rows and not outputs.output_spans:
             return
         slot = self._host_rows_slot = (self._host_rows_slot + 1) % _HOST_ROWS_RING
+        if rows:
+            outputs.host_rows = HostRows(
+                tuple(outputs.row_request_ids),
+                self._copy_to_pinned(buffers, f"host_rows{slot}"),
+            )
+        if outputs.output_spans:
+            outputs.host_spans = self._copy_to_pinned(
+                outputs.output_spans, _HOST_SPANS_PURPOSE[slot],
+            )
+
+    def _copy_to_pinned(self, buffers: dict, purpose: str) -> dict:
+        """Queue a non-blocking copy of each device tensor in ``buffers`` into
+        a pinned buffer of ``purpose``; anything else passes through."""
         host: dict[str, torch.Tensor] = {}
         for index, (name, tensor) in enumerate(buffers.items()):
             if not (
@@ -3859,11 +3882,38 @@ class Worker:
                 host[name] = tensor
                 continue
             buf = self._get_pinned_d2h_buffer(
-                f"host_rows{slot}", tensor.shape, tensor.dtype, index,
+                purpose, tensor.shape, tensor.dtype, index,
             )
             buf.copy_(tensor, non_blocking=True)
             host[name] = buf
-        outputs.host_rows = HostRows(tuple(outputs.row_request_ids), host)
+        return host
+
+    @staticmethod
+    def _crop_to_spans(outputs: "BatchedModelOutput") -> None:
+        """Cut each row of a spanned output to its span along the last dim
+        (``NodeSubmodule.spanned_outputs``). Called once the step's completion
+        event has fired, so the spans staged behind the step are on the host.
+        The cut is a view, and it replaces the tensor in its list in place, so
+        an output the submodule also put under a second name is cut there too.
+        """
+        spans = outputs.host_spans or outputs.output_spans
+        per_rid = outputs.per_rid_outputs
+        cut = False
+        for name, span in spans.items():
+            # columns, not a [start, end] list per row
+            starts, ends = span.t().tolist()
+            for rid, start, end in zip(outputs.span_request_ids, starts, ends, strict=True):
+                row = per_rid.get(rid)
+                tensors = row.get(name) if row is not None else None
+                if not tensors:
+                    continue
+                for i, tensor in enumerate(tensors):
+                    if start > 0 or end < tensor.shape[-1]:
+                        tensors[i] = tensor[..., max(start, 0):max(end, 0)]
+                        cut = True
+        if cut:
+            # the views no longer describe the stored rows
+            outputs.row_views = None
 
     def _get_pinned_d2h_buffer(
         self,
