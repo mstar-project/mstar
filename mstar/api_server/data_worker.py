@@ -34,6 +34,7 @@ from mstar.communication.tensors import (
 )
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.model.base import Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, serving_resources
 from mstar.model.media_limits import (
     RequestMediaBudget,
@@ -661,6 +662,9 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
+            if model_kwargs.get(LORA_ADAPTER_KWARG) is not None and not input.prefix_root:
+                # under the base model's empty root its pages would serve base requests
+                model_kwargs["prefix_cache"] = False
             if model_kwargs.get("prefix_cache") is not False:
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,

@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 LORA_RESOURCE_KEY = "lora"
 # The request kwarg that names a request's adapter; the OpenAI ``model`` field maps onto it.
 LORA_ADAPTER_KWARG = "lora_adapter"
+# The digest of the adapter's weights when the API server selected it (``ServedModels``),
+# set there, never by a client.
+LORA_DIGEST_KWARG = "lora_digest"
 
 
 def lora_enabled(model_config: Mapping[str, Any]) -> bool:
@@ -403,10 +406,12 @@ class LoraSpec(NodeResourceSpec):
         )
 
     def request_config(self, model_kwargs: dict | None) -> "LoraReqConfig | None":
-        """The adapter the ``lora_adapter`` kwarg names; None for a base-model request,
-        which leaves the pool idle (``Resource.idle_capture``)."""
-        adapter = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
-        return None if adapter is None else LoraReqConfig(adapter=adapter)
+        """The adapter the ``lora_adapter`` kwarg names, and the digest it was selected
+        under; None for a base-model request, which leaves the pool idle
+        (``Resource.idle_capture``)."""
+        kwargs = model_kwargs or {}
+        adapter = kwargs.get(LORA_ADAPTER_KWARG)
+        return None if adapter is None else LoraReqConfig(adapter=adapter, digest=kwargs.get(LORA_DIGEST_KWARG))
 
     def apply_yaml_overrides(
         self,
@@ -554,9 +559,12 @@ class LoraReqConfig(ResourceReqConfig):
     """The adapter a request runs under. A base-model request carries none.
 
     Which adapters are served is the API server's to check (``ServedModels``), where a
-    request names one; a pool refuses at ingest a name it does not serve."""
+    request names one; a pool refuses at ingest a name it does not serve, or serves under
+    other weights than ``digest``, which the request's prompt was keyed under: the name
+    was unloaded and loaded again since."""
 
     adapter: str
+    digest: bytes | None = None
 
     def validate(self, spec: "LoraSpec | None" = None) -> None:
         if not isinstance(self.adapter, str) or not self.adapter:

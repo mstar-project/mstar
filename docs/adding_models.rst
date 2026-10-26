@@ -466,9 +466,12 @@ selects a request's adapter (``ServedModels.select``) and the preprocess worker 
 prompt from it. The root travels with the request as ``KVReqConfig.prefix_root`` so that a page
 generation fills is keyed under it too. The same tokens under two adapters, or under an
 adapter and the base model, never share pages; two names for identical weights do; and a
-name registered again with other weights misses everything the old weights filled. A
-base-model request chains from the empty root, so its keys are what they were before
-LoRA. Only a registered adapter can be selected, so every request on one has its root.
+name registered again with other weights misses everything the old weights filled; a
+request selected under the old weights carries their digest (``LoraReqConfig.digest``),
+and a pool serving the new ones refuses it at ingest. A base-model request chains from
+the empty root, so its keys are what they were before LoRA. Only a registered adapter
+can be selected, so every request on one has its root; one that arrives without is not
+cached.
 Nothing on the model side is needed for this.
 
 .. _Step 2a — Declare your resources:
@@ -995,7 +998,8 @@ placed exactly as weights are.
   names an adapter in the ``lora_adapter`` kwarg, which the OpenAI ``model`` field maps
   onto, with a ``LoraReqConfig``, which each node's pool takes; a base-model request
   carries none. The API server refuses, with a 400, an adapter it does not serve
-  (``ServedModels``); an adapter is checked when it is registered (rank within
+  (``ServedModels``), and the conductor, with a 409, one a runtime load or unload is in
+  flight for; an adapter is checked when it is registered (rank within
   ``max_rank``, only declared targets, shapes that fit), not per request. A request on an
   adapter is prefix-cached in its adapter's own namespace (see **Cross-request prefix
   reuse**).

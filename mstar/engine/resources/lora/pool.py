@@ -464,15 +464,24 @@ class LoraAdapterPool(Resource):
     # Request lifecycle
 
     def ingest_request(self, rid, overrides: ResourceReqConfig | None = None):
-        adapter = overrides.adapter if isinstance(overrides, LoraReqConfig) else None
+        config = overrides if isinstance(overrides, LoraReqConfig) else None
+        adapter = None if config is None else config.adapter
         with self._lock:
             # idempotent: one NewRequest per partition
             if rid in self._adapter_of:
                 return
-            if adapter is not None and adapter not in self._serving:
-                raise ValueError(
-                    f"unknown LoRA adapter {adapter!r}; this deployment serves {sorted(self._serving)}"
-                )
+            if adapter is not None:
+                served = self._serving.get(adapter)
+                if served is None:
+                    raise ValueError(
+                        f"unknown LoRA adapter {adapter!r}; this deployment serves {sorted(self._serving)}"
+                    )
+                if config.digest is not None and served.digest != config.digest:
+                    # its prompt was keyed under the weights it was selected on
+                    raise ValueError(
+                        f"LoRA adapter {adapter!r} was loaded again with other weights after "
+                        "this request selected it; send the request again"
+                    )
             self._adapter_of[rid] = adapter
             if adapter is None:
                 self._row_slot[rid] = ZERO_SLOT

@@ -45,7 +45,12 @@ from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.conductor.lora_ops import LoraAdapterOps  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig  # noqa: E402
-from mstar.engine.resources.lora import LORA_ADAPTER_KWARG, LORA_RESOURCE_KEY, LoraReqConfig  # noqa: E402
+from mstar.engine.resources.lora import (  # noqa: E402
+    LORA_ADAPTER_KWARG,
+    LORA_DIGEST_KWARG,
+    LORA_RESOURCE_KEY,
+    LoraReqConfig,
+)
 from mstar.engine.resources.lora.config import ADAPTER_WEIGHTS_FILE  # noqa: E402
 from mstar.engine.resources.lora.identity import adapter_prefix_root  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
@@ -66,7 +71,8 @@ from mstar.worker.worker import Worker  # noqa: E402
 
 BASE = "qwen3_5_0.8b"
 LORA_CONFIG = {"resources": {"lora": {"adapters": {"sql": "/a"}}}}
-SQL_ROOT = adapter_prefix_root(b"\x01" * 32)
+SQL_DIGEST = b"\x01" * 32
+SQL_ROOT = adapter_prefix_root(SQL_DIGEST)
 # a refused load or unload: a ValueError is a 400, an HTTPException carries its status
 REFUSED = (ValueError, HTTPException)
 
@@ -74,7 +80,7 @@ REFUSED = (ValueError, HTTPException)
 def _served(config) -> ServedModels:
     """As the API server builds it, the configured adapters' digests read at startup."""
     adapters = ((config.get("resources") or {}).get("lora") or {}).get("adapters") or {}
-    return ServedModels.of(BASE, config, {name: b"\x01" * 32 for name in adapters})
+    return ServedModels.of(BASE, config, {name: SQL_DIGEST for name in adapters})
 
 
 def _status(exc: Exception) -> int:
@@ -198,7 +204,7 @@ def test_models_lists_adapters_with_their_parent(monkeypatch):
     assert [c["id"] for c in cards] == [BASE] and "parent" not in cards[0]
     assert stub.served_models.adapter_for("anything") is None  # no LoRA: the field is not read
     client, stub = _client(monkeypatch, LORA_CONFIG)
-    stub.served_models.add("loaded")  # a runtime load
+    stub.served_models.add("loaded", b"\x02" * 32)  # a runtime load
     cards = client.get("/v1/models").json()["data"]
     assert [(c["id"], c.get("parent")) for c in cards] == [(BASE, None), ("sql", BASE), ("loaded", BASE)]
 
@@ -216,11 +222,11 @@ def test_submit_request_refuses_an_unserved_adapter_kwarg():
     """``/generate``, the WebSocket route and the Rust frontend reach ``submit_request``
     with the kwarg; an adapter the deployment does not serve is a 400, and an unloaded one
     is out of ``ServedModels`` at once. A served one's prefix-cache root is taken here,
-    with the selection."""
+    with the selection, and its digest."""
     from api_server_helpers import make_test_api_server
 
     submitted = []
-    served = ServedModels(base=(BASE,), roots={"sql": SQL_ROOT})
+    served = ServedModels(base=(BASE,), digests={"sql": SQL_DIGEST})
     server = make_test_api_server(
         served_models=served, preprocess_worker=SimpleNamespace(new_request=submitted.append),
     )
@@ -230,6 +236,8 @@ def test_submit_request_refuses_an_unserved_adapter_kwarg():
     server.submit_request(**common, request_id="base")
     assert [s.model_kwargs.get(LORA_ADAPTER_KWARG) for s in submitted] == ["sql", "sql", None]
     assert [s.prefix_root for s in submitted] == [SQL_ROOT, SQL_ROOT, b""]
+    # the weights it was selected on, which a worker serving others under the name refuses
+    assert [s.model_kwargs.get(LORA_DIGEST_KWARG) for s in submitted] == [SQL_DIGEST, SQL_DIGEST, None]
     served.remove("sql")  # an unload takes it out of selection at once
     for kwargs in ({LORA_ADAPTER_KWARG: "nope"}, {LORA_ADAPTER_KWARG: "sql"}, {LORA_ADAPTER_KWARG: 3}):
         with pytest.raises(HTTPException) as err:
@@ -334,11 +342,12 @@ def test_the_new_messages_round_trip_the_wire():
     for kv in (KVReqConfig(prefix_root=root), KVReqConfig()):
         info = CurrentForwardPassInfo(request_id="r", fwd_index=0, random_seed=1, max_tokens=8,
                                       graph_walk="prefill_text", partition_name="p")
-        info.resource_configs = {LORA_RESOURCE_KEY: LoraReqConfig(adapter="sql"), "kv": kv}
+        lora = LoraReqConfig(adapter="sql", digest=SQL_DIGEST)
+        info.resource_configs = {LORA_RESOURCE_KEY: lora, "kv": kv}
         got = _wire(WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
             request_id="r", partition_name="p", request_info=info, inputs=[],
         ))).body.request_info.resource_configs
-        assert got[LORA_RESOURCE_KEY] == LoraReqConfig(adapter="sql") and got["kv"].prefix_root == kv.prefix_root
+        assert got[LORA_RESOURCE_KEY] == lora and got["kv"].prefix_root == kv.prefix_root
 
 
 # --- runtime loads -----------------------------------------------------------------------
@@ -483,7 +492,7 @@ def test_a_runtime_load_and_unload_end_to_end(paths):
     assert all(pool.serves("a1") for pool in d.pools.values())
     assert d.served.adapter_for("a1") == "a1"
     # its requests are keyed under the weights the workers serve
-    root = d.served.check("a1")
+    root = adapter_prefix_root(d.served.check("a1"))
     assert root == adapter_prefix_root(LoraAdapterStore(make_spec({}), pin=False).read("a1", paths["a1"]).digest)
     with pytest.raises(REFUSED) as err:
         d.load("a1", paths["a2"])
@@ -499,10 +508,10 @@ def test_a_runtime_load_and_unload_end_to_end(paths):
     assert _status(err.value) == 404
 
     d.load("a1", paths["a1"])  # the same weights key under the same root
-    assert d.served.check("a1") == root
+    assert adapter_prefix_root(d.served.check("a1")) == root
     d.unload("a1")
     d.load("a1", paths["a2"])  # other weights under the name: another namespace
-    assert d.served.check("a1") != root
+    assert adapter_prefix_root(d.served.check("a1")) != root
 
 
 def test_a_failed_read_on_one_worker_is_undone_everywhere_without_leaking_the_io_error(paths):

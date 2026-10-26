@@ -1,5 +1,6 @@
 from mstar.engine.resources.lora.config import (
     LORA_ADAPTER_KWARG,
+    LORA_DIGEST_KWARG,
     LORA_RESOURCE_KEY,
     AdapterInfo,
     LoraModuleRef,
@@ -13,6 +14,7 @@ from mstar.engine.resources.lora.config import (
 
 __all__ = [
     "LORA_ADAPTER_KWARG",
+    "LORA_DIGEST_KWARG",
     "LORA_RESOURCE_KEY",
     "AdapterInfo",
     "LoraModuleResolver",

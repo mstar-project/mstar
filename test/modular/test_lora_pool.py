@@ -216,6 +216,18 @@ def test_a_spec_over_two_nodes_builds_a_pool_per_node(adapters):
     assert spec.for_node("vision") is None and spec.for_node("LLM").targets.keys() == {"qkv"}
 
 
+def test_a_request_selected_on_other_weights_than_the_pool_serves_is_refused(adapters):
+    """The name was loaded again with other weights after the request selected it, and its
+    prompt was keyed under the first: run on the second, its cache hits would decode the
+    first's pages."""
+    _, paths = adapters
+    pool = make_pool({"a1": paths["a1"]})
+    digest = LoraAdapterStore(make_spec({}), pin=False).read("a1", paths["a1"]).digest
+    pool.ingest_request("same", LoraReqConfig("a1", digest))
+    with pytest.raises(ValueError, match="other weights"):
+        pool.ingest_request("stale", LoraReqConfig("a1", b"\x00" * 32))
+
+
 def test_rollback_undoes_only_what_this_admit_took(adapters):
     _, paths = adapters
     pool = make_pool(paths, max_slots=2)

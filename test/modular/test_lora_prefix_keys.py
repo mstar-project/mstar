@@ -121,7 +121,7 @@ def _worker(model, config: dict) -> PreprocessWorkerThread:
 def _served(config: dict) -> ServedModels:
     """The API server's selection, from the adapters its startup check digested."""
     digests = resolve_lora_adapters(lora_spec(declared_resources(_Model(), config)), config)
-    return ServedModels(base=("stub",), roots={n: adapter_prefix_root(d) for n, d in digests.items()})
+    return ServedModels(base=("stub",), digests=digests)
 
 
 _rids = iter(range(10**6))
@@ -214,10 +214,13 @@ def test_each_adapters_requests_are_keyed_under_its_weights(adapters):
     assert _keys(on_alias) == _keys(on_a)
 
 
-def test_control_without_a_root_adapters_share_the_base_models_keys(adapters):
-    """Mechanism off: every adapter on the empty root keys exactly as the base model."""
+def test_an_adapter_request_without_a_root_is_not_keyed(adapters):
+    """Under the base model's empty root an adapter's pages would serve base requests, so
+    a request on an adapter that reaches the data worker with no root is not cached."""
     worker = _worker(_Model(), _deployment(adapters))
-    assert _keys(_run(worker, "a")) == _keys(_run(worker, "b")) == _keys(_run(worker))
+    on_a = _run(worker, "a")
+    assert on_a["prefix_cache"] is False and "prefix_keys" not in on_a
+    assert _keys(_run(worker)) == _main_chain(_pages(PROMPT))
 
 
 @pytest.mark.parametrize("root", [b"", adapter_prefix_root(b"\x07" * 32)])

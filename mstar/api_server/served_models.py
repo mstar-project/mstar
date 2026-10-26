@@ -11,7 +11,7 @@ import threading
 from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
-from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, lora_enabled
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG, lora_enabled
 from mstar.engine.resources.lora.identity import adapter_prefix_root
 from mstar.model.registry import model_init_kwargs
 
@@ -26,17 +26,18 @@ class Selected(NamedTuple):
 
 
 class ServedModels:
-    """Read by request handlers; changed by runtime loads and unloads. ``roots`` maps each
-    selectable adapter to the root its requests' prefix-cache keys hang from
-    (``adapter_prefix_root`` of its weights' digest): pages written under an adapter are
-    keyed apart from the base model's and from other weights'. The mapping is replaced
-    whole under a lock, so a reader always sees one consistent set."""
+    """Read by request handlers; changed by runtime loads and unloads. ``digests`` maps
+    each selectable adapter to its weights' digest, which a request on it carries
+    (``LORA_DIGEST_KWARG``: a worker serving other weights under the name refuses it) and
+    keys its prompt's pages under (``adapter_prefix_root``), apart from the base model's
+    and from other weights'. The mapping is replaced whole under a lock, so a reader
+    always sees one consistent set."""
 
-    def __init__(self, base: Iterable[str], roots: Mapping[str, bytes] | None = None, lora: bool = False):
+    def __init__(self, base: Iterable[str], digests: Mapping[str, bytes] | None = None, lora: bool = False):
         # names that select the base model: the config's model name and its checkpoint repo
         self.base = frozenset(base)
-        self._roots: Mapping[str, bytes] = dict(roots or {})
-        self.lora = lora or bool(self._roots)
+        self._digests: Mapping[str, bytes] = dict(digests or {})
+        self.lora = lora or bool(self._digests)
         self._lock = threading.Lock()
 
     @classmethod
@@ -47,27 +48,26 @@ class ServedModels:
         """``digests`` are the serving config's adapters' (``resolve_lora_adapters``)."""
         repo = model_init_kwargs(model_name).get("model_path_hf")
         return cls(
-            base=(n for n in (model_name, repo) if n),
-            roots={name: adapter_prefix_root(digest) for name, digest in (digests or {}).items()},
+            base=(n for n in (model_name, repo) if n), digests=digests,
             lora=lora_enabled(model_config or {}),
         )
 
     @property
     def adapters(self) -> tuple[str, ...]:
-        return tuple(self._roots)
+        return tuple(self._digests)
 
-    def add(self, name: str, root: bytes) -> None:
-        """Make ``name`` selectable, its requests keyed under ``root``."""
+    def add(self, name: str, digest: bytes) -> None:
+        """Make ``name`` selectable, serving the weights ``digest`` names."""
         with self._lock:
-            self._roots = {**self._roots, name: root}
+            self._digests = {**self._digests, name: digest}
 
     def remove(self, name: str) -> bytes | None:
-        """Take ``name`` out of selection; its root, or None if it was not selectable."""
+        """Take ``name`` out of selection; its digest, or None if it was not selectable."""
         with self._lock:
-            root = self._roots.get(name)
-            if root is not None:
-                self._roots = {n: r for n, r in self._roots.items() if n != name}
-            return root
+            digest = self._digests.get(name)
+            if digest is not None:
+                self._digests = {n: d for n, d in self._digests.items() if n != name}
+            return digest
 
     def adapter_for(self, requested: str | None) -> str | None:
         """The adapter a request's ``model`` names; None runs the base model.
@@ -83,31 +83,33 @@ class ServedModels:
         return requested
 
     def check(self, adapter: object) -> bytes:
-        """``adapter``'s prefix-cache root; ``ValueError`` (a 400) for a name that is not
-        selectable now: how a ``lora_adapter`` kwarg (``/generate``, ``extra_body``) is
-        checked."""
-        root = self._roots.get(adapter) if isinstance(adapter, str) else None
-        if root is None:
+        """``adapter``'s digest; ``ValueError`` (a 400) for a name that is not selectable
+        now: how a ``lora_adapter`` kwarg (``/generate``, ``extra_body``) is checked."""
+        digest = self._digests.get(adapter) if isinstance(adapter, str) else None
+        if digest is None:
             raise ValueError(
                 f"unknown LoRA adapter {adapter!r}; this deployment serves "
-                f"{sorted(self._roots)}"
+                f"{sorted(self._digests)}"
             )
-        return root
+        return digest
 
     def select(self, requested: str | None, model_kwargs: dict | None) -> Selected:
-        """``model_kwargs`` naming the adapter a request runs under, and that adapter's
-        prefix-cache root: the one its OpenAI ``model`` field names, or its
+        """``model_kwargs`` naming the adapter a request runs under and its digest, and
+        that adapter's prefix-cache root: the one its OpenAI ``model`` field names, or its
         ``lora_adapter`` kwarg (``/generate``, ``extra_body``), each checked. Both, naming
         different adapters, is a ``ValueError``."""
         adapter = self.adapter_for(requested)
         explicit = (model_kwargs or {}).get(LORA_ADAPTER_KWARG)
-        if explicit is None:
-            if adapter is None:
-                return Selected(model_kwargs)
-            return Selected({**(model_kwargs or {}), LORA_ADAPTER_KWARG: adapter}, self.check(adapter))
-        root = self.check(explicit)
-        if adapter is not None and explicit != adapter:
-            raise ValueError(
-                f"model {requested!r} and lora_adapter {explicit!r} name different adapters"
-            )
-        return Selected(model_kwargs, root)
+        if explicit is not None:
+            digest = self.check(explicit)
+            if adapter is not None and explicit != adapter:
+                raise ValueError(
+                    f"model {requested!r} and lora_adapter {explicit!r} name different adapters"
+                )
+            adapter = explicit
+        elif adapter is None:
+            return Selected(model_kwargs)
+        else:
+            digest = self.check(adapter)
+        kwargs = {**(model_kwargs or {}), LORA_ADAPTER_KWARG: adapter, LORA_DIGEST_KWARG: digest}
+        return Selected(kwargs, adapter_prefix_root(digest))
