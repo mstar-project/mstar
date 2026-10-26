@@ -508,3 +508,72 @@ def dataclasses_replace(info, **changes):
     import dataclasses
 
     return dataclasses.replace(info, **changes)
+
+
+class PrefetchingToy(ToyDenoise):
+    PREFETCH_SEEDS = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.drawn_on: list[str] = []
+
+    def seed_latents(self, fwd_info, bucket_key, generator):
+        import threading
+
+        self.drawn_on.append(threading.current_thread().name)
+        # a permuted view, as klein's packing returns
+        return torch.randn(4, bucket_key[0], generator=generator).t()
+
+
+def _added(sub, rid, **info):
+    """``on_request_added`` as the engine calls it at ingest, with the first walk's info."""
+    ingest = dataclasses.replace(_info(rid, 0, **info), graph_walk="encode_text")
+    sub.on_request_added(_handle(rid), ingest)
+    return sub.request_state(_handle(rid))["seed_draw"][1]
+
+
+def test_prefetched_seeds_are_drawn_off_the_calling_thread_and_match_an_inline_draw():
+    sub = PrefetchingToy()
+    future = _added(sub, "p0", seed=11)
+    assert future.result()[LATENTS].is_contiguous()
+    got = sub.prepare_inputs(WALK, _info("p0", 0, seed=11), _inputs())
+    assert sub.drawn_on == ["mstar-seed_0"]
+    assert "seed_draw" not in sub.request_state(_handle("p0")), "the draw is taken once"
+    inline = PrefetchingToy().prepare_inputs(WALK, _info("p1", 0, seed=11), _inputs())
+    assert torch.equal(got.tensor_inputs[LATENTS], inline.tensor_inputs[LATENTS])
+
+
+def test_a_draw_for_another_bucket_key_is_dropped_and_drawn_inline():
+    sub = PrefetchingToy()
+    _added(sub, "p2", tokens=8, seed=3).result()
+    got = sub.prepare_inputs(WALK, _info("p2", 0, tokens=16, seed=3), _inputs())
+    assert got.tensor_inputs[LATENTS].shape == (16, 4)
+    assert sub.drawn_on == ["mstar-seed_0", "MainThread"]
+
+
+def test_seeds_are_drawn_once_per_request_and_only_when_asked():
+    sub = PrefetchingToy()
+    _added(sub, "p3").result()
+    sub.on_request_added(_handle("p3"), _info("p3", 0))  # its second partition on this worker
+    assert sub.drawn_on == ["mstar-seed_0"]
+    plain = ToyDenoise()
+    plain.on_request_added(_handle("p4"), _info("p4", 0))
+    assert "seed_draw" not in plain.request_state(_handle("p4"))
+
+
+def test_removing_the_request_drops_its_draw():
+    sub = PrefetchingToy()
+    _added(sub, "p5").result()
+    sub.cleanup_request(_handle("p5"))
+    assert _handle("p5") not in sub.request_states
+
+
+def test_an_initial_loop_back_of_its_own_is_not_handed_the_draw():
+    class FromInputs(PrefetchingToy):
+        def initial_loop_back(self, fwd_info, inputs, bucket_key, generator):
+            return {LATENTS: torch.full((bucket_key[0], 4), 2.0)}
+
+    sub = FromInputs()
+    _added(sub, "p6").result()
+    got = sub.prepare_inputs(WALK, _info("p6", 0), _inputs())
+    assert torch.equal(got.tensor_inputs[LATENTS], torch.full((8, 4), 2.0))
