@@ -212,8 +212,9 @@ Notes
   ``process_prompt`` for the inputs it expects.
 - Models on the fused MoE kernel (Qwen3-Omni, Command A+) use a tuned tile table
   from ``mstar/utils/fused_moe/configs/`` when one matches the expert shape and
-  GPU, and default tiles otherwise. ``python -m mstar.utils.fused_moe.tune``
-  writes a table for the local GPU.
+  GPU (``E=..,N=..,K=..,device_name=<GPU>.json``), and default tiles otherwise.
+  ``python -m mstar.utils.fused_moe.tune`` writes a table for the local GPU, and
+  on AMD GPUs it tunes Triton's HIP compiler options too.
 - To add a new family, see :doc:`adding_models`.
 - For AMD GPUs, see `Running on AMD GPUs`_.
 
