@@ -49,8 +49,8 @@ class AcceleratorGraphConfig(ABC):
         # Must be hashable.
         additional_key_info: Any | None = None,
         compile: bool = True, # whether to run torch.compile before accelerator graph capture
-        # torch.compile mode for the captured forward; None takes the runner's
-        # default, max-autotune-no-cudagraphs
+        # torch.compile mode for the captured forward; None takes the deployment's
+        # compile level (mstar serve -O), a mode opts the config out of it
         compile_mode: str | None = None,
 
         # Per-config override for the set of batch sizes to capture
@@ -306,8 +306,8 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     # Whether to torch.compile capture_fn before capture. Default off; the
     # block loop already benefits from graph capture alone.
     compile: bool = False
-    # torch.compile mode for the region; None takes the runner's default,
-    # max-autotune-no-cudagraphs
+    # torch.compile mode for the region; None takes the deployment's compile
+    # level (mstar serve -O), a mode opts the config out of it
     compile_mode: str | None = None
 
     def __post_init__(self):

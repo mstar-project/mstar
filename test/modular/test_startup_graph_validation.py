@@ -285,6 +285,7 @@ class _ChunkWalkRuntime:
         self.rid = self.rt.add_request(
             request_id="r", partition="C", graph_walk="chunk", partition_worker_graph_ids=ids,
             worker_graph_to_workers=ParallelList(ids, [["worker_0"]] * len(ids)),
+            loop_caps={},
         )
         self.minter = TensorUuidMinter("worker_0")
 
@@ -502,6 +503,7 @@ class _LoopWorker:
         self.rid = self.rt.add_request(
             request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+            loop_caps={},
         )
         self.minter = TensorUuidMinter("worker_0")
         _ingest(self.rt, self.rid, [GraphEdge(next_node="step", name="x")])
@@ -578,7 +580,7 @@ def _constructed(name, model_kwargs, **overrides):
 
 def _bagel(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.bagel.bagel_model import BagelModel
-    return _bare(BagelModel, config=SimpleNamespace(num_timesteps=50))
+    return _bare(BagelModel, config=SimpleNamespace(num_timesteps=50, max_position_embeddings=32768))
 
 
 def _chatterbox(name, model_kwargs, tmp_path, monkeypatch):
@@ -589,6 +591,13 @@ def _chatterbox(name, model_kwargs, tmp_path, monkeypatch):
     config.max_new_tokens_limit = model_kwargs.get("max_new_tokens_limit", config.max_new_tokens_limit)
     return _bare(ChatterboxModel, config=config, _t3_dtype=torch.bfloat16,
                  voices_dir=None, local_dir="/nonexistent", _shared={})
+
+
+def _command_a_plus(name, model_kwargs, tmp_path, monkeypatch):
+    # The tiny test config stands in for the pinned checkpoint metadata; the graph doesn't depend on its sizes.
+    fixture = ROOT / "mstar/model/command_a_plus/tests/fixtures/tiny_config.json"
+    (tmp_path / "config.json").write_text(fixture.read_text())
+    return _constructed(name, model_kwargs, checkpoint_dir=str(tmp_path), max_seq_len=64)
 
 
 def _cosmos3(name, model_kwargs, tmp_path, monkeypatch):
@@ -682,6 +691,7 @@ def _default(name, model_kwargs, tmp_path, monkeypatch):
 _FACTORIES = {
     "BagelModel": _bagel,
     "ChatterboxModel": _chatterbox,
+    "CommandAPlusModel": _command_a_plus,
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
     "Flux2KleinModel": _flux2,

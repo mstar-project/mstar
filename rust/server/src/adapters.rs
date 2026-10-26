@@ -90,7 +90,9 @@ pub fn flatten_messages(
     allow_remote: bool,
 ) -> Result<(Option<String>, BTreeMap<String, Vec<String>>, Vec<String>, Vec<Part>), String> {
     let mut parts: Vec<Part> = Vec::new();
-    let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // A refused chat is never submitted, so a refusal below drops `saved`
+    // unkept, which deletes the attachments saved before it.
+    let mut saved = crate::SavedUploads::new(upload_dir);
 
     for msg in messages {
         let role = match msg.role.as_str() {
@@ -132,7 +134,7 @@ pub fn flatten_messages(
                         let fallback = ptype.trim_end_matches("_url");
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
                         let m = if m == "unknown" { fallback.to_string() } else { m };
-                        add_file(&mut parts, &mut file_paths, m, p);
+                        add_file(&mut parts, &mut saved.paths, m, p);
                     }
                 }
                 "input_audio" => {
@@ -143,7 +145,7 @@ pub fn flatten_messages(
                         let fmt = ia.get("format").and_then(Value::as_str).unwrap_or("wav");
                         if !data.is_empty() {
                             let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
-                            add_file(&mut parts, &mut file_paths, m, p);
+                            add_file(&mut parts, &mut saved.paths, m, p);
                         }
                     }
                 }
@@ -155,7 +157,7 @@ pub fn flatten_messages(
     let texts: Vec<&str> = parts.iter().filter_map(|p| p.text.as_deref()).collect();
     let text = if texts.is_empty() { None } else { Some(texts.join("\n")) };
     let input_modalities = parts.iter().map(|p| p.modality.clone()).collect();
-    Ok((text, file_paths, input_modalities, parts))
+    Ok((text, saved.keep(), input_modalities, parts))
 }
 
 fn add_file(
@@ -318,10 +320,13 @@ impl Adapter {
             // max_output_tokens and seed are honored.
             Adapter::Bagel | Adapter::Qwen3_5 => text_chat(req, upload_dir, allow_remote),
             Adapter::Cosmos3Edge => {
-                let mut args = text_chat(req, upload_dir, allow_remote)?;
                 // How the vLLM recipe toggles thinking; a flat enable_thinking wins.
-                let template = args.model_kwargs.remove("chat_template_kwargs");
-                if let Some(on) = template_enable_thinking(template.as_ref())? {
+                // Read before the attachments are saved, since a malformed value
+                // refuses the request.
+                let thinking = template_enable_thinking(req.extra.get("chat_template_kwargs"))?;
+                let mut args = text_chat(req, upload_dir, allow_remote)?;
+                args.model_kwargs.remove("chat_template_kwargs");
+                if let Some(on) = thinking {
                     set_default(&mut args.model_kwargs, "enable_thinking", Value::Bool(on));
                 }
                 Ok(args)

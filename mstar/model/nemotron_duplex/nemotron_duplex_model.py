@@ -65,7 +65,7 @@ from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAt
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.config import (
     MAMBA,
@@ -662,7 +662,7 @@ class NemotronDuplexModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         # Duplex request: raw user audio (-> Encoder partition) plus an optional
         # system-prompt text that primes the nano cache (prefill_text).
         out: NameToTensorList = {}
@@ -726,7 +726,28 @@ class NemotronDuplexModel(Model):
             out["has_prompt"] = [torch.tensor([1], dtype=torch.long)]
         else:
             out["text_inputs"] = [torch.tensor([-1], dtype=torch.long)]
-        return out
+        # a session's first frame writes the prompt along with its own row, and the talker's first frame writes
+        # its speaker warm-up
+        prompt_len = ids.numel() if prompt else 0
+        nano = LabelLayout(
+            spans=(Span("ids", "decode", prompt_len, prompt_len, "text_inputs"),) if prompt else (),
+            growth=(("decode_loop", 1),),
+        )
+        warmup = self.TALKER_WARMUP_POSITIONS
+        talker = LabelLayout(
+            spans=(Span("rows", "talker_decode", warmup, warmup, "audio_prompt_latents"),),
+            growth=(("talker_decode_loop", 1),),
+        )
+        return ProcessPromptOutput(out, {"kv_layout": {
+            NANO_KV: {"main": nano}, TALKER_KV: {"main": talker, "uncond": talker},
+        }})
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        talker = KVLabel(growth=(("talker_decode", "talker_decode_loop"),))
+        return {
+            NANO_KV: {"main": KVLabel(growth=(("decode", "decode_loop"),))},
+            TALKER_KV: {"main": talker, "uncond": talker},
+        }
 
     def load_audio(self, filepath: str, device: str):
         """Decode an uploaded audio file to 16 kHz mono via soundfile (the base uses
@@ -1171,9 +1192,14 @@ class NemotronDuplexModel(Model):
         cv = build_char_vocab(tok)
         s2c, _ = subword_to_char_ids(tok, cv)
         # checkpoint config, so the talker samples with its inference_* knobs
-        return EarTTSTalkerSubmodule(
+        submodule = EarTTSTalkerSubmodule(
             talker=talker, config=cfg, subword_to_char=s2c, char_pad_idx=len(cv),
         )
+        assert submodule.warmup_len == self.TALKER_WARMUP_POSITIONS, (
+            f"the checkpoint's speaker warm-up is {submodule.warmup_len} positions, "
+            f"where the talker's layout counts {self.TALKER_WARMUP_POSITIONS}"
+        )
+        return submodule
 
     def _create_codec_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,

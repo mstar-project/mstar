@@ -26,6 +26,10 @@ and sampling kernels determine which devices it can capture on; see
      - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
        for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
        HiFT vocoder, PerTh watermark. 24 kHz. Multilingual covers 23 languages.
+   * - ``command_a_plus`` *(Experimental)*
+     - ``CohereLabs/command-a-plus-05-2026-bf16``
+     - Command A+ text chat: a 218B-parameter MoE (25B active) with sliding-window
+       attention. Tested on 4x GB200 at TP4; see the notes below.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -158,6 +162,10 @@ Notes
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
+- Models on the fused MoE kernel (Qwen3-Omni, Command A+) use a tuned tile table
+  from ``mstar/utils/fused_moe/configs/`` when one matches the expert shape and
+  GPU, and default tiles otherwise. ``python -m mstar.utils.fused_moe.tune``
+  writes a table for the local GPU.
 - To add a new family, see :doc:`adding_models`.
 
 Accelerator graph capture
@@ -325,6 +333,42 @@ refused and the MTP head is skipped. The chat template's new
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends.
 
+Command A+ (``command_a_plus``)
+-------------------------------
+
+Text chat on Command A+: 32 MoE layers (128 routed experts, top-8, plus an
+always-on shared expert), with three sliding-window (4096) layers for every
+global one. Only the text backbone is loaded. Served on ``POST /generate``
+(there is no OpenAI adapter yet)::
+
+    mstar serve command_a_plus --gpus 0,1,2,3
+
+Install the ``command_a_plus`` extra, and point ``CUDA_HOME`` at a toolkit
+matching PyTorch's CUDA version so the fused-MoE alignment op can JIT-build.
+The ~437 GB of BF16 weights are never downloaded automatically: download the
+checkpoint and set ``model_kwargs.checkpoint_dir`` in
+``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
+``max_seq_len``). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as
+H200, set ``resources.kv_cache.max_num_pages`` to 2048. Tokenizer and config
+metadata are pinned to one checkpoint revision.
+``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs and keeps NCCL's
+all-reduce until FlashInfer's is measured there.
+
+``model_kwargs={"messages": [{"role": ..., "content": ...}, ...]}`` with
+``system`` / ``user`` / ``assistant`` turns goes through the chat template; a
+plain ``text`` prompt is one user turn. Sampling defaults to temperature 0.9,
+top-p 0.95 and repetition penalty 1.04. The model reasons before answering, so
+give it a generous ``max_output_tokens``; a prompt plus ``max_output_tokens``
+(2048 when unset) longer than ``max_seq_len`` is rejected.
+
+On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
+Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer`` at TP4).
+On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
+64 (``benchmark/command_a_plus/bench_http.py``); ``validate_checkpoint.py``
+there checks parity against Hugging Face. Not supported yet: image input, FP8
+weights, prefill CUDA graphs, and reclaiming KV pages outside the sliding
+window.
+
 Kokoro notes
 ------------
 
@@ -369,6 +413,18 @@ Kokoro notes
   pointed at M*, ``response_format="pcm"``); ``GET /v1/audio/voices`` lists the
   voices for a picker: the bundled voices whose G2P extra is installed on the server
   (a request for one of the others gets a 400 with the ``pip install`` hint).
+
+Qwen3-Omni notes
+----------------
+
+- Streamed audio starts after 12 codec frames (0.96 s of audio), then 13, then
+  25-frame chunks behind 25 frames of left context. Playback stays gapless
+  while the Talker produces frames at about 1.5x real time over the first 50
+  frames (about 19 frames/s per request); the Talker batches at most 32
+  requests, so requests past that queue and can fall below it and pause. Set
+  ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
+  start with a 25-frame chunk instead: first audio comes later, and the
+  Talker needs only about 1.0 to 1.3x real time.
 
 Qwen3-TTS notes
 ---------------
@@ -824,18 +880,19 @@ own ``window_decoder`` partition; a request opts in per call:
      - Default
      - Meaning
    * - ``window_mode``
-     - —
+     - — (``chained`` with ``stream_video``)
      - ``chained``: every window is a full bidirectional denoise conditioned on
-       the previous window's tail (``overlap_frames`` pinned clean). ``kv``: the
-       finished window's clean K/V is committed to the cache and later windows
-       attend to it block-causally; no overlap, and frames older than
-       ``context_frames`` behind the frontier are released from the cache
-       (the persistent world state of a long rollout stays bounded).
+       the previous window's tail (``overlap_frames`` pinned clean). ``kv``
+       (experimental, see below): the finished window's clean K/V is committed
+       to the cache and later windows attend to it block-causally; no overlap,
+       and frames older than ``context_frames`` behind the frontier are
+       released from the cache (the persistent world state of a long rollout
+       stays bounded).
    * - ``window_frames``
-     - 29
+     - 61 on Edge, 29 elsewhere; ``kv``: 29
      - Pixel frames per window (quantized to latent frames).
    * - ``overlap_frames``
-     - 8
+     - 32 on Edge, 8 elsewhere
      - ``chained`` only: frames re-pinned from the previous window (at least two
        latent frames).
    * - ``context_frames``
@@ -873,7 +930,21 @@ own ``window_decoder`` partition; a request opts in per call:
    curl -sN http://localhost:8000/generate \
      -F 'text=a drone flies over a coastal town at dawn' \
      -F 'output_modalities=video' \
-     -F 'model_kwargs={"num_frames":241,"window_mode":"kv","window_frames":29,"context_frames":61,"stream_video":true}'
+     -F 'model_kwargs={"num_frames":241,"window_mode":"chained","stream_video":true}'
+
+.. warning::
+
+   ``window_mode: kv`` is experimental, and the server logs a warning at
+   startup when windowed video is enabled. The checkpoints were not trained
+   block-causally: committed K/V conditions the next window far more weakly
+   than frames pinned in the sequence, so an image-conditioned kv rollout
+   jumps away from the scene at the first window boundary and, unless the
+   prompt describes the image, can turn to texture noise within a few
+   windows. ``chained`` with Edge's 61/32 defaults holds the scene over 241
+   frames when the prompt describes the image; its first chunk arrives later,
+   since window 0 is 61 frames. A prompt that
+   contradicts the image still takes over within a few windows in every
+   windowed mode; non-windowed clips are not affected.
 
 The schedule is padded up to whole windows and the video trimmed back to
 ``num_frames``; a seeded request is deterministic end to end (later windows draw
@@ -975,6 +1046,25 @@ paths round the latent extent differently and the DiT dies mid-forward.
 32 frames and you would get 29 — so it too is rejected with a 400 naming the
 nearest valid counts.
 
+**Size ceiling.** ``height x width x num_frames`` may not exceed
+``max_video_pixels`` (default 268,435,456, about 3.6x the default clip; raise
+it under the yaml's ``model_kwargs``), each axis must fit the DiT's 1,024
+rotary positions (``num_frames`` up to 4,093), and height and width are at most
+16,384, the largest side the mp4 encoder (libx264) opens. Each is a 400 naming
+the limit.
+
+**Compiled DiT shapes.** With ``compile_dit`` the DiT compiles one graph per
+input shape, so only the ``"WxHxF"`` shapes in ``compile_dit_sizes`` (default
+``1280x704x81``) use the compiled transformer; each compiles on first use, once
+with CFG and once without, so at most two compiles per listed shape. Any other
+size or frame count runs the same transformer eager, with no compile, which is
+slower per request once warm: on an H200, about 49% more at 640x352x17 and 55%
+more at 832x480x33 than the same shape compiled. List the shapes a deployment
+serves under the yaml's ``model_kwargs``; each one listed costs its compiles on
+first use. The first DiT call after startup is traced twice (a guard on the
+rotary table), so a server compiles at most two graphs per listed shape plus
+one.
+
 **UniPC runs inline, inside the DiT node.** Unlike cosmos3, the scheduler is not
 a separate stage: the solver state (the order-2 history buffer and the
 corrector's ``last_sample``) is carried on the denoise loop's own edges, so it
@@ -985,8 +1075,8 @@ Requests are therefore independent and the loop is resumable across ranks.
 (``compile_dit``) and the untiled VAE decode runs the shared Wan VAE decoder,
 channels-last and compiled (``vae_decode_fast``; set it to ``false`` under the
 yaml's ``model_kwargs`` for stock ``vae.decode``). Both compile on first use:
-the DiT once per resolution, frame count and CFG setting, so the first request
-at a new size is slower. The VAE decode compiles once per resolution, and only
+the DiT only for the ``compile_dit_sizes`` shapes (see Compiled DiT shapes), so
+the first request at a listed shape is slower. The VAE decode compiles once per resolution, and only
 for the sizes in ``vae_decode_fast_sizes`` (default ``1280x704``); any other
 size decodes with stock ``vae.decode``, frames identical to
 ``vae_decode_fast: false``. The compile uses Inductor's deterministic mode, so

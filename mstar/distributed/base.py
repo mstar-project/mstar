@@ -64,6 +64,8 @@ class ShardingConfig:
     # group is the lockstep unit, spanning the whole tp*sp instance. This
     # set itself only gates config validation.
     sp_enabled_nodes: set[str] = field(default_factory=set)
+    # Nodes whose routed experts honour a node group's ``ep_config``; gates validation.
+    ep_enabled_nodes: set[str] = field(default_factory=set)
 
     def clone_empty(self):
         return ShardingConfig(
@@ -71,6 +73,7 @@ class ShardingConfig:
             tp_enabled_nodes=self.tp_enabled_nodes,
             shard_dim=self.shard_dim,
             sp_enabled_nodes=self.sp_enabled_nodes,
+            ep_enabled_nodes=self.ep_enabled_nodes,
         )
 
     def get_sharding_group(
@@ -83,6 +86,7 @@ class ShardingConfig:
         self.node_to_worker: dict[NodeAndGraphWalk, list[str]] = {}
         self.tp_enabled_nodes = set(self.tp_enabled_nodes)
         self.sp_enabled_nodes = set(self.sp_enabled_nodes)
+        self.ep_enabled_nodes = set(self.ep_enabled_nodes)
         self._setup_done = False
 
     def assert_stream_consumer_compatibility(self, streaming_consumers: set[str]):

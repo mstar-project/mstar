@@ -286,6 +286,85 @@ def test_orphan_sweep(tmp_path):
                 pass
 
 
+class _IpcCommunicator(_NullCommunicator):
+    """A deployment's communicator: over IPC, so its manager has a namespace."""
+
+    protocol = CommProtocol.IPC
+    ipc_socket_path_prefix = "/tmp/mstar/"
+
+    def _endpoint(self, entity_id):
+        return f"ipc://{self.ipc_socket_path_prefix}/{entity_id}.ipc"
+
+
+def _deployment_manager(entity, shm_dir, token, monkeypatch):
+    monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", token)
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    return ArenaShmCommunicationManager(
+        my_entity_id=entity, hostname="localhost", device="cpu",
+        communicator=_IpcCommunicator(), shm_dir=str(shm_dir),
+    )
+
+
+def test_a_start_in_another_pid_namespace_keeps_live_segments(
+        monkeypatch, tmp_path):
+    """Containers sharing /dev/shm cannot see each other's pids: a second
+    deployment's startup used to unlink every live segment of the first."""
+    a = _deployment_manager("w0", tmp_path, "a" * 16, monkeypatch)
+    x = torch.arange(64, dtype=torch.uint8)
+    infos = a.store_and_return_tensor_info("r", {"x": [x]})
+    a.register_for_send("r", list(infos["x"]))
+    seg_path = a._own_segment_paths[0]
+
+    real_exists, hidden = os.path.exists, f"/proc/{os.getpid()}"
+    monkeypatch.setattr(
+        os.path, "exists", lambda p: p != hidden and real_exists(p))
+    _deployment_manager("w0", tmp_path, "b" * 16, monkeypatch)
+    monkeypatch.setattr(os.path, "exists", real_exists)
+
+    assert os.path.exists(seg_path), "a live neighbour's segment was swept"
+    cons = _deployment_manager("w1", tmp_path, "a" * 16, monkeypatch)
+    cons.start_read_tensors(
+        "r", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])])
+    assert torch.equal(cons.tensor_store.get_tensor(infos["x"][0].uuid), x)
+
+
+def test_a_dead_namespaces_segments_are_swept(monkeypatch, tmp_path):
+    dead = "d" * 12
+    lock = f"/dev/shm/mstar_{dead}.lock"
+    seg = f"/dev/shm/mstar_{dead}_arena_w0_deadbeef.seg0"
+    open(lock, "wb").close()
+    with open(seg, "wb") as f:
+        f.write(b"x" * 64)
+    try:
+        _deployment_manager("sweeper", tmp_path, "c" * 16, monkeypatch)
+        assert not os.path.exists(seg), "a dead namespace's segment was kept"
+        assert not os.path.exists(lock)
+    finally:
+        for p in (seg, lock):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_a_dead_process_in_another_shm_dir_keeps_live_segments(
+        monkeypatch, tmp_path):
+    """One deployment's processes can use different shm_dirs: the unheld lock
+    a dead one leaves in its shm_dir must not let a sweep take the live
+    segments in /dev/shm."""
+    live_dir, dead_dir = tmp_path / "live", tmp_path / "dead"
+    live_dir.mkdir()
+    dead_dir.mkdir()
+    a = _deployment_manager("w0", live_dir, "e" * 16, monkeypatch)
+    infos = a.store_and_return_tensor_info(
+        "r", {"x": [torch.arange(64, dtype=torch.uint8)]})
+    a.register_for_send("r", list(infos["x"]))
+    seg_path = a._own_segment_paths[0]
+    (dead_dir / f"mstar_{a._shm_namespace}.lock").touch()
+
+    _deployment_manager("w0", dead_dir, "f" * 16, monkeypatch)
+    assert os.path.exists(seg_path), "a live process's segment was swept"
+
+
 def test_dead_peer_segments_evicted(tmp_path):
     """A consumer must not accumulate mappings for peer segments whose
     backing file is gone (instance-unique names mean every producer restart

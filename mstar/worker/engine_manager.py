@@ -11,11 +11,12 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     apply_yaml_overrides,
 )
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
-from mstar.model.base import Model
+from mstar.model.base import Model, keyed_labels, node_moe_parallel_configs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
@@ -30,7 +31,7 @@ def _refuse_uncacheable_positions(
     A cached page is reusable only at the positions it was written at, since its
     K is stored already rotated.
     """
-    declared = set(model.prefix_key_streams())
+    declared = set(keyed_labels(model))
     if not declared:
         return
     for spec in specs:
@@ -56,7 +57,7 @@ def _refuse_unskippable_resources(
     not just the ones that answered the probe, so one that cannot account for
     tokens it never saw would plan its step against a sequence that never ran.
     """
-    declared = set(model.prefix_key_streams())
+    declared = set(keyed_labels(model))
     if not declared:
         return
     cached_nodes = {
@@ -120,42 +121,64 @@ def refuse_combined_walks_across_tp_groups(
 
 
 def _refuse_unknown_walks(model: Model) -> None:
-    """Refuse a declared stream that names a walk the model never runs.
+    """Refuse a declared label that names a walk the model never runs, or a
+    growth loop its walk doesn't run.
 
     Only the named walks may file pages or be probed, so a name that matches
     nothing leaves that cache empty for good, and nothing says why.
     """
-    walks = set(model.get_graph_walk_graphs())
-    for key, by_label in model.prefix_key_streams().items():
-        for label, stream in by_label.items():
-            unknown = sorted(
-                {stream.walk, stream.decode_walk, *stream.layout_walks} - walks - {None}
-            )
+    graphs = model.get_graph_walk_graphs()
+    walks = set(graphs)
+    for key, by_label in model.kv_labels().items():
+        for label, kv_label in by_label.items():
+            named = {walk for walk, _ in kv_label.growth}
+            if kv_label.keys is not None:
+                named.update(kv_label.keys.walks)
+            unknown = sorted(named - walks)
             if unknown:
                 raise ValueError(
-                    f"{type(model).__name__} keys {key!r}/{label!r} on "
+                    f"{type(model).__name__} declares {key!r}/{label!r} over "
                     f"{unknown}, which it never runs; its walks are "
                     f"{sorted(walks)}"
                 )
+            for walk, loop in kv_label.growth:
+                loops = graphs[walk].get_loops()
+                if loop not in loops:
+                    raise ValueError(
+                        f"{type(model).__name__} declares {key!r}/{label!r} growing on "
+                        f"{loop!r}, which {walk!r} doesn't run; its loops are {sorted(loops)}"
+                    )
+
+
+def _refuse_undeclared_pools(specs: list[NodeResourceSpec], model: Model) -> None:
+    """A ring pool needs no labels, since its size is fixed per request."""
+    declared = model.kv_labels()
+    for spec in specs:
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and not declared.get(spec.resource_key):
+            raise ValueError(
+                f"{type(model).__name__} declares no labels for its paged pool "
+                f"{spec.resource_key!r}; add them to `kv_labels`, and return each "
+                "request's layout for them from `process_prompt`"
+            )
 
 
 def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> None:
-    """Refuse a stream with layout walks if the cache could not serve one of its
-    walks whole: a walk where a keyed node feeds another node, or where no
+    """Refuse a keyed label over several walks if the cache could not serve one
+    of them whole: a walk where a keyed node feeds another node, or where no
     keyed node runs.
 
     A walk the cache serves whole completes with no outputs, so a node that
-    reads them would get nothing. Only a stream with layout walks is checked,
-    because a stream with one span always runs its last token.
+    reads them would get nothing. A label keyed over one walk is not checked,
+    because its one span always runs its last token.
     """
     graphs = model.get_graph_walk_graphs()
     by_key = {spec.resource_key: spec for spec in specs}
-    for key, by_label in model.prefix_key_streams().items():
-        for label, stream in by_label.items():
-            if not stream.layout_walks:
+    for key, by_label in keyed_labels(model).items():
+        for label, kv_label in by_label.items():
+            if len(kv_label.keys.walks) < 2:
                 continue
             keyed_nodes = by_key[key].nodes
-            for walk in (stream.walk, *stream.layout_walks):
+            for walk in kv_label.keys.walks:
                 nodes = graphs[walk].get_nodes()
                 ran = sorted(keyed_nodes & set(nodes))
                 if not ran:
@@ -211,6 +234,7 @@ class EngineManager:
         _refuse_uncacheable_positions(specs, model)
         _refuse_unskippable_resources(specs, model)
         _refuse_unknown_walks(model)
+        _refuse_undeclared_pools(specs, model)
         _refuse_unservable_walks(specs, model)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
@@ -227,14 +251,19 @@ class EngineManager:
         # return — the latter doubles the load-time VRAM peak. The cast below
         # applies the same resolved dtype, so allocation and runtime agree.
         submodules: dict[str, torch.nn.Module] = {}
+        # Checked by the conductor's get_sharding_config before spawn.
+        moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
             # Sequence parallelism is opt-in per node; only forward the SP
             # group when this node actually participates in one, so models
             # that don't support SP keep their existing get_submodule call.
+            # Likewise ``moe_parallel``, only for a node group's ``ep_config``.
             extra = {}
             node_sp_group = parallel_groups.get_sp_config_for_node(name)
             if node_sp_group.world_size > 1:
                 extra["sp_group"] = node_sp_group
+            if name in moe_parallel:
+                extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
                 name, device,
                 tp_group=parallel_groups.get_tp_config_for_node(name),

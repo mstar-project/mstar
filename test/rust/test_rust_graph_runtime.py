@@ -121,6 +121,7 @@ def _admit(runtime, request_id="r1", walk=WALK):
         request_id=request_id, partition="default", graph_walk=walk,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        loop_caps={},
     )
 
 

@@ -2,7 +2,8 @@
 
 ``AllReduce`` is NCCL. ``SymmMemAllReduce`` sends the small messages it can take
 through torch symmetric memory and the rest through NCCL; its subclasses are the
-two kernels, NVLink one-shot and NVLS multicast. ``AllReduce.new`` picks one.
+two kernels, NVLink one-shot and NVLS multicast. ``FlashInferAllReduce`` is
+FlashInfer's one-kernel all-reduce. ``AllReduce.new`` picks one.
 """
 
 import logging
@@ -69,13 +70,16 @@ class AllReduce:
             return AllReduce(group.device_group)
         backend = None
         try:
-            backend = backend_cls(
-                group.device_group, torch.device("cuda", torch.cuda.current_device()),
-                max_kb * 1024,
-            )
+            if backend_cls is FlashInferAllReduce:
+                backend = FlashInferAllReduce(group, max_kb * 1024)
+            else:
+                backend = backend_cls(
+                    group.device_group, torch.device("cuda", torch.cuda.current_device()),
+                    max_kb * 1024,
+                )
         except Exception as exc:  # noqa: BLE001 — fall back to NCCL, loudly
             logger.warning(
-                "all-reduce %s requested but symmetric memory could not be set up (%r); using NCCL",
+                "all-reduce %s requested but could not be set up (%r); using NCCL",
                 mode, exc,
             )
         # every rank or none: one rank on NCCL while its peers wait in the symmetric
@@ -216,7 +220,38 @@ class MultimemAllReduce(SymmMemAllReduce):
             out.copy_(buf)
 
 
+class FlashInferAllReduce(AllReduce):
+    """FlashInfer's one-kernel all-reduce for 2-D bf16 messages that fit its
+    workspace, NCCL for the rest. The workspace is sized in bytes, so one serves
+    any hidden size."""
+
+    mode = "flashinfer"
+
+    def __init__(self, group: "CommGroup", max_bytes: int):
+        from mstar.distributed.ar_fusion import create_workspace
+
+        super().__init__(group.device_group)
+        self.world_size = group.world_size
+        self.ws_id = create_workspace(
+            group.rank, group.world_size, group.cpu_group, 1, max_bytes // 2, torch.bfloat16,
+        )
+        if self.ws_id is None:
+            raise RuntimeError("no FlashInfer all-reduce workspace")
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        from mstar.distributed.ar_fusion import _WORKSPACES, allreduce_oneshot
+
+        if (
+            not torch.compiler.is_compiling()
+            and input_.dim() == 2 and input_.dtype == torch.bfloat16
+            and input_.is_cuda and input_.is_contiguous()
+            and _WORKSPACES[self.ws_id].is_buffer_size_sufficient(self.world_size, *input_.shape, input_.dtype)
+        ):
+            return allreduce_oneshot(input_, self.ws_id)
+        return super().all_reduce(input_)
+
+
 # ``tp_allreduce`` -> its backend; "nccl" is ``AllReduce`` itself
-SYMM_BACKENDS: dict[str, type[SymmMemAllReduce]] = {
-    backend.mode: backend for backend in (OneShotAllReduce, MultimemAllReduce)
+SYMM_BACKENDS: dict[str, type[AllReduce]] = {
+    backend.mode: backend for backend in (OneShotAllReduce, MultimemAllReduce, FlashInferAllReduce)
 }

@@ -108,50 +108,56 @@ def flatten_messages(
             return
         parts.append(PromptPart(modality="text", text=text, role=role))
 
-    for msg in messages or []:
-        # Messages may be pydantic ChatMessage objects or plain dicts.
-        if isinstance(msg, dict):
-            role, content = msg.get("role"), msg.get("content")
-        else:
-            role, content = getattr(msg, "role", None), getattr(msg, "content", None)
-        if role == "developer":  # OpenAI's newer name for system
-            role = "system"
-        elif role not in ("system", "user", "assistant"):
-            raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
-        if content is None:
-            continue
-        if isinstance(content, str):
-            if content:
-                add_text(content, role)
-            continue
-        for part in content:
-            if not isinstance(part, dict):
+    try:
+        for msg in messages or []:
+            # Messages may be pydantic ChatMessage objects or plain dicts.
+            if isinstance(msg, dict):
+                role, content = msg.get("role"), msg.get("content")
+            else:
+                role, content = getattr(msg, "role", None), getattr(msg, "content", None)
+            if role == "developer":  # OpenAI's newer name for system
+                role = "system"
+            elif role not in ("system", "user", "assistant"):
+                raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
+            if content is None:
                 continue
-            ptype = part.get("type")
-            if ptype == "text":
-                if part.get("text"):
-                    add_text(part["text"], role)
-            elif ptype == "image_url":
-                url = (part.get("image_url") or {}).get("url", "")
-                if url:
-                    mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "image", path)
-            elif ptype == "video_url":  # extension for video-capable models
-                url = (part.get("video_url") or {}).get("url", "")
-                if url:
-                    mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "video", path)
-            elif ptype == "audio_url":  # data:/http audio input in an ``audio_url`` content part
-                url = (part.get("audio_url") or {}).get("url", "")
-                if url:
-                    mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "audio", path)
-            elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
-                ia = part.get("input_audio") or {}
-                data, fmt = ia.get("data"), ia.get("format", "wav")
-                if data:
-                    mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
-                    add_file(mod, path)
+            if isinstance(content, str):
+                if content:
+                    add_text(content, role)
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    if part.get("text"):
+                        add_text(part["text"], role)
+                elif ptype == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    if url:
+                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
+                        add_file(mod or "image", path)
+                elif ptype == "video_url":  # extension for video-capable models
+                    url = (part.get("video_url") or {}).get("url", "")
+                    if url:
+                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
+                        add_file(mod or "video", path)
+                elif ptype == "audio_url":  # data:/http audio input in an ``audio_url`` content part
+                    url = (part.get("audio_url") or {}).get("url", "")
+                    if url:
+                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
+                        add_file(mod or "audio", path)
+                elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
+                    ia = part.get("input_audio") or {}
+                    data, fmt = ia.get("data"), ia.get("format", "wav")
+                    if data:
+                        mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
+                        add_file(mod, path)
+    except BaseException:
+        # A refused chat is never submitted, so no deferred cleanup covers
+        # the attachments saved before the refusal.
+        media_io.remove_uploads(file_paths, upload_dir)
+        raise
 
     text_parts = [p.text for p in parts if p.modality == "text"]
     text = "\n".join(text_parts) if text_parts else None
@@ -805,15 +811,16 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         _refuse_tool_calls(req)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
         # Clients written for the Edge model's serving recipe toggle thinking
         # through ``chat_template_kwargs``; accept it alongside a flat
-        # ``enable_thinking``.
+        # ``enable_thinking``. Read before the attachments are saved, since a
+        # malformed value refuses the request.
         template_kwargs = mk.pop("chat_template_kwargs", None) or {}
         if "enable_thinking" in template_kwargs:
             mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,
             file_paths=file_paths or None,

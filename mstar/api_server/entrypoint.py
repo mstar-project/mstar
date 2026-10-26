@@ -8,6 +8,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import re
 import signal
 import sys
 import threading
@@ -38,6 +39,7 @@ from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.tensors import ensure_deployment_token
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -69,6 +71,20 @@ NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
 # rather than shared with ``mstar.client.media`` so the SDK keeps its stdlib-only
 # import contract; ``test_binary_framing.py`` asserts the two stay equal.
 BINARY_STREAM_MEDIA_TYPE = "application/vnd.mstar.frames"
+
+# A request's id rides in every control message about it, so a client-pinned
+# one is kept short. The Rust frontend (rust/server/src/main.rs) mirrors this.
+MAX_REQUEST_ID_LEN = 128
+_REQUEST_ID_RE = re.compile(rf"[A-Za-z0-9._:-]{{0,{MAX_REQUEST_ID_LEN}}}")
+REQUEST_ID_ERROR = f"request_id must be at most {MAX_REQUEST_ID_LEN} characters from [A-Za-z0-9._:-]"
+
+
+def check_request_id(request_id: str | None) -> None:
+    """Raise ``ValueError`` unless ``request_id`` is None or fits :data:`_REQUEST_ID_RE`."""
+    if request_id is not None and (
+        not isinstance(request_id, str) or _REQUEST_ID_RE.fullmatch(request_id) is None
+    ):
+        raise ValueError(REQUEST_ID_ERROR)
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -202,6 +218,10 @@ def _shutdown_conductor_process(
 #: The Rust frontend waits the same (``DUPLICATE_ID_GRACE`` in serving.rs).
 DUPLICATE_ID_GRACE_S = 0.5
 
+#: How often a non-streaming handler (``collect_results``) asks whether its
+#: client left while it waits for the request to finish.
+DISCONNECT_CHECK_S = 0.1
+
 
 def _client_text(text: str, key: str, request_id: str | None) -> str:
     """``text`` with the submission key ``key`` (``<request_id>#<n>``) shown
@@ -244,6 +264,9 @@ class PendingRequest:
     # sleeps between chunks instead of polling every millisecond per request.
     wake: Any | None = None
     loop: Any | None = None
+    # Set by collect_results, which reads no chunk before the request ends:
+    # the wake then waits for the finish instead of firing on every chunk.
+    wake_on_finish: bool = False
     # The client's request_id. The engine knows the request by its key, so
     # the message thread restamps each chunk with this before the client sees it.
     request_id: str | None = None
@@ -253,7 +276,7 @@ class PendingRequest:
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
         loop, wake = self.loop, self.wake
-        if loop is None or wake is None:
+        if loop is None or wake is None or (self.wake_on_finish and not self.event.is_set()):
             return
         try:
             loop.call_soon_threadsafe(wake.set)
@@ -274,7 +297,7 @@ def notify_many(reqs) -> None:
     by_loop: dict[int, tuple[Any, list]] = {}
     for req in reqs:
         loop, wake = req.loop, req.wake
-        if loop is None or wake is None:
+        if loop is None or wake is None or (req.wake_on_finish and not req.event.is_set()):
             continue
         entry = by_loop.get(id(loop))
         if entry is None:
@@ -364,6 +387,8 @@ class APIServer:
         self.model = model
         self.model_name = model_name
 
+        # Before any tensor manager; the conductor and workers inherit it.
+        ensure_deployment_token()
         self.preprocess_worker = PreprocessWorker(
             model=model,
             model_config=model_config,
@@ -552,6 +577,7 @@ class APIServer:
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
+        check_request_id(request_id)
 
         for m in input_modalities + output_modalities:
             if m not in SUPPORTED_MODALITIES:
@@ -1156,19 +1182,41 @@ class APIServer:
         return its chunks. Disconnecting or timing out releases engine state."""
         start = time.time()
         key = self.submission_key(request_id)
+        # Woken by the message thread (PendingRequest.notify) when the request
+        # finishes, not on each chunk (wake_on_finish). Polling every 5 ms per
+        # request (lock, cancel scope, timer) held the event loop at high
+        # concurrency; the timeout is checked on each pass and a disconnect
+        # every DISCONNECT_CHECK_S.
+        wake = asyncio.Event()
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is not None:
+                req.loop = asyncio.get_running_loop()
+                req.wake = wake
+                req.wake_on_finish = True
+        checked = start
         while True:
+            # Cleared before the read: a notification that lands after this
+            # point stays set and the wait below returns at once.
+            wake.clear()
             with self.request_lock:
                 req = self.pending_requests.get(key)
                 done = req.event.is_set() if req else True
             if done:
                 break
-            if time.time() - start > self.timeout_seconds:
+            now = time.time()
+            if now - start > self.timeout_seconds:
                 self.abort_submission(key, outcome="timeout")
                 raise HTTPException(status_code=500, detail="Request timed out")
-            if raw_request is not None and await raw_request.is_disconnected():
-                self.abort_submission(key)
-                return []
-            await asyncio.sleep(0.005)
+            if raw_request is not None and now - checked >= DISCONNECT_CHECK_S:
+                checked = now
+                if await raw_request.is_disconnected():
+                    self.abort_submission(key)
+                    return []
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=DISCONNECT_CHECK_S)
+            except asyncio.TimeoutError:
+                pass
 
         with self.request_lock:
             req = self.pending_requests.pop(key, None)
@@ -1601,6 +1649,10 @@ async def generate_ws(websocket: WebSocket):
         try:
             if request_id is not None and not isinstance(request_id, str):
                 raise ValueError("request_id must be a string")
+            if request_id == "":
+                # An empty form field reaches /generate as None; same here.
+                request_id = None
+            check_request_id(request_id)
             out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
             text = message.get("text")
             if text is not None and not isinstance(text, str):
@@ -1744,6 +1796,10 @@ async def generate(
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
+    try:
+        check_request_id(request_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
 
     # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
     # HTML checkbox) instead of its declared default, for Optional[bool] too.
@@ -2046,6 +2102,11 @@ def main(argv: list[str] | None = None):
         log_stats_file=args.log_stats_file,
         enable_nvtx=args.enable_nvtx,
     )
+
+    from mstar.api_server.openai.adapters import get_adapter
+    if getattr(get_adapter(model_name), "supports_realtime_transcription", False):
+        from mstar.api_server.openai import realtime_vad
+        realtime_vad.report_availability()   # warns now if server_vad or semantic_vad cannot run
 
     # Spawn conductor in a separate process
     ctx = mp.get_context("spawn")

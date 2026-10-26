@@ -397,7 +397,7 @@ class MicroScheduler:
             return self._apply_resident_delta(message.node_name, message.resident_delta)
         return self._apply_resident_delta(message.node_name)
 
-    def settle_tp_follow_delta(self) -> bool:
+    def settle_tp_follow_delta(self, caught_up: bool) -> bool:
         """Replay the front head's resident delta; True once every move landed.
 
         The one seam both consumers of this FIFO go through — the serial path
@@ -406,11 +406,23 @@ class MicroScheduler:
         to skip this entirely and read the difference as "rid not ready", which
         it then polled on for ever.
 
+        ``caught_up`` means every step this rank took before the head has committed.
         """
         head = self.peek_tp_follow()
         if head is None:
             return True
-        return self._apply_delta_from_message(head)
+        if not self._apply_delta_from_message(head):
+            return False
+        if not head.prefix_hits and not head.page_trails:
+            return True
+        engine = self.engine_manager.get_engine(head.node_name)
+        try:
+            engine.check_page_trails(head.node_name, head.graph_walk, head.spec_seq, head.page_trails)
+            return engine.adopt_cached_prefix(head, caught_up)
+        except Exception as exc:
+            # The error would repeat on every pass over this head, and failing its requests would
+            # leave the other ranks stuck in its collective.
+            raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
@@ -507,8 +519,8 @@ class MicroScheduler:
                 self.has_ready_excluding(request_state, head_key):
             return
         # Check readiness for every rid to pop all-or-none. Use the
-        # leader's graph walk.
-        if not self.settle_tp_follow_delta():
+        # leader's graph walk. No step of the node is in flight on this path.
+        if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name,
