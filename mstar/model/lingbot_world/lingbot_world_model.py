@@ -179,6 +179,9 @@ class LingBotWorldModel(Model):
         lat_f = (num_frames - 1) // cfg.vae_stride[0] + 1
         return lat_f - lat_f % cfg.chunk_size
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"camera_poses", "intrinsics", "num_frames", "height", "width"})
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,

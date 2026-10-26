@@ -194,6 +194,10 @@ class ZImageModel(Model):
             raise ValueError(f"num_inference_steps must be >= 1, got {steps}")
         return min(steps, self.config.max_denoise_steps)
 
+    def request_kwargs(self) -> frozenset[str]:
+        # guidance_scale is read only to log that the distilled checkpoint ignores it
+        return frozenset({"height", "width", "num_inference_steps", "guidance_scale"})
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,

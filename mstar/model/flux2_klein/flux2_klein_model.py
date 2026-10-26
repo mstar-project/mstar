@@ -310,6 +310,10 @@ class Flux2KleinModel(Model):
             steps = self.config.max_denoise_steps
         return steps
 
+    def request_kwargs(self) -> frozenset[str]:
+        # guidance_scale is read only to warn that the distilled checkpoint ignores it
+        return frozenset({"height", "width", "num_inference_steps", "guidance_scale"})
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,
