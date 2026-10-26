@@ -325,36 +325,38 @@ ranks. Loading fails otherwise.
 
 On a single rank, a request waits at the head of its pool's queue until its reservation fits
 beside the reservations already admitted, and no request behind it starts first. A cache hit on
-a page only the prefix index holds counts as a page the request takes. A request that
-can't fit in its pool at its full output length gets a 400 if it asked for that length,
-and otherwise has the model's default length cut until it fits. A request that can be
-rebuilt reserves only its prompt, so a decode step can find no page outside the reservations. The
-worker then moves the least recently active request to the host if ``cpu_offload_pages`` has
-room for it. Otherwise it drops the newest requests it can rebuild from their token ids. Either
-way, the request that ran short gets the pages freed, up to its shortage, unless it was the request
-moved to the host or dropped. A dropped request waits at its place in the queue until its history and
-one more page fit, then recomputes its KV in one prefill row. A
-request that streams audio out, or holds KV made from another node's outputs, reserves its whole
-footprint in every pool, with every cache hit counted, and is never dropped or moved to the host.
-So does a request in the pools of a node that keeps no token ids to rebuild it. A request with images
-whose whole prompt runs on one prefill walk, such as a Qwen3.5 chat with images, can be dropped
-at one rank: the worker keeps a host copy of what that walk read besides the token ids, the
-encoder's output included, and rebuilds the request from it. Bagel, Qwen3-Omni and Higgs Audio
-requests with media, whose prompts run on several walks, and requests with images above one
-rank keep no copies and stay guaranteed. A Qwen3.5 video stays guaranteed for its frames.
-Voice requests then queue when the pool is short and are never preempted mid-stream.
+a page only the prefix index holds counts as a page the request takes. A request that can't fit
+in its pool at its full output length gets a 400 if it asked for that length, and otherwise has
+the model's default length cut until it fits. A request that can be rebuilt reserves only its
+prompt, so a decode step can find no page outside the reservations. The worker then takes pages
+from the newest requests, those that arrived after the request that ran short, until they cover
+its shortage. Each moves to the host when the host pool (``cpu_offload_pages``) can hold all of
+its pages, and is otherwise dropped if it can be rebuilt from its token ids. The request that
+ran short gets the pages freed, up to its shortage, unless it moved or was dropped itself. A
+request on the host waits at its place in the queue until its pages and one more page fit, and
+its pages are then copied back. A dropped request waits until its history and one more page
+fit, then recomputes its KV in one prefill row. A request that streams audio out, or holds KV
+made from another node's outputs, reserves its whole footprint in every pool, with every cache
+hit counted, and is never dropped or moved to the host. So does a request in the pools of a
+node that keeps no token ids to rebuild it. A request with images whose whole prompt runs on
+one prefill walk, such as a Qwen3.5 chat with images, can be dropped at one rank: the worker
+keeps a host copy of what that walk read besides the token ids, the encoder's output included,
+and rebuilds the request from it. Bagel, Qwen3-Omni and Higgs Audio requests with media, whose
+prompts run on several walks, and requests with images above one rank keep no copies and stay
+guaranteed. A Qwen3.5 video stays guaranteed for its frames. Voice requests then queue when the
+pool is short and are never preempted mid-stream.
 
-Above one rank, a decode step that finds no page and nothing to offload holds its requests until
-they time out. At one rank, a request that runs short and can't be dropped waits for room when
-nothing can be offloaded and dropping newer requests wouldn't cover its shortage. That is the case
-for every request under ``MSTAR_SAMPLER_INGRAPH_SCATTER=1``, since the sampler then refuses every
-drop. Several such requests can wait on each other.
-``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the
-pool's pages divided by the pages one request needs, prompt and output together, is a
-safe value. ``cpu_offload_pages`` lets a full pool move a request to the host, and an offload
-comes before any drop. An offload frees only the device pages no other running request reads,
-though, so a request that shares most of its prompt frees little.
-Offload helps a pool that runs short now and then. It doesn't replace the cap.
+Above one rank, a decode step that finds no page and nothing to offload holds its requests
+until they time out. At one rank, a request that runs short and can neither move to the host
+nor be dropped waits for room when moving or dropping the newer requests wouldn't cover its
+shortage. When ``cpu_offload_pages`` can't hold the request, that is the case for every request
+under ``MSTAR_SAMPLER_INGRAPH_SCATTER=1``, since the sampler then refuses every drop. Several
+such requests can wait on each other. ``max_concurrent_requests`` prevents both. It caps how
+many requests run at once, and the pool's pages divided by the pages one request needs, prompt
+and output together, is a safe value. ``cpu_offload_pages`` lets a full pool move a request to
+the host instead of dropping it. An offload frees only the device pages no other running
+request reads, though, so a request that shares most of its prompt frees little. Offload helps
+a pool that runs short now and then. It doesn't replace the cap.
 
 **Single GPU.** Everything on rank 0:
 

@@ -176,6 +176,19 @@ class PrefixIndex:
                 page = parent
         return len(joined)
 
+    def freeable(self) -> int:
+        """How many pages `evict` can free: the pages only the index holds, with no held page below them. Read
+        from the owner counts, for an index whose arena doesn't keep `evictable` current."""
+        owners = self._arena.num_owners
+        held_below: set[int] = set()
+        for page in self._by_key.values():
+            if owners[page] > 1:
+                parent = self._parent[page]
+                while parent is not None and parent not in held_below:
+                    held_below.add(parent)
+                    parent = self._parent[parent]
+        return sum(owners[page] == 1 and page not in held_below for page in self._by_key.values())
+
     def assert_evictable(self) -> None:
         """Check that `evict`, run on a copy of the index and the owner counts, frees every page
         in the evictable set."""

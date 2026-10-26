@@ -2499,7 +2499,8 @@ class Engine:
 
         Returns what was reclaimed, in whatever each resource counts (pages,
         today); 0 means nothing moved and the caller should pick another
-        victim.
+        victim. A victim `KVManager.preempt` chose is the exception: it can
+        move with 0 reclaimed.
         """
         if node_name in self._tp_follower_nodes:
             # Rank 0 decides what this instance evicts, and its decision arrives

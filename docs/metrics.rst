@@ -280,7 +280,7 @@ tensor or sequence parallel instance count once: the instance's first rank repor
    ``rate(mstar_prefix_cache_query_tokens_total[5m])``.
 
 ``mstar_kv_preemptions_total{model_name, component}``
-   Counter. Requests chosen to drop because a grant past a request's reservation ran short
+   Counter. Requests chosen to move to the host or drop because a grant past a request's reservation ran short
    of KV pages, on a single rank. Their pages go to the request that ran short.
 
 ``mstar_kv_drops_total{model_name, component}``
@@ -299,7 +299,7 @@ tensor or sequence parallel instance count once: the instance's first rank repor
    for the load, and more pages or fewer concurrent requests stop it.
 
 ``mstar_kv_returns_preempted_total{model_name, component}``
-   Counter. Returned requests preempted again before they kept another token.
+   Counter. Dropped requests preempted again after their return, before they kept another token.
 
 ``mstar_component_pending_steps{model_name, component}``
    Gauge. Requests whose next step on the node is ready (its inputs arrived) and not
