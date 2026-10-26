@@ -661,6 +661,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#nemotron-voicechat-nemotron-duplex-notes">Nemotron VoiceChat (<code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code>) notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#chatterbox-notes">Chatterbox notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-environment-requirements">Cosmos3 environment requirements</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-image-to-video-conditioning">Cosmos3 image-to-video conditioning</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-edge-reasoner-and-action-loop">Cosmos3-Edge reasoner and action loop</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-streaming-rollout-windowed-video">Cosmos3 streaming rollout (windowed video)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>
@@ -1497,6 +1498,15 @@ pip-installable).</p></li>
 automatically.</p></li>
 </ul>
 </section>
+<section id="cosmos3-image-to-video-conditioning">
+<h2>Cosmos3 image-to-video conditioning<a class="headerlink" href="#cosmos3-image-to-video-conditioning" title="Link to this heading">#</a></h2>
+<p>An image-to-video request’s conditioning image is scaled to cover the output
+size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
+NVIDIA’s cosmos-framework and diffusers 0.40 and later. Setting
+<code class="docutils literal notranslate"><span class="pre">conditioning_resize:</span> <span class="pre">stretch</span></code> under the config YAML’s <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>
+resizes it to the output size instead (antialiased bilinear, aspect ratio not
+kept), as diffusers 0.39 did. Action requests ignore the setting.</p>
+</section>
 <section id="cosmos3-edge-reasoner-and-action-loop">
 <h2>Cosmos3-Edge reasoner and action loop<a class="headerlink" href="#cosmos3-edge-reasoner-and-action-loop" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">cosmos3_edge</span></code> serves the understanding tower as a vision-language model on the
@@ -1999,6 +2009,7 @@ fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#nemotron-voicechat-nemotron-duplex-notes">Nemotron VoiceChat (<code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code>) notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#chatterbox-notes">Chatterbox notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-environment-requirements">Cosmos3 environment requirements</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-image-to-video-conditioning">Cosmos3 image-to-video conditioning</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-edge-reasoner-and-action-loop">Cosmos3-Edge reasoner and action loop</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-streaming-rollout-windowed-video">Cosmos3 streaming rollout (windowed video)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>

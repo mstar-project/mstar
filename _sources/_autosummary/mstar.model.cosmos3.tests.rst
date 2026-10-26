@@ -29,6 +29,7 @@ mstar.model.cosmos3.tests
 
    pipeline
    test_action
+   test_conditioning
    test_distilled
    test_dit_step_guard
    test_droid

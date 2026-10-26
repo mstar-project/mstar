@@ -662,18 +662,16 @@
   <section id="module-mstar.model.cosmos3.components.conditioning">
 <span id="mstar-model-cosmos3-components-conditioning"></span><h1>mstar.model.cosmos3.components.conditioning<a class="headerlink" href="#module-mstar.model.cosmos3.components.conditioning" title="Link to this heading">#</a></h1>
 <p>Conditioning-frame preprocessing for image-to-video.</p>
-<p>Two references disagree on how a conditioning image reaches the target
-resolution, and both are served:</p>
+<p>Two recipes take a conditioning image to the generation size:</p>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">stretch</span></code> — the diffusers 0.39 pipeline (<code class="docutils literal notranslate"><span class="pre">VideoProcessor.preprocess</span></code>):
-a plain bilinear resize to <code class="docutils literal notranslate"><span class="pre">(height,</span> <span class="pre">width)</span></code>, aspect ratio not preserved,
-values mapped to [-1, 1] without 8-bit rounding. What the Nano checkpoints
-were validated against.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">aspect_crop</span></code> — the diffusers 0.40 pipeline (<code class="docutils literal notranslate"><span class="pre">_preprocess_conditioning_image</span></code>):
-scale so the image covers the target
+<li><p><code class="docutils literal notranslate"><span class="pre">aspect_crop</span></code> (the default): scale so the image covers the target
 (<code class="docutils literal notranslate"><span class="pre">max(width</span> <span class="pre">/</span> <span class="pre">w,</span> <span class="pre">height</span> <span class="pre">/</span> <span class="pre">h)</span></code>), antialiased bilinear resize to the ceiled
-size, center crop, round to 8-bit, then <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">/</span> <span class="pre">127.5</span> <span class="pre">-</span> <span class="pre">1</span></code>. The Edge model
-card’s recipe.</p></li>
+size, center crop, round to 8 bits, then <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">/</span> <span class="pre">127.5</span> <span class="pre">-</span> <span class="pre">1</span></code>. NVIDIA’s
+cosmos-framework (<code class="docutils literal notranslate"><span class="pre">_resize_and_center_crop</span></code> in <code class="docutils literal notranslate"><span class="pre">inference/vision.py</span></code>) and
+diffusers &gt;= 0.40 (<code class="docutils literal notranslate"><span class="pre">_preprocess_conditioning_image</span></code>) both do this.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">stretch</span></code>: antialiased bilinear resize straight to <code class="docutils literal notranslate"><span class="pre">(height,</span> <span class="pre">width)</span></code>,
+aspect ratio not preserved, then the same 8-bit rounding. What diffusers 0.39
+did with a PIL image; kept for A/B against that recipe.</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">prepare_conditioning_frames</span></code> takes the frames the data worker loaded
 (<code class="docutils literal notranslate"><span class="pre">[T,</span> <span class="pre">C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code> in [0, 1], or a single <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>) and returns
@@ -689,7 +687,7 @@ card’s recipe.</p></li>
 </div>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.components.conditioning.prepare_conditioning_frames">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.conditioning.</span></span><span class="sig-name descname"><span class="pre">prepare_conditioning_frames</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">frames</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">height</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">width</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'stretch'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/conditioning.html#prepare_conditioning_frames"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.conditioning.prepare_conditioning_frames" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.conditioning.</span></span><span class="sig-name descname"><span class="pre">prepare_conditioning_frames</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">frames</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">height</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">width</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'aspect_crop'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/conditioning.html#prepare_conditioning_frames"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.conditioning.prepare_conditioning_frames" title="Link to this definition">#</a></dt>
 <dd><p>Resize conditioning pixels to the generation size; see the module docstring.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>

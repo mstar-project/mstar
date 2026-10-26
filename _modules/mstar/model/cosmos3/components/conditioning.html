@@ -940,18 +940,16 @@ window.runMermaid = runMermaid;</script>
   <h1>Source code for mstar.model.cosmos3.components.conditioning</h1><div class="highlight"><pre>
 <span></span><span class="sd">"""Conditioning-frame preprocessing for image-to-video.</span>
 
-<span class="sd">Two references disagree on how a conditioning image reaches the target</span>
-<span class="sd">resolution, and both are served:</span>
+<span class="sd">Two recipes take a conditioning image to the generation size:</span>
 
-<span class="sd">* ``stretch`` — the diffusers 0.39 pipeline (``VideoProcessor.preprocess``):</span>
-<span class="sd">  a plain bilinear resize to ``(height, width)``, aspect ratio not preserved,</span>
-<span class="sd">  values mapped to [-1, 1] without 8-bit rounding. What the Nano checkpoints</span>
-<span class="sd">  were validated against.</span>
-<span class="sd">* ``aspect_crop`` — the diffusers 0.40 pipeline (``_preprocess_conditioning_image``):</span>
-<span class="sd">  scale so the image covers the target</span>
+<span class="sd">* ``aspect_crop`` (the default): scale so the image covers the target</span>
 <span class="sd">  (``max(width / w, height / h)``), antialiased bilinear resize to the ceiled</span>
-<span class="sd">  size, center crop, round to 8-bit, then ``x / 127.5 - 1``. The Edge model</span>
-<span class="sd">  card's recipe.</span>
+<span class="sd">  size, center crop, round to 8 bits, then ``x / 127.5 - 1``. NVIDIA's</span>
+<span class="sd">  cosmos-framework (``_resize_and_center_crop`` in ``inference/vision.py``) and</span>
+<span class="sd">  diffusers &gt;= 0.40 (``_preprocess_conditioning_image``) both do this.</span>
+<span class="sd">* ``stretch``: antialiased bilinear resize straight to ``(height, width)``,</span>
+<span class="sd">  aspect ratio not preserved, then the same 8-bit rounding. What diffusers 0.39</span>
+<span class="sd">  did with a PIL image; kept for A/B against that recipe.</span>
 
 <span class="sd">``prepare_conditioning_frames`` takes the frames the data worker loaded</span>
 <span class="sd">(``[T, C, H, W]`` in [0, 1], or a single ``[C, H, W]``) and returns</span>
@@ -965,7 +963,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
 
-<span class="n">CONDITIONING_RESIZE_MODES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"stretch"</span><span class="p">,</span> <span class="s2">"aspect_crop"</span><span class="p">)</span>
+<span class="n">CONDITIONING_RESIZE_MODES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"aspect_crop"</span><span class="p">,</span> <span class="s2">"stretch"</span><span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_to_float_0_255</span><span class="p">(</span><span class="n">frames</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
@@ -982,7 +980,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="prepare_conditioning_frames">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.conditioning.html#mstar.model.cosmos3.components.conditioning.prepare_conditioning_frames">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">prepare_conditioning_frames</span><span class="p">(</span>
-    <span class="n">frames</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">height</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"stretch"</span><span class="p">,</span>
+    <span class="n">frames</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">height</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"aspect_crop"</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Resize conditioning pixels to the generation size; see the module docstring."""</span>
     <span class="k">if</span> <span class="n">mode</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">CONDITIONING_RESIZE_MODES</span><span class="p">:</span>
@@ -996,18 +994,18 @@ window.runMermaid = runMermaid;</script>
     <span class="k">elif</span> <span class="n">frames</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="mi">4</span><span class="p">:</span>
         <span class="n">frames</span> <span class="o">=</span> <span class="n">frames</span><span class="p">[:,</span> <span class="p">:</span><span class="mi">3</span><span class="p">]</span>
     <span class="n">x</span> <span class="o">=</span> <span class="n">_to_float_0_255</span><span class="p">(</span><span class="n">frames</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">"stretch"</span><span class="p">:</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">interpolate</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">size</span><span class="o">=</span><span class="p">(</span><span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="p">),</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"bilinear"</span><span class="p">,</span> <span class="n">align_corners</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="p">(</span><span class="n">x</span> <span class="o">/</span> <span class="mf">255.0</span><span class="p">)</span> <span class="o">*</span> <span class="mf">2.0</span> <span class="o">-</span> <span class="mf">1.0</span>
-    <span class="k">else</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">"aspect_crop"</span><span class="p">:</span>
         <span class="n">src_h</span><span class="p">,</span> <span class="n">src_w</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">2</span><span class="p">:]</span>
         <span class="n">scale</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">width</span> <span class="o">/</span> <span class="n">src_w</span><span class="p">,</span> <span class="n">height</span> <span class="o">/</span> <span class="n">src_h</span><span class="p">)</span>
         <span class="n">rh</span><span class="p">,</span> <span class="n">rw</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">scale</span> <span class="o">*</span> <span class="n">src_h</span><span class="p">),</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">scale</span> <span class="o">*</span> <span class="n">src_w</span><span class="p">)</span>
         <span class="n">x</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">interpolate</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">size</span><span class="o">=</span><span class="p">(</span><span class="n">rh</span><span class="p">,</span> <span class="n">rw</span><span class="p">),</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"bilinear"</span><span class="p">,</span> <span class="n">align_corners</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">antialias</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="c1"># Python's round (half to even), like torchvision's center_crop</span>
         <span class="n">top</span> <span class="o">=</span> <span class="nb">round</span><span class="p">((</span><span class="n">rh</span> <span class="o">-</span> <span class="n">height</span><span class="p">)</span> <span class="o">/</span> <span class="mi">2</span><span class="p">)</span>
         <span class="n">left</span> <span class="o">=</span> <span class="nb">round</span><span class="p">((</span><span class="n">rw</span> <span class="o">-</span> <span class="n">width</span><span class="p">)</span> <span class="o">/</span> <span class="mi">2</span><span class="p">)</span>
         <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">top</span><span class="p">:</span><span class="n">top</span> <span class="o">+</span> <span class="n">height</span><span class="p">,</span> <span class="n">left</span><span class="p">:</span><span class="n">left</span> <span class="o">+</span> <span class="n">width</span><span class="p">]</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">round</span><span class="p">()</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">255</span><span class="p">)</span> <span class="o">/</span> <span class="mf">127.5</span> <span class="o">-</span> <span class="mf">1.0</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">interpolate</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">size</span><span class="o">=</span><span class="p">(</span><span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="p">),</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"bilinear"</span><span class="p">,</span> <span class="n">align_corners</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">antialias</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">round</span><span class="p">()</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">255</span><span class="p">)</span> <span class="o">/</span> <span class="mf">127.5</span> <span class="o">-</span> <span class="mf">1.0</span>
     <span class="c1"># [T, 3, H, W] -&gt; [1, 3, T, H, W]</span>
     <span class="k">return</span> <span class="n">x</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span></div>
 
