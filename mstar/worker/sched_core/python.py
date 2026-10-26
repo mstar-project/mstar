@@ -1,6 +1,5 @@
-"""The scheduling pass in Python (``PythonSchedCore``): the core for a worker the Rust
-graph runtime cannot schedule alone (a node that splits batches by capture
-key, a speculation chain that mixes walks, or the Python runtime).
+"""The scheduling pass in Python (``PythonSchedCore``): the core for the Python
+graph runtime, and the reference the Rust core follows.
 
 A pass is a generator that yields each ``CheckRequest`` and is sent its
 ``CheckResult``; ``begin`` and ``resume`` step it.
@@ -16,8 +15,6 @@ from mstar.worker.batch_builder import BaseBatchBuilder, BatchBuildRequest, Batc
 from mstar.worker.micro_scheduler import ReadyNodeEntry, ScheduledBatch
 from mstar.worker.sched_core.base import (
     NO_GROUP,
-    READY,
-    UNCHECKED,
     CheckRequest,
     CheckResult,
     PassRequest,
@@ -25,6 +22,7 @@ from mstar.worker.sched_core.base import (
     RoundRobin,
     SchedCore,
     SchedKeys,
+    Verdict,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,7 +156,7 @@ class PythonSchedCore(SchedCore):
         for i, (rid, verdict, (key, wg_id, walk)) in enumerate(
             zip(asked.rids, result.verdicts, rows, strict=True),
         ):
-            if verdict == READY:
+            if verdict == Verdict.READY:
                 group = NO_GROUP if groups is None else groups[i]
                 ready.setdefault(key, []).append(ReadyNodeEntry(rid, wg_id, walk, group))
         # the anchor's group only when the scan named one; otherwise the step
@@ -283,7 +281,7 @@ class PythonSchedCore(SchedCore):
         failed = self._req.failed
         blocked = waiting | {
             rid for rid, verdict in zip(asked.rids, result.verdicts, strict=True)
-            if verdict not in (READY, UNCHECKED)
+            if verdict not in (Verdict.READY, Verdict.UNCHECKED)
         }
         dropped = blocked & failed
         if dropped:

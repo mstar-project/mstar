@@ -16,15 +16,24 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from collections.abc import Set as AbstractSet
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from mstar.worker.engine_manager import EngineManager
     from mstar.worker.micro_scheduler import ScheduledBatch
 
-# One verdict per requested row. OFF_GROUP: ready, but outside the step's
-# capture group (``CheckRequest.by_anchor``).
-NOT_READY, READY, FAILED, UNCHECKED, OFF_GROUP = 0, 1, 2, 3, 4
+class Verdict(IntEnum):
+    """One per requested row; ``CheckResult.verdicts`` holds them as bytes."""
+    NOT_READY = 0
+    READY = 1
+    FAILED = 2
+    # past the request's limit
+    UNCHECKED = 3
+    # ready, but outside the step's capture group (``CheckRequest.by_anchor``)
+    OFF_GROUP = 4
+
+
 # ``CheckResult.groups`` for a row whose node does not split by capture key
 NO_GROUP = -1
 

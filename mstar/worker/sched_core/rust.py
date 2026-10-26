@@ -20,31 +20,31 @@ if TYPE_CHECKING:
 class RustSchedCore(SchedCore):
     """The scheduling pass in the Rust graph runtime: the backlog and the
     round-robin table live there, next to the ready masks, pops and in-flight
-    flags it works on, and a pass crosses once per check request.
-
-    Used for a worker the runtime can schedule alone: no node splits batches
-    by capture key and no speculation chain mixes walks.
-    """
+    flags it works on, and a pass crosses once per check request."""
 
     def __init__(self, runtime, keys: Iterable[tuple[str, str, list[str], dict, dict]],
-                 leader_nodes: Iterable[str]):
+                 leader_nodes: Iterable[str], mixing_chains: Iterable[tuple[str, str]]):
         self._rt = runtime._rust
         self._rt.sched_configure(
-            [(node, label, list(walks), list(caps.items()), list(row_caps.items()))
-             for node, label, walks, caps, row_caps in keys],
-            sorted(leader_nodes),
+            keys=[(node, label, list(walks), list(caps.items()), list(row_caps.items()))
+                  for node, label, walks, caps, row_caps in keys],
+            leaders=sorted(leader_nodes),
+            mixing=sorted(mixing_chains),
         )
 
     def begin(self, request: PassRequest) -> PassStep:
         return _step(*self._rt.sched_begin(
-            request.target, request.exclude_target, request.pre_existing_batch_size,
-            list(request.waiting), list(request.failed), list(request.scan_exclude),
+            target=request.target, exclude_target=request.exclude_target,
+            pre_existing=request.pre_existing_batch_size,
+            capture_group_of=request.capture_group_of,
+            waiting=list(request.waiting), failed=list(request.failed),
+            scan_exclude=list(request.scan_exclude),
         ))
 
     def resume(self, result: CheckResult) -> PassStep:
-        # Never asked for capture groups: it runs only where no node splits
-        # batches by capture key.
-        return _step(*self._rt.sched_resume(result.verdicts))
+        return _step(*self._rt.sched_resume(
+            verdicts=result.verdicts, groups=result.groups, anchor_group=result.anchor_group,
+        ))
 
     def room_for_continuing(self, target: tuple[str, str]) -> int | None:
         return self._rt.sched_room_for_continuing(*target)

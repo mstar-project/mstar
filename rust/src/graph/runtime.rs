@@ -1948,39 +1948,51 @@ impl GraphRuntime {
     // -- the micro-scheduler's pass (sched.rs) ------------------------------
 
     /// Install the scheduling keys -- `(node, walk label, real walks under a
-    /// combined label, [(walk, cap)], [(walk, row cap)])` -- and the nodes
-    /// this rank leads. Once, before the first pass.
+    /// combined label, [(walk, cap)], [(walk, row cap)])` --, the nodes this
+    /// rank leads and the `(node, real walk)`s whose speculation chain mixes
+    /// walks. Once, before the first pass.
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (keys, leaders, mixing))]
     fn sched_configure(
         &mut self,
         keys: Vec<(String, String, Vec<String>, Vec<(String, Option<u32>)>, Vec<(String, u32)>)>,
         leaders: Vec<String>,
+        mixing: Vec<(String, String)>,
     ) {
-        self.sched_configure_impl(keys, leaders);
+        self.sched_configure_impl(keys, leaders, mixing);
     }
 
     /// Begin a pass. Returns `(done, check, batch)`: rows to check and
     /// answer with `sched_resume`, or the pass's step (None for none).
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (target, exclude_target, pre_existing, waiting, failed, scan_exclude))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        target, exclude_target, pre_existing, capture_group_of, waiting, failed, scan_exclude,
+    ))]
     fn sched_begin(
         &mut self,
         target: Option<(String, String)>,
         exclude_target: Option<(String, String)>,
         pre_existing: u32,
+        capture_group_of: Option<u32>,
         waiting: Vec<u32>,
         failed: Vec<u32>,
         scan_exclude: Vec<u32>,
     ) -> PyResult<(bool, Option<sched::CheckOut>, Option<sched::BatchOut>)> {
-        self.sched_begin_impl(target, exclude_target, pre_existing, waiting, failed, scan_exclude)
+        self.sched_begin_impl(sched::Begin {
+            target, exclude_target, pre: pre_existing, anchor: capture_group_of,
+            waiting, failed, scan_exclude,
+        })
     }
 
-    /// Continue the waiting pass with one verdict byte per requested row.
+    /// Continue the waiting pass with one verdict byte per requested row,
+    /// and for a capture-split node each row's group and the anchor's.
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (verdicts, groups, anchor_group))]
     fn sched_resume(
-        &mut self, verdicts: &[u8],
+        &mut self, verdicts: &[u8], groups: Option<Vec<i64>>, anchor_group: Option<i64>,
     ) -> PyResult<(bool, Option<sched::CheckOut>, Option<sched::BatchOut>)> {
-        self.sched_resume_impl(verdicts)
+        self.sched_resume_impl(verdicts, groups, anchor_group)
     }
 
     fn sched_room_for_continuing(&self, node: &str, walk: &str) -> PyResult<Option<u32>> {

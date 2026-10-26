@@ -281,8 +281,6 @@ class RustGraphRuntime(GraphRuntime):
         self._sharding: dict[int, ShardingConfig] = {}
 
     supports_inline_emit = True
-    # the micro-scheduler's pass can run in here (MicroScheduler.core)
-    supports_sched_core = True
 
     def local_node_walks(self) -> list[tuple[str, str]]:
         """Every (node, walk) a local worker graph runs."""

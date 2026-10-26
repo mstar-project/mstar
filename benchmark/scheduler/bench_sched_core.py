@@ -96,12 +96,11 @@ def build(rust_core: bool, caps, row_caps, walks: list[str]):
     )
     engine = Engine(caps, row_caps)
     sched = MicroScheduler(
-        SimpleNamespace(get_engine=lambda node: engine),
+        SimpleNamespace(get_engine=lambda node: engine), runtime=rt,
         parallel_leader_nodes={LLM}, combined_walk_of=dict(COMBINED),
     )
-    sched.runtime = rt
     if not rust_core:
-        sched._core_chosen = True
+        sched._core = sched._python_core()  # on the same runtime
     rs = RequestStateManager(node_to_partition={LLM: PART})
     rids = []
     for i, walk in enumerate(walks):
@@ -116,10 +115,9 @@ def build(rust_core: bool, caps, row_caps, walks: list[str]):
         ))
         rids.append(rid)
     # caps are asked once per scheduler lifetime, and the core configured, before any pass
-    sched._rust_core()
-    for key in ((LLM, MIXED),):
-        sched._walk_caps(key)
-        sched._walk_row_caps(key)
+    _ = sched.core
+    sched.keys.walk_caps((LLM, MIXED))
+    sched.keys.walk_row_caps((LLM, MIXED))
     return rt, rs, sched, engine, rids
 
 

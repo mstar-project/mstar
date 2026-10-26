@@ -5,12 +5,7 @@ with a Python and a Rust implementation.
 imported here; ``MicroScheduler`` imports it when it picks a core.
 """
 from mstar.worker.sched_core.base import (
-    FAILED,
     NO_GROUP,
-    NOT_READY,
-    OFF_GROUP,
-    READY,
-    UNCHECKED,
     CheckRequest,
     CheckResult,
     PassRequest,
@@ -18,11 +13,11 @@ from mstar.worker.sched_core.base import (
     RoundRobin,
     SchedCore,
     SchedKeys,
+    Verdict,
 )
 from mstar.worker.sched_core.rust import RustSchedCore
 
 __all__ = [
-    "FAILED", "NO_GROUP", "NOT_READY", "OFF_GROUP", "READY", "UNCHECKED", "CheckRequest",
-    "CheckResult", "PassRequest", "PassStep",
-    "RoundRobin", "RustSchedCore", "SchedCore", "SchedKeys",
+    "NO_GROUP", "CheckRequest", "CheckResult", "PassRequest", "PassStep",
+    "RoundRobin", "RustSchedCore", "SchedCore", "SchedKeys", "Verdict",
 ]

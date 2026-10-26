@@ -9,11 +9,9 @@
 //! here, beside the ready masks, pops, in-flight flags and push-backs they
 //! drive.
 //!
-//! What it covers is what `MicroScheduler._rust_core` hands it: no node that
-//! splits batches by capture key (so no capture groups) and no speculation
-//! chain that mixes walks. Everything else is the Python core's
-//! (`micro_scheduler.py`), which is the reference: the logic below follows it
-//! step for step, and `test/rust/test_sched_core_parity.py` drives both.
+//! The Python core (`mstar/worker/sched_core/python.py`) is the reference:
+//! the logic below follows it step for step, and
+//! `test/rust/test_sched_core_parity.py` drives both.
 
 use super::*;
 
@@ -21,19 +19,21 @@ use super::*;
 /// the real one has one.
 pub(super) type Key = (Sym, Sym);
 
-/// One verdict per requested row.
-const NOT_READY: u8 = 0;
+/// One verdict per requested row (`sched_core.base.Verdict`).
 const READY: u8 = 1;
 const FAILED: u8 = 2;
+const UNCHECKED: u8 = 3;
+/// The group of a row whose node does not split batches by capture key.
+const NO_GROUP: i64 = -1;
 
 /// The engine's caps for one key, asked once by the Python side.
 struct KeyCfg {
     /// The real walks under a combined key; empty for a plain one.
     walks: Vec<Sym>,
-    /// walk -> cap (None: uncapped), in `MicroScheduler._walk_caps` order:
+    /// walk -> cap (None: uncapped), in `SchedKeys.walk_caps` order:
     /// each real walk, then the key's own.
     caps: Vec<(Sym, Option<u32>)>,
-    /// `_walk_row_caps`: per real walk, rows a mixed step may hold.
+    /// `SchedKeys.walk_row_caps`: per real walk, rows a mixed step may hold.
     row_caps: Vec<(Sym, u32)>,
 }
 
@@ -141,6 +141,8 @@ impl SBatch {
 struct Entry {
     rid: u32,
     walk: Sym,
+    /// capture group id, `NO_GROUP` for a node that does not split by one
+    group: i64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -150,6 +152,10 @@ enum Stage {
     KeyFresh,
     FinalScan,
     FinalPick,
+    /// `_park_other_walks`: a mixing chain at its cap parks its combined
+    /// walk's other ready rows
+    ParkScan,
+    Park,
 }
 
 /// Where a `_schedule_key` result goes.
@@ -167,6 +173,8 @@ enum After {
 struct KeyCtx {
     key: Key,
     entries: Vec<Entry>,
+    /// the group the step must share, as known before the backlog's check
+    anchor_group: Option<i64>,
     batch: SBatch,
     waiting_rows: FxHashSet<u32>,
     cands: Vec<u32>,
@@ -174,16 +182,37 @@ struct KeyCtx {
 }
 
 enum Await {
-    /// the fresh scan: (rid, key, real walk) per requested row
-    Scan { rows: Vec<(u32, Key, Sym)>, then: Stage },
+    /// the fresh scan: (rid, key, real walk) per requested row, and whether
+    /// it named an anchor
+    Scan { rows: Vec<(u32, Key, Sym)>, anchored: bool, then: Stage },
     Backlog(KeyCtx),
+}
+
+/// `sched_begin`'s arguments: `PassRequest`.
+pub(super) struct Begin {
+    pub target: Option<(String, String)>,
+    pub exclude_target: Option<(String, String)>,
+    pub pre: u32,
+    /// `capture_group_of`
+    pub anchor: Option<u32>,
+    pub waiting: Vec<u32>,
+    pub failed: Vec<u32>,
+    pub scan_exclude: Vec<u32>,
 }
 
 pub(super) struct Pass {
     target: Option<Key>,
     pre: u32,
     pre_walk: Option<Sym>,
+    /// a merge takes only this walk's backlogged rows: `pre_walk` unless
+    /// the chain mixes walks
+    own_walk: Option<Sym>,
+    /// a yield-away leaves this walk's backlogged rows parked
     skip_walk: Option<Sym>,
+    /// the rid whose capture group the step must share
+    anchor: Option<u32>,
+    /// the scan's anchor group, when it named one
+    scan_anchor: Option<i64>,
     scan_target: Option<(String, String)>,
     scan_exclude: Option<(String, String)>,
     waiting: FxHashSet<u32>,
@@ -200,7 +229,9 @@ pub(super) struct Pass {
 pub(super) struct SchedState {
     keys: FxHashMap<Key, KeyCfg>,
     leaders: FxHashSet<Sym>,
-    /// In `MicroScheduler.backlog`'s order: a key taken for a step and parked
+    /// (node, real walk) whose speculation chain mixes walks
+    mixing: FxHashSet<(Sym, Sym)>,
+    /// In `PythonSchedCore.backlog`'s order: a key taken for a step and parked
     /// again moves to the end, as a dict pop and re-insert does.
     backlog: Vec<(Key, SBatch)>,
     last_batch: FxHashMap<Key, u64>,
@@ -209,7 +240,7 @@ pub(super) struct SchedState {
 }
 
 impl SchedState {
-    /// `_drop_backlogged_rid` for several: the rows go, then any empty chunk.
+    /// `SchedCore.drop_rids`: the rows go, then any empty chunk.
     pub(super) fn drop_rids(&mut self, rids: &FxHashSet<u32>) {
         if rids.is_empty() {
             return;
@@ -221,8 +252,10 @@ impl SchedState {
     }
 }
 
-/// `(rids, node_idx, nodes, limit)`: rows to check, in order.
-pub(super) type CheckOut = (Vec<u32>, Option<Vec<u32>>, Vec<String>, i64);
+/// `CheckRequest`: `(rids, node_idx, nodes, limit, walks, anchor, by_anchor)`.
+pub(super) type CheckOut = (
+    Vec<u32>, Option<Vec<u32>>, Vec<String>, i64, Option<Vec<String>>, Option<u32>, bool,
+);
 /// A `ScheduledBatch` as columns: node, walk label, rids, worker graph ids,
 /// the walk names and each row's index into them (None unless the batch
 /// mixes walks), output signals, per-walk output signals, and the input
@@ -266,6 +299,7 @@ impl GraphRuntime {
         &mut self,
         keys: Vec<(String, String, Vec<String>, Vec<(String, Option<u32>)>, Vec<(String, u32)>)>,
         leaders: Vec<String>,
+        mixing: Vec<(String, String)>,
     ) {
         let mut cfgs = FxHashMap::default();
         for (node, label, walks, caps, row_caps) in keys {
@@ -279,6 +313,21 @@ impl GraphRuntime {
         }
         self.sched.keys = cfgs;
         self.sched.leaders = leaders.iter().map(|n| self.interner.intern(n)).collect();
+        self.sched.mixing = mixing.iter()
+            .map(|(n, w)| (self.interner.intern(n), self.interner.intern(w)))
+            .collect();
+    }
+
+    /// `speculation_mixes`.
+    fn sched_mixes(&self, node: Sym, walk: Sym) -> bool {
+        self.sched.mixing.contains(&(node, walk))
+    }
+
+    /// `walk_set_cap`: a mixed step's cap, the combined walk's own where it
+    /// has one, else the smallest of the walks present.
+    fn sched_walk_set_cap(&self, key: Key, walks: &[Sym]) -> PyResult<Option<u32>> {
+        let cfg = self.sched_cfg(key)?;
+        Ok(cfg.cap(key.1).or_else(|| min_cap(walks.iter().map(|&w| cfg.cap(w)))))
     }
 
     /// `_room_left`: what is left of the caller's own walk's cap.
@@ -320,9 +369,9 @@ impl GraphRuntime {
         Ok(live as u32 >= room)
     }
 
-    /// The graph-ready rows `_scan_ready` checks, in its order: `(rid, key,
-    /// walk, node)` per row, leader nodes only.
-    fn sched_scan_rows(&self, p: &Pass) -> Vec<(u32, Key, Sym, Sym)> {
+    /// The graph-ready rows `_scan_request` checks, in its order: `(rid, key,
+    /// walk)` per row, leader nodes only.
+    fn sched_scan_rows(&self, p: &Pass) -> Vec<(u32, Key, Sym)> {
         let mut out = Vec::new();
         // the rows failed earlier in this pass are out too
         let excl: FxHashSet<u32> = p.scan_excl.union(&p.failed).copied().collect();
@@ -334,30 +383,35 @@ impl GraphRuntime {
                 continue;
             }
             let key = self.sched_key_of(node, walk);
-            out.extend(rids.into_iter().map(|rid| (rid, key, walk, node)));
+            out.extend(rids.into_iter().map(|rid| (rid, key, walk)));
         }
         out
     }
 
-    fn check_out(&self, rids: Vec<u32>, nodes: &[Sym], limit: i64) -> CheckOut {
-        let mut names: Vec<Sym> = Vec::new();
-        let idx: Vec<u32> = nodes.iter().map(|n| {
-            match names.iter().position(|m| m == n) {
+    /// A check request for `rids`, row i of scheduling key `keys[i]`.
+    fn check_out(
+        &self, rids: Vec<u32>, keys: &[Key], limit: i64, anchor: Option<u32>, by_anchor: bool,
+    ) -> CheckOut {
+        let mut distinct: Vec<Key> = Vec::new();
+        let idx: Vec<u32> = keys.iter().map(|k| {
+            match distinct.iter().position(|d| d == k) {
                 Some(i) => i as u32,
                 None => {
-                    names.push(*n);
-                    (names.len() - 1) as u32
+                    distinct.push(*k);
+                    (distinct.len() - 1) as u32
                 }
             }
         }).collect();
-        let node_idx = if names.len() > 1 { Some(idx) } else { None };
-        let names = names.iter().map(|n| self.interner.name(*n).to_string()).collect();
-        (rids, node_idx, names, limit)
+        let node_idx = if distinct.len() > 1 { Some(idx) } else { None };
+        let name = |s: Sym| self.interner.name(s).to_string();
+        let nodes = distinct.iter().map(|k| name(k.0)).collect();
+        let walks = distinct.iter().map(|k| name(k.1)).collect();
+        (rids, node_idx, nodes, limit, Some(walks), anchor, by_anchor)
     }
 
     /// `_schedule_key` up to its backlog's check; the rest is `sched_key_finish_ctx`.
     fn sched_key_start(
-        &mut self, p: &Pass, key: Key, entries: Vec<Entry>, after: After,
+        &mut self, p: &Pass, key: Key, entries: Vec<Entry>, anchor_group: Option<i64>, after: After,
     ) -> PyResult<KeyStep> {
         if self.sched_room_left(key, p.pre_walk, p.pre)? == Some(0) {
             // the caller already holds a full batch
@@ -365,14 +419,15 @@ impl GraphRuntime {
         }
         let pos = self.sched.backlog.iter().position(|(k, _)| *k == key);
         let Some(pos) = pos else {
-            return Ok(KeyStep::Done(self.sched_key_build(p, key, entries, None, FxHashSet::default())?));
+            let built = self.sched_key_build(p, key, entries, None, FxHashSet::default(), anchor_group)?;
+            return Ok(KeyStep::Done(built));
         };
         let (_, batch) = self.sched.backlog.remove(pos);
         let limit = match self.sched_scan_limit(key, p.pre)? {
             None => batch.rows.len() as i64,
             Some(l) => i64::from(l),
         };
-        let own_walk = p.pre_walk;
+        let own_walk = p.own_walk;
         let by_walk = batch.combined && (own_walk.is_some() || p.skip_walk.is_some());
         let waiting_rows: FxHashSet<u32> = batch.rows.iter()
             .filter(|r| {
@@ -385,42 +440,63 @@ impl GraphRuntime {
             .map(|r| r.rid)
             .filter(|rid| !waiting_rows.contains(rid))
             .collect();
-        let ctx = KeyCtx { key, entries, batch, waiting_rows, cands, after };
+        let ctx = KeyCtx { key, entries, anchor_group, batch, waiting_rows, cands, after };
         if ctx.cands.is_empty() || limit <= 0 {
-            return Ok(KeyStep::Done(self.sched_key_finish_ctx(p, ctx, &[])?));
+            return Ok(KeyStep::Done(self.sched_key_finish_ctx(p, ctx, &[], None)?));
         }
-        let req = self.check_out(ctx.cands.clone(), &[key.0], limit);
+        // only rows of the step's capture group count toward the limit
+        let req = self.check_out(ctx.cands.clone(), &[key], limit, p.anchor, true);
         Ok(KeyStep::Check(ctx, req))
     }
 
-    /// The rest of `_schedule_key` for a key with a backlog: `_unready_backlog_rids`
+    /// The rest of `_schedule_key` for a key with a backlog: `_backlog_blocked`
     /// on the verdicts, then the build.
     fn sched_key_finish_ctx(
-        &mut self, p: &Pass, ctx: KeyCtx, verdicts: &[u8],
+        &mut self, p: &Pass, ctx: KeyCtx, verdicts: &[u8], checked_anchor: Option<i64>,
     ) -> PyResult<Option<SBatch>> {
-        let KeyCtx { key, entries, mut batch, waiting_rows, cands, .. } = ctx;
-        let mut not_ready = waiting_rows;
+        let KeyCtx { key, entries, anchor_group, mut batch, waiting_rows, cands, .. } = ctx;
+        // waiting, not ready, failed or off the step's capture group
+        let mut blocked = waiting_rows;
         for (i, rid) in cands.iter().enumerate() {
-            if matches!(verdicts.get(i), Some(&NOT_READY) | Some(&FAILED)) {
-                not_ready.insert(*rid);
+            if verdicts.get(i).is_some_and(|v| *v != READY && *v != UNCHECKED) {
+                blocked.insert(*rid);
             }
         }
         // a failed row is dropped rather than parked
-        batch.rows.retain(|r| !(not_ready.contains(&r.rid) && p.failed.contains(&r.rid)));
-        let blocked: FxHashSet<u32> = not_ready.into_iter().filter(|r| !p.failed.contains(r)).collect();
+        batch.rows.retain(|r| !(blocked.contains(&r.rid) && p.failed.contains(&r.rid)));
+        blocked.retain(|r| !p.failed.contains(r));
         let backlogged = if batch.rows.is_empty() { None } else { Some(batch) };
-        self.sched_key_build(p, key, entries, backlogged, blocked)
+        let anchor_group = checked_anchor.or(anchor_group);
+        self.sched_key_build(p, key, entries, backlogged, blocked, anchor_group)
     }
 
     fn sched_key_build(
         &mut self, p: &Pass, key: Key, entries: Vec<Entry>,
-        backlogged: Option<SBatch>, blocked: FxHashSet<u32>,
+        backlogged: Option<SBatch>, mut blocked: FxHashSet<u32>, anchor_group: Option<i64>,
     ) -> PyResult<Option<SBatch>> {
         let fresh = if entries.is_empty() { None } else { self.sched_assemble(key, &entries)? };
         if backlogged.is_none() && fresh.is_none() {
             return Ok(None);
         }
+        if let Some(fresh) = &fresh {
+            blocked.extend(Self::off_group(fresh, &entries, anchor_group));
+        }
         self.sched_build_and_schedule(p, key, backlogged, fresh, blocked)
+    }
+
+    /// `_off_group`: the fresh rows outside the step's capture group -- the
+    /// anchor's, or with none the first fresh row's.
+    fn off_group(fresh: &SBatch, entries: &[Entry], anchor_group: Option<i64>) -> Vec<u32> {
+        if entries.iter().all(|e| e.group == NO_GROUP) {
+            return Vec::new();
+        }
+        let group_of: FxHashMap<u32, i64> = entries.iter().map(|e| (e.rid, e.group)).collect();
+        let group = |rid: u32| group_of.get(&rid).copied().unwrap_or(NO_GROUP);
+        if fresh.rows.iter().all(|r| group(r.rid) == NO_GROUP) {
+            return Vec::new();
+        }
+        let wanted = anchor_group.unwrap_or_else(|| group(fresh.rows[0].rid));
+        fresh.rows.iter().map(|r| r.rid).filter(|rid| group(*rid) != wanted).collect()
     }
 
     /// `_assemble_batch`: pop the entries' node off their ready queues.
@@ -573,15 +649,7 @@ impl GraphRuntime {
         }
         let node_name = self.interner.name(key.0).to_string();
         if let Some(parked) = parked {
-            let rids: Vec<u32> = parked.rows.iter().map(|r| r.rid).collect();
-            let wgs: Vec<u32> = parked.rows.iter().map(|r| r.wg).collect();
-            match self.sched.backlog.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, existing)) => existing.merge(parked)?,
-                None => self.sched.backlog.push((key, parked)),
-            }
-            // claimed like a running batch, so an input arriving while it
-            // waits does not put its node back on the ready queue
-            self.set_in_flight(node_name.clone(), rids, wgs, true)?;
+            self.sched_park(key, parked)?;
         }
         if let Some(returned) = returned {
             let rids: Vec<u32> = returned.rows.iter().map(|r| r.rid).collect();
@@ -594,6 +662,19 @@ impl GraphRuntime {
         self.sched.last_batch.insert(key, self.sched.batch_number);
         scheduled.relabel_if_uniform();
         Ok(Some(scheduled))
+    }
+
+    /// `_backlog`: park `batch` behind whatever already waits under `key`.
+    fn sched_park(&mut self, key: Key, batch: SBatch) -> PyResult<()> {
+        let rids: Vec<u32> = batch.rows.iter().map(|r| r.rid).collect();
+        let wgs: Vec<u32> = batch.rows.iter().map(|r| r.wg).collect();
+        match self.sched.backlog.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, existing)) => existing.merge(batch)?,
+            None => self.sched.backlog.push((key, batch)),
+        }
+        // claimed like a running batch, so an input arriving while it waits
+        // does not put its node back on the ready queue
+        self.set_in_flight(self.interner.name(key.0).to_string(), rids, wgs, true)
     }
 
     /// `_single_walk`: the one walk of every row, the caller's included.
@@ -666,40 +747,51 @@ impl GraphRuntime {
     }
 
     /// Begin a pass: `get_next_batch` after the TP-follow FIFO.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn sched_begin_impl(
-        &mut self,
-        target: Option<(String, String)>,
-        exclude_target: Option<(String, String)>,
-        pre: u32,
-        waiting: Vec<u32>,
-        failed: Vec<u32>,
-        scan_exclude: Vec<u32>,
+        &mut self, b: Begin,
     ) -> PyResult<(bool, Option<CheckOut>, Option<BatchOut>)> {
+        let Begin { target, exclude_target, pre, anchor, waiting, failed, scan_exclude } = b;
         let sym_pair = |rt: &Self, t: &(String, String)| (rt.sym_or_none(&t.0), rt.sym_or_none(&t.1));
-        let target_key = target.as_ref().map(|t| {
-            let (n, w) = sym_pair(self, t);
-            self.sched_key_of(n, w)
-        });
-        let pre_walk = if pre > 0 { target.as_ref().map(|t| self.sym_or_none(&t.1)) } else { None };
-        let skip_walk = exclude_target.as_ref().map(|t| self.sym_or_none(&t.1));
         let key_strings = |rt: &Self, k: Key| (
             rt.interner.try_name(k.0).unwrap_or("").to_string(),
             rt.interner.try_name(k.1).unwrap_or("").to_string(),
         );
+        let target_syms = target.as_ref().map(|t| sym_pair(self, t));
+        let target_key = target_syms.map(|(n, w)| self.sched_key_of(n, w));
+        let pre_walk = if pre > 0 { target_syms.map(|t| t.1) } else { None };
+        // A chain merges and yields away within its own real walk, or its
+        // whole combined walk when it mixes walks.
+        let mixes = pre_walk.is_some() && target_syms.is_some_and(|(n, w)| self.sched_mixes(n, w));
+        let own_walk = if mixes { None } else { pre_walk };
+        let skip_walk = exclude_target.as_ref()
+            .map(|t| sym_pair(self, t))
+            .filter(|&(n, w)| !self.sched_mixes(n, w))
+            .map(|t| t.1);
         // the runtime matches a target against real and combined walks alike
-        let scan_target = if pre_walk.is_some() {
-            target.clone()
-        } else {
-            target_key.map(|k| key_strings(self, k)).or(target.clone())
+        let as_key = |rt: &Self, t: &(String, String)| {
+            let (n, w) = sym_pair(rt, t);
+            key_strings(rt, rt.sched_key_of(n, w))
         };
-        let p = Pass {
+        let scan_target = match &target {
+            Some(t) if own_walk.is_some() => Some(t.clone()),
+            Some(t) => Some(as_key(self, t)),
+            None => None,
+        };
+        let scan_exclude_target = match &exclude_target {
+            Some(t) if skip_walk.is_some() => Some(t.clone()),
+            Some(t) => Some(as_key(self, t)),
+            None => None,
+        };
+        let mut p = Pass {
             target: target_key,
             pre,
             pre_walk,
+            own_walk,
             skip_walk,
+            anchor,
+            scan_anchor: None,
             scan_target,
-            scan_exclude: exclude_target,
+            scan_exclude: scan_exclude_target,
             waiting: waiting.into_iter().collect(),
             failed: failed.into_iter().collect(),
             scan_excl: scan_exclude.into_iter().collect(),
@@ -714,25 +806,37 @@ impl GraphRuntime {
                 return Err(PyRuntimeError::new_err("target is not a configured scheduling key"));
             }
             if self.sched_room_left(t, p.pre_walk, p.pre)? == Some(0) {
-                // another walk's rows wait on their queues for the yield
+                if mixes && !self.sched_cfg(t)?.walks.is_empty() {
+                    // the chain never yields for its combined walk's other
+                    // rows, so park them: `room_for_continuing` gives them
+                    // first claim. Excluded in the scan, so the chain's own
+                    // rows pay no check.
+                    p.scan_target = Some(key_strings(self, t));
+                    p.scan_exclude = Some(key_strings(self, (t.0, pre_walk.unwrap_or(t.1))));
+                    p.stage = Stage::ParkScan;
+                    return self.sched_run(p, None, None, None);
+                }
+                // otherwise another walk's rows wait on their queues for the yield
                 return Ok((true, None, None));
             }
         }
-        let mut p = p;
         p.keys = self.sched.backlog.iter()
             .map(|(k, _)| *k)
             .filter(|k| p.target.is_none_or(|t| t == *k))
             .collect();
-        self.sched_run(p, None)
+        self.sched_run(p, None, None, None)
     }
 
     pub(super) fn sched_resume_impl(
-        &mut self, verdicts: &[u8],
+        &mut self, verdicts: &[u8], groups: Option<Vec<i64>>, anchor_group: Option<i64>,
     ) -> PyResult<(bool, Option<CheckOut>, Option<BatchOut>)> {
         let p = self.sched.pass.take().ok_or_else(|| {
             PyRuntimeError::new_err("sched_resume: no pass is waiting for verdicts")
         })?;
-        self.sched_run(p, Some(verdicts))
+        if groups.as_ref().is_some_and(|g| g.len() != verdicts.len()) {
+            return Err(PyValueError::new_err("sched_resume: one group per requested row"));
+        }
+        self.sched_run(p, Some(verdicts), groups.as_deref(), anchor_group)
     }
 
     /// Take a FAILED verdict's rid out of the pass and the backlog.
@@ -750,23 +854,27 @@ impl GraphRuntime {
     }
 
     fn sched_run(
-        &mut self, mut p: Pass, verdicts: Option<&[u8]>,
+        &mut self, mut p: Pass, verdicts: Option<&[u8]>, groups: Option<&[i64]>,
+        anchor_group: Option<i64>,
     ) -> PyResult<(bool, Option<CheckOut>, Option<BatchOut>)> {
         // a _schedule_key result still to act on, with where it goes
         let mut result: Option<(Option<SBatch>, After)> = None;
         if let Some(aw) = p.awaiting.take() {
             let v = verdicts.ok_or_else(|| PyRuntimeError::new_err("sched_resume: verdicts missing"))?;
             match aw {
-                Await::Scan { rows, then } => {
+                Await::Scan { rows, anchored, then } => {
                     let rids: Vec<u32> = rows.iter().map(|r| r.0).collect();
                     self.sched_note_failed(&mut p, &rids, v)?;
-                    p.ready = Some(Self::sched_ready_from(&rows, v));
+                    p.ready = Some(Self::sched_ready_from(&rows, v, groups));
+                    // the anchor's group only when the scan named one;
+                    // otherwise the step anchors on its own first row
+                    p.scan_anchor = if anchored { anchor_group } else { None };
                     p.stage = then;
                 }
                 Await::Backlog(ctx) => {
                     self.sched_note_failed(&mut p, &ctx.cands.clone(), v)?;
                     let after = ctx.after;
-                    result = Some((self.sched_key_finish_ctx(&p, ctx, v)?, after));
+                    result = Some((self.sched_key_finish_ctx(&p, ctx, v, anchor_group)?, after));
                 }
             }
         }
@@ -799,7 +907,7 @@ impl GraphRuntime {
                     // no fresh row could join a step its backlog fills,
                     // unless every backlogged row is blocked
                     if self.sched_backlog_fills(&p, key)? {
-                        match self.sched_key_start(&p, key, Vec::new(), After::BacklogOnly)? {
+                        match self.sched_key_start(&p, key, Vec::new(), None, After::BacklogOnly)? {
                             KeyStep::Done(b) => result = Some((b, After::BacklogOnly)),
                             KeyStep::Check(ctx, req) => return Ok(self.sched_suspend(p, Await::Backlog(ctx), req)),
                         }
@@ -807,8 +915,12 @@ impl GraphRuntime {
                         p.stage = Stage::KeyScan;
                     }
                 }
-                Stage::KeyScan | Stage::FinalScan => {
-                    let then = if p.stage == Stage::KeyScan { Stage::KeyFresh } else { Stage::FinalPick };
+                Stage::KeyScan | Stage::FinalScan | Stage::ParkScan => {
+                    let then = match p.stage {
+                        Stage::KeyScan => Stage::KeyFresh,
+                        Stage::FinalScan => Stage::FinalPick,
+                        _ => Stage::Park,
+                    };
                     if p.ready.is_some() {
                         p.stage = then;
                         continue;
@@ -820,15 +932,27 @@ impl GraphRuntime {
                         continue;
                     }
                     let rids: Vec<u32> = rows.iter().map(|r| r.0).collect();
-                    let nodes: Vec<Sym> = rows.iter().map(|r| r.3).collect();
-                    let req = self.check_out(rids, &nodes, -1);
-                    let rows = rows.into_iter().map(|(rid, key, walk, _)| (rid, key, walk)).collect();
-                    return Ok(self.sched_suspend(p, Await::Scan { rows, then }, req));
+                    let keys: Vec<Key> = rows.iter().map(|r| r.1).collect();
+                    // the anchor's group, for a step the scan was narrowed to
+                    let anchor = if p.target.is_some() { p.anchor } else { None };
+                    let req = self.check_out(rids, &keys, -1, anchor, false);
+                    let aw = Await::Scan { rows, anchored: anchor.is_some(), then };
+                    return Ok(self.sched_suspend(p, aw, req));
+                }
+                Stage::Park => {
+                    let key = p.target.expect("a park pass has a target");
+                    let entries = Self::ready_for(&p, key);
+                    if !entries.is_empty() {
+                        if let Some(parked) = self.sched_assemble(key, &entries)? {
+                            self.sched_park(key, parked)?;
+                        }
+                    }
+                    return Ok(self.sched_done(None));
                 }
                 Stage::KeyFresh => {
                     let key = p.keys[p.ki];
                     let entries = Self::ready_for(&p, key);
-                    match self.sched_key_start(&p, key, entries, After::KeyFresh)? {
+                    match self.sched_key_start(&p, key, entries, p.scan_anchor, After::KeyFresh)? {
                         KeyStep::Done(b) => result = Some((b, After::KeyFresh)),
                         KeyStep::Check(ctx, req) => return Ok(self.sched_suspend(p, Await::Backlog(ctx), req)),
                     }
@@ -852,7 +976,7 @@ impl GraphRuntime {
                         return Ok(self.sched_done(None));
                     }
                     let entries = Self::ready_for(&p, rr);
-                    match self.sched_key_start(&p, rr, entries, After::Final)? {
+                    match self.sched_key_start(&p, rr, entries, p.scan_anchor, After::Final)? {
                         KeyStep::Done(b) => result = Some((b, After::Final)),
                         KeyStep::Check(ctx, req) => return Ok(self.sched_suspend(p, Await::Backlog(ctx), req)),
                     }
@@ -868,13 +992,16 @@ impl GraphRuntime {
             .unwrap_or_default()
     }
 
-    fn sched_ready_from(rows: &[(u32, Key, Sym)], verdicts: &[u8]) -> Vec<(Key, Vec<Entry>)> {
+    fn sched_ready_from(
+        rows: &[(u32, Key, Sym)], verdicts: &[u8], groups: Option<&[i64]>,
+    ) -> Vec<(Key, Vec<Entry>)> {
         let mut ready: Vec<(Key, Vec<Entry>)> = Vec::new();
-        for (&(rid, key, walk), &v) in rows.iter().zip(verdicts) {
+        for (i, (&(rid, key, walk), &v)) in rows.iter().zip(verdicts).enumerate() {
             if v != READY {
                 continue;
             }
-            let entry = Entry { rid, walk };
+            let group = groups.map_or(NO_GROUP, |g| g[i]);
+            let entry = Entry { rid, walk, group };
             match ready.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, e)) => e.push(entry),
                 None => ready.push((key, vec![entry])),
@@ -927,15 +1054,29 @@ impl GraphRuntime {
         )
     }
 
-    /// `room_for_continuing` (no mixing chains): how many of a speculation
-    /// chain's own rows fit beside `(node, walk)`'s backlog.
+    /// `room_for_continuing`: how many of a speculation chain's own rows fit
+    /// beside `(node, walk)`'s backlog.
     pub(super) fn sched_room_for_continuing_impl(&self, node: &str, walk: &str) -> PyResult<Option<u32>> {
         let (n, w) = (self.sym_or_none(node), self.sym_or_none(walk));
         let key = self.sched_key_of(n, w);
-        let cap = self.sched_cfg(key)?.cap(w);
+        let mut cap = self.sched_cfg(key)?.cap(w);
         let backlog = self.sched.backlog.iter().find(|(k, _)| *k == key).map(|(_, b)| b);
         Ok(match backlog {
+            Some(b) if b.combined && self.sched_mixes(n, w) => {
+                // the chain's merge takes every backlogged row
+                let mut walks: Vec<Sym> = vec![w];
+                for r in &b.rows {
+                    if !walks.contains(&r.walk) {
+                        walks.push(r.walk);
+                    }
+                }
+                if walks.len() > 1 {
+                    cap = self.sched_walk_set_cap(key, &walks)?;
+                }
+                cap.map(|c| c.saturating_sub(b.rows.len() as u32))
+            }
             Some(b) if b.combined => {
+                // the chain's merge takes only its own walk's backlogged rows
                 let Some(cap) = cap else { return Ok(None) };
                 let own = b.rows.iter().filter(|r| r.walk == w).count() as u32;
                 Some(cap.saturating_sub(own))

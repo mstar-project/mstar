@@ -42,7 +42,7 @@ from mstar.worker.batch_builder import (
     FIFOBatchBuilder,
 )
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.sched_core import READY, CheckRequest
+from mstar.worker.sched_core import CheckRequest, Verdict
 
 
 def _edge_block(rids) -> ColumnarEdgeSpecs:
@@ -75,14 +75,13 @@ class _Runtime:
     """Graph-level ready scan, over the manager's queues.
 
     The real PythonGraphRuntime owns the queues and RequestStateManager shares
-    the same dict; this mirrors that by reading the manager's.
+    the same dict; this mirrors that by reading the manager's (see `_over`).
     """
 
-    def __init__(self, manager: _Manager):
-        self._manager = manager
-
-    # what the worker constructs the real runtime with
-    combined_walk_of: dict = {}
+    def __init__(self, combined_walk_of=None):
+        self._manager: _Manager | None = None
+        # what the worker constructs the real runtime with
+        self.combined_walk_of = combined_walk_of or {}
 
     def _names(self, target, node_name, walk):
         return target[0] == node_name and target[1] in (
@@ -186,7 +185,6 @@ class _Manager:
         # rid -> real walk, overriding ``walk``
         self.walks = dict(walks or {})
         self.pops: list = []
-        self.runtime = _Runtime(self)
         # (rid, node) pairs marked in flight
         self.in_flight: set = set()
 
@@ -294,24 +292,24 @@ class _QueuingEngine(_Engine):
 def _scheduler(engine: _Engine) -> MicroScheduler:
     return MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda name: engine),
+        runtime=_Runtime(),
         parallel_leader_nodes={NODE},
     )
 
 
-def _next_batch(sched: MicroScheduler, manager: _Manager, **kwargs):
-    """Bind the runtime that scans this manager's queues, then schedule.
+def _over(sched: MicroScheduler, manager: _Manager) -> None:
+    """Point the scheduler's runtime at this manager's queues: these tests
+    build a fresh manager per call, where a worker has one for its life."""
+    sched.runtime._manager = manager
 
-    The worker installs the runtime once at startup; these tests build a fresh
-    manager per call, so the binding happens here instead.
-    """
-    sched.runtime = manager.runtime
-    manager.runtime.combined_walk_of = sched.combined_walk_of
+
+def _next_batch(sched: MicroScheduler, manager: _Manager, **kwargs):
+    _over(sched, manager)
     return sched.get_next_batch(manager, **kwargs)
 
 
 def _has_ready(sched: MicroScheduler, manager: _Manager, exclude_target=None):
-    sched.runtime = manager.runtime
-    manager.runtime.combined_walk_of = sched.combined_walk_of
+    _over(sched, manager)
     return sched.has_ready_excluding(manager, exclude_target)
 
 
@@ -1010,7 +1008,7 @@ def test_a_walk_that_does_not_split_never_reads_stream_chunks():
         get_partition_for_node=lambda node: "p", get_fwd_info=lambda rid, partition: None,
     )
     result = sched._run_checks(manager, CheckRequest([0, 1], None, [NODE], walks=[WALK]))
-    assert result.groups is None and result.verdicts == bytes([READY, READY])
+    assert result.groups is None and result.verdicts == bytes([Verdict.READY, Verdict.READY])
 
 
 def test_request_state_reports_the_chunk_each_input_stream_ingested():
@@ -1218,7 +1216,7 @@ def test_an_input_landing_on_a_backlogged_row_does_not_ready_it_again():
     again, and the rid ran twice."""
     sched = _scheduler(_Engine(max_bs=1))
     manager = _Manager(["r0"])
-    sched.runtime = manager.runtime  # as _next_batch does, for _backlog below
+    _over(sched, manager)  # as _next_batch does, for _backlog below
     # Parked through the real path, which claims the row like a running batch.
     # A fresh row the cap pushes out no longer parks, so a row that genuinely
     # waits is the case worth pinning here.
@@ -1274,10 +1272,12 @@ MIXED = "mixed"
 
 
 def _combined_scheduler(engine: _Engine, mixes=None) -> MicroScheduler:
+    combined_walk_of = {(NODE, "prefill"): MIXED, (NODE, WALK): MIXED}
     return MicroScheduler(
         engine_manager=SimpleNamespace(get_engine=lambda name: engine),
+        runtime=_Runtime(combined_walk_of),
         parallel_leader_nodes={NODE},
-        combined_walk_of={(NODE, "prefill"): MIXED, (NODE, WALK): MIXED},
+        combined_walk_of=combined_walk_of,
         speculation_mixes_walks=mixes,
     )
 
@@ -1306,7 +1306,7 @@ def test_a_combined_batch_of_one_walk_keeps_its_real_label():
 def test_the_backlog_and_round_robin_key_on_the_combined_walk():
     sched = _combined_scheduler(_Engine(max_bs=2))
     manager = _Manager(["p0", "d0", "d1"], walks={"p0": "prefill"})
-    sched.runtime = manager.runtime  # as _next_batch does, for _backlog below
+    _over(sched, manager)  # as _next_batch does, for _backlog below
     # a parked chunk is filed under the combined key, not either real walk,
     # and carries each row's real walk as the assembly would
     parked = _batch(["b0"], walk=MIXED)
@@ -1361,8 +1361,7 @@ def test_a_split_keeps_each_halfs_walks():
 def test_a_follower_pops_each_walk_of_a_combined_head():
     sched = _combined_scheduler(_Engine(max_bs=8))
     manager = _Manager(["p0", "d0"], walks={"p0": "prefill"})
-    sched.runtime = manager.runtime
-    manager.runtime.combined_walk_of = sched.combined_walk_of
+    _over(sched, manager)
 
     popped = sched.pop_ready_rids(
         manager, NODE, MIXED, ["p0", "d0"], walks=["prefill", WALK], walk_idx=[0, 1],
@@ -1378,8 +1377,7 @@ def test_a_follower_pop_is_all_or_none_across_walks():
     sched = _combined_scheduler(_Engine(max_bs=8))
     manager = _Manager(["p0"], walks={"p0": "prefill", "d0": WALK})
     manager.per_request_info["d0"] = object()  # known, but its node is not ready
-    sched.runtime = manager.runtime
-    manager.runtime.combined_walk_of = sched.combined_walk_of
+    _over(sched, manager)
 
     assert sched.pop_ready_rids(
         manager, NODE, MIXED, ["p0", "d0"], walks=["prefill", WALK], walk_idx=[0, 1],

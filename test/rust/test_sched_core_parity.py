@@ -2,7 +2,8 @@
 
 Two identical worlds -- a Rust graph runtime with a Qwen3.5-shaped LLM node
 (``prefill_text`` and ``decode`` under one combined walk, per-walk caps and a
-row cap) beside a second node -- are driven by the same random script:
+row cap) beside a second node, with or without capture groups and a
+speculation chain that mixes walks -- are driven by the same random script:
 arrivals, scheduling passes of every kind (plain, a speculation's targeted
 merge, a yield-away), completions, holds on an injected clock, deferred
 removes, terminal check failures, and the fairness peek and backlog queries.
@@ -87,8 +88,10 @@ class _Engine:
     was asked in that pass, so the same checks in the same order get the
     same answers."""
 
-    def __init__(self, caps, row_caps, seed):
+    def __init__(self, caps, row_caps, seed, split=()):
         self.caps, self.row_caps, self.seed = caps, row_caps, seed
+        # the nodes that split batches by capture key
+        self.split = set(split)
         self.log: list[tuple[str, int]] = []
         self.pass_no = 0
         self._asked: dict[int, int] = {}
@@ -110,7 +113,10 @@ class _Engine:
         return FULL_ADMIT_NOT_READY if roll < 0.2 else FULL_ADMIT_OK
 
     def splits_by_capture_key(self, node, walk):
-        return False
+        return node in self.split
+
+    def capture_group(self, node, walk, rid, fwd_info, input_metadata=None):
+        return (node, (rid * 7 + self.seed) % 3)
 
     def get_max_batch_size(self, node, walk):
         return self.caps.get((node, walk))
@@ -128,7 +134,10 @@ class _Clock:
 
 
 class World:
-    def __init__(self, rust_core: bool, caps, row_caps, seed, clock, leaders=(LLM, ENC)):
+    def __init__(
+        self, rust_core: bool, caps, row_caps, seed, clock, leaders=(LLM, ENC), split=(),
+        mixes=None,
+    ):
         book = RustTensorBookkeeping()
         self.store = TensorStore(bookkeeping=book)
         graphs = _graphs()
@@ -141,12 +150,12 @@ class World:
             sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
             bookkeeping=book, combined_walk_of=dict(COMBINED),
         )
-        self.engine = _Engine(caps, row_caps, seed)
+        self.engine = _Engine(caps, row_caps, seed, split)
         manager = SimpleNamespace(get_engine=lambda node: self.engine)
         self.sched = MicroScheduler(
-            manager, parallel_leader_nodes=set(leaders), combined_walk_of=dict(COMBINED),
+            manager, runtime=self.rt, parallel_leader_nodes=set(leaders),
+            combined_walk_of=dict(COMBINED), speculation_mixes_walks=mixes,
         )
-        self.sched.runtime = self.rt
         if not rust_core:
             self.sched._core = self.sched._python_core()  # on the same runtime
         self.rs = RequestStateManager(node_to_partition={LLM: PART, ENC: PART})
@@ -269,16 +278,28 @@ CONFIGS = {
 # encoder only, with LLM's rows left to the leader
 LEADERS = {"leader": (LLM, ENC), "follower": (ENC,)}
 
+# (nodes that split batches by capture key, `speculation_mixes_walks`): a
+# decode chain mixes walks, a prefill chain does not
+VARIANTS = {
+    "plain": ((), None),
+    "split": ((LLM, ENC), None),
+    "mixes": ((), {LLM: {DEC: True, PRE: False}}),
+    "split_mixes": ((LLM,), {LLM: {DEC: True, PRE: False}}),
+}
 
+
+@pytest.mark.parametrize("variant", sorted(VARIANTS))
 @pytest.mark.parametrize("leaders", sorted(LEADERS))
 @pytest.mark.parametrize("config", sorted(CONFIGS))
-@pytest.mark.parametrize("seed", range(12))
-def test_both_cores_schedule_the_same(config, seed, leaders, monkeypatch):
+@pytest.mark.parametrize("seed", range(8))
+def test_both_cores_schedule_the_same(config, seed, leaders, variant, monkeypatch):
     caps, row_caps = CONFIGS[config]
+    split, mixes = VARIANTS[variant]
     clock = _Clock()
     monkeypatch.setattr(ms, "time", clock)
     worlds = [
-        World(rust, caps, row_caps, seed, clock, leaders=LEADERS[leaders]) for rust in (False, True)
+        World(rust, caps, row_caps, seed, clock, leaders=LEADERS[leaders], split=split, mixes=mixes)
+        for rust in (False, True)
     ]
     rng = random.Random(seed)
     idle: set[int] = set()
@@ -319,6 +340,9 @@ def test_both_cores_schedule_the_same(config, seed, leaders, monkeypatch):
             elif kind < 0.8:
                 walk = rng.choice([DEC, PRE])
                 kwargs = dict(target=(LLM, walk), pre_existing_batch_size=rng.randint(0, 6))
+                if live and rng.random() < 0.5:
+                    # the speculation chain's continuing row anchors the group
+                    kwargs["capture_group_of"] = rng.choice(live)
             else:
                 kwargs = dict(exclude_target=(LLM, rng.choice([DEC, PRE])))
             batch = both(
@@ -362,11 +386,3 @@ def test_both_cores_schedule_the_same(config, seed, leaders, monkeypatch):
                 both("splits", lambda w, rid=rid: w.sched.backlog_splits_from(w.rs, (LLM, DEC), rid))
     assert isinstance(worlds[1].sched.core, RustSchedCore), "the Rust world must have run the Rust core"
 
-
-def test_a_node_split_by_capture_key_keeps_the_python_core(monkeypatch):
-    caps, row_caps = CONFIGS["capped"]
-    clock = _Clock()
-    monkeypatch.setattr(ms, "time", clock)
-    w = World(True, caps, row_caps, 0, clock)
-    w.engine.splits_by_capture_key = lambda node, walk: node == ENC
-    assert w.sched._rust_core() is None

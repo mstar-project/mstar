@@ -17,11 +17,7 @@ from mstar.worker.batch_builder import (
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.sched_core import (
-    FAILED,
     NO_GROUP,
-    OFF_GROUP,
-    READY,
-    UNCHECKED,
     CheckRequest,
     CheckResult,
     PassRequest,
@@ -29,6 +25,7 @@ from mstar.worker.sched_core import (
     RustSchedCore,
     SchedCore,
     SchedKeys,
+    Verdict,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,6 +216,14 @@ class PopReadyResult(NamedTuple):
     walk_output_signals: dict[str, list[str]] = {}
 
 
+def _is_rust_runtime(runtime: GraphRuntime | None) -> bool:
+    try:
+        from mstar.graph.runtime.rust import RustGraphRuntime
+    except ImportError:  # mstar_rust is not built, so no runtime is one
+        return False
+    return isinstance(runtime, RustGraphRuntime)
+
+
 class MicroScheduler:
     """
     Simple MVP scheduler: scans all worker graph queues for ready nodes,
@@ -229,10 +234,10 @@ class MicroScheduler:
     HOLD_BACKOFF_SECONDS = 0.05
     # class-level too, for a scheduler built without __init__ (tests)
     _core: SchedCore | None = None
-    _runtime: GraphRuntime | None = None
 
     def __init__(
         self, engine_manager: EngineManager,
+        runtime: GraphRuntime | None = None,
         sched_type=SchedulingType.ROUND_ROBIN,
         parallel_leader_nodes: set[str] | None = None,
         max_consec_tp_follower_batches: int = 1,
@@ -244,9 +249,9 @@ class MicroScheduler:
         self.keys = SchedKeys(engine_manager, combined_walk_of, speculation_mixes_walks)
         self.batch_builder = make_batch_builder(batch_builder_type)
         self.rr = RoundRobin()
-        # The graph runtime, installed by the worker. Interning and the
-        # (walk, node) -> worker graph index both live there.
-        self._runtime: GraphRuntime | None = None
+        # The graph runtime. Interning and the (walk, node) -> worker graph
+        # index both live there.
+        self.runtime = runtime
         # Looks up the handle for a wire request id; the worker installs the
         # runtime's. Only the TP-follow messages need it -- everything else
         # here already holds handles. Defaults to the identity so a scheduler
@@ -793,24 +798,24 @@ class MicroScheduler:
         limit, taken = request.limit, 0
         for i, rid in enumerate(rids):
             if 0 <= limit <= taken:
-                verdicts[i:] = bytes((UNCHECKED,)) * (len(rids) - i)
+                verdicts[i:] = bytes((Verdict.UNCHECKED,)) * (len(rids) - i)
                 break
             n = 0 if node_idx is None else node_idx[i]
             full = checks[n](nodes[n], rid, get_fwd_info(rid, partitions[n]), allow_reload=True)
             outcome = full.outcome
             if outcome.reason is not None and outcome.reason.terminal:
                 self._fail_unservable(nodes[n], rid, full)
-                verdicts[i] = FAILED
+                verdicts[i] = Verdict.FAILED
                 continue
             if not (outcome.ok and outcome.ready):
                 continue
-            verdicts[i] = READY
+            verdicts[i] = Verdict.READY
             if split[n]:
                 group = groups[i] = self._group(request_state, nodes[n], walks[n], rid)
                 if anchor_group is None:
                     anchor_group = group
                 if request.by_anchor and group != anchor_group:
-                    verdicts[i] = OFF_GROUP
+                    verdicts[i] = Verdict.OFF_GROUP
                     continue
             taken += 1
         return CheckResult(bytes(verdicts), groups, anchor_group)
@@ -832,42 +837,24 @@ class MicroScheduler:
         return self._group_ids.setdefault(group, len(self._group_ids))
 
     @property
-    def runtime(self) -> GraphRuntime | None:
-        return self._runtime
-
-    @runtime.setter
-    def runtime(self, runtime: GraphRuntime | None) -> None:
-        # a core picked before the runtime was installed (a test reading the
-        # backlog) is the Python one, which reads it from here on
-        self._runtime = runtime
-        if self._core is not None and not isinstance(self._core, RustSchedCore):
-            self._core.runtime = runtime
-
-    @property
     def core(self) -> SchedCore:
-        """The Rust core where it covers this worker's scheduling (a Rust
-        graph runtime, no node that splits batches by capture key, no mixing
-        speculation chain), else the Python core. Chosen once, at first use,
-        so the backlog never has to move between cores. A lockstep (TP/SP)
-        node is covered: only its leader schedules it, and a follower's
-        TP-follow FIFO is taken before either core runs."""
+        """The pass and the backlog: the Rust core for the Rust graph runtime,
+        whose graph state it works on, the Python core for any other. Built
+        at first use, once the engines' caps are known. A lockstep (TP/SP)
+        node needs nothing of either: only its leader schedules it, and a
+        follower's TP-follow FIFO is taken before the core runs."""
         if self._core is None:
-            self._core = self._rust_core() or self._python_core()
+            rust = _is_rust_runtime(self.runtime)
+            self._core = self._rust_core() if rust else self._python_core()
         return self._core
 
-    def _rust_core(self) -> RustSchedCore | None:
-        runtime = self.runtime
-        if not getattr(runtime, "supports_sched_core", False) or self.keys.mixing_chains:
-            return None
-        keys = {self._key(node, walk) for node, walk in runtime.local_node_walks()}
-        for node, label in keys:
-            if self.engine_manager.get_engine(node).splits_by_capture_key(node, label):
-                return None
-        return RustSchedCore(runtime, [
+    def _rust_core(self) -> RustSchedCore:
+        keys = {self._key(node, walk) for node, walk in self.runtime.local_node_walks()}
+        return RustSchedCore(self.runtime, [
             (node, label, self.keys.walks_of_key.get((node, label), []),
              self.keys.walk_caps((node, label)), self.keys.walk_row_caps((node, label)))
             for node, label in sorted(keys)
-        ], self.parallel_leader_nodes or ())
+        ], self.parallel_leader_nodes or (), self.keys.mixing_chains)
 
     def _python_core(self) -> SchedCore:
         # imported here: it builds this module's batches
