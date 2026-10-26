@@ -77,7 +77,7 @@ def fused_experts(
     reduce_results: bool = True,
     skip_invalid: bool = False,
     alignment: MoeAlignment | None = None,
-    config: dict[str, Any] | None = None,
+    config: tuple[dict[str, Any], dict[str, Any]] | None = None,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -113,10 +113,11 @@ def fused_experts(
     alignment : MoeAlignment, optional
         Precomputed alignment of ``topk_ids``. Its ``block_m`` must be
         :func:`moe_block_m` for this shape. Computed here when omitted.
-    config : dict, optional
-        Kernel launch parameters (tile sizes, ``num_warps``, ``num_stages``
-        and any backend-specific compiler options), used for both GEMMs.
-        Defaults to :func:`get_config` for these sizes.
+    config : tuple of dict, optional
+        The gate/up and the down GEMM's launch parameters (tile sizes,
+        ``num_warps``, ``num_stages`` and any backend-specific compiler
+        options), as :func:`get_config` returns them. Defaults to
+        :func:`get_config` for these sizes.
 
     Returns
     -------
@@ -158,7 +159,7 @@ def fused_experts(
         config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=k_in, top_k=top_k,
                                          dtype=hidden_states.dtype, device=hidden_states.device, tuned=tuned)
     else:
-        down_config = config
+        config, down_config = config
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.

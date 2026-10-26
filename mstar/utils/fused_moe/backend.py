@@ -13,18 +13,19 @@ which has measured best so far.
 from __future__ import annotations
 
 import enum
-import functools
-from typing import Any
+from typing import NamedTuple
 
 import torch
 from torch import nn
 
-from mstar.utils.fused_moe.config import (
-    MoEProblem,
-    device_config_name,
-    load_tuned_configs,
-    nearest_config,
-)
+
+class MoEProblem(NamedTuple):
+    """Sizes of one MoE layer's expert GEMMs, minus the token count."""
+
+    num_experts: int
+    intermediate_size: int  # per expert and rank, i.e. w2.shape[2]
+    hidden_size: int
+    top_k: int
 
 
 class MoEBackend(str, enum.Enum):
@@ -65,48 +66,17 @@ class FusedMoEBackend:
         return f"{type(self).__name__}({self.problem})"
 
 
-@functools.cache
-def _tuned_configs(problem: MoEProblem, device_name: str | None) -> dict[int, dict[str, Any]] | None:
-    return load_tuned_configs(problem, device_name)
-
-
 class TritonFusedMoE(FusedMoEBackend):
-    """fused_experts, with a tuned launch config when configs/ has one for
-    this GPU and these sizes."""
+    """fused_experts, which takes its tiles from the GPU's ``moe_gemm`` table
+    (``mstar.kernels``) when it has these sizes, else the kernel's defaults."""
 
     name = "triton"
-
-    def __init__(self, problem: MoEProblem):
-        super().__init__(problem)
-        from mstar.platforms import current_platform
-
-        self._tuned = _tuned_configs(problem, device_config_name())
-        # AMD recommends 2 stages for Triton GEMMs on CDNA3 (more can run out
-        # of LDS). It's already Triton's HIP default, pinned here anyway.
-        self._untuned_extras = {"num_stages": 2} if current_platform.is_rocm() else {}
-
-    def config(self, num_tokens: int) -> dict[str, Any] | None:
-        """Launch config for num_tokens tokens. None means the kernel's default."""
-        if self._tuned is not None:
-            return nearest_config(self._tuned, num_tokens)
-        if not self._untuned_extras:
-            return None
-        from mstar.utils.fused_moe.kernels import get_default_config
-
-        p = self.problem
-        return {
-            **get_default_config(
-                M=num_tokens, E=p.num_experts, N=2 * p.intermediate_size, K=p.hidden_size, top_k=p.top_k,
-            ),
-            **self._untuned_extras,
-        }
 
     def __call__(self, hidden_states, w1, w2, topk_weights, topk_ids, skip_invalid=False, alignment=None):
         from mstar.utils.fused_moe.runner import fused_experts
 
         return fused_experts(
-            hidden_states, w1, w2, topk_weights, topk_ids, skip_invalid=skip_invalid,
-            alignment=alignment, config=self.config(hidden_states.shape[0]),
+            hidden_states, w1, w2, topk_weights, topk_ids, skip_invalid=skip_invalid, alignment=alignment,
         )
 
 

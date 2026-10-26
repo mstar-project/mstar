@@ -422,10 +422,10 @@ Qwen3-Omni notes
   output isn't bitwise reproducible (identical calls differ in the last bits),
   so greedy decoding can flip near-tied tokens and repeated requests may not
   match. The Triton kernels are reproducible.
-- The Triton kernels take launch configs tuned per GPU model from
-  ``mstar/utils/fused_moe/configs/`` when one matches the expert sizes, and
-  otherwise the ``moe_gemm`` table for the GPU (``mstar/kernels/tables/moe_gemm/``).
-  ``benchmark/fused_moe/tune_fused_moe.py`` makes one on the local GPU.
+- The Triton kernels take their tiles from the ``moe_gemm`` table for the GPU
+  (``mstar/kernels/tables/moe_gemm/``); tables ship for MI300X and MI325X at the
+  Thinker's and Talker's expert sizes without TP or EP, swept with Triton's AMD
+  compiler options (``waves_per_eu``, ``matrix_instr_nonkdim``, ``kpack``).
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
