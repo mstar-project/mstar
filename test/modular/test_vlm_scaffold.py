@@ -226,7 +226,7 @@ def test_a_media_prompt_hands_its_advance_and_ids_to_the_resources():
 
 
 def test_a_media_row_with_the_wrong_row_count_fails_its_request():
-    """Checked on host values: the media tensor's shape against the layout."""
+    """Checked on host values: the media tensors' rows against the layout."""
     llm = _qwen_llm((AUDIO,))
     llm.prompt_positions = lambda fwd_info, layout, n: (None, None)
     ids = torch.tensor([1, AUDIO_PAD, AUDIO_PAD])
@@ -234,6 +234,10 @@ def test_a_media_row_with_the_wrong_row_count_fails_its_request():
     fwd_info = SimpleNamespace(request_id="r", step_metadata={MEDIA_LAYOUT: layout})
     row = llm.prepare_inputs("prefill_audio", fwd_info, {"text_inputs": [ids], "audio_embeds": [torch.zeros(2, 8)]})
     assert row.input_ids is ids and row.tensor_inputs["audio_embeds"].shape == (2, 8)
+    # a chunked encoder's chunks, in order
+    chunks = [torch.zeros(1, 8), torch.ones(1, 8)]
+    row = llm.prepare_inputs("prefill_audio", fwd_info, {"text_inputs": [ids], "audio_embeds": chunks})
+    assert torch.equal(row.tensor_inputs["audio_embeds"], torch.cat(chunks))
     with pytest.raises(ValueError, match="1 rows for the prompt's 2 pads"):
         llm.prepare_inputs("prefill_audio", fwd_info, {"text_inputs": [ids], "audio_embeds": [torch.zeros(1, 8)]})
     # no output at all: a replay would splice in the previous step's rows

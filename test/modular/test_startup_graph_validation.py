@@ -33,7 +33,7 @@ from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
+from mstar.graph.base import GraphEdge, GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -545,10 +545,12 @@ def test_conductor_driven_walk_of_a_consumer_partition_is_accepted(tmp_path, mon
 ITERS = 3
 
 
-def _loop_feeding_post(accumulate):
+def _loop_feeding_post(accumulate, beside=False):
     """``step`` runs ITERS times on the conductor input ``x`` and sends ``y`` to
     ``post``: from inside the Loop on every iteration, or once, through
-    ``Loop.accumulated_outputs``, when the Loop finishes."""
+    ``Loop.accumulated_outputs``, when the Loop finishes. ``beside`` puts the
+    Loop in a ``Parallel`` with ``side``, which sends ``post`` ``z``, as a
+    media walk runs a chunked encoder beside another encoder."""
     if accumulate:
         loop = Loop(name="loop", max_iters=ITERS, outputs=[], section=GraphNode(
             name="step", input_names={"x"}, outputs=[GraphEdge(next_node="step", name="y")]),
@@ -556,7 +558,11 @@ def _loop_feeding_post(accumulate):
     else:
         loop = Loop(name="loop", max_iters=ITERS, outputs=[], section=GraphNode(
             name="step", input_names={"x"}, outputs=[GraphEdge(next_node="post", name="y")]))
-    return Sequential([loop, GraphNode(name="post", input_names={"y"}, outputs=[
+    if beside:
+        loop = Parallel([
+            GraphNode(name="side", input_names={"x"}, outputs=[GraphEdge(next_node="post", name="z")]), loop,
+        ])
+    return Sequential([loop, GraphNode(name="post", input_names={"y", "z"} if beside else {"y"}, outputs=[
         GraphEdge(next_node=EMIT_TO_CLIENT, name="out", output_modality="text")])])
 
 
@@ -574,17 +580,26 @@ def test_loop_member_feeding_a_successor_in_its_worker_graph_is_rejected(tmp_pat
 
 
 class _LoopWorker:
-    """worker_0 hosting walk 'w' as one worker graph, driven as the worker drives it."""
+    """worker_0 hosting walk 'w', driven as the worker drives it: one worker
+    graph, or with ``beside`` the Parallel's and post's two."""
 
-    def __init__(self, runtime, tmp_path):
-        model = _ToyModel(lambda: {"w": _loop_feeding_post(accumulate=True)})
-        wg, = model.get_worker_graphs(_config(tmp_path, [{"node_names": ["step", "post"], "ranks": [0]}]))
-        wg.worker_graph_id = 0
+    def __init__(self, runtime, tmp_path, beside=False):
+        model = _ToyModel(lambda: {"w": _loop_feeding_post(accumulate=True, beside=beside)})
+        groups = (
+            [{"node_names": ["side", "step"], "ranks": [0]}, {"node_names": ["post"], "ranks": [0]}] if beside
+            else [{"node_names": ["step", "post"], "ranks": [0]}]
+        )
+        wgs = model.get_worker_graphs(_config(tmp_path, groups))
+        assert len(wgs) == len(groups)
+        nodes = {i: set(wg.section.get_nodes()) for i, wg in enumerate(wgs)}
+        for i, wg in enumerate(wgs):
+            wg.worker_graph_id = i
+        self.wg_of = {node: i for i, names in nodes.items() for node in names}
         args = dict(
-            my_worker_id="worker_0", my_worker_graphs=[wg],
-            all_wg_ids_to_graph_walks={0: {"w"}}, all_wg_ids_to_dyn_loops={0: set()},
-            all_wg_ids_to_nodes={0: {"step", "post"}},
-            node_to_partition={"step": "default", "post": "default"}, sharding_config=_sharding_config(),
+            my_worker_id="worker_0", my_worker_graphs=wgs,
+            all_wg_ids_to_graph_walks={i: {"w"} for i in nodes}, all_wg_ids_to_dyn_loops={i: set() for i in nodes},
+            all_wg_ids_to_nodes=nodes,
+            node_to_partition=dict.fromkeys(self.wg_of, "default"), sharding_config=_sharding_config(),
         )
         self.runtime = runtime
         if runtime == "python":
@@ -599,13 +614,16 @@ class _LoopWorker:
             from mstar.graph.runtime.rust import RustGraphRuntime
             self.book = RustTensorBookkeeping()
             self.rt = RustGraphRuntime(bookkeeping=self.book, **args)
+        ids = list(nodes)
         self.rid = self.rt.add_request(
-            request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=[0],
-            worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+            request_id="r", partition="default", graph_walk="w", partition_worker_graph_ids=ids,
+            worker_graph_to_workers=ParallelList(ids, [["worker_0"]] * len(ids)),
             loop_caps={},
         )
         self.minter = TensorUuidMinter("worker_0")
-        _ingest(self.rt, self.rid, [GraphEdge(next_node="step", name="x")])
+        _ingest(self.rt, self.rid, [GraphEdge(next_node=n, name="x") for n in ("side", "step") if n in self.wg_of])
+        # what step sent on y, and what post read, in order
+        self.sent, self.read = [], []
 
     def _put(self, sig):
         if self.runtime == "python":
@@ -622,15 +640,26 @@ class _LoopWorker:
 
     def step_once(self):
         """Run the first ready node; returns (node, reported_done) or None."""
-        node = next((n for n in ("post", "step") if self.rt.pop_rids(n, "w", [self.rid], check_ready=True)), None)
-        if node is None:
+        popped = None
+        for node in ("post", "side", "step"):
+            if node in self.wg_of and (popped := self.rt.pop_rids(node, "w", [self.rid], check_ready=True)):
+                break
+        if not popped:
             return None
         rt, rid = self.rt, self.rid
         sig = rt.get_output_signals(node, "w")
         uuids = self._put(sig)
+        if node == "step":
+            self.sent += uuids["y"]
+        if node == "post":
+            edges, k = popped.input_edges, 0
+            for n, name in zip(edges.tensors_per_edge, edges.signal_name_idxs, strict=True):
+                if edges.signal_names[name] == "y":
+                    self.read += edges.uuids[k:k + n]
+                k += n
         out = rt.complete_and_route_batch(RouteInput(
             partition="default", graph_walk="w", node_name=node, output_signals=sig,
-            wg_ids=ParallelList([rid], [0]), tensors=[u for s in sig for u in uuids[s]],
+            wg_ids=ParallelList([rid], [self.wg_of[node]]), tensors=[u for s in sig for u in uuids[s]],
             num_tensors=[1] * len(sig),
         ))
         if self.runtime == "rust":
@@ -644,15 +673,23 @@ class _LoopWorker:
         return node, done
 
 
+@pytest.mark.parametrize("beside", [False, True], ids=["one_worker_graph", "beside_across_worker_graphs"])
 @pytest.mark.parametrize("runtime", ["python", "rust"])
-def test_accumulated_outputs_feed_the_successor_once_after_the_loop(runtime, tmp_path):
+def test_accumulated_outputs_feed_the_successor_once_after_the_loop(runtime, beside, tmp_path):
     """The shape the refusal points to passes startup, and in both runtimes
-    runs ``step`` ITERS times, then ``post`` once, reporting done once."""
-    w = _LoopWorker(runtime, tmp_path)
+    runs ``step`` ITERS times, then ``post`` once on every iteration's ``y``
+    in order, each worker graph reporting done once. ``beside``: the Loop in
+    a Parallel, its accumulated output crossing to post's worker graph."""
+    w = _LoopWorker(runtime, tmp_path, beside)
     trace = []
     while len(trace) < 4 * ITERS and (r := w.step_once()):
         trace.append(r)
-    assert trace == [("step", False)] * ITERS + [("post", True)], trace
+    if beside:
+        steps = [("side", False)] + [("step", False)] * (ITERS - 1) + [("step", True)]
+    else:
+        steps = [("step", False)] * ITERS
+    assert trace == [*steps, ("post", True)], trace
+    assert w.read == w.sent and len(w.sent) == ITERS
 
 
 # -- every shipped config -----------------------------------------------------

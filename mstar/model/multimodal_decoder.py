@@ -43,11 +43,13 @@ from mstar.model.multimodal import (
     PrefillStep,
     PromptPart,
     check_attachments,
+    encoder_combined_walks,
     expand_media_pads,
     initial_prefill_args,
     media_encoders,
     media_layout,
     media_prefill_schedule,
+    media_runs,
     media_walk_name,
     media_walks,
     next_prefill_args,
@@ -169,7 +171,7 @@ class MultimodalDecoderModel(Model):
     # -----------------------------------------------------------------------
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        return text_combined_walks()
+        return {**text_combined_walks(), **encoder_combined_walks(self.encoders)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # a safety bound on decode, not the per-request budget
@@ -177,7 +179,17 @@ class MultimodalDecoderModel(Model):
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the request's output budget: the stop check counts no tokens
-        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        caps = {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+        # A chunked encoder's loop runs each of its runs in whole chunks, so
+        # it ends on its last chunk. A request with none of its media leaves
+        # it out: its walk has no such loop.
+        layout = model_kwargs.get(MEDIA_LAYOUT) or {}
+        for e in self.encoders:
+            if e.chunk_tokens is not None:
+                chunks = sum(map(e.chunks, media_runs(layout, e.output)))
+                if chunks:
+                    caps[e.loop] = chunks
+        return caps
 
     # -----------------------------------------------------------------------
     # KV layout

@@ -387,6 +387,11 @@ class MediaEncoder:
     ``name`` names the walks (``prefill_vision``, ``prefill_vision_audio``);
     ``node`` reads ``inputs`` and sends the LLM ``output``, one row per pad
     of ``pad_ids`` in the prompt, in prompt order.
+
+    ``chunk_tokens`` makes it a chunked causal encoder: the node runs as the
+    Loop ``loop``, ``chunk_tokens`` tokens of one attachment an iteration, and
+    the LLM gets every iteration's rows when the loop ends (see
+    ``ChunkedCausalEncoder``). None runs the node once per prompt.
     """
 
     name: str
@@ -394,11 +399,23 @@ class MediaEncoder:
     inputs: tuple[str, ...]
     output: str
     pad_ids: tuple[int, ...]
+    chunk_tokens: int | None = None
 
     def __post_init__(self):
         if not self.pad_ids:
             # the splice would have no pad to fill
             raise ValueError(f"media encoder {self.node!r} names no pad ids")
+        if self.chunk_tokens is not None and self.chunk_tokens < 1:
+            raise ValueError(f"media encoder {self.node!r}: chunk_tokens must be >= 1, not {self.chunk_tokens}")
+
+    @property
+    def loop(self) -> str:
+        """The Loop a chunked encoder's node runs as."""
+        return f"{self.node}_chunks"
+
+    def chunks(self, tokens: int) -> int:
+        """The iterations a chunked encoder's loop runs for a run of ``tokens``."""
+        return -(-tokens // self.chunk_tokens)
 
 
 def vision_encoder(pad_ids: tuple[int, ...]) -> MediaEncoder:
@@ -410,11 +427,15 @@ def media_walk_name(encoders: Sequence[MediaEncoder]) -> str:
     return "prefill_" + "_".join(e.name for e in encoders)
 
 
-def media_walk_names(encoders: Sequence[MediaEncoder]) -> list[str]:
-    """One walk per non-empty subset of ``encoders``, in declaration order."""
+def media_walk_names(
+    encoders: Sequence[MediaEncoder], running: MediaEncoder | None = None,
+) -> list[str]:
+    """One walk per non-empty subset of ``encoders``, in declaration order;
+    with ``running``, only the walks that run it."""
     return [
         media_walk_name([e for i, e in enumerate(encoders) if mask >> i & 1])
         for mask in range(1, 1 << len(encoders))
+        if running is None or mask >> encoders.index(running) & 1
     ]
 
 
@@ -457,12 +478,21 @@ def media_encoders(encoders: Sequence[MediaEncoder], layout: Mapping) -> list[Me
     return [e for e in encoders if e.output in outputs]
 
 
+def media_runs(layout: Mapping, output: str) -> list[int]:
+    """The tokens of each run a ``MEDIA_LAYOUT`` fills from encoder output
+    ``output``, in prompt order."""
+    return [
+        n for n, out in zip(layout.get("tokens", ()), layout.get("output", ()), strict=True) if out == output
+    ]
+
+
 def media_walks(
     max_iters: int, encoders: Sequence[MediaEncoder] = (),
 ) -> dict[str, GraphSection]:
     """``prefill_text``, one media walk per subset of ``encoders``, and
     ``decode``, over the ``LLM`` node and the encoders. ``max_iters`` bounds
-    the decode loop; it is a safety bound, not the per-request budget."""
+    the decode loop and each chunked encoder's; it is a safety bound, not the
+    per-request budget."""
 
     def emit_first_token() -> GraphEdge:
         return GraphEdge(
@@ -474,13 +504,7 @@ def media_walks(
     }
     for mask in range(1, 1 << len(encoders)):
         present = [e for i, e in enumerate(encoders) if mask >> i & 1]
-        nodes = [
-            GraphNode(
-                name=e.node, input_names=list(e.inputs),
-                outputs=[GraphEdge(next_node="LLM", name=e.output)],
-            )
-            for e in present
-        ]
+        nodes = [_encoder_section(e, max_iters) for e in present]
         walks[media_walk_name(present)] = Sequential([
             nodes[0] if len(nodes) == 1 else Parallel(nodes),
             GraphNode(
@@ -505,9 +529,41 @@ def media_walks(
     return walks
 
 
+def _encoder_section(e: MediaEncoder, max_iters: int) -> GraphSection:
+    """An encoder's part of a media walk: its node, sending the LLM its
+    output; a chunked encoder's node as a Loop, whose accumulated output
+    sends the LLM every iteration's rows, in order, when it ends. The node's
+    edge to itself is never read: it is what the Loop accumulates from."""
+    if e.chunk_tokens is None:
+        return GraphNode(
+            name=e.node, input_names=list(e.inputs), outputs=[GraphEdge(next_node="LLM", name=e.output)],
+        )
+    return Loop(
+        name=e.loop,
+        section=GraphNode(
+            name=e.node, input_names=list(e.inputs), outputs=[GraphEdge(next_node=e.node, name=e.output)],
+        ),
+        # the request's chunk count caps it (`MultimodalDecoderModel.get_loop_caps`)
+        max_iters=max_iters,
+        outputs=[],
+        accumulated_outputs=[GraphEdge(next_node="LLM", name=e.output)],
+    )
+
+
 def text_combined_walks() -> dict[str, dict[str, set[str]]]:
     """Text prefill and decode rows of the ``LLM`` node share a step."""
     return {"LLM": {MIXED: {"prefill_text", "decode"}}}
+
+
+def encoder_combined_walks(encoders: Sequence[MediaEncoder]) -> dict[str, dict[str, set[str]]]:
+    """A chunked encoder's chunks from every media walk that runs it share a
+    step (``prefill_with_<name>``)."""
+    combined = {}
+    for e in encoders:
+        walks = media_walk_names(encoders, e)
+        if e.chunk_tokens is not None and len(walks) > 1:
+            combined[e.node] = {f"prefill_with_{e.name}": set(walks)}
+    return combined
 
 
 @dataclass(frozen=True)

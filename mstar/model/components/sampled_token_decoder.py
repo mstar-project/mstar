@@ -63,7 +63,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.keys import MIXED, ROPE, SAMPLER
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names
+from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_runs, media_walk_names
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -277,11 +277,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         layout = fwd_info.step_metadata.get(MEDIA_LAYOUT) or {}
         media: dict[str, torch.Tensor] = {}
         for e in self._encoders:
-            pads = sum(
-                n for n, out in zip(layout.get("tokens", ()), layout.get("output", ()), strict=True)
-                if out == e.output
-            )
-            rows = inputs[e.output][0] if inputs.get(e.output) else None
+            pads = sum(media_runs(layout, e.output))
+            # a chunked encoder sends one tensor per chunk, in prompt order
+            chunks = inputs.get(e.output)
+            rows = None if not chunks else chunks[0] if len(chunks) == 1 else torch.cat(chunks)
             found = 0 if rows is None else rows.shape[0]
             if found != pads:
                 raise ValueError(f"{e.output} has {found} rows for the prompt's {pads} pads")
@@ -368,7 +367,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             # in row order, as the forward's cumulative pad count reads them
             rows = [inp.tensor_inputs[e.output] for inp in inputs if e.output in inp.tensor_inputs]
             if rows:
-                out[e.output] = torch.cat(rows, dim=0)
+                # one row's media is already one tensor (`_media_inputs`): no second copy
+                out[e.output] = rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
         return out
 
     def declare_step(

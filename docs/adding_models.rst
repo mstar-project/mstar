@@ -2270,6 +2270,9 @@ Graph and walks (``mstar/model/multimodal.py``), from the model's ``MediaEncoder
     decode         : Loop("decode_loop", LLM)
     mixed          : prefill_text and decode rows in one step (a combined walk)
 
+A chunked encoder (``chunk_tokens`` set, below) runs as ``Loop("<node>_chunks", encoder)``
+in its walks, and ``prefill_with_<name>`` combines its walks on its node.
+
 The ``Model`` subclasses ``MultimodalDecoderModel`` (``mstar/model/multimodal_decoder.py``),
 which declares the walks (``media_walks(max_iters, encoders)`` and
 ``text_combined_walks()``), runs the prefill schedule from ``media_prefill_schedule``
@@ -2352,6 +2355,36 @@ A tower builds on the pieces in ``mstar/model/components/vit.py``:
 ``AxialVisionRope`` and ``RaggedVisionAttention`` (attention over the packed patches
 through the ragged resource, rope in fp32), which a tower subclasses with its q/k/v
 projections.
+
+An encoder whose every op is a causal conv or per token (a waveform conv stack) can
+run long attachments a fixed-size chunk at a time. Its ``MediaEncoder`` sets
+``chunk_tokens`` (C); the media walks then run its node as a ``Loop`` whose
+iterations each encode C tokens of one attachment, which
+``MultimodalDecoderModel.get_loop_caps`` caps at the request's chunk count from its
+media layout, and the LLM gets every chunk's rows, in order, through the loop's
+``accumulated_outputs`` when it ends. The node is a ``ChunkedCausalEncoder``
+(``mstar/model/components/chunked_causal_encoder.py``), which maps the iteration to
+its attachment and tokens, batches every request's chunks into one
+``BatchedAcceleratorGraphConfig`` (a final partial chunk zero-padded) and trims the
+padding off. What crosses a chunk boundary, such as each causal conv's left context,
+lives in a ``RecurrentStateSpec`` pool the model names to the submodule
+(``state_key``): the layers bind it and read and write their block with ``gather`` /
+``scatter_`` over ``addressing()``, reading zeros where ``has_state`` is False. The
+base releases the slot on each attachment's last chunk (``RecurrentStep.release``),
+so the next attachment starts on a fresh slot and ``max_slots`` bounds the
+attachments being encoded at once; the pool keeps its sink slot, which a replay's
+padding rows address. The intake hands over attachments in the tower's dtype. The
+loop is not speculated, so its chunks run one step apart. A model writes:
+
+.. code-block:: python
+
+    MediaEncoder("audio", "audio_encoder", ("audio_values",), "audio_embeds", (pad,),
+                 chunk_tokens=250)
+    RecurrentStateSpec(resource_key=AUDIO_CONV, nodes={"audio_encoder"},
+                       config=RecurrentStateConfig(num_layers=1, blocks=...))
+
+    # tower.forward(values [rows, C * per_token]) -> [rows, C, hidden]
+    ChunkedCausalEncoder(tower, per_token, encoder, encoders, state_key=AUDIO_CONV)
 
 Advanced: async partitions and streaming
 ----------------------------------------
