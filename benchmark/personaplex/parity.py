@@ -404,8 +404,11 @@ def pipeline(ref, native):
                 text.append(result["text_frame"][0])
                 got = torch.cat((text[-1][:, None, None], agent[-1]), dim=1)
                 record["emitted_equal"] = bool(torch.equal(got.cpu(), expected["output"][:, :9]))
+                # M* stops after the last depth step it samples; NVIDIA runs all 16, so compare that prefix.
                 depth_logits = torch.stack(latest["depth"], dim=1)
-                record["depth_logits"] = metrics(depth_logits, expected["depth_logits"])
+                executed = depth_logits.shape[1]
+                record["depth_steps_executed"] = executed
+                record["depth_logits"] = metrics(depth_logits, expected["depth_logits"][:, :executed])
                 same_input_prefix = all(r["input_codes_equal"] for r in records) and record["input_codes_equal"]
                 decisions = [
                     (
@@ -424,7 +427,7 @@ def pipeline(ref, native):
                         expected["depth_logits"][:, d],
                         bool(expected["depth_provided"][0, d]),
                     )
-                    for d in range(16)
+                    for d in range(executed)
                 ]
                 for kind, slot, got_logits, ref_logits, forced in decisions:
                     if forced or torch.equal(got_logits.argmax(-1), ref_logits.argmax(-1)):

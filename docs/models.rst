@@ -1208,7 +1208,10 @@ used, not a downmix) and output modalities ``audio`` or ``audio`` + ``text``.
   defaults to NVIDIA's offline default. The request prompt may carry it instead.
 - ``temp_text`` / ``topk_text`` (0.7 / 25), ``temp_audio`` / ``topk_audio``
   (0.8 / 250), ``greedy``. Seeded sampled output does not reproduce NVIDIA's,
-  whose RNG stream differs; parity is defined on greedy and forced paths.
+  whose RNG stream differs; parity is defined on greedy and forced paths. M*
+  also stops the depformer after the last codebook it samples (8 of 16 steps
+  per frame, since the user's codebooks are given), which leaves greedy output
+  unchanged but draws fewer random numbers than NVIDIA does.
 
 Uploads longer than 2999 × 80 ms (239.9 s) are rejected from the file header,
 or after at most that much decoding, before the exact budget below is checked.
@@ -1237,11 +1240,12 @@ implementation on GH200 and H100 GPUs:
   on both graph runtimes; a 20-minute mixed-load soak on the Rust runtime kept
   GPU memory flat.
 - The model runs eagerly (no CUDA graphs), so a step is bound by CPU overhead
-  and its speed varies between hosts. On one H100 an LM step took about 50 ms
-  for one request and 54 ms for four batched, and over HTTP four concurrent
-  17.7 s requests each finished in 0.82x real time (median), about 4.1 seconds
-  of audio per second in total; on a slower H100 host the step took 65 ms and
-  one request ran at 1.14x real time.
+  (``benchmark/worker_phases``: the LM forward is most of each iteration, with
+  no GPU wait) and its speed varies between hosts. On one H100 an LM step took
+  about 30 ms for one request and 43 ms for four batched, and over HTTP one
+  17.7 s request finished in 0.53x real time and four concurrent ones in 0.61x
+  each (median), about 5.6 seconds of audio per second in total; on a slower
+  H100 host the step took about 58 ms.
 - Audio quality has not been formally assessed. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge; no listening study

@@ -281,7 +281,8 @@ def test_forward_batched_returns_each_request_its_own_rows():
     assert set(got) == {"a", "b"}
     # The rows sample different text, so handing one row the other's tokens would show.
     assert text_sampler.tokens[0][0] != text_sampler.tokens[0][1]
-    assert text_sampler.shapes == [(2, TINY.text_card)] and depth_sampler.shapes == [(2, TINY.card)] * 16
+    # First generate frame: only depth step 0 samples (the agent acoustic codebooks are still forced).
+    assert text_sampler.shapes == [(2, TINY.text_card)] and depth_sampler.shapes == [(2, TINY.card)]
     _assert_same_outputs(got["a"], want[0], "a")
     _assert_same_outputs(got["b"], want[1], "b")
     for output in got.values():
@@ -345,6 +346,136 @@ def test_conditioning_frames_are_fully_forced_and_generate_reads_the_mask_each_f
     assert DelayedTokenCache.from_state_tensor(state)[1] == meta["conditioning_frames"] + meta["num_user_frames"]
 
 
+class _CountingDepth:
+    """Counts the depformer steps and depth-sampler calls a frame actually makes."""
+
+    def __init__(self, sub):
+        self.depth, self.steps, self.samples = sub.lm.depth, [], []
+        self._step = self.depth.step
+
+    def __enter__(self):
+        def step(index, *args, **kwargs):
+            self.steps.append(index)
+            return self._step(index, *args, **kwargs)
+
+        self.depth.step = step
+        return self
+
+    def __exit__(self, *exc):
+        self.depth.step = self._step
+
+    def sample(self, logits, step):
+        self.samples.append(step)
+        return _greedy_depth(logits, step)
+
+
+def _conditioned_pair(sub, case):
+    """Two identical runs after conditioning: one to step with every depth step, one with the shortened depformer."""
+    voice, persona, codes, meta = case
+    runs = [_Run(sub, meta, voice, persona, codes) for _ in range(2)]
+    states = [run.walk(cfg.CONDITIONING_WALK, None)[1] for run in runs]
+    return runs, states
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("seed", [61, 62, 63])
+def test_shortened_depformer_matches_every_depth_step_and_skips_the_forced_suffix(seed):
+    sub = _tiny_submodule(seed=seed)
+    case = _random_inputs(n_emb=2, n_text=3, n_user=12, seed=seed + 100)
+    (full, short), (full_state, short_state) = _conditioned_pair(sub, case)
+    meta = case[3]
+    for j in range(meta["num_user_frames"]):
+        frames = [sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
+                  for run, state in ((full, full_state), (short, short_state))]
+        want = sub.run_frames([frames[0]], full.backend, _greedy_text, _greedy_depth, depth_steps=cfg.DEP_Q)[0]
+        with _CountingDepth(sub) as counted:
+            got = sub.run_frames([frames[1]], short.backend, _greedy_text, counted.sample)[0]
+        full.backend.advance()
+        short.backend.advance()
+        # User codebooks (steps 8-15) are always forced; the first frame also forces the agent's acoustic codes.
+        expected = 1 if j == 0 else cfg.AUDIO_CODEBOOKS_PER_STREAM
+        assert counted.steps == list(range(expected)) and counted.samples == list(range(expected)), j
+        _assert_same_outputs(got, want, f"generate frame {j}")
+        full_state, short_state = want["lm_state"][0], got["lm_state"][0]
+
+
+@torch.no_grad()
+def test_stopping_one_depth_step_early_changes_the_committed_state():
+    """The step count is tight: dropping the last sampled step loses a committed agent code."""
+    sub = _tiny_submodule(seed=64)
+    case = _random_inputs(n_emb=1, n_text=2, n_user=4, seed=164)
+    (full, short), (full_state, short_state) = _conditioned_pair(sub, case)
+    meta = case[3]
+    changed = []
+    for _ in range(meta["num_user_frames"]):
+        frames = [sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
+                  for run, state in ((full, full_state), (short, short_state))]
+        needed = sub.depth_steps([frames[1]])
+        want = sub.run_frames([frames[0]], full.backend, _greedy_text, _greedy_depth, depth_steps=cfg.DEP_Q)[0]
+        got = sub.run_frames([frames[1]], short.backend, _greedy_text, _greedy_depth, depth_steps=needed - 1)[0]
+        full.backend.advance()
+        short.backend.advance()
+        changed.append(not torch.equal(got["lm_state"][0], want["lm_state"][0]))
+        # Continue both runs from the correct state, so each frame is checked on its own.
+        full_state = short_state = want["lm_state"][0]
+    assert all(changed), changed
+
+
+def test_depth_steps_needed_runs_through_the_last_free_step_of_any_row():
+    from mstar.model.personaplex.components.depformer import depth_steps_needed
+
+    forced = torch.ones(2, cfg.DEP_Q, dtype=torch.bool)
+    assert depth_steps_needed(forced) == 0
+    holes = forced.clone()
+    holes[0, 2] = holes[1, 5] = False  # forced steps between free ones still run
+    assert depth_steps_needed(holes) == 6
+    free_last = forced.clone()
+    free_last[1, cfg.DEP_Q - 1] = False  # an unexpectedly free user codebook is not skipped
+    assert depth_steps_needed(free_last) == cfg.DEP_Q
+
+
+@torch.no_grad()
+def test_batch_of_first_and_later_generate_frames_runs_the_longer_depformer():
+    """A row on its first generate frame next to a later one: 8 steps for both, each row still its solo result."""
+    sub = _tiny_submodule(seed=65)
+    cases = [_random_inputs(n_emb=1, n_text=2, n_user=3, seed=165),
+             _random_inputs(n_emb=2, n_text=1, n_user=3, seed=166)]
+    rows, want = [], []
+    for skip_frames, case in zip((0, 1), cases, strict=True):
+        voice, persona, codes, meta = case
+        solo, batched = _Run(sub, meta, voice, persona, codes), _Run(sub, meta, voice, persona, codes)
+        states = [solo.walk(cfg.CONDITIONING_WALK, None)[1], batched.walk(cfg.CONDITIONING_WALK, None)[1]]
+        for _ in range(skip_frames):  # advance both copies past the first generate frame
+            for k, run in enumerate((solo, batched)):
+                frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [states[k]]})
+                states[k] = sub.run_frame(frame, run.backend, _greedy_text, _greedy_depth)["lm_state"][0]
+                run.backend.advance()
+        frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**solo.static, "lm_state": [states[0]]})
+        want.append(sub.run_frames([frame], solo.backend, _greedy_text, _greedy_depth, depth_steps=cfg.DEP_Q)[0])
+        rows.append((batched, sub.prepare_frame(cfg.GENERATE_WALK, meta, {**batched.static, "lm_state": [states[1]]})))
+    frames = [frame for _, frame in rows]
+    assert [sub.depth_steps([frame]) for frame in frames] == [1, cfg.AUDIO_CODEBOOKS_PER_STREAM]
+    with _CountingDepth(sub) as counted:
+        got = sub.run_frames(frames, _RowBackends([run.backend for run, _ in rows]), _greedy_text, counted.sample)
+    assert counted.steps == list(range(cfg.AUDIO_CODEBOOKS_PER_STREAM))
+    for row in range(2):
+        _assert_same_outputs(got[row], want[row], f"row {row}")
+
+
+@torch.no_grad()
+def test_preprocess_passes_the_depth_step_count_to_forward():
+    sub = _tiny_submodule(seed=66)
+    voice, persona, codes, meta = _random_inputs(n_emb=1, n_text=1, n_user=2, seed=167)
+    run = _Run(sub, meta, voice, persona, codes)
+    _, state = run.walk(cfg.CONDITIONING_WALK, None)
+    inputs = sub.prepare_inputs(cfg.GENERATE_WALK, SimpleNamespace(step_metadata=meta),
+                                {**run.static, "lm_state": [state]})
+    assert sub.preprocess(cfg.GENERATE_WALK, None, [inputs])["depth_steps"] == 1
+    conditioning = sub.prepare_inputs(cfg.CONDITIONING_WALK, SimpleNamespace(step_metadata=meta),
+                                      {**run.static, "lm_state": []})
+    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [conditioning])["depth_steps"] == 0
+
+
 @torch.no_grad()
 def test_forward_accepts_eager_int32_sampler_tokens():
     """Eager FlashInfer returns int32 IDs; both PersonaPlex samplers feed an int64 cache."""
@@ -373,7 +504,7 @@ def test_forward_accepts_eager_int32_sampler_tokens():
         cfg.TEXT_SAMPLER: text_sampler, cfg.DEPTH_SAMPLER: depth_sampler,
     })
     got = sub.forward(cfg.GENERATE_WALK, engine_inputs, [frame])
-    assert (text_sampler.calls, depth_sampler.calls) == (1, 16)
+    assert (text_sampler.calls, depth_sampler.calls) == (1, 1)  # first generate frame: depth step 0 only
 
     reference = _Run(sub, meta, voice, persona, codes)
     _, reference_state = reference.walk(cfg.CONDITIONING_WALK, None)
@@ -450,8 +581,9 @@ def test_lm_frame_validation_and_engine_hooks():
     node_inputs = sub.prepare_inputs(cfg.CONDITIONING_WALK, fwd_info, inputs)
     assert node_inputs.input_seq_len == 1 and node_inputs.input_embeds.shape == (1, TINY.dim)
     frame = node_inputs.kwargs["frame"]
-    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs]) == {"frames": [frame]}
-    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs, node_inputs]) == {"frames": [frame, frame]}
+    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs]) == {"frames": [frame], "depth_steps": 0}
+    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs, node_inputs]) == {
+        "frames": [frame, frame], "depth_steps": 0}
     with pytest.raises(RuntimeError, match="not bound"):
         sub.forward(cfg.CONDITIONING_WALK, None, [frame])
     # One row takes the unbatched forward; the cap is the model kwarg.

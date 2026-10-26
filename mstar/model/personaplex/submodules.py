@@ -19,6 +19,10 @@ forces the agent acoustic codebooks).
 Requests in the same walk batch: the temporal transformer, text head, samplers
 and depformer run once over every row, while each row keeps its own cache
 (offsets differ between requests) and commits it separately.
+
+The depformer stops after the last depth step any row samples
+(``depth_steps_needed``): the user's codebooks are always forced here, so a
+generate frame runs 8 of its 16 depth steps, and the first one runs 1.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInput
 
 from . import config as cfg
 from .components.delayed_cache import DelayedTokenCache
+from .components.depformer import depth_steps_needed
 from .components.mimi import MimiCodec, pad_to_frames
 from .weights import PersonaPlexLM
 
@@ -184,17 +189,26 @@ class LMSubmodule(ARNodeSubmodule):
         """``run_frames`` for one request."""
         return self.run_frames([frame], backend, sample_text, sample_depth)[0]
 
+    @staticmethod
+    def depth_steps(frames: list[LMFrame]) -> int:
+        """Depth steps a generate batch must run (0 for conditioning); reads the forced mask on the host."""
+        if frames[0].walk not in GENERATE_WALKS:
+            return 0
+        return depth_steps_needed(torch.cat([frame.cache.target_provided[:, 1:, 0] for frame in frames]))
+
     def run_frames(
         self,
         frames: list[LMFrame],
         backend,
         sample_text: Callable[[torch.Tensor], torch.Tensor],
         sample_depth: Callable[[torch.Tensor, int], torch.Tensor],
+        depth_steps: int | None = None,
     ) -> list[NameToTensorList]:
         """Temporal forward, sampling, depformer and cache commits for one frame of each request.
 
         Row ``i`` of the batch is ``frames[i]``; the samplers map ``[B, vocab]``
-        logits to ``[B]`` tokens. Returns each request's outputs in order.
+        logits to ``[B]`` tokens. ``depth_steps`` is ``depth_steps(frames)``,
+        computed here when not given. Returns each request's outputs in order.
         """
         walk = frames[0].walk
         if any(frame.walk != walk for frame in frames):
@@ -216,7 +230,11 @@ class LMSubmodule(ARNodeSubmodule):
             def sample_audio(logits: torch.Tensor, step: int) -> torch.Tensor:
                 return _sampled_token_ids(sample_depth(logits, step), target[:, 0], f"depth sampler step {step}")
 
-            audio = self.lm.depth.run_frame(next_text, hidden, target[:, 1:], provided[:, 1:], sample_audio)
+            if depth_steps is None:
+                depth_steps = self.depth_steps(frames)
+            audio = self.lm.depth.run_frame(
+                next_text, hidden, target[:, 1:], provided[:, 1:], sample_audio, steps=depth_steps
+            )
         results = []
         for row, frame in enumerate(frames):
             cache = frame.cache
@@ -251,7 +269,9 @@ class LMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]
     ) -> dict[str, Any]:
         del graph_walk, engine_inputs
-        return {"frames": [inp.kwargs["frame"] for inp in inputs]}
+        frames = [inp.kwargs["frame"] for inp in inputs]
+        with torch.no_grad():
+            return {"frames": frames, "depth_steps": self.depth_steps(frames)}
 
     def declare_step(
         self,
@@ -274,7 +294,9 @@ class LMSubmodule(ARNodeSubmodule):
             steps=steps,
         )
 
-    def _run_engine_frames(self, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame]) -> list[NameToTensorList]:
+    def _run_engine_frames(
+        self, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame], depth_steps: int | None
+    ) -> list[NameToTensorList]:
         if self._backend is None:
             raise RuntimeError("LM resources are not bound")
         self._backend.begin()
@@ -285,19 +307,24 @@ class LMSubmodule(ARNodeSubmodule):
             frames, self._backend,
             lambda logits: text_sampler.sample(rids, logits),
             lambda logits, _step: depth_sampler.sample(rids, logits.float()),
+            depth_steps,
         )
 
     @torch.no_grad()
-    def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame], **kwargs):
+    def forward(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame],
+        depth_steps: int | None = None, **kwargs
+    ):
         del graph_walk, kwargs
-        return self._run_engine_frames(engine_inputs, frames)[0]
+        return self._run_engine_frames(engine_inputs, frames, depth_steps)[0]
 
     @torch.no_grad()
     def forward_batched(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame], **kwargs
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame],
+        depth_steps: int | None = None, **kwargs
     ) -> dict[str, NameToTensorList]:
         del graph_walk, kwargs
-        outputs = self._run_engine_frames(engine_inputs, frames)
+        outputs = self._run_engine_frames(engine_inputs, frames, depth_steps)
         return dict(zip(engine_inputs.request_ids, outputs, strict=True))
 
     def check_stop(self, request_id: str, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
