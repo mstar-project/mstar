@@ -305,3 +305,13 @@ def test_an_offload_outside_preemption_reloads_as_before(decides):
 
     assert kv.can_reload("r") and kv.reload("r"), "r waited in the queue behind w"
     assert kv._allotments.get("r", manager_mod.Allotment(0)).remaining == remaining, "the reload changed r's allotment"
+
+
+def test_a_guaranteed_request_is_never_moved_to_the_host():
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "r", 3, arrival=0)
+    _running(kv, "g", 2, arrival=1, guaranteed=True)
+    short = _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short
+
+    assert kv.preempt("r", short, droppable=lambda rid: False) == ["r"], "a guaranteed request was moved to the host"
