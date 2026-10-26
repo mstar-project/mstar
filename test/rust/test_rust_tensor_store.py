@@ -368,9 +368,10 @@ def test_a_tensor_freed_with_the_gil_released_is_gone_on_return(tmp_path):
     rt.pop_rids("LLM", "decode", [rid])
 
     column = torch.tensor([5], dtype=torch.int64)
-    status, _cid, _sent, route = rt.route_and_send_inline(
+    out = rt.route_and_send_inline(
         "default", "decode", "LLM", ["tok"], [rid], "tok", column, [rid],
     )
+    status, route = out.status, out.route_output
     assert status == 1, "nothing left for Python to tear down"
     assert route is None
     assert ref() is None
