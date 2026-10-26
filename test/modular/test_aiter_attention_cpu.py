@@ -272,6 +272,34 @@ def test_an_eager_ragged_step_is_exact():
     assert (plan.max_seqlen_q, plan.out) == (30, None)
 
 
+def test_one_request_brings_several_segments_to_a_captured_step():
+    """A segment per image or frame group, one request a step, like Qwen3.5's
+    captured vision block loop. A leased plan holds the ``max_segments_per_request``
+    the model's lease check reads, so one request with more never gets a lease
+    and plans eagerly instead."""
+    config = RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=72, max_segments_per_request=4)
+    m = AiterRaggedManager(device=CPU, dtype=torch.bfloat16, config=config)
+    assert m.max_segments_per_request == 4
+
+    def plan(spans, leased=True):
+        step = AttentionStep(segments=tuple(Segment("a", "main", n) for n in spans), causal=False)
+        m.plan(step, StepContext(
+            request_ids=["a"], graph_walk="w", slot=0, capture=False,
+            slot_lease=lease(1, 1024) if leased else None,
+        ))
+        return m._current_plans["main"]
+
+    three = plan([256, 64, 16])
+    assert three.cu_seqlens_q.tolist() == [0, 256, 320, 336, 336]
+    assert (three.num_segments, three.num_tokens, three.max_seqlen_q) == (3, 336, 1024)
+    four = plan([256] * 4)
+    assert four.cu_seqlens_q.tolist() == [0, 256, 512, 768, 1024]
+    assert four.cu_seqlens_q.data_ptr() == three.cu_seqlens_q.data_ptr(), "a replay reads the captured address"
+    with pytest.raises(ValueError, match="5 segments"):
+        plan([16] * 5)
+    assert plan([16] * 5, leased=False).cu_seqlens_q.tolist() == [0, 16, 32, 48, 64, 80]
+
+
 def test_ragged_cross_pairs_plan_their_own_key_layout():
     m = AiterRaggedCrossManager(device=CPU, dtype=torch.bfloat16, config=ragged_config())
     step = RaggedCrossAttentionStep(

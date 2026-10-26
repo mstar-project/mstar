@@ -106,6 +106,12 @@ class _AiterRaggedBase:
         self._preplanned = False
 
     @property
+    def max_segments_per_request(self) -> int:
+        """Segments one request may bring to a captured plan, as configured
+        (after YAML overrides); a captured plan holds this many per row."""
+        return self._config.max_segments_per_request
+
+    @property
     def supports_preplan(self):
         return True
 

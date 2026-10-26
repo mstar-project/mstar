@@ -442,6 +442,42 @@ def test_ragged_captured_with_empty_padding_segments(d):
         assert not out[n:].any(), "rows past the plan read back zero"
 
 
+@pytest.mark.parametrize("d", [64, 72])
+def test_ragged_one_request_with_several_segments_replays(d):
+    """One request a replay with a segment per image or frame group, like
+    Qwen3.5's vision block loop at batch size 1. Captured over one span, as the
+    piecewise runner does, then replayed with up to ``max_segments_per_request``."""
+    from mstar.engine.resources.attn.ragged.aiter import AiterRaggedManager
+
+    m = _ragged(AiterRaggedManager, d, hq=12, hkv=12, max_segments=4)
+    lease = SlotLease(slot=0, bucket=BucketKey("w", 1, 1024))
+
+    def plan(spans):
+        m.plan(AttentionStep(segments=tuple(Segment("r0", "main", n) for n in spans), causal=False),
+               StepContext(request_ids=["r0"], graph_walk="w", slot=0, capture=False, slot_lease=lease))
+
+    plan([1024])
+    bufs = [torch.zeros(1024, 12, d, dtype=torch.bfloat16, device=DEV) for _ in range(3)]
+    graph, out = _capture(lambda: m.run(*bufs))
+    for spans in ([256, 64, 16], [256, 256, 256, 256], [100, 0, 400, 7], [1000]):
+        plan(spans)
+        n = sum(spans)
+        q, k, v = (torch.randn(n, 12, d, device=DEV).to(torch.bfloat16) for _ in range(3))
+        for buf, t in zip(bufs, (q, k, v), strict=True):
+            buf[:n].copy_(t)
+        graph.replay()
+        torch.cuda.synchronize()
+        cu = [0]
+        for s in spans:
+            cu.append(cu[-1] + s)
+        rows = [(spans[i], k[cu[i]:cu[i + 1]], v[cu[i]:cu[i + 1]]) for i in range(len(spans))]
+        err, nonfinite = max_err(out, reference(q, rows, d ** -0.5, causal=False))
+        assert nonfinite == 0 and err < 1, (spans, err, nonfinite)
+        assert not out[n:].any(), "rows past the plan read back zero"
+    with pytest.raises(ValueError, match="5 segments"):
+        plan([16] * 5)
+
+
 def test_ragged_cross_parity():
     from mstar.engine.resources.attn.ragged.aiter import AiterRaggedCrossManager
 
