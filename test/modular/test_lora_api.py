@@ -41,6 +41,7 @@ from mstar.api_server.openai.adapters import SubmitArgs  # noqa: E402
 from mstar.api_server.request_types import APIServerMessage, LoraAdapterResult, RequestFailed  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
 from mstar.communication.wire import decode, encode  # noqa: E402
+from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.conductor.lora_ops import LoraAdapterOps  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig  # noqa: E402
@@ -368,6 +369,35 @@ def test_a_load_is_answered_only_once_every_worker_acknowledged(paths):
     assert out.answers() == []
     ops.ack(LoraAdapterAck(op_id="op1", worker_id="worker_1"))
     assert out.answers() == [LoraAdapterResult(op_id="op1", status=200)]
+
+
+def test_a_request_on_an_adapter_being_loaded_or_unloaded_is_refused(paths):
+    """Each worker finishes a load or unload in its own time, so the conductor refuses
+    (409) a request on its adapter until every worker answered, rather than have one rank
+    open the request and another refuse it."""
+    spec = make_spec({}, runtime_updates=True)
+    conductor = object.__new__(Conductor)
+    conductor.model = SimpleNamespace(get_node_resources=lambda: [spec], get_request_resource_configs=lambda **kw: {})
+    conductor.model_config = {"resources": {LORA_RESOURCE_KEY: {}}}
+    conductor._kv_labels, conductor.requests = {}, {}
+    conductor._lora_ops_cache = ops = LoraAdapterOps(spec, ["worker_0", "worker_1"], _Outbox())
+    conductor._do_ingest_request = lambda body: conductor._get_resource_configs(body.model_kwargs, {})
+    rejected = []
+    conductor._reject_request = lambda rid, error, status: rejected.append((rid, status))
+
+    def admit(rid, adapter):
+        conductor._admit_request(SimpleNamespace(request_id=rid, model_kwargs={LORA_ADAPTER_KWARG: adapter}))
+
+    ops.load(LoadLoraAdapter(op_id="l", lora_name="a1", lora_path=paths["a1"]))
+    admit("on_a1", "a1")
+    admit("on_a2", "a2")
+    ops.ack(LoraAdapterAck(op_id="l", worker_id="worker_0"))
+    admit("still_on_a1", "a1")
+    ops.ack(LoraAdapterAck(op_id="l", worker_id="worker_1"))
+    admit("done", "a1")
+    ops.unload(UnloadLoraAdapter(op_id="u", lora_name="a1"))
+    admit("unloading", "a1")
+    assert rejected == [("on_a1", 409), ("still_on_a1", 409), ("unloading", 409)]
 
 
 def test_a_load_a_worker_never_answers_times_out_and_is_undone(paths):

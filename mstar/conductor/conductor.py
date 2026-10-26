@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 import yaml
+from fastapi import HTTPException
 
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -674,7 +675,9 @@ class Conductor:
         A KV resource with declared labels gets a config even when the model
         returned none, or its keys and layout would have nowhere to go. So does
         any resource whose spec builds one from the request's kwargs
-        (``NodeResourceSpec.request_config``).
+        (``NodeResourceSpec.request_config``). A request on a LoRA adapter that
+        a runtime load or unload is in flight for is refused
+        (``LoraAdapterOps.refuse_request``).
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
@@ -686,6 +689,9 @@ class Conductor:
             config = spec.request_config(model_kwargs)
             if config is not None:
                 configs.setdefault(key, config)
+        lora_ops = getattr(self, "_lora_ops_cache", None)
+        if lora_ops is not None:
+            lora_ops.refuse_request(configs.values())
         return configs
 
     def _lora_ops(self) -> LoraAdapterOps:
@@ -1157,7 +1163,8 @@ class Conductor:
 
         An exception here would otherwise reach the run loop, which only logs
         it, and the client would wait for its timeout. A ``ValueError`` raised
-        before any worker heard of the request is the client's fault: a 400.
+        before any worker heard of the request is the client's fault: a 400,
+        and an ``HTTPException`` carries its own status.
         """
         try:
             self._do_ingest_request(body)
@@ -1168,6 +1175,9 @@ class Conductor:
                 self.requests.pop(body.request_id, None)
                 if isinstance(exc, ValueError):
                     self._reject_request(body.request_id, str(exc), status=400)
+                    return
+                if isinstance(exc, HTTPException):
+                    self._reject_request(body.request_id, exc.detail, status=exc.status_code)
                     return
                 logger.exception("Ingest failed for request %s", body.request_id)
                 self._reject_request(

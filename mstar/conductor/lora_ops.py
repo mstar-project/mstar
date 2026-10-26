@@ -4,7 +4,10 @@ The API server asks; the conductor forwards the request to every worker hosting 
 with the LoRA pool and answers once all of them have acknowledged. A load is answered as
 done only when every worker loaded it; if any failed, the others are told to unload it
 again. Which names are served is the API server's to track (``ServedModels``, which a
-request's adapter is selected from): the conductor keeps no registry of its own.
+request's adapter is selected from): the conductor keeps no registry of its own, only
+the operations in flight, during which it refuses requests on their adapters with a 409:
+each worker finishes an operation in its own time, so the ranks of one lockstep instance
+could open such a request differently.
 
 A worker that never answers (hung, dead) would leave the name refused with a 409 for good.
 Past ``runtime_update_timeout_s`` an operation is given up: a load is undone on every
@@ -16,11 +19,14 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from fastapi import HTTPException
+
 from mstar.api_server.request_types import APIServerMessage, LoraAdapterResult
-from mstar.engine.resources.lora.config import LoraSpec
+from mstar.engine.resources.lora.config import LoraReqConfig, LoraSpec
+from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.utils.ipc_format import (
     LoadLoraAdapter,
     LoraAdapterAck,
@@ -94,6 +100,18 @@ class LoraAdapterOps:
         if not op.waiting:
             del self._pending[body.op_id]
             self._finish(op)
+
+    def refuse_request(self, configs: Iterable[ResourceReqConfig]) -> None:
+        """Refuse (409) a request whose adapter a load or unload is in flight for."""
+        if not self._pending:
+            return
+        busy = {op.body.lora_name for op in self._pending.values()}
+        for config in configs:
+            if isinstance(config, LoraReqConfig) and config.adapter in busy:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"LoRA adapter '{config.adapter}' is being loaded or unloaded; retry once that is done",
+                )
 
     def _refusal(self, name: str) -> tuple[int, str] | None:
         if self._spec is None or not self._spec.runtime_updates:
