@@ -74,6 +74,7 @@ def _worker(known_rids=("r1", "r2")):
     w._graph_runtime = _Runtime(known_rids)
     w.scheduler = MicroScheduler.__new__(MicroScheduler)
     w.scheduler.failed_rids = set()
+    w.scheduler.read_failed_rids = set()
     w.scheduler.held_until = {}
     w.scheduler.admit_errors = {}
     w.scheduler.backlog = {}
@@ -291,6 +292,7 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
+        take_failed_reads=lambda: [],
         get_tensor=lambda uuid: object(),
         dereference=dereferenced.append,
     )
@@ -323,6 +325,7 @@ def test_a_failed_output_releases_the_outputs_held_behind_it():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
+        take_failed_reads=lambda: [],
         get_tensor=lambda uuid: object(),
         dereference=lambda uuid: None,
     )

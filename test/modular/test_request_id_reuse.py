@@ -95,6 +95,11 @@ class _TensorManager:
     def register_for_send(self, request_id, tensor_infos):
         pass
 
+    def take_failed_reads(self):
+
+        return []
+
+
     def get_ready_tensors(self):
         return {}
 

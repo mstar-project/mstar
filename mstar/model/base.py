@@ -27,7 +27,6 @@ from mstar.graph.base import (
     Parallel,
     Sequential,
     TensorPointerInfo,
-    top_level_entities,
 )
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
@@ -390,26 +389,6 @@ def node_moe_parallel_configs(node_groups: list[dict]) -> dict[str, "MoeParallel
     return {node: cfg for node, cfg in configs.items() if cfg != MoeParallelConfig()}
 
 
-def _self_triggered(entity: GraphNode | Loop) -> bool:
-    """Whether the stream alone can re-run a top-level entity once it completes:
-    it is, or (a Loop) holds, a consumer with every input streamed. Completion
-    reseeds streaming readiness only for such nodes; a consumer with a
-    non-streamed input has to receive it again first."""
-    return any(
-        node.consumes_stream and node.input_names <= node._streaming_inputs
-        for node in entity.get_nodes().values()
-    )
-
-
-def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
-    """Whether every request runs all of these worker graphs on the same
-    workers: the conductor picks one replica per node_group, so they share a
-    node_group, or each is a single instance on the same ranks."""
-    if len({wg._group_id for wg in wgs}) == 1:
-        return True
-    return all(len(wg.ranks) == wg.tp_size and wg.ranks == wgs[0].ranks for wg in wgs)
-
-
 @dataclass
 class ForwardPassArgs:
     # full_metadata is at the conductor level
@@ -489,160 +468,34 @@ class Model(ABC):
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Reject a deployment YAML this model cannot serve.
 
-        Called by the Conductor at startup with the parsed YAML. The model
-        sees only ``model_kwargs`` in ``__init__``, so checks on other keys
-        (``max_concurrent_requests``, ``resources``, ...) belong here. Raise
-        ``ValueError`` naming the key; ``config_path`` is for the message.
+        Called by ``validate_deployment`` in the conductor at startup, with the
+        parsed YAML. The model sees only ``model_kwargs`` in ``__init__``, so
+        checks on other keys (``max_concurrent_requests``, ``resources``, ...)
+        belong here. Raise ``ValueError`` naming the key; ``config_path`` is
+        for the message.
         """
         return
 
     def get_worker_graphs(self, config_path: str) -> list[WorkerGraph]:
+        """Divide every walk into worker graphs by ``node_groups``, first
+        refusing a placement that cannot be divided, with every problem in one
+        ``DeploymentError``. ``validate_deployment`` checks the result."""
+        from mstar.validation import DeploymentError
+        from mstar.validation.placement import check_placement
+
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
-        node_groups = config.get("node_groups")
-        if node_groups is None:
-            raise KeyError("Config must define `node_groups`.")
+        problems = check_placement(self, config)
+        if problems:
+            raise DeploymentError(config_path, problems)
 
-        walk_graphs = self.get_graph_walk_graphs()
-        self._check_walk_placement(walk_graphs, node_groups, config_path)
+        node_groups = config["node_groups"]
         # TODO: merge identical worker graphs from different graph walks
-        walk_to_wgs = {
-            graph_walk: self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
-            for graph_walk, graph in walk_graphs.items()
-        }
-        self._check_stream_driven_walks(walk_to_wgs, config_path)
-        self._check_loop_successors(walk_to_wgs, config_path)
-        return sum(walk_to_wgs.values(), start=[])
-
-    def _check_walk_placement(
-        self, walk_graphs: dict[str, GraphSection], node_groups: list[dict], config_path: str,
-    ) -> None:
-        """Reject declarations the conductor would accept and then serve wrongly:
-        a walk in no partition or in two (its worker graphs are registered on no
-        worker, or in both partitions), and a node of a walk in no node_group or
-        in two (the later group silently wins)."""
-        partitions = self.get_partitions()
-        for part in partitions:
-            unknown = sorted(part.graph_walks - walk_graphs.keys())
-            if unknown:
-                raise ValueError(
-                    f"Partition {part.name!r} lists graph walks {unknown} that "
-                    f"get_graph_walk_graphs() does not define (walks: {sorted(walk_graphs)})."
-                )
-        for walk in walk_graphs:
-            owners = [part.name for part in partitions if walk in part.graph_walks]
-            if len(owners) != 1:
-                raise ValueError(
-                    f"Graph walk {walk!r} is in {len(owners)} partitions {owners}; "
-                    "every walk must be listed in the graph_walks of exactly one "
-                    "PartitionDefinition from get_partitions()."
-                )
-
-        for i, group in enumerate(node_groups):
-            unknown = sorted(set(group.get("graph_walks", [])) - walk_graphs.keys())
-            if unknown:
-                raise ValueError(
-                    f"{config_path}: node_groups[{i}] (nodes {group['node_names']}) lists "
-                    f"graph_walks {unknown}, which this model does not define "
-                    f"(walks: {sorted(walk_graphs)})."
-                )
-        for walk, graph in walk_graphs.items():
-            for node in graph.get_nodes():
-                groups = [
-                    i for i, group in enumerate(node_groups)
-                    if node in group["node_names"]
-                    and ("graph_walks" not in group or walk in group["graph_walks"])
-                ]
-                if len(groups) != 1:
-                    where = ", ".join(f"node_groups[{i}]" for i in groups) or "no node_groups entry"
-                    raise ValueError(
-                        f"{config_path}: node {node!r} of graph walk {walk!r} is placed by "
-                        f"{where}; place it in exactly one node_groups entry for that walk "
-                        "(use graph_walks to give one node different ranks per walk)."
-                    )
-
-    def _check_stream_driven_walks(
-        self, walk_to_wgs: dict[str, list[WorkerGraph]], config_path: str,
-    ) -> None:
-        """Reject stream-driven walk shapes the runtime and conductor can't
-        account for.
-
-        A worker graph counts entity completions per pass, and a self-triggered
-        consumer (every input streamed) is re-armed for the next chunk as soon as
-        it completes, so a second top-level entity can be counted done before it
-        runs, and the pass-end reset drops input it has buffered. A consumer
-        gated on a non-streamed input waits for that input instead, which is
-        safe when it arrives once per pass (from the conductor, say).
-        Across worker graphs, self-triggered passes overlap with no pass
-        identity, and the conductor reads the final-stream flag only off the
-        report that closes a pass: the flag is per worker, so it is there only
-        if every worker graph of the walk runs on the consumer's workers. A walk
-        with no stream-consuming node is conductor driven and unaffected, and a
-        TP worker graph is one worker graph on several ranks.
-        """
-        topology = self.get_partition_topology()
-        consumer_partitions = {conn.to_partition for conn in topology.connections}
-        walk_partition = {
-            walk: part.name for part in self.get_partitions() for walk in part.graph_walks
-        }
-        for walk, wgs in walk_to_wgs.items():
-            if walk_partition[walk] not in consumer_partitions:
-                continue
-            if not any(wg.consumes_stream for wg in wgs):
-                continue
-            where = f"{config_path}: graph walk {walk!r} of consumer partition {walk_partition[walk]!r}"
-            entities = [top_level_entities(wg.section) for wg in wgs]
-            triggered = sorted(
-                name for ents in entities for name, e in ents.items() if _self_triggered(e)
-            )
-            if len(wgs) > 1 and (triggered or not _on_same_workers(wgs)):
-                raise ValueError(
-                    f"{where} consumes a stream and spans {len(wgs)} worker graphs "
-                    f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
-                    f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
-                    "is served only with every consumer gated on a non-streamed input that "
-                    "arrives once per pass and every worker graph on the same workers (one "
-                    "node_group, or one instance on the same ranks); otherwise run it as "
-                    "one worker graph, or move the work after the consumer into a "
-                    "downstream partition fed by a StreamingGraphEdge."
-                )
-            if len(wgs) == 1 and len(entities[0]) > 1 and triggered:
-                raise ValueError(
-                    f"{where} has self-triggered consumers {triggered} (every input "
-                    f"streamed) among {len(entities[0])} top-level entities {sorted(entities[0])} "
-                    "in one worker graph. Gate the consumer on a non-streamed input that "
-                    "arrives once per pass (from the conductor, say), or move the work "
-                    "after it into a downstream partition fed by a StreamingGraphEdge."
-                )
-
-    def _check_loop_successors(
-        self, walk_to_wgs: dict[str, list[WorkerGraph]], config_path: str,
-    ) -> None:
-        """Reject a Loop member with an edge to a node outside the Loop in the
-        same worker graph.
-
-        A worker graph counts top-level completions, and that successor
-        completes once per iteration, so the pass ends before the Loop and the
-        successor's later inputs are done, and the pass-end reset drops them.
-        ``Loop.accumulated_outputs`` hands the successor every iteration's
-        output once, when the Loop finishes.
-        """
-        for walk, wgs in walk_to_wgs.items():
-            for wg in wgs:
-                wg_nodes = wg.section.get_nodes()
-                for loop in wg.section.get_loops().values():
-                    members = loop.get_nodes()
-                    for name, node in members.items():
-                        for edge in node.outputs:
-                            if edge.next_node in wg_nodes and edge.next_node not in members:
-                                raise ValueError(
-                                    f"{config_path}: graph walk {walk!r}: node {name!r} of Loop "
-                                    f"{loop.name!r} sends {edge.name!r} to {edge.next_node!r}, "
-                                    "outside the Loop in the same worker graph. The worker graph "
-                                    "would report done before the Loop and its successor finish. "
-                                    "Send it through Loop.accumulated_outputs (every iteration's "
-                                    "output, once the Loop finishes) or Loop.outputs instead."
-                                )
+        return [
+            wg
+            for graph_walk, graph in self.get_graph_walk_graphs().items()
+            for wg in self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
+        ]
 
     def get_sharding_config(self, config_path: str) -> ShardingConfig:
         with open(config_path, "r") as f:
@@ -668,24 +521,6 @@ class Model(ABC):
             instance_size = tp * sp
             if instance_size <= 1:
                 continue
-            if tp > 1 and any(
-                node not in sharding_config.tp_enabled_nodes
-                for node in ng["node_names"]
-            ):
-                raise ValueError(
-                    f"Node group with tp_size {tp} contains "
-                    f"nodes not in tp_enabled_nodes {sharding_config.tp_enabled_nodes}: "
-                    f"{ng['node_names']}"
-                )
-            if sp > 1 and any(
-                node not in sharding_config.sp_enabled_nodes
-                for node in ng["node_names"]
-            ):
-                raise ValueError(
-                    f"Node group with sp_size {sp} contains "
-                    f"nodes not in sp_enabled_nodes {sharding_config.sp_enabled_nodes}: "
-                    f"{ng['node_names']}"
-                )
             # The sharding group is the lockstep unit — tp*sp workers routed
             # together. TP shards weights via shard_dim-driven fanout; SP is
             # in-module (replicated signals, no shard_dim) but its ranks must

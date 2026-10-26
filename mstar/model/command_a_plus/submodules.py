@@ -1,4 +1,4 @@
-"""Packed prefill and one-token-per-request decode for Command A+."""
+"""Packed prefill, one-token-per-request decode, and the image encoder for Command A+."""
 
 from collections.abc import Mapping
 from typing import Any
@@ -18,15 +18,40 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.model.command_a_plus.components.language_model import CommandAPlusForCausalLM
+from mstar.model.command_a_plus.components.vision import CommandAPlusVisionEncoder
 from mstar.model.command_a_plus.config import (
     GLOBAL_ATTN,
     KV_CACHE,
     LOCAL_ATTN,
+    PREFILL_WALKS,
     ROPE,
     SAMPLER,
     CommandAPlusTextConfig,
 )
-from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
+from mstar.model.submodule_base import (
+    ARNodeInputs,
+    ARNodeSubmodule,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+)
+
+
+class CommandAPlusVisionSubmodule(NodeSubmodule):
+    """Turns a request's image tiles into the embeddings for its ``<|IMG_PATCH|>`` tokens."""
+
+    disable_torch_compile = True
+
+    def __init__(self, encoder: CommandAPlusVisionEncoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+        tiles = torch.cat(inputs["pixel_values"]).to(self.get_device())
+        return NodeInputs(tensor_inputs={"pixel_values": tiles})
+
+    def forward(self, graph_walk, engine_inputs, pixel_values, **kwargs) -> NameToTensorList:
+        return {"image_embeds": [self.encoder(pixel_values)]}
 
 
 class CommandAPlusLLMSubmodule(ARNodeSubmodule):
@@ -34,10 +59,13 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
     # off until compiled numerics get their own parity checks.
     disable_torch_compile = True
 
-    def __init__(self, language_model: CommandAPlusForCausalLM, config: CommandAPlusTextConfig):
+    def __init__(
+        self, language_model: CommandAPlusForCausalLM, config: CommandAPlusTextConfig, image_token_id: int,
+    ):
         super().__init__()
         self.language_model = language_model
         self.config = config
+        self.image_token_id = image_token_id
         self._ended_at_prefill: set[str] = set()
 
     def get_accelerator_graph_configs(
@@ -56,7 +84,7 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
 
     @staticmethod
     def _check_walk(graph_walk: str) -> None:
-        if graph_walk not in ("prefill", "decode"):
+        if graph_walk not in (*PREFILL_WALKS, "decode"):
             raise ValueError(f"Unknown Command A+ graph walk: {graph_walk!r}")
 
     def prepare_inputs(
@@ -73,7 +101,15 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
         if graph_walk == "decode" and ids.numel() != 1:
             raise ValueError("decode requires exactly one token per request")
         ids = ids.to(device=self.get_device(), dtype=torch.long)
-        return ARNodeInputs(input_ids=ids, input_seq_len=ids.numel())
+        if graph_walk != "prefill_image":
+            return ARNodeInputs(input_ids=ids, input_seq_len=ids.numel())
+        # Embedded here, so a chunked prefill cuts the embeddings with the ids.
+        (image_embeds,) = inputs["image_embeds"]
+        embeds = self.language_model.model.embed(ids)
+        embeds = embeds.masked_scatter(
+            (ids == self.image_token_id).unsqueeze(-1), image_embeds.to(embeds.device, embeds.dtype),
+        )
+        return ARNodeInputs(input_ids=ids, input_embeds=embeds, input_seq_len=ids.numel())
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
@@ -95,7 +131,7 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
                     apply_penalty=True,
                     prefill_tracked_tokens={
                         rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
-                    } if graph_walk == "prefill" else {},
+                    } if graph_walk in PREFILL_WALKS else {},
                 ),
             },
         )
@@ -105,13 +141,16 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, Any]:
         self._check_walk(graph_walk)
-        return {"text_inputs": torch.cat([inp.input_ids for inp in inputs])}
+        ids = torch.cat([inp.input_ids for inp in inputs])
+        if graph_walk == "prefill_image":
+            return {"text_inputs": ids, "input_embeds": torch.cat([inp.input_embeds for inp in inputs])}
+        return {"text_inputs": ids}
 
-    def _sample(self, graph_walk, engine_inputs, text_inputs):
+    def _sample(self, graph_walk, engine_inputs, text_inputs, input_embeds=None):
         self._check_walk(graph_walk)
-        embeddings = self.language_model.model.embed(text_inputs)
+        embeddings = self.language_model.model.embed(text_inputs) if input_embeds is None else input_embeds
         hidden = self.language_model(embeddings, label="main")
-        if graph_walk == "prefill":
+        if graph_walk in PREFILL_WALKS:
             # Both managers have the same packing. Pick the final real prompt
             # token for each request, never the last row of the whole batch.
             hidden = engine_inputs.resources[LOCAL_ATTN].select_last_hidden(hidden, label="main")
@@ -120,18 +159,18 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor, **kwargs,
+        text_inputs: torch.Tensor, input_embeds: torch.Tensor | None = None, **kwargs,
     ) -> NameToTensorList:
-        return {"new_token": [self._sample(graph_walk, engine_inputs, text_inputs)]}
+        return {"new_token": [self._sample(graph_walk, engine_inputs, text_inputs, input_embeds)]}
 
     def can_batch(self, batch, model_inputs) -> bool:
         return True
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor, **kwargs,
+        text_inputs: torch.Tensor, input_embeds: torch.Tensor | None = None, **kwargs,
     ) -> dict[str, NameToTensorList]:
-        tokens = self._sample(graph_walk, engine_inputs, text_inputs)
+        tokens = self._sample(graph_walk, engine_inputs, text_inputs, input_embeds)
         return {
             rid: {"new_token": [tokens[i:i + 1]]}
             for i, rid in enumerate(engine_inputs.request_ids)
@@ -141,7 +180,7 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
         # Metadata only: check_stop reads the token values, off the GPU thread.
         if "new_token" not in outputs:
             return
-        if request_info.graph_walk == "prefill":
+        if request_info.graph_walk in PREFILL_WALKS:
             if request_info.max_tokens > 1:
                 outputs["decode_input"] = outputs["new_token"]
             return
@@ -152,7 +191,7 @@ class CommandAPlusLLMSubmodule(ARNodeSubmodule):
 
     def check_stop(self, request_id, request_info, outputs) -> set[str]:
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        if request_info.graph_walk == "prefill":
+        if request_info.graph_walk in PREFILL_WALKS:
             if (request_info.max_tokens > 1 and not ignore_eos
                     and outputs["new_token"][0].item() == self.config.eos_token_id):
                 self._ended_at_prefill.add(request_id)

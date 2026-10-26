@@ -1777,9 +1777,7 @@ class KVManager(AttentionResource):
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
                 # to allocate on a near-full arena and hold the batch.
-                if segment.span == 0 or self._on_sink(ctx, segment.request_id) or (
-                    sink and (segment.request_id, segment.label) in sink
-                ):
+                if not self._reserves(ctx, sink, segment):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
@@ -1794,7 +1792,9 @@ class KVManager(AttentionResource):
                     segment.request_id, segment.label, seq_len,
                 )
                 if not alloc_res.success:
-                    return AdmitOutcome(ok=False, reason=alloc_res.error)
+                    return AdmitOutcome(
+                        ok=False, reason=self._sized_refusal(step, ctx, alloc_res.error),
+                    )
                 if alloc_res.new_pages:
                     self._admit_reserved_pages.setdefault(
                         (segment.request_id, segment.label), []
@@ -1807,7 +1807,7 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
-                if self._on_sink(ctx, segment.request_id) or (sink and (segment.request_id, segment.label) in sink):
+                if self._sinks(ctx, sink, segment):
                     continue
                 stream = self._streams.get(
                     segment.request_id, {}
@@ -1824,6 +1824,81 @@ class KVManager(AttentionResource):
         # retention is applied at commit (see `_apply_retention`)
 
         return ADMIT_OK
+
+    def _sized_refusal(
+        self, step: KVStep, ctx: StepContext, error: AdmitFailedReason,
+    ) -> AdmitFailedReason:
+        """``error`` with the step's ``rows_fit`` and ``rows_fit_alone`` filled
+        in, or a terminal refusal naming a request of the step that needs more
+        pages than the whole pool has, the one ``error`` names first: no
+        eviction can make that fit, so retrying it only spins until the client
+        gives up. Caller holds ``_lock``.
+
+        A request's footprint is every distinct page it would hold after the
+        step: the ones its streams hold already, counted once where labels or
+        requests share them, plus the ones `admit` would still reserve for each
+        stream. A segment that runs against the sink holds and needs nothing,
+        and a span-0 one needs nothing beyond what it holds, as in `admit`. The
+        pool is every page but the sink, cached prefixes included, since those
+        can be evicted. ``rows_sized`` is how many real rows were counted.
+        """
+        if not isinstance(error, AllocationFailed):
+            return error
+        page_size = self.config.page_size
+        sink = step.sink
+        held: dict[str, set[int]] = {}
+        needed: dict[tuple[str, str], int] = {}
+        for segment in step.segments:
+            rid = segment.request_id
+            if self._on_sink(ctx, rid):
+                continue
+            # a row with every label on the sink still counts as a row that fits
+            rows_pages = held.setdefault(rid, set())
+            if self._sinks(ctx, sink, segment):
+                continue
+            stream = self._streams.get(rid, {}).get(segment.label)
+            pages = () if stream is None else stream.page_indices
+            rows_pages.update(pages)
+            if not self._reserves(ctx, sink, segment):
+                continue
+            stored = 0 if stream is None else stream.stored_len
+            key = (rid, segment.label)
+            more = -(-(stored + segment.span) // page_size) - len(pages)
+            needed[key] = max(needed.get(key, 0), more)
+        extra: dict[str, int] = {}
+        for (rid, _), more in needed.items():
+            extra[rid] = extra.get(rid, 0) + max(more, 0)
+        capacity = self.config.max_num_pages - 1
+        rows = list(held)
+        # every row, not only the named one: a row refused ahead of one that
+        # fills the pool names itself, and the eviction then takes the filler,
+        # the only row holding pages
+        for rid in sorted(rows, key=lambda rid: rid != error.request_id):
+            own = len(held[rid]) + extra.get(rid, 0)
+            if own > capacity:
+                # the client reads this text, and the rid is the worker's
+                # handle, not an id it sent
+                return AdmitRuntimeError(
+                    message=(
+                        f"The request needs {own} pages of {self.name} for this "
+                        f"step, more than the {capacity} the pool holds; raise "
+                        "max_num_pages or shorten the request."
+                    ),
+                    request_ids=frozenset({rid}),
+                )
+        if error.request_id in rows:
+            error.rows_fit = rows.index(error.request_id)
+        resident: set[int] = set()
+        new = alone = 0
+        for rid in rows:
+            resident |= held[rid]
+            new += extra.get(rid, 0)
+            if len(resident) + new > capacity:
+                break
+            alone += 1
+        error.rows_fit_alone = alone
+        error.rows_sized = len(rows)
+        return error
 
     def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
         """Give back the pages this admit freshly acquired, and clear the
@@ -2467,6 +2542,20 @@ class KVManager(AttentionResource):
             if not KVManager._on_sink(ctx, rid)
             and (step.fork_rids is None or rid in step.fork_rids)
         ]
+
+    @staticmethod
+    def _sinks(ctx: StepContext, sink: frozenset, segment: Segment) -> bool:
+        """Whether ``segment`` runs against SINK_PAGE: its row does (see
+        `_on_sink`), or the step puts its label there."""
+        return KVManager._on_sink(ctx, segment.request_id) or bool(
+            sink and (segment.request_id, segment.label) in sink
+        )
+
+    @staticmethod
+    def _reserves(ctx: StepContext, sink: frozenset, segment: Segment) -> bool:
+        """Whether `admit` reserves pages for ``segment``: it writes tokens,
+        and not against the sink. `_sized_refusal` counts the same ones."""
+        return bool(segment.span) and not KVManager._sinks(ctx, sink, segment)
 
     @staticmethod
     def _on_sink(ctx: StepContext, rid) -> bool:
