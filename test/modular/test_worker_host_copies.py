@@ -93,7 +93,7 @@ def _worker(tmp_path):
     w.tensor_manager = _manager(tmp_path, "worker_0")
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
         check_stop_for_batch=lambda batch, outputs, **kwargs: {},
-        extend_prefix_chains=lambda batch, outputs, **kwargs: None,
+        step_finished=lambda batch, outputs, **kwargs: None,
         materialize_publish=lambda batch, rids: None,
     ))
     w.request_state = SimpleNamespace(
