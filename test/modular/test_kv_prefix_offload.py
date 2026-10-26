@@ -419,14 +419,14 @@ def test_a_write_waits_for_a_queued_copy_of_its_host_page(queued):
     device[:, 1], device[:, 2] = 1.0, 2.0
     pool.copy_out(device, PageCopies(gpu=[1], cpu=[0]))
     # so the next copy is the only one queued since a write last waited on the copy stream
-    pool.write(device, PageCopies(gpu=[1], cpu=[1]), pool.record_compute())
+    pool.write(device, PageCopies(gpu=[1], cpu=[1]))
     torch.cuda.synchronize()
 
     with torch.cuda.stream(pool._stream):
         torch.cuda._sleep(100_000_000)
     getattr(pool, queued)(device, PageCopies(gpu=[3] if queued == "copy_in" else [1], cpu=[0]))
     # host page 0 taken by a write, as if `reload` or `_abandon_claims` had released it with its copy queued
-    pool.write(device, PageCopies(gpu=[2], cpu=[0]), pool.record_compute())
+    pool.write(device, PageCopies(gpu=[2], cpu=[0]))
     torch.cuda.synchronize()
 
     if queued == "copy_in":

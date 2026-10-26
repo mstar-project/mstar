@@ -138,7 +138,7 @@ def test_a_write_that_finished_before_its_pages_were_evicted_is_filed():
 def test_a_page_evicted_while_the_copies_launch_files_nothing():
     kv = _manager()
     # another thread evicts the pages once `after_output_copy` has dropped the lock to launch the copies
-    kv._cpu_pool.write = lambda gpu_kv_cache, copies, written: kv._evict(len(copies.gpu))
+    kv._cpu_pool.write = lambda gpu_kv_cache, copies: kv._evict(len(copies.gpu))
     keys = _cached(kv, "a", A_PROMPT)
     _land(kv)
 
@@ -252,7 +252,7 @@ def test_a_pending_page_evicted_and_reused_before_the_drain_copies_nothing():
 def test_a_copier_that_raises_files_nothing_and_frees_its_host_pages():
     kv = _manager()
 
-    def fails(gpu_kv_cache, copies, written):
+    def fails(gpu_kv_cache, copies):
         raise RuntimeError("copy failed")
 
     kv._cpu_pool.write = fails

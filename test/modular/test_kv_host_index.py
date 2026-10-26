@@ -56,7 +56,7 @@ class _HostPool(CPUPagePool):
     def copy_in(self, gpu_kv_cache, copies):
         self.copied_in.extend(copies.gpu)
 
-    def write(self, gpu_kv_cache, copies, written):
+    def write(self, gpu_kv_cache, copies):
         self.written_out.extend(copies.gpu)
 
     def record_compute(self):

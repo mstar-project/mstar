@@ -593,9 +593,9 @@ class KVManager(AttentionResource):
         self._writing: dict[bytes, HostCopy] = {}
         # `_commit_events` holds, oldest first, the commit count and an event recorded at the end of each
         # commit while keys are pending.
-        # `_commit_done` is the newest of them that `after_output_copy` has seen complete.
+        # `_commit_done` is the commit count of the newest event that `after_output_copy` has seen complete.
         self._commit_events: deque[tuple[int, torch.cuda.Event]] = deque()
-        self._commit_done: tuple[int, torch.cuda.Event] | None = None
+        self._commit_done: int | None = None
         self._writes_per_step = min(
             _WRITE_PAGES_PER_STEP, max(1, _WRITE_BYTES_PER_STEP // self.kv_cache.tensor[:, 0].nbytes),
         )
@@ -1159,12 +1159,10 @@ class KVManager(AttentionResource):
             return
         events = self._commit_events
         while events and events[0][1].query():
-            self._commit_done = events.popleft()
+            self._commit_done = events.popleft()[0]
         if self._commit_done is None:
             return
-        # Waiting on a commit that has run, and not on the step's stream as it is now, keeps the writes
-        # from queueing behind the next step's kernels and so from holding up the next step's output copy.
-        done, event = self._commit_done
+        done = self._commit_done
         with self._lock:
             keys, pages = [], []
             while pending and len(keys) < self._writes_per_step:
@@ -1195,7 +1193,7 @@ class KVManager(AttentionResource):
             self._host_copies.append(write)
         queued = False
         try:
-            self._cpu_pool.write(self.kv_cache.tensor, PageCopies(gpu=pages, cpu=host), event)
+            self._cpu_pool.write(self.kv_cache.tensor, PageCopies(gpu=pages, cpu=host))
             queued = True
         finally:
             event = self._cpu_pool.record_write()

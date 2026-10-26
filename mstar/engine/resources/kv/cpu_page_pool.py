@@ -214,12 +214,11 @@ class CPUPagePool:
         self._copied_since_write = True
         self._copier.copy(gpu_kv_cache, copies.gpu, self.cpu_kv_cache, copies.cpu, stream)
 
-    def write(self, gpu_kv_cache: torch.Tensor, copies: PageCopies, written: torch.cuda.Event) -> None:
+    def write(self, gpu_kv_cache: torch.Tensor, copies: PageCopies) -> None:
         """Copy cached device pages here on a stream of their own, so `sync` never waits for them. The
-        copies wait for ``written``, which completes once the steps that wrote the pages have run."""
+        caller has seen the steps that wrote the pages finish, so the write adds no wait on the compute stream."""
         if self._write_stream is None:
             self._write_stream = torch.cuda.Stream()
-        self._write_stream.wait_event(written)
         # Wait for the copies still queued on `_stream`, because `reload` and `_abandon_claims` release host
         # pages while those copies read or write them.
         if self._copied_since_write:
