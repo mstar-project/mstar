@@ -18,7 +18,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
     RecurrentStep,
 )
-from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
+from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentStatePool
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 
 MAX_SLOTS = 6  # 5 usable, slot 0 is the sink
@@ -192,6 +192,28 @@ def test_a_freed_slot_reads_as_zeros():
     assert slot_of(pool, "d") == freed
     assert not rows.has_state[0].item()
     assert bool((pool.gather("h", rows, layer_idx=1) == 0).all())
+
+
+def test_a_pool_without_a_sink_refuses_gather_and_scatter():
+    """Its padding rows address NO_SLOT, which no index op takes: a clear
+    error naming the pool rather than an IndexError, or on CUDA a
+    device-side assert."""
+    spec = RecurrentStateSpec(
+        "no_sink_state", {"node"},
+        RecurrentStateConfig(
+            num_layers=1, blocks={"h": RecurrentBlockConfig(shape=SHAPE, dtype=torch.float32)},
+            max_slots=MAX_SLOTS, disable_sink_slot=True,
+        ),
+    )
+    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    pool.ingest_request("a")
+    step, ctx = replay(["a"], bs=2)
+    rows = plan(pool, step, ctx)
+    assert rows.slot_indices.tolist()[1] == NO_SLOT
+    with pytest.raises(ValueError, match="'no_sink_state' has no sink slot"):
+        pool.gather("h", rows)
+    with pytest.raises(ValueError, match="'no_sink_state' has no sink slot"):
+        pool.scatter_("h", rows, rows_of(2, 0.0))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
