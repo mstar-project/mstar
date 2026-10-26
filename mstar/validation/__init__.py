@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
 from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources, parse_autocast_dtype
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems
@@ -83,6 +84,12 @@ def validate_deployment(
             problems.append(f"validate_config_yaml failed: {type(e).__name__}: {e}")
         except _UNREADABLE as e:
             problems.append(_unreadable("validate_config_yaml", e))
+        try:
+            refuse_unresolved_lora_adapters(config)
+        except ValueError as e:
+            problems.append(str(e))
+        except _UNREADABLE as e:
+            problems.append(_unreadable("refuse_unresolved_lora_adapters", e))
 
     malformed = node_groups_problems(config)
     problems += malformed

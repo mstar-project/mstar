@@ -11,7 +11,7 @@ under.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, LoraSpec
@@ -38,6 +38,19 @@ def served_lora_targets(spec: LoraSpec) -> list[str] | None:
         return None
     used = set().union(*(adapter_targets(spec, path) for path in spec.adapters.values()))
     return None if not used or used == set(spec.targets) else sorted(used)
+
+
+def refuse_unresolved_lora_adapters(model_config: Mapping[str, Any]) -> None:
+    """Refuse a serving config whose ``lora:`` block names adapters with no pinned digest:
+    workers spawned with it would serve whatever each of their reads finds, rather than
+    the weights the API server keyed the prefix cache under."""
+    block = (model_config.get("resources") or {}).get(LORA_RESOURCE_KEY) or {}
+    unpinned = sorted(set(block.get("adapters") or ()) - set(block.get("adapter_digests") or ()))
+    if unpinned:
+        raise ValueError(
+            f"LoRA adapters {unpinned} have no pinned digest: the API server resolves the "
+            "serving config's adapters (resolve_lora_adapters) and hands the conductor the result"
+        )
 
 
 def resolve_lora_adapters(spec: LoraSpec | None, model_config: dict) -> dict[str, bytes]:

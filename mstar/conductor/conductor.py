@@ -436,7 +436,8 @@ class Conductor:
     ):
         """``model_config`` is the serving config as the API server resolved it (its LoRA
         adapters' digests pinned, say), which the workers are spawned with; None reads
-        ``model_config_file``, which the model's placement methods read in any case."""
+        ``model_config_file``, which the model's placement methods read in any case. A
+        LoRA adapter without its digest is refused either way."""
         self.requests: dict[str, RequestData] = {}
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
