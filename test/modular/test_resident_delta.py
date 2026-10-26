@@ -210,6 +210,7 @@ class _Engine:
     is_offloaded = Engine.is_offloaded
     is_resident = Engine.is_resident
     offload_request = Engine.offload_request
+    paged_kv_caches = Engine.paged_kv_caches
     reclaimable = Engine.reclaimable
     reload_request = Engine.reload_request
     take_resident_delta = Engine.take_resident_delta
@@ -1322,31 +1323,6 @@ def test_a_drop_whose_victim_is_in_a_step_here_waits_and_nothing_behind_it_jumps
     follower.rollback_admit(step, ctx)
     assert follow.apply_resident_delta(NODE, delta, _kept)
     assert _counts(leader) == _counts(follower)
-
-
-def test_a_follower_takes_the_released_pages_rank_0_allots_to_the_request_that_ran_short(monkeypatch):
-    """After an offload, rank 0 allots the pages it freed to the request that ran short. The follower makes the same
-    allotment from the delta, so its next grant for that request is counted as rank 0's is."""
-    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
-    _ingest((leader, follower), "r", 3, arrival=1)
-    _ingest((leader, follower), "v", 5, arrival=2)
-    assert leader.admit_retrieve("r", NODE, "prefill", None).ready
-    assert leader.admit_retrieve("v", NODE, "prefill", None).ready
-    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
-    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
-        assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok
-    # v's pages free on both ranks, as an offload frees them, and rank 0 allots them to r
-    for engine in (lead, follow):
-        engine.remove_request("v")
-    lead._resident_delta[NODE].discard("v")
-    leader.allot_released("r", 1)
-    delta = lead.take_resident_delta(NODE)
-    assert delta.kinds == [MoveKind.ALLOT] and delta.counts == [1], "rank 0 didn't journal the allotment"
-
-    assert follow.apply_resident_delta(NODE, delta, _kept)
-    assert _counts(leader) == _counts(follower), "the follower's counts differ from rank 0's after the allotment"
-    assert _step(leader, "r", 1).ok and _step(follower, "r", 1).ok
-    assert _counts(leader) == _counts(follower), "the ranks counted r's next grant differently"
 
 
 def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):

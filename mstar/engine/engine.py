@@ -2519,7 +2519,8 @@ class Engine:
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction
         )
-        if freed > 0 and node_name in self._resident_delta:
+        # a victim can be offloaded without freeing a page
+        if (freed > 0 or self.is_offloaded(node_name, request_id)) and node_name in self._resident_delta:
             self._journal(node_name, "", MoveKind.OFFLOAD, request_id, 0)
         return freed
 
@@ -2657,11 +2658,12 @@ class Engine:
             elif kind == MoveKind.REBUILD:
                 self.lay_out_rebuild(node_name, rid, kept_ids(rid))
             elif kind == MoveKind.OFFLOAD:
+                hosted = any(kv.cache.moves_to_host(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes)
                 if self.is_offloaded(node_name, rid):
                     logger.debug(
                         "Replay: %s already off %s", wire_rid, node_name,
                     )
-                elif self.reclaimable(node_name, rid) <= 0:
+                elif self.reclaimable(node_name, rid) <= 0 and not hosted:
                     # Nothing resident to move, so this rank already matches the
                     # leader. Distinct from the refusal below, and the difference
                     # matters: ``offload`` answers 0 for both, and treating
@@ -2676,7 +2678,7 @@ class Engine:
                         for resource in resources
                         if resource.supports_eviction
                     )
-                    if freed <= 0:
+                    if not self.is_offloaded(node_name, rid):
                         # Refused for now: a step still holds these pages and
                         # will release them when it commits.
                         logger.warning(

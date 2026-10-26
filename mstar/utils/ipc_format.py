@@ -118,7 +118,7 @@ class Move(NamedTuple):
     rid: str
     kind: MoveKind
     # `pool` is the key of the KV resource the move applies to, or empty for a move on the node as a whole.
-    # `count` is the number of pages of a RESERVE, an ALLOT or an EARMARK, and of kept ids for a DROP.
+    # `count` is the number of pages of a RESERVE or an EARMARK, and of kept ids for a DROP.
     pool: str = ""
     count: int = 0
     victims: tuple[str, ...] = ()
