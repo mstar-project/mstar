@@ -35,7 +35,7 @@ from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import ResourceStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.components.lora.capable import apply_lora
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
@@ -834,13 +834,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep | None:
-        # Leased, the captured block loop plans its own attention per replay. A node
-        # serving adapters still declares its frames: the engine adds their LoRA rows
-        # (this admit is the one that can wait for a slot, and the patch embed and
-        # merger run outside the loop).
+        # Leased, the captured block loop plans its own attention per replay. The step
+        # still declares the frames, from which the engine adds a LoRA pool's rows (this
+        # admit is the one that can wait for a slot, and the patch embed and merger run
+        # outside the loop).
         leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
-        if leased and not self.segment_keys:
-            return None
         # one segment per frame: a frame attends to itself alone, and the frames, in
         # order, are the rows the tower's linears see (the merger's folded)
         segments = [
@@ -884,17 +882,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
 
         def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
             (rid,) = request_ids
-            steps = {VISION_ATTN: AttentionStep(causal=False)}
-            # The region's step is the model's, not the engine's, so it declares its
-            # LoRA rows itself: the prompt as one row, what the bucket's one row holds.
-            # They address the slot the outer step took; the pool restores the outer
-            # plan when the region commits, for the merger after it.
-            prompt = (Segment(request_id=rid, label="main", span=sum(seq_lens)),)
-            for key in self.segment_keys:
-                steps[key] = ResourceStep(segments=prompt)
             return SubmoduleStep(
                 segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
-                steps=steps,
+                steps={VISION_ATTN: AttentionStep(causal=False)},
             )
 
         return {
@@ -902,6 +892,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
                 capture_fn=self._capture_block_loop,
                 make_static_inputs=make_static_inputs,
                 declare_step=declare_step,
+                # the blocks' linears take the adapter: the engine adds a LoRA pool's
+                # rows, which address the slot the outer step took (the pool restores
+                # the outer plan when the region commits, for the merger after it)
+                segment_rows=True,
                 lease_before_step=True,
                 can_lease=self._fits_capture,
                 total_tokens=self.BLOCK_LOOP_PATCH_BUCKETS,
@@ -940,8 +934,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
     ) -> torch.Tensor | None:
         """The block loop replayed once per prompt, or None if not leased.
 
-        A leased step declares no attention of its own (`declare_step`: no step,
-        or only the engine's LoRA rows); a bucket that fits is not enough, as
+        A leased step declares no attention of its own (`declare_step`: its frames
+        alone); a bucket that fits is not enough, as
         ``can_lease`` may have refused the batch, and the eager tower then needs
         the attention plan its step declared. The bucket check keeps a forward
         driven outside the engine (no declaration either) eager.

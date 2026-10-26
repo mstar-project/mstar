@@ -32,7 +32,7 @@ from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lor
 from mstar.engine.resources.lora.serving import lora_spec  # noqa: E402
 from mstar.engine.resources.lora.store import inspect_keys  # noqa: E402
 from mstar.engine.resources.spec import instance_key  # noqa: E402
-from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, SlotLease, StepContext  # noqa: E402
+from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, Segment, SlotLease, StepContext  # noqa: E402
 from mstar.model.components.lora.capable import make_lora_capable  # noqa: E402
 from mstar.model.components.lora.modules import _check  # noqa: E402
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM  # noqa: E402
@@ -335,6 +335,17 @@ def _admit(lora_pool, step, rid, adapter, walk="encode", lease=None):
     return lora, ctx
 
 
+def _region_step(region_cfg, request_ids, seq_lens):
+    """The block loop's step as its runner declares it: the region's own, plus the rows
+    the engine adds for a ``segment_rows`` region, a request's merged into one."""
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+
+    assert region_cfg.segment_rows
+    runner = PiecewiseAcceleratorGraphRunner.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._config, runner._label, runner._segment_keys = region_cfg, VISION_BLOCK_LOOP, (VISION_POOL,)
+    return runner._declared_step(request_ids, seq_lens)
+
+
 def _encode_leased(sub, lora_pool):
     """As the leased path runs it: the outer step plans the adapter rows only (attention
     is the region's), the block loop's region plans its own into its bucket's buffer as
@@ -344,7 +355,7 @@ def _encode_leased(sub, lora_pool):
     lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, VISION_BLOCK_LOOP))
     # the capture, at startup: the region over the bucket's whole shape, on the zero adapter
     lora_pool.ingest_capture_row("cap")
-    cap = region_cfg.declare_step(["cap"], [bucket]).steps[VISION_POOL]
+    cap = _region_step(region_cfg, ["cap"], [bucket]).steps[VISION_POOL]
     cap_ctx = StepContext(request_ids=["cap"], graph_walk=PIECEWISE_WALK, slot=0, capture=True, slot_lease=lease)
     assert lora_pool.admit(cap, cap_ctx).ok
     lora_pool.plan(cap, cap_ctx)
@@ -360,8 +371,8 @@ def _encode_leased(sub, lora_pool):
             kwargs["pixel_values"], kwargs["indices"], kwargs["weights"], kwargs["position_ids"],
         )
         seq_lens = list(kwargs["seq_lengths"])
-        region = region_cfg.declare_step(["r"], seq_lens)
-        assert region.steps[VISION_POOL].segments[0].span == PATCHES
+        region = _region_step(region_cfg, ["r"], seq_lens)
+        assert len(seq_lens) > 1 and region.steps[VISION_POOL].segments == (Segment("r", "main", PATCHES),)
         lora, ctx = _admit(lora_pool, region, "r", "v", walk=PIECEWISE_WALK, lease=lease)
         lora_pool._current = recorded  # the replay reads its capture's views of the planned buffer
         sub._frames.lengths = seq_lens

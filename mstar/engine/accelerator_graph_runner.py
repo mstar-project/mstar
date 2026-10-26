@@ -24,7 +24,15 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
-from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
+from mstar.engine.resources import (
+    BucketKey,
+    CGSlotSpec,
+    Resource,
+    SlotLease,
+    StepContext,
+    StepRunner,
+    SubmoduleStep,
+)
 from mstar.engine.resources.step import PIECEWISE_WALK
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -32,6 +40,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
     declared_step,
+    with_segment_steps,
 )
 from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
@@ -1705,6 +1714,10 @@ class PiecewiseAcceleratorGraphRunner:
         self._label = label
         self._config = config
         self._resources = resources
+        # the resources whose step is the region's segments (``Resource.steps_from_segments``)
+        self._segment_keys = tuple(
+            key for key, r in resources.items() if getattr(r, "steps_from_segments", False)
+        ) if config.segment_rows else ()
         self._step_runner = step_runner
         self._device = device
         self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
@@ -1750,9 +1763,8 @@ class PiecewiseAcceleratorGraphRunner:
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
             # handles, not `ensure`: the declaration only labels its rows, and
             # ingesting here would run before the buffers are built
-            step = self._config.declare_step(
-                self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
-                list(shape.seq_lens),
+            step = self._declared_step(
+                self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs), shape.seq_lens,
             )
             if step is not None and any(
                 self._resources[key].force_double_buffer for key in step.steps
@@ -1789,9 +1801,8 @@ class PiecewiseAcceleratorGraphRunner:
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
             if shapes and self._config.declare_step is not None:
                 shape = shapes[0]
-                step = self._config.declare_step(
-                    self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
-                    list(shape.seq_lens),
+                step = self._declared_step(
+                    self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs), shape.seq_lens,
                 )
                 blocked = blocked_capture_resources(step, self._resources)
                 if blocked:
@@ -2108,7 +2119,7 @@ class PiecewiseAcceleratorGraphRunner:
         """
         if self._config.declare_step is None:
             return None
-        step = self._config.declare_step(list(request_ids), list(seq_lens))
+        step = self._declared_step(request_ids, seq_lens)
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs
@@ -2123,6 +2134,14 @@ class PiecewiseAcceleratorGraphRunner:
         ctx.set_padded_rids(tuple(request_ids))
         step.set_ctx(ctx)
         return step
+
+    def _declared_step(self, request_ids, seq_lens) -> SubmoduleStep | None:
+        """The region's declaration, plus, for a ``segment_rows`` region, its segments
+        under each resource that takes them as its step, as ``declared_step`` adds them
+        for a node: a request's merged into one, as the region's bucket holds a row per
+        request."""
+        step = self._config.declare_step(list(request_ids), list(seq_lens))
+        return with_segment_steps(step, self._segment_keys, f"piecewise region {self._label!r}", per_request=True)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:

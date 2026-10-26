@@ -12,7 +12,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import Resource, ResourceStep, SlotLease, SubmoduleStep
+from mstar.engine.resources import Resource, ResourceStep, Segment, SlotLease, SubmoduleStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 
@@ -533,8 +533,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # node bound to one must say so.
     segment_rows: bool = False
     # the keys of this node's resources whose step is its segments, which
-    # ``declared_step`` adds; set by ``bind_node_resources``. A piecewise region that runs
-    # adapted modules declares its rows under them in its own step.
+    # ``declared_step`` adds; set by ``bind_node_resources``, read by the engine
     segment_keys: tuple[str, ...] = ()
 
     def __init__(self):
@@ -1030,22 +1029,37 @@ def declared_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     """What the engine calls for a node's step: its ``declare_step``, plus a step of its
     segments under each resource that takes them as they are
     (``Resource.steps_from_segments``: a LoRA pool), which the node declares nothing for."""
-    step = submodule.declare_step(*args, **kwargs)
     # the engine drives duck-typed submodules too; one with resources bound is a NodeSubmodule
     keys = getattr(submodule, "segment_keys", ())
+    return with_segment_steps(submodule.declare_step(*args, **kwargs), keys, type(submodule).__name__)
+
+
+def with_segment_steps(
+    step: SubmoduleStep | None, keys: Sequence[str], owner: str, per_request: bool = False,
+) -> SubmoduleStep | None:
+    """``step`` with a ``ResourceStep`` of its segments under each of ``keys``, the
+    resources whose step is the segments (``Resource.steps_from_segments``). ``per_request``
+    merges a request's consecutive segments into one: a piecewise region's capture bucket
+    holds a row per request."""
     if step is None or not keys:
         return step
     if step.segments is None:
         raise ValueError(
-            f"{type(submodule).__name__}'s step declares no SubmoduleStep.segments, which "
-            f"{list(keys)} take as their step"
+            f"{owner}'s step declares no SubmoduleStep.segments, which {list(keys)} take as their step"
         )
     segments = tuple(step.segments)
+    if per_request:
+        merged: list[Segment] = []
+        for segment in segments:
+            if merged and merged[-1].request_id == segment.request_id:
+                merged[-1] = merged[-1]._replace(span=merged[-1].span + segment.span)
+            else:
+                merged.append(segment)
+        segments = tuple(merged)
     for key in keys:
         if key in step.steps:
             raise ValueError(
-                f"{type(submodule).__name__} declares its own step under {key!r}, which "
-                "declared_step adds from its segments"
+                f"{owner} declares its own step under {key!r}, which the engine adds from its segments"
             )
         step.steps[key] = ResourceStep(segments=segments)
     return step

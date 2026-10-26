@@ -962,8 +962,9 @@ placed exactly as weights are.
   engine brackets every planned step's ``preprocess`` and forward, and every capture, in
   ``StepRunner.compute_scope`` (``Resource.enter_compute`` / ``exit_compute``); an
   engine-built pool refuses a delta called outside one. A piecewise region that runs
-  adapted modules declares their rows in its own step, under the node's
-  ``segment_keys``, or its capture is refused.
+  adapted modules sets ``segment_rows=True`` on its config, and the engine adds their
+  rows to its step (a request's segments as one row, what the region's bucket holds),
+  or its capture is refused.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
