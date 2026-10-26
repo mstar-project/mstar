@@ -711,7 +711,7 @@ def test_rank_0_drops_its_victim_before_it_drains_the_journal_for_the_step():
     """A follower drops the victim before it builds the step, so rank 0's drop has to travel with that step."""
     leader = _Leader()
     leader._victims = {"v": None}
-    leader._drop_victims = lambda node: leader.engine._resident_delta[node].add(MoveKind.DROP, "wire-v", count=8)
+    leader._move_victims = lambda node: leader.engine._resident_delta[node].add(MoveKind.DROP, "wire-v", count=8)
 
     leader.maybe_send_zmq_to_tp_followers(_node_batch())
 

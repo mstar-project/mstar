@@ -225,3 +225,13 @@ class CPUPagePool:
     @property
     def num_free_pages(self) -> int:
         return self.arena.num_free
+
+    def room(self) -> int:
+        """Free pages plus the cached pages `place` can evict."""
+        return self.arena.num_free + self.index.freeable()
+
+    def takes(self, pages: int, keys: list[bytes]) -> int:
+        """How many pages `place` takes out of `room` for a stream ``pages`` long, filed under ``keys``. A page
+        another request holds under the same key costs nothing."""
+        owners = self.arena.num_owners
+        return pages - sum(owners[page] > 1 for page in self.index.pages_for(keys))

@@ -135,6 +135,7 @@ def _rank(
     w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
     w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}, {}
     w._logged_pools = []
+    w._kv_caches = {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -254,7 +255,7 @@ def test_rank_0_sends_an_owed_drop_before_the_loop_top_removes_its_victim(monkey
     removal applies, so the removal is stamped with the step that carries the drop."""
     w, log = _rank(monkeypatch, tp_rank=0, inbox=[])
     w.parallel_nodes = w.parallel_leader_nodes = {NODE}
-    w._kv_caches = {"kv": SimpleNamespace(nodes={NODE})}
+    w._kv_caches = {"kv": SimpleNamespace(nodes={NODE}, cache=SimpleNamespace(head_on_host=lambda: None))}
     w._victims = {HANDLES["gone"]: worker_mod.Victim("kv", 1)}
     w._pending_removes = {HANDLES["gone"]: None}
     w._make_executing_batch = lambda **kwargs: SimpleNamespace(node_name=kwargs["node_name"], request_ids=[])

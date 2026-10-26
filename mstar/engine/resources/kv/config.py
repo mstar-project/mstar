@@ -262,7 +262,7 @@ class KVReqConfig(ResourceReqConfig):
     prompt_ids: dict[str, bytes] | None = None
     # its place in the conductor's arrival order, the same on every worker, or None when the conductor gave it no number
     arrival: int | None = None
-    # a guaranteed request reserves what it grows into on each worker and is never preempted
+    # in a pool that decides admission, a guaranteed request reserves what it grows into and is never preempted
     guaranteed: bool = False
 
     def apply_conductor_config(

@@ -120,6 +120,7 @@ def _worker(eng, runtime):
     w.device = torch.device("cpu")
     w._last_active = {}
     w._kv_keys, w._kept_ids, w._rebuild_rows, w._dropped, w._victims, w._preempted = {}, {}, {}, {}, {}, {}
+    w._kv_caches = {}
     w._graph_runtime = runtime
     w.tensor_manager = SimpleNamespace(
         cleanup_collectable=lambda *a: None,

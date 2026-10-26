@@ -1,9 +1,11 @@
-"""A request whose grant runs short drops newer requests and takes the pages they free.
+"""A request whose grant runs short moves newer requests off the device and takes the pages they free.
 
 A new prompt waits in the queue for room, since a pool admits only its oldest waiting request.
 A request that grows past what it was allotted can't wait that way: every request beside it
-may be growing too, and nothing would ever finish. The newest requests the pool can rebuild are dropped,
-and they wait in the queue at their arrival position until their whole history and one more page fit.
+may be growing too, and nothing would ever finish. The newest requests go to the host when the host holds
+them whole, and are otherwise dropped if they can be rebuilt from their token ids. They wait in the queue at their
+arrival position. A request on the host returns once its pages and one more page fit, and a dropped request
+once its whole history and one more page fit.
 So the oldest request always gets its page and finishes.
 """
 
@@ -14,6 +16,7 @@ import sys
 sys.path.insert(0, ".")
 
 import pytest
+import test_kv_host_index as host
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
 
 from mstar.engine.resources.kv import manager as manager_mod
@@ -232,3 +235,83 @@ def test_only_a_deciding_pool_keeps_a_guaranteed_request_from_the_offload(decide
     # Only a deciding pool reserves a guaranteed request's pages and drops requests to free room.
     # Any other pool frees room only through the offload, which has to be able to take any request.
     assert kv.reclaimable("p") and bool(kv.reclaimable("g")) is not decides, "the offload saw the wrong class"
+
+
+def test_the_host_counts_as_room_only_the_cached_pages_place_can_evict():
+    """A host fetch holds a run of cached pages that starts below the root, and eviction takes leaves only, so the
+    pages above that run stay. Counting those pages as room would send a victim to a host that can't take
+    it."""
+    cpu = host._HostPool(6)
+    cached, keys = cpu.arena.acquire(4), [bytes([i]) * 32 for i in range(4)]
+    cpu.index.insert_run(keys, cached, None)
+    cpu.arena.release(cached)
+    cpu.retain_run(keys[2:])
+    room = cpu.room()
+
+    assert cpu.place("v", "main", list(range(room)), [], room * PAGE_SIZE, room * PAGE_SIZE) is not None, (
+        f"the host counted {room} pages of room and couldn't place them"
+    )
+
+
+def test_the_page_check_catches_a_request_on_the_host_that_kept_a_device_page():
+    """A request waiting in the queue on the host holds no page on the device. A move that copied only some of its
+    pages would leave the request holding a device page, which the debug page check raises on."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    short = _step(kv, "r", 1).reason.pages_short
+    assert kv.preempt("r", short, droppable=lambda rid: False) == ["v"]
+    kv.offload("v")
+    assert "v" in kv._waiting and kv.is_offloaded("v")
+    kv.assert_pages_conserved()
+    kv._streams["v"]["main"].page_indices = kv._arena.acquire(1)
+
+    with pytest.raises(AssertionError, match="v waits on the host, holding pages"):
+        kv.assert_pages_conserved()
+
+
+def test_an_older_request_on_the_host_returns_before_a_newer_one():
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "r", 4, arrival=1)
+    _running(kv, "a", 3, arrival=2)
+    _running(kv, "b", 3, arrival=3)
+    short = _step(kv, "r", 4 * PAGE_SIZE).reason.pages_short
+    assert kv.preempt("r", short, droppable=lambda rid: False) == ["b", "a"]
+    assert kv.moves_to_host("b") and kv.moves_to_host("a")
+    kv.offload("b")
+    kv.offload("a")
+    assert list(kv._waiting) == ["a", "b"] and not kv._allotments.keys() & {"a", "b"}, "a victim kept its allotment"
+
+    kv.remove_request("r")
+
+    assert not kv.can_reload("b") and not kv.reload("b"), "b returned ahead of a"
+    assert kv.reload("a") and kv._allotments["a"].remaining == 1, "a didn't reserve its reload and a page"
+    assert kv.reload("b") and not kv._waiting
+
+
+@pytest.mark.parametrize("decides", [False, True], ids=["a pool that doesn't decide", "an offload no victim chose"])
+def test_an_offload_outside_preemption_reloads_as_before(decides):
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    kv._decides = decides
+    _running(kv, "r", 5, arrival=1)
+    _request(kv, "w", 8, arrival=0)
+    _ready(kv, "w")
+    remaining = kv._allotments.get("r", manager_mod.Allotment(0)).remaining
+
+    assert kv.offload("r") == 5 and "r" not in kv._waiting
+
+    assert kv.can_reload("r") and kv.reload("r"), "r waited in the queue behind w"
+    assert kv._allotments.get("r", manager_mod.Allotment(0)).remaining == remaining, "the reload changed r's allotment"
+
+
+def test_a_guaranteed_request_is_never_moved_to_the_host():
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "r", 3, arrival=0)
+    _running(kv, "g", 2, arrival=1, guaranteed=True)
+    short = _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short
+
+    assert kv.preempt("r", short, droppable=lambda rid: False) == ["r"], "a guaranteed request was moved to the host"
