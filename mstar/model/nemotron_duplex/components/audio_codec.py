@@ -181,46 +181,51 @@ def _spec_to_wav(
         pad = (win_length - hop_length) // 2
         T = spec.size(-1)
         window = torch.hann_window(win_length, device=spec.device)
+        frames = _windowed_frames(spec, n_fft, window, constrain_value_range, by_matmul)
+        wav = _overlap_add(frames, hop_length, (T - 1) * hop_length + win_length)[..., pad:-pad]
+        return _normalize(wav, _window_envelope(window, T, hop_length, win_length))
 
-        if by_matmul:
-            ifft = irfft_dim1(spec, n_fft)
-        else:
-            ifft = torch.fft.irfft(spec, n=n_fft, dim=-2, norm="backward")
-        window_unsqz = window.unsqueeze(-1)
 
-        if constrain_value_range:
-            ifft = torch.where(
-                ifft >= 0,
-                torch.minimum(ifft, window_unsqz),
-                torch.maximum(ifft, -window_unsqz),
-            )
+def _windowed_frames(
+    spec: torch.Tensor, n_fft: int, window: torch.Tensor, constrain_value_range: bool = True,
+    by_matmul: bool = False,
+) -> torch.Tensor:
+    """Each frame's inverse DFT, clamped to the window's range (NeMo's
+    ``constrain_value_range``) and windowed, ``[..., win, T]``: what the full
+    decode and the stream overlap-add."""
+    if by_matmul:
+        ifft = irfft_dim1(spec, n_fft)
+    else:
+        ifft = torch.fft.irfft(spec, n=n_fft, dim=-2, norm="backward")
+    window = window.unsqueeze(-1)
+    if constrain_value_range:
+        ifft = torch.where(ifft >= 0, torch.minimum(ifft, window), torch.maximum(ifft, -window))
+    return ifft * window
 
-        ifft = ifft * window_unsqz
 
-        output_size = (T - 1) * hop_length + win_length
-        wav = F.fold(
-            ifft, output_size=(1, output_size), kernel_size=(1, win_length), stride=(1, hop_length),
-        )[..., 0, 0, pad:-pad]
-
-        # The envelope is ~0 only where the window and hop leave a gap, which
-        # check_window_envelope refuses when the codec is built; a device-side
-        # guard keeps the decode free of host syncs, for CUDA-graph capture.
-        env = _window_envelope(window, T, hop_length, win_length)
-        return torch.where(env > _ENVELOPE_FLOOR, wav / env, torch.zeros_like(wav))
+def _overlap_add(frames: torch.Tensor, hop_length: int, size: int) -> torch.Tensor:
+    """``frames`` ``[..., win, T]`` overlap-added ``hop_length`` apart into ``size`` samples, ``[..., size]``."""
+    return F.fold(frames, output_size=(1, size), kernel_size=(1, frames.size(-2)), stride=(1, hop_length))[..., 0, 0, :]
 
 
 _ENVELOPE_FLOOR = 1e-11
+
+
+def _normalize(sig: torch.Tensor, env: torch.Tensor) -> torch.Tensor:
+    """The overlap-added signal over its squared-window sum, 0 where that is ~0
+    (a fresh stream's empty overlap). The sum is ~0 elsewhere only where the
+    window and hop leave a gap, which check_window_envelope refuses when the
+    codec is built; a device-side guard keeps the decode free of host syncs,
+    for CUDA-graph capture."""
+    return torch.where(env > _ENVELOPE_FLOOR, sig / env, torch.zeros_like(sig))
 
 
 def _window_envelope(window: torch.Tensor, T: int, hop_length: int, win_length: int) -> torch.Tensor:
     """The overlap-added squared window of ``T`` frames, trimmed as ``_spec_to_wav``
     trims the signal."""
     pad = (win_length - hop_length) // 2
-    output_size = (T - 1) * hop_length + win_length
-    return F.fold(
-        window.square().expand(T, -1).transpose(0, 1), output_size=(1, output_size),
-        kernel_size=(1, win_length), stride=(1, hop_length),
-    ).squeeze()[pad:-pad]
+    squares = window.square().unsqueeze(-1).expand(-1, T)
+    return _overlap_add(squares, hop_length, (T - 1) * hop_length + win_length)[pad:-pad]
 
 
 def check_window_envelope(window: torch.Tensor, hop_length: int) -> None:
@@ -272,23 +277,17 @@ def codec_state_blocks(config: CodecConfig, dtype: torch.dtype | None = None) ->
 def _overlap_add_stream(
     spec: torch.Tensor, overlap: torch.Tensor, n_fft: int, hop_length: int,
 ) -> tuple[CodecStreamAudio, torch.Tensor]:
-    """``_spec_to_wav`` (window == n_fft, value range constrained, by matmul) for
-    a stream: ``spec``'s frames overlap-add onto the carried ``overlap``. The
-    samples no later frame reaches are final; the next ``n_fft - hop`` become
-    the new overlap."""
+    """``_spec_to_wav``'s steps (window == n_fft, value range constrained, by
+    matmul) for a stream: ``spec``'s frames overlap-add onto the carried
+    ``overlap``. The samples no later frame reaches are final; the next
+    ``n_fft - hop`` become the new overlap."""
     with torch.autocast(device_type=spec.device.type, enabled=False):
         frames, held = spec.size(-1), n_fft - hop_length
         size = frames * hop_length + held
-        window = torch.hann_window(n_fft, device=spec.device).unsqueeze(-1)
-        ifft = irfft_dim1(spec, n_fft)
-        ifft = torch.where(ifft >= 0, torch.minimum(ifft, window), torch.maximum(ifft, -window)) * window
-
-        def fold(x: torch.Tensor) -> torch.Tensor:
-            return F.fold(x, output_size=(1, size), kernel_size=(1, n_fft), stride=(1, hop_length))
-
+        window = torch.hann_window(n_fft, device=spec.device)
         carried = F.pad(overlap, (0, size - held))
-        sig = fold(ifft)[:, 0, 0] + carried[:, 0]
-        env = fold(window.square().expand(-1, frames)).reshape(1, size) + carried[:, 1]
+        sig = _overlap_add(_windowed_frames(spec, n_fft, window, by_matmul=True), hop_length, size) + carried[:, 0]
+        env = _overlap_add(window.square().unsqueeze(-1).expand(-1, frames), hop_length, size) + carried[:, 1]
         out = _normalize(sig, env)
         done, edge = frames * hop_length, held // 2
         audio = CodecStreamAudio(
@@ -296,12 +295,6 @@ def _overlap_add_stream(
             end_after=out[:, done:done + edge],
         )
         return audio, torch.stack([sig[:, done:], env[:, done:]], dim=1)
-
-
-def _normalize(sig: torch.Tensor, env: torch.Tensor) -> torch.Tensor:
-    """The overlap-added signal over its squared-window sum, 0 where that is ~0
-    (as ``_spec_to_wav``; a fresh stream's empty overlap)."""
-    return torch.where(env > _ENVELOPE_FLOOR, sig / env, torch.zeros_like(sig))
 
 
 class AudioCodec(nn.Module):
