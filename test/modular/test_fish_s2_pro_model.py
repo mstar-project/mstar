@@ -713,3 +713,25 @@ def test_postprocess_emits_pcm16_bytes():
     assert model.postprocess(torch.tensor([7, -3], dtype=torch.int16), "audio") == b"\x07\x00\xfd\xff"
     with pytest.raises(ValueError, match="modality"):
         model.postprocess(torch.zeros(1), "text")
+
+
+def test_request_kwargs_are_the_keys_it_reads():
+    model = tiny_model()
+    declared = model.request_kwargs()
+    base = model.get_request_resource_configs({}, {})[AR_SAMPLER]
+    sent = {"temperature": 0.3, "top_p": 0.5, "top_k": 7, "repetition_penalty": 1.3, "ignore_eos": True}
+    for key, value in sent.items():
+        assert key in declared
+        assert getattr(base, key) != value
+        assert getattr(model.get_request_resource_configs({}, {key: value})[AR_SAMPLER], key) == value
+    assert model.get_request_resource_configs({}, {"do_sample": False})[AR_SAMPLER].temperature == 0.0
+    assert model.get_max_output_tokens(max_output_tokens=9) == 9
+    assert declared == set(sent) | {"do_sample", "max_output_tokens", "ref_text"}
+
+
+def test_speech_adapter_forwards_a_sent_voice_and_speed_so_they_are_logged_as_ignored(tmp_path):
+    adapter = adapters.FishS2ProAdapter()
+    sent = adapter.speech_to_request(SpeechRequest(input="hi", voice="alloy", speed=1.2), tmp_path).model_kwargs
+    assert (sent["voice"], sent["speed"]) == ("alloy", 1.2)
+    unsent = adapter.speech_to_request(SpeechRequest(input="hi"), tmp_path).model_kwargs
+    assert "voice" not in unsent and "speed" not in unsent

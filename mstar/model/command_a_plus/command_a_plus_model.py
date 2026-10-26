@@ -129,6 +129,11 @@ class CommandAPlusModel(Model):
         supplied = model_kwargs or {}
         return {SAMPLER: SamplingReqConfig(**{key: supplied.get(key, val) for key, val in defaults.items()})}
 
+    def request_kwargs(self):
+        return frozenset({
+            "messages", "max_output_tokens", "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos",
+        })
+
     def get_loop_caps(self, **model_kwargs):
         # Prefill samples the first token, so decode runs one fewer.
         return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
