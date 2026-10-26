@@ -395,10 +395,11 @@ class WhisperLarge(Model):
         return {RequestType.A2T}
 
     def get_model_kwargs(self, request_type: RequestType):
+        # 448 positions less the 4-token forced prompt; the server refuses more
         return {
             "temperature": 0.0,
-            "max_tokens": 448,
-            "max_output_tokens": 448,
+            "max_tokens": 444,
+            "max_output_tokens": 444,
         }
 
 
