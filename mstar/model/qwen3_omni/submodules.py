@@ -1491,7 +1491,8 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         # forward over [last_hidden] to update kv cache with the Talker's final hidden
         # state as context for the code prediction. This returns nothing because the
-        # layer 0 code is already provided by the talker LLM
+        # layer 0 code is already provided by the talker LLM. Each call consumes its
+        # input (last_hidden here, embed below).
         cp = self.code_predictor
         codec_embedding = cp.model.codec_embedding
         cp.forward_depth_unrolled(

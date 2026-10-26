@@ -463,9 +463,11 @@ class Qwen3OmniCodePredictor(nn.Module):
             the captured kernel sees identical shapes every replay.
 
         Args:
-            inputs_embeds: ``[bs, seq_len, hidden_size]``. ``seq_len`` is 2 for
-                the initial "prefill" call (``[last_hidden, c0_embed]``) and 1
-                for every subsequent decode iteration.
+            inputs_embeds: ``[bs, seq_len, hidden_size]``: the Talker's last
+                hidden state on the first call, a codec embedding on each later
+                one (``seq_len`` 1). Consumed: it is the first residual, which
+                the fused norms update in place, so pass a tensor nothing reads
+                afterwards.
             position_ids: ``[bs, seq_len]`` int tensor with the absolute
                 position of each input token within the depth sequence.
             kv_cache: ``[n_layers, bs, 2, max_seq_len, n_kv_heads, head_dim]``
@@ -487,16 +489,19 @@ class Qwen3OmniCodePredictor(nn.Module):
         n_q_heads = first_attn.num_heads
         head_dim = first_attn.head_dim
 
-        # FlashInfer's rope kernels require bf16; the rest of the code
-        # predictor runs at the weights' native dtype (fp32 for quality per
-        # the KVCacheEngine.has_autocast=False invariant).
         flat_pos = position_ids.reshape(-1)
 
+        # The model casts the code predictor to the autocast dtype (bf16) at
+        # load, so each residual add fuses into the next norm: one kernel, in
+        # place on both inputs.
+        residual = None
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
-            residual = hidden_states
-
-            hidden_states = layer.input_layernorm(hidden_states)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = layer.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = layer.input_layernorm.forward_residual(hidden_states, residual)
 
             total_tokens = bs * seq_len
             qkv = F.linear(hidden_states, layer.self_attn.qkv_proj.weight)
@@ -537,14 +542,10 @@ class Qwen3OmniCodePredictor(nn.Module):
                 q, k_full, v_full, valid_len
             )
             attn_out = attn_out.reshape(bs, seq_len, -1)
-            hidden_states = residual + attn.o_proj(attn_out)
-
-            # Post-attention RMSNorm + dense MLP.
-            residual = hidden_states
-            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states, residual = layer.post_attention_layernorm.forward_residual(
+                attn.o_proj(attn_out), residual,
+            )
             hidden_states = layer.mlp(hidden_states)
-            hidden_states = residual + hidden_states
 
-        # Final norm.
-        hidden_states = self.model.norm(hidden_states)
+        hidden_states, _ = self.model.norm.forward_residual(hidden_states, residual)
         return hidden_states
