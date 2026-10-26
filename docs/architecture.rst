@@ -162,8 +162,8 @@ field (norms, RoPE, sampling) pick their kernel by platform on first call.
    * - MoE routed experts (``moe_backend`` in the model's ``model_kwargs``)
      - M*'s Triton fused-MoE kernels, with a launch config tuned for the GPU when
        ``mstar/utils/fused_moe/configs/`` has one
-     - The same Triton kernels (the align op is hipified when it builds). MI300X configs
-       ship for Qwen3-Omni's experts. AITER's fused MoE is opt-in (``moe_backend:
+     - The same Triton kernels (the align op is hipified when it builds). MI300X and
+       MI325X tables ship for Qwen3-Omni's experts. AITER's fused MoE is opt-in (``moe_backend:
        aiter``) because its output isn't bitwise reproducible, see
        :ref:`models:Qwen3-Omni notes`.
    * - Media decoding (``Model.load_audio`` / ``load_video``, the API server)
