@@ -342,3 +342,26 @@ def test_a_key_written_again_after_a_cancelled_write_is_cancelled_by_its_next_ev
     _land(kv)
 
     assert _on_host(kv, keys) == 0, "the host filed pages eviction reused during their second copy"
+
+
+def test_eviction_takes_pages_still_waiting_for_their_copy_last():
+    kv = _manager()
+    take, kv._cpu_pool.take = kv._cpu_pool.take, lambda n: []
+    # the drain finds no host page for d's keys and drops them, so no copy is coming
+    uncopied = _cached(kv, "d", list(range(700, 700 + 6 * PAGE_SIZE)))
+    kv._cpu_pool.take = take
+    copied = _cached(kv, "a", B_PROMPT)
+    _land(kv)
+    # e's write is issued and never lands, and c's is never issued
+    writing = _cached(kv, "e", list(range(800, 800 + 6 * PAGE_SIZE)))
+    kv._writes_per_step = 0
+    waiting = _cached(kv, "c", C_PROMPT)
+    # b's hit makes the pages of a's prefix the newest, and b's release queues those pages' keys again
+    _serve(kv, "b", B_PROMPT + [7, 8])
+    kv.remove_request("b")
+
+    kv._evict(6)
+    assert kv._index.pages_for(uncopied) == [], "pages with no copy coming outlived pages the host has"
+    kv._evict(6)
+    left = [len(kv._index.pages_for(keys)) for keys in (copied, writing, waiting)]
+    assert left == [0, 6, 6], "eviction dropped pages waiting for their copy while pages the host has were left"

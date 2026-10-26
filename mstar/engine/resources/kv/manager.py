@@ -1131,9 +1131,10 @@ class KVManager(AttentionResource):
             self._cache_image_end(stream, chain, *ended)
 
     def _evict(self, n: int) -> int:
-        """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host. A dropped
-        page leaves `pending`, and a write still copying it is cancelled."""
-        dropped = self._index.evict(n)
+        """`PrefixIndex.evict`, counting the pages it drops that have no copy on the host. Pages still waiting
+        for their copy to the host go last. A dropped page leaves `pending`, and a write still copying it is
+        cancelled."""
+        dropped = self._index.evict(n, None if self._cpu_pool is None else self._awaits_write)
         if self._cpu_pool is not None:
             for key in dropped:
                 self._arena.pending.pop(key, None)
@@ -1143,6 +1144,12 @@ class KVManager(AttentionResource):
                     write.cancelled.add(key)
             self._cpu_pool.count_dropped(dropped)
         return len(dropped)
+
+    def _awaits_write(self, key: bytes) -> bool:
+        """Whether the page under ``key`` is queued or being copied to the host and has no copy there yet. A
+        key the host already holds can still be in `pending` until `after_output_copy` skips it, so the key is
+        also looked up on the host."""
+        return (key in self._arena.pending or key in self._writing) and self._cpu_pool.index.page_for(key) is None
 
     def after_output_copy(self) -> None:
         """Copy to the host up to `_writes_per_step` of the cached pages that only the index holds, each
