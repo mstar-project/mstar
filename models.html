@@ -1367,9 +1367,10 @@ warning when a package is missing, as the reference does.</p></li>
 <li><p>Requests: <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> with <code class="docutils literal notranslate"><span class="pre">input</span></code>, <code class="docutils literal notranslate"><span class="pre">voice</span></code> (<code class="docutils literal notranslate"><span class="pre">default</span></code> = the
 voice shipped in the checkpoint, or a preset name resolved under the
 deployment’s <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">voices_dir</span></code>), and in <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>
-<code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> (data URL of a reference clip, 5-30 s, cloning; an http(s)
-URL only when the server sets <code class="docutils literal notranslate"><span class="pre">MSTAR_ALLOW_REMOTE=1</span></code>; paths on the
-server are refused), <code class="docutils literal notranslate"><span class="pre">exaggeration</span></code> (0-2, emotion intensity, default 0.5),
+<code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> (data URL or bare base64 of a reference clip, 5-30 s,
+cloning; an http(s) URL only when the server sets <code class="docutils literal notranslate"><span class="pre">MSTAR_ALLOW_REMOTE=1</span></code>;
+paths on the server, clips over 60 s and clips below 8 kHz are refused),
+<code class="docutils literal notranslate"><span class="pre">exaggeration</span></code> (0-2, emotion intensity, default 0.5),
 <code class="docutils literal notranslate"><span class="pre">cfg_weight</span></code> (0-1, default 0.5; 0 disables guidance and halves the T3 work),
 <code class="docutils literal notranslate"><span class="pre">temperature</span></code> (up to 5; under 1e-5 is greedy)/<code class="docutils literal notranslate"><span class="pre">top_p</span></code>/<code class="docutils literal notranslate"><span class="pre">top_k</span></code> (the
 whole vocab or more is no filter)/<code class="docutils literal notranslate"><span class="pre">min_p</span></code>/<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> (up to 2;

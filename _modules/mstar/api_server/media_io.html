@@ -1131,9 +1131,9 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># 16 kHz).</span>
 <span class="n">MIN_REF_AUDIO_SAMPLE_RATE</span> <span class="o">=</span> <span class="mi">8000</span>
 <span class="c1"># Voice cloning needs seconds of speech. Twice the longest reference a model</span>
-<span class="c1"># takes (Qwen3-TTS refuses over 30 s, Chatterbox keeps 30 s), so this never</span>
-<span class="c1"># refuses a clip a model would use; without it a 66 MB FLAC probe-decodes to</span>
-<span class="c1"># about 23 GB.</span>
+<span class="c1"># uses (Qwen3-TTS refuses over 30 s, Chatterbox trims to 30 s), so this only</span>
+<span class="c1"># refuses a clip well past what any model would keep; without it a 66 MB FLAC</span>
+<span class="c1"># probe-decodes to about 23 GB.</span>
 <span class="n">MAX_REF_AUDIO_SECONDS</span> <span class="o">=</span> <span class="mf">60.0</span>
 <span class="c1"># The probe decode runs in the request thread pool (32 threads); this bounds</span>
 <span class="c1"># how many decode at once.</span>
@@ -1179,43 +1179,29 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Open the reference clip at ``path`` the way the model's ``load_audio``</span>
 <span class="sd">    will; on failure delete it and raise ValueError.</span>
 
-<span class="sd">    ``decoder`` is the library that ``load_audio`` uses, ``"soundfile"`` or</span>
-<span class="sd">    ``"torchcodec"``. torchcodec decodes the clip, not just its header: some</span>
-<span class="sd">    FFmpeg builds parse a container header (MAT4, MAT5) they cannot decode. A</span>
-<span class="sd">    clip whose header rate is below ``MIN_REF_AUDIO_SAMPLE_RATE``, or whose</span>
-<span class="sd">    header duration is over ``MAX_REF_AUDIO_SECONDS``, is refused before any</span>
-<span class="sd">    decode; the decode itself stops just past ``MAX_REF_AUDIO_SECONDS``, so a</span>
-<span class="sd">    header that hides or understates the length cannot make it unbounded.</span>
+<span class="sd">    ``decoder`` is the library that ``load_audio`` uses: ``"soundfile"``,</span>
+<span class="sd">    ``"torchcodec"``, or ``"soundfile+torchcodec"`` for a loader that tries</span>
+<span class="sd">    libsndfile first and FFmpeg for what it cannot open, as</span>
+<span class="sd">    ``Model.load_audio`` does. torchcodec decodes the clip, not just its</span>
+<span class="sd">    header: some FFmpeg builds parse a container header (MAT4, MAT5) they</span>
+<span class="sd">    cannot decode. A clip whose header rate is below</span>
+<span class="sd">    ``MIN_REF_AUDIO_SAMPLE_RATE``, or whose header duration is over</span>
+<span class="sd">    ``MAX_REF_AUDIO_SECONDS``, is refused before any decode; the decode itself</span>
+<span class="sd">    stops just past ``MAX_REF_AUDIO_SECONDS``, so a header that hides or</span>
+<span class="sd">    understates the length cannot make it unbounded.</span>
 <span class="sd">    """</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">decoder</span> <span class="o">==</span> <span class="s2">"torchcodec"</span><span class="p">:</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">torchcodec.decoders</span><span class="w"> </span><span class="kn">import</span> <span class="n">AudioDecoder</span>
-
-            <span class="n">header</span> <span class="o">=</span> <span class="n">AudioDecoder</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">metadata</span>
-            <span class="n">_require_ref_audio_rate</span><span class="p">(</span><span class="n">header</span><span class="o">.</span><span class="n">sample_rate</span><span class="p">)</span>
-            <span class="n">_require_ref_audio_seconds</span><span class="p">(</span><span class="n">header</span><span class="o">.</span><span class="n">duration_seconds_from_header</span><span class="p">)</span>
-            <span class="k">with</span> <span class="n">_ref_audio_decodes</span><span class="p">:</span>
-                <span class="c1"># Mono at a fixed rate: a small compressed upload can declare many</span>
-                <span class="c1"># channels at a high rate, and decoding it natively takes gigabytes.</span>
-                <span class="n">samples</span> <span class="o">=</span> <span class="n">AudioDecoder</span><span class="p">(</span>
-                    <span class="n">path</span><span class="p">,</span> <span class="n">sample_rate</span><span class="o">=</span><span class="n">_REF_AUDIO_PROBE_RATE</span><span class="p">,</span> <span class="n">num_channels</span><span class="o">=</span><span class="mi">1</span>
-                <span class="p">)</span><span class="o">.</span><span class="n">get_samples_played_in_range</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">MAX_REF_AUDIO_SECONDS</span> <span class="o">+</span> <span class="mf">1.0</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">samples</span><span class="o">.</span><span class="n">duration_seconds</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"reference audio has no samples in its first seconds"</span><span class="p">)</span>
-            <span class="n">_require_ref_audio_seconds</span><span class="p">(</span><span class="n">samples</span><span class="o">.</span><span class="n">pts_seconds</span> <span class="o">+</span> <span class="n">samples</span><span class="o">.</span><span class="n">duration_seconds</span><span class="p">)</span>
+            <span class="n">_check_ref_audio_torchcodec</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">decoder</span> <span class="o">==</span> <span class="s2">"soundfile"</span><span class="p">:</span>
+            <span class="n">_check_ref_audio_soundfile</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span>
-
-            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.media_limits</span><span class="w"> </span><span class="kn">import</span> <span class="n">count_sound_file_seconds</span><span class="p">,</span> <span class="n">sound_file_seconds</span>
-
-            <span class="n">info</span> <span class="o">=</span> <span class="n">soundfile</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
-            <span class="n">_require_ref_audio_rate</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">samplerate</span><span class="p">)</span>
-            <span class="n">seconds</span> <span class="o">=</span> <span class="n">sound_file_seconds</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">frames</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">samplerate</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">seconds</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="c1"># no sample count in the header (a FLAC written to a pipe)</span>
-                <span class="k">with</span> <span class="n">_ref_audio_decodes</span><span class="p">:</span>
-                    <span class="n">seconds</span> <span class="o">=</span> <span class="n">count_sound_file_seconds</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">MAX_REF_AUDIO_SECONDS</span><span class="p">)</span>
-            <span class="n">_require_ref_audio_seconds</span><span class="p">(</span><span class="n">seconds</span><span class="p">)</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">_check_ref_audio_soundfile</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+            <span class="k">except</span> <span class="n">RefAudioTooLongError</span><span class="p">:</span>
+                <span class="k">raise</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — not a libsndfile container; the loader tries FFmpeg</span>
+                <span class="n">_check_ref_audio_torchcodec</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
     <span class="k">except</span> <span class="n">RefAudioTooLongError</span><span class="p">:</span>
         <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">missing_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">raise</span>
@@ -1225,6 +1211,40 @@ window.runMermaid = runMermaid;</script>
             <span class="sa">f</span><span class="s2">"ref_audio must be audio the model can decode, at </span><span class="si">{</span><span class="n">MIN_REF_AUDIO_SAMPLE_RATE</span><span class="si">}</span><span class="s2"> Hz or more"</span>
         <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span></div>
 
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_check_ref_audio_torchcodec</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">torchcodec.decoders</span><span class="w"> </span><span class="kn">import</span> <span class="n">AudioDecoder</span>
+
+    <span class="n">header</span> <span class="o">=</span> <span class="n">AudioDecoder</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">metadata</span>
+    <span class="n">_require_ref_audio_rate</span><span class="p">(</span><span class="n">header</span><span class="o">.</span><span class="n">sample_rate</span><span class="p">)</span>
+    <span class="n">_require_ref_audio_seconds</span><span class="p">(</span><span class="n">header</span><span class="o">.</span><span class="n">duration_seconds_from_header</span><span class="p">)</span>
+    <span class="k">with</span> <span class="n">_ref_audio_decodes</span><span class="p">:</span>
+        <span class="c1"># Mono at a fixed rate: a small compressed upload can declare many</span>
+        <span class="c1"># channels at a high rate, and decoding it natively takes gigabytes.</span>
+        <span class="n">samples</span> <span class="o">=</span> <span class="n">AudioDecoder</span><span class="p">(</span>
+            <span class="n">path</span><span class="p">,</span> <span class="n">sample_rate</span><span class="o">=</span><span class="n">_REF_AUDIO_PROBE_RATE</span><span class="p">,</span> <span class="n">num_channels</span><span class="o">=</span><span class="mi">1</span>
+        <span class="p">)</span><span class="o">.</span><span class="n">get_samples_played_in_range</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">MAX_REF_AUDIO_SECONDS</span> <span class="o">+</span> <span class="mf">1.0</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">samples</span><span class="o">.</span><span class="n">duration_seconds</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"reference audio has no samples in its first seconds"</span><span class="p">)</span>
+    <span class="n">_require_ref_audio_seconds</span><span class="p">(</span><span class="n">samples</span><span class="o">.</span><span class="n">pts_seconds</span> <span class="o">+</span> <span class="n">samples</span><span class="o">.</span><span class="n">duration_seconds</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_check_ref_audio_soundfile</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span>
+
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.media_limits</span><span class="w"> </span><span class="kn">import</span> <span class="n">count_sound_file_seconds</span><span class="p">,</span> <span class="n">sound_file_seconds</span>
+
+    <span class="n">info</span> <span class="o">=</span> <span class="n">soundfile</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+    <span class="n">_require_ref_audio_rate</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">samplerate</span><span class="p">)</span>
+    <span class="n">seconds</span> <span class="o">=</span> <span class="n">sound_file_seconds</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">frames</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">samplerate</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">seconds</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># no sample count in the header (a FLAC written to a pipe)</span>
+        <span class="k">with</span> <span class="n">_ref_audio_decodes</span><span class="p">:</span>
+            <span class="n">seconds</span> <span class="o">=</span> <span class="n">count_sound_file_seconds</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">MAX_REF_AUDIO_SECONDS</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">seconds</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"reference audio has no samples"</span><span class="p">)</span>
+    <span class="n">_require_ref_audio_seconds</span><span class="p">(</span><span class="n">seconds</span><span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_require_ref_audio_rate</span><span class="p">(</span><span class="n">rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>

@@ -970,13 +970,16 @@ and Opus also needs one of its native sample rates when <code class="docutils li
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">check_ref_audio</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decoder</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#check_ref_audio"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.check_ref_audio" title="Link to this definition">#</a></dt>
 <dd><p>Open the reference clip at <code class="docutils literal notranslate"><span class="pre">path</span></code> the way the model’s <code class="docutils literal notranslate"><span class="pre">load_audio</span></code>
 will; on failure delete it and raise ValueError.</p>
-<p><code class="docutils literal notranslate"><span class="pre">decoder</span></code> is the library that <code class="docutils literal notranslate"><span class="pre">load_audio</span></code> uses, <code class="docutils literal notranslate"><span class="pre">&quot;soundfile&quot;</span></code> or
-<code class="docutils literal notranslate"><span class="pre">&quot;torchcodec&quot;</span></code>. torchcodec decodes the clip, not just its header: some
-FFmpeg builds parse a container header (MAT4, MAT5) they cannot decode. A
-clip whose header rate is below <code class="docutils literal notranslate"><span class="pre">MIN_REF_AUDIO_SAMPLE_RATE</span></code>, or whose
-header duration is over <code class="docutils literal notranslate"><span class="pre">MAX_REF_AUDIO_SECONDS</span></code>, is refused before any
-decode; the decode itself stops just past <code class="docutils literal notranslate"><span class="pre">MAX_REF_AUDIO_SECONDS</span></code>, so a
-header that hides or understates the length cannot make it unbounded.</p>
+<p><code class="docutils literal notranslate"><span class="pre">decoder</span></code> is the library that <code class="docutils literal notranslate"><span class="pre">load_audio</span></code> uses: <code class="docutils literal notranslate"><span class="pre">&quot;soundfile&quot;</span></code>,
+<code class="docutils literal notranslate"><span class="pre">&quot;torchcodec&quot;</span></code>, or <code class="docutils literal notranslate"><span class="pre">&quot;soundfile+torchcodec&quot;</span></code> for a loader that tries
+libsndfile first and FFmpeg for what it cannot open, as
+<code class="docutils literal notranslate"><span class="pre">Model.load_audio</span></code> does. torchcodec decodes the clip, not just its
+header: some FFmpeg builds parse a container header (MAT4, MAT5) they
+cannot decode. A clip whose header rate is below
+<code class="docutils literal notranslate"><span class="pre">MIN_REF_AUDIO_SAMPLE_RATE</span></code>, or whose header duration is over
+<code class="docutils literal notranslate"><span class="pre">MAX_REF_AUDIO_SECONDS</span></code>, is refused before any decode; the decode itself
+stops just past <code class="docutils literal notranslate"><span class="pre">MAX_REF_AUDIO_SECONDS</span></code>, so a header that hides or
+understates the length cannot make it unbounded.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
