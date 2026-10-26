@@ -82,6 +82,7 @@ def _worker(tmp_path):
     w._walk_driven_edges = {}
     w._phase_period = 0
     w.enable_nvtx = w.enable_prof = False
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w.device = torch.device("cpu")
     w._last_active = {}
     w._innermost_loop_by_node = {}
