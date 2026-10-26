@@ -68,6 +68,7 @@ def _stub_transfer(monkeypatch):
 def _make_model() -> WhisperModel:
     model = object.__new__(WhisperModel)
     model.config = WhisperModelConfig()  # large-v3 dims
+    model.sampling_defaults = {}
     return model
 
 

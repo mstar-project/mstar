@@ -1359,6 +1359,9 @@ class BagelModel(Model):
         )
         for step in plan:
             pool = texts if step.modality == "text" else images
+            if step.index >= len(pool) and step.modality == "text":
+                # a request without text has no span for the plan's text step
+                continue
             if step.index >= len(pool):
                 # ``check_plan`` fails this at intake; a ValueError here is a 400 too
                 raise ValueError(
