@@ -521,12 +521,12 @@ def test_streamed_deltas_add_up_to_the_final_text(client_and_stub, monkeypatch, 
     """A SentencePiece model's text starts with a space, and a silent window
     has no text: the deltas still join to exactly the done event's text."""
     client, stub = client_and_stub
-    stub.model_name = "nemotron_asr"
-    monkeypatch.setattr(adapters.TransducerAdapter, "max_audio_seconds", 20.0)
+    stub.model_name = "canary"
+    monkeypatch.setattr(adapters.CanaryAdapter, "max_audio_seconds", 20.0)
     stub.queued_chunks = [_text(" one", " two"), [], _text(" three")]
     with client.stream(
         "POST", "/v1/audio/transcriptions",
-        data={"model": "nemotron_asr", "stream": "true", "long_form": long_form},
+        data={"model": "canary", "stream": "true", "long_form": long_form},
         files={"file": ("long.wav", _wav_bytes(45), "audio/wav")},
     ) as r:
         lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]

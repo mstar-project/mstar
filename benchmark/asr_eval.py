@@ -29,7 +29,7 @@ from benchmark.request import RequestInput
 
 _ASR_MODELS = {
     ModelType.WHISPER_LARGE, ModelType.HIGGS_AUDIO,
-    ModelType.CANARY, ModelType.CANARY_QWEN, ModelType.PARAKEET, ModelType.NEMOTRON_ASR,
+    ModelType.CANARY, ModelType.CANARY_QWEN,
 }
 
 
