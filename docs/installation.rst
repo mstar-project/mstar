@@ -138,6 +138,13 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[fish_s2_pro]``
      - Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[kokoro]``
+     - Kokoro G2P: ``misaki``, ``spacy``, ``num2words``, and the espeak-ng fallback for
+       out-of-dictionary English words (``phonemizer-fork``, ``espeakng-loader``), which
+       is also the G2P of the Spanish, French, Hindi, Italian and Portuguese voices.
+       There is no system package to install: the ``espeakng-loader`` wheel (Linux x86_64
+       and aarch64, macOS, Windows) bundles ``libespeak-ng``. Both packages are GPL-3.0.
+       Fetch the spaCy tagger once with ``python -m spacy download en_core_web_sm``.
    * - ``.[omnivoice]``
      - OmniVoice TTS. The extra is empty on purpose: the runtime is the
        ``omnivoice`` package, installed separately from git —

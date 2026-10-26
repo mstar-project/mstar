@@ -233,10 +233,14 @@ fish_s2_pro = [
 ]
 
 kokoro = [
-    # misaki is the G2P (lexicon + spaCy tagger); `misaki[en]` additionally
-    # bundles espeak-ng (GPL) for out-of-dictionary words and is optional.
+    # misaki is the G2P (lexicon + spaCy tagger). phonemizer-fork and
+    # espeakng-loader are its espeak-ng fallback for out-of-dictionary English
+    # words and the G2P of the es/fr/hi/it/pt voices; the loader's wheel bundles
+    # libespeak-ng, so there is no system package. Both are GPL-3.0.
     # The spaCy model is fetched on first use: `python -m spacy download en_core_web_sm`.
     "misaki>=0.9.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
     "spacy>=3.8",
     "num2words",
     "huggingface-hub",
@@ -419,6 +423,8 @@ all = [
     # kokoro's G2P (see the [kokoro] extra). The Docker images also install the
     # spaCy tagger it loads, en_core_web_sm.
     "misaki>=0.9.4",
+    "phonemizer-fork>=3.3.2",
+    "espeakng-loader>=0.2.4",
     "spacy>=3.8",
     "num2words",
     "audioseal>=0.2,<0.3",  # see the audioseal extra

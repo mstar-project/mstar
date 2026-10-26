@@ -10,6 +10,7 @@ loop iteration.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -373,6 +374,19 @@ def test_missing_spacy_model_gives_an_install_hint(monkeypatch):
     frontend = G2PFrontend(chunk_target=40, max_phonemes=510, espeak_fallback=False)
     with pytest.raises(ImportError, match="spacy download en_core_web_sm"):
         frontend.backend("a")
+
+
+def test_missing_espeak_fallback_is_a_warning_with_the_fix(monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, "misaki.espeak", None)  # `from misaki import espeak` -> ImportError
+    with caplog.at_level(logging.WARNING, logger=g2p.logger.name):
+        assert G2PFrontend(chunk_target=40, max_phonemes=510)._english_fallback(british=False) is None
+    assert "no espeak-ng fallback" in caplog.text and "pip install -e '.[kokoro]'" in caplog.text
+    caplog.clear()
+    # a deployment that turned the fallback off asked for this
+    with caplog.at_level(logging.WARNING, logger=g2p.logger.name):
+        frontend = G2PFrontend(chunk_target=40, max_phonemes=510, espeak_fallback=False)
+        assert frontend._english_fallback(british=False) is None
+    assert caplog.text == ""
 
 
 def test_misaki_english_g2p_if_available():

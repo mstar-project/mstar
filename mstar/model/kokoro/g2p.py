@@ -1,10 +1,10 @@
 """Grapheme-to-phoneme front end and sentence chunking for Kokoro.
 
 Runs on the CPU in the API data worker (``process_prompt``). English uses
-``misaki``'s lexicon G2P with, when the optional ``misaki[en]`` extra (which
-bundles espeak-ng) is installed, its espeak fallback for out-of-dictionary
-words; Japanese and Mandarin use ``misaki[ja]`` / ``misaki[zh]``; the other
-languages Kokoro ships voices for go through espeak-ng.
+``misaki``'s lexicon G2P with its espeak-ng fallback for out-of-dictionary
+words (``phonemizer-fork`` + ``espeakng-loader``, in the ``kokoro`` extra);
+Japanese and Mandarin use ``misaki[ja]`` / ``misaki[zh]``; the other languages
+Kokoro ships voices for go through espeak-ng.
 
 Text is cut into chunks at sentence boundaries. A chunk never exceeds the
 model's 510-phoneme window; sentences are packed up to a target size so the
@@ -227,7 +227,14 @@ class G2PFrontend:
 
             return espeak.EspeakFallback(british=british)
         except Exception as exc:  # noqa: BLE001 — optional dependency
-            logger.warning("espeak fallback unavailable (%s); out-of-dictionary words will be skipped", exc)
+            logger.warning(
+                "Kokoro %s G2P has no espeak-ng fallback (%s): words outside misaki's dictionary, such as "
+                "many names, will be missing from the audio. Install phonemizer-fork and espeakng-loader "
+                "(pip install -e '.[kokoro]'), or set espeak_fallback: false in model_kwargs to drop them "
+                "without this warning.",
+                LANG_NAMES["b" if british else "a"],
+                exc,
+            )
             return None
 
     def backend(self, lang: str):
