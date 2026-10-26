@@ -362,6 +362,12 @@ Kokoro notes
   synthesized, so ``stream=True`` on ``/v1/audio/speech`` returns audio sentence by
   sentence. The first chunk is kept short so time to first audio is one short
   synthesis.
+- Kokoro predicts about 0.3 s of silence before each chunk (the ``<bos>`` token's
+  duration) and lets the last phonemes ring out into about 0.5 s more; the reference
+  ``kokoro`` package returns both. M* trims a request's outer edges, the head of its
+  first chunk and the tail of its last, to 25 ms beyond the first and last sample above
+  -60 dBFS, and keeps the silence between chunks as the pause between sentences.
+  ``trim_edge_silence: false`` in ``model_kwargs`` returns the untrimmed audio.
 - Output is 24 kHz mono PCM16. The model runs in fp32 by default: its vocoder is
   phase-sensitive, so reduced precision is opt-in. On CUDA the text half and the
   frame half of the forward are captured as CUDA graphs per length bucket and the

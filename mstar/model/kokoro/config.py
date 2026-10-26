@@ -127,6 +127,15 @@ class KokoroModelConfig:
     chunk_target_phonemes: int = 200
     # Upper bound on chunks per request (the loop's ``max_iters``).
     max_chunks: int = 512
+    # Kokoro opens every chunk with the silence it predicts for <bos> (about
+    # 0.3 s) and lets the final phonemes ring out into silence (about 0.5 s).
+    # Trimming cuts the request's outer edges, the head of its first chunk and
+    # the tail of its last, down to ``edge_silence_keep_ms`` next to the first
+    # and last sample above ``edge_silence_threshold`` (full scale 1.0). The
+    # silence between chunks is the pause between sentences and is kept.
+    trim_edge_silence: bool = True
+    edge_silence_threshold: float = 1e-3
+    edge_silence_keep_ms: float = 25.0
 
     # --- CUDA-graph buckets ------------------------------------------------
     # The text half is captured per padded phoneme count, the decoder half per
@@ -168,6 +177,10 @@ class KokoroModelConfig:
         """Waveform samples per predicted duration unit: the prosody
         predictor doubles the frame rate, the generator upsamples by 300."""
         return 2 * self.istftnet.upsample_factor
+
+    @property
+    def edge_silence_keep_samples(self) -> int:
+        return round(self.edge_silence_keep_ms * self.sample_rate / 1000)
 
     @property
     def style_pack_rows(self) -> int:

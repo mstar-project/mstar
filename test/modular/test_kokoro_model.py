@@ -43,7 +43,7 @@ from mstar.model.kokoro.config import (  # noqa: E402
 )
 from mstar.model.kokoro.g2p import Chunk, G2PFrontend  # noqa: E402
 from mstar.model.kokoro.kokoro_model import KokoroModel  # noqa: E402
-from mstar.model.kokoro.submodules import KokoroSynthSubmodule  # noqa: E402
+from mstar.model.kokoro.submodules import REQUEST_EDGES, KokoroSynthSubmodule, speech_span  # noqa: E402
 from mstar.model.kokoro.voices import VoiceRegistry  # noqa: E402
 from mstar.model.kokoro.weight_loader import fold_weight_norm, remap_name  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
@@ -601,7 +601,11 @@ def test_submodule_iterates_chunks_and_stops():
     assert prepared["r1"].input_seq_len == 4 and prepared["r1"].tensor_inputs["input_ids"].tolist() == [0, 1, 2, 0]
     assert prepared["r2"].input_seq_len == 3 and prepared["r2"].tensor_inputs["speed"].item() == 1.5
     # iteration 1 exists only for r1; iteration 2 for nobody
-    assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r1", 1), requests["r1"]).input_seq_len == 5
+    last = submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r1", 1), requests["r1"])
+    assert last.input_seq_len == 5
+    # which chunks open and close their request's audio
+    assert prepared["r1"].kwargs[REQUEST_EDGES] == (True, False) and last.kwargs[REQUEST_EDGES] == (False, True)
+    assert prepared["r2"].kwargs[REQUEST_EDGES] == (True, True)
     assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r2", 1), requests["r2"]) is None
     # the engine passes the rid handle, not the request id string
     assert submodule.check_stop(HANDLES["r1"], _fwd_info("r1", 0), {}) == set()
@@ -627,6 +631,55 @@ def test_submodule_iterates_chunks_and_stops():
     assert rel_l2(single.float(), out["r2"][AUDIO_CHUNK][0].float()) < 5e-3
     submodule.cleanup_request(HANDLES["r1"])
     assert HANDLES["r1"] not in submodule.request_states
+
+
+def test_speech_span_finds_the_outermost_loud_samples():
+    audio = torch.tensor([
+        [0.0, 0.0, 0.5, 0.0, -0.2, 0.0],
+        [0.3, 0.0, 0.0, 0.0, 0.0, 0.0001],
+        [0.0, 0.0001, 0.0, 0.0, 0.0, 0.0],  # nothing above the threshold: kept whole
+    ])
+    assert speech_span(audio, 1e-3).tolist() == [[2, 4], [0, 0], [0, 5]]
+
+
+def _with_silent_edges(model: KokoroTTS, silence: int) -> None:
+    """Zero the first and last ``silence`` valid samples of every decoded row,
+    as Kokoro's <bos> and sentence-final frames do."""
+    synthesize = model.synthesize_frames
+    samples_per_frame = model.config.samples_per_frame
+
+    def silent_edges(d, t_en, pred_dur, style, num_frames):
+        audio, frame_lengths = synthesize(d, t_en, pred_dur, style, num_frames)
+        positions = torch.arange(audio.shape[1])[None, :]
+        ends = (frame_lengths * samples_per_frame)[:, None]
+        return audio.masked_fill((positions < silence) | (positions >= ends - silence), 0.0), frame_lengths
+
+    model.synthesize_frames = silent_edges
+
+
+def test_request_edges_lose_their_silence_and_nothing_else():
+    config = tiny_config()
+    config.edge_silence_keep_ms = 1.0  # 24 samples, under the 100 silent ones
+    submodule = KokoroSynthSubmodule(tiny_model(), config)
+    _with_silent_edges(submodule.model, silence=100)
+    keep = config.edge_silence_keep_samples
+    padded, lengths, style = _random_batch(5, (7, 4, 9, 5))
+    speed = torch.ones(4)
+    # the first chunk of one request, a middle chunk, the last chunk, a one-chunk request
+    edges = [(True, False), (False, False), (False, True), (True, True)]
+    with torch.no_grad():
+        whole = submodule._synthesize(padded, lengths, style, speed, {})
+        trimmed = submodule._synthesize(padded, lengths, style, speed, {}, edges)
+    for row, ((opens, closes), full, cut) in enumerate(zip(edges, whole, trimmed, strict=True)):
+        head = (100 - keep) if opens else 0
+        tail = (100 - keep) if closes else 0
+        assert full.shape[0] > 200, row
+        # the same samples, minus the cut silence
+        assert torch.equal(cut, full[head : full.shape[0] - tail]), row
+    config.trim_edge_silence = False
+    with torch.no_grad():
+        untouched = submodule._synthesize(padded, lengths, style, speed, {}, edges)
+    assert all(torch.equal(a, b) for a, b in zip(untouched, whole, strict=True))
 
 
 def test_openai_adapter_maps_speech_request():

@@ -16,3 +16,4 @@ node_groups:
 #   compile_decoder: false              # skip torch.compile of the vocoder: start-up in seconds, about half the throughput
 #   decoder_dtype: "bfloat16"           # bf16 vocoder trunk (+13% audio-s/s at concurrency 32 on an H100; fp32 is parity-tested)
 #   frame_grouping: "single"            # pad one step's rows into one group instead of one group per frame bucket
+#   trim_edge_silence: false            # keep the silence the model predicts before the first and after the last sentence
