@@ -23,6 +23,7 @@ from mstar.engine.resources.lora.ops import lora_gather_shrink  # noqa: E402
     ("base_model.model.layers.0.q_proj.lora_down.weight", ("layers.0.q_proj", "A")),
     ("base_model.model.layers.0.q_proj.alpha", ("layers.0.q_proj", "alpha")),
     ("base_model.model.layers.0.q_proj.lora_magnitude_vector", "DoRA"),
+    ("lora_unet_double_blocks_0_img_attn_qkv.dora_scale", "DoRA"),
     ("base_model.model.lm_head.modules_to_save.weight", "modules_to_save"),
     ("base_model.model.embed_tokens.token_adapter.trainable_tokens_delta", "trainable_token"),
     ("base_model.model.layers.0.q_proj.lora_B.bias", "lora_bias"),

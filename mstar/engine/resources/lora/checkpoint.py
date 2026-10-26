@@ -147,11 +147,9 @@ def sidecar_default_alpha(path: str) -> Callable[[str, int], float] | None:
     return None
 
 
-def normalize_lora_key(key: str) -> str | None:
+def normalize_lora_key(key: str) -> str:
     """A raw checkpoint key in reference-library naming: known prefixes stripped, Kohya's
-    ``lora_down`` / ``lora_up`` renamed to ``lora_A`` / ``lora_B``. None for a key to skip."""
-    if "dora_scale" in key:
-        return None
+    ``lora_down`` / ``lora_up`` renamed to ``lora_A`` / ``lora_B``."""
     for prefix in _PREFIXES:
         if key.startswith(prefix):
             key = key[len(prefix):]
@@ -183,6 +181,8 @@ def parse_lora_key(key: str) -> tuple[str, str]:
 _UNSUPPORTED = (
     ("lora_magnitude_vector", "a DoRA adapter (use_dora=True), whose magnitude rescales "
      "the merged weight per output row"),
+    ("dora_scale", "a DoRA adapter in Kohya's naming, whose magnitude rescales the merged "
+     "weight per output row"),
     ("modules_to_save", "a full copy of a module (PEFT's modules_to_save), which replaces "
      "the base weights rather than adding to them"),
     ("original_module", "a full copy of a module (PEFT's modules_to_save), which replaces "
@@ -209,11 +209,7 @@ def normalize_lora_state_dict(
     default_alpha: Callable[[str, int], float] | None = None,
 ) -> LoraAdapter:
     """Group raw LoRA tensors into per-module ``(A, B, alpha)`` triples in reference-library naming."""
-    sd = {}
-    for key, value in state_dict.items():
-        key = normalize_lora_key(key)
-        if key is not None:
-            sd[key] = value
+    sd = {normalize_lora_key(key): value for key, value in state_dict.items()}
     if convert_keys is not None:
         sd = convert_keys(sd)
     pairs: dict[str, dict[str, torch.Tensor]] = {}

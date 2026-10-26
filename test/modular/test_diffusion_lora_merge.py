@@ -127,7 +127,6 @@ def test_kohya_names_alpha_and_scale(model):
         "base_model.model.transformer_blocks.0.attn.to_k.lora_down.weight": a,
         "base_model.model.transformer_blocks.0.attn.to_k.lora_up.weight": b,
         "base_model.model.transformer_blocks.0.attn.to_k.alpha": torch.tensor(8.0),
-        "base_model.model.transformer_blocks.0.attn.to_k.dora_scale": torch.ones(DIM),  # ignored
     }
     adapter = normalize_lora_state_dict(sd)
     assert adapter.layers["transformer_blocks.0.attn.to_k"][2] == 8.0

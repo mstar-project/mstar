@@ -907,7 +907,7 @@ A ``LoraSpec``'s parts:
 - **Checkpoint layouts.** Adapters are validated from the safetensors header: modules
   map to targets, shapes fit them (an adapter for another model size is a 400, not an
   admit failure), and a conv adapter whose kernel is its stride flattens to the linear
-  over the patch. DoRA (``lora_magnitude_vector``), ``modules_to_save``, trainable
+  over the patch. DoRA (PEFT's ``lora_magnitude_vector``, Kohya's ``dora_scale``), ``modules_to_save``, trainable
   tokens and bias LoRA are refused by name. A YAML ``targets: [...]`` keeps a subset of
   the model's targets (dropping vocabulary-sized ones saves their slots); an adapter
   touching a dropped target is refused, and its modules stay unbound. Without the list,

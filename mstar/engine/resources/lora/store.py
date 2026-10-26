@@ -119,9 +119,7 @@ def adapter_targets(spec: LoraSpec, path: str) -> set[str]:
             keys = list(f.keys())
         modules = set()
         for key in keys:
-            normalized = normalize_lora_key(key)
-            if normalized is not None:
-                modules.add(parse_lora_key(normalized)[0])
+            modules.add(parse_lora_key(normalize_lora_key(key))[0])
     else:
         modules = set(read_lora_file(path, convert_keys=spec.convert_keys).layers)
     return {
@@ -134,11 +132,8 @@ def inspect_keys(spec: LoraSpec, items) -> AdapterInfo:
     """``inspect_adapter`` over ``(checkpoint key, shape)`` pairs, as a header lists them."""
     shapes: dict[str, dict[str, tuple[int, ...]]] = {}
     for key, shape in items:
-        normalized = normalize_lora_key(key)
-        if normalized is None:
-            continue
         # a key no plain LoRA has (DoRA, modules_to_save, ...) raises a refusal, named
-        module, kind = parse_lora_key(normalized)
+        module, kind = parse_lora_key(normalize_lora_key(key))
         if kind != "alpha":
             shapes.setdefault(module, {})[kind] = tuple(shape)
     return _classify(spec, shapes)
