@@ -221,8 +221,11 @@ class HostLens(torch.Tensor):
     plan thread every decode step). Iterating the numpy view costs 0.1 us a
     row and the numpy scalar has ``.item()`` too. Everything else FlashInfer
     does with the row (``.cpu()``, ``.min()``, ``len``, a ``copy_`` into its
-    device buffer) is plain tensor behaviour.
+    device buffer) is plain tensor behaviour, so torch ops skip the subclass
+    dispatch (about 6 us a call) and treat it as a plain tensor.
     """
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
 
     def __iter__(self):
         return iter(self.numpy())

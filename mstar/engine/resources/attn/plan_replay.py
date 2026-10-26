@@ -36,13 +36,14 @@ def _host(t: torch.Tensor):
     return t.numpy() if t.device.type == "cpu" else t
 
 
-# How a plan may derive a per-step attribute from one of the step's arrays.
-_DERIVATIONS: dict[str, Callable[[torch.Tensor], Any]] = {
-    "is": lambda t: t,
-    "last": lambda t: int(_host(t)[-1]),
-    "max": lambda t: int(_host(t).max()),
-    "max_span": lambda t: int((_host(t)[1:] - _host(t)[:-1]).max()),
+# How a plan may derive a per-step attribute from one of the step's arrays:
+# the array itself, or a value read off its host view.
+_FROM_HOST: dict[str, Callable[[Any], Any]] = {
+    "last": lambda h: int(h[-1]),
+    "max": lambda h: int(h.max()),
+    "max_span": lambda h: int((h[1:] - h[:-1]).max()),
 }
+_DERIVATIONS = ("is", *_FROM_HOST)
 # buffers above this many elements (FlashInfer's workspaces) are not snapshotted
 _MAX_SNAPSHOT = 1 << 24
 # synthetic steps per configuration: one to resolve FlashInfer's module, three
@@ -57,9 +58,12 @@ _RECORDING = threading.Lock()
 _MISSING = object()
 
 
-def _derive(f: Callable[[torch.Tensor], Any], t: torch.Tensor) -> Any:
+def _derive(kind: str, t: torch.Tensor, host=None) -> Any:
+    """``kind``'s value of array ``t`` (its host view ``host`` if at hand)."""
+    if kind == "is":
+        return t
     try:
-        return f(t)
+        return _FROM_HOST[kind](_host(t) if host is None else host)
     except (RuntimeError, IndexError, ValueError):  # e.g. the widest span of one row
         return _MISSING
 
@@ -108,10 +112,33 @@ def _copy_names(before: torch.Tensor, after: torch.Tensor, arrays: Arrays) -> se
     return names
 
 
-def _one(candidates: list[set]) -> Any | None:
-    """The one candidate every record agrees on, else None."""
+def _distinct(steps: list[Arrays]) -> bool:
+    """Whether every array differs from step to step: what learning needs to
+    tell a buffer's copy of it from a buffer that happens to hold it."""
+    return all(
+        not torch.equal(a[name], b[name])
+        for i, a in enumerate(steps) for b in steps[i + 1:] for name in a
+        if a[name].shape == b[name].shape
+    )
+
+
+def _agreed(candidates: list[set], key: Callable[[Any], Any] | None = None) -> Any | None:
+    """A candidate every record agrees on, else None. Several that agree on
+    every record (an indptr's last value is also its max) are taken in
+    ``key`` order: the replay is checked against FlashInfer's plan anyway."""
     common = set.intersection(*candidates) if candidates else set()
-    return next(iter(common)) if len(common) == 1 else None
+    return min(common, key=key) if common else None
+
+
+def _equal(a: Any, b: Any) -> bool:
+    """``_same``, or tensors of the same values: a planner argument FlashInfer
+    builds afresh each plan, the same every plan (``qo_indptr`` of one-token
+    rows)."""
+    return _same(a, b) or (
+        isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
+        and a.device == b.device and a.dtype == b.dtype and a.shape == b.shape
+        and torch.equal(a, b)
+    )
 
 
 class _Call(NamedTuple):
@@ -149,7 +176,7 @@ def _recorded(w, flashinfer_plan: Callable[[Arrays], None], arrays: Arrays) -> _
 
 def _args_match(replayed: list, recorded: list, arrays: Arrays) -> bool:
     return len(replayed) == len(recorded) and all(
-        _same(x, y) or bool(_array_names(x, arrays) & _array_names(y, arrays))
+        _equal(x, y) or bool(_array_names(x, arrays) & _array_names(y, arrays))
         for x, y in zip(replayed, recorded, strict=True)
     )
 
@@ -170,7 +197,7 @@ class _Replay:
     arrays in their slots, the buffer copies and the attribute updates."""
 
     def __init__(self, fn, template: list, params: dict[int, str], copies: dict[str, str],
-                 derived: dict[str, tuple[Callable, str]], info_attr: str):
+                 derived: dict[str, tuple[str, str]], info_attr: str):
         self.fn = fn
         self.template = template
         self.params = params
@@ -186,10 +213,10 @@ class _Replay:
             return None, "the planner call changes"
         template, params = list(records[0].args), {}
         for i in range(n):
-            name = _one([_array_names(r.args[i], r.arrays) for r in records])
+            name = _agreed([_array_names(r.args[i], r.arrays) for r in records])
             if name is not None:
                 params[i] = name
-            elif not all(_same(r.args[i], template[i]) for r in records):
+            elif not all(_equal(r.args[i], template[i]) for r in records):
                 return None, f"planner argument {i} varies with no array behind it"
         planner_buffers = {id(a) for a in template if isinstance(a, torch.Tensor)}
 
@@ -198,33 +225,34 @@ class _Replay:
             return None, "no one attribute holds the planner's result"
         info_attr = info[0]
 
+        # A copy is found by what the buffer holds after each plan, not by
+        # whether it changed: the steps' arrays all differ (``_distinct``), so
+        # a buffer can match one in every record only by being its copy.
         copies = {}
         for buf in records[0].after:
             if id(records[0].attrs.get(buf)) in planner_buffers:
                 continue  # written by the planner itself
             if any(buf not in r.before or buf not in r.after for r in records):
                 return None, f"buffer {buf} comes and goes"
-            written = [r for r in records if not torch.equal(r.before[buf], r.after[buf])]
-            if not written:
-                continue
-            name = _one([_copy_names(r.before[buf], r.after[buf], r.arrays) for r in written])
-            if name is None:
+            name = _agreed([_copy_names(r.before[buf], r.after[buf], r.arrays) for r in records])
+            if name is not None:
+                copies[buf] = name
+            elif any(not torch.equal(r.before[buf], r.after[buf]) for r in records):
                 return None, f"buffer {buf} is written with something other than a step array"
-            copies[buf] = name
 
         derived = {}
         for attr in set().union(*(r.attrs.keys() for r in records)) - {info_attr}:
             values = [r.attrs.get(attr, _MISSING) for r in records]
             if all(_same(v, values[0]) for v in values):
                 continue  # the same every plan of this configuration
-            how = _one([
-                {(d, name) for d, f in _DERIVATIONS.items() for name, t in r.arrays.items()
-                 if _same(_derive(f, t), r.attrs.get(attr, _MISSING))}
+            how = _agreed([
+                {(d, name) for d in _DERIVATIONS for name, t in r.arrays.items()
+                 if _same(_derive(d, t), r.attrs.get(attr, _MISSING))}
                 for r in records
-            ])
+            ], key=lambda how: (_DERIVATIONS.index(how[0]), how[1]))
             if how is None:
                 return None, f"attribute {attr} varies with no simple function of a step array"
-            derived[attr] = (_DERIVATIONS[how[0]], how[1])
+            derived[attr] = how
         return cls(fn, template, params, copies, derived, info_attr), ""
 
     def fits(self, w, arrays: Arrays) -> bool:
@@ -239,11 +267,21 @@ class _Replay:
     def __call__(self, w, arrays: Arrays) -> None:
         for buf, name in self.copies.items():
             src = arrays[name]
-            dst = getattr(w, buf)[: src.shape[0]]
-            if src.data_ptr() != dst.data_ptr():
-                dst.copy_(src, non_blocking=True)
-        for attr, (f, name) in self.derived.items():
-            setattr(w, attr, f(arrays[name]))
+            dst = getattr(w, buf)
+            if src.data_ptr() == dst.data_ptr():
+                continue  # staged into the buffer already
+            n = src.shape[0]
+            (dst if n == dst.shape[0] else dst[:n]).copy_(src, non_blocking=True)
+        hosts: dict[str, Any] = {}  # each array's host view, made once
+        for attr, (kind, name) in self.derived.items():
+            t = arrays[name]
+            if kind == "is":
+                setattr(w, attr, t)
+                continue
+            host = hosts.get(name)
+            if host is None:
+                host = hosts[name] = _host(t)
+            setattr(w, attr, _FROM_HOST[kind](host))
         setattr(w, self.info_attr, self.fn(*self.args(arrays)))
 
     def disagrees(self, before: dict, after: dict, call: _Call | None, arrays: Arrays) -> str:
@@ -258,8 +296,8 @@ class _Replay:
             if attr == self.info_attr:
                 continue
             if attr in self.derived:
-                f, name = self.derived[attr]
-                expected = _derive(f, arrays[name])
+                kind, name = self.derived[attr]
+                expected = _derive(kind, arrays[name])
             else:
                 expected = before.get(attr, _MISSING)
             if not _same(expected, value):
@@ -284,15 +322,22 @@ class PlanReplay:
         self._replays: dict[Hashable, _Replay | None] = {}
         self._last_key: Hashable = _MISSING
 
-    def plan(self, key: Hashable, arrays: Arrays, flashinfer_plan: Callable[[Arrays], None]) -> None:
-        """Plan one step of configuration ``key``. A replay runs only right
-        after another plan of the same configuration: the rest of what
-        FlashInfer's plan sets is the configuration's, and still in place."""
+    def plan(
+        self, key: Hashable, stage: Callable[[], Arrays],
+        flashinfer_plan: Callable[[Arrays], None],
+    ) -> None:
+        """Plan one step of configuration ``key``. ``stage`` puts the step's
+        arrays in place (into the wrapper's own buffers, say) and returns
+        them; it runs after any learning, whose synthetic plans write those
+        buffers. A replay runs only right after another plan of the same
+        configuration: the rest of what FlashInfer's plan sets is the
+        configuration's, and still in place."""
         w = self._w
         replay = self._replays.get(key, _MISSING)
         if replay is _MISSING and not self._capturing():
             replay = self._replays[key] = self._learn(key, flashinfer_plan)
             self._last_key = key
+        arrays = stage()
         if not isinstance(replay, _Replay) or self._last_key != key or not replay.fits(w, arrays):
             flashinfer_plan(arrays)
         elif replay.steps < _CHECK_FIRST or replay.steps % _CHECK_EVERY == 0:
@@ -314,6 +359,8 @@ class PlanReplay:
     def _learn(self, key: Hashable, flashinfer_plan: Callable[[Arrays], None]) -> _Replay | None:
         try:
             steps = self._synthetic(_N_SYNTHETIC)
+            if not _distinct(steps[1:]):
+                raise ValueError("the synthetic steps repeat an array")
             flashinfer_plan(steps[0])  # resolves the planner module
             records = [self._record(flashinfer_plan, s) for s in steps[1:4]]
             if any(r is None for r in records):
@@ -351,9 +398,11 @@ class PlanReplay:
         return _Record(arrays, call.fn, call.args, call.result, dict(vars(w)), before, _snapshot(w))
 
     def _check(self, replay: _Replay, flashinfer_plan, a: Arrays, b: Arrays) -> str:
-        """Replay ``a`` over FlashInfer's plan of ``b`` and compare with
-        FlashInfer's own plan of ``a``; empty when they agree."""
+        """Compare FlashInfer's plan of ``a`` with a replay of ``a``, each
+        over FlashInfer's plan of ``b`` (so a buffer's unused tail matches);
+        empty when they agree."""
         w = self._w
+        flashinfer_plan(b)
         want = self._record(flashinfer_plan, a)
         if want is None or want.fn is not replay.fn:
             return "no planner call to check against"
