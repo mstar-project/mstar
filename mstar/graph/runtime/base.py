@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.communication.tensors import NameToTensorList, TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -12,6 +12,11 @@ from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
+
+if TYPE_CHECKING:
+    import torch
+
+    from mstar.model.submodule_base import StopPolicy
 
 
 class SpeculationOutput(NamedTuple):
@@ -689,6 +694,32 @@ class GraphRuntime(ABC):
             list(per_request_info), partition=partition,
         ):
             per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
+
+    # --------- Declared stop policies ----------
+    @abstractmethod
+    def set_stop_policies(
+        self, node_name: str, graph_walk: str, policies: Mapping[str, "StopPolicy"],
+    ) -> None:
+        """(node, walk)'s declared stop policies, per loop
+        (``NodeSubmodule.get_stop_policies``). Once, at startup."""
+
+    @abstractmethod
+    def check_stops(
+        self, partition: str, node_name: str, graph_walk: str, rids: list[int],
+        tokens: "torch.Tensor | None", row_rids: list[int],
+        infos: Mapping[int, CurrentForwardPassInfo],
+    ) -> dict[int, set[str]]:
+        """(node, walk)'s declared stop policies over a step's rows: per rid,
+        the loops it stops (``StopPolicy.stops``).
+
+        Each loop's count is this runtime's as of the step: counts move when
+        the step is routed, which comes after. ``tokens`` is the step's token
+        column, row i for ``row_rids[i]``, a 1-D host view the caller keeps
+        alive, or None when no policy reads a token; a rid with no row is
+        skipped, as ``check_stop`` skips a request with no output. A request's
+        limits (``StopPolicy.limits``) come from ``infos`` the first time it
+        is checked on the walk, and are dropped with the request.
+        """
 
     @abstractmethod
     def is_async_schedulable(self, node_name: str, graph_walk: str) -> bool:

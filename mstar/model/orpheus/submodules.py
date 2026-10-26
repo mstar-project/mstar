@@ -213,12 +213,11 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             return
         outputs["text_inputs"] = outputs["new_token"]
 
-    def get_stop_policies(self, graph_walk: str) -> tuple[StopPolicy, ...]:
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy]:
         # check_stop's EOS / token-budget test, on every walk
-        return (StopPolicy(
-            StopKind.AR, "decode_loop", token_signal="new_token",
-            eos_tokens=(self.config.stop_token_id,), sampler=SAMPLER,
-        ),)
+        return {"decode_loop": StopPolicy(
+            StopKind.AR, token_signal="new_token", eos_tokens=(self.config.stop_token_id,), sampler=SAMPLER,
+        )}
 
     def check_stop(
         self, request_id: str,
