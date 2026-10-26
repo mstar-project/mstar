@@ -248,7 +248,8 @@ class _AiterRaggedBase:
 
         ``q`` is [total_tokens, Hq, D] in the query layout, ``k`` and ``v`` are
         [total_kv_tokens, Hkv, D] in the key layout (the query layout, for
-        self-attention). In a captured step, rows past the planned tokens read
+        self-attention). The output is in the resource's dtype, like
+        FlashInfer's. In a captured step, rows past the planned tokens read
         back zero.
         """
         plan = self._plan(label)
@@ -270,7 +271,7 @@ class _AiterRaggedBase:
         if plan.out is not None:
             # every layer shares this buffer, and the next call overwrites it
             out = out.clone()
-        return out if out.dtype == q.dtype else out.to(q.dtype)
+        return out
 
 
 def _round(n: int) -> int:
