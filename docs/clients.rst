@@ -183,6 +183,18 @@ streaming request gets that status instead of a ``200`` followed by an in-band e
    * - ``ignore_eos``
      - ``true`` / ``false``
      -
+   * - ``num_inference_steps``
+     - integer ``>= 1``
+     - Denoising steps of an image or video model. Above the model's limit is a 400.
+   * - ``height``, ``width``, ``num_frames``
+     - integer ``>= 1``
+     - Output size of an image or video model, which may refuse sizes its VAE cannot tile.
+   * - ``fps``
+     - number ``> 0``
+     -
+   * - ``guidance_scale``
+     - number
+     - Classifier-free guidance strength.
 
 A string that spells a number is read as that number, since some JSON clients send
 numbers as strings: ``"0.7"`` or ``" 0.7 "`` for a real-valued knob, ``"5"`` or ``"5.0"``
