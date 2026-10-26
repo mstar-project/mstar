@@ -577,3 +577,21 @@ def test_an_initial_loop_back_of_its_own_is_not_handed_the_draw():
     _added(sub, "p6").result()
     got = sub.prepare_inputs(WALK, _info("p6", 0), _inputs())
     assert torch.equal(got.tensor_inputs[LATENTS], torch.full((8, 4), 2.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the host sync is a CUDA stream sync")
+def test_iteration_zero_stages_its_schedule_and_seeds_without_a_host_sync():
+    """A blocking H2D synchronizes the stream, so on the GPU thread it would wait out
+    the step still running there; sync-debug mode raises on one."""
+    sub = PrefetchingToy().to("cuda")
+    _added(sub, "s0", seed=4).result()
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = sub.prepare_inputs(WALK, _info("s0", 0, seed=4), _inputs())
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    want = PrefetchingToy().prepare_inputs(WALK, _info("s1", 0, seed=4), _inputs())
+    for name in (LATENTS, "sigma", "timestep"):
+        assert torch.equal(got.tensor_inputs[name].cpu(), want.tensor_inputs[name].cpu()), name
