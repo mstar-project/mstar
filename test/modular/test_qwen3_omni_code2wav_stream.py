@@ -351,6 +351,23 @@ def test_mixed_batch_of_a_terminal_flush_and_a_live_window():
         assert torch.equal(streamed, full), rid
 
 
+def test_the_vocoder_searches_conv_algorithms_only_in_its_own_calls(monkeypatch):
+    """Benchmark mode is on while the vocoder runs and back to what it was
+    after, so the worker's other nodes (the encoders) never search."""
+    seen = []
+
+    class Spy(_LookaheadDecoder):
+        def forward(self, codes, position_ids):
+            seen.append(torch.backends.cudnn.benchmark)
+            return super().forward(codes, position_ids)
+
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    _stream(Code2WavSubmodule(Spy(), Qwen3OmniModelConfig()), _codes(30))
+
+    assert seen and all(seen)
+    assert torch.backends.cudnn.benchmark is False
+
+
 @pytest.mark.parametrize("num_requests", [2, 5])
 def test_ramp_windows_batch_with_steady_ones(num_requests):
     """Requests at different points of the ramp share steps: each step pads to

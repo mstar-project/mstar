@@ -16,6 +16,7 @@ import functools
 import inspect
 import logging
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import torch
@@ -1689,6 +1690,24 @@ class TalkerSubmodule(ARNodeSubmodule):
 # ===================================================================
 
 
+@contextmanager
+def _vocoder_conv_search():
+    """cuDNN/MIOpen benchmark mode for the vocoder's eager calls only.
+
+    Its Conv1d/ConvTranspose1d at small channel counts get a better algorithm
+    from a search, and the warm-up's search is what its captures replay. Set
+    for the whole process it also searched every new input shape of the
+    encoders on the same worker, which took seconds per new image size or
+    audio length. Never inside a capture, which a search would fail.
+    """
+    previous = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = previous
+
+
 class Code2WavSubmodule(NodeSubmodule):
     """Wraps the HF Code2Wav vocoder for streaming chunk decode.
 
@@ -1900,9 +1919,8 @@ class Code2WavSubmodule(NodeSubmodule):
                 for rid in request_ids
             }
 
-        wavs = self.code2wav(
-            codec_tokens, position_ids
-        )
+        with _vocoder_conv_search():
+            wavs = self.code2wav(codec_tokens, position_ids)
 
         results: dict[str, NameToTensorList] = {}
         for i, rid in enumerate(request_ids):
@@ -1928,7 +1946,8 @@ class Code2WavSubmodule(NodeSubmodule):
         if codec_tokens is None or codec_tokens.numel() == 0:
             return {}
 
-        wav = self.code2wav(codec_tokens, position_ids)
+        with _vocoder_conv_search():
+            wav = self.code2wav(codec_tokens, position_ids)
         audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": [audio_int16]}
 

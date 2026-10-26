@@ -88,18 +88,12 @@ def code2wav():
     config = Code2WavConfig.from_dict(json.loads((SNAPSHOT / "config.json").read_text())["code2wav_config"])
     model = Qwen3OmniMoeCode2Wav(config)
     load_weights_from_hf_shards(repo_dir=SNAPSHOT, modules=[ModuleAndPrefix(model, prefix="code2wav")], device="cuda:0")
-    benchmark = torch.backends.cudnn.benchmark
-    # what _create_code2wav_submodule sets before the warm-up and capture
-    torch.backends.cudnn.benchmark = True
     model.eval()
     eager_forward = type(model).forward.__get__(model)
     model.consolidate()
     # what the engine manager does with a disable_autocast node: device only
     model.to(device="cuda:0")
-    try:
-        yield model, eager_forward, config
-    finally:
-        torch.backends.cudnn.benchmark = benchmark
+    yield model, eager_forward, config
 
 
 def stream(submodule: Code2WavSubmodule, frames: torch.Tensor) -> list[torch.Tensor]:
