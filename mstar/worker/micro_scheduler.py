@@ -11,8 +11,8 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWal
 from mstar.model.submodule_base import InputMetadata
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
+    BATCH_BUILDERS,
     BatchBuilderType,
-    make_batch_builder,
 )
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -247,7 +247,12 @@ class MicroScheduler:
     ):
         self.engine_manager = engine_manager
         self.keys = SchedKeys(engine_manager, combined_walk_of, speculation_mixes_walks)
-        self.batch_builder = make_batch_builder(batch_builder_type)
+        self.batch_builder = BATCH_BUILDERS[batch_builder_type]
+        if self.batch_builder.python is None and not _is_rust_runtime(runtime):
+            raise ValueError(
+                f"batch builder {batch_builder_type.value!r} has only a Rust backend, "
+                "which needs the Rust graph runtime (MSTAR_RUST_GRAPH)"
+            )
         self.rr = RoundRobin()
         # The graph runtime. Interning and the (walk, node) -> worker graph
         # index both live there.
@@ -838,13 +843,14 @@ class MicroScheduler:
 
     @property
     def core(self) -> SchedCore:
-        """The pass and the backlog: the Rust core for the Rust graph runtime,
-        whose graph state it works on, the Python core for any other. Built
-        at first use, once the engines' caps are known. A lockstep (TP/SP)
-        node needs nothing of either: only its leader schedules it, and a
-        follower's TP-follow FIFO is taken before the core runs."""
+        """The pass and the backlog: the Rust core with the Rust graph
+        runtime, whose graph state it works on, where the batch builder has a
+        Rust backend; the Python core otherwise. Built at first use, once the
+        engines' caps are known. A lockstep (TP/SP) node needs nothing of
+        either: only its leader schedules it, and a follower's TP-follow FIFO
+        is taken before the core runs."""
         if self._core is None:
-            rust = _is_rust_runtime(self.runtime)
+            rust = self.batch_builder.rust is not None and _is_rust_runtime(self.runtime)
             self._core = self._rust_core() if rust else self._python_core()
         return self._core
 
@@ -854,14 +860,14 @@ class MicroScheduler:
             (node, label, self.keys.walks_of_key.get((node, label), []),
              self.keys.walk_caps((node, label)), self.keys.walk_row_caps((node, label)))
             for node, label in sorted(keys)
-        ], self.parallel_leader_nodes or (), self.keys.mixing_chains)
+        ], self.parallel_leader_nodes or (), self.keys.mixing_chains, self.batch_builder.rust)
 
     def _python_core(self) -> SchedCore:
         # imported here: it builds this module's batches
         from mstar.worker.sched_core.python import PythonSchedCore
 
         return PythonSchedCore(
-            self.runtime, self.keys, self.batch_builder, self.rr,
+            self.runtime, self.keys, self.batch_builder.python(), self.rr,
             self.parallel_leader_nodes or (),
         )
 

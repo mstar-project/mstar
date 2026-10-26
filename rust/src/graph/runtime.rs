@@ -1949,17 +1949,19 @@ impl GraphRuntime {
 
     /// Install the scheduling keys -- `(node, walk label, real walks under a
     /// combined label, [(walk, cap)], [(walk, row cap)])` --, the nodes this
-    /// rank leads and the `(node, real walk)`s whose speculation chain mixes
-    /// walks. Once, before the first pass.
+    /// rank leads, the `(node, real walk)`s whose speculation chain mixes
+    /// walks and the batch builder's Rust backend, by name. Once, before the
+    /// first pass.
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (keys, leaders, mixing))]
+    #[pyo3(signature = (keys, leaders, mixing, builder))]
     fn sched_configure(
         &mut self,
         keys: Vec<(String, String, Vec<String>, Vec<(String, Option<u32>)>, Vec<(String, u32)>)>,
         leaders: Vec<String>,
         mixing: Vec<(String, String)>,
-    ) {
-        self.sched_configure_impl(keys, leaders, mixing);
+        builder: &str,
+    ) -> PyResult<()> {
+        self.sched_configure_impl(keys, leaders, mixing, builder)
     }
 
     /// Begin a pass. Returns `(done, check, batch)`: rows to check and

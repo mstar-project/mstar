@@ -42,6 +42,12 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.base import WorkerGraph  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker import micro_scheduler as ms  # noqa: E402
+from mstar.worker.batch_builder import (  # noqa: E402
+    BATCH_BUILDERS,
+    BatchBuilderBackends,
+    BatchBuilderType,
+    FIFOBatchBuilder,
+)
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.node_manager_utils import RequestStateManager  # noqa: E402
 from mstar.worker.sched_core import RustSchedCore  # noqa: E402
@@ -386,3 +392,16 @@ def test_both_cores_schedule_the_same(config, seed, leaders, variant, monkeypatc
                 both("splits", lambda w, rid=rid: w.sched.backlog_splits_from(w.rs, (LLM, DEC), rid))
     assert isinstance(worlds[1].sched.core, RustSchedCore), "the Rust world must have run the Rust core"
 
+
+@pytest.mark.parametrize("backends, rust_core", [
+    (BatchBuilderBackends(FIFOBatchBuilder, "fifo"), True),
+    (BatchBuilderBackends(FIFOBatchBuilder, None), False),
+    (BatchBuilderBackends(None, "fifo"), True),
+])
+def test_the_builders_backends_pick_the_core(backends, rust_core, monkeypatch):
+    """On the Rust runtime a builder with a Rust backend runs on the Rust
+    core, and one with only a Python backend on the Python core."""
+    monkeypatch.setitem(BATCH_BUILDERS, BatchBuilderType.FIFO, backends)
+    caps, row_caps = CONFIGS["capped"]
+    w = World(True, caps, row_caps, 0, _Clock())
+    assert isinstance(w.sched.core, RustSchedCore) is rust_core

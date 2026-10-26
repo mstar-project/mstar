@@ -35,8 +35,11 @@ from mstar.graph.runtime.base import (
     RequestWalks,
 )
 from mstar.utils.containers import ParallelList
+from mstar.worker import batch_builder
 from mstar.worker.batch_builder import (
     BaseBatchBuilder,
+    BatchBuilderBackends,
+    BatchBuilderType,
     BatchBuildRequest,
     BatchBuildResult,
     FIFOBatchBuilder,
@@ -1104,7 +1107,7 @@ class _ReturnOddBuilder(BaseBatchBuilder):
 
 def test_the_scheduler_runs_the_configured_builder():
     sched = _scheduler(_Engine(max_bs=8))
-    builder = sched.batch_builder = _ReturnOddBuilder()
+    builder = sched.core.batch_builder = _ReturnOddBuilder()
     manager = _Manager(["r0", "r1", "r2", "r3"])
 
     batch = _next_batch(sched, manager, capture_group_of="r2")
@@ -1117,7 +1120,7 @@ def test_the_scheduler_runs_the_configured_builder():
 
 def test_returned_rows_go_back_to_their_ready_queue_not_the_backlog():
     sched = _scheduler(_Engine(max_bs=8))
-    sched.batch_builder = _ReturnOddBuilder()
+    sched.core.batch_builder = _ReturnOddBuilder()
     manager = _Manager(["r0", "r1", "r2", "r3"])
 
     _next_batch(sched, manager)
@@ -1238,13 +1241,21 @@ def test_an_input_landing_on_a_backlogged_row_does_not_ready_it_again():
 
 def test_returned_rows_are_no_longer_in_flight():
     sched = _scheduler(_Engine(max_bs=8))
-    sched.batch_builder = _ReturnOddBuilder()
+    sched.core.batch_builder = _ReturnOddBuilder()
     manager = _Manager(["r0", "r1"])
     manager.in_flight.add(("r1", NODE))
 
     _next_batch(sched, manager)
 
     assert ("r1", NODE) not in manager.in_flight
+
+
+def test_a_rust_only_builder_needs_the_rust_runtime(monkeypatch):
+    monkeypatch.setitem(
+        batch_builder.BATCH_BUILDERS, BatchBuilderType.FIFO, BatchBuilderBackends(None, "fifo"),
+    )
+    with pytest.raises(ValueError, match="only a Rust backend"):
+        _scheduler(_Engine(max_bs=8))
 
 
 class _DroppingBuilder(BaseBatchBuilder):
@@ -1260,7 +1271,7 @@ def test_a_builder_that_loses_a_row_is_refused():
     its ready queue and is marked in flight, so nothing would ever schedule it
     again -- the request would hang with no evidence of where it went."""
     sched = _scheduler(_Engine(max_bs=8))
-    sched.batch_builder = _DroppingBuilder()
+    sched.core.batch_builder = _DroppingBuilder()
 
     with pytest.raises(AssertionError, match="dropped rows"):
         _next_batch(sched, _Manager(["r0", "r1", "r2"]))

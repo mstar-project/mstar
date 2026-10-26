@@ -23,13 +23,15 @@ class RustSchedCore(SchedCore):
     flags it works on, and a pass crosses once per check request."""
 
     def __init__(self, runtime, keys: Iterable[tuple[str, str, list[str], dict, dict]],
-                 leader_nodes: Iterable[str], mixing_chains: Iterable[tuple[str, str]]):
+                 leader_nodes: Iterable[str], mixing_chains: Iterable[tuple[str, str]],
+                 batch_builder: str):
         self._rt = runtime._rust
         self._rt.sched_configure(
             keys=[(node, label, list(walks), list(caps.items()), list(row_caps.items()))
                   for node, label, walks, caps, row_caps in keys],
             leaders=sorted(leader_nodes),
             mixing=sorted(mixing_chains),
+            builder=batch_builder,
         )
 
     def begin(self, request: PassRequest) -> PassStep:

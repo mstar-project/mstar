@@ -1,9 +1,13 @@
 """Batch composition: which ready rows of one (node, walk) run this step.
 
 The ``MicroScheduler`` picks the (node, walk) and owns the mechanics (popping
-ready queues, the backlog, holds, TP follow); a ``BaseBatchBuilder`` decides
-which of the popped rows go into the step, which stay parked in the backlog
-and which go back to their ready queues.
+ready queues, the backlog, holds, TP follow); a batch builder decides which of
+the popped rows go into the step, which stay parked in the backlog and which
+go back to their ready queues.
+
+A builder has a Python backend (a ``BaseBatchBuilder``, for the Python
+scheduler core), a Rust one (``rust/src/batch_builder.rs``, for the Rust
+core), or both; ``BATCH_BUILDERS`` says which.
 """
 
 from abc import ABC, abstractmethod
@@ -210,5 +214,13 @@ class BatchBuilderType(Enum):
     FIFO = "fifo"
 
 
-def make_batch_builder(kind: BatchBuilderType) -> BaseBatchBuilder:
-    return {BatchBuilderType.FIFO: FIFOBatchBuilder}[kind]()
+class BatchBuilderBackends(NamedTuple):
+    """A builder's implementations; either may be missing."""
+    python: "type[BaseBatchBuilder] | None"
+    # the name ``rust/src/batch_builder.rs``'s ``by_name`` knows it by
+    rust: str | None
+
+
+BATCH_BUILDERS: dict[BatchBuilderType, BatchBuilderBackends] = {
+    BatchBuilderType.FIFO: BatchBuilderBackends(python=FIFOBatchBuilder, rust="fifo"),
+}

@@ -7,13 +7,15 @@
 //! from where it stopped when they come back -- plan, check, commit, with one
 //! crossing per check request. The backlog and the round-robin table live
 //! here, beside the ready masks, pops, in-flight flags and push-backs they
-//! drive.
+//! drive. Which popped rows a step takes is the configured batch builder's
+//! (`crate::batch_builder`).
 //!
 //! The Python core (`mstar/worker/sched_core/python.py`) is the reference:
 //! the logic below follows it step for step, and
 //! `test/rust/test_sched_core_parity.py` drives both.
 
 use super::*;
+use crate::batch_builder::{self, BatchBuilder, BuildRequest, KeyCaps, Row, min_cap};
 
 /// A scheduling key: (node, walk), the walk being the combined walk where
 /// the real one has one.
@@ -25,28 +27,6 @@ const FAILED: u8 = 2;
 const UNCHECKED: u8 = 3;
 /// The group of a row whose node does not split batches by capture key.
 const NO_GROUP: i64 = -1;
-
-/// The engine's caps for one key, asked once by the Python side.
-struct KeyCfg {
-    /// The real walks under a combined key; empty for a plain one.
-    walks: Vec<Sym>,
-    /// walk -> cap (None: uncapped), in `SchedKeys.walk_caps` order:
-    /// each real walk, then the key's own.
-    caps: Vec<(Sym, Option<u32>)>,
-    /// `SchedKeys.walk_row_caps`: per real walk, rows a mixed step may hold.
-    row_caps: Vec<(Sym, u32)>,
-}
-
-impl KeyCfg {
-    /// `caps.get(walk)`: None for an uncapped walk and for one not listed.
-    fn cap(&self, walk: Sym) -> Option<u32> {
-        self.caps.iter().find(|c| c.0 == walk).and_then(|c| c.1)
-    }
-
-    fn row_cap(&self, walk: Sym) -> Option<u32> {
-        self.row_caps.iter().find(|c| c.0 == walk).map(|c| c.1)
-    }
-}
 
 #[derive(Clone)]
 struct SRow {
@@ -94,29 +74,6 @@ impl SBatch {
             }
         }
         Ok(())
-    }
-
-    /// `ScheduledBatch.split_off_first`: up to `bs` rows not in `exclude`,
-    /// and the rest (the excluded ones last).
-    fn split_off_first(
-        self, bs: Option<usize>, exclude: &FxHashSet<u32>,
-    ) -> (Option<SBatch>, Option<SBatch>) {
-        let bs = bs.unwrap_or(self.rows.len());
-        let (keep, out): (Vec<&SRow>, Vec<&SRow>) =
-            self.rows.iter().partition(|r| !exclude.contains(&r.rid));
-        if keep.len() <= bs && out.is_empty() {
-            return (Some(self), None);
-        }
-        if keep.is_empty() {
-            return (None, Some(self));
-        }
-        let taken: Vec<SRow> = keep[..bs.min(keep.len())].iter().map(|r| (*r).clone()).collect();
-        let left: Vec<SRow> = keep[bs.min(keep.len())..]
-            .iter()
-            .chain(out.iter())
-            .map(|r| (*r).clone())
-            .collect();
-        (Some(self.with_rows(taken)), Some(self.with_rows(left)))
     }
 
     /// `ScheduledBatch.relabel_if_uniform`.
@@ -227,7 +184,9 @@ pub(super) struct Pass {
 
 #[derive(Default)]
 pub(super) struct SchedState {
-    keys: FxHashMap<Key, KeyCfg>,
+    keys: FxHashMap<Key, KeyCaps>,
+    /// the configured batch builder's Rust backend
+    builder: Option<Box<dyn BatchBuilder>>,
     leaders: FxHashSet<Sym>,
     /// (node, real walk) whose speculation chain mixes walks
     mixing: FxHashSet<(Sym, Sym)>,
@@ -271,10 +230,6 @@ enum KeyStep {
     Check(KeyCtx, CheckOut),
 }
 
-fn min_cap(caps: impl IntoIterator<Item = Option<u32>>) -> Option<u32> {
-    caps.into_iter().flatten().min()
-}
-
 impl GraphRuntime {
     fn sym_or_none(&self, s: &str) -> Sym {
         // a name no graph has matches nothing
@@ -285,7 +240,7 @@ impl GraphRuntime {
         (node, self.combined_walk_of.get(&(node, walk)).copied().unwrap_or(walk))
     }
 
-    fn sched_cfg(&self, key: Key) -> PyResult<&KeyCfg> {
+    fn sched_cfg(&self, key: Key) -> PyResult<&KeyCaps> {
         self.sched.keys.get(&key).ok_or_else(|| {
             PyRuntimeError::new_err(format!(
                 "scheduling key ({}, {}) was not configured",
@@ -300,11 +255,15 @@ impl GraphRuntime {
         keys: Vec<(String, String, Vec<String>, Vec<(String, Option<u32>)>, Vec<(String, u32)>)>,
         leaders: Vec<String>,
         mixing: Vec<(String, String)>,
-    ) {
+        builder: &str,
+    ) -> PyResult<()> {
+        self.sched.builder = Some(batch_builder::by_name(builder).ok_or_else(|| {
+            PyValueError::new_err(format!("no Rust backend for batch builder {builder:?}"))
+        })?);
         let mut cfgs = FxHashMap::default();
         for (node, label, walks, caps, row_caps) in keys {
             let key = (self.interner.intern(&node), self.interner.intern(&label));
-            let cfg = KeyCfg {
+            let cfg = KeyCaps {
                 walks: walks.iter().map(|w| self.interner.intern(w)).collect(),
                 caps: caps.iter().map(|(w, c)| (self.interner.intern(w), *c)).collect(),
                 row_caps: row_caps.iter().map(|(w, c)| (self.interner.intern(w), *c)).collect(),
@@ -316,6 +275,12 @@ impl GraphRuntime {
         self.sched.mixing = mixing.iter()
             .map(|(n, w)| (self.interner.intern(n), self.interner.intern(w)))
             .collect();
+        Ok(())
+    }
+
+    fn sched_builder(&self) -> PyResult<&dyn BatchBuilder> {
+        self.sched.builder.as_deref()
+            .ok_or_else(|| PyRuntimeError::new_err("the scheduler core was not configured"))
     }
 
     /// `speculation_mixes`.
@@ -579,7 +544,8 @@ impl GraphRuntime {
         Ok(Some((rows, walk_sigs)))
     }
 
-    /// `_build_and_schedule` with `FIFOBatchBuilder.build_batch`.
+    /// `_build_and_schedule`: the configured builder composes one step out of
+    /// the backlog and the fresh rows, and the core carries out its verdict.
     fn sched_build_and_schedule(
         &mut self, p: &Pass, key: Key,
         backlog: Option<SBatch>, fresh: Option<SBatch>, blocked: FxHashSet<u32>,
@@ -588,8 +554,7 @@ impl GraphRuntime {
         for b in backlog.iter().chain(fresh.iter()) {
             expected.extend(b.rows.iter().map(|r| r.rid));
         }
-        let had_backlog = backlog.is_some();
-        let fresh_rids: FxHashSet<u32> = fresh.iter().flat_map(|b| b.rows.iter().map(|r| r.rid)).collect();
+        let n_backlog = backlog.as_ref().map_or(0, |b| b.rows.len());
         let batch = match (backlog, fresh) {
             (None, None) => return Ok(None),
             (Some(b), None) => b,
@@ -599,49 +564,23 @@ impl GraphRuntime {
                 b
             }
         };
-
-        let mut exclude = blocked;
-        let walk = self.sched_single_walk(&batch, key.1, p.pre_walk);
-        let max_bs: Option<i64> = match walk {
-            None => {
-                let (max_bs, left_out) = self.sched_compose_walks(&batch, &exclude, key, p)?;
-                exclude.extend(left_out);
-                max_bs
-            }
-            Some(w) => self.sched_cfg(key)?.cap(w).map(|c| i64::from(c) - i64::from(p.pre)),
+        let rows: Vec<Row> = batch.rows.iter().map(|r| Row { rid: r.rid, walk: r.walk }).collect();
+        let built = self.sched_builder()?.build(&BuildRequest {
+            label: key.1, rows: &rows, n_backlog, combined: batch.combined, blocked: &blocked,
+            caps: self.sched_cfg(key)?, pre: p.pre, pre_walk: p.pre_walk,
+        });
+        let part = |idx: &[usize]| {
+            (!idx.is_empty()).then(|| batch.with_rows(idx.iter().map(|&i| batch.rows[i].clone()).collect()))
         };
+        let (scheduled, parked, returned) = (part(&built.scheduled), part(&built.parked), part(&built.returned));
 
-        let (scheduled, parked, returned) = if max_bs.is_some_and(|m| m <= 0) {
-            (None, Some(batch), None) // the caller's rows fill it
-        } else {
-            let (scheduled, remainder) = batch.split_off_first(max_bs.map(|m| m as usize), &exclude);
-            match remainder {
-                None => (scheduled, None, None),
-                Some(remainder) => {
-                    let give_back: FxHashSet<u32> = if had_backlog {
-                        remainder.rows.iter()
-                            .map(|r| r.rid)
-                            .filter(|r| fresh_rids.contains(r) && !exclude.contains(r))
-                            .collect()
-                    } else {
-                        FxHashSet::default()
-                    };
-                    if give_back.is_empty() {
-                        (scheduled, Some(remainder), None)
-                    } else {
-                        let (parked, returned) = remainder.split_off_first(None, &give_back);
-                        (scheduled, parked, returned)
-                    }
-                }
-            }
-        };
-
-        // `_refuse_lost_rows`: every row handed in comes back out
+        // `_refuse_lost_rows`: every row handed in comes back out, once
         let mut got: FxHashSet<u32> = FxHashSet::default();
         for b in scheduled.iter().chain(parked.iter()).chain(returned.iter()) {
             got.extend(b.rows.iter().map(|r| r.rid));
         }
-        if got != expected {
+        let n_out = built.scheduled.len() + built.parked.len() + built.returned.len();
+        if got != expected || n_out != rows.len() {
             return Err(PyRuntimeError::new_err(format!(
                 "batch builder dropped rows for ({}, {})",
                 self.interner.name(key.0), self.interner.name(key.1),
@@ -675,75 +614,6 @@ impl GraphRuntime {
         // claimed like a running batch, so an input arriving while it waits
         // does not put its node back on the ready queue
         self.set_in_flight(self.interner.name(key.0).to_string(), rids, wgs, true)
-    }
-
-    /// `_single_walk`: the one walk of every row, the caller's included.
-    fn sched_single_walk(&self, batch: &SBatch, label: Sym, pre_walk: Option<Sym>) -> Option<Sym> {
-        if !batch.combined {
-            return Some(label);
-        }
-        let mut walks: Vec<Sym> = Vec::new();
-        for w in batch.rows.iter().map(|r| r.walk).chain(pre_walk) {
-            if !walks.contains(&w) {
-                walks.push(w);
-            }
-        }
-        if walks.len() == 1 { Some(walks[0]) } else { None }
-    }
-
-    /// `_compose_walks`: rows left for the step after the caller's, and the
-    /// rows left out.
-    fn sched_compose_walks(
-        &self, batch: &SBatch, exclude: &FxHashSet<u32>, key: Key, p: &Pass,
-    ) -> PyResult<(Option<i64>, FxHashSet<u32>)> {
-        let cfg = self.sched_cfg(key)?;
-        let mut n: i64 = i64::from(p.pre);
-        let mut walks: Vec<Sym> = p.pre_walk.into_iter().collect();
-        let mut counts: Vec<(Sym, i64)> = p.pre_walk.map(|w| (w, n)).into_iter().collect();
-        let count = |counts: &Vec<(Sym, i64)>, w: Sym| counts.iter().find(|c| c.0 == w).map_or(0, |c| c.1);
-        let mut cap = min_cap(walks.iter().map(|&w| cfg.cap(w)));
-        let mut left_out = FxHashSet::default();
-        for row in &batch.rows {
-            if exclude.contains(&row.rid) {
-                continue;
-            }
-            let walk = row.walk;
-            let mut new_cap = cap;
-            if !walks.contains(&walk) {
-                let mixed_cap = if walks.is_empty() { None } else { cfg.cap(key.1) };
-                new_cap = if mixed_cap.is_some() { mixed_cap } else { min_cap([cap, cfg.cap(walk)]) };
-            }
-            if new_cap.is_some_and(|c| i64::from(c) <= n) {
-                left_out.insert(row.rid);
-                continue;
-            }
-            if !cfg.row_caps.is_empty() && !walks.is_empty() {
-                let over = if !walks.contains(&walk) {
-                    walks.iter().copied().chain(std::iter::once(walk)).any(|w| {
-                        cfg.row_cap(w).is_some_and(|rc| {
-                            count(&counts, w) + i64::from(w == walk) > i64::from(rc)
-                        })
-                    })
-                } else {
-                    walks.len() > 1
-                        && cfg.row_cap(walk).is_some_and(|rc| count(&counts, walk) + 1 > i64::from(rc))
-                };
-                if over {
-                    left_out.insert(row.rid);
-                    continue;
-                }
-            }
-            if !walks.contains(&walk) {
-                walks.push(walk);
-            }
-            match counts.iter_mut().find(|c| c.0 == walk) {
-                Some(c) => c.1 += 1,
-                None => counts.push((walk, 1)),
-            }
-            cap = new_cap;
-            n += 1;
-        }
-        Ok((cap.map(|c| i64::from(c) - i64::from(p.pre)), left_out))
     }
 
     /// Begin a pass: `get_next_batch` after the TP-follow FIFO.
@@ -1073,7 +943,7 @@ impl GraphRuntime {
                 if walks.len() > 1 {
                     cap = self.sched_walk_set_cap(key, &walks)?;
                 }
-                cap.map(|c| c.saturating_sub(b.rows.len() as u32))
+                self.sched_builder()?.room_for_continuing(cap, b.rows.len())
             }
             Some(b) if b.combined => {
                 // the chain's merge takes only its own walk's backlogged rows
@@ -1081,7 +951,7 @@ impl GraphRuntime {
                 let own = b.rows.iter().filter(|r| r.walk == w).count() as u32;
                 Some(cap.saturating_sub(own))
             }
-            _ => cap.map(|c| c.saturating_sub(backlog.map_or(0, |b| b.rows.len() as u32))),
+            _ => self.sched_builder()?.room_for_continuing(cap, backlog.map_or(0, |b| b.rows.len())),
         })
     }
 
