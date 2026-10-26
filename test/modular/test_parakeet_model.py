@@ -9,7 +9,17 @@ import torch
 
 from mstar.api_server.openai.adapters import TransducerAdapter
 from mstar.api_server.openai.protocol import TranscriptionRequest
-from mstar.model.parakeet.config import ParakeetModelConfig
+from mstar.engine.resources.recurrent import RecurrentStateSpec
+from mstar.graph.base import GraphNode, Loop, TensorPointerInfo
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.parakeet.config import (
+    DECODE_LOOP,
+    DECODE_WALK,
+    NUM_FRAMES,
+    PREFILL_WALK,
+    TRANSDUCER_STATE,
+    ParakeetModelConfig,
+)
 from mstar.model.parakeet.parakeet_model import ParakeetModel
 
 ENCODER = dict(
@@ -83,13 +93,20 @@ def test_unsupported_checkpoint(tmp_path):
 def test_graph_and_process_prompt(tmp_path, nemotron):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
     assert model.nodes == ["audio_encoder", "transducer"]
-    assert model.get_node_resources() == []
+    (pool,) = model.get_node_resources()
+    assert isinstance(pool, RecurrentStateSpec) and pool.resource_key == TRANSDUCER_STATE
+    assert pool.nodes == {"transducer"} and pool.config.usable_slots == model.MAX_CONCURRENT_REQUESTS
+    assert pool.config.blocks.keys() == {"h", "c", "dec_out", "cursor", "symbols"}
     out = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(8000)]},
                                language="de")
-    assert out["audio"][0].shape == (8000,)
-    assert ("prompt_ids" in out) == nemotron
+    tensors = out.new_input_tensors
+    assert tensors["audio"][0].shape == (8000,)
+    # the encoder frames of 50 mel frames, as the encoder node will count them
+    assert out.metadata == {NUM_FRAMES: model.config.encoder.output_lengths(8000 // 160)}
+    assert NUM_FRAMES in model.INTERNAL_KWARGS
+    assert ("prompt_ids" in tensors) == nemotron
     if nemotron:
-        assert out["prompt_ids"][0].tolist() == [2]
+        assert tensors["prompt_ids"][0].tolist() == [2]
     with pytest.raises(ValueError):
         model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(611 * 16_000)]})
     # Parakeet-TDT refuses a language it can't detect, Nemotron one its prompt
@@ -128,3 +145,73 @@ def test_adapter(detects_language):
             adapter.transcription_to_request(unknown, "a")
     else:
         assert adapter.transcription_to_request(unknown, "a").model_kwargs["language"] == "ja"
+
+
+def _pointer(uuid: int) -> TensorPointerInfo:
+    return TensorPointerInfo(
+        dims=[7, 16], dtype=torch.float32, nbytes=448, address=0, stride=[16, 1], uuid=uuid,
+        source_session_id="host:0", source_entity="worker",
+    )
+
+
+@pytest.mark.parametrize("nemotron", [False, True])
+def test_prefill_then_a_decode_loop(tmp_path, nemotron):
+    """prefill persists the projected frames; decode is a loop over the
+    transducer that the Loop re-injects them into, with a self loop-back
+    clock that makes the node a speculation target; then the request is done."""
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
+    walks = model.get_graph_walk_graphs()
+    assert walks.keys() == {PREFILL_WALK, DECODE_WALK}
+    transducer = walks[PREFILL_WALK].get_nodes()["transducer"]
+    assert transducer.input_names == ({"encoder_states", "prompt_ids"} if nemotron else {"encoder_states"})
+    [frames] = transducer.outputs
+    assert (frames.name, frames.next_node, frames.persist) == ("frames", EMPTY_DESTINATION, True)
+
+    loop = walks[DECODE_WALK]
+    assert isinstance(loop, Loop) and loop.name == DECODE_LOOP and loop.outputs == []
+    node = loop.section
+    assert isinstance(node, GraphNode) and node.name == "transducer" and node.enable_async_scheduling
+    assert node.input_names == {"frames", "clock"}
+    assert {(e.name, e.next_node) for e in node.outputs} == {("clock", "transducer"), ("tokens", EMIT_TO_CLIENT)}
+    # the frames come from outside the loop, so it saves and re-injects them; the clock loops back
+    assert loop._external_inputs == {("frames", "transducer")}
+    assert loop._loop_back_inputs == {("clock", "transducer")}
+    # a ceiling only: the clip's own cap, and its stop check, end the loop first
+    assert loop.max_iters == model.config.transducer.decode_iterations(
+        model.config.encoder.output_lengths(610 * 16_000 // 160))
+    assert model.get_loop_caps(**{NUM_FRAMES: 7}) == {DECODE_LOOP: model.config.transducer.decode_iterations(7)}
+
+    audio, prompt = _pointer(1), _pointer(2)
+    first = model.get_initial_forward_pass_args(
+        "default", ["audio"], ["text"], {"audio": [audio], "prompt_ids": [prompt]}, model_kwargs={NUM_FRAMES: 7},
+    )
+    assert first.full_metadata.graph_walk == PREFILL_WALK and first.full_metadata.is_prefill
+    assert [e.next_node for e in first.inputs] == ["audio_encoder"] + (["transducer"] if nemotron else [])
+    persisted = _pointer(3)
+    decode = model.get_partition_forward_pass_args("default", first.full_metadata, {"frames": [persisted]})
+    assert decode.full_metadata.graph_walk == DECODE_WALK and not decode.full_metadata.is_prefill
+    assert not decode.request_done
+    edges = {e.name: e for e in decode.inputs}
+    assert edges.keys() == {"frames", "clock"} and all(e.next_node == "transducer" for e in decode.inputs)
+    assert edges["frames"].tensor_info == [persisted] and edges["clock"].tensor_info == []
+    # the conductor lets go of the frames; the loop holds its own reference
+    assert decode.unpersist_tensors == [persisted]
+    assert decode.step_metadata == {NUM_FRAMES: 7}
+    done = model.get_partition_forward_pass_args("default", decode.full_metadata, {})
+    assert done.request_done and done.inputs == []
+
+
+def test_startup_refuses_more_requests_than_slots(tmp_path):
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=False)))
+    model.validate_config_yaml({"max_concurrent_requests": 128}, "a.yaml")
+    model.validate_config_yaml(
+        {"max_concurrent_requests": 128, "resources": {TRANSDUCER_STATE: {"max_slots": 129}}}, "a.yaml",
+    )
+    with pytest.raises(ValueError, match="need 129 slots"):
+        model.validate_config_yaml(
+            {"max_concurrent_requests": 128, "resources": {TRANSDUCER_STATE: {"max_slots": 128}}}, "a.yaml",
+        )
+    with pytest.raises(ValueError, match="need 130 slots"):
+        model.validate_config_yaml({"max_concurrent_requests": 129}, "a.yaml")
+    with pytest.raises(ValueError, match="positive int"):
+        model.validate_config_yaml({"max_concurrent_requests": 0}, "a.yaml")

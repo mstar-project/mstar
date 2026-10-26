@@ -1,5 +1,6 @@
 """Batched greedy transducer decoding (TDT and RNN-T) against a plain
-one-request reference loop, on tiny random heads."""
+one-request reference loop, on tiny random heads. The decode loop through the
+engine's recurrent state pool is ``test_transducer_loop.py``."""
 
 import pytest
 import torch
@@ -61,6 +62,21 @@ def _reference(head: TransducerHead, states: torch.Tensor, prompt_id=None) -> li
     return tokens
 
 
+def _greedy(head: TransducerHead, states, lengths, prompt_ids=None) -> list[list[int]]:
+    """Each request's tokens from ``advance`` alone: the batch's state, from
+    the start state, stepped a chunk at a time until no row is active."""
+    frames = head.project_frames(states, prompt_ids)
+    rows = frames.shape[0]
+    state = {name: start.expand(rows, *start.shape).clone() for name, start in head.initial_state().items()}
+    chunks = []
+    for _ in range(head.config.decode_iterations(frames.shape[1])):
+        tokens, active = head.advance(frames, lengths, state)
+        chunks.append(tokens)
+        if not active.any():
+            break
+    return [[token for token in row if token >= 0] for row in torch.cat(chunks, dim=1).tolist()]
+
+
 @pytest.mark.parametrize("durations", [[0, 1, 2, 3, 4], []], ids=["tdt", "rnnt"])
 def test_batched_greedy_matches_reference(durations):
     head = _head(durations)
@@ -70,7 +86,7 @@ def test_batched_greedy_matches_reference(durations):
     for i, n in enumerate(lens):
         states[i, :n] = torch.randn(n, 24)
     with torch.no_grad():
-        batched = head.greedy_decode(states, torch.tensor(lens))
+        batched = _greedy(head, states, torch.tensor(lens))
         expected = [_reference(head, states[i, :n]) for i, n in enumerate(lens)]
     assert batched == expected
     assert any(batched), "the random head emitted nothing; the test would be vacuous"
@@ -81,7 +97,7 @@ def test_rnnt_caps_symbols_per_frame():
     with torch.no_grad():
         # never blank: every frame emits exactly max_symbols tokens
         head.joint.head.bias[head.config.blank_token_id] = -1e4
-        tokens = head.greedy_decode(torch.randn(1, 4, 24), torch.tensor([4]))
+        tokens = _greedy(head, torch.randn(1, 4, 24), torch.tensor([4]))
     assert len(tokens[0]) == 4 * head.config.max_symbols_per_step
 
 
@@ -103,7 +119,7 @@ def test_rnnt_finds_emissions_across_blank_runs():
         states = torch.zeros(len(lens), 23, 24)
         for row, frames in enumerate([[0, 3, 4, 11, 22], [7, 8, 9, 10], [8]]):
             states[row, frames, 0] = 100.0
-        batched = head.greedy_decode(states, torch.tensor(lens))
+        batched = _greedy(head, states, torch.tensor(lens))
         expected = [_reference(head, states[i, :n]) for i, n in enumerate(lens)]
     assert batched == expected
     assert [len(t) for t in batched] == [5 * cfg.max_symbols_per_step, 4 * cfg.max_symbols_per_step,
@@ -117,10 +133,24 @@ def test_prompt_changes_the_frames():
     with torch.no_grad():
         a = head.project_frames(states, torch.tensor([0, 0]))
         b = head.project_frames(states, torch.tensor([0, 5]))
-        batched = head.greedy_decode(states, torch.tensor([12, 12]), torch.tensor([1, 4]))
+        batched = _greedy(head, states, torch.tensor([12, 12]), torch.tensor([1, 4]))
         expected = [_reference(head, states[i], prompt_id=p) for i, p in enumerate([1, 4])]
     assert torch.equal(a[0], b[0]) and not torch.allclose(a[1], b[1])
     assert batched == expected
+
+
+def test_the_start_state_fills_the_pool_blocks():
+    head = _head([0, 1, 2, 3, 4])
+    blocks = head.config.state_blocks()
+    start = head.initial_state()
+    assert start.keys() == blocks.keys()
+    for name, block in blocks.items():
+        assert start[name].shape == block.shape and start[name].dtype == block.dtype, name
+    zeros = torch.zeros(1, 2, 16)
+    with torch.no_grad():
+        out, h, c = head.decoder(torch.tensor([head.config.start_token_id]), zeros, zeros)
+    assert torch.equal(start["dec_out"], out[0]) and torch.equal(start["h"], h[0]) and torch.equal(start["c"], c[0])
+    assert int(start["cursor"]) == int(start["symbols"]) == 0
 
 
 def test_written_out_lstm_matches_nn_lstm():
@@ -157,135 +187,33 @@ def test_tdt_moves_on_after_max_symbols_at_one_frame():
         head.encoder_projector.weight[0, 0] = 1.0
         states = torch.zeros(1, 5, 24)
         states[0, 1, 0] = states[0, 3, 0] = 100.0
-        tokens = head.greedy_decode(states, torch.tensor([5]))
+        tokens = _greedy(head, states, torch.tensor([5]))
         expected = _reference(head, states[0])
     assert tokens[0] == expected == [4] * (2 * cfg.max_symbols_per_step)
 
 
-def _captured_runners(node):
-    import gc
-    from unittest import mock
-
-    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
-
-    # an earlier test's graphs freed by the collector mid-capture would void it
-    gc.collect()
-    runners = {}
-    for label, config in node.get_piecewise_accelerator_graph_configs(torch.device("cuda", 0), torch.float32).items():
-        runner = PiecewiseAcceleratorGraphRunner(
-            label=label, config=config, resources={}, step_runner=mock.Mock(), device=torch.device("cuda", 0),
-            autocast_dtype=None, num_slots=1,
-        )
-        runner.warmup_and_capture(None)  # no plan: every bucket
-        assert not runner.dropped_shapes
-        runners[label] = runner
-    return runners
-
-
-class _Replays:
-    """A runner that notes which regions replayed."""
-
-    def __init__(self, runner, label, seen):
-        self._runner, self._label, self._seen = runner, label, seen
-
-    def can_run(self, *args):
-        return self._runner.can_run(*args)
-
-    def run(self, *args, **kwargs):
-        self._seen.add(self._label)
-        return self._runner.run(*args, **kwargs)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a GPU")
-@pytest.mark.parametrize("durations", [[0, 1, 2, 3, 4], []], ids=["tdt", "rnnt"])
-@pytest.mark.parametrize("lens,replayed", [
-    ([17, 5, 30], {"greedy_T512"}),
-    # each row to its own bucket: both captures replay, under one frames buffer
-    ([600, 3, 41, 520, 9, 77], {"greedy_T512", "greedy_T8192"}),
-    # more long rows than the long capture holds: it replays a part at a time
-    ([600, 530, 700, 650, 520, 610], {"greedy_T8192"}),
-], ids=["short", "mixed", "wide-long"])
-def test_captured_chunks_match_eager(durations, lens, replayed):
-    from mstar.model.parakeet.submodules import TransducerSubmodule
-
-    node = TransducerSubmodule(_head(durations, seed=6).cuda())
-    assert node._step is not node.head.step, "the captures should replay the compiled step"
-    # as the engine does before warmup: the compiled step captures inference-only
-    node.requires_grad_(False)
-    seen = set()
-    runners = {label: _Replays(runner, label, seen) for label, runner in _captured_runners(node).items()}
-    torch.manual_seed(7)
-    states = torch.zeros(len(lens), max(lens), 24, device="cuda")
-    for i, n in enumerate(lens):
-        states[i, :n] = torch.randn(n, 24, device="cuda")
-    lengths = torch.tensor(lens, device="cuda")
-    with torch.no_grad():
-        captured = [t.tolist() for t in node._decode(states, lengths, None, lens, runners)]
-        eager = [t.tolist() for t in node._decode(states, lengths, None, lens, {})]
-    assert seen == replayed
-    assert captured == eager
-    assert sum(map(len, eager)) > len(lens), "the random head emitted nothing; the test would be vacuous"
-
-
-def test_rows_past_the_working_captures_decode_uncaptured():
-    """The engine keeps a region whose widest capture failed at warmup; the
-    rows no remaining capture holds decode uncaptured, the rest replay."""
-    from mstar.model.parakeet.submodules import TransducerSubmodule
-
-    class Region:
-        # 600-700 frames is the long bucket, whose widest capture is 4 rows;
-        # here it failed and 1 and 2 remain
-        def __init__(self):
-            self.replayed = []
-
-        def can_run(self, b):
-            return b <= 2
-
-        def run(self, static_inputs, real_bs):
-            self.replayed.append(real_bs)
-            if static_inputs:
-                self.state = static_inputs
-            return node.head.advance(self.state, node._step)
-
-    node = TransducerSubmodule(_head([0, 1, 2, 3, 4], seed=6), compile_step=False)
-    region = Region()
-    lens = [600, 530, 700, 650, 520, 610]
-    torch.manual_seed(7)
-    states = torch.zeros(len(lens), max(lens), 24)
-    for i, n in enumerate(lens):
-        states[i, :n] = torch.randn(n, 24)
-    with torch.no_grad():
-        tokens = node._decode(states, torch.tensor(lens), None, lens, {"greedy_T8192": region})
-        expected = node._decode(states, torch.tensor(lens), None, lens, {})
-    # rows 0-3 are one 4-row part (uncaptured), rows 4-5 a 2-row replay
-    assert set(region.replayed) == {2}
-    assert [t.tolist() for t in tokens] == [t.tolist() for t in expected]
-
-
-def test_greedy_runs_in_full_fp32(monkeypatch):
-    """The engine runs fp32 GEMMs in TF32; decoding and the captured chunk
-    lift that, and put it back."""
-    from types import SimpleNamespace
-
+def test_the_node_decodes_in_full_fp32(monkeypatch):
+    """The engine runs fp32 GEMMs in TF32. The transducer node asks it for full
+    fp32 around its forward and capture, and computes its start state in full
+    fp32 too, then puts the setting back."""
+    from mstar.engine.fp32_precision import node_fp32_precision
     from mstar.model.parakeet.submodules import TransducerSubmodule
 
     head = _head([0, 1, 2, 3, 4])
     seen = []
-    advance = head.advance
+    decoder = head.decoder.forward
 
-    def spy(state, step=None):
+    def spy(*args):
         seen.append(torch.get_float32_matmul_precision())
-        return advance(state, step)
+        return decoder(*args)
 
-    monkeypatch.setattr(head, "advance", spy)
+    monkeypatch.setattr(head.decoder, "forward", spy)
     previous = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high")
     try:
-        with torch.no_grad():
-            head.greedy_decode(torch.randn(2, 6, 24), torch.tensor([6, 4]))
-            frames = head.project_frames(torch.randn(2, 6, 24), None)
-            TransducerSubmodule(head)._capture(SimpleNamespace(static_inputs=head.start(frames, torch.tensor([6, 4]))))
+        node = TransducerSubmodule(head, compile_step=False)
         assert torch.get_float32_matmul_precision() == "high"
     finally:
         torch.set_float32_matmul_precision(previous)
-    assert seen and set(seen) == {"highest"}
+    assert seen == ["highest"]
+    assert node_fp32_precision("transducer", node).matmul == "highest"

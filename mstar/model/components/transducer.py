@@ -5,8 +5,9 @@ the encoder frame under each request's cursor; TDT also predicts how many
 frames to skip. The loop steps per emitted token, as NeMo's label looping does:
 the prediction network only changes on an emission, so a step scores a
 window of frames at once and runs the LSTM once, for the first frame that
-emits. The loop runs ``CHUNK`` steps per host read, which the transducer node
-replays from a CUDA graph.
+emits. ``advance`` runs ``CHUNK`` steps on a batch's state; the transducer
+node runs it once per iteration of its decode loop, with each request's state
+kept in a recurrent state slot between iterations.
 """
 from __future__ import annotations
 
@@ -17,9 +18,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.utils.precision import ieee_fp32_matmul
+from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 
-# greedy steps per chunk: one host read (and one graph replay) each
+# greedy steps per decode iteration: one graph replay each
 CHUNK = 16
 # frames an RNN-T step scores at once: wider windows cost more joint work, over
 # a 13k vocabulary, than the blank steps they save. TDT scores one: its
@@ -57,6 +58,24 @@ class TransducerConfig:
             num_prompts=hf.get("num_prompts", 0),
             prompt_intermediate_size=hf.get("prompt_intermediate_size", 0),
         )
+
+    def state_blocks(self) -> dict[str, RecurrentBlockConfig]:
+        """One request's decoding state between iterations, as recurrent pool
+        blocks: the LSTM state and output in fp32, the cursor and the tokens
+        emitted at its frame."""
+        layers = (self.num_layers, self.hidden_size)
+        return {
+            "h": RecurrentBlockConfig(layers, torch.float32),
+            "c": RecurrentBlockConfig(layers, torch.float32),
+            "dec_out": RecurrentBlockConfig((self.hidden_size,), torch.float32),
+            "cursor": RecurrentBlockConfig((), torch.int64),
+            "symbols": RecurrentBlockConfig((), torch.int64),
+        }
+
+    def decode_iterations(self, num_frames: int) -> int:
+        """The most decode iterations a clip of ``num_frames`` can take: a frame
+        takes at most ``max_symbols_per_step`` steps, so this never binds."""
+        return max(1, math.ceil(self.max_symbols_per_step * num_frames / CHUNK))
 
 
 class LSTMWeights(nn.Module):
@@ -138,30 +157,22 @@ class TransducerHead(nn.Module):
             encoder_states = self.prompt_projector(torch.cat([encoder_states, one_hot], dim=-1))
         return self.encoder_projector(encoder_states)
 
-    def start(self, frames: torch.Tensor, lengths: torch.Tensor) -> dict[str, torch.Tensor]:
-        """A batch's loop state, every tensor batch-first: ``(B, T, hidden)``
-        projected frames and per-row frame counts -> what ``advance`` updates."""
+    @torch.no_grad()
+    def initial_state(self) -> dict[str, torch.Tensor]:
+        """A request's state before its first step, one tensor per
+        ``state_blocks`` entry: the prediction network after the start token,
+        the cursor at frame 0. The same for every request."""
         cfg = self.config
-        b = frames.shape[0]
-        start = torch.full((b,), cfg.start_token_id, dtype=torch.long, device=frames.device)
-        zeros = frames.new_zeros(b, cfg.num_layers, cfg.hidden_size)
-        dec_out, h, c = self.decoder(start, zeros, zeros)
-        return {
-            "frames": frames,
-            "lengths": lengths,
-            "cursor": torch.zeros_like(lengths),
-            # tokens emitted at the cursor's frame so far
-            "symbols": torch.zeros_like(lengths),
-            "active": lengths > 0,
-            "dec_out": dec_out,
-            "h": h,
-            "c": c,
-        }
+        device = self.encoder_projector.weight.device
+        zeros = torch.zeros(1, cfg.num_layers, cfg.hidden_size, device=device)
+        dec_out, h, c = self.decoder(torch.tensor([cfg.start_token_id], device=device), zeros, zeros)
+        count = torch.zeros((), dtype=torch.long, device=device)
+        return {"h": h[0], "c": c[0], "dec_out": dec_out[0], "cursor": count, "symbols": count.clone()}
 
     def step(self, s: dict[str, torch.Tensor]) -> torch.Tensor:
-        """One greedy step on every row of ``start``'s state, in place and with
-        no host reads: each active row emits one token or moves past a window
-        of blanks -> the step's tokens (-1 where a row emitted none)."""
+        """One greedy step on every row of ``advance``'s state, in place and
+        with no host reads: each active row emits one token or moves past a
+        window of blanks -> the step's tokens (-1 where a row emitted none)."""
         cfg = self.config
         frames, cursor, symbols, active, lengths = s["frames"], s["cursor"], s["symbols"], s["active"], s["lengths"]
         rows, t, hidden = frames.shape
@@ -208,34 +219,15 @@ class TransducerHead(nn.Module):
         active.copy_(cursor < lengths)
         return torch.where(emit, token, -1)
 
-    def advance(self, s: dict[str, torch.Tensor], step=None) -> dict[str, torch.Tensor]:
-        """``CHUNK`` greedy steps (``step``, by default :meth:`step`) -> the
-        chunk's tokens and which rows are still decoding."""
+    def advance(
+        self, frames: torch.Tensor, lengths: torch.Tensor, state: dict[str, torch.Tensor],
+        chunk: int = CHUNK, step=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``chunk`` greedy steps (``step``, by default :meth:`step`) over
+        ``(B, T, hidden)`` projected frames and per-row frame counts, updating
+        ``state`` (``state_blocks``' names, batch-first) in place -> the steps'
+        ``(B, chunk)`` tokens and which rows are still decoding."""
         step = step or self.step
-        tokens = [step(s) for _ in range(CHUNK)]
-        return {"tokens": torch.stack(tokens, dim=1), "active": s["active"]}
-
-    @torch.no_grad()
-    def greedy_decode(
-        self, encoder_states: torch.Tensor, lengths: torch.Tensor, prompt_ids: torch.Tensor | None = None,
-        run_chunk=None, pad_frames_to: int | None = None,
-    ) -> list[list[int]]:
-        """Each request's tokens (blanks dropped) from padded ``(B, T, hidden)``
-        encoder output and frame counts. ``run_chunk(state, first)`` runs
-        ``advance``: eagerly by default, or a capture over frames padded to
-        ``pad_frames_to``. Full fp32, as NeMo decodes: TF32 flips argmax near-ties."""
-        run_chunk = run_chunk or (lambda state, first: self.advance(state))
-        with ieee_fp32_matmul():
-            frames = self.project_frames(encoder_states, prompt_ids)
-            if pad_frames_to is not None:
-                frames = F.pad(frames, (0, 0, 0, pad_frames_to - frames.shape[1]))
-            state = self.start(frames, lengths)
-            chunks = []
-            # a frame takes at most max_symbols steps, so this bound never binds
-            for i in range(math.ceil(self.config.max_symbols_per_step * encoder_states.shape[1] / CHUNK)):
-                out = run_chunk(state, i == 0)
-                chunks.append(out["tokens"])
-                if not bool(out["active"].any()):
-                    break
-        rows = torch.cat(chunks, dim=1).tolist()
-        return [[tok for tok in row if tok >= 0] for row in rows]
+        s = {**state, "frames": frames, "lengths": lengths, "active": state["cursor"] < lengths}
+        tokens = torch.stack([step(s) for _ in range(chunk)], dim=1)
+        return tokens, s["active"]

@@ -72,6 +72,25 @@ def _frame_by_frame(head, states: torch.Tensor, prompt: torch.Tensor | None) -> 
     return tokens
 
 
+def _greedy(head, states: torch.Tensor, prompt: torch.Tensor | None, step=None) -> list[int]:
+    """One clip through ``advance`` a chunk at a time from the start state, as
+    the decode loop runs it, in full fp32 as the node does."""
+    from mstar.model.components.transducer import CHUNK
+    from mstar.utils.precision import ieee_fp32_matmul
+
+    with ieee_fp32_matmul():
+        frames = head.project_frames(states, prompt)
+        lengths = torch.tensor([frames.shape[1]], device=frames.device)
+        state = {name: start[None].clone() for name, start in head.initial_state().items()}
+        tokens = []
+        for _ in range(head.config.decode_iterations(frames.shape[1])):
+            chunk, active = head.advance(frames, lengths, state, CHUNK, step)
+            tokens += [token for token in chunk[0].tolist() if token >= 0]
+            if not active.item():
+                break
+    return tokens
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("name", list(CASES))
 def test_matches_hf(name, monkeypatch):
@@ -130,16 +149,13 @@ def test_matches_hf(name, monkeypatch):
         assert states.shape == hf_states.shape
         # fp32, but 24 layers of differently ordered GEMM accumulation
         assert _relative_error(states, hf_states) < 5e-3
-        frames = torch.tensor([hf_states.shape[1]], device="cuda")
         our_states = encoder.encoder(features[None])[0].float()
-        capped = head.greedy_decode(our_states, frames, prompt)[0]
+        capped = _greedy(head, our_states, prompt)
         reference = _frame_by_frame(head, our_states[0], prompt)
-        compiled = head.greedy_decode(
-            our_states, frames, prompt, lambda state, first: head.advance(state, compiled_step),
-        )[0]
+        compiled = _greedy(head, our_states, prompt, compiled_step)
         monkeypatch.setattr(head.config, "max_symbols_per_step", 10**6)
-        from_their_states = head.greedy_decode(hf_states.float(), frames, prompt)[0]
-        ours = head.greedy_decode(our_states, frames, prompt)[0]
+        from_their_states = _greedy(head, hf_states.float(), prompt)
+        ours = _greedy(head, our_states, prompt)
     assert len(theirs) > 20, "the clip decoded to almost nothing; the comparison would be vacuous"
     assert from_their_states == theirs, (processor.decode(from_their_states), processor.decode(theirs))
     assert ours == theirs, (processor.decode(ours), processor.decode(theirs))

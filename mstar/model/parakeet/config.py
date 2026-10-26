@@ -15,6 +15,12 @@ from mstar.model.utils import GRANARY_LANGUAGES, base_language
 
 SUPPORTED_MODEL_TYPES = ("parakeet_tdt", "parakeet_rnnt", "nemotron3_5_asr")
 
+PREFILL_WALK, DECODE_WALK, DECODE_LOOP = "prefill", "decode", "decode_loop"
+# each request's decoding state between iterations of the decode loop
+TRANSDUCER_STATE = "transducer_state"
+# model_kwargs and step_metadata key: the clip's encoder frames, from process_prompt
+NUM_FRAMES = "num_frames"
+
 
 def check_detected_language(language: str | None) -> None:
     """Parakeet-TDT detects the language from the speech. A request may name

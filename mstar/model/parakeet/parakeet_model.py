@@ -10,10 +10,14 @@ frames to skip; Nemotron conditions every frame on a language prompt.
 
 Architecture (2 nodes, single partition):
     audio_encoder — log-mel + FastConformer, batched
-    transducer    — greedy decoding of the whole clip, batched
+    transducer    — the encoder frames projected once, then greedy decoding
+                    a chunk of steps per loop iteration, batched; each
+                    request's decoder state in a recurrent state slot
 
-Graph walk:
-    transcribe — audio_encoder -> transducer -> transcript tokens
+Graph walks:
+    prefill — audio_encoder -> transducer (the projected frames persist)
+    decode  — transducer loop over the frames: each iteration's tokens to
+              the client, until the cursor passes the clip's last frame
 """
 
 import json
@@ -24,11 +28,20 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec
-from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Sequential, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
-from mstar.model.components.audio_features import SAMPLE_RATE, clip_samples, load_speech_file
-from mstar.model.parakeet.config import ParakeetModelConfig, check_detected_language
+from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
+from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
+from mstar.model.parakeet.config import (
+    DECODE_LOOP,
+    DECODE_WALK,
+    NUM_FRAMES,
+    PREFILL_WALK,
+    TRANSDUCER_STATE,
+    ParakeetModelConfig,
+    check_detected_language,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import SentencePieceDetokenizer, check_loaded
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
@@ -36,7 +49,6 @@ from mstar.utils.hf_snapshot import resolve_snapshot_dir
 logger = logging.getLogger(__name__)
 
 CHECKPOINT_FILES = ["*.json", "*.safetensors"]
-WALK = "transcribe"
 
 
 class ParakeetModel(Model):
@@ -45,8 +57,11 @@ class ParakeetModel(Model):
     # full attention, whose position scores grow with the clip's square: the route
     # windows at 600 s, plus slack for containers that decode longer than their header said
     MAX_AUDIO_SECONDS = 610.0
+    # requests the default state pool holds; the YAMLs cap max_concurrent_requests here
+    MAX_CONCURRENT_REQUESTS = 128
     # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
     PREPROCESS_TORCH_THREADS = 1
+    INTERNAL_KWARGS = (NUM_FRAMES,)
 
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None,
@@ -65,26 +80,89 @@ class ParakeetModel(Model):
     def checkpoint_path(self) -> str | None:
         return str(self.local_dir)
 
+    def _num_frames(self, num_samples: int) -> int:
+        """Encoder frames for a clip, as the encoder node counts them."""
+        return int(self.config.encoder.output_lengths(num_samples // HOP_LENGTH))
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        # both nodes are stateless: no cache, no sampler (decoding is greedy)
-        return []
+        # no cache and no sampler (decoding is greedy): the decoder state is all
+        return [
+            RecurrentStateSpec(
+                resource_key=TRANSDUCER_STATE, nodes={"transducer"},
+                config=RecurrentStateConfig(
+                    # the LSTM's layers are in h's and c's shape
+                    num_layers=1,
+                    blocks=self.config.transducer.state_blocks(),
+                    # + 1 for the pool's sink slot
+                    max_slots=self.MAX_CONCURRENT_REQUESTS + 1,
+                ),
+            ),
+        ]
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse a ``max_concurrent_requests`` the state pool can't hold. A
+        request holds its slot from its first decode iteration to its last;
+        past the pool, a decode step's admit waits for a slot while the
+        request's frames sit on the GPU, where the conductor would have
+        queued the request."""
+        slots = ((config.get("resources") or {}).get(TRANSDUCER_STATE) or {}).get(
+            "max_slots", self.MAX_CONCURRENT_REQUESTS + 1,
+        )
+        cap = config.get("max_concurrent_requests")
+        if cap is None:
+            logger.warning(
+                "%s sets no max_concurrent_requests: past the %d requests resources.%s holds, "
+                "decode steps wait for a slot", config_path, slots - 1, TRANSDUCER_STATE,
+            )
+            return
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+            raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
+        if cap > slots - 1:
+            raise ValueError(
+                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need "
+                f"{cap + 1} slots of resources.{TRANSDUCER_STATE} (one each and the sink), which has "
+                f"{slots}; raise max_slots or lower max_concurrent_requests"
+            )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        transducer_inputs = ["encoder_states"] + (["prompt_ids"] if self.config.has_prompt else [])
-        return {
-            WALK: Sequential([
-                GraphNode(
-                    name="audio_encoder",
-                    input_names=["audio"],
-                    outputs=[GraphEdge(next_node="transducer", name="encoder_states")],
-                ),
-                GraphNode(
-                    name="transducer",
-                    input_names=transducer_inputs,
-                    outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="tokens", output_modality="text")],
-                ),
-            ]),
-        }
+        prompt = ["prompt_ids"] if self.config.has_prompt else []
+        prefill = Sequential([
+            GraphNode(
+                name="audio_encoder",
+                input_names=["audio"],
+                outputs=[GraphEdge(next_node="transducer", name="encoder_states")],
+            ),
+            GraphNode(
+                name="transducer",
+                input_names=["encoder_states", *prompt],
+                outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name="frames", persist=True)],
+            ),
+        ])
+        decode = Loop(
+            name=DECODE_LOOP,
+            section=GraphNode(
+                name="transducer",
+                # the loop re-injects the frames every iteration; the clock
+                # carries no data, it only makes the node a same-node
+                # speculation target
+                input_names=["frames", "clock"],
+                outputs=[
+                    GraphEdge(next_node="transducer", name="clock"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="tokens", output_modality="text"),
+                ],
+            ),
+            # a ceiling only: the stop check ends each request's loop
+            max_iters=self.config.transducer.decode_iterations(self._num_frames(
+                int(self.MAX_AUDIO_SECONDS * SAMPLE_RATE),
+            )),
+            outputs=[],
+        )
+        return {PREFILL_WALK: prefill, DECODE_WALK: decode}
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # where the stop check's guard ends the loop
+        num_frames = model_kwargs.get(NUM_FRAMES)
+        return {} if num_frames is None else {DECODE_LOOP: self.config.transducer.decode_iterations(num_frames)}
 
     def get_initial_forward_pass_args(
         self,
@@ -97,8 +175,10 @@ class ParakeetModel(Model):
         metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            graph_walk=WALK,
+            graph_walk=PREFILL_WALK,
             is_prefill=True,
+            # for the decode walk's steps
+            kwargs={NUM_FRAMES: (model_kwargs or {}).get(NUM_FRAMES)},
         )
         audio = GraphEdge(next_node="audio_encoder", name="audio")
         audio.tensor_info = input_signals.get("audio", [])
@@ -120,8 +200,23 @@ class ParakeetModel(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        # one walk transcribes the whole clip
-        return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True)
+        """prefill -> decode loop -> done."""
+        metadata = partition_metadata
+        if metadata.graph_walk == DECODE_WALK:
+            # the decode loop returned: the cursor passed the last frame
+            return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True)
+        metadata.graph_walk, metadata.is_prefill = DECODE_WALK, False
+        frames = GraphEdge(next_node="transducer", name="frames")
+        frames.tensor_info = persist_signals.get("frames", [])
+        # sent empty, like Waypoint's: the submodule never reads it
+        clock = GraphEdge(next_node="transducer", name="clock")
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=[frames, clock],
+            # the loop re-injects its own copy worker-side, as wan22's denoise loop does
+            unpersist_tensors=list(frames.tensor_info),
+            step_metadata={NUM_FRAMES: metadata.kwargs.get(NUM_FRAMES)},
+        )
 
     def process_prompt(
         self,
@@ -130,17 +225,19 @@ class ParakeetModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """The clip's samples, plus Nemotron's language prompt from
         ``language`` (a locale such as ``en-US``, a bare code, or ``auto``,
         the default). Parakeet-TDT detects the language itself and refuses
-        only a ``language`` it doesn't know."""
-        out = {"audio": [clip_samples(tensors, self.MAX_AUDIO_SECONDS, "this model")]}
+        only a ``language`` it doesn't know. The clip's encoder frames ride
+        along: they pick the decode capture before the frames exist."""
+        samples = clip_samples(tensors, self.MAX_AUDIO_SECONDS, "this model")
+        out = {"audio": [samples]}
         if self.config.has_prompt:
             out["prompt_ids"] = [torch.tensor([self.config.prompt_id(kwargs.get("language"))], dtype=torch.long)]
         else:
             check_detected_language(kwargs.get("language"))
-        return out
+        return ProcessPromptOutput(out, {NUM_FRAMES: self._num_frames(samples.shape[0])})
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)
