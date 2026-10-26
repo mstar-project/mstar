@@ -217,12 +217,11 @@ class Qwen3OmniModel(Model):
         adapter touching them is refused with that reason; so is one touching the
         Talker or the encoders, which are other nodes. Modules are named as the full
         model's checkpoint names them (``thinker.*``) or as the Thinker alone does."""
-        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
-
-        root = meta_root(lambda group: Qwen3OmniThinkerModel(self.config, comm_group=group))
         return module_lora_spec(
-            root, nodes={"Thinker"}, root_path="model",
+            lambda group: Qwen3OmniThinkerModel(self.config, comm_group=group),
+            nodes={"Thinker"}, root_path="model",
             rows={"lm_head": PER_SEGMENT},
         )
 

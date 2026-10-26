@@ -1,7 +1,8 @@
 """Per-request LoRA declared from a model's own modules.
 
 ``module_lora_spec`` walks a node's weights root (the module its weight loader fills;
-built on the meta device at one rank, so any process can declare it), finds every
+built on the meta device at one rank, so any process can declare it, and only once the
+spec is read, so a deployment without LoRA builds nothing), finds every
 LoRA-capable module (``capable.py``), groups them into targets by their role in a layer
 stack (``layers.N.<role>`` / ``blocks.N.<role>``; a module outside the stacks is a target
 of its own), and places checkpoint modules with the root's own ``CheckpointRules`` (the
@@ -191,16 +192,8 @@ class _Found(NamedTuple):
 _EXCLUDED = "excluded by the model's LoRA declaration"
 
 
-def meta_root(build: Callable[[CommGroup], nn.Module]) -> nn.Module:
-    """A node's weights root as ``module_lora_spec`` reads it: built on the meta device
-    (no memory), as one rank sees it (``build`` gets the trivial group; the pool shards
-    the targets for its own rank)."""
-    with torch.device("meta"):
-        return build(CommGroup.trivial())
-
-
 def module_lora_spec(
-    root: nn.Module,
+    build: Callable[[CommGroup], nn.Module],
     *,
     nodes: set[str],
     root_path: str,
@@ -216,13 +209,15 @@ def module_lora_spec(
     embeddings: bool = False,
     convert_keys: Callable | None = None,
 ) -> LoraSpec:
-    """A node's LoRA spec, a target per role of the LoRA-capable modules under ``root``,
-    keyed ``LORA_RESOURCE_KEY``: the key the serving config's ``resources: lora:`` block
-    and the API server's adapter selection name.
+    """A node's LoRA spec, a target per role of the LoRA-capable modules under its weights
+    root, keyed ``LORA_RESOURCE_KEY``: the key the serving config's ``resources: lora:``
+    block and the API server's adapter selection name.
 
-    ``root`` is the module the node's weight loader fills, at one rank (built on the meta
-    device is enough), and ``root_path`` its attribute path in the node's submodule
-    (``""`` for the submodule itself), where binding finds it. ``rules`` are the loader's
+    ``build`` makes the root, the module the node's weight loader fills, as one rank sees
+    it: it gets the trivial group (the pool shards the targets for its own rank) and runs
+    on the meta device, when the spec is first read (``LoraSpec.declare``). ``root_path``
+    is the root's attribute path in the node's submodule (``""`` for the submodule
+    itself), where binding finds it. ``rules`` are the loader's
     (``CheckpointRules``); by default the root's own ``checkpoint_rules()``, so placement
     cannot drift from loading. ``adapter_stacked_params`` adds rules only adapters need
     (Tinker's split projections). Module paths, ``rows`` / ``names`` keys and ``exclude``
@@ -250,90 +245,97 @@ def module_lora_spec(
     Linear-like modules that cannot take a delta (a depthwise conv, MoE experts) are
     recorded with the reason, which an adapter touching them is refused with.
     """
-    own_rules = getattr(root, "checkpoint_rules", None)
-    if rules is None:
-        rules = own_rules() if own_rules is not None else CheckpointRules()
-    elif own_rules is not None:
-        raise ValueError(
-            f"{type(root).__name__} states its checkpoint rules; LoRA placement takes them "
-            "from it rather than from a copy"
-        )
-    excluded = dict(exclude) if isinstance(exclude, Mapping) else dict.fromkeys(exclude, _EXCLUDED)
-    rows, names = dict(rows or {}), dict(names or {})
-    groups: dict[tuple[str | None, str], list[_Found]] = defaultdict(list)
-    unservable: dict[str, str] = {}
-    for path, module in root.named_modules():
-        if not path:
-            continue
-        capability = lora_capability(module)
-        if capability is None:
-            continue
-        pattern = _match(path, excluded)
-        if pattern is not None:
-            unservable[path] = excluded[pattern]
-            continue
-        if capability.capable is None:
-            unservable[path] = capability.reason
-            continue
-        target = capability.capable.lora_target(module)
-        if target.kind == "embedding" and not embeddings:
-            unservable[path] = "a token embedding, which this node does not serve LoRA on"
-            continue
-        m = _STACK.match(path)
-        if m is None:
-            groups[(None, path)].append(_Found(path, 0, target))
-        else:
-            groups[(m["stack"], m["role"])].append(_Found(path, int(m["layer"]), target))
-    if not groups:
-        raise ValueError(f"{type(root).__name__} has no LoRA-capable modules")
-
-    stacked = [f.layer for (stack, _), found in groups.items() if stack is not None for f in found]
-    num_layers = max(stacked, default=0) + 1
-    target_names = _target_names(list(groups), names)
-    unused = set(names) - {role for _, role in groups}
-    if unused:
-        raise ValueError(f"`names` names roles {sorted(unused)} that {type(root).__name__} does not have")
-
-    targets: dict[str, LoraTarget] = {}
-    bindings: dict[str, LoraModuleRef] = {}
-    for key, found in groups.items():
-        stack, role = key
-        first = found[0].target
-        differ = [f.path for f in found if f.target != first]
-        if differ:
+    def declare() -> dict[str, Any]:
+        with torch.device("meta"):
+            root = build(CommGroup.trivial())
+        own_rules = getattr(root, "checkpoint_rules", None)
+        placing = rules
+        if placing is None:
+            placing = own_rules() if own_rules is not None else CheckpointRules()
+        elif own_rules is not None:
             raise ValueError(
-                f"LoRA target {role!r} has other shapes at {differ[:3]} than at "
-                f"{found[0].path}; exclude them or give them a stack of their own"
+                f"{type(root).__name__} states its checkpoint rules; LoRA placement takes them "
+                "from it rather than from a copy"
             )
-        layers = tuple(sorted(f.layer for f in found))
-        if stack is not None and layers == tuple(range(num_layers)):
-            layers = None
-        name = target_names[key]
-        targets[name] = dataclasses.replace(first, layers=layers, **_row_fields(rows, role))
-        for f in found:
-            bindings[f.path] = LoraModuleRef(name, f.layer)
-    unmatched = [p for p in rows if not any(fnmatch.fnmatchcase(r, p) for _, r in groups)]
-    if unmatched:
-        raise ValueError(f"`rows` patterns {unmatched} match no LoRA target role")
-    deferred_paths = frozenset(p for p in bindings if _match(p, deferred) is not None)
-    unmatched = [p for p in deferred if not any(_match(b, [p]) for b in bindings)]
-    if unmatched:
-        raise ValueError(f"`deferred` patterns {unmatched} match no LoRA target module")
-    if unservable:
-        logger.info(
-            "LoRA on %s: %d module(s) take no delta, e.g. %s",
-            sorted(nodes), len(unservable), [f"{p} ({r})" for p, r in list(unservable.items())[:3]],
-        )
+        excluded = dict(exclude) if isinstance(exclude, Mapping) else dict.fromkeys(exclude, _EXCLUDED)
+        row_specs, renames = dict(rows or {}), dict(names or {})
+        groups: dict[tuple[str | None, str], list[_Found]] = defaultdict(list)
+        unservable: dict[str, str] = {}
+        for path, module in root.named_modules():
+            if not path:
+                continue
+            capability = lora_capability(module)
+            if capability is None:
+                continue
+            pattern = _match(path, excluded)
+            if pattern is not None:
+                unservable[path] = excluded[pattern]
+                continue
+            if capability.capable is None:
+                unservable[path] = capability.reason
+                continue
+            target = capability.capable.lora_target(module)
+            if target.kind == "embedding" and not embeddings:
+                unservable[path] = "a token embedding, which this node does not serve LoRA on"
+                continue
+            m = _STACK.match(path)
+            if m is None:
+                groups[(None, path)].append(_Found(path, 0, target))
+            else:
+                groups[(m["stack"], m["role"])].append(_Found(path, int(m["layer"]), target))
+        if not groups:
+            raise ValueError(f"{type(root).__name__} has no LoRA-capable modules")
 
-    module_map = ModuleLoraMap(
-        bindings, rules=rules, adapter_stacked_params=adapter_stacked_params,
-        adapter_roots=adapter_roots, aliases=aliases, unservable=unservable, ignore=ignore,
-        root_path=root_path, deferred=deferred_paths,
-    )
+        stacked = [f.layer for (stack, _), found in groups.items() if stack is not None for f in found]
+        num_layers = max(stacked, default=0) + 1
+        target_names = _target_names(list(groups), renames)
+        unused = set(renames) - {role for _, role in groups}
+        if unused:
+            raise ValueError(f"`names` names roles {sorted(unused)} that {type(root).__name__} does not have")
+
+        targets: dict[str, LoraTarget] = {}
+        bindings: dict[str, LoraModuleRef] = {}
+        for key, found in groups.items():
+            stack, role = key
+            first = found[0].target
+            differ = [f.path for f in found if f.target != first]
+            if differ:
+                raise ValueError(
+                    f"LoRA target {role!r} has other shapes at {differ[:3]} than at "
+                    f"{found[0].path}; exclude them or give them a stack of their own"
+                )
+            layers = tuple(sorted(f.layer for f in found))
+            if stack is not None and layers == tuple(range(num_layers)):
+                layers = None
+            name = target_names[key]
+            targets[name] = dataclasses.replace(first, layers=layers, **_row_fields(row_specs, role))
+            for f in found:
+                bindings[f.path] = LoraModuleRef(name, f.layer)
+        unmatched = [p for p in row_specs if not any(fnmatch.fnmatchcase(r, p) for _, r in groups)]
+        if unmatched:
+            raise ValueError(f"`rows` patterns {unmatched} match no LoRA target role")
+        deferred_paths = frozenset(p for p in bindings if _match(p, deferred) is not None)
+        unmatched = [p for p in deferred if not any(_match(b, [p]) for b in bindings)]
+        if unmatched:
+            raise ValueError(f"`deferred` patterns {unmatched} match no LoRA target module")
+        if unservable:
+            logger.info(
+                "LoRA on %s: %d module(s) take no delta, e.g. %s",
+                sorted(nodes), len(unservable), [f"{p} ({r})" for p, r in list(unservable.items())[:3]],
+            )
+
+        module_map = ModuleLoraMap(
+            bindings, rules=placing, adapter_stacked_params=adapter_stacked_params,
+            adapter_roots=adapter_roots, aliases=aliases, unservable=unservable, ignore=ignore,
+            root_path=root_path, deferred=deferred_paths,
+        )
+        return {"num_layers": num_layers, "targets": targets, "module_map": module_map,
+                "ignored_modules": module_map.ignores}
+
     return LoraSpec(
-        resource_key=LORA_RESOURCE_KEY, nodes=set(nodes), num_layers=num_layers, targets=targets,
-        module_map=module_map, ignored_modules=module_map.ignores, convert_keys=convert_keys,
+        resource_key=LORA_RESOURCE_KEY, nodes=set(nodes), convert_keys=convert_keys, declare=declare,
     )
+
 
 
 def _row_fields(rows: Mapping[str, RowSpec], role: str) -> dict[str, Any]:
@@ -374,23 +376,30 @@ def join_lora_specs(*specs: LoraSpec) -> LoraSpec:
     """One spec over the nodes of ``specs``, each a node's from ``module_lora_spec`` (an
     LLM's and its vision tower's): their targets, each naming its node, under the first's
     key. A checkpoint module is placed by the node whose ``AdapterRoot``s claim it most
-    specifically, so one adapter file serves them all."""
-    targets: dict[str, LoraTarget] = {}
-    parts: dict[str, ModuleLoraMap] = {}
-    for spec in specs:
-        (node,) = spec.nodes
-        if spec.convert_keys is not specs[0].convert_keys:
-            raise ValueError("joined LoRA specs must read checkpoints alike (convert_keys)")
-        for name, target in spec.targets.items():
-            if name in targets:
-                raise ValueError(f"LoRA target {name!r} is declared on two nodes; rename one with `names`")
-            layers = target.layers if target.layers is not None else tuple(range(spec.num_layers))
-            targets[name] = dataclasses.replace(target, node=node, layers=layers)
-        parts[node] = spec.module_map
-    joined = _JoinedLoraMap(parts)
-    return dataclasses.replace(
-        specs[0], nodes=set(parts), num_layers=max(s.num_layers for s in specs), targets=targets,
-        module_map=joined, ignored_modules=joined.ignores,
+    specifically, so one adapter file serves them all. Declared, like its parts, on first
+    read."""
+    convert_keys = specs[0].convert_keys
+    if any(spec.convert_keys is not convert_keys for spec in specs):
+        raise ValueError("joined LoRA specs must read checkpoints alike (convert_keys)")
+
+    def declare() -> dict[str, Any]:
+        targets: dict[str, LoraTarget] = {}
+        parts: dict[str, ModuleLoraMap] = {}
+        for spec in specs:
+            (node,) = spec.nodes
+            for name, target in spec.targets.items():
+                if name in targets:
+                    raise ValueError(f"LoRA target {name!r} is declared on two nodes; rename one with `names`")
+                layers = target.layers if target.layers is not None else tuple(range(spec.num_layers))
+                targets[name] = dataclasses.replace(target, node=node, layers=layers)
+            parts[node] = spec.module_map
+        joined = _JoinedLoraMap(parts)
+        return {"num_layers": max(s.num_layers for s in specs), "targets": targets, "module_map": joined,
+                "ignored_modules": joined.ignores}
+
+    return LoraSpec(
+        resource_key=specs[0].resource_key, nodes=set().union(*(spec.nodes for spec in specs)),
+        convert_keys=convert_keys, declare=declare,
     )
 
 

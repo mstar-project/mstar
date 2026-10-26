@@ -313,11 +313,10 @@ class ChatterboxModel(Model):
         if self.config.t3.backbone.is_gpt2:
             return None
         from mstar.model.chatterbox.components.t3 import T3Model
-        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
-
-        root = meta_root(lambda group: T3Model(self.config.t3, comm_group=group))
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         return module_lora_spec(
-            root, nodes={T3_NODE}, root_path="model",
+            lambda group: T3Model(self.config.t3, comm_group=group),
+            nodes={T3_NODE}, root_path="model",
             rows={"speech_head": PER_SEGMENT},
             exclude={"cond_enc": "the conditioning encoder runs in prepare_inputs, outside the planned step"},
         )

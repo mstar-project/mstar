@@ -884,14 +884,16 @@ serving YAML has a ``resources: lora:`` block. Orpheus is the reference
 
 .. code-block:: python
 
-   from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+   from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
 
    def get_node_resources(self) -> list[NodeResourceSpec]:
        return [
            ...,  # KV, attention, positions, sampler
            module_lora_spec(
-               # the module the node's weight loader fills, at one rank, on the meta device
-               meta_root(lambda group: OrpheusForCausalLM(self.config, comm_group=group)),
+               # builds the module the node's weight loader fills, at one rank, on the
+               # meta device: only once the spec is read, which a deployment without
+               # a `lora:` block never does
+               lambda group: OrpheusForCausalLM(self.config, comm_group=group),
                nodes={"LLM"},
                root_path="language_model",    # the root's attribute path in the node submodule
                rows={"lm_head": PER_SEGMENT},  # rows that are not the step's tokens

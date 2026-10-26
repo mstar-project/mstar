@@ -296,7 +296,9 @@ class LoraSpec(NodeResourceSpec):
     spec comes from ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose
     ``ModuleLoraMap`` is what binds the node's modules, and a pool built with any other
     resolver is refused at bind. ``convert_keys`` rewrites a model-native checkpoint
-    layout first.
+    layout first. ``declare`` gives ``num_layers``, ``targets``, ``module_map`` and
+    ``ignored_modules`` in place of passing them, on their first read: ``module_lora_spec``
+    walks a node's modules there, which a deployment that never builds the spec skips.
 
     Opt-in (``NodeResourceSpec.opt_in``): built only for a deployment whose serving config
     has a ``resources: lora:`` block. One spec covers every node an adapter reaches (an
@@ -308,9 +310,11 @@ class LoraSpec(NodeResourceSpec):
     opt_in: ClassVar[bool] = True
     per_node: ClassVar[bool] = True
 
-    num_layers: int
-    targets: dict[str, LoraTarget]
-    module_map: LoraModuleResolver
+    # what ``declare`` may give defaults by factory, which sets no class attribute that
+    # would answer a read before ``__getattr__`` does
+    num_layers: int = field(default_factory=int)
+    targets: dict[str, LoraTarget] = field(default_factory=dict)
+    module_map: LoraModuleResolver | None = field(default_factory=lambda: None)
     max_slots: int = 4
     max_rank: int = 16
     cpu_capacity: int = 16
@@ -334,13 +338,32 @@ class LoraSpec(NodeResourceSpec):
     convert_keys: Callable | None = None
     # checkpoint modules this spec neither loads nor refuses: the deployment never runs
     # them, or (in a node's pool) another node's pool loads them
-    ignored_modules: Callable[[str], bool] | None = None
+    ignored_modules: Callable[[str], bool] | None = field(default_factory=lambda: None)
     # targets the YAML's ``targets`` list dropped: a layer binding one gets no delta,
     # while binding a name the spec never declared stays an error
     dropped_targets: frozenset[str] = field(default_factory=frozenset)
+    declare: Callable[[], dict[str, Any]] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         super().__post_init__()
+        _check_sizes({name: getattr(self, name) for name in _SIZES})
+        if self.declare is not None:
+            for name in _DECLARED:
+                del self.__dict__[name]  # read through `__getattr__`
+            return
+        self._check_declaration()
+
+    def __getattr__(self, name: str) -> Any:
+        # reached only for an attribute not set: a field ``declare`` gives, read first
+        declare = self.__dict__.get("declare")
+        if declare is None or name not in _DECLARED:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+        self.__dict__.update(declare())
+        self.declare = None
+        self._check_declaration()
+        return self.__dict__[name]
+
+    def _check_declaration(self) -> None:
         if not self.targets:
             raise ValueError(f"LoRA resource {self.resource_key!r} declares no targets")
         if len(self.nodes) > 1:
@@ -350,7 +373,6 @@ class LoraSpec(NodeResourceSpec):
                     f"LoRA resource {self.resource_key!r} spans nodes {sorted(self.nodes)}, so "
                     f"each target names one of them; {astray} do not"
                 )
-        _check_sizes({name: getattr(self, name) for name in _SIZES})
 
     @property
     def num_slots(self) -> int:
@@ -492,6 +514,10 @@ class LoraSpec(NodeResourceSpec):
                 "it was trained on another size of the model, or lays a module out "
                 "differently from the target it names"
             )
+
+
+# what ``LoraSpec.declare`` gives
+_DECLARED = ("num_layers", "targets", "module_map", "ignored_modules")
 
 
 def _ignoring(

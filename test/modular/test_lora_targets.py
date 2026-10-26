@@ -255,10 +255,8 @@ def _build(case: Case, group: CommGroup, weights) -> _Root:
 
 
 def _spec(case: Case):
-    with torch.device("meta"):
-        root = _Root(case, CommGroup.trivial())
     return module_lora_spec(
-        root, nodes={"N"}, root_path="inner",
+        lambda group: _Root(case, group), nodes={"N"}, root_path="inner",
         rules=CheckpointRules(stacked_params=case.stacked), embeddings=True, rows=case.rows,
     )
 
@@ -482,7 +480,7 @@ def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name
         root.layers = nn.ModuleList([nn.Module()])
         root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
         root.layers[0].bad = make()
-    spec = module_lora_spec(root, nodes={"N"}, root_path="")
+    spec = module_lora_spec(lambda _: root, nodes={"N"}, root_path="")
     assert set(spec.targets) == {"fc"} and reason in spec.module_map.unservable["layers.0.bad"]
     path = write_peft(tmp_path / "a.safetensors", {
         "layers.0.fc": (rand(2, HIDDEN, seed=1), rand(HIDDEN, 2, seed=2)),
@@ -493,6 +491,28 @@ def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name
     assert info.unmapped == ("layers.0.bad",)
     with pytest.raises(ValueError, match=re.escape(reason)):
         spec.check_adapter("a", info)
+
+
+def test_a_deployment_without_a_lora_block_never_builds_the_root():
+    """Every deployment of a model declares its LoRA spec; the root is built and walked
+    only once the spec is read, which only a deployment opting into LoRA does."""
+    from types import SimpleNamespace
+
+    from mstar.model.base import serving_resources
+
+    built = []
+
+    def build(group):
+        built.append(group)
+        root = nn.Module()
+        root.layers = nn.ModuleList([nn.Module()])
+        root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
+        return root
+
+    model = SimpleNamespace(get_node_resources=lambda: [module_lora_spec(build, nodes={"N"}, root_path="")])
+    assert serving_resources(model, {"resources": {}}) == [] and not built
+    (spec,) = serving_resources(model, {"resources": {"lora": {}}})
+    assert set(spec.targets) == {"fc"} and len(built) == 1
 
 
 # --- the checkpoint: keys, scaling, header refusals ----------------------------------------
@@ -559,7 +579,7 @@ def test_header_refusals_reach_the_client_as_themselves():
         root = nn.Module()
         root.layers = nn.ModuleList([nn.Module()])
         root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
-    spec = serve(module_lora_spec(root, nodes={"N"}, root_path=""), {})
+    spec = serve(module_lora_spec(lambda _: root, nodes={"N"}, root_path=""), {})
     key = "base_model.model.layers.0.fc.lora_{}.weight"
     bad = inspect_keys(spec, [(key.format("A"), (4, 2 * HIDDEN)), (key.format("B"), (HIDDEN, 4))])
     with pytest.raises(ValueError, match="does not fit") as misfit:

@@ -118,12 +118,11 @@ class HiggsAudioModel(Model):
         the checkpoint's own tensors. The embedding takes none: ``prefill_text`` embeds in
         ``prepare_inputs``, outside the step. Adapters saved on a ``Qwen3ForCausalLM``
         layout (``model.layers.*``) are read as the flat checkpoint's."""
-        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.higgs_audio.components.llm import HiggsAudioLLM
-
-        root = meta_root(lambda group: HiggsAudioLLM(self.config, comm_group=group))
         return module_lora_spec(
-            root, nodes={"LLM"}, root_path="model",
+            lambda group: HiggsAudioLLM(self.config, comm_group=group),
+            nodes={"LLM"}, root_path="model",
             adapter_roots=[("model.", "")],
             rows={"lm_head": PER_SEGMENT},
         )

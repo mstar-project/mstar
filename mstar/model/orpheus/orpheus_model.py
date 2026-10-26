@@ -398,12 +398,11 @@ class OrpheusModel(Model):
         LM head (one row per request: the last token's) and the token embedding, placed as
         the weight loader places the checkpoint's own tensors. Adapters saved on the bare
         ``LlamaModel`` (``layers.*``) are read under ``model.``."""
-        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
-
-        root = meta_root(lambda group: OrpheusForCausalLM(self.config, comm_group=group))
         return module_lora_spec(
-            root, nodes={"LLM"}, root_path="language_model",
+            lambda group: OrpheusForCausalLM(self.config, comm_group=group),
+            nodes={"LLM"}, root_path="language_model",
             adapter_roots=[("", "model.")],
             rows={"lm_head": PER_SEGMENT},
             embeddings=True,

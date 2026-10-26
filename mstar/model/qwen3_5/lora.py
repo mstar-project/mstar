@@ -30,7 +30,6 @@ from mstar.model.components.lora.modules import (
     PER_SEGMENT,
     AdapterRoot,
     join_lora_specs,
-    meta_root,
     module_lora_spec,
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule
@@ -66,10 +65,9 @@ VISION_NAMES = {
 def qwen3_5_llm_lora_spec(config: Qwen3_5Config) -> LoraSpec:
     """The LLM node's part (``qwen3_5_lora_spec`` joins it to the vision tower's)."""
     from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
-
-    root = meta_root(lambda _: Qwen3_5ForCausalLM(config))
     return module_lora_spec(
-        root, nodes={"LLM"}, root_path="model",
+        lambda _: Qwen3_5ForCausalLM(config),
+        nodes={"LLM"}, root_path="model",
         rules=CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper),
         adapter_stacked_params=SPLIT_QKV_RULES,
         adapter_roots=TEXT_ROOTS,
@@ -87,10 +85,9 @@ def qwen3_5_llm_lora_spec(config: Qwen3_5Config) -> LoraSpec:
 def qwen3_5_vision_lora_spec(config: Qwen3_5VisionConfig) -> LoraSpec:
     """The vision encoder node's spec; the tower is not tensor-parallel."""
     from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
-
-    root = meta_root(lambda _: Qwen3_5VisionModel(config))
     return module_lora_spec(
-        root, nodes={"vision_encoder"}, root_path="model",
+        lambda _: Qwen3_5VisionModel(config),
+        nodes={"vision_encoder"}, root_path="model",
         rules=CheckpointRules(remap=qwen3_5_vision_name_remapper),
         adapter_roots=VISION_ROOTS,
         rows={"merger.*": config.merge_unit},
