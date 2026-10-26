@@ -1,9 +1,10 @@
-"""A request is admitted only once its prompt fits, in the order requests first asked.
+"""A request is admitted only once its prompt fits, in the order requests first asked unless it passes the head.
 
 "Not ready" is an answer the scheduler already retries, so the pool gives it until the
-prompt at the head of its queue fits beside the prompts already admitted. A cache hit on a
+prompt at the head of its queue fits beside what admitted requests have reserved. A cache hit on a
 page only the index holds counts as a page taken, since eviction could hand that page out.
-Nothing passes the head, or a stream of short requests would starve a long one.
+A request with a cache hit passes the head only when no page of the hit is evictable. The pages
+it frees are then kept for the head, or a stream of short requests would starve a long one.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
 
 SEED = 20261022
+HELD = list(range(48))
 
 
 @pytest.fixture(autouse=True)
@@ -101,7 +103,7 @@ def _queued(max_num_pages: int = 9):
     return kv
 
 
-def test_nothing_passes_the_head_of_the_queue():
+def test_a_request_with_nothing_cached_never_passes_the_head():
     kv = _queued()
 
     assert not _ready(kv, "short"), "a later request took the room the head waits for"
@@ -115,7 +117,63 @@ def test_removing_the_head_makes_the_next_request_the_head():
 
     kv.remove_request("long")
 
+    assert kv._head_wait is None, "the removed head's last ask would still decide who passes the next one"
     assert _ready(kv, "short"), "a request that left still heads the queue"
+
+
+def _prefill(kv, rid: str, tokens: list[int]) -> None:
+    """Admit ``rid`` and write its prompt past what the cache serves."""
+    _laid_out(kv, rid, tokens, keyed=True)
+    assert _ready(kv, rid)
+    prefix = _probe(kv, rid, len(tokens))
+    _grow(kv, rid, len(tokens) - (prefix.tokens if prefix else 0))
+
+
+def _passing(free: int, head: int):
+    """"r" runs on ``HELD``, "fill" runs on tokens from 2000 and leaves ``free`` pages, and "head" waits."""
+    kv = _manager(max_num_pages=16)
+    kv._cpu_pool = host._HostPool(64)
+    _prefill(kv, "r", HELD + list(range(1000, 1008)))
+    _prefill(kv, "fill", list(range(2000, 2000 + (kv._room() - free) * PAGE_SIZE)))
+    _laid_out(kv, "head", list(range(3000, 3000 + head * PAGE_SIZE)))
+    assert not _ready(kv, "head")
+    return kv
+
+
+def test_a_request_passes_the_head_only_when_no_page_of_its_hit_is_evictable_and_its_output_fits():
+    kv = _passing(free=3, head=5)
+    _prefill(kv, "w", HELD + list(range(100, 116)))
+    kv.remove_request("w")
+    _laid_out(kv, "partly", HELD + list(range(100, 124)), keyed=True)
+    for rid, cap in (("long", 32), ("short", 16)):
+        kv.ingest_request(rid, KVReqConfig(prefix_keys={"main": _keys(HELD + [8] * 8)}, loop_caps={"decode_loop": cap},
+            kv_layout={"main": StreamLayout((PrefixSpan(56, 56, WALK),), (("decode_loop", 1),), keyed_spans=1)}))
+
+    assert not _ready(kv, "partly"), "a request passed the head on a hit eviction can still take"
+    assert not _ready(kv, "long"), "a request passed the head with room for its prompt but not its output"
+    assert _ready(kv, "short") and kv._allotments["short"].pages == 2, "a request whose hit and output fit waited"
+
+
+@pytest.mark.parametrize("leave", [KVManager.remove_request, KVManager.offload], ids=["finishes", "is offloaded"])
+def test_the_pages_a_request_that_passed_frees_go_to_the_head(leave):
+    kv = _passing(free=1, head=5)
+    _prefill(kv, "p", HELD + list(range(4000, 4008)))
+    _laid_out(kv, "q", list(range(2000, 2048)) + list(range(5000, 5008)), keyed=True)
+    leave(kv, "p")
+    assert not _ready(kv, "q"), f"a request behind the head took the page {leave.__name__} freed"
+    kv.remove_request("r")
+
+    assert not _ready(kv, "q"), "a request passed a head that the room now covers"
+    assert _ready(kv, "head"), "the head waits though the room, the page kept for it included, covers it"
+    assert kv._head_wait is None, "the admitted head's wait would decide who passes the next head"
+
+
+def test_a_request_that_passed_goes_back_behind_the_head_when_another_pool_holds_it_back():
+    kv = _passing(free=1, head=2)
+    _laid_out(kv, "p", HELD + list(range(4000, 4008)), keyed=True)
+    assert _ready(kv, "p")
+    kv.requeue("p")
+    assert _ready(kv, "p") and kv._head_wait is not None, "a requeued request took the place of the head it passed"
 
 
 def test_a_prompt_bigger_than_the_pool_fails_as_it_joins():
