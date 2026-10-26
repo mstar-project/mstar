@@ -131,6 +131,8 @@ class PreprocessInput:
     # The id the client knows the request by; ``request_id`` is the API
     # server's key for this one submission.
     client_request_id: str | None = None
+    # the client streams the opening ends; the others stay open for appends
+    ends: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -149,5 +151,5 @@ class ClientAppend:
     model_kwargs: dict | None = None
     # Answers the append as late, with an error naming why; called from the
     # preprocess thread when the model routes items to a stream the client
-    # already ended. None: nobody to answer (the opening's own end of input).
+    # already ended. None: nobody to answer.
     on_late: Callable[[str], None] | None = field(default=None, compare=False)

@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 
 from mstar.engine.resources import PublishedInfo, ResourceReqConfig
-from mstar.graph.base import TensorPointerInfo
 
 
 @dataclass
@@ -111,9 +110,6 @@ class StreamingConnectionState:
     # destination worker -> stream items the producer sent there, which
     # producer_done carries so the consumer waits for the last of them
     items_sent: dict[str, int] = field(default_factory=dict)
-    # A client stream's newest item, held back while its consumer is
-    # max_pending_items behind (pending_overflow "keep_newest").
-    waiting: TensorPointerInfo | None = None
 
 
 @dataclass

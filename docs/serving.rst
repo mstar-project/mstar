@@ -237,7 +237,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        below).
    * - ``max_concurrent_requests``
      - *(optional)* How many requests run at once. Requests past the cap wait in the
-       conductor's queue.
+       conductor's queue, except a live call (open client input), which is refused with
+       a 503.
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
@@ -255,24 +256,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        its edge name, e.g. ``audio_in``), overrides of the limits the model declares on
        it (``ClientStreamLimits``, see :doc:`adding_models`). ``max_items``: what the
        stream may carry over a call's life, in the model's units (items, or the frames
-       or samples a model counts per item); a call past it ends with a 400.
-       ``max_pending_items``: how many items the model may have been sent and not yet
-       consumed at once, as the model last reported (after each step that took any, so
-       a step late). It counts items, not
-       the frames or samples ``max_items`` may count per item, and must be at least the
-       widest chunk the stream's chunk policy waits for, or loading fails: the model
-       would never take a chunk, so it would never make room.
-       ``pending_overflow``: what input past that does, ``refuse`` (the default: the
-       call ends with a 400) or ``keep_newest``: the items that fit are sent, in order;
-       of the rest the conductor keeps only the newest, in one slot, until the model
-       reports room or the stream ends, and drops the others, as well as any item the
-       slot held before. The model so gets the oldest input that fits and then the
-       latest, without what came between: for a stream where only the latest input
-       matters. A deployment may set a bound the model leaves open (``null`` is none) or lower one it
+       or samples a model counts per item); a call past it ends with a 400. A deployment
+       may set a bound the model leaves open (``null`` is none) or lower one it
        declares, which is the most the model can take, but not raise or lift it: a
        model sizes its buffers from its own settings (for ``nemotron_duplex``, raise
        ``max_session_s`` instead). An unknown stream, key or value fails loading. Unlike
-       ``max_call_input_mb`` these count what the model was handed, not bytes uploaded.
+       ``max_call_input_mb`` it counts what the model was handed, not bytes uploaded.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
    * - ``ws_per_message_deflate``

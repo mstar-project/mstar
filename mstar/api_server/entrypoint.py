@@ -686,9 +686,8 @@ class APIServer:
             output_modalities=output_modalities,
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
+            ends=ending,
         ))
-        if ending:
-            self.preprocess_worker.stream_input(ClientAppend(key, ends=ending))
 
         logger.info(
             "Request %s submitted as %s  in=%s  out=%s",
