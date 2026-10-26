@@ -101,8 +101,10 @@ logger = logging.getLogger(__name__)
 # retried every backoff, and a line per retry buries the rest of the log
 _HOLD_LOG_INTERVAL = 5.0
 
-# ``_await_admit_settled``'s safety net, not a tuning knob: the GPU thread
-# releases the event on every exit, so this only fires if that thread died.
+# ``_await_admit_settled`` warns this often while a TP lockstep step has yet to
+# admit, and gives up on any other step after it. A lockstep step is never given
+# up on: a teardown landing inside its admit changes what that admit decides on
+# this rank alone, and the ranks split.
 _ADMIT_FENCE_TIMEOUT_S = 10.0
 
 # How many torn-down request keys a worker remembers, so that a message landing
@@ -2255,6 +2257,22 @@ class Worker:
         Once the step's work is submitted we record a CUDA event on the
         default stream; anything that reads the output VALUES waits on it.
         """
+        try:
+            return self._run_gpu_step(batch, node_batch, plan_future)
+        finally:
+            # Every exit releases the submitter and the admit fence
+            # (`_await_admit_settled`), a raise before the step began included;
+            # the engine sets it at launch on the normal path.
+            if node_batch.launch_started_event is not None:
+                node_batch.launch_started_event.set()
+
+    def _run_gpu_step(
+        self,
+        batch: ScheduledBatch,
+        node_batch: ExecutingBatch,
+        plan_future: Future | None,
+    ) -> dict[int, NameToTensorList]:
+        """``_execute_on_gpu_thread``'s body."""
         from mstar.utils.profiler import range_pop, range_push
 
         timed = self._phase_period
@@ -2351,10 +2369,6 @@ class Worker:
                     laps.lap("gpu_exec_events")
             return outputs
         finally:
-            # Safety net: a step that raised before the forward would otherwise
-            # leave the submitter blocked on this for the full wait timeout.
-            if node_batch.launch_started_event is not None:
-                node_batch.launch_started_event.set()
             # Safety net: a step that raised before publishing outputs or
             # committing would otherwise strand the plan thread preparing the
             # next one. The engine does this too on its own paths; here covers
@@ -2381,30 +2395,51 @@ class Worker:
                 range_pop(synchronize=False)
 
     def _await_admit_settled(self, pending: "PendingBatch | None") -> None:
-        """Block until the in-flight step's admit has run (for TP leaders).
+        """Block until the in-flight step has admitted and planned.
 
-        Admit is on the GPU thread; every offload and reload is on this one. A
-        page move in the window between a step's broadcast and its admit lands
-        in the NEXT step's resident delta, so the follower applies it after
-        admitting this step while the leader admitted with it already applied.
+        The GPU thread sets the event at the step's launch, so this fences admit
+        and plan, not commit. Admit is on the GPU thread; every offload and
+        reload is on this one. A page move in the window between a step's
+        broadcast and its admit lands in the NEXT step's resident delta, so the
+        follower applies it after admitting this step while the leader admitted
+        with it already applied.
 
         Separate from the submitter's ``MSTAR_LAUNCH_WAIT_MS`` wait on the same
         event: that one is a GIL throttle and is meant to expire early. This
-        one is for correctness, so it waits out the step.
+        one is for correctness, so it waits for the launch.
+
+        A lockstep step (``tp_seq >= 0``) is waited for however long it takes,
+        with a warning every ``_ADMIT_FENCE_TIMEOUT_S``: a teardown landing
+        inside its admit would change what the admit decides on this rank alone
+        (KV pages, say), and the ranks would diverge or hang in a collective.
+        Any other step is given up on after one interval. The GPU thread sets
+        the event on every exit (``_execute_on_gpu_thread``'s outermost
+        ``finally``), and the wait also ends once the step's future is done (an
+        executor that failed to start completes it without running the step), so
+        a wait that never ends means a hung admit or plan.
         """
         if pending is None:
             return
         event = pending.node_batch.launch_started_event
         if event is None or event.is_set():
             return
+        waited = 0.0
         with self._span("worker.await_admit_settled"):
-            settled = event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S)
-        if not settled:
-            logger.warning(
-                "Worker %s: timed out waiting for node=%s walk=%s to admit "
-                "before scheduling; page moves may diverge across TP ranks",
-                self.worker_id, pending.node_name, pending.graph_walk,
-            )
+            while not (event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S) or pending.future.done()):
+                waited += _ADMIT_FENCE_TIMEOUT_S
+                if pending.tp_seq < 0:
+                    logger.warning(
+                        "Worker %s: timed out waiting for node=%s walk=%s to admit "
+                        "before scheduling",
+                        self.worker_id, pending.node_name, pending.graph_walk,
+                    )
+                    return
+                logger.warning(
+                    "Worker %s: still waiting for node=%s walk=%s (TP seq %d) to "
+                    "admit and plan after %.0f s; scheduling and teardowns wait for it",
+                    self.worker_id, pending.node_name, pending.graph_walk,
+                    pending.tp_seq, waited,
+                )
 
     def _drop_rows_whose_loop_stopped(self, pending: PendingBatch) -> None:
         """Take a refused speculative step's rows whose loop stopped at N out
