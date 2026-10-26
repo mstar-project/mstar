@@ -80,6 +80,8 @@ from mstar.model.gr00t_n17.submodules import (
     Gr00tN17Shape,
 )
 from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.worker.batch_builder import off_group_rids
+from mstar.worker.micro_scheduler import ScheduledBatch
 
 _HUB = Path.home() / ".cache/huggingface/hub"
 _GR00T = _HUB / "models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495"
@@ -714,6 +716,42 @@ def test_two_requests_batch_only_when_both_spans_match():
     assert node.cg_key_info(_WALK, {info.request_id: info for info in same}) == _SHAPE
     assert node.cg_key_info(_WALK, {info.request_id: info for info in other_text}) is None
     assert node.cg_key_info(_WALK, {info.request_id: info for info in other_image}) is None
+
+
+def _off_group(node: Gr00tN17DenoiseStepSubmodule, infos: dict[int, CurrentForwardPassInfo]):
+    """``off_group_rids`` over one batch of ``infos``, grouped as ``Engine.capture_group``
+    groups a captured walk: by the node's ``cg_key_info`` for one rid if it opts in, else not."""
+    def capture_group(rid: int):
+        if not node.split_batches_by_capture_key(_WALK):
+            return None
+        return node.cg_key_info(_WALK, {rid: infos[rid]})
+
+    batch = ScheduledBatch(_LOOP, _WALK, request_to_worker_graph={rid: 0 for rid in infos})
+    return off_group_rids(batch, capture_group), [capture_group(rid) for rid in infos]
+
+
+def test_the_scheduler_batches_each_prompt_length_apart(monkeypatch):
+    """D16: a DT batch mixing prompt lengths matches no capture and runs eager one request at
+    a time, so the node opts in and the scheduler's grouping keeps the lengths apart."""
+    node = _node()
+    assert node.split_batches_by_capture_key(_WALK) is True
+    # the real lengths: only the text span differs
+    infos = {
+        rid: _info(f"r{rid}", text=text, image=448)
+        for rid, text in enumerate((13, 21, 13, 21))
+    }
+
+    off, groups = _off_group(node, infos)
+    assert groups == [Gr00tN17Shape(13, 448), Gr00tN17Shape(21, 448)] * 2
+    # the first rid anchors: the other length is held back, the same length stays
+    assert off == {1, 3}
+    assert _off_group(node, {rid: infos[rid] for rid in (0, 2)})[0] == set()
+
+    # opted out, every rid is in one group and the mixed batch goes ahead whole
+    monkeypatch.setattr(node, "split_batches_by_capture_key", lambda graph_walk: False)
+    off, groups = _off_group(node, infos)
+    assert groups == [None] * 4
+    assert off == set()
 
 
 # ----------------------------------------------------------------------------
