@@ -526,6 +526,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # would pay for nothing.
     reads_device_loopback: bool = False
 
+    # the LoRA pools among this node's resources; set by `bind_node_resources`
+    lora_keys: tuple[str, ...] = ()
+
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs
@@ -555,6 +558,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
                 bind(resources)
+        from mstar.engine.resources.lora.pool import LoraAdapterPool
+
+        self.lora_keys = tuple(k for k, r in resources.items() if isinstance(r, LoraAdapterPool))
 
     def cg_key_info(
         self, graph_walk: str,
@@ -816,6 +822,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         and doesn't need this surface.
         """
         return None
+
+    def compute_dtype(self, default: torch.dtype | None) -> torch.dtype | None:
+        """The dtype the worker casts this node's weights to: its own
+        ``get_autocast_dtype``, else ``default`` (the serving config's); None for a
+        node that keeps the dtype it was built in (``disable_autocast``)."""
+        if self.disable_autocast:
+            return None
+        return self.get_autocast_dtype() or default
 
     # Note: do not import CudaGraphConfig; it causes a circular import situation
     def get_accelerator_graph_configs(

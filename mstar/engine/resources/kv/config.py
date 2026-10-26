@@ -249,6 +249,10 @@ class KVReqConfig(ResourceReqConfig):
     prefix_tail: dict[str, list[int]] | None = None
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
+    # what the request's chains hang from: empty for the base model, a LoRA adapter's
+    # root otherwise. The prompt's keys already include it; generation keys a first
+    # page with it when the prompt filled none.
+    prefix_root: bytes = b""
     prefix_cache: bool = True
     kv_layout: dict[str, "StreamLayout"] | None = None
     loop_caps: dict[str, int] | None = None
@@ -258,6 +262,7 @@ class KVReqConfig(ResourceReqConfig):
         prefix_keys: dict[str, list[bytes]] | None=None,
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
+        prefix_root: bytes | None=None,
         prefix_cache: bool | None=None,
         kv_layout: dict[str, list] | None=None,
         loop_caps: Mapping[str, int] | None=None,
@@ -269,6 +274,8 @@ class KVReqConfig(ResourceReqConfig):
             self.prefix_tail = prefix_tail
         if prefix_decode is not None:
             self.prefix_decode = prefix_decode
+        if prefix_root is not None:
+            self.prefix_root = prefix_root
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
         if kv_layout is not None:

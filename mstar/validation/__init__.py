@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
-from mstar.model.base import Model, WorkerGraph
+from mstar.model.base import Model, WorkerGraph, built_resources, enabled_resources
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems
 from mstar.validation.resources import check_resources, resources_shape_problem
@@ -69,7 +69,8 @@ def validate_deployment(
     if "max_seq_len" not in config:
         problems.append("the config must define `max_seq_len`")
     # model hooks read `resources:` as a mapping; check_resources reports a bad one
-    if resources_shape_problem(config) is None:
+    resources_readable = resources_shape_problem(config) is None
+    if resources_readable:
         try:
             model.validate_config_yaml(config, config_path)
         except ValueError as e:
@@ -103,7 +104,8 @@ def validate_deployment(
     # problems found so far, and only the checks that need the specs are skipped
     specs = None
     try:
-        specs = model.get_node_resources()
+        # a `resources:` block check_resources refuses turns no resource on
+        specs = enabled_resources(model, config if resources_readable else {**config, "resources": None})
     except (ValueError, OSError) as e:
         problems.append(
             f"declaring the node resources failed: {type(e).__name__}: {e}; "
@@ -113,6 +115,12 @@ def validate_deployment(
         problems.append(_unreadable("get_node_resources", e))
     if specs is not None:
         problems += _checked("checking the node resources", check_resources, model, specs, config)
+        # the placement checks see what the workers build of them
+        try:
+            specs = built_resources(specs)
+        except (ValueError, OSError) as e:
+            problems.append(f"building the node resources failed: {type(e).__name__}: {e}")
+            specs = None
     if deployment is not None:
         problems += _checked(
             "checking the worker graphs", check_worker_graphs,
