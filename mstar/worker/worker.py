@@ -1292,6 +1292,17 @@ class Worker:
                     self._preempted[rid].returned_at = len(kept.sampled)
                 self._rebuild(rid, node_name)
 
+    def _reload_from_host(self) -> None:
+        """Reload the request first in each pool's queue when it waits on the host and fits, as `_readmit_dropped`
+        returns a dropped request. Without this pass, the request reloads only when its next step is checked for
+        readiness. That step may not come before the request's REMOVE, and every newer request waits until then."""
+        for kv in self._kv_caches.values():
+            rid = kv.cache.head_on_host()
+            if rid is not None and not self._is_tearing_down(rid):
+                for node_name in kv.nodes:
+                    if not self.engine_manager.get_engine(node_name).reload_request(node_name, rid):
+                        break
+
     def _runnable_rebuilds(self) -> dict[int, RebuildRow]:
         """The queued rebuild rows the scheduler would run now: not held, failed or removed."""
         now = _time.monotonic()
@@ -4901,6 +4912,7 @@ class Worker:
 
                 if self._dropped:
                     self._readmit_dropped()
+                self._reload_from_host()
 
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.

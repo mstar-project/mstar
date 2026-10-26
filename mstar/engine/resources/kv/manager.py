@@ -2895,9 +2895,7 @@ class KVManager(AttentionResource):
             free, room = self._arena.num_free, self._room()
             self.reset_request(rid, free=True)
             self._dropped.add(rid)
-            allotment = self._vacate(rid, room)
-            if allotment is not None:
-                self._queue(rid, allotment.prompt)
+            self._vacate(rid, room)
             return self._arena.num_free - free
 
     def lay_out_again(self, rid: str, ids: Sequence[int]) -> str:
@@ -3137,11 +3135,14 @@ class KVManager(AttentionResource):
         )
 
     def can_reload(self, rid: str) -> bool:
-        """Whether `_room` covers the pages ``rid``'s reload takes."""
+        """Whether `_room` covers the pages ``rid``'s reload takes plus the pages `_return_pages` counts for it. A
+        request in `_waiting` must also be first there."""
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
-            needed = 0
+            if rid in self._waiting and next(iter(self._waiting)) != rid:
+                return False
+            needed = self._return_pages(rid)
             evictable = () if self._index is None else self._index.evictable()
             for state in self._cpu_pool.offloaded[rid].values():
                 run = self._index.pages_for(state.keys) if self._index is not None else []
@@ -3149,17 +3150,41 @@ class KVManager(AttentionResource):
                 needed += len(state.cpu_page_indices) - len(run) + sum(page in evictable for page in run)
             return needed <= self._room()
 
+    def _return_pages(self, rid: str) -> int:
+        """The pages a request in `_waiting` is allotted beyond what it reloads, or 0 outside `_waiting`. Its whole
+        allotment is its prompt or, when larger, the sum of `_one_more` over each stream's reloaded pages, as
+        `readmit` counts a dropped request's history."""
+        prompt = self._waiting.get(rid)
+        if prompt is None:
+            return 0
+        reloaded = grown = 0
+        for label, state in self._cpu_pool.offloaded[rid].items():
+            pages = len(state.cpu_page_indices)
+            reloaded += pages
+            grown += self._one_more(pages, self._streams[rid][label].footprint)
+        return max(prompt, grown, reloaded) - reloaded
+
+    @staticmethod
+    def _one_more(pages: int, footprint: int | None) -> int:
+        """``pages`` and one page more, at most ``footprint``."""
+        return pages + 1 if footprint is None else min(pages + 1, footprint)
+
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
 
         Keyed pages the index still holds are taken from it, and the rest come
         from the host. False when the device can't fit them right now; nothing
         moves in that case, so the caller can evict further and try again.
+        A request in `_waiting` reloads only when it is first there, and is allotted its reloaded pages plus
+        the pages `_return_pages` counts.
         """
         self._touch_plan_cache(rid)
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
+            if rid in self._waiting and next(iter(self._waiting)) != rid:
+                return False
+            extra = self._return_pages(rid)
             states = dict(self._cpu_pool.offloaded[rid])
             # a reload is a hit, so `lookup` marks the pages recently used
             runs = {
@@ -3171,7 +3196,7 @@ class KVManager(AttentionResource):
             needed = sum(len(state.cpu_page_indices) - len(runs[label]) for label, state in states.items())
             # retaining the runs already took their evictable pages out of the room, so the check runs
             # even when the index holds every page
-            fits = not self._decides or needed <= self._room()
+            fits = not self._decides or needed + extra <= self._room()
             pages = self._grant(rid, ", ".join(states), needed, 0) if fits else None
             if pages is None:
                 for run in runs.values():
@@ -3192,6 +3217,9 @@ class KVManager(AttentionResource):
                 stream.released = state.released
                 stream.protected_prefix = state.protected_prefix
                 copies.cpu.extend(state.cpu_page_indices[len(run):])
+            if rid in self._waiting:
+                self._allotments[rid] = Allotment(pages=self._held(rid) + extra, prompt=self._waiting.pop(rid))
+                self._recount(rid)
         # The streams stay marked offloaded while the copies are queued outside
         # the lock, so nothing extends or claims their pages.
         self._cpu_pool.copy_in(self.kv_cache.tensor, copies)
@@ -3622,13 +3650,14 @@ class KVManager(AttentionResource):
             )
             if self._index is not None:
                 self._index.assert_evictable()
-            for rid in self._dropped:
-                if rid in self._waiting:
+            for rid in self._waiting:
+                on_host = self._cpu_pool is not None and self._cpu_pool.is_offloaded(rid)
+                if rid in self._dropped or on_host:
                     held = [
                         page for stream in self._streams[rid].values()
                         for page in (*stream.page_indices, *(stream.lease or ()))
                     ]
-                    assert not held, f"{rid} was dropped and still holds pages {held}"
+                    assert not held, f"{rid} waits {'on the host' if on_host else 'dropped'}, holding pages {held}"
             if self._cpu_pool is not None:
                 self._assert_host_pages_conserved()
 
@@ -3848,11 +3877,8 @@ class KVManager(AttentionResource):
         with self._lock:
             if next(iter(self._waiting), None) != rid:
                 return False
-            pages = -(-history // self.config.page_size) + 1
-            need = sum(
-                pages if stream.footprint is None else min(pages, stream.footprint)
-                for stream in self._streams[rid].values()
-            )
+            pages = -(-history // self.config.page_size)
+            need = sum(self._one_more(pages, stream.footprint) for stream in self._streams[rid].values())
             if need > self._room():
                 return False
             self._allotments[rid] = Allotment(pages=need, prompt=self._waiting.pop(rid))
@@ -3864,6 +3890,14 @@ class KVManager(AttentionResource):
 
     def moves_to_host(self, rid: str) -> bool:
         return rid in self._hosted
+
+    def head_on_host(self) -> str | None:
+        """The request first in `_waiting` if it waits on the host, or None."""
+        if not self._decides or self._cpu_pool is None or not self._waiting:
+            return None
+        with self._lock:
+            rid = next(iter(self._waiting), None)
+            return rid if rid is not None and self._cpu_pool.is_offloaded(rid) else None
 
     def arrival(self, rid: str) -> int | None:
         overrides = self._overrides.get(rid)
@@ -3931,19 +3965,18 @@ class KVManager(AttentionResource):
             del self._earmarks[earmark.rid]
             self._allot(earmark.rid, min(earmark.pages, earmark.freed))
 
-    def _vacate(self, rid: str, room: int) -> Allotment | None:
-        """Release ``rid``'s leases and give up its allotment, once a drop or a move to the host has released its
-        pages, and settle the earmark ``rid`` is a victim of with the room made since `_room` was ``room``. Return
-        the allotment given up."""
+    def _vacate(self, rid: str, room: int) -> None:
+        """Release ``rid``'s leases, give up its allotment and queue ``rid`` at its arrival, once a drop or a move
+        to the host has freed its pages. ``room`` is `_room` as it was before the drop or the move."""
         for stream in self._streams[rid].values():
             self._release_lease(rid, stream)
         allotment = self._allotments.pop(rid, None)
         if allotment is not None:
             self._unused -= allotment.remaining
+            self._queue(rid, allotment.prompt)
         self._short.pop(rid, None)
         self._ran_short.pop(rid, None)
         self._settle(rid, self._room() - room)
-        return allotment
 
     def _allot(self, rid: str, pages: int) -> None:
         # A request past its allotment holds more than ``allotment.pages``, so ``pages`` add to what it holds.
