@@ -937,7 +937,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.openai.realtime_vad</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""Server turn detection for ``/v1/realtime`` (OpenAI's ``server_vad``).</span>
+<span></span><span class="sd">"""Server turn detection for ``/v1/realtime`` (OpenAI's ``server_vad`` and</span>
+<span class="sd">``semantic_vad``).</span>
 
 <span class="sd">``TurnSegmenter`` cuts a 16 kHz stream into turns from a per-frame speech</span>
 <span class="sd">probability, and returns what to do in stream order: start a turn, add audio</span>
@@ -949,7 +950,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">The probability comes from Silero VAD (MIT), its 2 MB ONNX export run by</span>
 <span class="sd">onnxruntime on one CPU thread, about 0.15 ms per 32 ms frame. Its weights are</span>
 <span class="sd">read from disk only: ``MSTAR_SILERO_VAD_PATH``, else the copy bundled with</span>
-<span class="sd">the ``silero-vad`` package (``pip install 'mstar[vad]'``).</span>
+<span class="sd">the ``silero-vad`` package (``pip install 'mstar[vad]'``). ``semantic_vad`` adds</span>
+<span class="sd">Pipecat's Smart Turn v3 (BSD-2), an 8 MB ONNX model that judges from the audio</span>
+<span class="sd">whether a pause ends the turn; without it (or onnxruntime), or with a file</span>
+<span class="sd">that is not that model, ``semantic_vad`` is refused with an error event.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -958,6 +962,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">importlib.util</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">deque</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">asdict</span><span class="p">,</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Protocol</span>
@@ -1017,6 +1022,152 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">view</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"server_vad"</span><span class="p">,</span> <span class="o">**</span><span class="n">asdict</span><span class="p">(</span><span class="bp">self</span><span class="p">)}</span></div>
 </div>
+
+
+
+<div class="viewcode-block" id="SemanticVAD">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.SemanticVAD">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">SemanticVAD</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""OpenAI's ``semantic_vad``: a pause asks an end-of-turn model whether</span>
+<span class="sd">    the speaker is done; ``eagerness`` sets the pause, the confidence needed</span>
+<span class="sd">    and the longest silence that ends a turn regardless (``EAGERNESS``)."""</span>
+
+    <span class="n">eagerness</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span>
+    <span class="n">create_response</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">interrupt_response</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="SemanticVAD.view">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.SemanticVAD.view">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">view</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"semantic_vad"</span><span class="p">,</span> <span class="o">**</span><span class="n">asdict</span><span class="p">(</span><span class="bp">self</span><span class="p">)}</span></div>
+</div>
+
+
+
+<span class="c1"># eagerness -&gt; (pause before asking the model, P(end of turn) that commits,</span>
+<span class="c1"># silence that always ends the turn), in ms. Every pause is shorter than</span>
+<span class="c1"># server_vad's 500 ms window; the silences are OpenAI's 8, 4 and 2 s limits.</span>
+<span class="n">EAGERNESS</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">"low"</span><span class="p">:</span> <span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="mf">0.7</span><span class="p">,</span> <span class="mi">8000</span><span class="p">),</span>
+    <span class="s2">"medium"</span><span class="p">:</span> <span class="p">(</span><span class="mi">300</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mi">4000</span><span class="p">),</span>
+    <span class="s2">"high"</span><span class="p">:</span> <span class="p">(</span><span class="mi">200</span><span class="p">,</span> <span class="mf">0.3</span><span class="p">,</span> <span class="mi">2000</span><span class="p">),</span>
+    <span class="s2">"auto"</span><span class="p">:</span> <span class="p">(</span><span class="mi">300</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mi">4000</span><span class="p">),</span>
+<span class="p">}</span>
+<span class="n">SEMANTIC_THRESHOLD</span> <span class="o">=</span> <span class="mf">0.5</span>     <span class="c1"># Silero speech threshold for semantic_vad</span>
+<span class="n">SEMANTIC_PREFIX_MS</span> <span class="o">=</span> <span class="mi">300</span>
+<span class="n">SMART_TURN_SECONDS</span> <span class="o">=</span> <span class="mi">8</span>       <span class="c1"># the model hears the last 8 s of the turn</span>
+<span class="n">SMART_TURN_REPO</span><span class="p">,</span> <span class="n">SMART_TURN_FILE</span> <span class="o">=</span> <span class="s2">"pipecat-ai/smart-turn-v3"</span><span class="p">,</span> <span class="s2">"smart-turn-v3.2-cpu.onnx"</span>
+
+
+<div class="viewcode-block" id="SmartTurn">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.SmartTurn">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">SmartTurn</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Pipecat Smart Turn v3 (BSD-2, 8 MB int8 ONNX on CPU): P(the speaker</span>
+<span class="sd">    has finished) from the last 8 s of a turn, about 45 ms a call on one</span>
+<span class="sd">    thread. Stateless, so one instance serves every session."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="n">Path</span><span class="p">):</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">onnxruntime</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ort</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">WhisperFeatureExtractor</span>
+
+        <span class="n">so</span> <span class="o">=</span> <span class="n">ort</span><span class="o">.</span><span class="n">SessionOptions</span><span class="p">()</span>
+        <span class="n">so</span><span class="o">.</span><span class="n">inter_op_num_threads</span> <span class="o">=</span> <span class="n">so</span><span class="o">.</span><span class="n">intra_op_num_threads</span> <span class="o">=</span> <span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_session</span> <span class="o">=</span> <span class="n">ort</span><span class="o">.</span><span class="n">InferenceSession</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">),</span> <span class="n">sess_options</span><span class="o">=</span><span class="n">so</span><span class="p">,</span> <span class="n">providers</span><span class="o">=</span><span class="p">[</span><span class="s2">"CPUExecutionProvider"</span><span class="p">])</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_features</span> <span class="o">=</span> <span class="n">WhisperFeatureExtractor</span><span class="p">(</span><span class="n">chunk_length</span><span class="o">=</span><span class="n">SMART_TURN_SECONDS</span><span class="p">)</span>
+        <span class="c1"># another ONNX file loads fine and then fails on a session's first pause</span>
+        <span class="n">inputs</span> <span class="o">=</span> <span class="p">{</span><span class="n">i</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">i</span><span class="o">.</span><span class="n">type</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_session</span><span class="o">.</span><span class="n">get_inputs</span><span class="p">()}</span>
+        <span class="k">if</span> <span class="n">inputs</span> <span class="o">!=</span> <span class="n">_SMART_TURN_INPUTS</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="n">_NotSmartTurnError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"its inputs are </span><span class="si">{</span><span class="n">inputs</span><span class="si">}</span><span class="s2">, not </span><span class="si">{</span><span class="n">_SMART_TURN_INPUTS</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="n">shapes</span> <span class="o">=</span> <span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">shape</span><span class="p">(</span><span class="n">o</span><span class="p">)</span> <span class="k">for</span> <span class="n">o</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_run</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">))]</span>
+        <span class="k">if</span> <span class="n">shapes</span><span class="p">[:</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="p">[(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)]:</span>
+            <span class="k">raise</span> <span class="n">_NotSmartTurnError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"its outputs have shapes </span><span class="si">{</span><span class="n">shapes</span><span class="si">}</span><span class="s2">, not [(1, 1)]"</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_run</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">audio</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="n">SMART_TURN_SECONDS</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span>
+        <span class="n">audio</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">asarray</span><span class="p">(</span><span class="n">audio</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)[</span><span class="o">-</span><span class="n">n</span><span class="p">:]</span>
+        <span class="n">audio</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span><span class="n">audio</span><span class="p">,</span> <span class="p">(</span><span class="n">n</span> <span class="o">-</span> <span class="n">audio</span><span class="o">.</span><span class="n">size</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>   <span class="c1"># the reference pads at the front</span>
+        <span class="n">features</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_features</span><span class="p">(</span><span class="n">audio</span><span class="p">,</span> <span class="n">sampling_rate</span><span class="o">=</span><span class="n">SAMPLE_RATE</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">"np"</span><span class="p">,</span> <span class="n">padding</span><span class="o">=</span><span class="s2">"max_length"</span><span class="p">,</span>
+                                  <span class="n">max_length</span><span class="o">=</span><span class="n">n</span><span class="p">,</span> <span class="n">truncation</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">do_normalize</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">input_features</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_session</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="p">{</span><span class="s2">"input_features"</span><span class="p">:</span> <span class="n">features</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)})</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">audio</span><span class="p">:</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">float</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_run</span><span class="p">(</span><span class="n">audio</span><span class="p">)[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span></div>
+
+
+
+<span class="n">_SMART_TURN_INPUTS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"input_features"</span><span class="p">:</span> <span class="s2">"tensor(float)"</span><span class="p">}</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_NotSmartTurnError</span><span class="p">(</span><span class="ne">ValueError</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The file loads, but its inputs or outputs are not Smart Turn v3's."""</span>
+
+
+<div class="viewcode-block" id="smart_turn_weights">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.smart_turn_weights">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">smart_turn_weights</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Path</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``MSTAR_SMART_TURN_PATH``, else the file in the local Hugging Face</span>
+<span class="sd">    cache (``hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx``);</span>
+<span class="sd">    never downloaded here."""</span>
+    <span class="n">path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_SMART_TURN_PATH"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">path</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">huggingface_hub</span><span class="w"> </span><span class="kn">import</span> <span class="n">hf_hub_download</span>
+
+        <span class="k">return</span> <span class="n">Path</span><span class="p">(</span><span class="n">hf_hub_download</span><span class="p">(</span><span class="n">SMART_TURN_REPO</span><span class="p">,</span> <span class="n">SMART_TURN_FILE</span><span class="p">,</span> <span class="n">local_files_only</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — not cached, or no huggingface_hub</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+
+<span class="n">_smart_turn_problem</span> <span class="o">=</span> <span class="s2">"no Smart Turn model is loaded"</span>
+
+
+<div class="viewcode-block" id="smart_turn_problem">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.smart_turn_problem">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">smart_turn_problem</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Why ``smart_turn()`` gave None, in words safe to send a client (no paths)."""</span>
+    <span class="k">return</span> <span class="n">_smart_turn_problem</span></div>
+
+
+
+<div class="viewcode-block" id="smart_turn">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.smart_turn">[docs]</a>
+<span class="nd">@functools</span><span class="o">.</span><span class="n">lru_cache</span><span class="p">(</span><span class="n">maxsize</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">smart_turn</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">],</span> <span class="nb">float</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The shared end-of-turn model, or None (with one warning, and the</span>
+<span class="sd">    reason in ``smart_turn_problem``): semantic_vad is then refused."""</span>
+    <span class="k">global</span> <span class="n">_smart_turn_problem</span>
+    <span class="n">_smart_turn_problem</span> <span class="o">=</span> <span class="s2">"no Smart Turn model is loaded"</span>
+    <span class="n">path</span> <span class="o">=</span> <span class="n">smart_turn_weights</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">path</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">path</span><span class="o">.</span><span class="n">is_file</span><span class="p">():</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"semantic_vad is unavailable: no Smart Turn weights</span><span class="si">%s</span><span class="s2"> (set MSTAR_SMART_TURN_PATH "</span>
+                       <span class="s2">"or hf download </span><span class="si">%s</span><span class="s2"> </span><span class="si">%s</span><span class="s2">)"</span><span class="p">,</span> <span class="sa">f</span><span class="s2">" at </span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">path</span> <span class="k">else</span> <span class="s2">""</span><span class="p">,</span> <span class="n">SMART_TURN_REPO</span><span class="p">,</span> <span class="n">SMART_TURN_FILE</span><span class="p">)</span>
+        <span class="n">_smart_turn_problem</span> <span class="o">=</span> <span class="s2">"no Smart Turn weights on this server"</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">SmartTurn</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — missing onnxruntime/transformers or a bad file</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"semantic_vad is unavailable: cannot load Smart Turn from </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">); "</span>
+                       <span class="s2">"it needs mstar[vad] and the </span><span class="si">%s</span><span class="s2"> file"</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">exc</span><span class="p">,</span> <span class="n">SMART_TURN_FILE</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="ne">ImportError</span><span class="p">):</span>
+            <span class="n">_smart_turn_problem</span> <span class="o">=</span> <span class="s2">"onnxruntime or transformers is not installed"</span>
+        <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">exc</span><span class="p">,</span> <span class="n">_NotSmartTurnError</span><span class="p">):</span>
+            <span class="n">_smart_turn_problem</span> <span class="o">=</span> <span class="s2">"the Smart Turn file is not the expected model"</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">_smart_turn_problem</span> <span class="o">=</span> <span class="s2">"the Smart Turn model did not load"</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+
+<div class="viewcode-block" id="report_availability">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.report_availability">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">report_availability</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Load the turn detection models once at startup, so a missing one is a</span>
+<span class="sd">    startup warning rather than a surprise in the first session."""</span>
+    <span class="k">if</span> <span class="n">silero_factory</span><span class="p">()</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">smart_turn</span><span class="p">()</span></div>
 
 
 
@@ -1123,29 +1274,45 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="TurnSegmenter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.TurnSegmenter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">TurnSegmenter</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Splits a 16 kHz stream into turns (OpenAI ``server_vad`` semantics).</span>
+<span class="w">    </span><span class="sd">"""Splits a 16 kHz stream into turns (OpenAI ``server_vad`` and</span>
+<span class="sd">    ``semantic_vad`` semantics).</span>
 
 <span class="sd">    ``feed`` takes audio of any length and returns operations in stream</span>
 <span class="sd">    order: ``("speech_started", audio_start_ms)``, ``("audio", samples)`` for</span>
-<span class="sd">    the open turn, ``("speech_stopped", audio_end_ms)``, ``("commit",)``.</span>
+<span class="sd">    the open turn, ``("speech_stopped", audio_end_ms)``, ``("commit",)``,</span>
+<span class="sd">    and ``("end_of_turn_failed", exc)`` when the end-of-turn model raises.</span>
 <span class="sd">    Times are milliseconds from the start of the session's audio. A turn</span>
 <span class="sd">    starts on a frame at or above ``threshold`` and takes up to</span>
 <span class="sd">    ``prefix_padding_ms`` of the audio before it; it ends after the frame</span>
 <span class="sd">    that brings ``silence_duration_ms`` of whole frames, counted from a frame</span>
 <span class="sd">    below ``threshold - HYSTERESIS`` (included) with none at or above</span>
 <span class="sd">    ``threshold`` since, whatever that last frame's probability (the frames</span>
-<span class="sd">    belong to the turn). A turn holds at most ``max_turn_samples``: it is</span>
+<span class="sd">    belong to the turn). With ``semantic_vad`` the silence that always ends</span>
+<span class="sd">    a turn is the eagerness' longest, and each pause that reaches the</span>
+<span class="sd">    eagerness' shorter pause asks ``end_of_turn`` (once per pause) over the</span>
+<span class="sd">    turn's last 8 s; a probability at or above the eagerness' threshold ends</span>
+<span class="sd">    the turn there. A turn holds at most ``max_turn_samples``: it is</span>
 <span class="sd">    committed before the frame that would pass that, and in mid-speech the</span>
 <span class="sd">    next turn starts with that frame. Audio between turns, beyond the</span>
 <span class="sd">    prefix, is in no turn. A partial frame waits for the next ``feed``.</span>
 <span class="sd">    """</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">vad</span><span class="p">:</span> <span class="n">SpeechProbability</span><span class="p">,</span> <span class="n">cfg</span><span class="p">:</span> <span class="n">ServerVAD</span><span class="p">,</span> <span class="n">max_turn_samples</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">pos</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">vad</span><span class="p">:</span> <span class="n">SpeechProbability</span><span class="p">,</span> <span class="n">cfg</span><span class="p">:</span> <span class="n">ServerVAD</span> <span class="o">|</span> <span class="n">SemanticVAD</span><span class="p">,</span> <span class="n">max_turn_samples</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+                 <span class="n">pos</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">end_of_turn</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">],</span> <span class="nb">float</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">vad</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">cfg</span> <span class="o">=</span> <span class="n">vad</span><span class="p">,</span> <span class="n">cfg</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_turn</span> <span class="o">=</span> <span class="n">max_turn_samples</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_cap</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">prefix_padding_ms</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span> <span class="o">//</span> <span class="mi">1000</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_silence_cap</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">silence_duration_ms</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span> <span class="o">//</span> <span class="mi">1000</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_neg</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">cfg</span><span class="o">.</span><span class="n">threshold</span> <span class="o">-</span> <span class="n">HYSTERESIS</span><span class="p">,</span> <span class="mf">0.01</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_eot</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">SemanticVAD</span><span class="p">):</span>
+            <span class="n">pause_ms</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eot_threshold</span><span class="p">,</span> <span class="n">silence_ms</span> <span class="o">=</span> <span class="n">EAGERNESS</span><span class="p">[</span><span class="n">cfg</span><span class="o">.</span><span class="n">eagerness</span><span class="p">]</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">threshold</span><span class="p">,</span> <span class="n">prefix_ms</span> <span class="o">=</span> <span class="n">SEMANTIC_THRESHOLD</span><span class="p">,</span> <span class="n">SEMANTIC_PREFIX_MS</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_eot</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pause_cap</span> <span class="o">=</span> <span class="n">end_of_turn</span><span class="p">,</span> <span class="n">pause_ms</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span> <span class="o">//</span> <span class="mi">1000</span>
+            <span class="c1"># the turn's last 8 s, for end_of_turn (frames, plus the prefix as one piece)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_recent</span><span class="p">:</span> <span class="n">deque</span> <span class="o">=</span> <span class="n">deque</span><span class="p">(</span><span class="n">maxlen</span><span class="o">=</span><span class="n">SMART_TURN_SECONDS</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span> <span class="o">//</span> <span class="n">FRAME</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">threshold</span><span class="p">,</span> <span class="n">prefix_ms</span><span class="p">,</span> <span class="n">silence_ms</span> <span class="o">=</span> <span class="n">cfg</span><span class="o">.</span><span class="n">threshold</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">prefix_padding_ms</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">silence_duration_ms</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_cap</span> <span class="o">=</span> <span class="n">prefix_ms</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span> <span class="o">//</span> <span class="mi">1000</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_silence_cap</span> <span class="o">=</span> <span class="n">silence_ms</span> <span class="o">*</span> <span class="n">SAMPLE_RATE</span> <span class="o">//</span> <span class="mi">1000</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_neg</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">threshold</span> <span class="o">-</span> <span class="n">HYSTERESIS</span><span class="p">,</span> <span class="mf">0.01</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_rest</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>   <span class="c1"># the partial frame</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pos</span> <span class="o">=</span> <span class="n">pos</span>                              <span class="c1"># stream index of _rest[0]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prefix</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
@@ -1177,23 +1344,45 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">mid_speech</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_open</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="n">ops</span><span class="p">)</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">speaking</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">cfg</span><span class="o">.</span><span class="n">threshold</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">threshold</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_cap</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_prefix</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">_prefix</span><span class="p">,</span> <span class="n">frame</span><span class="p">])[</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">_prefix_cap</span><span class="p">:]</span>
                 <span class="k">return</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_open</span><span class="p">(</span><span class="n">start</span><span class="p">,</span> <span class="n">ops</span><span class="p">)</span>
         <span class="n">ops</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"audio"</span><span class="p">,</span> <span class="n">frame</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_turn</span> <span class="o">+=</span> <span class="n">FRAME</span>
+        <span class="n">paused</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span>
         <span class="c1"># the hysteresis of Silero's VADIterator: a frame below threshold -</span>
         <span class="c1"># HYSTERESIS starts the silence, one at or above threshold cancels it,</span>
         <span class="c1"># and one in between leaves it running</span>
-        <span class="k">if</span> <span class="n">p</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cfg</span><span class="o">.</span><span class="n">threshold</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">p</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">threshold</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="k">elif</span> <span class="n">p</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_neg</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span> <span class="o">+=</span> <span class="n">FRAME</span>
         <span class="c1"># at least one silent frame, so silence_duration_ms 0 does not end a turn mid-speech</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence_cap</span><span class="p">:</span>
+        <span class="n">done</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_silence</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence_cap</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eot</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># a copy: a view would keep the whole append it came in alive</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_recent</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">frame</span><span class="o">.</span><span class="n">copy</span><span class="p">())</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">done</span> <span class="ow">and</span> <span class="n">paused</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pause_cap</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span><span class="p">:</span>
+                <span class="n">done</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ask_end_of_turn</span><span class="p">(</span><span class="n">ops</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">done</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_stop</span><span class="p">(</span><span class="n">start</span> <span class="o">+</span> <span class="n">FRAME</span><span class="p">,</span> <span class="n">ops</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_ask_end_of_turn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ops</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether ``end_of_turn`` says the turn is over. If the model raises</span>
+<span class="sd">        (onnxruntime, the feature extractor), the error goes out as an</span>
+<span class="sd">        ``("end_of_turn_failed", exc)`` operation and this segmenter stops</span>
+<span class="sd">        asking: its turns then end at the eagerness' longest silence, the</span>
+<span class="sd">        limit that already ends a turn regardless. The frame is counted</span>
+<span class="sd">        before the call, so the stream state stays whole either way."""</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eot</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_recent</span><span class="p">))</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eot_threshold</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — any model failure; the session goes on</span>
+            <span class="n">ops</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"end_of_turn_failed"</span><span class="p">,</span> <span class="n">exc</span><span class="p">))</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_eot</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_recent</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+            <span class="k">return</span> <span class="kc">False</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_open</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">start</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">ops</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Start a turn at stream index ``start``, with the prefix padding</span>
@@ -1205,11 +1394,16 @@ window.runMermaid = runMermaid;</script>
         <span class="n">ops</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"speech_started"</span><span class="p">,</span> <span class="n">samples_to_ms</span><span class="p">(</span><span class="n">start</span> <span class="o">-</span> <span class="n">prefix</span><span class="o">.</span><span class="n">size</span><span class="p">)))</span>
         <span class="k">if</span> <span class="n">prefix</span><span class="o">.</span><span class="n">size</span><span class="p">:</span>
             <span class="n">ops</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"audio"</span><span class="p">,</span> <span class="n">prefix</span><span class="p">))</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eot</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_recent</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_recent</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">prefix</span><span class="o">.</span><span class="n">copy</span><span class="p">())</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_stop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">end</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">ops</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">ops</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"speech_stopped"</span><span class="p">,</span> <span class="n">samples_to_ms</span><span class="p">(</span><span class="n">end</span><span class="p">)))</span>
         <span class="n">ops</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="s2">"commit"</span><span class="p">,))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">speaking</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_turn</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eot</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_recent</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
 
 <div class="viewcode-block" id="TurnSegmenter.end_turn">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.TurnSegmenter.end_turn">[docs]</a>
@@ -1243,6 +1437,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_rest</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prefix</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">speaking</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_silence</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_turn</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eot</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_recent</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">vad</span><span class="o">.</span><span class="n">reset</span><span class="p">()</span></div>
 
 

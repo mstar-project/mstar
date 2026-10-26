@@ -13,9 +13,13 @@ mstar.api\_server.openai.realtime\_vad
 
    .. autosummary::
    
+      report_availability
       samples_to_ms
       silero_factory
       silero_weights
+      smart_turn
+      smart_turn_problem
+      smart_turn_weights
    
    
 
@@ -25,8 +29,10 @@ mstar.api\_server.openai.realtime\_vad
 
    .. autosummary::
    
+      SemanticVAD
       ServerVAD
       SileroVAD
+      SmartTurn
       SpeechProbability
       TurnSegmenter
    

@@ -995,6 +995,15 @@ workers do not inherit it), and
 with a file whose inputs or outputs differ (the package’s other
 exports), <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> sessions are refused. Never downloaded.</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SMART_TURN_PATH</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Pipecat Smart Turn v3 ONNX file for <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code>,
+read by <code class="docutils literal notranslate"><span class="pre">realtime_vad.smart_turn_weights</span></code>. Unset, the
+<code class="docutils literal notranslate"><span class="pre">pipecat-ai/smart-turn-v3</span></code> <code class="docutils literal notranslate"><span class="pre">smart-turn-v3.2-cpu.onnx</span></code> file in the
+local Hugging Face cache is used if present; with neither, or with a
+file whose inputs or outputs differ, <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> sessions are
+refused. Never downloaded.</p></td>
+</tr>
 </tbody>
 </table>
 </div>

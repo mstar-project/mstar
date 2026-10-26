@@ -276,6 +276,14 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
        with a file whose inputs or outputs differ (the package's other
        exports), ``server_vad`` sessions are refused. Never downloaded.
+   * - ``MSTAR_SMART_TURN_PATH``
+     - unset
+     - Pipecat Smart Turn v3 ONNX file for ``/v1/realtime`` ``semantic_vad``,
+       read by ``realtime_vad.smart_turn_weights``. Unset, the
+       ``pipecat-ai/smart-turn-v3`` ``smart-turn-v3.2-cpu.onnx`` file in the
+       local Hugging Face cache is used if present; with neither, or with a
+       file whose inputs or outputs differ, ``semantic_vad`` sessions are
+       refused. Never downloaded.
 
 Serving (Rust frontend)
 -----------------------

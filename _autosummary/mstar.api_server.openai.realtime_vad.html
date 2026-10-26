@@ -646,6 +646,13 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD"><code class="docutils literal notranslate"><span class="pre">SemanticVAD</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.create_response"><code class="docutils literal notranslate"><span class="pre">SemanticVAD.create_response</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.eagerness"><code class="docutils literal notranslate"><span class="pre">SemanticVAD.eagerness</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.interrupt_response"><code class="docutils literal notranslate"><span class="pre">SemanticVAD.interrupt_response</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.view"><code class="docutils literal notranslate"><span class="pre">SemanticVAD.view()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.ServerVAD"><code class="docutils literal notranslate"><span class="pre">ServerVAD</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.ServerVAD.create_response"><code class="docutils literal notranslate"><span class="pre">ServerVAD.create_response</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.ServerVAD.interrupt_response"><code class="docutils literal notranslate"><span class="pre">ServerVAD.interrupt_response</span></code></a></li>
@@ -660,6 +667,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SileroVAD.reset"><code class="docutils literal notranslate"><span class="pre">SileroVAD.reset()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SmartTurn"><code class="docutils literal notranslate"><span class="pre">SmartTurn</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SpeechProbability"><code class="docutils literal notranslate"><span class="pre">SpeechProbability</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SpeechProbability.reset"><code class="docutils literal notranslate"><span class="pre">SpeechProbability.reset()</span></code></a></li>
 </ul>
@@ -673,9 +681,13 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.TurnSegmenter.unscored"><code class="docutils literal notranslate"><span class="pre">TurnSegmenter.unscored()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.report_availability"><code class="docutils literal notranslate"><span class="pre">report_availability()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.samples_to_ms"><code class="docutils literal notranslate"><span class="pre">samples_to_ms()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.silero_factory"><code class="docutils literal notranslate"><span class="pre">silero_factory()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.silero_weights"><code class="docutils literal notranslate"><span class="pre">silero_weights()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.smart_turn"><code class="docutils literal notranslate"><span class="pre">smart_turn()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.smart_turn_problem"><code class="docutils literal notranslate"><span class="pre">smart_turn_problem()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.smart_turn_weights"><code class="docutils literal notranslate"><span class="pre">smart_turn_weights()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -689,7 +701,8 @@
                   
   <section id="module-mstar.api_server.openai.realtime_vad">
 <span id="mstar-api-server-openai-realtime-vad"></span><h1>mstar.api_server.openai.realtime_vad<a class="headerlink" href="#module-mstar.api_server.openai.realtime_vad" title="Link to this heading">#</a></h1>
-<p>Server turn detection for <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> (OpenAI’s <code class="docutils literal notranslate"><span class="pre">server_vad</span></code>).</p>
+<p>Server turn detection for <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> (OpenAI’s <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> and
+<code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code>).</p>
 <p><code class="docutils literal notranslate"><span class="pre">TurnSegmenter</span></code> cuts a 16 kHz stream into turns from a per-frame speech
 probability, and returns what to do in stream order: start a turn, add audio
 to it, stop it, commit it. A commit covers exactly the frames up to the end
@@ -699,18 +712,33 @@ drops the start of the next utterance, and each sample is committed exactly once
 <p>The probability comes from Silero VAD (MIT), its 2 MB ONNX export run by
 onnxruntime on one CPU thread, about 0.15 ms per 32 ms frame. Its weights are
 read from disk only: <code class="docutils literal notranslate"><span class="pre">MSTAR_SILERO_VAD_PATH</span></code>, else the copy bundled with
-the <code class="docutils literal notranslate"><span class="pre">silero-vad</span></code> package (<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'mstar[vad]'</span></code>).</p>
+the <code class="docutils literal notranslate"><span class="pre">silero-vad</span></code> package (<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">'mstar[vad]'</span></code>). <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> adds
+Pipecat’s Smart Turn v3 (BSD-2), an 8 MB ONNX model that judges from the audio
+whether a pause ends the turn; without it (or onnxruntime), or with a file
+that is not that model, <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> is refused with an error event.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.samples_to_ms" title="mstar.api_server.openai.realtime_vad.samples_to_ms"><code class="xref py py-obj docutils literal notranslate"><span class="pre">samples_to_ms</span></code></a>(n)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.report_availability" title="mstar.api_server.openai.realtime_vad.report_availability"><code class="xref py py-obj docutils literal notranslate"><span class="pre">report_availability</span></code></a>()</p></td>
+<td><p>Load the turn detection models once at startup, so a missing one is a startup warning rather than a surprise in the first session.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.samples_to_ms" title="mstar.api_server.openai.realtime_vad.samples_to_ms"><code class="xref py py-obj docutils literal notranslate"><span class="pre">samples_to_ms</span></code></a>(n)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.silero_factory" title="mstar.api_server.openai.realtime_vad.silero_factory"><code class="xref py py-obj docutils literal notranslate"><span class="pre">silero_factory</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.silero_factory" title="mstar.api_server.openai.realtime_vad.silero_factory"><code class="xref py py-obj docutils literal notranslate"><span class="pre">silero_factory</span></code></a>()</p></td>
 <td><p>Make one SileroVAD per session over a model loaded once, or return None (with one warning) when the weights or onnxruntime are missing.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.silero_weights" title="mstar.api_server.openai.realtime_vad.silero_weights"><code class="xref py py-obj docutils literal notranslate"><span class="pre">silero_weights</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.silero_weights" title="mstar.api_server.openai.realtime_vad.silero_weights"><code class="xref py py-obj docutils literal notranslate"><span class="pre">silero_weights</span></code></a>()</p></td>
 <td><p>The Silero ONNX file this server uses, or None.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.smart_turn" title="mstar.api_server.openai.realtime_vad.smart_turn"><code class="xref py py-obj docutils literal notranslate"><span class="pre">smart_turn</span></code></a>()</p></td>
+<td><p>The shared end-of-turn model, or None (with one warning, and the reason in <code class="docutils literal notranslate"><span class="pre">smart_turn_problem</span></code>): semantic_vad is then refused.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.smart_turn_problem" title="mstar.api_server.openai.realtime_vad.smart_turn_problem"><code class="xref py py-obj docutils literal notranslate"><span class="pre">smart_turn_problem</span></code></a>()</p></td>
+<td><p>Why <code class="docutils literal notranslate"><span class="pre">smart_turn()</span></code> gave None, in words safe to send a client (no paths).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.smart_turn_weights" title="mstar.api_server.openai.realtime_vad.smart_turn_weights"><code class="xref py py-obj docutils literal notranslate"><span class="pre">smart_turn_weights</span></code></a>()</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SMART_TURN_PATH</span></code>, else the file in the local Hugging Face cache (<code class="docutils literal notranslate"><span class="pre">hf</span> <span class="pre">download</span> <span class="pre">pipecat-ai/smart-turn-v3</span> <span class="pre">smart-turn-v3.2-cpu.onnx</span></code>); never downloaded here.</p></td>
 </tr>
 </tbody>
 </table>
@@ -718,21 +746,70 @@ the <code class="docutils literal notranslate"><span class="pre">silero-vad</spa
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.ServerVAD" title="mstar.api_server.openai.realtime_vad.ServerVAD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ServerVAD</span></code></a>([threshold, prefix_padding_ms, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.SemanticVAD" title="mstar.api_server.openai.realtime_vad.SemanticVAD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SemanticVAD</span></code></a>([eagerness, create_response, ...])</p></td>
+<td><p>OpenAI's <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code>: a pause asks an end-of-turn model whether the speaker is done; <code class="docutils literal notranslate"><span class="pre">eagerness</span></code> sets the pause, the confidence needed and the longest silence that ends a turn regardless (<code class="docutils literal notranslate"><span class="pre">EAGERNESS</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.ServerVAD" title="mstar.api_server.openai.realtime_vad.ServerVAD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ServerVAD</span></code></a>([threshold, prefix_padding_ms, ...])</p></td>
 <td><p>OpenAI's <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> settings.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.SileroVAD" title="mstar.api_server.openai.realtime_vad.SileroVAD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SileroVAD</span></code></a>(session)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.SileroVAD" title="mstar.api_server.openai.realtime_vad.SileroVAD"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SileroVAD</span></code></a>(session)</p></td>
 <td><p>Silero VAD for one stream.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.SmartTurn" title="mstar.api_server.openai.realtime_vad.SmartTurn"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SmartTurn</span></code></a>(path)</p></td>
+<td><p>Pipecat Smart Turn v3 (BSD-2, 8 MB int8 ONNX on CPU): P(the speaker has finished) from the last 8 s of a turn, about 45 ms a call on one thread.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.SpeechProbability" title="mstar.api_server.openai.realtime_vad.SpeechProbability"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SpeechProbability</span></code></a>(*args, **kwargs)</p></td>
 <td><p>Per-session speech probability of one FRAME of 16 kHz audio; stateful.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.TurnSegmenter" title="mstar.api_server.openai.realtime_vad.TurnSegmenter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TurnSegmenter</span></code></a>(vad, cfg, max_turn_samples[, pos])</p></td>
-<td><p>Splits a 16 kHz stream into turns (OpenAI <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> semantics).</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.TurnSegmenter" title="mstar.api_server.openai.realtime_vad.TurnSegmenter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TurnSegmenter</span></code></a>(vad, cfg, max_turn_samples[, ...])</p></td>
+<td><p>Splits a 16 kHz stream into turns (OpenAI <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> and <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> semantics).</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.SemanticVAD">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">SemanticVAD</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">eagerness</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">create_response</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interrupt_response</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#SemanticVAD"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.SemanticVAD" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>OpenAI’s <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code>: a pause asks an end-of-turn model whether
+the speaker is done; <code class="docutils literal notranslate"><span class="pre">eagerness</span></code> sets the pause, the confidence needed
+and the longest silence that ends a turn regardless (<code class="docutils literal notranslate"><span class="pre">EAGERNESS</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>eagerness</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>create_response</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>interrupt_response</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.SemanticVAD.create_response">
+<span class="sig-name descname"><span class="pre">create_response</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.create_response" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.SemanticVAD.eagerness">
+<span class="sig-name descname"><span class="pre">eagerness</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></span><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.eagerness" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.SemanticVAD.interrupt_response">
+<span class="sig-name descname"><span class="pre">interrupt_response</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.interrupt_response" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.SemanticVAD.view">
+<span class="sig-name descname"><span class="pre">view</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#SemanticVAD.view"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.view" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.ServerVAD">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">ServerVAD</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">threshold</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.5</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_padding_ms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">300</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">silence_duration_ms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">500</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">create_response</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">interrupt_response</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#ServerVAD"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.ServerVAD" title="Link to this definition">#</a></dt>
@@ -813,6 +890,20 @@ samples, which the model reads before each frame.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.SmartTurn">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">SmartTurn</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#SmartTurn"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.SmartTurn" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Pipecat Smart Turn v3 (BSD-2, 8 MB int8 ONNX on CPU): P(the speaker
+has finished) from the last 8 s of a turn, about 45 ms a call on one
+thread. Stateless, so one instance serves every session.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>path</strong> (<em>Path</em>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.SpeechProbability">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">SpeechProbability</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#SpeechProbability"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.SpeechProbability" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Protocol" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Protocol</span></code></a></p>
@@ -831,19 +922,25 @@ samples, which the model reads before each frame.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.TurnSegmenter">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">TurnSegmenter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vad</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cfg</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_turn_samples</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pos</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#TurnSegmenter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.TurnSegmenter" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">TurnSegmenter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">vad</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cfg</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_turn_samples</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pos</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end_of_turn</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#TurnSegmenter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.TurnSegmenter" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>Splits a 16 kHz stream into turns (OpenAI <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> semantics).</p>
+<p>Splits a 16 kHz stream into turns (OpenAI <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> and
+<code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> semantics).</p>
 <p><code class="docutils literal notranslate"><span class="pre">feed</span></code> takes audio of any length and returns operations in stream
 order: <code class="docutils literal notranslate"><span class="pre">(&quot;speech_started&quot;,</span> <span class="pre">audio_start_ms)</span></code>, <code class="docutils literal notranslate"><span class="pre">(&quot;audio&quot;,</span> <span class="pre">samples)</span></code> for
-the open turn, <code class="docutils literal notranslate"><span class="pre">(&quot;speech_stopped&quot;,</span> <span class="pre">audio_end_ms)</span></code>, <code class="docutils literal notranslate"><span class="pre">(&quot;commit&quot;,)</span></code>.
+the open turn, <code class="docutils literal notranslate"><span class="pre">(&quot;speech_stopped&quot;,</span> <span class="pre">audio_end_ms)</span></code>, <code class="docutils literal notranslate"><span class="pre">(&quot;commit&quot;,)</span></code>,
+and <code class="docutils literal notranslate"><span class="pre">(&quot;end_of_turn_failed&quot;,</span> <span class="pre">exc)</span></code> when the end-of-turn model raises.
 Times are milliseconds from the start of the session’s audio. A turn
 starts on a frame at or above <code class="docutils literal notranslate"><span class="pre">threshold</span></code> and takes up to
 <code class="docutils literal notranslate"><span class="pre">prefix_padding_ms</span></code> of the audio before it; it ends after the frame
 that brings <code class="docutils literal notranslate"><span class="pre">silence_duration_ms</span></code> of whole frames, counted from a frame
 below <code class="docutils literal notranslate"><span class="pre">threshold</span> <span class="pre">-</span> <span class="pre">HYSTERESIS</span></code> (included) with none at or above
 <code class="docutils literal notranslate"><span class="pre">threshold</span></code> since, whatever that last frame’s probability (the frames
-belong to the turn). A turn holds at most <code class="docutils literal notranslate"><span class="pre">max_turn_samples</span></code>: it is
+belong to the turn). With <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> the silence that always ends
+a turn is the eagerness’ longest, and each pause that reaches the
+eagerness’ shorter pause asks <code class="docutils literal notranslate"><span class="pre">end_of_turn</span></code> (once per pause) over the
+turn’s last 8 s; a probability at or above the eagerness’ threshold ends
+the turn there. A turn holds at most <code class="docutils literal notranslate"><span class="pre">max_turn_samples</span></code>: it is
 committed before the frame that would pass that, and in mid-speech the
 next turn starts with that frame. Audio between turns, beyond the
 prefix, is in no turn. A partial frame waits for the next <code class="docutils literal notranslate"><span class="pre">feed</span></code>.</p>
@@ -851,9 +948,10 @@ prefix, is in no turn. A partial frame waits for the next <code class="docutils 
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>vad</strong> (<a class="reference internal" href="#mstar.api_server.openai.realtime_vad.SpeechProbability" title="mstar.api_server.openai.realtime_vad.SpeechProbability"><em>SpeechProbability</em></a>)</p></li>
-<li><p><strong>cfg</strong> (<a class="reference internal" href="#mstar.api_server.openai.realtime_vad.ServerVAD" title="mstar.api_server.openai.realtime_vad.ServerVAD"><em>ServerVAD</em></a>)</p></li>
+<li><p><strong>cfg</strong> (<a class="reference internal" href="#mstar.api_server.openai.realtime_vad.ServerVAD" title="mstar.api_server.openai.realtime_vad.ServerVAD"><em>ServerVAD</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.openai.realtime_vad.SemanticVAD" title="mstar.api_server.openai.realtime_vad.SemanticVAD"><em>SemanticVAD</em></a>)</p></li>
 <li><p><strong>max_turn_samples</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>pos</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>end_of_turn</strong> (<em>Callable</em><em>[</em><em>[</em><em>np.ndarray</em><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -942,6 +1040,18 @@ position, its partial frame, not scored yet, and its prefix padding.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.report_availability">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">report_availability</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#report_availability"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.report_availability" title="Link to this definition">#</a></dt>
+<dd><p>Load the turn detection models once at startup, so a missing one is a
+startup warning rather than a surprise in the first session.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.samples_to_ms">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">samples_to_ms</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">n</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#samples_to_ms"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.samples_to_ms" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -970,6 +1080,42 @@ None (with one warning) when the weights or onnxruntime are missing.</p>
 <dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.silero_weights">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">silero_weights</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#silero_weights"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.silero_weights" title="Link to this definition">#</a></dt>
 <dd><p>The Silero ONNX file this server uses, or None.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.smart_turn">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">smart_turn</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#smart_turn"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.smart_turn" title="Link to this definition">#</a></dt>
+<dd><p>The shared end-of-turn model, or None (with one warning, and the
+reason in <code class="docutils literal notranslate"><span class="pre">smart_turn_problem</span></code>): semantic_vad is then refused.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a>[[<em>ndarray</em>], <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)">float</a>] | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.smart_turn_problem">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">smart_turn_problem</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#smart_turn_problem"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.smart_turn_problem" title="Link to this definition">#</a></dt>
+<dd><p>Why <code class="docutils literal notranslate"><span class="pre">smart_turn()</span></code> gave None, in words safe to send a client (no paths).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.realtime_vad.smart_turn_weights">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.realtime_vad.</span></span><span class="sig-name descname"><span class="pre">smart_turn_weights</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/realtime_vad.html#smart_turn_weights"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.realtime_vad.smart_turn_weights" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SMART_TURN_PATH</span></code>, else the file in the local Hugging Face
+cache (<code class="docutils literal notranslate"><span class="pre">hf</span> <span class="pre">download</span> <span class="pre">pipecat-ai/smart-turn-v3</span> <span class="pre">smart-turn-v3.2-cpu.onnx</span></code>);
+never downloaded here.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a> | None</p>
@@ -1026,6 +1172,13 @@ None (with one warning) when the weights or onnxruntime are missing.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD"><code class="docutils literal notranslate"><span class="pre">SemanticVAD</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.create_response"><code class="docutils literal notranslate"><span class="pre">SemanticVAD.create_response</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.eagerness"><code class="docutils literal notranslate"><span class="pre">SemanticVAD.eagerness</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.interrupt_response"><code class="docutils literal notranslate"><span class="pre">SemanticVAD.interrupt_response</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SemanticVAD.view"><code class="docutils literal notranslate"><span class="pre">SemanticVAD.view()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.ServerVAD"><code class="docutils literal notranslate"><span class="pre">ServerVAD</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.ServerVAD.create_response"><code class="docutils literal notranslate"><span class="pre">ServerVAD.create_response</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.ServerVAD.interrupt_response"><code class="docutils literal notranslate"><span class="pre">ServerVAD.interrupt_response</span></code></a></li>
@@ -1040,6 +1193,7 @@ None (with one warning) when the weights or onnxruntime are missing.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SileroVAD.reset"><code class="docutils literal notranslate"><span class="pre">SileroVAD.reset()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SmartTurn"><code class="docutils literal notranslate"><span class="pre">SmartTurn</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SpeechProbability"><code class="docutils literal notranslate"><span class="pre">SpeechProbability</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.SpeechProbability.reset"><code class="docutils literal notranslate"><span class="pre">SpeechProbability.reset()</span></code></a></li>
 </ul>
@@ -1053,9 +1207,13 @@ None (with one warning) when the weights or onnxruntime are missing.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.TurnSegmenter.unscored"><code class="docutils literal notranslate"><span class="pre">TurnSegmenter.unscored()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.report_availability"><code class="docutils literal notranslate"><span class="pre">report_availability()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.samples_to_ms"><code class="docutils literal notranslate"><span class="pre">samples_to_ms()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.silero_factory"><code class="docutils literal notranslate"><span class="pre">silero_factory()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.silero_weights"><code class="docutils literal notranslate"><span class="pre">silero_weights()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.smart_turn"><code class="docutils literal notranslate"><span class="pre">smart_turn()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.smart_turn_problem"><code class="docutils literal notranslate"><span class="pre">smart_turn_problem()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.realtime_vad.smart_turn_weights"><code class="docutils literal notranslate"><span class="pre">smart_turn_weights()</span></code></a></li>
 </ul>
   </nav></div>
 

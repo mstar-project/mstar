@@ -937,7 +937,7 @@ that key, which the client sends as <code class="docutils literal notranslate"><
 <code class="docutils literal notranslate"><span class="pre">mstar.transcription.partial</span></code> (whole current hypothesis) out; <code class="docutils literal notranslate"><span class="pre">commit</span></code>
 finishes the utterance. Input is <code class="docutils literal notranslate"><span class="pre">pcm16</span></code> at 16 kHz (the default) or
 <code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;audio/pcm&quot;,</span> <span class="pre">&quot;rate&quot;:</span> <span class="pre">24000}</span></code>, resampled to 16 kHz. Turn
-detection is null (client commits) or <code class="docutils literal notranslate"><span class="pre">server_vad</span></code>; see below.</p></td>
+detection is null (client commits), <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> or <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code>; see below.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code></p></td>
@@ -1050,6 +1050,23 @@ bundled 2 MB ONNX weights, run by onnxruntime on one CPU thread) or point
 exports take other inputs, and with one of them <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> is refused); weights are
 never downloaded. The Dynamo bridge has no turn detection yet and
 refuses it.</p></li>
+<li><p><strong>Semantic turn detection</strong> — <code class="docutils literal notranslate"><span class="pre">&quot;turn_detection&quot;:</span> <span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;semantic_vad&quot;,</span> <span class="pre">&quot;eagerness&quot;:</span>
+<span class="pre">&quot;auto&quot;}</span></code> ends a turn when the speaker sounds finished rather than after a fixed
+silence, as OpenAI’s semantic VAD does. When a pause reaches the eagerness’ pause
+(high 200 ms, medium and auto 300 ms, low 400 ms; all shorter than server_vad’s
+500 ms), Pipecat’s Smart Turn v3 judges the turn’s last 8 s of audio once; a
+probability of at least 0.3, 0.5 or 0.7 (high, medium/auto, low) commits there, and
+otherwise the server keeps listening. A silence of 2, 4 or 8 s always ends the turn.
+Speech starts on Silero’s 0.5 with 300 ms of prefix padding; the events are the same
+as server_vad’s. Smart Turn (BSD-2, 8 MB int8 ONNX, about 45 ms per pause on one CPU
+thread) runs off the event loop. It needs <code class="docutils literal notranslate"><span class="pre">onnxruntime</span></code> and <code class="docutils literal notranslate"><span class="pre">transformers</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar[vad]</span></code>) and its weights at <code class="docutils literal notranslate"><span class="pre">MSTAR_SMART_TURN_PATH</span></code> or in the local Hugging
+Face cache (<code class="docutils literal notranslate"><span class="pre">hf</span> <span class="pre">download</span> <span class="pre">pipecat-ai/smart-turn-v3</span> <span class="pre">smart-turn-v3.2-cpu.onnx</span></code>). Without
+them, or with an ONNX file whose inputs or outputs differ, the server warns at startup
+and refuses <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> with an <code class="docutils literal notranslate"><span class="pre">error</span></code> event that says why (no weights, a
+missing package, or a file that is not the model), as <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> is refused
+without Silero. The session goes on with its previous settings, so the client can
+choose <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> or manual commits instead. See OpenAI’s <a class="reference external" href="https://platform.openai.com/docs/guides/realtime-vad">realtime VAD guide</a>.</p></li>
 <li><p><strong>Kokoro</strong> — <code class="docutils literal notranslate"><span class="pre">voice</span></code> is one of the 54 bundled voices (default <code class="docutils literal notranslate"><span class="pre">af_heart</span></code>) or a
 blend such as <code class="docutils literal notranslate"><span class="pre">af_bella+af_sky</span></code> or <code class="docutils literal notranslate"><span class="pre">af_bella(2)+af_sky(1)</span></code>; <code class="docutils literal notranslate"><span class="pre">speed</span></code> scales the
 speaking rate (0.25-4.0). <code class="docutils literal notranslate"><span class="pre">lang_code</span></code> and <code class="docutils literal notranslate"><span class="pre">phonemes</span></code> go through <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.
