@@ -27,6 +27,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+import test_kv_host_index as host
 from test_kv_preemption import _step
 from test_kv_prefix_lease import NODE, PAGE_SIZE, _StubTransfer
 
@@ -1323,6 +1324,73 @@ def test_a_drop_whose_victim_is_in_a_step_here_waits_and_nothing_behind_it_jumps
     follower.rollback_admit(step, ctx)
     assert follow.apply_resident_delta(NODE, delta, _kept)
     assert _counts(leader) == _counts(follower)
+
+
+@pytest.mark.parametrize("in_step", [False, True], ids=["at once", "once its step there lands"])
+def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0_did(monkeypatch, in_step):
+    """Rank 0 journals a victim's move to the host when it chooses the victim, and again when the victim moves. The
+    follower gives up the victim's allotment and queues the victim as rank 0 does. Rank 0 returns the victim from
+    the head of the queue, and the return reserves the same pages on both ranks."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    leader._cpu_pool, follower._cpu_pool = host._HostPool(64), host._HostPool(64)
+    _ingest((leader, follower), "r", 3, arrival=1)
+    _ingest((leader, follower), "v", 5, arrival=2)
+    assert leader.admit_retrieve("r", NODE, "prefill", None).ready
+    assert leader.admit_retrieve("v", NODE, "prefill", None).ready
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
+        assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok
+    assert leader.preempt("r", 1, droppable=lambda rid: False) == ["v"] and leader.moves_to_host("v")
+    lead.offload_request(NODE, "v")
+    delta = lead.take_resident_delta(NODE)
+    assert delta.kinds == [MoveKind.EARMARK, MoveKind.OFFLOAD, MoveKind.OFFLOAD], "a choice or a move went unjournaled"
+    if in_step:
+        follower._streams["v"]["main"].step_in_flight = True
+        assert not follow.apply_resident_delta(NODE, delta, _kept), "the follower moved a victim its step holds"
+        assert "v" in follower._allotments, "a refused move gave up the victim's allotment"
+        follower._streams["v"]["main"].step_in_flight = False
+
+    assert follow.apply_resident_delta(NODE, delta, _kept)
+    assert follower.is_offloaded("v") and _counts(leader) == _counts(follower), "the follower's move left other counts"
+    assert list(follower._waiting) == list(leader._waiting) == ["v"], "the follower queued the victim elsewhere"
+    for kv, engine in ((leader, lead), (follower, follow)):
+        assert _step(kv, "r", 1).ok
+        engine.remove_request("r")
+    assert follower.head_on_host() is None, "a follower would reload v ahead of rank 0's journal"
+    w = Worker.__new__(Worker)
+    w._kv_caches = {"kv": engine_mod.PagedKVCache("kv", frozenset({NODE}), leader)}
+    w.engine_manager, w._is_tearing_down = SimpleNamespace(get_engine=lambda node: lead), lambda rid: False
+    Worker._reload_from_host(w)
+    assert leader.is_resident("v")
+    assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
+    assert follower.is_resident("v"), "the follower didn't replay rank 0's return"
+    assert _counts(leader) == _counts(follower), "the follower holds another allotment for the return"
+
+
+def test_above_one_rank_a_host_victim_moves_when_a_fetch_retains_cached_host_pages_before_the_broadcast(
+    monkeypatch,
+):
+    """Rank 0 moves its victims as their node's next step goes out, after the readiness checks, and a host fetch
+    there can retain cached pages that only the host index held. If those pages counted as room, a victim sent to
+    the host would not fit, stay on the device, and keep the request it was chosen for waiting."""
+    leader, lead = _pool_rank(monkeypatch, 0)
+    cpu = leader._cpu_pool = host._HostPool(8)
+    cached, keys = cpu.arena.acquire(4), [bytes([i]) * 32 for i in range(4)]
+    cpu.index.insert_run(keys, cached, None)
+    cpu.arena.release(cached)
+    _ingest((leader,), "r", 2, arrival=1)
+    _ingest((leader,), "v", 6, arrival=2)
+    assert leader.admit_retrieve("r", NODE, "prefill", None).ready
+    assert leader.admit_retrieve("v", NODE, "prefill", None).ready
+    for rid, tokens in (("r", 2 * PAGE_SIZE), ("v", 6 * PAGE_SIZE), ("r", 2 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok
+    assert not _step(leader, "r", 1).ok
+    victims = leader.preempt("r", 1, droppable=lambda rid: False)
+    hosted = [rid for rid in victims if leader.moves_to_host(rid)]
+    cpu.retain_run(keys)
+    for rid in hosted:
+        lead.offload_request(NODE, rid)
+    assert hosted and all(leader.is_offloaded(rid) for rid in hosted), f"{hosted} chosen for the host stayed"
 
 
 def test_an_allotment_undone_in_the_sweep_that_made_it_never_reaches_the_followers(monkeypatch):
