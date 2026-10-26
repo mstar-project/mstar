@@ -21,15 +21,10 @@ from safetensors.torch import save_file
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.lora import LoraReqConfig, LoraSpec, LoraStep
+from mstar.engine.resources.lora import LoraReqConfig, LoraSpec
 from mstar.engine.resources.lora.pool import LoraAdapterPool
-from mstar.engine.resources.step import Segment, StepContext
-from mstar.model.qwen3_5.config import (  # noqa: F401 - LORA re-exported
-    FULL_ATTENTION,
-    LINEAR_ATTENTION,
-    LORA,
-    Qwen3_5Config,
-)
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext
+from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 from mstar.model.submodule_base import ARNodeInputs, declared_step
 
 DTYPE = torch.float64
@@ -143,26 +138,38 @@ def compute(*pools):
             p.exit_compute()
 
 
+def _config(adapter: str | None) -> LoraReqConfig | None:
+    """As the conductor opens a request: a base-model one carries no config."""
+    return None if adapter is None else LoraReqConfig(adapter=adapter)
+
+
+def _idle(rows) -> bool:
+    """The step's ``StepContext.idle``, as the engine sets it: no row names an adapter."""
+    return all(adapter is None for _, adapter, _ in rows)
+
+
 def plan(pools, rows: list[tuple[str, str | None, int]]) -> None:
     """Ingest ``rows`` ((rid, adapter, span)) into each pool, then admit and plan one step
     over them, as the engine drives a step whose segments are one per request."""
     for p in pools:
         for rid, adapter, _ in rows:
-            p.ingest_request(rid, LoraReqConfig(adapter=adapter))
-        step = LoraStep(segments=tuple(Segment(rid, "main", n) for rid, _, n in rows))
-        ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk="prefill", slot=0, capture=False)
+            p.ingest_request(rid, _config(adapter))
+        step = ResourceStep(segments=tuple(Segment(rid, "main", n) for rid, _, n in rows))
+        ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk="prefill", slot=0, capture=False,
+                          idle=_idle(rows))
         assert p.admit(step, ctx).ok
         p.plan(step, ctx)
 
 
 def admit_declared(lora_pool, step, rows, walk: str = "prefill") -> None:
-    """Admit and plan a node's own declared ``step`` (its LoraStep under the pool's key)
+    """Admit and plan a node's own declared ``step`` (its step under the pool's key)
     for ``rows`` ((rid, adapter, span))."""
     for rid, adapter, _ in rows:
-        lora_pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
-    ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk=walk, slot=0, capture=False)
+        lora_pool.ingest_request(rid, _config(adapter))
+    ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk=walk, slot=0, capture=False,
+                      idle=_idle(rows))
     lora_step = step.get(lora_pool.spec.resource_key)
-    assert lora_step is not None, "the node's declare_step carries no LoraStep"
+    assert lora_step is not None, "the node's declare_step carries no step for the pool"
     assert lora_pool.admit(lora_step, ctx).ok
     lora_pool.plan(lora_step, ctx)
 
@@ -422,6 +429,11 @@ def write_peft_adapter(directory, rank, projs, alpha=None, text_only=False, seed
     return str(path), ref
 
 
+def _declared(model) -> LoraSpec:
+    """The model's LoRA spec, as it declares it beside its other resources."""
+    return next(s for s in model.get_node_resources() if isinstance(s, LoraSpec))
+
+
 def lora_spec(paths, **kw) -> LoraSpec:
     from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
 
@@ -584,7 +596,7 @@ def _orpheus():
         return OrpheusLLMSubmodule(lm.requires_grad_(False).eval(), c)
 
     return Stack(
-        config=tiny, lora_spec=lambda c: model_object(OrpheusModel, c).get_lora_specs()[0], build=build,
+        config=tiny, lora_spec=lambda c: _declared(model_object(OrpheusModel, c)), build=build,
         weights=lambda c: llama_weights(c, "model.", "lm_head"),
         a1=lambda c: {**llama_layers(c, "model."), "lm_head": (c.vocab_size, c.hidden_size),
                       "model.embed_tokens": (c.hidden_size, c.vocab_size)},
@@ -613,7 +625,7 @@ def _higgs():
             hidden_size=16, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
             head_dim=4, intermediate_size=32, vocab_size=64,
         ),
-        lora_spec=lambda c: model_object(HiggsAudioModel, c).get_lora_specs()[0],
+        lora_spec=lambda c: _declared(model_object(HiggsAudioModel, c)),
         build=lambda c, group, w: HiggsAudioLLMSubmodule(_loaded(
             HiggsAudioLLM(c, comm_group=group).to(DTYPE), w, stacked_params=LLAMA_STACKED_PARAMS,
             name_remapper=higgs_llm_remap), c),
@@ -668,7 +680,7 @@ def _omni(dense: bool):
             num_experts_per_tok=2, moe_intermediate_size=8,
             mlp_only_layers=[i for i in range(2) if i not in moe_layers],
         )),
-        lora_spec=lambda c: model_object(Qwen3OmniModel, c).get_lora_specs()[0],
+        lora_spec=lambda c: _declared(model_object(Qwen3OmniModel, c)),
         build=lambda c, group, w: ThinkerSubmodule(_loaded(
             Qwen3OmniThinkerModel(c, comm_group=group).to(DTYPE), w,
             stacked_params=model_object(Qwen3OmniModel, c)._get_thinker_stacked_params(),
@@ -715,7 +727,7 @@ def _qwen3_tts():
             num_hidden_layers=2, text_hidden_size=8, text_vocab_size=32, **dims,
             code_predictor=Qwen3TTSCodePredictorConfig(num_hidden_layers=1, **dims),
         )),
-        lora_spec=lambda c: model_object(Qwen3TTSModel, c).get_lora_specs()[0],
+        lora_spec=lambda c: _declared(model_object(Qwen3TTSModel, c)),
         # the code predictor sits beside the Talker, with relative paths of the same shape
         build=lambda c, group, w: TalkerSubmodule(
             _loaded(Qwen3TTSTalkerModel(c, comm_group=group).to(DTYPE), w, stacked_params=LLAMA_STACKED_PARAMS),
@@ -787,7 +799,7 @@ def _chatterbox_t3():
         return [tuple(torch.cat(p) for p in zip(per[i], per[i + k], strict=True)) for i in range(k)]
 
     return Stack(
-        config=_t3_config, lora_spec=lambda c: model_object(ChatterboxModel, c).get_lora_specs()[0],
+        config=_t3_config, lora_spec=lambda c: _declared(model_object(ChatterboxModel, c)),
         build=build, weights=weights,
         a1=lambda c: {**llama_layers(c.t3.backbone, "tfmr."), "speech_head": (40, 16)},
         a2=lambda c: _subset(llama_layers(c.t3.backbone, "tfmr."), "v_proj", "down_proj"),

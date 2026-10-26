@@ -377,9 +377,10 @@ Adapters may touch every module PEFT adapters for Qwen3.5 on the Hub touch:
   2B, 4B) each delta stays on its own side, as PEFT applies them;
 * the vision tower, as unsloth's vision fine-tunes adapt it: each block's
   ``attn.qkv``, ``attn.proj``, ``mlp.linear_fc1`` and ``mlp.linear_fc2``, the merger's
-  ``linear_fc1`` / ``linear_fc2``, and the conv ``patch_embed.proj``. The vision
-  encoder node has its own pool (``vision_lora``), sized by the same ``lora:`` block,
-  and runs the request's adapter too.
+  ``linear_fc1`` / ``linear_fc2``, and the conv ``patch_embed.proj``. One spec covers
+  both nodes, sized by the one ``lora:`` block; the vision encoder node has a pool of
+  its own (``lora@vision_encoder``, beside the LLM's ``lora@LLM``) and runs the
+  request's adapter too.
 
 Module names may be in any layout PEFT writes for the model: the released checkpoint's
 (``model.language_model.layers.*``, ``model.visual.*``), the text-only causal LM's
@@ -447,8 +448,7 @@ unless the ``lora`` block opts in, and answer 404 otherwise (as vLLM's do withou
         -d '{"lora_name": "sql"}'
 
 ``lora_path`` is a PEFT directory (its ``adapter_model.safetensors`` is read) or a
-safetensors file, readable at the same path by the API server, the conductor (which
-reads the adapter's header to check requests on it) and every worker. A load is checked
+safetensors file, readable at the same path by the API server and every worker. A load is checked
 first (LoRA layers present, rank within ``max_rank``, only the targets above, shapes
 that fit them), then read by every worker that hosts a node with a LoRA pool (the LLM's
 or the vision encoder's); the name is selectable, and listed by ``/v1/models``, once all

@@ -702,6 +702,16 @@ def test_a_graphs_executable_memory_counts_against_the_floor():
     assert (plan.predicted["Thinker"], plan.outside["Thinker"]) == (100 * _MIB, 50 * _MIB)
 
 
+def test_an_idle_bucket_is_planned_only_beside_its_plain_twin():
+    """An idle bucket serves only steps that leave a resource idle, and is kept only beside
+    its plain twin. Cheaper, it took the room the plain one needed, and was then dropped."""
+    plain = _bucket("decode", 1, 1)
+    pools = {"LLM": {plain: _cost(200, kept=100), BucketKey("decode", 1, 1, idle=True): _cost(60)}}
+
+    assert plan_captures(pools, free=150 * _MIB).buckets == {"LLM": set()}
+    assert plan_captures(pools, free=300 * _MIB).buckets == {"LLM": set(pools["LLM"])}
+
+
 def test_a_bucket_goes_in_with_all_its_slots_or_not_at_all():
     """Two slots of a 200 MiB graph that keeps 100 MiB of outputs take 300 MiB:
     the second slot reuses the first's scratch but not its outputs."""

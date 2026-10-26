@@ -2,8 +2,8 @@
 
 The same tokens fill different KV pages under two adapters, so a request on an adapter
 chains its page keys from a root that names the adapter's weights (a digest read once,
-when the adapter is registered); a base-model request chains from the empty root exactly
-as before LoRA.
+when the adapter is registered, and taken when the API server selects the adapter); a
+base-model request chains from the empty root exactly as before LoRA.
 """
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ import torch
 pytest.importorskip("safetensors")
 from safetensors.torch import save_file  # noqa: E402
 
-from mstar.api_server.data_worker import PreprocessWorkerThread, adapter_prefix_roots  # noqa: E402
+from mstar.api_server.data_worker import PreprocessWorkerThread  # noqa: E402
 from mstar.api_server.request_types import PreprocessInput  # noqa: E402
+from mstar.api_server.served_models import ServedModels  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan  # noqa: E402
 from mstar.engine.resources.kv.keys import chain, page_key  # noqa: E402
 from mstar.engine.resources.kv.manager import PrefixChain  # noqa: E402
@@ -31,14 +32,17 @@ from mstar.engine.resources.lora import (  # noqa: E402
     LoraSpec,
     LoraTarget,
 )
-from mstar.engine.resources.lora import identity as identity_mod  # noqa: E402
-from mstar.engine.resources.lora.identity import (  # noqa: E402
-    AdapterPrefixRoots,
-    adapter_prefix_root,
-    read_adapter_digest,
-)
+from mstar.engine.resources.lora.identity import adapter_prefix_root  # noqa: E402
+from mstar.engine.resources.lora.serving import lora_spec, resolve_lora_adapters  # noqa: E402
 from mstar.engine.resources.lora.store import LoraAdapterStore  # noqa: E402
-from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, ProcessPromptOutput, Span  # noqa: E402
+from mstar.model.base import (  # noqa: E402
+    KVLabel,
+    LabelLayout,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    serving_resources,
+)
 
 PAGE_SIZE = 16
 NODE, WALK = "LLM", "prefill"
@@ -67,10 +71,7 @@ class _Model:
     def get_node_resources(self):
         return [KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=64, page_size=128,
-        ))]
-
-    def get_lora_specs(self):
-        return [_lora_spec()]
+        )), _lora_spec()]
 
     def process_prompt(self, *args, **kwargs):
         layout = LabelLayout(spans=(Span("ids", WALK, len(PROMPT), len(PROMPT), TENSOR),))
@@ -102,34 +103,44 @@ def _deployment(adapters: dict[str, str] | None) -> dict:
     return {"model": "stub", "resources": resources}
 
 
-def _worker(model, config: dict, roots: AdapterPrefixRoots | None = None) -> PreprocessWorkerThread:
-    """The preprocess thread, with the roots its facade registers at startup unless given."""
-    if roots is None:
-        roots = adapter_prefix_roots(model, config)
+def _worker(model, config: dict) -> PreprocessWorkerThread:
     sent = []
     return PreprocessWorkerThread(
         in_queue=queue.Queue(), result_tensor_queue=queue.Queue(),
         out_queue=queue.Queue(), profile_queue=queue.Queue(),
         cleanup_request_queue=queue.Queue(), abort_request_queue=queue.Queue(),
         reads_done_queue=queue.Queue(), discard_tensor_queue=queue.Queue(),
-        stop_event=threading.Event(), model=model, model_config=config, adapter_roots=roots,
+        stop_event=threading.Event(), model=model, model_config=config,
         communicator=SimpleNamespace(sent=sent, get_all_new_messages=lambda: [], send=lambda _, m: sent.append(m)),
         tensor_manager=SimpleNamespace(store_and_return_tensor_info=lambda *a, **k: {},
                                        register_for_send=lambda *a, **k: None, set_persist=lambda *a, **k: None),
     )
 
 
+def _served(config: dict) -> ServedModels:
+    """The API server's selection, from the adapters its startup check digested."""
+    digests = resolve_lora_adapters(lora_spec(serving_resources(_Model(), config)), config)
+    return ServedModels(base=("stub",), roots={n: adapter_prefix_root(d) for n, d in digests.items()})
+
+
 _rids = iter(range(10**6))
 
 
-def _run(worker: PreprocessWorkerThread, adapter: str | None = None, **extra) -> dict:
-    """Preprocess one request and return the kwargs the conductor was sent."""
+def _run(
+    worker: PreprocessWorkerThread, adapter: str | None = None, served: ServedModels | None = None, **extra,
+) -> dict:
+    """Preprocess one request, its adapter selected as the API server selects it, and
+    return the kwargs the conductor was sent."""
     kwargs = dict(extra)
     if adapter is not None:
         kwargs[LORA_ADAPTER_KWARG] = adapter
+    root = b""
+    if served is not None:
+        kwargs, root = served.select(None, kwargs)
     worker._process_input(PreprocessInput(
         request_id=f"req{next(_rids)}", text="hello", file_paths=None,
         input_modalities=["text"], output_modalities=["text"], model_kwargs=kwargs,
+        prefix_root=root,
     ))
     return worker.communicator.sent[-1].body.model_kwargs
 
@@ -182,11 +193,16 @@ def test_base_keys_are_byte_identical_to_mains(adapters):
 
 
 def test_each_adapters_requests_are_keyed_under_its_weights(adapters):
-    worker = _worker(_Model(), _deployment(adapters))
+    config = _deployment(adapters)
+    worker, served = _worker(_Model(), config), _served(config)
     planted = b"\x00" * 32  # a client cannot choose its root
-    on_a, base = _run(worker, "a", prefix_root=planted), _run(worker, prefix_root=planted)
-    on_b, on_alias = _run(worker, "b"), _run(worker, "alias")
-    root = adapter_prefix_root(read_adapter_digest(_lora_spec(), adapters["a"]))
+    on_a = _run(worker, "a", served, prefix_root=planted)
+    base = _run(worker, None, served, prefix_root=planted)
+    on_b, on_alias = _run(worker, "b", served), _run(worker, "alias", served)
+    # the root names the weights a worker's pool serves under the pinned digest
+    spec = lora_spec(serving_resources(_Model(), config))
+    pinned = LoraAdapterStore(spec, pin=False).load("a", adapters["a"], spec.adapter_digests["a"])
+    root = adapter_prefix_root(pinned.digest)
     assert on_a["prefix_root"] == root and len(root) == 32
     assert "prefix_root" not in base and _handed_over(base).prefix_root == b""
     assert _keys(on_a) == chain(_pages(PROMPT), root=root)
@@ -197,9 +213,8 @@ def test_each_adapters_requests_are_keyed_under_its_weights(adapters):
     assert _keys(on_alias) == _keys(on_a)
 
 
-def test_control_without_a_root_adapters_share_the_base_models_keys(adapters, monkeypatch):
+def test_control_without_a_root_adapters_share_the_base_models_keys(adapters):
     """Mechanism off: every adapter on the empty root keys exactly as the base model."""
-    monkeypatch.setattr(AdapterPrefixRoots, "root", lambda self, name: b"")
     worker = _worker(_Model(), _deployment(adapters))
     assert _keys(_run(worker, "a")) == _keys(_run(worker, "b")) == _keys(_run(worker))
 
@@ -218,27 +233,3 @@ def test_a_generated_first_page_hangs_from_the_requests_root(root):
         assert chain_.keys[0] == _main_chain([tail + generated])[0]
     else:
         assert chain_.keys[0] != page_key(b"", tail + generated)
-
-
-def test_an_unknown_or_unloaded_adapter_is_not_keyed(adapters):
-    roots = adapter_prefix_roots(_Model(), _deployment(adapters))
-    worker = _worker(_Model(), _deployment(adapters), roots=roots)
-    roots.unregister("a")
-    for name in ("nope", "a"):
-        sent = _run(worker, name)
-        assert sent.get("prefix_cache") is False and "prefix_keys" not in sent, name
-
-
-def test_each_adapter_is_digested_once_and_as_the_pool_digests_it(adapters, monkeypatch):
-    reads: list[str] = []
-    real = identity_mod.read_adapter_digest
-    monkeypatch.setattr(identity_mod, "read_adapter_digest",
-                        lambda spec, path: (reads.append(path), real(spec, path))[1])
-    worker = _worker(_Model(), _deployment(adapters))
-    for name in ("a", "b", None, "a", "b", None):
-        _run(worker, name)
-    assert sorted(reads) == sorted(adapters.values()), "a request read an adapter"
-    spec = _lora_spec()
-    spec.adapters = dict(adapters)
-    held = LoraAdapterStore(spec, pin=False).load("a", adapters["a"])
-    assert held.digest == real(spec, adapters["a"])

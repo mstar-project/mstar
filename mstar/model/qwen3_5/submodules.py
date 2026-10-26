@@ -31,12 +31,11 @@ from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.lora import LoraStep
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources.step import ResourceStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.components.lora.capable import apply_lora
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
@@ -86,8 +85,6 @@ logger = logging.getLogger(__name__)
 class LLMSubmodule(ARNodeSubmodule):
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
-    # every row's tokens, image tokens included, go through the adapted linears
-    lora_segment_rows = True
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
@@ -781,10 +778,6 @@ class VisionEncoderSubmodule(NodeSubmodule):
     # LLM's 4096 `prefill_vision` bucket; a larger prompt runs eagerly.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
 
-    # the frames' segments, in order, are the rows the tower's linears see (the
-    # merger's folded); the captured block loop declares its own (see there)
-    lora_segment_rows = True
-
     def __init__(
         self, model: Qwen3_5VisionModel, config: Qwen3_5VisionConfig,
     ):
@@ -840,9 +833,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
         # (this admit is the one that can wait for a slot, and the patch embed and
         # merger run outside the loop).
         leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
-        if leased and not self.lora_keys:
+        if leased and not self.segment_keys:
             return None
-        # one segment per frame: a frame attends to itself alone
+        # one segment per frame: a frame attends to itself alone, and the frames, in
+        # order, are the rows the tower's linears see (the merger's folded)
         segments = [
             Segment(request_id=rid, label="main", span=span)
             for rid, inp in zip(request_ids, inputs, strict=True)
@@ -890,8 +884,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
             # They address the slot the outer step took; the pool restores the outer
             # plan when the region commits, for the merger after it.
             prompt = (Segment(request_id=rid, label="main", span=sum(seq_lens)),)
-            for key in self.lora_keys:
-                steps[key] = LoraStep(segments=prompt)
+            for key in self.segment_keys:
+                steps[key] = ResourceStep(segments=prompt)
             return SubmoduleStep(
                 segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
                 steps=steps,

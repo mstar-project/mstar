@@ -34,9 +34,6 @@ from mstar.model.multimodal import TEXT, PromptPart
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
-if TYPE_CHECKING:
-    from mstar.engine.resources.lora.config import LoraSpec
-
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
 
@@ -416,22 +413,27 @@ class ForwardPassArgs:
 
 def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
-    overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
-    (``mstar.engine.resources.lora.serving``)."""
-    from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
-
-    specs = list(model.get_node_resources() or [])
-    lora = declared_lora_specs(model, model_config)
-    size_lora_specs(lora, model_config)
-    return specs + lora
+    overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
+    its ``resources:`` block does not name."""
+    named = (model_config.get("resources") or {}).keys()
+    return [
+        spec for spec in model.get_node_resources() or []
+        if not spec.opt_in or spec.resource_key in named
+    ]
 
 
 def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
-    """The specs a deployment builds of its ``enabled_resources``, the YAML's overrides
-    applied: all but a LoRA spec the YAML's ``targets`` left with none."""
-    from mstar.engine.resources.lora.serving import drop_lora_specs_without_targets
-
-    return drop_lora_specs_without_targets(specs)
+    """The specs the deployment's engines build of its ``enabled_resources``, the YAML's
+    overrides applied: each as declared, except a split one (``NodeResourceSpec.for_node``),
+    which gives one per node."""
+    built: list[NodeResourceSpec] = []
+    for spec in specs:
+        if type(spec).for_node is NodeResourceSpec.for_node:
+            built.append(spec)
+            continue
+        instances = (spec.for_node(node) for node in sorted(spec.nodes))
+        built.extend(instance for instance in instances if instance is not None)
+    return built
 
 
 def parse_autocast_dtype(value) -> torch.dtype | None:
@@ -447,7 +449,7 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
 
 def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
     """The resource specs a deployment builds: ``enabled_resources``, the YAML's
-    ``resources:`` overrides applied, as ``built_resources``.
+    ``resources:`` overrides applied; each engine splits a split spec for its nodes.
 
     Every process that reads specs resolves them here, so the conductor validates
     requests against what the workers built. ``validate_deployment`` takes the same
@@ -457,7 +459,7 @@ def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
 
     specs = enabled_resources(model, model_config)
     apply_yaml_overrides(specs, model_config)
-    return built_resources(specs)
+    return specs
 
 
 class Model(ABC):
@@ -607,23 +609,11 @@ class Model(ABC):
 
         The whole declaration: a KV cache's shape, the attention backend over
         it, positions, samplers. The engine builds one resource per spec and
-        hands each node the subset naming it.
+        hands each node the subset naming it. An opt-in spec (per-request LoRA
+        adapters) is declared here too, and built only for a deployment whose
+        ``resources:`` block names it.
         """
         pass
-
-    def get_lora_specs(self) -> list["LoraSpec"]:
-        """The per-request LoRA adapters this model can serve: a spec per node they
-        reach (none for a model that serves none), the first keyed
-        ``LORA_RESOURCE_KEY`` and the others apart (an LLM's and its vision encoder's),
-        and the conductor opens a request with the same adapter on each.
-
-        Built only when the deployment's YAML has a ``resources: lora:`` block (see
-        ``serving_resources``): a deployment without one builds exactly what it did
-        before. Usually by ``module_lora_spec`` from each node's weights root, whose
-        LoRA-capable modules the node then binds itself (``lora_segment_rows``). The conductor
-        opens each request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
-        """
-        return []
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.

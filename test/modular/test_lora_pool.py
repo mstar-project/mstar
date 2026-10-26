@@ -14,11 +14,18 @@ pytest.importorskip("safetensors")
 from safetensors.torch import save_file  # noqa: E402
 
 from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
-from mstar.engine.resources.lora import LoraModuleRef, LoraReqConfig, LoraSpec, LoraStep, LoraTarget  # noqa: E402
+from mstar.engine.resources.lora import LoraModuleRef, LoraReqConfig, LoraSpec, LoraTarget  # noqa: E402
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.lora.store import LoraAdapterStore  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
-from mstar.engine.resources.step import AllocationFailed, BucketKey, Segment, SlotLease, StepContext  # noqa: E402
+from mstar.engine.resources.step import (  # noqa: E402
+    AllocationFailed,
+    BucketKey,
+    ResourceStep,
+    Segment,
+    SlotLease,
+    StepContext,
+)
 from mstar.model.components.lora.modules import ModuleLoraMap  # noqa: E402
 from mstar.model.loader.base import CheckpointRules, StackedParamRule  # noqa: E402
 
@@ -88,16 +95,16 @@ def make_pool(paths, **kw) -> LoraAdapterPool:
     return LoraAdapterPool(make_spec(paths, **kw), "cpu")
 
 
-def ctx(rids, capture=False, lease=None, padded=None) -> StepContext:
-    c = StepContext(request_ids=list(rids), graph_walk="decode", slot=0, capture=capture, slot_lease=lease)
+def ctx(rids, capture=False, lease=None, padded=None, idle=False) -> StepContext:
+    c = StepContext(request_ids=list(rids), graph_walk="decode", slot=0, capture=capture, slot_lease=lease, idle=idle)
     if padded is not None:
         c.set_padded_rids(padded)
     return c
 
 
-def step(rids, spans=None) -> LoraStep:
+def step(rids, spans=None) -> ResourceStep:
     spans = spans or [1] * len(rids)
-    return LoraStep(segments=tuple(Segment(r, "main", s) for r, s in zip(rids, spans, strict=True)))
+    return ResourceStep(segments=tuple(Segment(r, "main", s) for r, s in zip(rids, spans, strict=True)))
 
 
 def run_step(pool, rids, spans=None, **ctx_kw):
@@ -110,7 +117,8 @@ def run_step(pool, rids, spans=None, **ctx_kw):
 
 
 def ingest(pool, rid, adapter):
-    pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
+    """As the conductor opens a request: a base-model one carries no config."""
+    pool.ingest_request(rid, None if adapter is None else LoraReqConfig(adapter=adapter))
 
 
 def token_slots_of(addr) -> list[int]:
@@ -184,6 +192,28 @@ def test_an_adapter_with_nothing_for_the_pools_targets_takes_no_slot(adapters, t
     assert run_step(pool, ["r1"]).ok and ready(pool, "e2")
     assert run_step(pool, ["r1", "e2"]).ok and pool.slot_of("e2") == ZERO_SLOT
     assert pool.slot_state(1).refcount == 1 and pool.resident_slot("mlp") is None
+
+
+def test_a_spec_over_two_nodes_builds_a_pool_per_node(adapters):
+    """One spec spans an LLM and a vision tower: each node's pool holds its own targets
+    under a key every rank agrees on, and reads an adapter touching both without refusing
+    the other node's modules. A node the YAML's ``targets`` leaves empty gets no pool."""
+    import dataclasses
+
+    _, paths = adapters
+    spec = make_spec(paths)
+    spec.nodes = {"LLM", "vision"}
+    spec.targets = {"qkv": dataclasses.replace(QKV, node="LLM"), "o": dataclasses.replace(O, node="vision")}
+    llm, vision = spec.for_node("LLM"), spec.for_node("vision")
+    assert (llm.resource_key, llm.nodes, set(llm.targets)) == ("lora@LLM", {"LLM"}, {"qkv"})
+    assert (vision.resource_key, set(vision.targets)) == ("lora@vision", {"o"})
+    for instance, target in ((llm, "qkv"), (vision, "o")):
+        pool = LoraAdapterPool(instance, "cpu")
+        ingest(pool, "r1", "a1")  # a1 adapts q, k, v and o
+        assert run_step(pool, ["r1"]).ok
+        assert pool.layer_ranks(target, 0)[pool.slot_of("r1")] == 2
+    spec.apply_yaml_overrides(targets=["qkv"])
+    assert spec.for_node("vision") is None and spec.for_node("LLM").targets.keys() == {"qkv"}
 
 
 def test_rollback_undoes_only_what_this_admit_took(adapters):
@@ -352,7 +382,7 @@ def test_compiles_without_graph_breaks(adapters):
 
 def test_compiled_steps_of_varying_tokens_do_not_recompile(adapters):
     """As the engine compiles an eager forward (``dynamic=None``): one graph for the
-    first shape, one dynamic graph from the second, one more for the first base-only
+    first shape, one dynamic graph from the second, one more for the first idle
     step (the delta is skipped, guarded on ``pool.active``), and no recompile for the
     later steps, whose token counts, rows and adapters all differ."""
     from torch._dynamo.utils import counters
@@ -374,7 +404,8 @@ def test_compiled_steps_of_varying_tokens_do_not_recompile(adapters):
         rids = [f"s{i}r{j}" for j in range(len(names))]
         for rid, name in zip(rids, names, strict=True):
             ingest(pool, rid, name)
-        s, c = step(rids, spans), ctx(rids)
+        # idle as the engine decides it: no row names an adapter
+        s, c = step(rids, spans), ctx(rids, idle=all(name is None for name in names))
         assert pool.admit(s, c).ok
         pool.plan(s, c)
         tokens = sum(spans)
@@ -452,30 +483,30 @@ def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
     assert build(CommGroup.trivial()).targets
 
 
-def test_served_targets_narrow_to_what_the_adapters_touch(adapters):
-    """With runtime updates off, the conductor keeps only the targets the adapters touch
-    and every worker builds just those."""
+def test_the_api_server_pins_digests_and_narrows_targets_in_the_config_it_hands_on(adapters):
+    """With runtime updates off, the API server writes each configured adapter's digest
+    and the targets the adapters touch into the serving config, which the conductor
+    spawns every worker with, so every worker builds just those targets and serves just
+    those weights."""
     from types import SimpleNamespace
 
-    from mstar.conductor.conductor import Conductor
-    from mstar.engine.resources.lora.serving import served_lora_targets
+    from mstar.engine.resources.lora.serving import lora_spec, resolve_lora_adapters, served_lora_targets
     from mstar.model.base import serving_resources
 
     _, paths = adapters
-    assert served_lora_targets([make_spec({"a3": paths["a3"]}, runtime_updates=True)]) is None
-    model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({})])
+    assert served_lora_targets(make_spec({"a3": paths["a3"]}, runtime_updates=True)) is None
+    model = SimpleNamespace(get_node_resources=lambda: [make_spec({})])
     config = {"resources": {"lora": {"adapters": {"a3": paths["a3"]}, "max_slots": 2}}}
-    conductor = Conductor.__new__(Conductor)
-    conductor.model, conductor.model_config = model, config
-    Conductor._settle_lora_adapters(conductor, {"a3": "00" * 32})
+    digests = resolve_lora_adapters(lora_spec(serving_resources(model, config)), config)
     block = config["resources"]["lora"]
-    assert block["targets"] == ["o"] and block["adapter_digests"] == {"a3": "00" * 32}
-    (llm,) = [s for s in serving_resources(model, config) if isinstance(s, LoraSpec)]
-    assert set(llm.targets) == {"o"}
-    # mechanism off: without the conductor's list a worker builds every target
+    assert block["targets"] == ["o"] and block["adapter_digests"] == {"a3": digests["a3"].hex()}
+    worker = lora_spec(serving_resources(model, config))
+    assert set(worker.targets) == {"o"} and worker.adapter_digests == digests
+    # mechanism off: without the API server's list a worker builds every target
     del block["targets"]
-    (llm,) = [s for s in serving_resources(model, config) if isinstance(s, LoraSpec)]
-    assert set(llm.targets) == {"qkv", "o"}
+    assert set(lora_spec(serving_resources(model, config)).targets) == {"qkv", "o"}
+    # a deployment that does not name the opt-in spec builds none
+    assert lora_spec(serving_resources(model, {"resources": {}})) is None
 
 
 # --- readiness: a full pool is backpressure, not a refused step ----------------------------------

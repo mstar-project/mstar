@@ -57,7 +57,7 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     # Engine imports live here so importing this module (registration
     # mapping, --help) never loads the model stacks.
     from mstar.api_server.auth import keep_api_key_from_children
-    from mstar.api_server.entrypoint import APIServer, _conductor_process_target
+    from mstar.api_server.entrypoint import APIServer, _conductor_process_target, resolve_serving_config
     from mstar.communication.communicator import CommProtocol
 
     # Dynamo's frontend serves HTTP here; this worker never checks a key, so
@@ -74,6 +74,7 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
+    resolve_serving_config(model, config)
 
     server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
@@ -98,6 +99,8 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
             CommProtocol(args.tensor_comm_protocol),
             "",     # tcp_transfer_device
         ),
+        # the config every process reads (``resolve_serving_config``)
+        kwargs={"model_config": config},
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)

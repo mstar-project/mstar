@@ -12,8 +12,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
-from mstar.engine.resources.lora.config import LoraStep
+from mstar.engine.resources import Resource, ResourceStep, SlotLease, SubmoduleStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
 
@@ -527,15 +526,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # would pay for nothing.
     reads_device_loopback: bool = False
 
-    # A node serving LoRA from its modules (``module_lora_spec``) must say how its rows
-    # meet the pool: True when ``declare_step``'s segments are, in order, the rows its
-    # adapted linears see, each a request's span of tokens (a request may have several,
-    # as CFG's cond and uncond copies); ``declared_step`` then adds the pools'
-    # ``LoraStep``. A piecewise region that runs adapted modules declares its rows in its
-    # own step too; its capture refuses a delta called without one.
-    lora_segment_rows: bool = False
-    # the LoRA pools bound to this node's modules; set by `bind_node_resources`
-    lora_keys: tuple[str, ...] = ()
+    # the keys of this node's resources whose step is its segments
+    # (``Resource.steps_from_segments``), which ``declared_step`` adds; set by
+    # ``bind_node_resources``. A piecewise region that runs adapted modules declares its
+    # rows under them in its own step.
+    segment_keys: tuple[str, ...] = ()
 
     def __init__(self):
         super().__init__()
@@ -566,9 +561,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
                 bind(resources)
+        self.segment_keys = tuple(
+            key for key, resource in resources.items() if getattr(resource, "steps_from_segments", False)
+        )
         from mstar.model.components.lora.modules import bind_module_lora
 
-        self.lora_keys = bind_module_lora(self, resources)
+        bind_module_lora(self, resources)
 
     def cg_key_info(
         self, graph_walk: str,
@@ -1017,18 +1015,18 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 
 def declared_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
-    """What the engine calls for a node's step: its ``declare_step``, plus the LoRA
-    pools' steps for a node whose segments lay out its rows (``lora_segment_rows``), so
-    a model declaring LoRA from its modules writes no LoRA step."""
+    """What the engine calls for a node's step: its ``declare_step``, plus a step of its
+    segments under each resource that takes them as they are
+    (``Resource.steps_from_segments``: a LoRA pool), which the node declares nothing for."""
     step = submodule.declare_step(*args, **kwargs)
-    # the engine drives duck-typed submodules too; a node with pools bound is a NodeSubmodule
-    keys = getattr(submodule, "lora_keys", ())
-    if step is None or not keys or not submodule.lora_segment_rows:
+    # the engine drives duck-typed submodules too; one with resources bound is a NodeSubmodule
+    keys = getattr(submodule, "segment_keys", ())
+    if step is None or not keys:
         return step
     if step.segments is None:
         raise ValueError(
-            f"{type(submodule).__name__} has lora_segment_rows but its step declares "
-            "no SubmoduleStep.segments to lay its LoRA rows out from"
+            f"{type(submodule).__name__}'s step declares no SubmoduleStep.segments, which "
+            f"{list(keys)} take as their step"
         )
     segments = tuple(step.segments)
     for key in keys:
@@ -1037,7 +1035,7 @@ def declared_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
                 f"{type(submodule).__name__} declares its own step under {key!r}, which "
                 "declared_step adds from its segments"
             )
-        step.steps[key] = LoraStep(segments=segments)
+        step.steps[key] = ResourceStep(segments=segments)
     return step
 
 

@@ -22,7 +22,7 @@ pytest test/integration/test_lora_triton_gpu.py -v
 * `test_one_capture_serves_every_adapter_mix[layers|layers-compiled|lm_head]`:
   captures the deltas once (every row on the zero adapter, as the graph runner
   captures), then replays for four mixes that move adapters between slots (an
-  eviction, a reload and a base-only batch included). Each replay must equal the
+  eviction, a reload and a batch of base rows included). Each replay must equal the
   same rows run eagerly bit for bit, leave the bucket's padding untouched and match
   fp32 to bf16 accuracy. `layers-compiled` captures the Inductor-compiled function
   (`max-autotune-no-cudagraphs`), as the runner does; `lm_head` has one row per
@@ -126,8 +126,8 @@ What to read:
 Any `failed` request in a `load_c*.json` invalidates that run.
 
 A step none of whose rows names an adapter replays a capture with no LoRA kernel in it
-(`LoraBaseOnly`, see "Capture and compile" in `docs/adding_models.rst`). On an H200 with
-`compare_engines` (3 rounds, per-arm `e_off`), Qwen3.5-9B base-only traffic (GPU-bound)
+(an idle capture, see "Idle captures" in `docs/adding_models.rst`). On an H200 with
+`compare_engines` (3 rounds, per-arm `e_off`), Qwen3.5-9B base-model traffic (GPU-bound)
 kept 96.2/96.2/97.2% of its LoRA-off throughput at c=1/32/64 without it and
 100.0/99.8/100.4% with it; one-adapter and mixed traffic did not move, and 0.8B
 (CPU-bound) stayed within run-to-run noise. It doubles a LoRA node's captures (9B: 109
@@ -172,7 +172,7 @@ python -m benchmark.lora.prefix_cache --model orpheus --config configs/orpheus_c
 ```
 
 Orpheus is the first model that keys a prefix-cache stream *and* serves LoRA adapters
-(`get_lora_specs` through `module_lora_spec`). Requests go through `/generate` with the
+(a `LoraSpec` from `module_lora_spec`). Requests go through `/generate` with the
 adapter in `model_kwargs` (`--endpoint speech`, the default for Orpheus), and a
 request's output is its audio; a text model takes `--endpoint chat`. Qwen3.5 serves
 adapters but keys no stream, because its gated DeltaNet state cannot skip a cached

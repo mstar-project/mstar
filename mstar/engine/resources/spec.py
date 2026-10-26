@@ -11,7 +11,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -42,6 +42,11 @@ class NodeResourceSpec(ABC):
     resource_key: str
     nodes: set[str]
 
+    # Built only when the serving config's ``resources:`` block names this spec's key
+    # (``mstar.model.base.serving_resources``): a resource a deployment turns on, such as
+    # per-request LoRA adapters, declared beside the model's other resources.
+    opt_in: ClassVar[bool] = False
+
     def __post_init__(self):
         if not isinstance(self.nodes, set):
             self.nodes = set(self.nodes)
@@ -60,6 +65,22 @@ class NodeResourceSpec(ABC):
         The builder, not necessarily the class built: an attention spec names
         `AttentionManager`, whose `build` picks a backend subclass.
         """
+
+    def for_node(self, node: str) -> "NodeResourceSpec | None":
+        """The spec of this resource's instance for ``node`` alone, or None when ``node``
+        needs none. Only a spec that overrides it is split: the engine then builds an
+        instance per node it hosts, keyed ``<resource_key>@<node>`` (``instance_key``),
+        rather than one shared by them, for a resource whose nodes share no state and may
+        sit in different lockstep instances (a vision tower beside a tensor-parallel LLM).
+        Requests and the serving config still name the declared key."""
+        return self
+
+    def request_config(self, model_kwargs: dict | None) -> "ResourceReqConfig | None":
+        """The config a request is opened with on this resource, built from its kwargs, or
+        None. The conductor adds it to the model's own (``get_request_resource_configs``),
+        so a resource the deployment declares needs no model code to take request
+        settings."""
+        return None
 
     def apply_yaml_overrides(self, **kwargs):
         """Patch declared parameters from this resource's YAML block.
@@ -80,6 +101,12 @@ class NodeResourceSpec(ABC):
                 f"resource {self.resource_key!r} takes no YAML overrides; got "
                 f"{sorted(kwargs)}"
             )
+
+
+def instance_key(resource_key: str, node: str) -> str:
+    """The key of a split spec's instance for ``node`` (``NodeResourceSpec.for_node``):
+    the same on every rank, since it names the node rather than the worker."""
+    return f"{resource_key}@{node}"
 
 
 class ResourceReqConfig:

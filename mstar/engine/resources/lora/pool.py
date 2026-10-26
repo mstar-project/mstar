@@ -23,8 +23,8 @@ the batches the scheduler builds until a slot can take its adapter, so rows alre
 never lose a step to it. Only the rank that chooses batches screens (a lockstep instance's
 leader); the admit refusal stays as a backstop.
 
-A model with LoRA specs on several nodes (an LLM and its vision encoder) has a pool per
-node, and each screens only its own node's rows. A request holds a slot in each until it
+A spec over several nodes (an LLM and its vision encoder) builds a pool per node
+(``LoraSpec.for_node``), and each screens only its own node's rows. A request holds a slot in each until it
 is removed (none in a pool whose targets its adapter has nothing for), but where the
 graph runs the encoder once, before the LLM (Qwen3.5), it takes them in that order and a
 row holding an LLM slot never waits on the encoder's pool, so the two pools' waits
@@ -61,10 +61,8 @@ import torch
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, Resource
 from mstar.engine.resources.lora.backend import LoraBackend, make_backend
 from mstar.engine.resources.lora.config import (
-    LoraBaseOnly,
     LoraReqConfig,
     LoraSpec,
-    LoraStep,
     describe_load_error,
 )
 from mstar.engine.resources.lora.store import LoadedAdapter, LoraAdapterStore
@@ -75,6 +73,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
     AdmitRuntimeError,
     AllocationFailed,
+    ResourceStep,
     StepContext,
 )
 from mstar.utils.h2d import H2DMirror, PinnedStager
@@ -138,9 +137,9 @@ class LoraLayerDelta:
 
     A layer computes its base output, then calls this before anything consumes ``y`` —
     for a row-parallel linear, before its all-reduce. Rows on the base model address the
-    zero adapter, which the kernels skip; a step with no adapter row at all returns ``y``
-    untouched (``LoraAdapterPool.active``). The layer's slot weights are views resolved
-    once, here; a call reads only the step's addressing.
+    zero adapter, which the kernels skip; an idle step (``StepContext.idle``: no row names
+    an adapter) returns ``y`` untouched (``LoraAdapterPool.active``). The layer's slot
+    weights are views resolved once, here; a call reads only the step's addressing.
     """
 
     def __init__(self, pool: "LoraAdapterPool", target: str, layer_idx: int):
@@ -163,7 +162,7 @@ class LoraLayerDelta:
                 "and add the delta in preprocess or the forward"
             )
         if not self._pool.active:
-            # a base-only step: no row names an adapter, so nothing is launched
+            # an idle step: no row names an adapter, so nothing is launched
             return y
         if self._embedding:
             x = x.reshape(-1)
@@ -241,6 +240,11 @@ class LoraAdapterPool(Resource):
     # holds no per-token state, so a request whose prompt prefix was served from the cache
     # runs here exactly as one that computed it
     prefix_skip_safe = True
+    # a base-model request carries no config here (`LoraSpec.request_config`), so a step
+    # of them runs a graph captured without the deltas
+    idle_capture = True
+    # a node's rows are its segments' tokens, so it declares nothing for the pool
+    steps_from_segments = True
 
     @classmethod
     def build(cls, spec: LoraSpec, info: EngineResourceInfo) -> "LoraAdapterPool":
@@ -349,7 +353,6 @@ class LoraAdapterPool(Resource):
 
         # Handle-keyed request state, all purged by `remove_request`.
         self._adapter_of: dict = {}   # rid -> adapter name, None for the base model
-        self._adapter_rows = 0  # live rids naming an adapter
         self._row_slot: dict = {}     # rid -> slot held, read by `plan`
         self._awaiting: set = set()   # rids with an adapter but no slot yet
         self._admit_taken: dict = {}  # rid -> slot the live admit took, for rollback
@@ -440,7 +443,7 @@ class LoraAdapterPool(Resource):
         if self._current is None:
             raise RuntimeError(
                 "the LoRA pool has no plan for this step; the step declaration must carry "
-                "a LoraStep under this resource's key"
+                "a step under this resource's key"
             )
         return self._current[grouping]
 
@@ -474,7 +477,6 @@ class LoraAdapterPool(Resource):
             if adapter is None:
                 self._row_slot[rid] = ZERO_SLOT
             else:
-                self._adapter_rows += 1
                 self._awaiting.add(rid)
                 # every rank, so a follower has its copy when the leader's step needs it
                 self._read_errors.pop(adapter, None)
@@ -483,8 +485,6 @@ class LoraAdapterPool(Resource):
     def remove_request(self, rid):
         with self._lock:
             adapter = self._adapter_of.pop(rid, None)
-            if adapter is not None:
-                self._adapter_rows -= 1
             self._awaiting.discard(rid)
             self._admit_taken.pop(rid, None)
             self._unclaim(rid)
@@ -709,7 +709,7 @@ class LoraAdapterPool(Resource):
 
     # Step lifecycle
 
-    def admit(self, step: LoraStep, ctx: StepContext) -> AdmitOutcome:
+    def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:
         """Give each row whose adapter is not resident yet a slot, loading it there.
 
         Nothing to do once every row holds its slot, which is every step after a request's
@@ -769,7 +769,7 @@ class LoraAdapterPool(Resource):
                 return outcome
         return ADMIT_OK
 
-    def rollback_admit(self, step: LoraStep, ctx: StepContext) -> None:
+    def rollback_admit(self, step: ResourceStep, ctx: StepContext) -> None:
         """Give back the slots this step's admit took. An adapter it loaded stays resident
         in its now-unheld slot, as a cache."""
         del step
@@ -785,7 +785,7 @@ class LoraAdapterPool(Resource):
                 if slot:
                     self._release(slot)
 
-    def commit(self, step: LoraStep, ctx: StepContext) -> None:
+    def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         del step
         if self._enclosing is not None and ctx.graph_walk == PIECEWISE_WALK:
             # the region is done; the eager code after it reads the enclosing plan
@@ -979,37 +979,12 @@ class LoraAdapterPool(Resource):
 
     # Addressing
 
-    def runs_adapters(self, rids) -> bool:
-        """Whether any of ``rids`` names an adapter: set at ingest, so the same on every
-        rank of a lockstep instance."""
-        if not self._adapter_rows:
-            return False
-        get = self._adapter_of.get
-        return any(get(rid) is not None for rid in rids)
-
-    def _adds_deltas(self, segments, ctx: StepContext) -> bool:
-        """Whether this step's deltas run: under a capture lease, unless its bucket is a
-        base-only one (``LoraBaseOnly``), whose graph records none; eagerly, when a row
-        names an adapter."""
-        lease = ctx.slot_lease
-        if lease is None or lease.bucket is None:
-            return self.runs_adapters(seg.request_id for seg in segments)
-        if not isinstance(lease.bucket.cg_key_info, LoraBaseOnly):
-            return True
-        if not ctx.capture and self.runs_adapters(seg.request_id for seg in segments):
-            # its rows would lose their deltas silently
-            raise RuntimeError(
-                f"LoRA resource {self.spec.resource_key!r}: leased base-only {lease.bucket} "
-                "for a step whose rows name an adapter"
-            )
-        return False
-
-    def plan(self, step: LoraStep, ctx: StepContext) -> LoraAddressing | None:
+    def plan(self, step: ResourceStep, ctx: StepContext) -> LoraAddressing | None:
         if ctx.graph_walk == PIECEWISE_WALK and not ctx.capture and self._current is not None:
             # before the memoized return below, which a region's repeat plan takes too
             self._enclosing = (self._current, self.active)
         segments = step.segments or ()
-        self.active = self._adds_deltas(segments, ctx)
+        self.active = not ctx.idle
         if not self.active:
             # no delta reads an addressing, so none is staged
             self._current = {}

@@ -27,21 +27,25 @@ import lora_module_helpers as H  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
-from mstar.engine.resources.lora import LoraReqConfig, LoraSpec  # noqa: E402
+from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig, LoraSpec  # noqa: E402
 from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key  # noqa: E402
+from mstar.engine.resources.lora.serving import lora_spec  # noqa: E402
 from mstar.engine.resources.lora.store import inspect_keys  # noqa: E402
+from mstar.engine.resources.spec import instance_key  # noqa: E402
 from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, SlotLease, StepContext  # noqa: E402
 from mstar.model.components.lora.capable import make_lora_capable  # noqa: E402
 from mstar.model.components.lora.modules import _check  # noqa: E402
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM  # noqa: E402
 from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel  # noqa: E402
-from mstar.model.qwen3_5.config import VISION_ATTN, VISION_LORA, Qwen3_5Config, Qwen3_5VisionConfig  # noqa: E402
-from mstar.model.qwen3_5.lora import qwen3_5_lora_specs  # noqa: E402
+from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5Config, Qwen3_5VisionConfig  # noqa: E402
+from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel  # noqa: E402
 from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP, VisionEncoderSubmodule  # noqa: E402
 from mstar.model.submodule_base import declared_step  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
+# the vision node's pool, as the engine keys it (`LoraSpec.for_node`)
+VISION_POOL = instance_key(LORA_RESOURCE_KEY, "vision_encoder")
 # two adapters, the base model, and a1 again (sharing its slot)
 ROWS = [("r0", "a1", 3), ("r1", None, 2), ("r2", "a2", 4), ("r3", "a1", 2)]
 # ranks set up one at a time: the Qwen3.5 build sets the process-wide default dtype
@@ -102,8 +106,9 @@ QWEN3_5_SIZES = json.loads((FIXTURES / "qwen3_5_configs.json").read_text())["siz
 
 
 def _released(name: str, size: str | None = None):
-    """The model at its released config (Qwen3.5: ``size``), and per LoRA spec
-    ``(TP group -> the root it binds in, whether that root is TP)``."""
+    """The model at its released config (Qwen3.5: ``size``), and per node its LoRA spec
+    reaches, in the spec's order, ``(TP group -> the root it binds in, whether that root
+    is TP)``."""
     if name != "qwen3_5":
         model, root = H.STACKS[name]().released()
         return model, [(lambda g: root(model.config, g), True)]
@@ -135,13 +140,14 @@ def test_every_placed_module_binds_at_the_released_size(name, size, world):
     """What generic binding checks on each rank: the module is the declared target, and
     its rank-local shape is the pool's shard of it (whole, on a root that is not TP)."""
     model, roots = _released(name, size)
-    specs = model.get_lora_specs()
+    spec = lora_spec(model.get_node_resources())
+    nodes = list(dict.fromkeys(t.node or next(iter(spec.nodes)) for t in spec.targets.values()))
     for rank in sorted({0, world - 1}):
         group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world)))
-        for spec, (build, tp) in zip(specs, roots, strict=True):
+        for node, (build, tp) in zip(nodes, roots, strict=True):
             with torch.device("meta"):
                 root = build(group if tp else CommGroup.trivial())
-            for path, ref in spec.module_map.bindings.items():
+            for path, ref in spec.module_map.part(node).bindings.items():
                 target = spec.targets[ref.target]
                 _check(make_lora_capable(root.get_submodule(path)), target, target.shard(world if tp else 1),
                        path, spec.resource_key)
@@ -167,14 +173,13 @@ HUB["qwen3_omni_thinker"] = {"moe-experts": {  # packed tensors, run by the fuse
 }}
 
 
-def _validate(model: str, size: str | None, repo: str, keys: dict) -> list[LoraSpec]:
-    """What ``LoraReqConfig.validate`` does with an adapter, from its header."""
-    specs = _released(model, size)[0].get_lora_specs() if size != "tiny" else [
-        H.STACKS[model]().lora_spec(H.tiny())]
-    for spec in specs:
-        spec.apply_yaml_overrides(max_rank=512)
-        spec.check_adapter(repo, inspect_keys(spec, sorted(keys.items())))
-    return specs
+def _validate(model: str, size: str | None, repo: str, keys: dict) -> LoraSpec:
+    """What registering an adapter checks (``check_adapter_file``), from its header."""
+    spec = (lora_spec(_released(model, size)[0].get_node_resources()) if size != "tiny"
+            else H.STACKS[model]().lora_spec(H.tiny()))
+    spec.apply_yaml_overrides(max_rank=512)
+    spec.check_adapter(repo, inspect_keys(spec, sorted(keys.items())))
+    return spec
 
 
 @pytest.mark.parametrize("model,repo", [(m, r) for m, entries in HUB.items() for r in sorted(entries)])
@@ -187,11 +192,11 @@ def test_hub_adapter_is_served_or_refused_by_name(model, repo):
         if "served_without" not in entry:
             return
         keys = {k: v for k, v in keys.items() if entry["served_without"] not in k}
-    specs = _validate(model, entry.get("size"), repo, keys)
-    # no module is silently dropped: each is placed by exactly one of the model's specs
+    spec = _validate(model, entry.get("size"), repo, keys)
+    # no module is silently dropped: each is placed on one of the model's targets
     for module in {parse_lora_key(normalize_lora_key(k))[0] for k in keys}:
-        placed = [s.resource_key for s in specs if (r := s.module_map(module)) is not None and r.target in s.targets]
-        assert len(placed) == 1, f"{module}: placed by {placed}"
+        ref = spec.module_map(module)
+        assert ref is not None and ref.target in spec.targets, module
 
 
 @pytest.mark.parametrize("model,repo,other", [
@@ -312,17 +317,19 @@ def _encode(sub, rid="r"):
 
 
 def _vision_pool(paths, max_slots=2):
-    """The vision node's pool, its spec linked to the LLM's as a deployment builds it."""
-    spec = qwen3_5_lora_specs(H.tiny_config(), vision_config())[1]
+    """The vision node's pool, from the model's one spec as the engine builds it."""
+    spec = qwen3_5_lora_spec(H.tiny_config(), vision_config()).for_node("vision_encoder")
     spec.apply_yaml_overrides(max_slots=max_slots, max_rank=4, adapters=dict(paths))
     spec.dtype, spec.backend = H.DTYPE, "torch"
     return H.pool(spec)
 
 
 def _admit(lora_pool, step, rid, adapter, walk="encode", lease=None):
-    lora_pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
-    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease)
-    lora = step.steps[VISION_LORA]
+    lora_pool.ingest_request(rid, None if adapter is None else LoraReqConfig(adapter=adapter))
+    # idle as the engine sets it: an eager step of a base row (a region never is)
+    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease,
+                      idle=adapter is None and lease is None)
+    lora = step.steps[VISION_POOL]
     assert lora_pool.admit(lora, ctx).ok
     lora_pool.plan(lora, ctx)
     return lora, ctx
@@ -337,7 +344,7 @@ def _encode_leased(sub, lora_pool):
     lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, VISION_BLOCK_LOOP))
     # the capture, at startup: the region over the bucket's whole shape, on the zero adapter
     lora_pool.ingest_capture_row("cap")
-    cap = region_cfg.declare_step(["cap"], [bucket]).steps[VISION_LORA]
+    cap = region_cfg.declare_step(["cap"], [bucket]).steps[VISION_POOL]
     cap_ctx = StepContext(request_ids=["cap"], graph_walk=PIECEWISE_WALK, slot=0, capture=True, slot_lease=lease)
     assert lora_pool.admit(cap, cap_ctx).ok
     lora_pool.plan(cap, cap_ctx)
@@ -345,7 +352,7 @@ def _encode_leased(sub, lora_pool):
 
     inp = _prompt(sub)
     outer = declared_step(sub, "encode", ["r"], [inp], piecewise_leases={VISION_BLOCK_LOOP: lease})
-    assert set(outer.steps) == {VISION_LORA}
+    assert set(outer.steps) == {VISION_POOL}
     _admit(lora_pool, outer, "r", "v")
     kwargs = sub.preprocess("encode", _engine("r"), [inp])
     with torch.no_grad():
@@ -354,7 +361,7 @@ def _encode_leased(sub, lora_pool):
         )
         seq_lens = list(kwargs["seq_lengths"])
         region = region_cfg.declare_step(["r"], seq_lens)
-        assert region.steps[VISION_LORA].segments[0].span == PATCHES
+        assert region.steps[VISION_POOL].segments[0].span == PATCHES
         lora, ctx = _admit(lora_pool, region, "r", "v", walk=PIECEWISE_WALK, lease=lease)
         lora_pool._current = recorded  # the replay reads its capture's views of the planned buffer
         sub._frames.lengths = seq_lens
@@ -370,10 +377,10 @@ def test_qwen3_5_vision_rows_match_the_merged_tower(tmp_path, mode, adapter):
     conv patch embed, eagerly and through the piecewise block loop."""
     path, ref = write_vision_adapter(tmp_path / "v")
     lora_pool = _vision_pool({"v": path})
-    sub = _vision_node(tower(), {VISION_LORA: lora_pool})
+    sub = _vision_node(tower(), {VISION_POOL: lora_pool})
     if mode == "eager":
         step = declared_step(sub, "encode", ["r"], [_prompt(sub)])
-        assert set(step.steps) == {VISION_ATTN, VISION_LORA}
+        assert set(step.steps) == {VISION_ATTN, VISION_POOL}
         _admit(lora_pool, step, "r", adapter)
         got = _encode(sub)
     else:
@@ -391,7 +398,7 @@ def test_qwen3_5_vision_replays_the_block_loop_only_when_leased(tmp_path):
     the captured block loop, while an unleased one runs the eager tower on the attention
     plan it declared."""
     path, _ = write_vision_adapter(tmp_path / "v")
-    sub = _vision_node(tower(), {VISION_LORA: _vision_pool({"v": path})})
+    sub = _vision_node(tower(), {VISION_POOL: _vision_pool({"v": path})})
     lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, 32, VISION_BLOCK_LOOP))
     replays = []
 
@@ -416,13 +423,13 @@ def test_qwen3_5_text_only_adapter_holds_no_vision_slot_nor_a_wait(tmp_path):
     path, _ = write_vision_adapter(tmp_path / "v")
     text, _ = H.write_peft_adapter(tmp_path / "t", 2, ("self_attn.q_proj",), text_only=True)
     lora_pool = _vision_pool({"v": path, "t": text}, max_slots=1)
-    sub = _vision_node(tower(), {VISION_LORA: lora_pool})
+    sub = _vision_node(tower(), {VISION_POOL: lora_pool})
 
     def encode(rid, adapter):
         lora_pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
         assert lora_pool.admit_retrieve(rid, "vision_encoder", "encode", None).ready
         ctx = StepContext(request_ids=[rid], graph_walk="encode", slot=0, capture=False)
-        assert lora_pool.admit(declared_step(sub, "encode", [rid], [_prompt(sub)]).steps[VISION_LORA], ctx).ok
+        assert lora_pool.admit(declared_step(sub, "encode", [rid], [_prompt(sub)]).steps[VISION_POOL], ctx).ok
         return lora_pool.slot_of(rid)
 
     assert encode("r0", "v") == 1  # the one slot, held
@@ -449,7 +456,7 @@ def test_qwen3_5_tied_head_and_embedding_keep_each_delta_on_its_own_side(tmp_pat
     model = H.build_stack(base, config=dataclasses.replace(H.tiny_config(), tie_word_embeddings=True))
     assert model.lm_head.weight is model.model.embed_tokens.weight
     lora_pool = H.pool(H.lora_spec({"h": path}))
-    H.bind(model, H._Rows(), {H.LORA: lora_pool})
+    H.bind(model, H._Rows(), {LORA_RESOURCE_KEY: lora_pool})
     H.plan([lora_pool], [("r0", "h", 1), ("r1", "h", 1), ("r2", "h", 1)])  # three decode rows
     ids, hidden = torch.tensor([1, 2, 60]), H.rand(3, H.HIDDEN, seed=4)
     with torch.no_grad(), H.compute(lora_pool):

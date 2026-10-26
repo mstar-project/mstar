@@ -39,12 +39,12 @@ from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
-from mstar.api_server.served_models import ServedModels
+from mstar.api_server.served_models import Selected, ServedModels
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
-from mstar.engine.resources.lora.config import lora_enabled
-from mstar.engine.resources.lora.serving import lora_specs
-from mstar.engine.resources.lora.store import check_adapters
+from mstar.engine.resources.lora.config import LoraSpec, lora_enabled
+from mstar.engine.resources.lora.serving import lora_spec, resolve_lora_adapters
+from mstar.model.base import serving_resources
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -106,6 +106,20 @@ def _detect_modality(filename: str) -> str:
     return _EXT_TO_MODALITY.get(Path(filename).suffix.lower(), "unknown")
 
 
+def resolve_serving_config(model, model_config: dict | None) -> LoraSpec | None:
+    """Settle ``model_config`` as every process reads it, before the conductor is
+    spawned: each LoRA adapter it names is checked and read once, and its digest and the
+    targets the adapters touch are written into it (``resolve_lora_adapters``). The
+    conductor gets this config and spawns the workers with it, so their reads serve the
+    weights whose digests key the API server's prefix cache. Returns the deployment's
+    LoRA spec, resolved likewise; None without one."""
+    if model is None or not model_config:
+        return None
+    spec = lora_spec(serving_resources(model, model_config))
+    resolve_lora_adapters(spec, model_config)
+    return spec
+
+
 # ------------------------------------------------------------------
 # Conductor process target (top-level for picklability with spawn)
 # ------------------------------------------------------------------
@@ -121,11 +135,12 @@ def _conductor_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
-    lora_adapter_digests: dict[str, str] | None = None,
+    model_config: dict | None = None,
 ):
     """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
-    turns on the conductor's status message (metrics on). ``lora_adapter_digests``
-    are the API server's checked serving-config adapters (name -> hex digest)."""
+    turns on the conductor's status message (metrics on). ``model_config`` is the
+    serving config as the API server resolved it (``APIServer.model_config``); None
+    reads ``config_path``."""
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
@@ -152,9 +167,10 @@ def _conductor_process_target(
 
     from mstar.conductor.conductor import Conductor
     from mstar.model.registry import get_model_class
-    with open(config_path, "r") as _f:
-        _yaml_cfg = _yaml.safe_load(_f) or {}
-    yaml_model_kwargs = _yaml_cfg.get("model_kwargs", {}) or {}
+    if model_config is None:
+        with open(config_path, "r") as _f:
+            model_config = _yaml.safe_load(_f) or {}
+    yaml_model_kwargs = model_config.get("model_kwargs", {}) or {}
     if yaml_model_kwargs:
         logging.getLogger(__name__).info(
             "yaml model_kwargs from %s: %s (forwarded to %s.__init__)",
@@ -179,7 +195,7 @@ def _conductor_process_target(
         tensor_comm_protocol=tensor_comm_protocol,
         tcp_transfer_device=tcp_transfer_device,
         status_interval_s=status_interval_s,
-        lora_adapter_digests=lora_adapter_digests,
+        model_config=model_config,
     )
     try:
         conductor.run()
@@ -398,18 +414,12 @@ class APIServer:
         # tokenizer-only model the API server already builds for preprocessing.
         self.model = model
         self.model_name = model_name
+        # the serving config as every other process reads it (``resolve_serving_config``)
+        self.model_config = model_config
+        lora = resolve_serving_config(model, model_config)
         # what an OpenAI request's `model` field may name: the base model, or an adapter
-        self.served_models = ServedModels.of(model_name, model_config)
-        specs = lora_specs(model, model_config)
-        lora_spec = specs[0] if specs else None
-        # Every adapter the serving config names, checked against every LoRA spec and
-        # read once before anything else starts. Their digests key the prefix cache here
-        # and travel to the conductor, which pins them for the workers' reads. So a LoRA
-        # deployment's `resources:` block is read here, before the conductor's
-        # validate_deployment; one without LoRA reads nothing here.
-        self.lora_adapter_digests: dict[str, bytes] = (
-            check_adapters(lora_spec, others=specs[1:])
-            if lora_spec is not None and lora_spec.adapters else {}
+        self.served_models = ServedModels.of(
+            model_name, model_config, lora.adapter_digests if lora is not None else None,
         )
 
         # Before any tensor manager; the conductor and workers inherit it.
@@ -423,17 +433,14 @@ class APIServer:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=self.log_stats,
             enable_nvtx=self.enable_nvtx,
-            adapter_digests=self.lora_adapter_digests,
         )
 
         # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker
         # thread, which owns this process's socket to the conductor
         self.lora_admin = LoraAdmin(
-            lora_spec, self.served_models,
-            self.preprocess_worker.adapter_prefix_roots,
+            lora, self.served_models,
             lambda message: self.preprocess_worker.send_to_conductor(message),  # noqa: PLW0108 - late-bound
             timeout_s=timeout_seconds,
-            others=specs[1:],
         )
 
         self._init_request_state()
@@ -632,7 +639,7 @@ class APIServer:
                 f"Output modality {names} requires streaming=True; raw frame "
                 "chunks cannot be returned as an aggregated response."
             )
-        model_kwargs = self.lora_kwargs(model, model_kwargs)
+        model_kwargs, prefix_root = self.lora_kwargs(model, model_kwargs)
 
         # Register pending request
         with self.request_lock:
@@ -665,6 +672,7 @@ class APIServer:
             output_modalities=output_modalities,
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
+            prefix_root=prefix_root,
         ))
 
         logger.info(
@@ -673,9 +681,10 @@ class APIServer:
         )
         return request_id
 
-    def lora_kwargs(self, model: str | None, model_kwargs: dict | None) -> dict | None:
+    def lora_kwargs(self, model: str | None, model_kwargs: dict | None) -> Selected:
         """``model_kwargs`` naming the LoRA adapter ``model`` or a ``lora_adapter`` kwarg
-        selects; an adapter this deployment does not serve is a 400."""
+        selects, and its prefix-cache root; an adapter this deployment does not serve is a
+        400."""
         try:
             return self.served_models.select(model, model_kwargs)
         except ValueError as e:
@@ -2188,9 +2197,7 @@ def main(argv: list[str] | None = None):
         # The API server drops these until enable_metrics(), after the warmups.
         kwargs={
             "status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None,
-            "lora_adapter_digests": {
-                name: digest.hex() for name, digest in api_server.lora_adapter_digests.items()
-            },
+            "model_config": api_server.model_config,
         },
     )
     conductor_proc.start()

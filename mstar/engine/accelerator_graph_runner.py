@@ -25,7 +25,6 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseConfigType,
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
-from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.step import PIECEWISE_WALK
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -234,6 +233,19 @@ def fail_if_graphs_required(missing: list[str]) -> None:
         "accelerator graph capture failed for " + ", ".join(missing)
         + " and accelerator graphs are required"
     )
+
+
+def _plain_twin(key):
+    """The bucket that serves ``key``'s steps when ``key`` is not captured: an idle
+    bucket's plain twin, else ``key`` itself. The plain bucket serves every step and the
+    idle one only steps that leave a resource idle, so an idle bucket is planned,
+    captured and kept only beside its plain twin."""
+    return replace(key, idle=False) if isinstance(key, BucketKey) and key.idle else key
+
+
+def _with_plain_twin(buckets: set[BucketKey]) -> set[BucketKey]:
+    """``buckets`` without the idle ones whose plain twin is not among them."""
+    return {key for key in buckets if _plain_twin(key) in buckets}
 
 
 def _is_packed(config: AcceleratorGraphConfig) -> bool:
@@ -520,13 +532,22 @@ def plan_captures(
         pool, _, _, cost = candidate
         return added(pool, cost) + cost.slots * cost.outside - reused(cost)
 
+    def beside_plain_twin(candidate) -> bool:
+        pool, _, bucket, _ = candidate
+        twin = _plain_twin(bucket)
+        return twin == bucket or twin in plan.buckets[pool]
+
     left = [
         (pool, index, bucket, cost) for pool, costs in pools.items()
         for index, (bucket, cost) in enumerate(costs.items()) if cost.graph is not None
     ]
     while left:
+        # an idle bucket only once its plain twin is planned (see `_plain_twin`)
+        ready = [candidate for candidate in left if beside_plain_twin(candidate)]
+        if not ready:
+            break
         # a tie goes to the pool named first, which leads with its node, then to capture order
-        best = min(left, key=lambda candidate: (on_device(candidate), *candidate[:2]))
+        best = min(ready, key=lambda candidate: (on_device(candidate), *candidate[:2]))
         pool, _, bucket, cost = best
         if on_device(best) > room:
             break
@@ -736,21 +757,22 @@ class AcceleratorGraphRunner:
 
     def _get_slot_specs(self) -> list[CGSlotSpec]:
         specs = []
+        # a node with an idle-capable resource may also capture each bucket for steps
+        # that leave it idle, recording none of its kernels (`prepare_for_capture` keeps
+        # the twins only of configs whose step drives it). The two share the config's
+        # static buffers and padding rows; the idle one compiles separately (Dynamo
+        # guards on what the resource reads at trace) and is sized as a walk of its own
+        variants = (False, True) if any(r.idle_capture for r in self._resources.values()) else (False,)
         for config_idx, config in enumerate(self._capture_configs):
-            keys = [config.additional_key_info]
-            if getattr(self._submodule, "lora_keys", ()):
-                # a node serving adapters also captures each bucket for steps with no
-                # adapter row, recording no LoRA kernel (see `LoraBaseOnly`); the two
-                # share the config's compiled forward, static buffers and padding rows
-                keys.append(LoraBaseOnly(config.additional_key_info))
             for bs in self._batch_sizes(config):
                 for num_tokens in config.get_total_tokens(bs):
-                    for key in keys:
+                    for idle in variants:
                         bucket = BucketKey(
                             graph_walk=config.capture_graph_walk,
-                            cg_key_info=key,
+                            cg_key_info=config.additional_key_info,
                             bs=bs,
                             num_tokens=num_tokens,
+                            idle=idle,
                         )
                         for slot in range(self._num_slots):
                             specs.append(CGSlotSpec(
@@ -782,6 +804,8 @@ class AcceleratorGraphRunner:
             slot_specs.sort(key=lambda s: (s.bs, s.num_tokens), reverse=True)
             blocked_configs = set()
             checked_configs = set()
+            idle_keys = [key for key, resource in self._resources.items() if resource.idle_capture]
+            idle_configs = set()
             for spec in slot_specs:
                 if spec.config_idx in checked_configs:
                     continue
@@ -795,6 +819,8 @@ class AcceleratorGraphRunner:
                     slot_lease=SlotLease(slot=0, bucket=spec.bucket),
                     per_request_info=dummy_metadata(rids, spec.bucket.graph_walk),
                 )
+                if step is not None and any(key in step.steps for key in idle_keys):
+                    idle_configs.add(spec.config_idx)
                 blocked = blocked_capture_resources(step, self._resources)
                 if blocked:
                     logger.error(
@@ -803,6 +829,11 @@ class AcceleratorGraphRunner:
                         spec.config_idx, self._submodule_name, blocked,
                     )
                     blocked_configs.add(spec.config_idx)
+            # a config whose step leaves the idle-capable resources out would capture
+            # the same kernels twice
+            slot_specs = [
+                spec for spec in slot_specs if not spec.bucket.idle or spec.config_idx in idle_configs
+            ]
             self._blocked_buckets = list(dict.fromkeys(
                 spec.bucket for spec in slot_specs if spec.config_idx in blocked_configs
             ))
@@ -843,7 +874,8 @@ class AcceleratorGraphRunner:
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
                     if spec.slot == 0:
-                        walk = (spec.bucket.graph_walk, spec.bucket.cg_key_info)
+                        # an idle bucket runs other kernels, so it is sized as a walk of its own
+                        walk = (spec.bucket.graph_walk, spec.bucket.cg_key_info, spec.bucket.idle)
                         self._capture_costs[spec.bucket], lent = _size_in_walk(
                             captured.setdefault(walk, []),
                             CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
@@ -888,7 +920,7 @@ class AcceleratorGraphRunner:
                             autocast_dtype=self._autocast_dtype,
                         ),
                         f"{self._submodule_name} {spec}",
-                        self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
+                        self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info, spec.bucket.idle)],
                     )
                 if memory is not None:
                     cost = cost._replace(graph=memory.pool, outside=memory.outside)
@@ -920,10 +952,10 @@ class AcceleratorGraphRunner:
         slot_specs = self.prepare_for_capture()
         sized = planned is not None
         # what every rank planned, as though captured in full (see `_buckets_captured_everywhere`)
-        planned = self._buckets_captured_everywhere(slot_specs, {
+        planned = _with_plain_twin(self._buckets_captured_everywhere(slot_specs, {
             bucket: range(self._num_slots)
             for bucket in (planned if sized else {spec.bucket for spec in slot_specs})
-        })
+        }))
         # costliest first, so the graphs after it fit in what it leaves free; by
         # the most each costs on any rank, so every rank warms up in one order
         buckets = list(dict.fromkeys(spec.bucket for spec in slot_specs))
@@ -960,13 +992,15 @@ class AcceleratorGraphRunner:
                     self._submodule_name, spec.bucket, self._num_slots
                 )
 
-        agreed = self._buckets_captured_everywhere(slot_specs, captured)
+        everywhere = self._buckets_captured_everywhere(slot_specs, captured)
+        agreed = _with_plain_twin(everywhere)
         for bucket_key, slots in captured.items():
             if bucket_key not in agreed:
                 logger.error(
-                    "Dropping accelerator graph bucket %s for %s: captured %d of %d "
-                    "slots here, or fewer on another rank",
-                    bucket_key, self._submodule_name, len(slots), self._num_slots,
+                    "Dropping accelerator graph bucket %s for %s: %s",
+                    bucket_key, self._submodule_name,
+                    f"its plain twin {_plain_twin(bucket_key)} was not kept" if bucket_key in everywhere
+                    else f"captured {len(slots)} of {self._num_slots} slots here, or fewer on another rank",
                 )
                 continue
             # by slot index, so a bucket's list position is its slot index
@@ -994,7 +1028,8 @@ class AcceleratorGraphRunner:
         10-20x latency cliff otherwise, and one failure used to take every
         later bucket with it."""
         wanted = list(dict.fromkeys([*self._blocked_buckets, *wanted]))
-        self.dropped_buckets = [key for key in wanted if key not in kept]
+        # an idle bucket's steps replay its plain twin, if that one was kept
+        self.dropped_buckets = [key for key in wanted if _plain_twin(key) not in kept]
         if self.dropped_buckets:
             logger.error(
                 "AcceleratorGraphRunner[%s]: captured %d of %d buckets; these run "
@@ -1104,6 +1139,7 @@ class AcceleratorGraphRunner:
                 capture=True,
                 slot_lease=lease,
                 force_prefill=_is_packed(config),
+                idle=spec.bucket.idle,
             ))
 
         engine_inputs.step = step
@@ -1294,7 +1330,8 @@ class AcceleratorGraphRunner:
         self, graph_walk: str, bs: int, num_tokens: int,
         cg_key_info: Any | None = None,
     ) -> BucketKey | None:
-        """Tightest captured bucket that fits this batch, or None for eager.
+        """Tightest captured plain bucket that fits this batch, or None for eager
+        (``lease_slot`` takes its idle twin).
 
         A walk may have several captures (e.g. one per image resolution, each a
         fixed shape with its own token count), so every matching bucket is
@@ -1304,7 +1341,7 @@ class AcceleratorGraphRunner:
         """
         best: BucketKey | None = None
         for key, bucket in self._buckets.items():
-            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
+            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info or key.idle:
                 continue
             needed = num_tokens * bucket.config.total_tokens_multiplier
             if key.bs < bs or key.num_tokens < needed or not bucket.slots:
@@ -1330,7 +1367,7 @@ class AcceleratorGraphRunner:
         """
         best: BucketKey | None = None
         for key, bucket in self._buckets.items():
-            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
+            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info or key.idle:
                 continue
             if key.bs < bs or not bucket.slots:
                 continue
@@ -1383,6 +1420,7 @@ class AcceleratorGraphRunner:
         slot: int,
         num_tokens: int | None = None,
         cg_key_info: Any | None = None,
+        idle: bool = False,
     ) -> SlotLease | None:
         """Pick the bucket and double-buffer slot an upcoming step replays on.
 
@@ -1392,6 +1430,9 @@ class AcceleratorGraphRunner:
         ``slot=None`` advances the bucket's counter so the next lease lands on
         the other slot; a caller that already reserved one (pre-plan) passes it
         back so both submissions target the same slot.
+
+        ``idle`` leases the tightest plain bucket's idle twin when that was captured,
+        and the plain bucket otherwise.
         """
         key = (
             self.select_batched_bucket(graph_walk, bs, cg_key_info)
@@ -1400,6 +1441,9 @@ class AcceleratorGraphRunner:
         )
         if key is None:
             return None
+        if idle and replace(key, idle=True) in self._buckets:
+            # the same shape as the plain bucket, so no more padding
+            key = replace(key, idle=True)
         bucket = self._buckets[key]
 
         # Hand back the bucket the capture ran under, not the alias this walk

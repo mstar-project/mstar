@@ -117,6 +117,21 @@ class Resource(ABC):
     def can_capture(self) -> bool:
         return True
 
+    # Whether this resource's kernels may be left out of a step none of whose rows
+    # carries its request config (``NodeResourceSpec.request_config``); at most one on a
+    # node. The engine then captures each bucket whose step drives it a second time,
+    # idle (``BucketKey.idle``), and tells the resource through ``StepContext.idle``,
+    # eager steps included. Its kernels must hold no collective: TP ranks can replay
+    # different twins of one step (``SubmoduleManagement.rows_idle``).
+    idle_capture: bool = False
+
+    # Whether this resource's step on a node is the node's own segments
+    # (``SubmoduleStep.segments``: a request's span of tokens each, in the order the node
+    # packs its rows), so the node declares nothing for it: ``declared_step`` adds a
+    # ``ResourceStep`` of them under the resource's key (the LoRA pool, whose rows are the
+    # node's tokens).
+    steps_from_segments: bool = False
+
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 

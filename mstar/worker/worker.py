@@ -94,7 +94,7 @@ from mstar.utils.profiler import (
     range_push,
 )
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
-from mstar.worker.lora_loads import LoraLoads
+from mstar.worker.lora_loads import LoraLoads, lora_pools
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.worker_metrics import WorkerMetrics
@@ -1323,7 +1323,7 @@ class Worker:
         and the conductor rolls back the other workers."""
         if self._lora_loads is None:
             self._lora_loads = LoraLoads()
-        self._lora_loads.start(body, self.engine_manager.engine.lora_pools())
+        self._lora_loads.start(body, lora_pools(self.engine_manager.engine.resources))
         self._finish_lora_loads()
 
     def _finish_lora_loads(self) -> None:
@@ -1342,7 +1342,7 @@ class Worker:
             return
         error = None
         try:
-            for pool in self.engine_manager.engine.lora_pools():
+            for pool in lora_pools(self.engine_manager.engine.resources):
                 pool.unload_adapter(body.lora_name)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Worker %s: LoRA adapter %s failed to unload", self.worker_id, body.lora_name)

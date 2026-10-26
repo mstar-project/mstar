@@ -1314,7 +1314,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
     class _Server:
         fatal_error = None
-        lora_adapter_digests: dict = {}
+        model_config: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1368,7 +1368,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
     class _Server:
         fatal_error = None
-        lora_adapter_digests: dict = {}
+        model_config: dict = {}
 
         def __init__(self, **kwargs):
             pass
@@ -1394,7 +1394,7 @@ def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
 
 def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {
-        "status_interval_s": 1.0, "lora_adapter_digests": {}}
+        "status_interval_s": 1.0, "model_config": {}}
     assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
 
 

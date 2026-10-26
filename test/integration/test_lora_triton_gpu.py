@@ -17,11 +17,11 @@ pytest.importorskip("safetensors")
 
 from safetensors.torch import save_file  # noqa: E402
 
-from mstar.engine.resources.lora import LoraReqConfig, LoraStep, ops  # noqa: E402
+from mstar.engine.resources.lora import LoraReqConfig, ops  # noqa: E402
 from mstar.engine.resources.lora import backend as ref_ops  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.lora.triton_backend import TritonLoraBackend  # noqa: E402
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext  # noqa: E402
+from mstar.engine.resources.step import BucketKey, ResourceStep, Segment, SlotLease, StepContext  # noqa: E402
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config  # noqa: E402
 from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
 
@@ -125,9 +125,11 @@ def check(got, want, what):  # bf16 inputs and weights, plus a bf16 rounding of 
 def eager_step(pool, rows, walk="prefill_text", ingest=True):
     """Admit and plan ``rows`` of (rid, adapter, tokens) as one eager step."""
     for rid, name, _ in rows if ingest else ():
-        pool.ingest_request(rid, LoraReqConfig(adapter=name))
-    step = LoraStep(segments=tuple(Segment(rid, "main", n) for rid, _, n in rows))
-    ctx = StepContext(request_ids=[rid for rid, *_ in rows], graph_walk=walk, slot=0, capture=False)
+        pool.ingest_request(rid, None if name is None else LoraReqConfig(adapter=name))
+    step = ResourceStep(segments=tuple(Segment(rid, "main", n) for rid, _, n in rows))
+    # idle as the engine sets it: no row names an adapter
+    ctx = StepContext(request_ids=[rid for rid, *_ in rows], graph_walk=walk, slot=0, capture=False,
+                      idle=all(name is None for _, name, _ in rows))
     assert pool.admit(step, ctx).ok
     pool.plan(step, ctx)
     return step, ctx
@@ -151,7 +153,7 @@ def bucket_step(pool, rows, lease, capturing=False):
     """A step of (rid, tokens) rows padded to the bucket as the graph runner pads a replay."""
     pad = [-(i + 1) for i in range(len(rows), BUCKET_BS)]
     rids = [rid for rid, _ in rows]
-    step = LoraStep(segments=tuple([Segment(r, "main", n) for r, n in rows] + [Segment(r, "main", 0) for r in pad]))
+    step = ResourceStep(segments=tuple([Segment(r, "main", n) for r, n in rows] + [Segment(r, "main", 0) for r in pad]))
     ctx = StepContext(request_ids=rids, graph_walk="prefill_text", slot=lease.slot, capture=capturing,
                       slot_lease=lease)
     ctx.set_padded_rids([*rids, *pad])
@@ -237,7 +239,7 @@ def test_lm_head_rows_per_request_against_fp32(head_adapters, world):
 @pytest.mark.parametrize("case", ["layers", "layers-compiled", "lm_head"])
 def test_one_capture_serves_every_adapter_mix(adapters, head_adapters, case):
     """Deltas captured once on the zero adapter (as the runner captures), replayed for mixes that
-    move adapters between slots (loads that evict, a base-only batch): bitwise equal to the same
+    move adapters between slots (loads that evict, a batch of base rows): bitwise equal to the same
     rows run eagerly, bucket padding untouched, fp32-accurate. ``layers-compiled`` captures the
     Inductor-compiled function as the runner does; ``lm_head`` has one row per request."""
     head = case == "lm_head"
@@ -267,7 +269,7 @@ def test_one_capture_serves_every_adapter_mix(adapters, head_adapters, case):
     g = torch.Generator(device="cuda").manual_seed(13)
     for mix in mixes:
         for rid, name, _ in mix:
-            pool.ingest_request(rid, LoraReqConfig(adapter=name))
+            pool.ingest_request(rid, None if name is None else LoraReqConfig(adapter=name))
         bucket_step(pool, [(rid, n) for rid, _, n in mix], lease)
         spans = [1 if head else n for *_, n in mix]
         real = sum(spans)

@@ -140,8 +140,6 @@ class _Root(nn.Module):
 
 
 class _Node(nn.Module):  # a node submodule holding the root, as binding sees it
-    lora_segment_rows = True
-
     def __init__(self, root: nn.Module):
         super().__init__()
         self.inner = root
@@ -277,7 +275,7 @@ def test_mixed_batch_matches_each_rows_merged_adapter(name, world, tmp_path):
         unbound = [m(_local_input(case, x, rank, world)) for m in root.modules_run(case)]
         lora_pool = pool(spec, rank, world)
         plan([lora_pool], ROWS)
-        assert bind_module_lora(_Node(root), {"lora": lora_pool}) == ("lora",)
+        bind_module_lora(_Node(root), {"lora": lora_pool})
         off_vocab = None
         with compute(lora_pool):
             bound = [m(_local_input(case, x, rank, world)) for m in root.modules_run(case)]
@@ -420,7 +418,7 @@ def test_unbound_module_runs_the_pre_lora_forward(name):
 
 # --- what binding refuses ------------------------------------------------------------------
 
-def test_binding_refuses_a_second_delta_a_silent_node_a_split_target_and_a_hand_spec(tmp_path):
+def test_binding_refuses_a_second_delta_a_split_target_and_a_hand_spec(tmp_path):
     case = CASES["qkv"]
     paths, _ = _adapters(case, tmp_path)
     spec = serve(_spec(case), paths)
@@ -432,13 +430,7 @@ def test_binding_refuses_a_second_delta_a_silent_node_a_split_target_and_a_hand_
     with pytest.raises(ValueError, match="already holds a LoRA delta"):
         bind_module_lora(node, {"other": pool(spec)})
 
-    # a node that does not say how its rows meet the pool's segments
-    silent, root = nn.Module(), _build(case, CommGroup.trivial(), weights)
-    silent.inner = root
-    with pytest.raises(ValueError, match="lora_segment_rows"):
-        bind_module_lora(silent, {"lora": pool(spec)})
-    assert type(root.layers[0].qkv_proj) is QKVParallelLinear
-
+    root = _build(case, CommGroup.trivial(), weights)
     # a target the pool splits over 2 ranks, on a module built whole: wrong columns
     with pytest.raises(ValueError, match="whole on every rank"):
         bind_module_lora(_Node(root), {"lora": pool(spec, rank=0, world=2)})

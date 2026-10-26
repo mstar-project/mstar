@@ -2,22 +2,18 @@
 
 A request on an adapter fills KV pages that differ from the base model's for the same
 tokens, so its prompt's key chain hangs from a root that names the adapter's weights
-(``AdapterPrefixRoots``). The preprocess worker, which keys prompts, reads each adapter
-once when it is registered; nothing about an adapter travels per step.
+(``adapter_prefix_root``). The API server takes it from the adapter's digest when it
+selects the adapter for a request (``ServedModels``); nothing about an adapter travels
+per step.
 """
 
 from __future__ import annotations
 
 import hashlib
-import logging
-import threading
 
 import torch
 
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.engine.resources.lora.checkpoint import read_lora_file
-
-logger = logging.getLogger(__name__)
 
 # folded into every adapter's root, so no adapter digest can coincide with another use of the chain root
 _NAMESPACE = "lora-adapter"
@@ -47,11 +43,6 @@ def adapter_digest(adapter) -> bytes:
     return hasher.digest()
 
 
-def read_adapter_digest(spec, path: str) -> bytes:
-    """The digest of the adapter at ``path``, read as the pool reads it (``spec.convert_keys``)."""
-    return adapter_digest(read_lora_file(path, convert_keys=spec.convert_keys))
-
-
 def adapter_prefix_root(digest: bytes) -> bytes:
     """The root an adapter's key chains hang from.
 
@@ -59,40 +50,3 @@ def adapter_prefix_root(digest: bytes) -> bytes:
     same weights share pages, and one name reloaded with other weights does not.
     """
     return fingerprint(_NAMESPACE, digest)
-
-
-class AdapterPrefixRoots:
-    """Adapter name -> the root its requests' key chains hang from.
-
-    A name that is not registered has no root, and a request on it must not be keyed
-    at all: keyed under the base model's empty root, its pages would serve base
-    requests. ``register`` and ``unregister`` are the hooks for loading and unloading
-    an adapter at runtime; reads happen on the preprocess thread, writes on whichever
-    thread registers.
-    """
-
-    def __init__(self, roots: dict[str, bytes] | None = None):
-        self._lock = threading.Lock()
-        self._roots: dict[str, bytes] = dict(roots or {})
-
-    @classmethod
-    def read(cls, spec, digests: dict[str, bytes] | None = None) -> "AdapterPrefixRoots":
-        """Register every adapter ``spec`` (a ``LoraSpec``) serves under ``digests``, or,
-        for one not in it, under the digest of its file, read once."""
-        roots = cls()
-        for name, path in spec.adapters.items():
-            digest = (digests or {}).get(name)
-            roots.register(name, digest if digest is not None else read_adapter_digest(spec, path))
-        return roots
-
-    def register(self, name: str, digest: bytes) -> None:
-        with self._lock:
-            self._roots[name] = adapter_prefix_root(digest)
-        logger.info("LoRA %s: prefix-cache root %s", name, digest.hex()[:16])
-
-    def unregister(self, name: str) -> None:
-        with self._lock:
-            self._roots.pop(name, None)
-
-    def root(self, name: str) -> bytes | None:
-        return self._roots.get(name)

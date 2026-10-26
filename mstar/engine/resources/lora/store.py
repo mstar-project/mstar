@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
-from collections.abc import Collection, Sequence
+from collections.abc import Collection
 from dataclasses import dataclass
 
 import torch
@@ -157,31 +157,17 @@ def _classify(spec: LoraSpec, shapes: dict[str, dict[str, tuple[int, ...]]]) -> 
     )
 
 
-def check_adapter_file(
-    spec: LoraSpec, name: str, path: str, others: Sequence[LoraSpec] = (),
-) -> bytes:
-    """The adapter at ``path`` checked against ``spec`` and the model's ``others`` (its
-    LoRA specs for other nodes, a vision tower's say, which serve the same adapters), and
-    read as a worker reads it under each (shapes against the targets included); returns
-    its digest. Raises ``ValueError`` for an adapter the deployment cannot
-    serve."""
-    digest = None
-    for each in (spec, *others):
-        each.check_adapter(name, inspect_adapter(each, path))
-        read = LoraAdapterStore(each, pin=False, dtype=torch.float32).read(name, path).digest
-        # one digest pins the adapter on every spec's pools (``adapter_digests``)
-        if digest is not None and read != digest:
-            raise ValueError(
-                f"LoRA adapter {name!r} digests differently under {each.resource_key!r}; "
-                "a model's LoRA specs must read checkpoints alike (convert_keys)"
-            )
-        digest = read
-    return digest
+def check_adapter_file(spec: LoraSpec, name: str, path: str) -> bytes:
+    """The adapter at ``path`` checked against ``spec`` and read as a worker reads it
+    (shapes against the targets included); returns its digest. Raises ``ValueError``
+    for an adapter the deployment cannot serve."""
+    spec.check_adapter(name, inspect_adapter(spec, path))
+    return LoraAdapterStore(spec, pin=False, dtype=torch.float32).read(name, path).digest
 
 
-def check_adapters(spec: LoraSpec, others: Sequence[LoraSpec] = ()) -> dict[str, bytes]:
-    """Every adapter ``spec`` serves, through ``check_adapter_file`` (against ``others``
-    too); returns each one's digest.
+def check_adapters(spec: LoraSpec) -> dict[str, bytes]:
+    """Every adapter ``spec`` serves, through ``check_adapter_file``; returns each one's
+    digest.
 
     Raises naming every adapter that fails, so a bad adapter in the serving config stops
     the deployment at startup, the same whether or not a worker would have preloaded it.
@@ -190,7 +176,7 @@ def check_adapters(spec: LoraSpec, others: Sequence[LoraSpec] = ()) -> dict[str,
     errors: list[str] = []
     for name, path in spec.adapters.items():
         try:
-            digests[name] = check_adapter_file(spec, name, path, others)
+            digests[name] = check_adapter_file(spec, name, path)
         except Exception as exc:  # noqa: BLE001 - each bad adapter is named below
             errors.append(f"{name!r} at {path}: {exc}")
     if errors:
@@ -274,7 +260,7 @@ class LoraAdapterStore:
         raw = read_lora_file(path, convert_keys=spec.convert_keys)
         if not raw.layers:
             raise ValueError(f"LoRA adapter {name!r} holds no LoRA layers")
-        # modules another spec loads (or the deployment never runs) are not this one's
+        # modules another node's pool loads (or the deployment never runs) are not this one's
         modules = sorted(m for m in raw.layers if not _ignored(spec, m))
         unmapped = [m for m in modules if not _maps(spec, m)]
         if unmapped:

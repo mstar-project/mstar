@@ -10,10 +10,13 @@ target's rows relate to the step's tokens (``rows``), modules it calls outside t
 (``exclude``, ``deferred``), names kept for compatibility (``names``), the prefixes
 adapters write the root under (``adapter_roots``) and adapter-only renames (``aliases``).
 
+``join_lora_specs`` makes one spec of several nodes' (an LLM's and its vision tower's),
+each node's pool holding its own targets (``LoraSpec.for_node``).
+
 ``bind_module_lora`` binds each placed module to its delta when the node's resources
-include the spec's pool (``NodeSubmodule.bind_node_resources`` calls it), checking the
-real, possibly sharded, module against the declaration first. A deployment without a
-``lora:`` block declares no spec, so nothing is bound and every module runs as before.
+include its pool (``NodeSubmodule.bind_node_resources`` calls it), checking the real,
+possibly sharded, module against the declaration first. A deployment without a ``lora:``
+block builds no pool, so nothing is bound and every module runs as before.
 """
 
 from __future__ import annotations
@@ -24,22 +27,19 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.lora.config import LoraModuleRef, LoraSpec, LoraTarget
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, LoraModuleRef, LoraSpec, LoraTarget
 from mstar.model.components.lora.capable import (
     LoraCapable,
     lora_capability,
     make_lora_capable,
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, apply_stacked
-
-if TYPE_CHECKING:
-    from mstar.engine.resources.lora.pool import LoraAdapterPool
 
 logger = logging.getLogger(__name__)
 
@@ -94,13 +94,6 @@ class ModuleLoraMap:
         self._roots = tuple(roots)
         self._aliases = dict(aliases or {})
         self._ignore = tuple(ignore)
-        # the other nodes' maps of the same model (``link``)
-        self._siblings: tuple[ModuleLoraMap, ...] = ()
-
-    def link(self, siblings: Sequence[ModuleLoraMap]) -> None:
-        """Leave a module another node's map of the same model claims more specifically
-        to that map (``link_lora_specs``)."""
-        self._siblings = tuple(m for m in siblings if m is not self)
 
     def _candidates(self, module: str):
         yield self._aliases.get(module, module)
@@ -149,14 +142,36 @@ class ModuleLoraMap:
         )
 
     def ignores(self, module: str) -> bool:
-        """``LoraSpec.ignored_modules``: a module the model never runs (``ignore``), or one
-        another node's spec claims more specifically, which that spec loads or refuses."""
-        if any(fnmatch.fnmatchcase(module, p) for p in self._ignore):
-            return True
-        if not self._siblings:
-            return False
-        own = self.claim(module)
-        return any(s.claim(module) > own for s in self._siblings)
+        """``LoraSpec.ignored_modules``: a module the model never runs (``ignore``)."""
+        return any(fnmatch.fnmatchcase(module, p) for p in self._ignore)
+
+    def part(self, node: str) -> ModuleLoraMap:
+        """The map that binds ``node``'s modules: this one, for one node's spec."""
+        return self
+
+
+class _JoinedLoraMap:
+    """Several nodes' ``ModuleLoraMap``s as one spec's (``join_lora_specs``): a
+    checkpoint module goes to the node whose adapter roots claim it most specifically,
+    which places or refuses it."""
+
+    def __init__(self, parts: Mapping[str, ModuleLoraMap]):
+        self._parts = dict(parts)
+
+    def _claimant(self, module: str) -> ModuleLoraMap:
+        return max(self._parts.values(), key=lambda m: m.claim(module))
+
+    def __call__(self, module: str) -> LoraModuleRef | None:
+        return self._claimant(module)(module)
+
+    def explain(self, module: str) -> str | None:
+        return self._claimant(module).explain(module)
+
+    def ignores(self, module: str) -> bool:
+        return any(m.ignores(module) for m in self._parts.values())
+
+    def part(self, node: str) -> ModuleLoraMap:
+        return self._parts[node]
 
 
 def _match(path: str, patterns) -> str | None:
@@ -187,9 +202,9 @@ def meta_root(build: Callable[[CommGroup], nn.Module]) -> nn.Module:
 def module_lora_spec(
     root: nn.Module,
     *,
-    resource_key: str,
     nodes: set[str],
     root_path: str,
+    resource_key: str = LORA_RESOURCE_KEY,
     rules: CheckpointRules | None = None,
     adapter_stacked_params: Sequence[StackedParamRule] = (),
     adapter_roots: Sequence[AdapterRoot | tuple[str, str]] = (),
@@ -354,15 +369,28 @@ def _target_names(keys: list[tuple[str | None, str]], names: Mapping[str, str]) 
     return out
 
 
-def link_lora_specs(specs: Sequence[LoraSpec]) -> list[LoraSpec]:
-    """A model's specs for several nodes (an LLM and its vision tower), told about each
-    other: each leaves the modules another claims more specifically (``AdapterRoot``) to
-    it, so one adapter file serves both nodes and a module either places is not refused
-    by the other."""
-    maps = [s.module_map for s in specs if isinstance(s.module_map, ModuleLoraMap)]
-    for m in maps:
-        m.link(maps)
-    return list(specs)
+def join_lora_specs(*specs: LoraSpec) -> LoraSpec:
+    """One spec over the nodes of ``specs``, each a node's from ``module_lora_spec`` (an
+    LLM's and its vision tower's): their targets, each naming its node, under the first's
+    key. A checkpoint module is placed by the node whose ``AdapterRoot``s claim it most
+    specifically, so one adapter file serves them all."""
+    targets: dict[str, LoraTarget] = {}
+    parts: dict[str, ModuleLoraMap] = {}
+    for spec in specs:
+        (node,) = spec.nodes
+        if spec.convert_keys is not specs[0].convert_keys:
+            raise ValueError("joined LoRA specs must read checkpoints alike (convert_keys)")
+        for name, target in spec.targets.items():
+            if name in targets:
+                raise ValueError(f"LoRA target {name!r} is declared on two nodes; rename one with `names`")
+            layers = target.layers if target.layers is not None else tuple(range(spec.num_layers))
+            targets[name] = dataclasses.replace(target, node=node, layers=layers)
+        parts[node] = spec.module_map
+    joined = _JoinedLoraMap(parts)
+    return dataclasses.replace(
+        specs[0], nodes=set(parts), num_layers=max(s.num_layers for s in specs), targets=targets,
+        module_map=joined, ignored_modules=joined.ignores,
+    )
 
 
 # -- binding ------------------------------------------------------------------------------
@@ -390,7 +418,7 @@ def _check(module: LoraCapable, declared: LoraTarget, shard: LoraTarget, path: s
     module's own rank-local shape (catches a target split across ranks while the module
     is whole, or the reverse)."""
     own = module.lora_target()
-    plain = dataclasses.replace(declared, layers=None, per_segment=False, token_fold=1)
+    plain = dataclasses.replace(declared, layers=None, node=None, per_segment=False, token_fold=1)
     if own != plain:
         raise ValueError(f"LoRA resource {key!r}: {path} is {own}, but the spec declares {plain}")
     local = module.lora_local_shape()
@@ -403,36 +431,25 @@ def _check(module: LoraCapable, declared: LoraTarget, shard: LoraTarget, path: s
         )
 
 
-def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> tuple[str, ...]:
-    """Bind every module a ``module_lora_spec`` placed to its delta, for each LoRA pool
-    among ``resources``; returns those pools' keys (empty, and nothing touched, when the
-    node serves no adapters).
-
-    The node must have said how its rows meet the pool's segments (``lora_segment_rows``), since
-    a step's ``LoraStep`` is what addresses each row to its adapter."""
+def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> None:
+    """Bind every module a ``module_lora_spec`` placed on this node to its delta, for the
+    node's LoRA pool among ``resources``; nothing is touched when the node serves no
+    adapters. The pool's step is the node's own segments (``Resource.steps_from_segments``),
+    which address each row to its adapter."""
     from mstar.engine.resources.lora.pool import LoraAdapterPool
 
-    pools: list[tuple[str, LoraAdapterPool]] = [
-        (key, r) for key, r in resources.items() if isinstance(r, LoraAdapterPool)
-    ]
-    for key, pool in pools:
-        if not isinstance(pool.spec.module_map, ModuleLoraMap):
+    for key, pool in resources.items():
+        if not isinstance(pool, LoraAdapterPool):
+            continue
+        spec = pool.spec
+        if not isinstance(spec.module_map, ModuleLoraMap | _JoinedLoraMap):
             raise ValueError(
                 f"LoRA resource {key!r} was not declared with `module_lora_spec`, so nothing "
                 "binds the node's modules to it; build the node's spec with `module_lora_spec`"
             )
-    if not pools:
-        return ()
-    if not getattr(submodule, "lora_segment_rows", False):
-        raise ValueError(
-            f"{type(submodule).__name__} serves LoRA adapters but does not say how its rows "
-            "meet them: set `lora_segment_rows = True` when `declare_step`'s segments are, in "
-            "order, the rows its linears see (each a request's span of tokens), and the "
-            "engine adds the LoraStep"
-        )
-    for key, pool in pools:
-        spec = pool.spec
-        module_map: ModuleLoraMap = spec.module_map
+        # a node's pool holds its own targets (`LoraSpec.for_node`)
+        (node,) = spec.nodes
+        module_map = spec.module_map.part(node)
         modules = _locate(submodule, module_map, key)
         for path, ref in module_map.bindings.items():
             if ref.target not in spec.targets:
@@ -452,4 +469,3 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> tupl
                 module.lora_deferred = delta
             else:
                 module.lora_delta = delta
-    return tuple(key for key, _ in pools)

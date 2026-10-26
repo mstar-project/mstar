@@ -3,11 +3,12 @@
 A load is checked here first (against the deployment's ``LoraSpec``: LoRA layers present,
 rank within ``max_rank``, only declared targets, shapes that fit them) and its weights'
 digest taken, then sent with the digest through the conductor to every worker hosting
-the LoRA pool. The name becomes selectable, and its prefix-cache root registered, only
-once the conductor reports that every worker loaded it.
+the LoRA pool. The name becomes selectable, under its digest's prefix-cache root
+(``ServedModels``), only once the conductor reports that every worker loaded it.
 An unload takes the name out of selection first, then tells the workers, whose running
-requests on it finish on its weights; its prefix-cache root is unregistered once the
-conductor confirms, and the name is selectable again if the conductor refused.
+requests on it finish on its weights; the name is selectable again if the conductor
+refused. This process and ``ServedModels`` are the registry of what is served: the
+conductor keeps none.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import concurrent.futures
 import logging
 import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from fastapi import HTTPException
@@ -29,7 +30,7 @@ from mstar.engine.resources.lora.config import (
     describe_load_error,
     resolve_adapter_path,
 )
-from mstar.engine.resources.lora.identity import AdapterPrefixRoots
+from mstar.engine.resources.lora.identity import adapter_prefix_root
 from mstar.engine.resources.lora.store import check_adapter_file
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -45,31 +46,27 @@ logger = logging.getLogger(__name__)
 class _Op:
     name: str
     is_load: bool
-    # the adapter's weight digest, registered as its prefix-cache root once it is loaded
-    digest: bytes | None
+    # the prefix-cache root its requests are keyed under: a load's once it is served, an
+    # unload's restored with the name if the conductor refuses
+    root: bytes
     future: concurrent.futures.Future
 
 
 class LoraAdmin:
-    """``spec`` is the deployment's ``LoraSpec`` (None without LoRA) and ``others`` the
-    model's LoRA specs for other nodes, which a load is checked against too;
-    ``prefix_roots`` the preprocess worker's (None when nothing is prefix-keyed); ``send`` hands a
-    ``ConductorMessage`` to the thread that sends this process's messages to the
-    conductor. ``on_result`` is called from the thread that receives the conductor's."""
+    """``spec`` is the deployment's ``LoraSpec`` (None without LoRA), which a load is
+    checked against; ``send`` hands a ``ConductorMessage`` to the thread that sends this
+    process's messages to the conductor. ``on_result`` is called from the thread that
+    receives the conductor's."""
 
     def __init__(
         self,
         spec: LoraSpec | None,
         served: ServedModels,
-        prefix_roots: AdapterPrefixRoots | None,
         send: Callable[[ConductorMessage], None],
         timeout_s: float = 300.0,
-        others: Sequence[LoraSpec] = (),
     ):
         self._spec = spec
-        self._others = tuple(others)
         self._served = served
-        self._roots = prefix_roots
         self._send = send
         self._timeout_s = timeout_s
         # one load or unload at a time, so "already loaded" and "not found" hold until
@@ -90,9 +87,7 @@ class LoraAdmin:
                 raise ValueError(f"The lora adapter '{name}' has already been loaded.")
             path = resolve_adapter_path(path)
             try:
-                digest = await asyncio.to_thread(
-                    check_adapter_file, self._spec, name, path, self._others,
-                )
+                digest = await asyncio.to_thread(check_adapter_file, self._spec, name, path)
             except Exception as exc:  # noqa: BLE001 - any unreadable or unfit file is the client's
                 # the client sees why the adapter was refused, never what the server's
                 # files hold or whether a path exists
@@ -102,7 +97,7 @@ class LoraAdmin:
                 LoadLoraAdapter(
                     op_id=_op_id(), lora_name=name, lora_path=path, lora_digest=digest.hex(),
                 ),
-                ConductorMessageType.LOAD_LORA_ADAPTER, digest,
+                ConductorMessageType.LOAD_LORA_ADAPTER, adapter_prefix_root(digest),
             )
         return f"Success: LoRA adapter '{name}' added successfully."
 
@@ -113,41 +108,34 @@ class LoraAdmin:
         async with self._serial:
             self._refuse_unanswered(name)
             # Out of selection before any worker hears of it, so no new request names it
-            # while they forget it. Its prefix-cache root stays until the conductor
-            # answers (``on_result``): pages keyed under it hold this adapter's weights
-            # either way, and a refusal then leaves the name exactly as it was.
-            if not self._served.remove(name):
+            # while they forget it; a request already selected keyed its prompt under the
+            # root it took then. A refusal restores the name as it was (``on_result``).
+            root = self._served.remove(name)
+            if root is None:
                 raise HTTPException(
                     status_code=404, detail=f"The lora adapter '{name}' cannot be found.",
                 )
             await self._request(
                 UnloadLoraAdapter(op_id=_op_id(), lora_name=name),
-                ConductorMessageType.UNLOAD_LORA_ADAPTER, None,
+                ConductorMessageType.UNLOAD_LORA_ADAPTER, root,
             )
         return f"Success: LoRA adapter '{name}' removed successfully."
 
     def on_result(self, body: LoraAdapterResult) -> None:
         """The conductor's answer, applied here even when its HTTP request has timed out,
-        so this process agrees with the conductor: a successful load becomes selectable,
-        and an unload either unregisters the root (done) or makes the name selectable
-        again (refused: the conductor still serves it)."""
+        so this process agrees with the workers: a successful load becomes selectable,
+        and a refused unload (one the conductor never sent on) selectable again."""
         with self._ops_lock:
             op = self._ops.pop(body.op_id, None)
         if op is None:
             logger.warning("LoRA: an answer for unknown operation %s", body.op_id)
             return
         if op.is_load and body.error_message is None:
-            # the root first: a request may name the adapter as soon as it is selectable
-            if self._roots is not None and op.digest is not None:
-                self._roots.register(op.name, op.digest)
-            self._served.add(op.name)
+            self._served.add(op.name, op.root)
             logger.info("LoRA adapter %s is now served", op.name)
-        elif not op.is_load:
-            if body.served:
-                self._served.add(op.name)
-                logger.info("LoRA adapter %s: unload refused (%s); still served", op.name, body.error_message)
-            elif self._roots is not None:
-                self._roots.unregister(op.name)
+        elif not op.is_load and body.error_message is not None:
+            self._served.add(op.name, op.root)
+            logger.info("LoRA adapter %s: unload refused (%s); still served", op.name, body.error_message)
         try:
             op.future.set_result(body)
         except concurrent.futures.InvalidStateError:
@@ -173,13 +161,13 @@ class LoraAdmin:
 
     async def _request(
         self, body: LoadLoraAdapter | UnloadLoraAdapter, message_type: ConductorMessageType,
-        digest: bytes | None,
+        root: bytes,
     ) -> None:
         future: concurrent.futures.Future = concurrent.futures.Future()
         with self._ops_lock:
             self._ops[body.op_id] = _Op(
                 name=body.lora_name, is_load=isinstance(body, LoadLoraAdapter),
-                digest=digest, future=future,
+                root=root, future=future,
             )
         self._send(ConductorMessage(message_type=message_type, body=body))
         try:

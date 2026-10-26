@@ -35,7 +35,6 @@ except ImportError:  # collected without package context
     from test_lora_tp_lockstep import _Barrier
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
-from mstar.api_server.data_worker import adapter_prefix_roots  # noqa: E402
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
 from mstar.api_server.lora_admin import LoraAdmin  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs  # noqa: E402
@@ -48,17 +47,11 @@ from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig  # noqa: E402
 from mstar.engine.resources.lora import LORA_ADAPTER_KWARG, LORA_RESOURCE_KEY, LoraReqConfig  # noqa: E402
 from mstar.engine.resources.lora.config import ADAPTER_WEIGHTS_FILE  # noqa: E402
-from mstar.engine.resources.lora.identity import (  # noqa: E402
-    AdapterPrefixRoots,
-    adapter_prefix_root,
-    read_adapter_digest,
-)
+from mstar.engine.resources.lora.identity import adapter_prefix_root  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
-from mstar.engine.resources.lora.serving import lora_specs  # noqa: E402
-from mstar.engine.resources.lora.store import check_adapter_file, check_adapters  # noqa: E402
+from mstar.engine.resources.lora.store import LoraAdapterStore, check_adapters  # noqa: E402
 from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import AdmitRuntimeError  # noqa: E402
-from mstar.model.base import KVLabel, PrefixKeys  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -73,8 +66,15 @@ from mstar.worker.worker import Worker  # noqa: E402
 
 BASE = "qwen3_5_0.8b"
 LORA_CONFIG = {"resources": {"lora": {"adapters": {"sql": "/a"}}}}
+SQL_ROOT = adapter_prefix_root(b"\x01" * 32)
 # a refused load or unload: a ValueError is a 400, an HTTPException carries its status
 REFUSED = (ValueError, HTTPException)
+
+
+def _served(config) -> ServedModels:
+    """As the API server builds it, the configured adapters' digests read at startup."""
+    adapters = ((config.get("resources") or {}).get("lora") or {}).get("adapters") or {}
+    return ServedModels.of(BASE, config, {name: b"\x01" * 32 for name in adapters})
 
 
 def _status(exc: Exception) -> int:
@@ -104,14 +104,14 @@ class _StubAPI:
     def __init__(self, config):
         self.model_name = BASE
         self.model = SimpleNamespace(get_output_sample_rate=lambda modality="audio": 24000)
-        self.served_models = ServedModels.of(BASE, config)
+        self.served_models = _served(config)
         self.lora_admin = None
         self.upload_dir = Path(tempfile.mkdtemp())
         self.last_submit = None
 
     def submit_request(self, **kw):
         # the real APIServer's adapter selection, on this stub's ServedModels
-        kw["model_kwargs"] = APIServer.lora_kwargs(self, kw.pop("model", None), kw.get("model_kwargs"))
+        kw["model_kwargs"] = APIServer.lora_kwargs(self, kw.pop("model", None), kw.get("model_kwargs")).model_kwargs
         self.last_submit = kw
         return kw["request_id"]
 
@@ -210,40 +210,45 @@ def test_a_deployment_without_lora_leaves_its_resources_block_to_the_conductor(r
     config = {"resources": resources}
     served = ServedModels.of(BASE, config)
     assert not served.lora and served.adapters == ()
-    assert lora_specs(object(), config) == []
-    keyed = SimpleNamespace(
-        kv_labels=lambda: {"kv": {"main": KVLabel(keys=PrefixKeys("ids", ("prefill",)))}},
-        get_node_resources=list,
-    )
-    assert adapter_prefix_roots(keyed, config) is None
-
-
-@pytest.mark.parametrize("block", [None, ["sql"]], ids=["bare", "list"])
-def test_a_lora_block_that_is_not_a_mapping_is_left_to_the_conductor(block):
-    """``validate_deployment`` reports it: `resources: lora:` must be a mapping."""
-    assert lora_specs(object(), {"resources": {LORA_RESOURCE_KEY: block}}) == []
 
 
 def test_submit_request_refuses_an_unserved_adapter_kwarg():
-    """``/generate`` and the WebSocket route reach ``submit_request`` with the kwarg; an
-    unloaded adapter is out of ``ServedModels`` at once, so new requests on it are a 400."""
+    """``/generate``, the WebSocket route and the Rust frontend reach ``submit_request``
+    with the kwarg; an adapter the deployment does not serve is a 400, and an unloaded one
+    is out of ``ServedModels`` at once. A served one's prefix-cache root is taken here,
+    with the selection."""
     from api_server_helpers import make_test_api_server
 
     submitted = []
-    served = ServedModels(base=(BASE,), adapters=("sql",), lora=True)
+    served = ServedModels(base=(BASE,), roots={"sql": SQL_ROOT})
     server = make_test_api_server(
         served_models=served, preprocess_worker=SimpleNamespace(new_request=submitted.append),
     )
     common = dict(input_modalities=["text"], output_modalities=["text"], text="hi")
     server.submit_request(**common, model_kwargs={LORA_ADAPTER_KWARG: "sql"}, request_id="a")
     server.submit_request(**common, model="sql", request_id="b")
-    assert [s.model_kwargs[LORA_ADAPTER_KWARG] for s in submitted] == ["sql", "sql"]
-    served.remove("sql")
-    for kwargs in ({LORA_ADAPTER_KWARG: "sql"}, {LORA_ADAPTER_KWARG: 3}):
+    server.submit_request(**common, request_id="base")
+    assert [s.model_kwargs.get(LORA_ADAPTER_KWARG) for s in submitted] == ["sql", "sql", None]
+    assert [s.prefix_root for s in submitted] == [SQL_ROOT, SQL_ROOT, b""]
+    served.remove("sql")  # an unload takes it out of selection at once
+    for kwargs in ({LORA_ADAPTER_KWARG: "nope"}, {LORA_ADAPTER_KWARG: "sql"}, {LORA_ADAPTER_KWARG: 3}):
         with pytest.raises(HTTPException) as err:
             server.submit_request(**common, model_kwargs=kwargs, request_id="c")
         assert err.value.status_code == 400
-    assert len(submitted) == 2 and "c" not in server._live
+    assert len(submitted) == 3 and "c" not in server._live
+
+
+def test_the_conductor_opens_a_request_with_the_specs_config():
+    """The spec builds the request's config from the kwarg, under its declared key, which
+    each node's pool takes; a base-model request carries none, which leaves the pools idle."""
+    conductor = object.__new__(Conductor)
+    conductor.model = SimpleNamespace(get_request_resource_configs=lambda **kw: {})
+    conductor._kv_labels = {}
+    conductor._resource_specs_cache = {LORA_RESOURCE_KEY: make_spec({})}
+    assert conductor._get_resource_configs({LORA_ADAPTER_KWARG: "sql"}, {}) == {
+        LORA_RESOURCE_KEY: LoraReqConfig("sql"),
+    }
+    assert conductor._get_resource_configs({}, {}) == {}
 
 
 # --- the admin endpoints -----------------------------------------------------------------
@@ -301,7 +306,7 @@ def test_the_lora_endpoints_are_404_without_runtime_updates(monkeypatch):
     client, stub = _client(monkeypatch, LORA_CONFIG)
     sent = []
     for spec in (None, SimpleNamespace(runtime_updates=False)):
-        stub.lora_admin = LoraAdmin(spec, ServedModels(base=(BASE,)), None, sent.append)
+        stub.lora_admin = LoraAdmin(spec, ServedModels(base=(BASE,)), sent.append)
         for path, body in _ENDPOINTS:
             assert client.post(path, json=body).status_code == 404
     assert sent == []
@@ -311,7 +316,7 @@ def test_the_lora_endpoints_are_404_without_runtime_updates(monkeypatch):
         LoraAdapterOps(spec, ["worker_0"], out).load(LoadLoraAdapter(op_id="l", lora_name="a", lora_path="/p"))
     assert [a.status for a in out.answers()] == [404, 404] and out.to("worker_0") == []
     # with them on, a malformed name or path is a 400
-    admin = LoraAdmin(SimpleNamespace(runtime_updates=True), ServedModels(base=(BASE,)), None, sent.append)
+    admin = LoraAdmin(SimpleNamespace(runtime_updates=True), ServedModels(base=(BASE,)), sent.append)
     for call in (admin.load("", "/p"), admin.load("a", ""), admin.unload(""), admin.load(BASE, "/p")):
         with pytest.raises(ValueError):
             asyncio.run(call)
@@ -365,7 +370,8 @@ class _Outbox:
         return [m.body for m in self.to("api_server")]
 
 
-def test_a_load_is_selectable_only_once_every_worker_acknowledged(paths):
+def test_a_load_is_answered_only_once_every_worker_acknowledged(paths):
+    """The API server makes the name selectable on the answer (``LoraAdmin.on_result``)."""
     spec = make_spec({"a1": paths["a1"]}, runtime_updates=True)
     out = _Outbox()
     ops = LoraAdapterOps(spec, ["worker_0", "worker_1"], out)
@@ -373,12 +379,9 @@ def test_a_load_is_selectable_only_once_every_worker_acknowledged(paths):
     for worker in ("worker_0", "worker_1"):
         assert [m.message_type for m in out.to(worker)] == [WorkerMessageType.LOAD_LORA_ADAPTER]
     ops.ack(LoraAdapterAck(op_id="op1", worker_id="worker_0"))
-    with pytest.raises(ValueError, match="unknown LoRA adapter 'a2'"):
-        LoraReqConfig(adapter="a2").validate(spec)
     assert out.answers() == []
     ops.ack(LoraAdapterAck(op_id="op1", worker_id="worker_1"))
-    LoraReqConfig(adapter="a2").validate(spec)
-    assert out.answers() == [LoraAdapterResult(op_id="op1", status=200, served=True)]
+    assert out.answers() == [LoraAdapterResult(op_id="op1", status=200)]
 
 
 def test_a_load_a_worker_never_answers_times_out_and_is_undone(paths):
@@ -394,7 +397,6 @@ def test_a_load_a_worker_never_answers_times_out_and_is_undone(paths):
     ops.expire()
     (answer,) = out.answers()
     assert answer.status == 504 and "1 worker(s) did not answer" in answer.error_message
-    assert answer.served is False and "a2" not in spec.adapters
     # undone on every worker: the silent one may still be reading it
     for worker in ("worker_0", "worker_1"):
         assert out.to(worker)[-1].message_type == WorkerMessageType.UNLOAD_LORA_ADAPTER
@@ -414,9 +416,8 @@ class _Deployment:
     """API server, conductor and two workers (TP ranks 0 and 1, each with its own pool)."""
 
     def __init__(self, paths, fail_on: str | None = None):
-        self.roots = AdapterPrefixRoots()
         self.served = ServedModels(base=("base",), lora=True)
-        self.admin = LoraAdmin(make_spec({}, runtime_updates=True), self.served, self.roots, self._to_conductor)
+        self.admin = LoraAdmin(make_spec({}, runtime_updates=True), self.served, self._to_conductor)
         self.ops = LoraAdapterOps(make_spec({}, runtime_updates=True), ["worker_0", "worker_1"], self._from_conductor)
         self.pools, self.workers, self.unload_seen = {}, {}, []
         for rank in range(2):
@@ -428,7 +429,7 @@ class _Deployment:
                 pool.store._read = broken  # the worker's background read fails
             w = self.workers[worker_id] = Worker.__new__(Worker)
             w.worker_id = worker_id
-            w.engine_manager = SimpleNamespace(engine=SimpleNamespace(lora_pools=lambda p=pool: [p]))
+            w.engine_manager = SimpleNamespace(engine=SimpleNamespace(resources={LORA_RESOURCE_KEY: pool}))
             w.communicator = SimpleNamespace(send=self._from_worker)
 
     def _to_conductor(self, message: ConductorMessage):
@@ -445,7 +446,7 @@ class _Deployment:
             return
         if message.message_type == WorkerMessageType.UNLOAD_LORA_ADAPTER:
             name = message.body.lora_name
-            self.unload_seen.append((peer, name in self.served.adapters, self.roots.root(name)))
+            self.unload_seen.append((peer, name in self.served.adapters))
         self.workers[peer]._process_message_list([message])
         _finish_when_read(self.workers[peer])
 
@@ -465,27 +466,27 @@ def test_a_runtime_load_and_unload_end_to_end(paths):
     assert d.load("a1", paths["a1"]) == "Success: LoRA adapter 'a1' added successfully."
     assert all(pool.serves("a1") for pool in d.pools.values())
     assert d.served.adapter_for("a1") == "a1"
-    LoraReqConfig(adapter="a1").validate(d.ops._spec)
-    root = d.roots.root("a1")
-    assert root == adapter_prefix_root(read_adapter_digest(make_spec({}), paths["a1"]))
+    # its requests are keyed under the weights the workers serve
+    root = d.served.check("a1")
+    assert root == adapter_prefix_root(LoraAdapterStore(make_spec({}), pin=False).read("a1", paths["a1"]).digest)
     with pytest.raises(REFUSED) as err:
         d.load("a1", paths["a2"])
     assert _status(err.value) == 400 and "already been loaded" in _message(err.value)
 
     assert d.unload("a1") == "Success: LoRA adapter 'a1' removed successfully."
-    # out of selection before any worker hears of it; keyed until the conductor confirmed
-    assert d.unload_seen == [("worker_0", False, root), ("worker_1", False, root)]
-    assert d.roots.root("a1") is None and d.served.adapters == ()
+    # out of selection before any worker hears of it
+    assert d.unload_seen == [("worker_0", False), ("worker_1", False)]
+    assert d.served.adapters == ()
     assert not any(pool.serves("a1") for pool in d.pools.values())
     with pytest.raises(REFUSED) as err:
         d.unload("a1")
     assert _status(err.value) == 404
 
     d.load("a1", paths["a1"])  # the same weights key under the same root
-    assert d.roots.root("a1") == root
+    assert d.served.check("a1") == root
     d.unload("a1")
     d.load("a1", paths["a2"])  # other weights under the name: another namespace
-    assert d.roots.root("a1") not in (None, root)
+    assert d.served.check("a1") != root
 
 
 def test_a_failed_read_on_one_worker_is_undone_everywhere_without_leaking_the_io_error(paths):
@@ -496,8 +497,7 @@ def test_a_failed_read_on_one_worker_is_undone_everywhere_without_leaking_the_io
     # the I/O error and the worker ids stay in the server log
     assert "/srv/secret" not in _message(err.value) and "worker_1" not in _message(err.value)
     assert not any(pool.serves("a1") for pool in d.pools.values())
-    assert "a1" not in d.pools["worker_0"].store and "a1" not in d.ops._spec.adapters
-    assert d.served.adapters == () and d.roots.root("a1") is None
+    assert "a1" not in d.pools["worker_0"].store and d.served.adapters == ()
 
 
 def test_a_refused_path_tells_the_client_nothing_about_the_servers_files(paths, tmp_path):
@@ -566,12 +566,6 @@ def test_startup_refuses_every_bad_configured_adapter(tmp_path):
     assert "rank 8" in str(err.value)
     # mechanism off: the pool alone preloads only cpu_capacity adapters, and starts
     LoraAdapterPool(make_spec({"good": good, "wide": wide}, cpu_capacity=1), "cpu")
-    # the conductor runs the check when the API server did not
-    conductor = object.__new__(Conductor)
-    conductor.model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({})])
-    conductor.model_config = {"resources": {"lora": {"adapters": {"good": good, "wide": wide}}}}
-    with pytest.raises(ValueError, match="'wide'"):
-        conductor._settle_lora_adapters(None)
 
 
 @pytest.mark.parametrize("pinned", [True, False])
@@ -579,7 +573,7 @@ def test_a_file_changed_on_disk_is_refused_on_every_rank(paths, pinned):
     """a1's file is overwritten after it was checked and before a worker first reads it.
     Mechanism off (no digest pinned): the new weights are served."""
     path = paths["a1"]
-    digest = read_adapter_digest(make_spec({}), path)
+    digest = LoraAdapterStore(make_spec({}), pin=False).read("a1", path).digest
     barrier, pools = _Barrier(2), []
     for rank in range(2):
         # a2 first: the preload reads only it, so a1's first read comes after the change
@@ -622,14 +616,4 @@ def test_a_runtime_load_whose_file_changes_before_the_workers_read_it_is_refused
         d.load("a1", paths["a1"])
     assert _status(err.value) == 400 and "changed on disk" in _message(err.value)
     assert not any(pool.serves("a1") for pool in d.pools.values())
-    assert d.served.adapters == () and d.roots.root("a1") is None
-
-
-def test_specs_that_digest_an_adapter_differently_refuse_it(paths):
-    """One digest pins an adapter on every spec's pools, so specs reading a file into
-    different weights refuse it."""
-    one = make_spec({"a": paths["a1"]})
-    other = make_spec({"a": paths["a1"]}, convert_keys=lambda sd: {k: v * 2 for k, v in sd.items()})
-    other.resource_key = "lora_other"
-    with pytest.raises(ValueError, match="digests differently"):
-        check_adapter_file(one, "a", paths["a1"], [other])
+    assert d.served.adapters == ()
