@@ -5,7 +5,10 @@ inside a CUDA graph that launches once per routing in a rotation, so expert weig
 HBM rather than L2, as in a decode step. The two GEMMs share one alignment, so a row takes the
 BLOCK_SIZE_M whose best gate/up plus best down is fastest. A candidate, and the row that runs now,
 competes only when its output is within the implementation's tolerance of the same kernel's at
-its default tiles (the reference), which allows bf16 accumulation-order noise.
+its default tiles (the reference), which allows bf16 accumulation-order noise. On AMD GPUs the
+tiles run at two stages with one to eight warps, and the best few tiles of each GEMM and
+BLOCK_SIZE_M are timed again across Triton's HIP compiler options (waves_per_eu,
+matrix_instr_nonkdim, kpack), which ride in the row's config.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ import triton.language as tl
 from benchmark.kernels.sweep import BucketResult
 from benchmark.kernels.timing import time_graph
 from mstar.kernels import Choice, TableEntry
+from mstar.platforms import current_platform
 from mstar.utils.fused_moe import kernels
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import MOE_GEMM, get_default_config, invoke_fused_moe_kernel
@@ -25,24 +29,39 @@ from mstar.utils.fused_moe.kernels import MOE_GEMM, get_default_config, invoke_f
 # Decode batch sizes, then prefill chunk sizes; a row takes the counts up to its bucket.
 DEFAULT_BUCKETS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 2048, 4096)
 DECODE_MAX = 128
+# Triton's HIP compiler options, swept for the best tiles on AMD GPUs
+AMD_OPTIONS = {"waves_per_eu": (0, 1, 2, 4), "matrix_instr_nonkdim": (16, 32), "kpack": (1, 2)}
+AMD_SWEPT_TILES = 3  # per GEMM and BLOCK_SIZE_M
 
 
-def candidates(m: int, top_k: int, quick: bool = False) -> Iterator[dict]:
+def candidates(m: int, top_k: int, quick: bool = False, amd: bool | None = None) -> Iterator[dict]:
     """Tile configs worth timing at ``m`` tokens. Up to DECODE_MAX tokens the GEMMs are
-    bandwidth-bound and want narrow row blocks; above, they are compute-bound and want wide ones."""
+    bandwidth-bound and want narrow row blocks; above, they are compute-bound and want wide ones.
+    AMD recommends two stages for Triton GEMMs on CDNA3 (more can run out of LDS), and small
+    tiles often run best on one or two of its 64-wide warps."""
+    if amd is None:
+        amd = current_platform.is_rocm()
+    warps, stages = ((1, 2, 4, 8), (2,)) if amd else ((4, 8), None)
     if m <= DECODE_MAX:
         block_m = (16, 32, 64) if m * top_k >= 256 else (16,)
-        grid = itertools.product(block_m, (32, 64, 128, 256), (64, 128, 256), (4, 8), (2, 3, 4, 5), (1,))
+        grid = itertools.product(block_m, (32, 64, 128, 256), (64, 128, 256), warps, stages or (2, 3, 4, 5), (1,))
     else:
-        grid = itertools.product((32, 64, 128), (64, 128, 256), (64, 128), (4, 8), (2, 3, 4), (1, 8))
+        grid = itertools.product((32, 64, 128), (64, 128, 256), (64, 128), warps, stages or (2, 3, 4), (1, 8))
     for bm, bn, bk, warps, stages, group in grid:
         if bn * bk > 256 * 128 or bm * bn > 128 * 256 or (bm == 64 and bn == 256 and bk == 256):
             continue
-        if quick and (warps == 8 or stages == 2):
+        if quick and (warps == 8 or (stages == 2 and not amd)):
             continue
         yield {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk,
                "GROUP_SIZE_M": group if m > DECODE_MAX else (1 if m <= 64 else 8),
                "num_warps": warps, "num_stages": stages}
+
+
+def amd_variants(cfg: Mapping) -> Iterator[dict]:
+    """``cfg`` under each combination of the HIP options its tiles allow."""
+    for waves, nonk, kpack in itertools.product(*AMD_OPTIONS.values()):
+        if nonk <= min(cfg["BLOCK_SIZE_M"], cfg["BLOCK_SIZE_N"]):
+            yield {**cfg, "waves_per_eu": waves, "matrix_instr_nonkdim": nonk, "kpack": kpack}
 
 
 def as_row(up: Mapping, down: Mapping) -> Choice:
@@ -131,16 +150,33 @@ class MoeGemmSweep:
 
         current_us = pair_us(*self.tiles(current))
         default_us = pair_us(*self.tiles(default_choice))
-        best: dict[str, dict[int, tuple[float, dict]]] = {"up": {}, "down": {}}
+        amd = current_platform.is_rocm()
+        # GEMM -> BLOCK_SIZE_M -> the fastest tiles, best first (several on AMD, for the option sweep)
+        ranked: dict[str, dict[int, list[tuple[float, dict]]]] = {"up": {}, "down": {}}
         tried = rejected = 0
-        for cfg in candidates(m, top_k, self.quick):
+
+        def consider(cfg, gemm, keep) -> None:
+            nonlocal tried, rejected
+            tried += 1
+            us = timed(cfg, gemm)
+            if us is None:
+                rejected += 1
+                return
+            top = ranked[gemm].setdefault(cfg["BLOCK_SIZE_M"], [])
+            top.append((us, cfg))
+            top.sort(key=lambda t: t[0])
+            del top[keep:]
+
+        for cfg in candidates(m, top_k, self.quick, amd):
             for gemm in gemms:
-                tried += 1
-                us = timed(cfg, gemm)
-                if us is None:
-                    rejected += 1
-                elif us < best[gemm].get(cfg["BLOCK_SIZE_M"], (float("inf"),))[0]:
-                    best[gemm][cfg["BLOCK_SIZE_M"]] = (us, cfg)
+                consider(cfg, gemm, AMD_SWEPT_TILES if amd else 1)
+        if amd:
+            for gemm in gemms:
+                for top in list(ranked[gemm].values()):
+                    for _, cfg in list(top):
+                        for variant in amd_variants(cfg):
+                            consider(variant, gemm, AMD_SWEPT_TILES)
+        best = {gemm: {bm: top[0] for bm, top in by_bm.items()} for gemm, by_bm in ranked.items()}
         result = BucketResult(bucket=m, current=current, current_us=current_us, default_us=default_us,
                               best=None, best_us=float("nan"), timed=tried - rejected, rejected=rejected)
         shared = [b for b in best["up"] if b in best["down"]]
