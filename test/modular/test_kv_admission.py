@@ -493,8 +493,8 @@ def test_every_page_an_offload_frees_is_room():
 def test_a_copy_from_the_host_waits_for_the_join_and_comes_out_of_the_allotment():
     kv = host._manager(max_num_pages=20)
     host._on_the_host_only(kv)
-    # "c" holds the first four pages of the prompt "b" finds on the host
-    host._serve(kv, "c", host.SHARED + list(range(900, 900 + 4 * host.PAGE_SIZE)))
+    # only the host holds "b"'s prefix, so "b" can't be admitted past "big"
+    host._serve(kv, "c", list(range(900, 900 + 8 * host.PAGE_SIZE)))
     room = kv._room()
     for rid, prompt in (("big", list(range(500, 500 + (room + 1) * host.PAGE_SIZE))), ("b", host.A_PROMPT + [7, 8])):
         host._ingest(kv, rid, prompt)

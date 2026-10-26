@@ -319,10 +319,23 @@ class KVPageCounts(NamedTuple):
 class Allotment:
     """Pages an admitted request may take from free and evictable pages: its prompt, less the
     cache hits another request holds. ``remaining`` is its share of `KVManager._unused`, and
-    ``prompt`` is the request's prompt in pages, which `requeue` puts back in `_waiting`."""
+    ``prompt`` is the request's prompt in pages, which `requeue` puts back in `_waiting`.
+    ``passed`` is set for a request admitted past the head of `_waiting`, and its allotment then
+    covers its growth too."""
     pages: int
     remaining: int = 0
     prompt: int = 0
+    passed: bool = False
+
+
+@dataclass(slots=True)
+class HeadWait:
+    """Set once the head, the first request in `_waiting`, fails to fit, until it leaves the
+    queue. ``pages`` is what the head last asked for. ``kept`` counts the pages freed during the
+    wait by requests that passed this head or an earlier one. Those pages are kept for the head:
+    no request behind it may be admitted into them, though admitted requests can still take them."""
+    pages: int
+    kept: int = 0
 
 
 @dataclass
@@ -607,6 +620,7 @@ class KVManager(AttentionResource):
         self._waiting: OrderedDict[str, int] = OrderedDict()
         self._allotments: dict[str, Allotment] = {}
         self._unused = 0
+        self._head_wait: HeadWait | None = None
         if _DEBUG_ASSERTS and tp_cache:
             self._arena.trail = (0, 0)
         self._device = device
@@ -2959,6 +2973,7 @@ class KVManager(AttentionResource):
             freed = sum(self._reusable(page) for claim in moved for page in claim.pages)
             if not freed:
                 return 0, set()
+            room = self._room()
             for claim in moved:
                 stream = streams[claim.label]
                 stream.page_indices = []
@@ -2969,6 +2984,7 @@ class KVManager(AttentionResource):
                 if claim.keys:
                     self._cpu_pool.insert_keys(rid, claim.label)
             self._recount(rid)
+            self._keep_for_head(self._allotments.get(rid), room)
             return freed, {claim.label for claim in moved}
 
     def _reusable(self, page: int) -> bool:
@@ -3370,6 +3386,9 @@ class KVManager(AttentionResource):
         with self._lock:
             if _DEBUG_ASSERTS and rid in self._streams:
                 self._report_underuse(rid)
+            if self._waiting and next(iter(self._waiting)) == rid:
+                self._head_wait = None
+            room = self._room()
             allotment = self._allotments.pop(rid, None)
             if allotment is not None:
                 self._unused -= allotment.remaining
@@ -3379,6 +3398,7 @@ class KVManager(AttentionResource):
                     self._release_lease(rid, stream)
                     self._release_hold(rid, stream)
                     self._arena.release(stream.page_indices)
+            self._keep_for_head(allotment, room)
             if self._cpu_pool is not None:
                 self._cpu_pool.remove_request(rid)
             # handle-keyed, and this releases the handle: a survivor would be
@@ -3559,28 +3579,59 @@ class KVManager(AttentionResource):
     def _hold_back(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
     ) -> AdmitOutcome | None:
-        """Return the outcome that holds ``rid`` back, or None once it has an allotment."""
+        """Return the outcome that holds ``rid`` back, or None once it has an allotment.
+
+        While the head doesn't fit, a later request is admitted when it has a hit, no page of the
+        hit is evictable, and its own pages fit, growth included.
+        """
         with self._lock:
             if rid not in self._waiting and (failed := self._enqueue(rid)) is not None:
                 return failed
-            if next(iter(self._waiting)) != rid:
+            head = next(iter(self._waiting)) == rid
+            if not head and not self._may_pass():
                 return _WAIT
             chains = [] if self._index is None else [
                 stream.chain for stream in self._streams[rid].values()
                 if stream.chain is not None and stream.chain.rooted is None
             ]
-        # Requests are queued and removed on one thread only, so ``rid`` is still first in `_waiting`
+        # Requests are queued and removed on one thread only, so ``rid`` keeps its place in `_waiting`
         # once the lock is taken again.
         for chain in chains:
             self._root_chain(chain)
         with self._lock:
             whole, charged = self._hit(rid, node_name, graph_walk, published)
-            need = self._waiting[rid] - whole
-            if need + charged > self._room():
-                return _WAIT
-            self._allotments[rid] = Allotment(pages=need + charged, prompt=self._waiting.pop(rid))
+            if head:
+                need = self._waiting[rid] - whole
+                if need + charged > self._room():
+                    if self._head_wait is None:
+                        self._head_wait = HeadWait(need + charged)
+                    self._head_wait.pages = need + charged
+                    return _WAIT
+                self._head_wait = None
+            else:
+                if not whole or charged:
+                    return _WAIT
+                overrides = self._overrides[rid]
+                need = overrides.pages(self._nodes, overrides.loop_caps, self.config.page_size) - whole
+                if not self._may_pass(need):
+                    return _WAIT
+            self._allotments[rid] = Allotment(
+                pages=need + charged, prompt=self._waiting.pop(rid), passed=not head,
+            )
             self._recount(rid)
             return None
+
+    def _may_pass(self, need: int = 1) -> bool:
+        """True while the head asks for more than the room, and ``need`` pages fit in the room less
+        the pages kept for the head. The default ``need`` is the fewest pages a request takes."""
+        wait, room = self._head_wait, self._room()
+        return wait is not None and wait.pages > room and need <= room - wait.kept
+
+    def _keep_for_head(self, allotment: Allotment | None, room: int) -> None:
+        """When ``allotment`` belongs to a request that passed a head, keep for the waiting head the
+        pages freed since ``room`` was read."""
+        if self._head_wait is not None and allotment is not None and allotment.passed:
+            self._head_wait.kept += self._room() - room
 
     def _enqueue(self, rid: str) -> AdmitOutcome | None:
         """Queue ``rid``, or return why it can never be admitted.
@@ -3603,9 +3654,13 @@ class KVManager(AttentionResource):
         with self._lock:
             allotment = self._allotments.pop(rid)
             self._unused -= allotment.remaining
+            head = next(iter(self._waiting), None)
             self._waiting[rid] = allotment.prompt
-            # back to the front of `_waiting`, so no later request passes ``rid``
+            # back to the front of `_waiting`, or, for a request that passed the head, right behind
+            # it, so `_head_wait` still belongs to that head
             self._waiting.move_to_end(rid, last=False)
+            if allotment.passed:
+                self._waiting.move_to_end(head, last=False)
 
     def _hit(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
