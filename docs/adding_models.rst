@@ -971,7 +971,9 @@ methods are:
 ``check_stop(...) -> set[str]`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
-   terminates.
+   terminates. ``dynamic_loop_iter_counts`` holds the iteration being checked, starting
+   at 0, so if prefill already emitted a token, decode step ``k`` has emitted ``k + 2``
+   and the loop should stop once ``k + 2 >= max_tokens``.
 
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,
