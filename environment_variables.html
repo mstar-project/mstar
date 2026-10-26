@@ -764,7 +764,9 @@ when a launcher starts a deployment’s processes separately: the same
 value in all of them, and a new value per launch (a dead run’s files
 are swept only once no process holds its namespace, and a stopping
 worker unlinks its own files even after its conductor is gone, which
-a reused value would let it do to the next launch’s files).</p></td>
+a reused value would let it do to the next launch’s files).
+The API server logs a warning whenever it keeps a value the launcher
+set.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_SHM_DIR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/dev/shm</span></code> (or <code class="docutils literal notranslate"><span class="pre">/tmp</span></code> if unavailable)</p></td>

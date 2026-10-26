@@ -3035,6 +3035,15 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">token</span> <span class="ow">or</span> <span class="n">token</span> <span class="o">==</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">_MINTED_TOKEN_ENV</span><span class="p">):</span>
         <span class="n">token</span> <span class="o">=</span> <span class="n">secrets</span><span class="o">.</span><span class="n">token_hex</span><span class="p">(</span><span class="mi">8</span><span class="p">)</span>
         <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="n">DEPLOYMENT_TOKEN_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="n">_MINTED_TOKEN_ENV</span><span class="p">]</span> <span class="o">=</span> <span class="n">token</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># Kept as is: processes a launcher starts separately must all derive</span>
+        <span class="c1"># the same names, so mixing in a nonce here would split them apart.</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+            <span class="s2">"</span><span class="si">%s</span><span class="s2">=</span><span class="si">%s</span><span class="s2"> was set by the launcher and is kept. It must be new for every "</span>
+            <span class="s2">"launch: a fixed value (a systemd Environment= line, a pod template "</span>
+            <span class="s2">"shared by replicas or restarts) lets a stopping worker of the "</span>
+            <span class="s2">"previous launch unlink this launch's SHM tensor files. Unset it to "</span>
+            <span class="s2">"have the API server mint one."</span><span class="p">,</span> <span class="n">DEPLOYMENT_TOKEN_ENV</span><span class="p">,</span> <span class="n">token</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">token</span></div>
 
 

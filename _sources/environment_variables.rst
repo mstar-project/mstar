@@ -85,6 +85,8 @@ Communication
        are swept only once no process holds its namespace, and a stopping
        worker unlinks its own files even after its conductor is gone, which
        a reused value would let it do to the next launch's files).
+       The API server logs a warning whenever it keeps a value the launcher
+       set.
    * - ``MSTAR_KV_SHM_DIR``
      - ``/dev/shm`` (or ``/tmp`` if unavailable)
      - Base directory for host-staged KV snapshots when remote KV transfer

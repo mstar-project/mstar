@@ -1933,6 +1933,18 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># -- reclaim ----------------------------------------------------------</span>
 
+<div class="viewcode-block" id="ArenaShmCommunicationManager.unlink_owned_files">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.unlink_owned_files">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">unlink_owned_files</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The spill files, then this arena's own segments, for a process that</span>
+<span class="sd">        is stopping: its exit-time finalizer never runs when a hung teardown</span>
+<span class="sd">        ends in SIGKILL or the watchdog's hard exit. Peers keep the mappings</span>
+<span class="sd">        they have; the finalizer still runs at a normal exit and finds them</span>
+<span class="sd">        gone, and unlinks any segment grown after this call."""</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">unlink_owned_files</span><span class="p">()</span>
+        <span class="n">_unlink_paths</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_own_segment_paths</span><span class="p">))</span></div>
+
+
 <div class="viewcode-block" id="ArenaShmCommunicationManager.close">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.close">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">close</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>

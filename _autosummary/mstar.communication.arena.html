@@ -654,6 +654,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stamps_shm_placement</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.start_read_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stats_summary"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stats_summary()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.unlink_owned_files()</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -830,6 +831,21 @@ and <code class="docutils literal notranslate"><span class="pre">refresh_shm_pla
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.unlink_owned_files">
+<span class="sig-name descname"><span class="pre">unlink_owned_files</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#ArenaShmCommunicationManager.unlink_owned_files"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.unlink_owned_files" title="Link to this definition">#</a></dt>
+<dd><p>The spill files, then this arena’s own segments, for a process that
+is stopping: its exit-time finalizer never runs when a hung teardown
+ends in SIGKILL or the watchdog’s hard exit. Peers keep the mappings
+they have; the finalizer still runs at a normal exit and finds them
+gone, and unlinks any segment grown after this call.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </dd></dl>
 
 </section>
@@ -889,6 +905,7 @@ and <code class="docutils literal notranslate"><span class="pre">refresh_shm_pla
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stamps_shm_placement</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.start_read_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stats_summary"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stats_summary()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.unlink_owned_files()</span></code></a></li>
 </ul>
 </li>
 </ul>
