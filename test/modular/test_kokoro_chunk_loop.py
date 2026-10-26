@@ -127,9 +127,9 @@ def test_every_chunk_is_synthesized_before_the_loop_stops():
             outputs = submodule.forward_batched(
                 SYNTH_WALK, engine_inputs, **submodule.preprocess(SYNTH_WALK, engine_inputs, batch.inputs)
             )
-        assert all(out[AUDIO_CHUNK][0].numel() > 0 for out in outputs.values())
+        assert all(out[AUDIO_CHUNK][0].numel() > 0 for out in outputs.per_rid_outputs.values())
 
-        stops = engine.check_stop_for_batch(batch, outputs)
+        stops = engine.check_stop_for_batch(batch, outputs.per_rid_outputs)
         assert not batch.failed_requests
         for handle, loops in stops.items():
             assert loops == {CHUNK_LOOP}

@@ -19,8 +19,9 @@ captured one is cut into captured-size slices; a chunk longer than every
 frame bucket runs the same code eagerly, at most ``max_batch_frames`` frames
 per call, so no call needs more memory than a capture did.
 
-With ``trim_edge_silence`` the silence at a request's outer edges is cut per
-row once the decoder has run; finding it is a second host read per step.
+With ``trim_edge_silence`` each row also returns, as a span on the device,
+its PCM without the silence at its request's outer edges; the worker cuts the
+row to it once the step has run (``spanned_outputs``).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ import logging
 import os
 import time
 from functools import partial
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -54,7 +55,7 @@ from mstar.model.kokoro.config import (
     SPEED,
     KokoroModelConfig,
 )
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 # One line per batched step (batch size, text bucket, frame groups, ms) when
@@ -104,6 +105,14 @@ def group_by_bucket(
     elif policy != "bucket":
         raise ValueError(f"Unknown frame_grouping {policy!r}; use 'bucket' or 'single'")
     return sorted(groups.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))
+
+
+class Synthesized(NamedTuple):
+    """One step's PCM16 chunks, one per row, and with edge trimming the
+    ``[B, 2]`` span of each to keep."""
+
+    pcm: list[torch.Tensor]
+    spans: torch.Tensor | None
 
 
 def speech_span(audio: torch.Tensor, threshold: float) -> torch.Tensor:
@@ -201,17 +210,28 @@ class KokoroSynthSubmodule(NodeSubmodule):
         """Pad the chunks of the batch to a common phoneme length."""
         del graph_walk, engine_inputs
         device = self.get_device()
+        per_row = [[inp.input_seq_len for inp in inputs]]
+        edges = [inp.kwargs[REQUEST_EDGES] for inp in inputs]
+        trim = self.config.trim_edge_silence and any(map(any, edges))
+        if trim:
+            per_row.extend(zip(*edges, strict=True))
+        # one host-to-device copy: the lengths, and the edges when trimming
+        per_row = torch.tensor(per_row, dtype=torch.long, device=device)
         return {
             "input_ids": pad_sequence(
                 [inp.tensor_inputs["input_ids"].to(device) for inp in inputs],
                 batch_first=True,
                 padding_value=BOUNDARY_TOKEN_ID,
             ),
-            "lengths": torch.tensor([inp.input_seq_len for inp in inputs], dtype=torch.long, device=device),
+            "lengths": per_row[0],
             "style": torch.stack([inp.tensor_inputs["style"].to(device) for inp in inputs]),
             "speed": torch.stack([inp.tensor_inputs["speed"].to(device) for inp in inputs]),
-            "edges": [inp.kwargs[REQUEST_EDGES] for inp in inputs],
+            "edges": per_row[1:] if trim else None,
         }
+
+    def spanned_outputs(self, graph_walk: str) -> frozenset[str]:
+        del graph_walk
+        return frozenset({AUDIO_CHUNK}) if self.config.trim_edge_silence else frozenset()
 
     def forward(
         self,
@@ -221,12 +241,10 @@ class KokoroSynthSubmodule(NodeSubmodule):
         lengths: torch.Tensor,
         style: torch.Tensor,
         speed: torch.Tensor,
-        edges: list[tuple[bool, bool]] | None = None,
+        edges: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> NameToTensorList:
-        del graph_walk, kwargs
-        pcm = self._synthesize(input_ids, lengths, style, speed, engine_inputs.piecewise_runners, edges)
-        return {AUDIO_CHUNK: [pcm[0]]}
+    ) -> BatchedModelOutput:
+        return self.forward_batched(graph_walk, engine_inputs, input_ids, lengths, style, speed, edges, **kwargs)
 
     def forward_batched(
         self,
@@ -236,12 +254,16 @@ class KokoroSynthSubmodule(NodeSubmodule):
         lengths: torch.Tensor,
         style: torch.Tensor,
         speed: torch.Tensor,
-        edges: list[tuple[bool, bool]] | None = None,
+        edges: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         del graph_walk, kwargs
-        chunks = self._synthesize(input_ids, lengths, style, speed, engine_inputs.piecewise_runners, edges)
-        return {rid: {AUDIO_CHUNK: [pcm]} for rid, pcm in zip(engine_inputs.request_ids, chunks, strict=True)}
+        pcm, spans = self._synthesize(input_ids, lengths, style, speed, engine_inputs.piecewise_runners, edges)
+        rids = engine_inputs.request_ids
+        return BatchedModelOutput(
+            per_rid_outputs={rid: {AUDIO_CHUNK: [chunk]} for rid, chunk in zip(rids, pcm, strict=True)},
+            output_spans=None if spans is None else {AUDIO_CHUNK: spans},
+        )
 
     # -- the two halves, captured or eager -------------------------------------
 
@@ -252,11 +274,11 @@ class KokoroSynthSubmodule(NodeSubmodule):
         style: torch.Tensor,
         speed: torch.Tensor,
         runners: dict[str, Any],
-        edges: list[tuple[bool, bool]] | None = None,
-    ) -> list[torch.Tensor]:
-        """One PCM16 chunk per row, sliced to its own length. ``edges`` says per
-        row whether it opens and whether it closes its request; those edges
-        lose their silence when ``trim_edge_silence`` is set."""
+        edges: torch.Tensor | None = None,
+    ) -> Synthesized:
+        """One PCM16 chunk per row, sliced to its own length. ``edges`` (``[2, B]``)
+        says per row whether it opens and whether it closes its request; with
+        it, each row also gets the span that drops the silence at those edges."""
         logging_step = step_logger.isEnabledFor(logging.INFO)
         if logging_step:
             if input_ids.is_cuda:
@@ -264,12 +286,12 @@ class KokoroSynthSubmodule(NodeSubmodule):
             t0 = time.perf_counter()
         d, t_en, pred_dur = self._encode_text(input_ids, lengths, style, speed, runners)
         frame_lengths = pred_dur.sum(dim=1)
-        sizes = frame_lengths.tolist()  # the host read that sizes the decoder
+        sizes = frame_lengths.tolist()  # the one host read
         pcm: list[torch.Tensor | None] = [None] * len(sizes)
         groups = group_by_bucket(sizes, self.config.frame_buckets, self.config.frame_grouping)
         calls = [(bucket, part) for bucket, rows in groups for part in self._frame_batches(bucket, rows, sizes)]
-        trim = self.config.trim_edge_silence and edges is not None and any(map(any, edges))
-        spans: list[torch.Tensor] = []
+        # each row's first and last sample above the threshold, in batch order
+        loud = None if edges is None else torch.empty(len(sizes), 2, dtype=torch.long, device=input_ids.device)
         for bucket, rows in calls:
             index = torch.tensor(rows, device=input_ids.device)
             runner = runners.get(frame_region(bucket)) if bucket is not None else None
@@ -284,20 +306,12 @@ class KokoroSynthSubmodule(NodeSubmodule):
                 audio, _ = self.model.synthesize_frames(
                     d[index], t_en[index], pred_dur[index], style[index], num_frames
                 )
-            if trim:
-                spans.append(speech_span(audio, self.config.edge_silence_threshold))
+            if loud is not None:
+                loud.index_copy_(0, index, speech_span(audio, self.config.edge_silence_threshold))
             audio = (audio.clamp(-1, 1) * PCM16_SCALE).to(torch.int16)
             for i, row in enumerate(rows):
                 pcm[row] = audio[i, : sizes[row] * self.config.samples_per_frame]
-        if trim:
-            # read once, after every decoder call of the step is queued
-            keep = self.config.edge_silence_keep_samples
-            order = [row for _, rows in calls for row in rows]
-            for row, (first, last) in zip(order, torch.cat(spans).tolist(), strict=True):
-                opens, closes = edges[row]
-                start = max(first - keep, 0) if opens else 0
-                end = last + 1 + keep if closes else pcm[row].shape[0]
-                pcm[row] = pcm[row][start:end]
+        spans = None if loud is None else self._edge_spans(loud, frame_lengths, edges)
         if logging_step:
             if input_ids.is_cuda:
                 torch.cuda.synchronize()
@@ -309,7 +323,18 @@ class KokoroSynthSubmodule(NodeSubmodule):
                 [(b, len(r)) for b, r in calls],
                 (time.perf_counter() - t0) * 1000,
             )
-        return pcm
+        return Synthesized(pcm, spans)
+
+    def _edge_spans(self, loud: torch.Tensor, frame_lengths: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
+        """``[B, 2]`` span of each row's PCM: from ``edge_silence_keep_samples``
+        before its first loud sample when the row opens its request, to as far
+        past its last when it closes it, and the whole row otherwise."""
+        keep = self.config.edge_silence_keep_samples
+        length = frame_lengths * self.config.samples_per_frame
+        opens, closes = edges.bool()
+        start = torch.where(opens, (loud[:, 0] - keep).clamp(min=0), 0)
+        end = torch.where(closes, torch.minimum(loud[:, 1] + 1 + keep, length), length)
+        return torch.stack([torch.minimum(start, end), end], dim=1)
 
     def frame_capture_sizes(self, bucket: int) -> list[int]:
         """Batch sizes captured for a frame bucket: ``bs * bucket <= max_batch_frames``."""

@@ -48,7 +48,8 @@ from mstar.model.kokoro.submodules import REQUEST_EDGES, KokoroSynthSubmodule, s
 from mstar.model.kokoro.voices import VoiceRegistry  # noqa: E402
 from mstar.model.kokoro.weight_loader import fold_weight_norm, remap_name  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs  # noqa: E402
+from mstar.worker.worker import Worker  # noqa: E402
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "kokoro.yaml"
 VOCAB = {c: i + 1 for i, c in enumerate("abcdefghij .,!?")}
@@ -634,15 +635,19 @@ def test_submodule_iterates_chunks_and_stops():
         out = submodule.forward_batched(SYNTH_WALK, engine_inputs, **batch)
         _, _, pred_dur = submodule.model(batch["input_ids"], batch["lengths"], batch["style"], batch["speed"])
     for row, rid in enumerate(["r1", "r2"]):
-        pcm = out[rid][AUDIO_CHUNK][0]
+        # uncut: the worker cuts the rows to their spans
+        pcm = out.per_rid_outputs[rid][AUDIO_CHUNK][0]
         assert pcm.dtype == torch.int16
         assert pcm.numel() == int(pred_dur[row].sum()) * config.samples_per_frame
-    batch_r2 = submodule.preprocess(SYNTH_WALK, engine_inputs, [prepared["r2"]])
+    assert out.output_spans[AUDIO_CHUNK].shape == (2, 2)
+    single_inputs = ModelInputsFromEngine(request_ids=["r2"], per_request_info={})
+    batch_r2 = submodule.preprocess(SYNTH_WALK, single_inputs, [prepared["r2"]])
     with torch.no_grad():
-        single = submodule.forward(SYNTH_WALK, engine_inputs, **batch_r2)[AUDIO_CHUNK][0]
+        single = submodule.forward(SYNTH_WALK, single_inputs, **batch_r2).per_rid_outputs["r2"][AUDIO_CHUNK][0]
     # the same chunk alone and inside a padded batch agree to rounding
-    assert single.shape == out["r2"][AUDIO_CHUNK][0].shape
-    assert rel_l2(single.float(), out["r2"][AUDIO_CHUNK][0].float()) < 5e-3
+    batched = out.per_rid_outputs["r2"][AUDIO_CHUNK][0]
+    assert single.shape == batched.shape
+    assert rel_l2(single.float(), batched.float()) < 5e-3
     submodule.cleanup_request(HANDLES["r1"])
     assert HANDLES["r1"] not in submodule.request_states
 
@@ -671,29 +676,58 @@ def _with_silent_edges(model: KokoroTTS, silence: int) -> None:
     model.synthesize_frames = silent_edges
 
 
+def _synth_step(submodule: KokoroSynthSubmodule, lengths: tuple[int, ...], edges: list[tuple[bool, bool]]):
+    """One forward over random chunks with the given request edges, cut to its
+    spans by the worker's own crop."""
+    padded, _, style = _random_batch(5, lengths)
+    inputs = [
+        NodeInputs(
+            tensor_inputs={"input_ids": padded[row, :n], "style": style[row], "speed": torch.tensor(1.0)},
+            kwargs={REQUEST_EDGES: edge},
+            input_seq_len=n,
+        )
+        for row, (n, edge) in enumerate(zip(lengths, edges, strict=True))
+    ]
+    engine_inputs = ModelInputsFromEngine(request_ids=list(range(len(lengths))), per_request_info={})
+    batch = submodule.preprocess(SYNTH_WALK, engine_inputs, inputs)
+    with torch.no_grad():
+        out = submodule.forward_batched(SYNTH_WALK, engine_inputs, **batch)
+    out.span_request_ids = tuple(engine_inputs.request_ids)  # stamped by the engine
+    whole = [out.per_rid_outputs[row][AUDIO_CHUNK][0] for row in engine_inputs.request_ids]
+    if out.output_spans:
+        Worker._crop_to_spans(out)
+    return whole, [out.per_rid_outputs[row][AUDIO_CHUNK][0] for row in engine_inputs.request_ids], out
+
+
 def test_request_edges_lose_their_silence_and_nothing_else():
     config = tiny_config()
     config.edge_silence_keep_ms = 1.0  # 24 samples, under the 100 silent ones
     submodule = KokoroSynthSubmodule(tiny_model(), config)
     _with_silent_edges(submodule.model, silence=100)
     keep = config.edge_silence_keep_samples
-    padded, lengths, style = _random_batch(5, (7, 4, 9, 5))
-    speed = torch.ones(4)
+    lengths = (7, 4, 9, 5)
     # the first chunk of one request, a middle chunk, the last chunk, a one-chunk request
     edges = [(True, False), (False, False), (False, True), (True, True)]
-    with torch.no_grad():
-        whole = submodule._synthesize(padded, lengths, style, speed, {})
-        trimmed = submodule._synthesize(padded, lengths, style, speed, {}, edges)
+    assert submodule.spanned_outputs(SYNTH_WALK) == {AUDIO_CHUNK}
+    whole, trimmed, out = _synth_step(submodule, lengths, edges)
+    assert out.output_spans[AUDIO_CHUNK].dtype == torch.long
     for row, ((opens, closes), full, cut) in enumerate(zip(edges, whole, trimmed, strict=True)):
         head = (100 - keep) if opens else 0
         tail = (100 - keep) if closes else 0
         assert full.shape[0] > 200, row
         # the same samples, minus the cut silence
         assert torch.equal(cut, full[head : full.shape[0] - tail]), row
+        if not (opens or closes):
+            assert cut is full, row
+    # a batch of middle chunks has no edge to trim
+    _, _, middle = _synth_step(submodule, lengths, [(False, False)] * 4)
+    assert middle.output_spans is None
     config.trim_edge_silence = False
-    with torch.no_grad():
-        untouched = submodule._synthesize(padded, lengths, style, speed, {}, edges)
+    assert submodule.spanned_outputs(SYNTH_WALK) == frozenset()
+    untouched, cut, off = _synth_step(submodule, lengths, edges)
+    assert off.output_spans is None
     assert all(torch.equal(a, b) for a, b in zip(untouched, whole, strict=True))
+    assert all(a is b for a, b in zip(untouched, cut, strict=True))
 
 
 def test_openai_adapter_maps_speech_request():
@@ -851,8 +885,8 @@ def test_synthesize_uses_runners_when_they_fit():
     style = torch.randn(3, 16)
     speed = torch.tensor([1.0, 1.0, 1.0])
     with torch.no_grad():
-        eager = submodule._synthesize(padded, lengths, style, speed, {})
-        captured = submodule._synthesize(padded, lengths, style, speed, runners)
+        eager = submodule._synthesize(padded, lengths, style, speed, {}).pcm
+        captured = submodule._synthesize(padded, lengths, style, speed, runners).pcm
     assert runners[text_region(8)].calls == [(8, 3)]
     frame_calls = [c for name, r in runners.items() if name.startswith("frames") for c in r.calls]
     assert sum(bs for _, bs in frame_calls) == 3  # every row went through exactly one frame bucket
@@ -906,7 +940,7 @@ def test_oversized_batch_is_sliced_and_matches_one_pass():
     padded, lengths, style = _random_batch(3, (7, 4, 9, 5, 8))
     speed = torch.tensor([1.0, 0.5, 0.8, 1.2, 0.6])
     with torch.no_grad():
-        sliced = submodule._synthesize(padded, lengths, style, speed, {})
+        sliced = submodule._synthesize(padded, lengths, style, speed, {}).pcm
         text_calls.clear()
         audio, frame_lengths, _ = submodule.model(padded, lengths, style, speed)
     assert text_calls == [5]  # the reference really is one pass
@@ -921,7 +955,7 @@ def test_oversized_batch_calls_stay_bounded():
     padded, lengths, style = _random_batch(4, (7, 4, 9, 5, 8, 6, 9))
     with torch.no_grad():
         # speed 0.3 pushes four rows past the 64-frame bucket, onto the eager path
-        pcm = submodule._synthesize(padded, lengths, style, torch.full((7,), 0.3), {})
+        pcm = submodule._synthesize(padded, lengths, style, torch.full((7,), 0.3), {}).pcm
     assert len(pcm) == 7 and all(p.numel() > 0 for p in pcm)
     assert text_calls == [2, 2, 2, 1]
     assert sum(bs for bs, _ in frame_calls) == 7
