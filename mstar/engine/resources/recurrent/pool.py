@@ -74,11 +74,13 @@ class RecurrentStatePool(Resource):
         config = spec.config
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
-        return cls(device=info.device, config=config)
+        return cls(device=info.device, config=config, name=spec.resource_key)
 
-    def __init__(self, device: torch.device, config: RecurrentStateConfig):
+    def __init__(self, device: torch.device, config: RecurrentStateConfig, name: str = "recurrent_state"):
         self._device = device
         self.config = config
+        # the resource key, for errors
+        self._name = name
 
         # One [num_layers, max_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
@@ -143,16 +145,31 @@ class RecurrentStatePool(Resource):
 
         ``rows`` is the step's addressing (``addressing``), so a captured and an
         eager forward address their slots the same way; padding rows read the
-        sink."""
+        sink. A pool without one refuses (``_need_sink``)."""
+        if self.config.disable_sink_slot:
+            self._need_sink("gather")
         index = rows.slot_indices[: rows.num_rows].long()
         return self._blocks[name][layer_idx].index_select(0, index)
 
     def scatter_(
         self, name: str, rows: RecurrentAddressing, value: torch.Tensor, layer_idx: int = 0,
     ) -> None:
-        """Write ``value [rows, *shape]`` into block ``name`` of these rows' slots."""
+        """Write ``value [rows, *shape]`` into block ``name`` of these rows'
+        slots; padding rows write the sink, which a pool without one refuses."""
+        if self.config.disable_sink_slot:
+            self._need_sink("scatter_")
         index = rows.slot_indices[: rows.num_rows].long()
         self._blocks[name][layer_idx].index_copy_(0, index, value)
+
+    def _need_sink(self, op: str) -> None:
+        # Without a sink, rows with no slot address NO_SLOT, which index_select
+        # and index_copy_ refuse: an IndexError on the CPU, a device-side
+        # assert that kills the worker on CUDA.
+        raise ValueError(
+            f"recurrent state pool {self._name!r} has no sink slot "
+            f"(disable_sink_slot), so {op} has no slot for a padding row; "
+            "unset RecurrentStateConfig.disable_sink_slot to use gather / scatter_"
+        )
 
     @property
     def num_free_slots(self) -> int:
