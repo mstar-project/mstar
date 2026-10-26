@@ -304,6 +304,21 @@ class _Cosmos3Tokenizer:
         return 2
 
 
+@pytest.mark.parametrize("max_tokens", [1, 2, 64])
+def test_command_a_plus_caps_decode_where_its_stop_check_ends_it(max_tokens):
+    from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
+    from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
+
+    llm = CommandAPlusLLMSubmodule(None, SimpleNamespace(eos_token_id=0))
+
+    cap = CommandAPlusModel.get_loop_caps(object.__new__(CommandAPlusModel), max_output_tokens=max_tokens)
+
+    assert cap["decode_loop"] == _stops_after(
+        llm.check_stop, "decode_loop", "decode", 2048,
+        {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
+    ), "the cap and the stop check end decode on different iterations"
+
+
 @pytest.mark.parametrize("max_tokens", [1, 64])
 def test_cosmos3_caps_the_reasoners_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model

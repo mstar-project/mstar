@@ -119,6 +119,14 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - BAGEL runtime for Intel XPU. Pins ``vllm-xpu-kernels==0.1.15.4`` for
        batched token sampling with per-request RNG state on the device.
        Install the matching XPU build of PyTorch.
+   * - ``.[command_a_plus]``
+     - Command A+ runtime: ``flashinfer-python>=0.6.18`` (its one-kernel all-reduce),
+       ``transformers>=5.17`` (the version its Hugging Face parity checks use),
+       ``huggingface-hub``, ``safetensors``, ``mooncake-transfer-engine``, and ``ninja``
+       (speeds up the JIT build of the vendored MoE align kernel). Set ``CUDA_HOME`` to a
+       CUDA toolkit matching PyTorch's so that kernel can build. ``.[all]`` allows older
+       FlashInfer and Transformers for the other models, so add ``.[command_a_plus]``
+       when installing both.
    * - ``.[qwen3_omni]``
      - Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and
        ``ninja`` (speeds up the JIT build of the vendored MoE align kernel).
