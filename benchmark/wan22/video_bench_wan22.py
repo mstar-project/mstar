@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import mimetypes
 import os
 import statistics
 import subprocess
@@ -26,7 +27,7 @@ import time
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from benchmark.wan22.profile_log import RequestProfile, parse_profiles
 
@@ -157,9 +158,16 @@ class GenResult:
     e2e_s: float
     mp4_bytes: int = 0
     error: str = ""
+    mp4: bytes = field(default=b"", repr=False)
 
 
-def _gen_ours(cfg: "CellConfig", prompt: str) -> GenResult:
+def _data_uri(path: str) -> str:
+    mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+    with open(path, "rb") as f:
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
+
+
+def _gen_ours(cfg: "CellConfig", prompt: str, image: str = "") -> GenResult:
     """M* (this repo): POST /v1/videos/generations (JSON); mp4 in data[0].b64_json.
 
     guidance_scale / num_inference_steps / negative_prompt / flow_shift are not
@@ -176,8 +184,9 @@ def _gen_ours(cfg: "CellConfig", prompt: str) -> GenResult:
         "fps": cfg.fps,
         "flow_shift": cfg.flow_shift,
     }
-    if cfg.image_data_uri:
-        payload["image"] = cfg.image_data_uri
+    if image:
+        payload["image"] = _data_uri(image)
+    payload.update(cfg.extra)
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"http://{cfg.host}:{cfg.port}/v1/videos/generations",
@@ -189,19 +198,33 @@ def _gen_ours(cfg: "CellConfig", prompt: str) -> GenResult:
             out = json.load(r)
         dt = time.perf_counter() - t0
         mp4 = base64.b64decode(out["data"][0]["b64_json"])
-        return GenResult(ok=True, e2e_s=dt, mp4_bytes=len(mp4))
+        return GenResult(ok=True, e2e_s=dt, mp4_bytes=len(mp4), mp4=mp4)
     except Exception as e:  # noqa: BLE001
         return GenResult(ok=False, e2e_s=time.perf_counter() - t0, error=f"{type(e).__name__}: {str(e)[:160]}")
 
 
-def _multipart(fields: dict) -> tuple[bytes, str]:
-    """Encode fields as multipart/form-data — vllm-omni's /v1/videos rejects a JSON body."""
+def _multipart(fields: dict, image: str = "") -> tuple[bytes, str]:
+    """Encode fields as multipart/form-data — vllm-omni's /v1/videos rejects a JSON body.
+
+    An i2v conditioning frame goes up as the ``input_reference`` file part, which
+    both vllm-omni and SGLang read.
+    """
     boundary = f"----wan22bench{uuid.uuid4().hex}"
     parts = []
     for key, value in fields.items():
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value)
         parts.append(f"--{boundary}\r\n".encode())
         parts.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
         parts.append(f"{value}\r\n".encode())
+    if image:
+        mime = mimetypes.guess_type(image)[0] or "image/jpeg"
+        with open(image, "rb") as f:
+            data = f.read()
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="input_reference"; '
+                     f'filename="{os.path.basename(image)}"\r\nContent-Type: {mime}\r\n\r\n'.encode())
+        parts.append(data + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
@@ -227,10 +250,10 @@ def _poll_and_download(base: str, vid: str, cfg: "CellConfig", t0: float) -> Gen
         return GenResult(ok=False, e2e_s=time.perf_counter() - t0, error="poll timeout")
     with urllib.request.urlopen(f"{base}/{vid}/content", timeout=120) as r:
         mp4 = r.read()
-    return GenResult(ok=True, e2e_s=time.perf_counter() - t0, mp4_bytes=len(mp4))
+    return GenResult(ok=True, e2e_s=time.perf_counter() - t0, mp4_bytes=len(mp4), mp4=mp4)
 
 
-def _gen_vllm(cfg: "CellConfig", prompt: str) -> GenResult:
+def _gen_vllm(cfg: "CellConfig", prompt: str, image: str = "") -> GenResult:
     """vllm-omni baseline: multipart POST /v1/videos → poll → GET /content.
 
     An async job API, and multipart: ``/v1/videos/sync`` does not exist on the
@@ -251,7 +274,8 @@ def _gen_vllm(cfg: "CellConfig", prompt: str) -> GenResult:
         "flow_shift": cfg.flow_shift,
         "seed": cfg.seed,
     }
-    body, content_type = _multipart(fields)
+    fields.update(cfg.extra)
+    body, content_type = _multipart(fields, image)
     req = urllib.request.Request(base, data=body, headers={"Content-Type": content_type})
     t0 = time.perf_counter()
     try:
@@ -263,7 +287,7 @@ def _gen_vllm(cfg: "CellConfig", prompt: str) -> GenResult:
         return GenResult(ok=False, e2e_s=time.perf_counter() - t0, error=f"{type(e).__name__}: {str(e)[:160]}")
 
 
-def _gen_sglang(cfg: "CellConfig", prompt: str) -> GenResult:
+def _gen_sglang(cfg: "CellConfig", prompt: str, image: str = "") -> GenResult:
     """SGLang-Diffusion baseline: multipart POST /v1/videos → poll → /content.
 
     Same async job API shape as vllm-omni. flow_shift is not a request field
@@ -283,7 +307,8 @@ def _gen_sglang(cfg: "CellConfig", prompt: str) -> GenResult:
         "guidance_scale": cfg.guidance_scale,
         "seed": cfg.seed,
     }
-    body, content_type = _multipart(fields)
+    fields.update(cfg.extra)
+    body, content_type = _multipart(fields, image)
     req = urllib.request.Request(base, data=body, headers={"Content-Type": content_type})
     t0 = time.perf_counter()
     try:
@@ -295,7 +320,8 @@ def _gen_sglang(cfg: "CellConfig", prompt: str) -> GenResult:
         return GenResult(ok=False, e2e_s=time.perf_counter() - t0, error=f"{type(e).__name__}: {str(e)[:160]}")
 
 
-_ENGINES = {"ours": _gen_ours, "vllm": _gen_vllm, "sglang": _gen_sglang}
+# FastVideo's `fastvideo serve` exposes the same async multipart /v1/videos job API.
+_ENGINES = {"ours": _gen_ours, "vllm": _gen_vllm, "sglang": _gen_sglang, "fastvideo": _gen_sglang}
 
 # What the client's measured wall actually spans, per engine. Stamped into every row
 # so a cross-system delta is never read without its measurement boundary.
@@ -306,6 +332,7 @@ TIMING_BOUNDARY = {
     "sglang": "POST /v1/videos (multipart) → poll GET /v1/videos/{{id}} every {poll}ms → GET /content; "
               "includes submit + poll quantisation (+{halfpoll}ms expected bias) + download",
 }
+TIMING_BOUNDARY["fastvideo"] = TIMING_BOUNDARY["sglang"]
 
 
 def _timing_boundary(cfg: "CellConfig") -> str:
@@ -332,10 +359,15 @@ class CellConfig:
     fps: int = PINNED_FPS
     seed: int = PINNED_SEED
     num_prompts: int = 10
+    # Measured requests; 0 means one per prompt. Request i uses prompt i % len(prompts).
+    num_requests: int = 0
     warmup: int = 1
     timeout_s: float = 3600.0
-    image_path: str = ""        # i2v conditioning frame (vllm: file path)
-    image_data_uri: str = ""    # i2v conditioning frame (ours: base64 data URI)
+    # i2v conditioning frames; request i uses images[i % len(images)]. Empty means t2v.
+    images: tuple[str, ...] = ()
+    # Extra request fields merged into every request (JSON body for ours, form fields otherwise).
+    extra: dict = field(default_factory=dict)
+    save_dir: str = ""          # write each measured mp4 here
     log_stats_file: str = ""    # server --log-stats-file (ours: phase breakdown source)
     gpu_index: int = 0
     vram_interval_s: float = 0.05
@@ -418,33 +450,19 @@ def _file_size(path: str) -> int:
 # ---------------------------------------------------------------------------
 # Run one cell: warmup, measured closed-loop, phase parse, schema row.
 # ---------------------------------------------------------------------------
-def _require_supported_task(cfg: CellConfig) -> None:
-    """Refuse an i2v cell on an engine whose client cannot send the image.
-
-    Only ``_gen_ours`` sends a conditioning frame. The baseline clients send a
-    text-only request, so accepting ``--image`` for them would issue a **t2v**
-    generation and then stamp the row ``"task": "i2v"`` — a silently mislabelled
-    measurement, which is worse than no measurement. Fail loudly instead.
-    """
-    if cfg.image_path and cfg.engine != "ours":
-        raise ValueError(
-            f"--image is not supported for --engine {cfg.engine}: this harness's "
-            f"{cfg.engine} client sends no conditioning frame, so the cell would "
-            "silently be a t2v run labelled i2v. Run i2v against --engine ours, or "
-            "extend the client to upload the image before benchmarking i2v here."
-        )
-
-
 def run_cell(cfg: CellConfig, prompts: list[str], gpu_info: dict,
              server_info: dict | None = None) -> dict:
-    _require_supported_task(cfg)
     gen = _ENGINES[cfg.engine]
     server_info = server_info or probe_server_versions(cfg.server_python)
+
+    def request(i: int) -> GenResult:
+        image = cfg.images[i % len(cfg.images)] if cfg.images else ""
+        return gen(cfg, prompts[i % len(prompts)], image)
 
     # -- Warmup, excluded from every metric: the profiler offset is taken after it.
     if cfg.warmup > 0:
         with ThreadPoolExecutor(max_workers=cfg.concurrency) as ex:
-            list(ex.map(lambda i: gen(cfg, prompts[i % len(prompts)]), range(cfg.warmup)))
+            list(ex.map(request, range(cfg.warmup)))
         # Settle so a late-flushed warmup profile lands before we take the offset.
         if cfg.log_stats_file:
             time.sleep(1.5)
@@ -455,10 +473,10 @@ def run_cell(cfg: CellConfig, prompts: list[str], gpu_info: dict,
     poller = VramPoller(cfg.gpu_index, cfg.vram_interval_s)
     poller.start()
 
-    n = min(cfg.num_prompts, len(prompts))
+    n = cfg.num_requests or len(prompts)
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=cfg.concurrency) as ex:
-        results: list[GenResult] = list(ex.map(lambda i: gen(cfg, prompts[i]), range(n)))
+        results: list[GenResult] = list(ex.map(request, range(n)))
     makespan = time.perf_counter() - t0
 
     peak_vram = poller.stop()
@@ -466,6 +484,13 @@ def run_cell(cfg: CellConfig, prompts: list[str], gpu_info: dict,
     # -- Let the server flush the last profile(s) before slicing the log.
     if cfg.log_stats_file:
         time.sleep(1.5)
+
+    if cfg.save_dir:
+        os.makedirs(cfg.save_dir, exist_ok=True)
+        for i, r in enumerate(results):
+            if r.ok:
+                with open(os.path.join(cfg.save_dir, f"{cfg.label}_{i:03d}.mp4"), "wb") as f:
+                    f.write(r.mp4)
 
     oks = [r for r in results if r.ok]
     e2e_client = [r.e2e_s for r in oks]
@@ -500,13 +525,14 @@ def run_cell(cfg: CellConfig, prompts: list[str], gpu_info: dict,
     row = {
         # ---- identity / config ----
         "label": cfg.label,
-        "system": {"ours": "mstar", "vllm": "vllm-omni", "sglang": "sglang-diffusion"}[cfg.engine],
+        "system": {"ours": "mstar", "vllm": "vllm-omni", "sglang": "sglang-diffusion",
+                   "fastvideo": "fastvideo"}[cfg.engine],
         "engine": cfg.engine,
         "model": cfg.model if cfg.engine == "ours" else _baseline_model_id(cfg),
-        "endpoint": {"ours": "/v1/videos/generations", "vllm": "/v1/videos", "sglang": "/v1/videos"}[cfg.engine],
-        # Only the mstar client sends the conditioning image; a baseline i2v request
-        # is refused rather than run as t2v and mislabelled (_require_supported_task).
-        "task": "i2v" if cfg.image_data_uri else "t2v",
+        "endpoint": "/v1/videos/generations" if cfg.engine == "ours" else "/v1/videos",
+        "task": "i2v" if cfg.images else "t2v",
+        "images": list(cfg.images),
+        "extra_fields": cfg.extra,
         "size_wxh": cfg.size,
         "width": int(cfg.size.lower().split("x")[0]),
         "height": int(cfg.size.lower().split("x")[1]),
@@ -529,7 +555,7 @@ def run_cell(cfg: CellConfig, prompts: list[str], gpu_info: dict,
         # What the measured wall actually spans on THIS engine's transport — never
         # compare an e2e across engines without reading this (see TIMING_BOUNDARY).
         "timing_boundary": _timing_boundary(cfg),
-        "poll_interval_s": cfg.poll_interval_s if cfg.engine in ("vllm", "sglang") else None,
+        "poll_interval_s": cfg.poll_interval_s if cfg.engine != "ours" else None,
         # ---- environment ----
         "gpu_name": gpu_info.get("name"),
         "gpu_count": gpu_info.get("count"),
@@ -550,6 +576,7 @@ def run_cell(cfg: CellConfig, prompts: list[str], gpu_info: dict,
         "first_error": first_err,
         # ---- latency / throughput (seconds unless noted) ----
         "e2e_client_s": _stats(e2e_client),
+        "e2e_client_per_request_s": [round(r.e2e_s, 3) if r.ok else None for r in results],
         "makespan_s": makespan,
         "throughput_req_s": (len(oks) / makespan) if makespan > 0 else None,
         "peak_vram_mib": peak_vram,
@@ -768,7 +795,7 @@ def load_prompts(path: str | None, n: int) -> list[str]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["ours", "vllm", "sglang"], required=True)
+    ap.add_argument("--engine", choices=sorted(_ENGINES), required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--model", default="wan22")
@@ -777,6 +804,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--num-prompts", type=int, default=10)
+    ap.add_argument("--num-requests", type=int, default=0,
+                    help="measured requests (default: one per prompt); request i uses prompt i %% num-prompts")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--guidance", type=float, default=PINNED_GUIDANCE_SCALE)
     ap.add_argument("--negative", default=PINNED_NEGATIVE_PROMPT)
@@ -784,7 +813,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fps", type=int, default=PINNED_FPS)
     ap.add_argument("--seed", type=int, default=PINNED_SEED)
     ap.add_argument("--prompts-file", default=None)
-    ap.add_argument("--image", default="", help="i2v conditioning frame (path)")
+    ap.add_argument("--image", nargs="*", default=[],
+                    help="i2v conditioning frame(s); request i uses image i %% len (default: t2v)")
+    ap.add_argument("--extra-json", default="{}", help="extra request fields merged into every request")
+    ap.add_argument("--save-dir", default="", help="save each measured mp4 here")
     ap.add_argument("--log-stats-file", default="", help="server --log-stats-file path (ours: phase source)")
     ap.add_argument("--gpu-index", type=int, default=0)
     ap.add_argument("--vram-interval", type=float, default=0.05)
@@ -803,17 +835,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    image_data_uri = ""
-    if args.image and args.engine == "ours":
-        with open(args.image, "rb") as f:
-            image_data_uri = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
     cfg = CellConfig(
         engine=args.engine, host=args.host, port=args.port, model=args.model,
         size=args.size, frames=args.frames, steps=args.steps, concurrency=args.concurrency,
         guidance_scale=args.guidance, negative_prompt=args.negative, flow_shift=args.flow_shift,
         fps=args.fps, seed=args.seed, num_prompts=args.num_prompts, warmup=args.warmup,
-        timeout_s=args.timeout, image_path=args.image,
-        image_data_uri=image_data_uri, log_stats_file=args.log_stats_file,
+        timeout_s=args.timeout, num_requests=args.num_requests, images=tuple(args.image),
+        extra=json.loads(args.extra_json), save_dir=args.save_dir, log_stats_file=args.log_stats_file,
         gpu_index=args.gpu_index,
         vram_interval_s=args.vram_interval, poll_interval_s=args.poll_interval,
         server_python=args.server_python, label=args.label,

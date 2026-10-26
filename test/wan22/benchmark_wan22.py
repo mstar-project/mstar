@@ -85,12 +85,6 @@ def main() -> None:
     conc_grid = args.concurrency if args.concurrency else DEFAULT_CONCURRENCY
     prompts = load_prompts(args.prompts_file, args.num_prompts)
 
-    image_data_uri = ""
-    if args.image and args.engine == "ours":
-        import base64
-        with open(args.image, "rb") as f:
-            image_data_uri = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
-
     gpu_info = probe_gpu(args.gpu_index)
     # Probed once, from the SERVER's interpreter — not this client's (the baselines
     # run in their own venvs, and a client-stamped torch on a baseline row is a false
@@ -110,7 +104,7 @@ def main() -> None:
                 engine=args.engine, host=args.host, port=args.port, model=args.model,
                 size=args.size, frames=args.frames, steps=steps, concurrency=conc,
                 num_prompts=args.num_prompts, warmup=args.warmup, timeout_s=args.timeout,
-                image_path=args.image, image_data_uri=image_data_uri,
+                images=(args.image,) if args.image else (),
                 log_stats_file=args.log_stats_file,
                 gpu_index=args.gpu_index, vram_interval_s=args.vram_interval,
                 poll_interval_s=args.poll_interval, server_python=args.server_python,
