@@ -1,60 +1,39 @@
-"""Fused-MoE backend choice and launch-config tables, without a GPU.
+"""Fused-MoE backend choice, without a GPU.
 
-AUTO is Triton everywhere. Without a tuned table NVIDIA runs the kernel's own
-default config (same as before backends existed) and AMD adds num_stages=2.
-Tuned tables are found by GPU name and nearest token count. The AITER backend
-refuses unsupported platforms and sizes up front.
+AUTO is Triton everywhere. The Triton backend runs fused_experts, which takes
+the GPU's moe_gemm table (test_fused_moe_config.py covers the lookup) and the
+kernel's own defaults without one. The AITER backend refuses unsupported
+platforms and sizes up front.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import json
 
 import pytest
 import torch
 
 from mstar import platforms
 from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform
-from mstar.utils.fused_moe import backend as backend_module
-from mstar.utils.fused_moe import config as config_module
 from mstar.utils.fused_moe.backend import (
     FusedMoEBackend,
     MoEBackend,
+    MoEProblem,
     TritonFusedMoE,
     make_moe_backend,
 )
-from mstar.utils.fused_moe.config import (
-    CONFIG_DIR,
-    MoEProblem,
-    config_file_name,
-    load_tuned_configs,
-    nearest_config,
-)
-from mstar.utils.fused_moe.kernels import get_default_config
 
 THINKER = MoEProblem(num_experts=128, intermediate_size=768, hidden_size=2048, top_k=8)
 TALKER_TP2 = MoEProblem(num_experts=128, intermediate_size=192, hidden_size=1024, top_k=6)
-LAUNCH_KEYS = {
-    "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M", "num_warps", "num_stages",
-    "waves_per_eu", "matrix_instr_nonkdim", "kpack",
-}
 
 
 @pytest.fixture
 def on_platform(monkeypatch):
-    def use(platform: Platform, device_name: str | None = None) -> Platform:
+    def use(platform: Platform) -> Platform:
         monkeypatch.setattr(platforms, "resolve_platform", lambda: platform)
-        monkeypatch.setattr(backend_module, "device_config_name", lambda: device_name)
-        backend_module._tuned_configs.cache_clear()
         return platform
 
-    yield use
-    backend_module._tuned_configs.cache_clear()
-
-
-def _default(m: int, p: MoEProblem = THINKER) -> dict:
-    return get_default_config(M=m, E=p.num_experts, N=2 * p.intermediate_size, K=p.hidden_size, top_k=p.top_k)
+    return use
 
 
 @pytest.mark.parametrize("kind", ["auto", "triton", MoEBackend.AUTO, MoEBackend.TRITON])
@@ -68,85 +47,6 @@ def test_unknown_backend_is_an_error(on_platform):
     on_platform(CudaPlatform())
     with pytest.raises(ValueError):
         make_moe_backend("cutlass", THINKER)
-
-
-@pytest.mark.parametrize("m", [1, 8, 128, 129, 4096])
-def test_untuned_size_on_nvidia_runs_the_kernel_default(on_platform, m):
-    on_platform(CudaPlatform(), device_name="NVIDIA_H100_80GB_HBM3")
-    backend = make_moe_backend("auto", THINKER)
-    assert backend.config(m) is None  # fused_experts then picks get_default_config itself
-
-
-@pytest.mark.parametrize("m", [1, 8, 128, 129, 4096])
-def test_untuned_size_on_amd_pins_two_stages(on_platform, m):
-    on_platform(RocmPlatform(), device_name="AMD_Instinct_MI300X")
-    backend = make_moe_backend("auto", TALKER_TP2)  # no table ships for these sizes
-    assert backend.config(m) == {**_default(m, TALKER_TP2), "num_stages": 2}
-
-
-def test_tuned_table_is_found_by_device_name_and_nearest_count(on_platform, monkeypatch, tmp_path):
-    table = {
-        "triton_version": "3.7.1",
-        "1": {"BLOCK_SIZE_M": 16, "num_warps": 1},
-        "16": {"BLOCK_SIZE_M": 16, "num_warps": 2},
-        "64": {"BLOCK_SIZE_M": 32, "num_warps": 4},
-    }
-    (tmp_path / config_file_name(THINKER, "Some_GPU")).write_text(json.dumps(table))
-    monkeypatch.setattr(config_module, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(
-        backend_module, "load_tuned_configs",
-        lambda problem, name: load_tuned_configs(problem, name, config_dir=tmp_path),
-    )
-    on_platform(CudaPlatform(), device_name="Some_GPU")
-    backend = make_moe_backend("triton", THINKER)
-    assert backend.config(1)["num_warps"] == 1
-    assert backend.config(8)["num_warps"] == 1  # |8 - 1| < |8 - 16|
-    assert backend.config(9)["num_warps"] == 2
-    assert backend.config(40)["num_warps"] == 2  # tie between 16 and 64 goes to the smaller
-    assert backend.config(1000)["num_warps"] == 4
-
-    on_platform(CudaPlatform(), device_name="Other_GPU")
-    assert make_moe_backend("triton", THINKER).config(1) is None
-
-
-def test_nearest_config_ties_go_to_the_smaller_count():
-    table = {1: {"a": 1}, 3: {"a": 3}}
-    assert nearest_config(table, 2) == {"a": 1}
-    assert nearest_config(table, 0) == {"a": 1}
-    assert nearest_config(table, 10) == {"a": 3}
-
-
-def test_no_gpu_means_no_table():
-    assert load_tuned_configs(THINKER, None) is None
-
-
-def test_file_name_names_the_whole_problem():
-    assert config_file_name(THINKER, "AMD_Instinct_MI300X") == (
-        "E=128,N=768,K=2048,topk=8,device_name=AMD_Instinct_MI300X.json"
-    )
-
-
-def _shipped():
-    # get_config's tables (mstar.utils.fused_moe.tune) share the directory, named without topk
-    return sorted(p for p in CONFIG_DIR.glob("*.json") if ",topk=" in p.name)
-
-
-@pytest.mark.parametrize("path", _shipped(), ids=lambda p: p.name)
-def test_shipped_tables_are_well_formed(path):
-    raw = json.loads(path.read_text())
-    entries = {k: v for k, v in raw.items() if k.isdigit()}
-    assert entries and set(raw) - set(entries) <= {"triton_version"}
-    for m, cfg in entries.items():
-        assert set(cfg) <= LAUNCH_KEYS, (m, cfg)
-        assert {"BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M"} <= set(cfg)
-        assert cfg.get("num_warps", 4) <= 16  # 64-wide waves, so 1024 threads max
-        # compiles but computes garbage on gfx942 with Triton 3.7
-        assert not (cfg.get("kpack") == 2 and cfg["BLOCK_SIZE_K"] < 32), (m, cfg)
-    name = path.name
-    problem = MoEProblem(*(int(part.split("=")[1]) for part in name.split(",")[:4]))
-    device = name.split("device_name=")[1].removesuffix(".json")
-    assert config_file_name(problem, device) == name
-    assert load_tuned_configs(problem, device) == {int(m): c for m, c in entries.items()}
 
 
 def test_aiter_refuses_non_amd_platforms(on_platform):
