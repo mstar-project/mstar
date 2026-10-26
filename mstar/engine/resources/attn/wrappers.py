@@ -35,12 +35,19 @@ DIRECT_PLAN_FLASHINFER_VERSIONS = frozenset({"0.7.2"})
 def _direct_plan_supported() -> bool:
     import flashinfer
 
-    if flashinfer.__version__ in DIRECT_PLAN_FLASHINFER_VERSIONS:
+    # a stand-in module (CPU tests) has no version: not a checked one
+    version = getattr(flashinfer, "__version__", None)
+    if version in DIRECT_PLAN_FLASHINFER_VERSIONS:
         return True
+    checked = ", ".join(sorted(DIRECT_PLAN_FLASHINFER_VERSIONS))
     logger.warning(
-        "FlashInfer %s is not a version the direct planner calls were checked against (%s); "
-        "captured wrappers plan with FlashInfer's plan()",
-        flashinfer.__version__, ", ".join(sorted(DIRECT_PLAN_FLASHINFER_VERSIONS)),
+        "FlashInfer %s is not a version the attention wrappers' direct planner calls were "
+        "checked against (%s), so captured wrappers plan with FlashInfer's plan(), which is "
+        "slower. Install the pinned version (pip install flashinfer-python==%s) to use them.",
+        version, checked, max(
+            DIRECT_PLAN_FLASHINFER_VERSIONS,
+            key=lambda v: tuple(int(p) for p in v.split(".") if p.isdigit()),
+        ),
     )
     return False
 
