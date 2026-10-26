@@ -95,11 +95,10 @@ def test_engine_falls_back_and_attributes_failures():
         register_failure=failures.setdefault,
         step_context=SimpleNamespace(graph_walk="decode"),
     )
-    sub = SimpleNamespace(
-        check_stop_batched=lambda *a: LLMSubmodule.check_stop_batched(_sub(), *a),
-        check_stop=lambda rid, info, out: LLMSubmodule.check_stop(_sub(), rid, info, out),
-    )
-    engine = SimpleNamespace(_submodules={"LLM": SimpleNamespace(submodule=sub)})
+    sub = LLMSubmodule.__new__(LLMSubmodule)
+    sub.config = _sub().config
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"LLM": SimpleNamespace(submodule=sub)}
     tokens = torch.tensor([3, 3])
     outputs = {"a": {"new_token": [tokens[0:1]]}, "x": {"new_token": [tokens[1:2]]}}
     stops = Engine.check_stop_for_batch(

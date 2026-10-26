@@ -999,6 +999,26 @@ def test_qwen3_tts_stops_on_eos_from_routed_codec_tokens():
     }
 
 
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_qwen3_tts_talker_withholds_eos_frames_from_the_codec_stream(ignore_eos):
+    """EOS is not a codebook index, so its frame never reaches the codec,
+    including under ``ignore_eos`` where the loop runs on past it."""
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule.__new__(TalkerSubmodule)
+    submodule.talker_config = config.talker
+    request_info = SimpleNamespace(
+        resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
+    )
+    eos = config.talker.codec_eos_token_id
+
+    def outputs(token):
+        return {"layer0_codes": [torch.tensor(token)], "codec_tokens": [torch.tensor([token, 1, 2, 3])]}
+
+    assert submodule.withheld_outputs("request", request_info, outputs(eos)) == ("codec_tokens",)
+    assert submodule.withheld_outputs("request", request_info, outputs(eos - 1)) == ()
+    assert submodule.withheld_outputs("request", request_info, {}) == ()
+
+
 def test_qwen3_tts_honors_ignore_eos_for_fixed_length_benchmarks():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
@@ -1832,14 +1852,13 @@ def test_qwen3_tts_fused_snake_matches_the_reference_activation():
     torch.testing.assert_close(fused(x), expected, rtol=1e-5, atol=1e-6)
 
 
-def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
+def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape():
     config = _tiny_model_config()
     submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
-    eos = config.talker.codec_eos_token_id
     codes = torch.tensor([
         [1, 2, 3, 4],
-        [eos, 0, 0, 0],
         [5, 6, 7, 8],
+        [9, 10, 11, 12],
     ])
 
     prepared = submodule.prepare_inputs(
@@ -1847,17 +1866,32 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
         SimpleNamespace(request_id="request", rid_handle="request"),
         {"codec_tokens": [codes]},
         input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
-            start_offset=1, context_items=1, num_items=3, is_final=False,
+            start_offset=1, context_items=1, num_items=3, is_final=True,
         )}),
     )
 
-    # Three items (one of them EOS) pad up to the smallest captured window (4).
+    # Three frames pad up to the smallest captured window (4), the one
+    # `cg_key_info` picks from the chunk info alone.
     packed = prepared.tensor_inputs["codec_tokens"]
     assert packed.shape == (4, 4)
-    assert packed[:, :2].t().tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
-    assert packed[:, 2:].count_nonzero().item() == 0
-    assert prepared.kwargs == {"frames": 2, "context": 1, "conv_start": 0, "is_final": False}
+    assert packed[:, :3].t().tolist() == codes.tolist()
+    assert packed[:, 3:].count_nonzero().item() == 0
+    assert prepared.kwargs == {"frames": 3, "context": 1, "conv_start": 0, "is_final": True}
     assert submodule.request_state("request")["codec_bucket"] == 4
+    assert submodule.cg_key_info("codec_chunk", {"request": None}, {
+        "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True)}),
+    }) == 4
+
+    # A stream whose only frame was a withheld EOS ends with an empty chunk: no audio.
+    empty = submodule.prepare_inputs(
+        "codec_chunk", SimpleNamespace(request_id="empty", rid_handle="empty"), {},
+        input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(0, 0, 0, True)}),
+    )
+    assert empty.tensor_inputs["codec_tokens"].shape == (4, 1)
+    assert empty.kwargs["frames"] == empty.kwargs["context"] == 0
+    outputs = {"audio_chunk": [torch.arange(4)]}
+    submodule.postprocess("empty", None, outputs, inputs=empty)
+    assert outputs["audio_chunk"][0].numel() == 0
 
     # A single frame lands in the first ramp bucket; too many frames is an error.
     one = submodule.prepare_inputs(

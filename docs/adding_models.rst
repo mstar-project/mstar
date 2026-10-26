@@ -961,6 +961,13 @@ methods are:
    objects to stop, for example after seeing the EOS token. This is how a decode loop
    terminates.
 
+``withheld_outputs(...) -> Sequence[str]`` (optional)
+   Runs right after ``check_stop`` on the same host copies. Return the names of this
+   step's outputs that are not data for this request and must not be routed, for example
+   a frame streamed alongside the EOS token: its consumer then never receives it, instead
+   of finding and dropping it with a device read. Qwen3-TTS's ``TalkerSubmodule`` keeps
+   its EOS frame out of the codec stream this way.
+
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,
    per-request caches, counters. See Qwen3-Omni's ``Code2WavSubmodule`` for an example.

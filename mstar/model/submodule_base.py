@@ -977,6 +977,23 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return None
 
+    def withheld_outputs(
+        self, request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> Sequence[str]:
+        """Outputs of this step that are not routed for ``request_id``.
+
+        Runs after ``check_stop`` on the same host copies, so it may read
+        values. For an output that a step produces whatever it samples but
+        that is not data for some values, e.g. a frame streamed alongside a
+        stop token: the consumer never receives it, and needs no device read
+        to find and drop it.
+
+        Default: none.
+        """
+        return ()
+
     def cleanup_request(self, request_id: str):
         """Remove per-request state when a request completes. The engines call
         this on request removal; overrides with extra internal state should

@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple, Sequence
 
 import torch
 
@@ -310,6 +310,9 @@ class ExecutingBatch:
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
     failed_requests: dict[int, str] = field(default_factory=dict)
+    # rid -> outputs the stop check found are not data this step
+    # (``NodeSubmodule.withheld_outputs``); the worker does not route them
+    withheld_outputs: dict[int, Sequence[str]] = field(default_factory=dict)
 
     admit_error: AdmitFailedReason | None = None
     # the resource that ran out, so an eviction can be scoped to it
@@ -1825,8 +1828,20 @@ class Engine:
         With ``host_rows``, ``check_stop_batched`` checks the batch in one call;
         if it raises, the per-request path runs so a failure lands on its own
         request.
+
+        Also records each rid's ``submodule.withheld_outputs`` on
+        ``batch.withheld_outputs``, for the caller to leave unrouted.
         """
         submodule = self._submodules[batch.node_name].submodule
+        stops = self._check_stops(submodule, batch, outputs, host_rows)
+        if type(submodule).withheld_outputs is not NodeSubmodule.withheld_outputs:
+            self._collect_withheld_outputs(submodule, batch, outputs)
+        return stops
+
+    def _check_stops(
+        self, submodule: NodeSubmodule, batch: ExecutingBatch,
+        outputs: dict[str, NameToTensorList], host_rows: HostRows | None,
+    ) -> dict[str, set[str]]:
         if host_rows is not None:
             try:
                 ctx = batch.step_context
@@ -1861,6 +1876,28 @@ class Engine:
             if rid_stops:
                 stops[rid] = rid_stops
         return stops
+
+    def _collect_withheld_outputs(
+        self, submodule: NodeSubmodule, batch: ExecutingBatch,
+        outputs: dict[str, NameToTensorList],
+    ) -> None:
+        for rid in batch.request_ids:
+            rid_outputs = outputs.get(rid)
+            if not rid_outputs or rid in batch.failed_requests:
+                continue
+            try:
+                names = submodule.withheld_outputs(
+                    rid, batch.per_request_info_wrapped[rid], rid_outputs
+                )
+            except Exception as error:
+                logger.exception(
+                    "withheld_outputs failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.step_context.graph_walk,
+                )
+                batch.register_failure(rid, error)
+                continue
+            if names:
+                batch.withheld_outputs[rid] = names
 
     def finalize_batch(
         self, batch: ExecutingBatch,

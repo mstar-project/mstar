@@ -811,6 +811,20 @@ class TalkerSubmodule(ARNodeSubmodule):
             return {"talker_decode_loop"}
         return set()
 
+    def withheld_outputs(
+        self,
+        request_id: str,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> tuple[str, ...]:
+        """An EOS frame stays out of the codec stream: EOS is loop control and
+        not a codebook index, and only the host copy here tells it from audio."""
+        del request_id, request_info
+        if "layer0_codes" not in outputs:
+            return ()
+        token = int(outputs["layer0_codes"][0].item())
+        return ("codec_tokens",) if token == self.talker_config.codec_eos_token_id else ()
+
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Admit compatible prefill/decode requests to continuous batching.
 
@@ -1058,46 +1072,40 @@ class CodecSubmodule(ARNodeSubmodule):
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> ARNodeInputs:
-        """Remove EOS frames and pad one stream window to its capture bucket.
+        """Pad one stream window to its capture bucket.
 
         Input arrives as ``[frames, code_groups]``. The official decoder wants
         ``[quantizers, frames]``; every request is padded to the smallest
         captured window that fits so the ramp's windows and the terminal tail
-        all replay CUDA graphs.
+        all replay CUDA graphs. Every item is a frame: the Talker withholds
+        its EOS frame from the stream (``TalkerSubmodule.withheld_outputs``).
         """
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
         state = self.request_state(fwd_info.rid_handle)
-        codes = inputs["codec_tokens"][0].to(
-            device=self.get_device(), dtype=torch.long
-        )
+        received = inputs.get("codec_tokens")
+        if received:
+            codes = received[0].to(device=self.get_device(), dtype=torch.long)
+        else:
+            # a stream whose first frame was EOS ends with an empty chunk
+            codes = torch.zeros(0, self.config.num_code_groups, dtype=torch.long, device=self.get_device())
         if codes.ndim == 1:
             codes = codes.view(-1, self.config.num_code_groups)
         if codes.ndim != 2:
             raise ValueError(
                 f"Expected codec tokens with shape (frames, groups), got {codes.shape}"
             )
-        num_items = codes.shape[0]
-        # EOS belongs to Talker loop control and is not a valid codec codebook
-        # index for waveform reconstruction. It is only ever the last frame of
-        # a stream, so the leading context count is unaffected. A sync: which
-        # window holds that frame is not known on the host.
-        codes = codes[
-            codes[:, 0] != self.config.talker.codec_eos_token_id,
-            :self.config.codec.num_quantizers,
-        ]
+        codes = codes[:, :self.config.codec.num_quantizers]
         frames = codes.shape[0]
-        context = min(chunk.context_items if chunk is not None else 0, frames)
+        context = chunk.context_items if chunk is not None else 0
         # First window frame the conv stack decodes: the new frames' conv context.
         conv_start = context - min(context, self.conv_context) if self.split_decode else 0
-        # The bucket is chosen from the window's item count (EOS included) so
-        # that ``cg_key_info``, which only sees the stream chunk info, agrees.
-        bucket = self._bucket(max(chunk.num_items if chunk is not None else num_items, 1))
+        bucket = self._bucket(max(frames, 1))
         if frames < bucket:
             codes = torch.nn.functional.pad(codes, (0, 0, 0, bucket - frames))
         logger.debug(
-            "codec %s: window items=%d context=%d frames=%d bucket=%d final=%s",
-            fwd_info.request_id, num_items, context, frames, bucket, chunk is not None and chunk.is_final,
+            "codec %s: window context=%d frames=%d bucket=%d final=%s",
+            fwd_info.request_id, context, frames, bucket, chunk is not None and chunk.is_final,
         )
         state.add("codec_bucket", bucket)   # graph-key fallback when a caller has no stream chunk info
         # The window's geometry rides with this pass: under speculative
