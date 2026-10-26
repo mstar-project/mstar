@@ -300,6 +300,18 @@ def test_one_request_brings_several_segments_to_a_captured_step():
     assert plan([16] * 5, leased=False).cu_seqlens_q.tolist() == [0, 16, 32, 48, 64, 80]
 
 
+def test_ragged_output_stays_in_the_resources_dtype(monkeypatch):
+    """Like FlashInfer's: whatever dtype q comes in, the output is the resource's."""
+    monkeypatch.setattr(rocm_ragged, "_varlen", lambda: lambda q, *args, out, **kwargs: out.copy_(q))
+    m = AiterRaggedManager(device=CPU, dtype=torch.bfloat16, config=ragged_config())
+    m.plan(AttentionStep(segments=(Segment("a", "img", 3),), causal=False),
+           StepContext(request_ids=["a"], graph_walk="w", slot=0, capture=False))
+    q = torch.randn(3, 4, 72)
+    out = m.run(q, q, q, "img")
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out, q.to(torch.bfloat16))
+
+
 def test_ragged_cross_pairs_plan_their_own_key_layout():
     m = AiterRaggedCrossManager(device=CPU, dtype=torch.bfloat16, config=ragged_config())
     step = RaggedCrossAttentionStep(
