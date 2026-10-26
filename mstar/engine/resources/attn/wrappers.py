@@ -278,19 +278,22 @@ class FlashInferPrefillWrapper:
                 f"{int(qo_indptr[-1])} query rows in a wrapper captured for {self.max_total_tokens}"
             )
         self.dtype = dtype
-        self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
-        arrays = dict(
-            qo_indptr=qo_indptr, kv_indptr=paged_kv_indptr, indices=self._paged_kv_indices_buf[:n],
-            last_page_len=paged_kv_last_page_len, kv_lens=kv_lens,
-        )
+
+        def stage() -> Arrays:
+            self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
+            return dict(
+                qo_indptr=qo_indptr, kv_indptr=paged_kv_indptr,
+                indices=self._paged_kv_indices_buf[:n],
+                last_page_len=paged_kv_last_page_len, kv_lens=kv_lens,
+            )
 
         def flashinfer_plan(a: Arrays) -> None:
             self._flashinfer_plan(a, causal, dtype, window_left)
 
         if self._replay is None:
-            flashinfer_plan(arrays)
+            flashinfer_plan(stage())
         else:
-            self._replay.plan((dtype, causal, window_left), arrays, flashinfer_plan)
+            self._replay.plan((dtype, causal, window_left), stage, flashinfer_plan)
 
     def _flashinfer_plan(self, a: Arrays, causal: bool, dtype: torch.dtype, window_left: int) -> None:
         self.attn_wrapper.plan(
@@ -313,7 +316,7 @@ class FlashInferPrefillWrapper:
         """``n`` steps at the captured shapes for ``PlanReplay`` to learn
         from, the first using every query row of the bucket: one-token rows,
         an empty last row (as the mixed wrapper's padding), and a first row
-        whose span and length differ in every step."""
+        whose span, length and page count differ in every step."""
         rows, tokens, page = self.batch_size, self.max_total_tokens, self.page_size
         steps = []
         for i in range(n):
@@ -324,7 +327,9 @@ class FlashInferPrefillWrapper:
                 spans[-1] = 0
             spans[0] = max(tokens - int(spans.sum()) - i, 1)
             lens = spans + rng.integers(0, page, rows)
-            lens[0] = spans[0] + 2 * page + i + 1
+            # a page more each step (spans[0] falls by one), so every array
+            # differs from step to step
+            lens[0] = spans[0] + (2 + i) * page + i + 1
             lens[-1] = spans[-1] + i + 1
             steps.append(_paged_step(rng, lens, page, qo_spans=spans))
         return steps
@@ -447,25 +452,28 @@ class FlashInferDecodeWrapper:
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
         n_req = paged_kv_indptr.shape[0] - 1
-        if (
-            self.accelerator_graph and paged_kv_indices.device.type != "cuda"
-            and paged_kv_indices.is_pinned()
-        ):
-            # FlashInfer copies host indices with a blocking copy; page-locked
-            # indices (the KV plan's ring, MSTAR_KV_PINNED_INDPTRS) go in one
-            # non-blocking copy into its own buffer instead, and its copy_ of
-            # that buffer onto itself is a no-op. Pageable indices keep
-            # FlashInfer's path, so the knob is a full toggle.
-            n = paged_kv_indices.shape[0]
-            self._paged_kv_indices_buf[:n].copy_(paged_kv_indices, non_blocking=True)
-            paged_kv_indices = self._paged_kv_indices_buf[:n]
-
         if self.accelerator_graph and n_req != self.batch_size:
             raise ValueError(f"{n_req} rows in a wrapper captured for {self.batch_size}")
-        arrays = dict(
-            kv_indptr=paged_kv_indptr, indices=paged_kv_indices,
-            last_page_len=paged_kv_last_page_len, kv_lens=kv_lens,
-        )
+
+        def stage() -> Arrays:
+            indices = paged_kv_indices
+            if (
+                self.accelerator_graph and indices.device.type != "cuda"
+                and indices.is_pinned()
+            ):
+                # FlashInfer copies host indices with a blocking copy;
+                # page-locked indices (the KV plan's ring,
+                # MSTAR_KV_PINNED_INDPTRS) go in one non-blocking copy into its
+                # own buffer instead, and its copy_ of that buffer onto itself
+                # is a no-op. Pageable indices keep FlashInfer's path, so the
+                # knob is a full toggle.
+                n = indices.shape[0]
+                self._paged_kv_indices_buf[:n].copy_(indices, non_blocking=True)
+                indices = self._paged_kv_indices_buf[:n]
+            return dict(
+                kv_indptr=paged_kv_indptr, indices=indices,
+                last_page_len=paged_kv_last_page_len, kv_lens=kv_lens,
+            )
 
         def flashinfer_plan(a: Arrays) -> None:
             self.attn_wrapper.plan(
@@ -488,9 +496,9 @@ class FlashInferDecodeWrapper:
             range_push("flashinfer.decode.plan_inner", synchronize=False)
         try:
             if self._replay is None or kv_lens is None:
-                flashinfer_plan(arrays)
+                flashinfer_plan(stage())
             else:
-                self._replay.plan((dtype, window_left), arrays, flashinfer_plan)
+                self._replay.plan((dtype, window_left), stage, flashinfer_plan)
         finally:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
