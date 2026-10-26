@@ -50,8 +50,9 @@ class NodeResourceSpec(ABC):
     # Built as one instance per node (``for_node``) rather than one shared by its nodes:
     # for a resource whose nodes share no state and may sit in different lockstep
     # instances (a vision tower beside a tensor-parallel LLM). ``serving_resources``
-    # splits it, so every process sees the instances, keyed ``<resource_key>@<node>``
-    # (``instance_key``); the serving config's block still names the declared key.
+    # splits it, so every process that builds or validates requests (the conductor and
+    # workers) sees the instances, keyed ``<resource_key>@<node>`` (``instance_key``); the
+    # serving config's block still names the declared key.
     per_node: ClassVar[bool] = False
 
     def __post_init__(self):
