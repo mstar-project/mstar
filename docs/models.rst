@@ -319,11 +319,11 @@ Meta's Muse Glimmer 30B: text-and-image chat (video is refused), on ``POST
 
 Three in four layers attend a 2048-token sliding window; every layer writes the
 one paged KV cache, and the sliding layers attend it through a windowed
-attention resource. The paged KV cache has no per-layer-group retention yet (a
-group of sliding-window layers releasing the pages behind its window; see #855
-and #379), so the sliding layers hold their whole history: at 32k tokens about
-3.4x the KV the model needs, which costs concurrent requests, not
-correctness. Sampling defaults to the checkpoint's (temperature 1,
+attention resource. The cache keeps only the window of the sliding layers'
+K/V (``PagedKVConfig.sliding_layers``) and returns the pages behind it to the
+pool, so a 32k-token request holds about 3.4x less KV than with every layer's
+history. A page holds 192 tokens of the full layers, or 64 of the sliding
+ones. Sampling defaults to the checkpoint's (temperature 1,
 top_p 0.95, top_k 64). ``reasoning_effort`` (``low``, ``medium``, ``high``,
 ``xhigh``; default ``high``) sets the template's reasoning strength, and
 ``enable_thinking: false`` means ``low``, as the template has no off: the model
@@ -361,9 +361,10 @@ A request's audio, all its clips together, is capped at the YAML's
 ``model_kwargs: {max_audio_seconds: ...}`` (default 1800), as rank 0 holds the
 clips' encoder outputs until the request's prefill. TP async scheduling
 (``tp_async_sched``) is refused while an encoder shares the LLM's ranks.
-Not yet supported:
+As Glimmer's, the KV cache keeps only the window of the sliding layers; its
+pages hold 184 tokens of the 16 full layers. Not yet supported:
 NVFP4 experts (what the published 8x H200 setups serve), an FP8 KV cache,
-releasing the sliding layers' KV pages, video and the DFlash drafter.
+video and the DFlash drafter.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------

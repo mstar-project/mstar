@@ -127,7 +127,8 @@ def test_rope_off_the_sliding_layers_or_at_another_theta_is_refused(tmp_path, ch
      "rope is a default one"),
     ({"vision_config": {"layer_types": ["window_attention"] * 3 + ["sliding_attention"]}},
      "window and full attention layers"),
-], ids=["projector act", "mlp act", "all sliding", "scaled rope", "vision layer kind"])
+    ({"text_config": {"num_hidden_layers": N_LAYERS + 1}}, "layer_types names"),
+], ids=["projector act", "mlp act", "all sliding", "scaled rope", "vision layer kind", "layer count"])
 def test_a_checkpoint_fact_the_port_builds_in_is_checked(tmp_path, change, match):
     raw = _raw_config()
     for key, value in change.items():
@@ -162,7 +163,7 @@ def test_without_a_softcap_or_multiplier_the_logits_are_the_head_s(tmp_path):
 
 def test_config_reads_the_checkpoint(ckpt_dir):
     cfg = MuseGlimmerConfig.from_hf(ckpt_dir)
-    assert cfg.sliding_layers == [True, True, True, False] * 2
+    assert cfg.is_sliding == [True, True, True, False] * 2
     assert cfg.sliding_window == 5
     assert cfg.attn_scale == pytest.approx(3.87 / 4)
     # the tokenizer's eos and generation_config's <|eot|>
@@ -257,7 +258,7 @@ def _reference_logits(model: MuseGlimmerForCausalLM, ids: torch.Tensor, cfg: Mus
         if cfg.layer_rope_theta[i]:
             pos = torch.arange(ids.shape[0])
             q, k = _rope(q, pos, cfg.rope_theta), _rope(k, pos, cfg.rope_theta)
-        window = cfg.sliding_window - 1 if cfg.sliding_layers[i] else -1
+        window = cfg.sliding_window - 1 if cfg.is_sliding[i] else -1
         a = _attend(q, k, v, hd ** -0.5, window).reshape(-1, nh * hd)
         a = (a * torch.sigmoid(x @ g_w.T)) @ layer.self_attn.o_proj.weight.T
         h = h + _gemma(a, layer.post_attention_layernorm.weight, cfg.post_norm_eps)
@@ -896,14 +897,75 @@ SPARK_TEMPLATE = (
 )
 
 
-@pytest.fixture
-def spark_dir(tmp_path):
+def _spark_dir(tmp_path, raw):
     specials = SPECIALS + AUDIO_SPECIALS
-    raw = _spark_raw()
     raw["audio_token_id"] = specials.index("<|audio|>")
     _write(tmp_path, raw)
     (tmp_path / "generation_config.json").write_text(json.dumps({"eos_token_id": [1, 4]}))
     return _write_tokenizer(tmp_path, specials, SPARK_TEMPLATE)
+
+
+@pytest.fixture
+def spark_dir(tmp_path):
+    return _spark_dir(tmp_path, _spark_raw())
+
+
+def _glimmer_dir(tmp_path, raw):
+    return _write_tokenizer(_write(tmp_path, raw), SPECIALS, TEMPLATE)
+
+
+def _spark_layers(raw: dict) -> dict:
+    """Spark's layer pattern: every fourth layer full, from layer 1."""
+    tc = raw["text_config"]
+    types = ["full_attention" if i % 4 == 1 else "sliding_attention" for i in range(tc["num_hidden_layers"])]
+    tc.update(layer_types=types, layer_rope_theta=[5e5 if t == "sliding_attention" else 0 for t in types])
+    return raw
+
+
+@pytest.mark.parametrize("raw, write_dir, name", [
+    (_raw_config(52), _glimmer_dir, "muse_glimmer"),
+    (_spark_layers(_spark_raw(62)), _spark_dir, "muse_spark"),
+], ids=["glimmer", "spark"])
+def test_the_kv_pool_keeps_only_the_window_of_the_sliding_layers(raw, write_dir, name, tmp_path, monkeypatch):
+    """At each checkpoint's layers (Glimmer's 39 sliding and 13 full, Spark's 46
+    and 16), the cache keeps only the window of the config's sliding layers (by
+    stack index), and each layer of the stack attends through the attention over
+    its own group of the cache."""
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from mstar.engine.resources.attn.base import AttentionManager
+    from mstar.engine.resources.attn.config import check_window_readers
+    from mstar.engine.resources.base import EngineResourceInfo
+    from mstar.model.muse.components.spark import MuseSparkForCausalLM
+    from mstar.model.registry import get_model_class
+
+    model = get_model_class(name)(str(write_dir(tmp_path, raw)))
+    specs = {spec.resource_key: spec for spec in model.get_node_resources()}
+    types = raw["text_config"]["layer_types"]
+    assert specs[KV_CACHE].config.groups[-1].layers == tuple(
+        i for i, t in enumerate(types) if t == "sliding_attention"
+    )
+    check_window_readers(specs)
+    # the managers' plans need no kernels to tell which layers they read
+    wrapper = MagicMock(side_effect=lambda *a, **kw: MagicMock())
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(
+        BatchPrefillWithPagedKVCacheWrapper=wrapper, BatchDecodeWithPagedKVCacheWrapper=wrapper,
+    ))
+    monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
+    info = EngineResourceInfo(device=torch.device("cpu"), dependencies={KV_CACHE: specs[KV_CACHE]})
+    attn = {key: AttentionManager.build(specs[key], info) for key in (ATTN_SLIDING, ATTN_FULL)}
+    lm = (MuseSparkForCausalLM(model.config, moe_parallel=EP) if name == "muse_spark"
+          else MuseGlimmerForCausalLM(model.config))
+    # the LLM node's resources, handed to every module that binds them as bind_node_resources does
+    resources = {KV_CACHE: MagicMock(), ROPE: MagicMock(), **attn}
+    for module in lm.modules():
+        if hasattr(module, "bind_resources"):
+            module.bind_resources(resources)
+    for i, layer in enumerate(lm.model.layers):
+        # what the stack's forward sets; the attention refuses a layer of the other group
+        layer.self_attn.attend.set_layer_idx(i)
 
 
 def test_each_audio_clip_expands_between_the_soft_audio_sentinels(spark_dir):

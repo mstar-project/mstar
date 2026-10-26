@@ -145,6 +145,8 @@ class MuseGlimmerModel(MultimodalDecoderModel):
 
         top_bucket = VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
         max_segments = 4 * (top_bucket // vision.window_patches ** 2)
+        # each layer of the stack is the cache's layer at its stack index
+        sliding = tuple(i for i, s in enumerate(cfg.is_sliding) if s)
         return [
             KVSpec(
                 resource_key=KV_CACHE, nodes={"LLM"},
@@ -154,6 +156,9 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                     head_dim=cfg.head_dim,
                     max_seq_len=cfg.max_position_embeddings,
                     num_qo_heads=cfg.num_attention_heads,
+                    # the sliding layers keep only their window's K/V
+                    sliding_window=cfg.sliding_window,
+                    sliding_layers=sliding,
                 ),
             ),
             AttentionSpec(

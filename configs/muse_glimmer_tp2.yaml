@@ -1,5 +1,15 @@
 model: "muse_glimmer"
 max_seq_len: 32768
+
+resources:
+  kv_cache:
+    # One KV head a rank: 26 KiB a token, 4.9 MiB a page of 192, 6.5 GiB a rank. The
+    # same pages as muse_glimmer.yaml, so the same 71 requests of 8K tokens or 24
+    # of 32K (31 or 7 keeping every layer's K/V; benchmark/kv_capacity.py).
+    # max_num_pages counts pages of page_size, as in muse_glimmer.yaml.
+    page_size: 192
+    max_num_pages: 1365
+
 node_groups:
   # Two KV heads, so TP past 2 replicates the KV cache and saves no memory.
   - node_names: [vision_encoder]

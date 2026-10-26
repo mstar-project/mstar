@@ -10,7 +10,7 @@ model_kwargs:
 resources:
   kv_cache:
     # 62 layers x 2 KV heads a rank x 64 dims x 2 (k, v) x bf16 = 31.7 KB a
-    # token a rank, 4.06 MB a page of 128. ~52 GB of a B300 left after
+    # token a rank, 5.84 MB a page of 184. ~52 GB of a B300 left after
     # weights, activations, graphs and MoE scratch (the experts take long
     # prompts in chunks of 8192 tokens, so ~3 GB at any length). Every rank
     # takes this page count, and rank 0 also runs the media encoders: the
@@ -19,9 +19,16 @@ resources:
     # row keep, measured on an H200), so ~4.5 GB stay free, less ~250 KB a
     # second of audio for each clip in flight: the clip (48 KB/s) and its
     # chunks' outputs, which the loop holds on rank 0 until its last chunk
-    # (8192 bf16 a 80 ms token, 205 KB/s): 11000 pages, 1.4M tokens.
+    # (8192 bf16 a 80 ms token, 205 KB/s): 7652 pages, 44.7 GB.
     # To be measured on the box.
-    max_num_pages: 11000
+    # A request holds a page per 184 tokens of the 16 full layers but only the
+    # last ~2048 tokens of the 46 sliding ones (all of a prompt's until its
+    # prefill commits), so this holds 383 requests of 8K tokens, 138 of 32K or
+    # 37 of 128K, where keeping every layer's K/V held 170, 42 or 10
+    # (benchmark/kv_capacity.py, which reruns these after a change). page_size
+    # is the derived 184, not pinned here: the startup validation's stub
+    # checkpoint can't split a 184-token page.
+    max_num_pages: 7652
   audio_conv:
     # The audio tower's convs' left context between chunks, 92 KB a slot. A
     # clip holds a slot from its first chunk to its last, so this bounds the
