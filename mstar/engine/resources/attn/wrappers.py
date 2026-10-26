@@ -22,12 +22,16 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# FlashInfer versions the direct planner calls (``_plan_direct``) were checked
-# against: test_flashinfer_direct_plan.py and test_attn_mixed_split.py compare
-# them with FlashInfer's own ``plan()`` on a GPU. They restate its planner
-# arguments and per-plan state, so on any other version a captured wrapper
-# plans with ``plan()`` until those tests pass there and it is added here.
-# pyproject.toml pins the same version.
+# A captured wrapper's later plans call FlashInfer's planner module directly
+# (``_plan_direct``): most of FlashInfer's ``plan()`` is Python that gives the
+# same answer every step of a captured bucket. vLLM and SGLang do the same
+# (vLLM's fast_plan_decode over FlashInfer's fast_decode_plan, SGLang's
+# fast_prefill_plan) with FlashInfer pinned to one version, because the
+# direct call restates FlashInfer's planner arguments and per-plan state.
+# So it runs only on the versions here, which test_flashinfer_direct_plan.py
+# and test_attn_mixed_split.py have compared with ``plan()`` on a GPU; on any
+# other, a captured wrapper plans with ``plan()``. pyproject.toml pins the
+# same version.
 DIRECT_PLAN_FLASHINFER_VERSIONS = frozenset({"0.7.2"})
 
 
@@ -78,6 +82,32 @@ def check_flashinfer_head_dim(head_dim: int, device: torch.device | None = None)
         )
 
 
+def _prefill_plan_is_direct(w) -> bool:
+    """Whether FlashInfer prefill wrapper ``w``'s plan resolved to the one
+    path ``_plan_direct`` reproduces, on a checked FlashInfer version: fa2 or
+    fa3 under a graph, no custom mask, prefix items, window, soft cap or
+    position encoding, a 16-bit KV."""
+    return (
+        _direct_plan_supported()
+        and w._backend in ("fa2", "fa3") and w.is_cuda_graph_enabled and w._jit_module is None
+        and w._cached_module is not None and w._custom_mask_buf is None
+        and w._prefix_len_ptr is None and w._window_left == -1
+        and w._logits_soft_cap == 0.0 and w._pos_encoding_mode == "NONE"
+        and w._cached_kv_data_type in (torch.bfloat16, torch.float16)
+        and w._max_total_num_rows is not None
+    )
+
+
+def _decode_plan_is_direct(w) -> bool:
+    """Whether FlashInfer decode wrapper ``w``'s plan resolved to the one
+    path ``_plan_direct`` reproduces, on a checked FlashInfer version: fa2
+    tensor-core decode under a graph, one query token per row, no window."""
+    return (
+        _direct_plan_supported()
+        and w._backend == "fa2" and w.use_tensor_cores and w.is_cuda_graph_enabled
+        and not getattr(w, "_uses_cudnn", False) and w._jit_module is None
+        and getattr(w, "_q_len_per_req", 1) in (None, 1) and w._window_left == -1
+    )
 
 
 class FlashInferPrefillWrapper:
@@ -252,7 +282,7 @@ class FlashInferPrefillWrapper:
                     kv_lens, paged_kv_indices,
                 )
             )
-            self.plan_staged(
+            self._plan_staged(
                 qo_indptr, paged_kv_indptr, self._pinned["indices"][:n],
                 paged_kv_last_page_len, kv_lens, causal, dtype, window_left,
             )
@@ -283,7 +313,7 @@ class FlashInferPrefillWrapper:
                 qo_indptr = qo_indptr.to(self.device, non_blocking=True)
             self._qo_indptr_buf = qo_indptr
 
-    def plan_staged(
+    def _plan_staged(
         self, qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len,
         kv_lens, causal: bool, dtype: torch.dtype, window_left: int = -1,
     ) -> None:
@@ -318,22 +348,11 @@ class FlashInferPrefillWrapper:
     def _direct_planner_args(self, causal: bool) -> list | None:
         """FlashInfer's planner arguments for this wrapper, fixed but for the
         host indptrs and lengths, when its plan resolved to the one path
-        ``_plan_direct`` reproduces (fa2 or fa3 under a graph, no custom mask,
-        prefix items, window, soft cap or position encoding, a 16-bit KV); else
-        None.
-        As for decode, the rest of FlashInfer's ``plan`` gives the same answer
-        for every step of a captured bucket."""
+        ``_plan_direct`` reproduces (``_prefill_plan_is_direct``); else None.
+        Restating them is what vLLM and SGLang do too, on a pinned FlashInfer
+        (see ``DIRECT_PLAN_FLASHINFER_VERSIONS``)."""
         w = self.attn_wrapper
-        if not _direct_plan_supported():
-            return None
-        if not (
-            w._backend in ("fa2", "fa3") and w.is_cuda_graph_enabled and w._jit_module is None
-            and w._cached_module is not None and w._custom_mask_buf is None
-            and w._prefix_len_ptr is None and w._window_left == -1
-            and w._logits_soft_cap == 0.0 and w._pos_encoding_mode == "NONE"
-            and w._cached_kv_data_type in (torch.bfloat16, torch.float16)
-            and w._max_total_num_rows is not None
-        ):
+        if not _prefill_plan_is_direct(w):
             return None
         args = [
             w._float_workspace_buffer, w._int_workspace_buffer, w._pin_memory_int_workspace_buffer,
@@ -546,21 +565,13 @@ class FlashInferDecodeWrapper:
     def _direct_planner_args(self, n_req: int) -> list | None:
         """FlashInfer's planner arguments for this wrapper, fixed but for the
         indptr and lengths, when its plan resolved to the one path
-        ``_plan_direct`` reproduces (fa2 tensor-core decode under a graph,
-        one query token per row, no window, no split override); else None.
-
-        Everything else FlashInfer's ``plan`` does per call (dtype and
-        backend resolution, frozen-shape checks, the module lookup) gives the
-        same answer for every step of a captured bucket. As FlashInfer's own
-        ``fast_decode_plan``, it sets no per-step state but the plan."""
+        ``_plan_direct`` reproduces (``_decode_plan_is_direct``); else None.
+        Restating them is what vLLM and SGLang do too, on a pinned FlashInfer
+        (see ``DIRECT_PLAN_FLASHINFER_VERSIONS``). As FlashInfer's own
+        ``fast_decode_plan``, the direct path sets no per-step state but the
+        plan."""
         w = self.attn_wrapper
-        if not _direct_plan_supported():
-            return None
-        if not (
-            w._backend == "fa2" and w.use_tensor_cores and w.is_cuda_graph_enabled
-            and not getattr(w, "_uses_cudnn", False) and w._jit_module is None
-            and getattr(w, "_q_len_per_req", 1) in (None, 1) and w._window_left == -1
-        ):
+        if not _decode_plan_is_direct(w):
             return None
         from flashinfer.utils import _get_range_buf
 
@@ -843,7 +854,7 @@ class FlashInferMixedWrapper:
             kv_lens=self._d_lens,
             dtype=dtype, window_left=window_left,
         )
-        self._prefill.plan_staged(
+        self._prefill._plan_staged(
             t["p_qo"], t["p_kvp"], t["p_idx"][:n_pre], t["p_last"], self._p_lens,
             causal, dtype, window_left,
         )
