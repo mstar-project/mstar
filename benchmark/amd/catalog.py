@@ -37,7 +37,7 @@ class Row:
     cost: float = 1.0  # rough relative run time, so the sweep starts the long rows first
     # How long the launcher waits for /health when a cold start of this model runs past its default.
     startup_timeout: int | None = None
-    # mstar's fused-MoE layer sizes, as config file names start ("E=..,N=..,K=..,topk=.."). The table shows
+    # mstar's fused-MoE layer sizes, as config file names start ("E=..,N=..,K=.."). The table shows
     # whether each one loaded a tuned table, since a missing one silently runs the default launch config.
     moe_shapes: tuple[str, ...] = ()
     # Deployment configs (configs/<name>.yaml) of mstar arms that serve this row with another one, by arm name.
@@ -72,7 +72,7 @@ def _qwen(size: str, gpus: int = 1, tp: int = 1, name: str | None = None) -> Row
                max_len=32768, runner_model_id=True, cost=1 + float(size.rstrip("B")) / 4)
 
 
-QWEN3_OMNI_MOE = ("E=128,N=768,K=2048,topk=8", "E=128,N=384,K=1024,topk=6")  # Thinker, Talker
+QWEN3_OMNI_MOE = ("E=128,N=1536,K=2048", "E=128,N=768,K=1024")  # Thinker, Talker
 
 
 def _qwen3tts(name: str, size: str, runner_model: str, sglang_omni_config: str, **kw) -> Row:
