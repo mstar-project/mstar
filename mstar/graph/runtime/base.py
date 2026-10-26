@@ -627,6 +627,8 @@ class _Postprocess:
     wg_ids: ParallelList[int, int] | None = None
     rid_walk_idx: list[int] | None = None
     stopped: list[int] = field(default_factory=list)
+    # the request's stream_partition_done, less the dropped rows
+    stream_done: list[int] = field(default_factory=list)
     stored: RouteTensors | None = None
     route: RouteOutput | None = None
     send: SendInput | None = None
@@ -665,7 +667,7 @@ class PhasedPostprocess:
     _postprocess: _Postprocess | None = None
 
     def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
-        self._postprocess = _Postprocess(request)
+        self._postprocess = _Postprocess(request, stream_done=list(request.stream_partition_done))
         return self._run_postprocess()
 
     def resume_postprocess(
@@ -734,7 +736,7 @@ class PhasedPostprocess:
                 pp.route.completion_id, ParallelList([], []), ParallelList([], []),
             )
         # the consuming pass reports the partition done, on its WORKER_GRAPHS_DONE
-        for rid in req.stream_partition_done:
+        for rid in pp.stream_done:
             self.mark_stream_partition_done(rid, req.partition)
         completed = self.send_outputs(pp.send)
         self._postprocess = None
@@ -751,6 +753,8 @@ class PhasedPostprocess:
         pp.rid_walk_idx = None if idx is None else [idx[i] for i in keep]
         for rid in dropped:
             pp.stops.pop(rid, None)
+        # a dropped row's streams do not end here
+        pp.stream_done = [rid for rid in pp.stream_done if rid not in dropped]
 
     def _stop_step_loops(self, pp: _Postprocess) -> list[int]:
         """Stop the step's loops, per walk; the rids whose loops stopped."""
@@ -947,8 +951,9 @@ class GraphRuntime(PhasedPostprocess, ABC):
         Each loop's count is this runtime's as of the step: counts move when
         the step is routed, which comes after. ``tokens`` is the step's token
         column, row i for ``row_rids[i]``, a 1-D host view the caller keeps
-        alive, or None when no policy reads a token; a rid with no row is
-        skipped, as ``check_stop`` skips a request with no output.
+        alive, or None when no policy reads a token. With a column, a rid with
+        no row is skipped, as ``check_stop`` skips a request with no output;
+        without one (``ITER`` only), every rid is checked.
         """
 
     @abstractmethod
