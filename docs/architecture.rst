@@ -202,8 +202,9 @@ step.
   bucket's token count). On ROCm, captured buckets of up to 32 tokens autotune their
   GEMMs over ATen (hipBLASLt) only. At decode sizes inductor's autotuner couldn't pick
   reliably between its Triton templates and hipBLASLt, and a bad pick cost Orpheus 10%
-  of its decode step. Everything else keeps inductor's defaults. A new override should
-  come with a measured win.
+  of its decode step. This only matters under ``mstar serve -O2``, since the default
+  compile level runs no GEMM template search. Everything else keeps inductor's defaults.
+  A new override should come with a measured win.
 - **Process environment.** ``Platform.process_env_defaults()`` is applied with
   ``os.environ.setdefault`` in the conductor before it spawns workers, so values you
   export win. ROCm turns off MIOpen's split-K conv solver there (see
