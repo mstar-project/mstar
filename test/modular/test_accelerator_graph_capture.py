@@ -20,7 +20,9 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from torch.distributed import ReduceOp
 
+from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
 from mstar.engine.accelerator_graph_runner import (
@@ -47,11 +49,11 @@ class _Group:
     def barrier(self):
         self.count += 1
 
-    def all_gather(self, tensor, dim=0):
-        del dim
-        peer = torch.tensor(self._peer, dtype=tensor.dtype, device=tensor.device)
-        # rank-major, matching CommGroup.all_gather
-        return torch.cat([tensor, peer])
+    def agree(self, values, op):
+        if self._peer is None:
+            return list(values)
+        pick = min if op == ReduceOp.MIN else max
+        return [int(pick(a, b)) for a, b in zip(values, self._peer, strict=True)]
 
 
 class _FakeRunner:
@@ -83,9 +85,7 @@ class _FakeRunner:
         self._blocked_buckets = []
         self._executables = {}
         self.barrier = _Group(peer_flags)
-        self._comm_group = SimpleNamespace(
-            tp_group=self.barrier, sp_group=self.barrier
-        )
+        self._comm_group = JointGroups(tp_group=self.barrier, sp_group=self.barrier)
         self.declared: list = []
         self._dummy_rows = SimpleNamespace(
             released=False,
