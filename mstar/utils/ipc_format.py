@@ -221,20 +221,6 @@ class ConductorMessageType(Enum):
     WORKER_STATUS = "worker_status"
     ENABLE_METRICS = "enable_metrics"
     CLIENT_STREAM_INPUT = "client_stream_input"
-    CLIENT_STREAM_CONSUMED = "client_stream_consumed"
-
-
-@dataclass
-class NewRequestConductor(MessageBody):
-    request_id: str
-    initial_signals: dict[str, list[TensorPointerInfo]]
-    initial_input_modalities: list[str]
-    initial_output_modalities: list[str]
-    input_metadata: dict[str, list[dict]]
-    model_kwargs: dict
-    # The client's request_id. ``request_id`` is the API server's key for this
-    # one submission, never reused; the seed still derives from the client's.
-    client_request_id: str | None = None
 
 
 @dataclass
@@ -248,17 +234,20 @@ class ClientStreamInput(MessageBody):
 
 
 @dataclass
-class ClientStreamConsumed(MessageBody):
-    """How many items of each client stream with a ``max_pending_items`` bound
-    its consumer has taken, from the worker after a step that moved the count:
-    the conductor makes room for the client from it. ``WORKER_GRAPHS_DONE``
-    carries the same counts, but only when a worker graph finishes, which for a
-    consumer inside a dynamic loop is the end of the call. One row per
-    (request, stream); the counts are running totals, so a late one is
-    harmless."""
-    request_ids: list[str] = field(default_factory=list)
-    edge_names: list[str] = field(default_factory=list)
-    consumed: list[int] = field(default_factory=list)
+class NewRequestConductor(MessageBody):
+    request_id: str
+    initial_signals: dict[str, list[TensorPointerInfo]]
+    initial_input_modalities: list[str]
+    initial_output_modalities: list[str]
+    input_metadata: dict[str, list[dict]]
+    model_kwargs: dict
+    # The client's request_id. ``request_id`` is the API server's key for this
+    # one submission, never reused; the seed still derives from the client's.
+    client_request_id: str | None = None
+    # For a model with client streams, the opening's own client input: its
+    # first chunk and the streams it ends, forwarded once the request is
+    # admitted. A stream it leaves open makes it a live call.
+    client_input: ClientStreamInput | None = None
 
 
 @dataclass
