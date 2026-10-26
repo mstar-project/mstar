@@ -572,6 +572,12 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
             "embodiment_id": embodiment_id,
         }
 
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        """A batch mixing prompt lengths matches no capture and runs eager one request at a
+        time, so batch each length apart (D16: on a GH200 the mix capped serving at ~8 req/s)."""
+        del graph_walk
+        return True
+
     def capture_request_inputs(self, bucket_key: Gr00tN17Shape, device) -> dict:
         dtype = next(self.model.parameters()).dtype
         width = self.config.backbone_embedding_dim
