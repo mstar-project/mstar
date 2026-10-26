@@ -846,7 +846,7 @@ class Worker:
         )
         try:
             self.engine_manager.add_request(
-                request_id, body.request_info.resource_configs,
+                request_id, body.request_info.resource_configs, body.request_info,
             )
         except Exception as err:
             # the engine rolled the ingest back; the conductor's REMOVE tears down the rest

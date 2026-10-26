@@ -35,11 +35,11 @@ from mstar.utils.device import DeviceCapability
 
 
 class NoiseStager:
-    """A ring of pinned host buffers for one dtype, plus the CPU generator.
+    """A ring of pinned host buffers for one dtype.
 
-    Not model-specific: anything that draws on the host and needs the result on the
-    device without a host stall can use it. One instance per (dtype) per submodule;
-    it is thread-safe, so the plan thread and the GPU thread may share one.
+    Not model-specific: anything that has a host tensor and needs it on the device
+    without a host stall can use it. One instance per (dtype) per submodule; it is
+    thread-safe.
     """
 
     def __init__(self, dtype: torch.dtype, depth: int = 4, numel: int = 0):
@@ -57,9 +57,6 @@ class NoiseStager:
         self._pinned = torch.accelerator.is_available()
         if numel:
             self._grow(numel)
-        # One generator, re-seeded per request: the draw is seeded from the
-        # request, so a fresh Generator object per call buys nothing.
-        self._generator = torch.Generator(device="cpu")
 
     # ------------------------------------------------------------------ buffers
     def _grow(self, numel: int) -> None:
@@ -74,59 +71,6 @@ class NoiseStager:
         ]
         self._events = [None] * self._depth
         self._next = 0
-
-    # -------------------------------------------------------------------- draw
-    def randn(self, shape: tuple[int, ...], seed: int) -> torch.Tensor:
-        """``torch.randn(shape)`` on this stager's generator, seeded with ``seed``.
-
-        A plain CPU tensor: identical to drawing it inline, so a model is free to
-        post-process it (pack, reshape) before handing it to :meth:`to_device`.
-
-        The generator is shared, so seeding and drawing are one critical section:
-        split them and a concurrent caller's seed lands between, and both draws
-        come out of the wrong stream.
-        """
-        with self._lock:
-            generator = self._generator.manual_seed(int(seed))
-            return torch.randn(shape, generator=generator, dtype=self.dtype)
-
-    def randn_to_device(
-        self, shape: tuple[int, ...], seed: int, device: torch.device,
-    ) -> torch.Tensor:
-        """Draw straight into the staging buffer and copy, skipping the host memcpy.
-
-        Use this when the model's post-processing of the draw is layout-only -- a
-        reshape, a permute -- so it can run on the device for the same values
-        (klein's ``pack_latents`` is ``reshape`` + ``permute``). A model that does
-        real host work on the noise keeps :meth:`randn` + :meth:`to_device` instead,
-        which stages the finished tensor and leaves the CPU semantics untouched.
-
-        The device tensor has ``shape`` and is contiguous; any packing the model
-        applies afterwards is its own business.
-        """
-        device = torch.device(device)
-        numel = 1
-        for dim in shape:
-            numel *= dim
-        if not DeviceCapability.of(device).is_accelerator or not self._pinned:
-            return self.randn(shape, seed).to(device)
-
-        out = torch.empty(shape, dtype=self.dtype, device=device)
-        if numel == 0:
-            return out
-        with self._lock:
-            if numel > self._numel:
-                self._grow(numel)
-            index, event, staging = self._take(numel, device)
-            # Seed inside the lock, with the draw: the generator is shared, so a
-            # concurrent caller seeding between the two would reseed this draw.
-            generator = self._generator.manual_seed(int(seed))
-            # Fill the pinned buffer in place: no intermediate host tensor, so the
-            # draw is the only host-side pass over the values.
-            torch.randn(shape, generator=generator, dtype=self.dtype, out=staging.view(shape))
-            out.view(-1).copy_(staging, non_blocking=True)
-            self._record(index, event, device)
-        return out
 
     # ---------------------------------------------------------------- staging
     def _take(self, numel: int, device: torch.device):
@@ -168,7 +112,9 @@ class NoiseStager:
             if numel > self._numel:
                 self._grow(numel)
             index, event, staging = self._take(numel, device)
-            staging.copy_(source.view(-1))
+            # One memcpy on the calling thread: copy_ would split it over torch's
+            # intra-op pool, where a descheduled thread holds up the GPU thread.
+            staging.view(torch.uint8).numpy()[:] = source.view(-1).view(torch.uint8).numpy()
             out.view(-1).copy_(staging, non_blocking=True)
             self._record(index, event, device)
         return out

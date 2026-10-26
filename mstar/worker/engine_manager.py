@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
@@ -174,10 +175,12 @@ class EngineManager:
     def add_request(
         self, request_id: str,
         resource_configs: dict[str, ResourceReqConfig] | None = None,
+        request_info: CurrentForwardPassInfo | None = None,
     ) -> None:
         """Open resource state for a request, on the per-resource configs the
-        conductor resolved for it (``Model.get_request_resource_configs``)."""
-        self.engine.add_request(request_id, resource_configs)
+        conductor resolved for it (``Model.get_request_resource_configs``),
+        and hand the submodules its ``request_info``."""
+        self.engine.add_request(request_id, resource_configs, request_info)
 
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down; returns the resources it handed pages back to."""
