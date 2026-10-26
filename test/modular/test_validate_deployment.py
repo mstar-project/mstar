@@ -494,6 +494,20 @@ def test_a_lora_deployment_passes(tmp_path):
     _validate(_Model(_a_then_b, specs=[_lora_spec()], tp_enabled_nodes=["a"]), cfg)
 
 
+@pytest.mark.parametrize("block, refusal", [
+    ({"max_slots": 0}, r"resources\.lora: max_slots must be an integer >= 1; got 0"),
+    (["sql"], r"resources\.lora: .*argument after \*\* must be a mapping, not list"),
+], ids=["bad_value", "not_a_mapping"])
+def test_a_bad_lora_value_is_reported_once_with_the_other_problems(tmp_path, block, refusal):
+    """A refused `lora:` block leaves the spec as declared, so splitting it per node
+    reports nothing again, and the other resources' placement checks still run."""
+    cfg = _cfg(tmp_path, _A_TP_THEN_B, resources={"lora": block})
+    model = _Model(_a_then_b, specs=[_lora_spec(), _Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"])
+    problems = _problems(model, cfg)
+    assert len(problems) == 2 and re.fullmatch(refusal, problems[0]), problems
+    assert problems[1] == "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas"
+
+
 # -- every problem at once ----------------------------------------------------
 
 

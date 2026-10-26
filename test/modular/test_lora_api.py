@@ -35,7 +35,7 @@ except ImportError:  # collected without package context
     from test_lora_tp_lockstep import _Barrier
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
-from mstar.api_server.entrypoint import APIServer  # noqa: E402
+from mstar.api_server.entrypoint import APIServer, resolve_lora_spec  # noqa: E402
 from mstar.api_server.lora_admin import LoraAdmin  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs  # noqa: E402
 from mstar.api_server.request_types import APIServerMessage, LoraAdapterResult, RequestFailed  # noqa: E402
@@ -216,6 +216,14 @@ def test_a_deployment_without_lora_leaves_its_resources_block_to_the_conductor(r
     config = {"resources": resources}
     served = ServedModels.of(BASE, config)
     assert not served.lora and served.adapters == ()
+    assert resolve_lora_spec(SimpleNamespace(get_node_resources=list), config) is None
+
+
+@pytest.mark.parametrize("block", [None, ["sql"]], ids=["bare", "list"])
+def test_a_lora_block_that_is_not_a_mapping_is_left_to_the_conductor(block):
+    """``validate_deployment`` reports it as a refused `resources: lora:` override."""
+    config = {"resources": {LORA_RESOURCE_KEY: block}}
+    assert resolve_lora_spec(SimpleNamespace(get_node_resources=list), config) is None
 
 
 def test_submit_request_refuses_an_unserved_adapter_kwarg():

@@ -44,7 +44,9 @@ def refuse_unresolved_lora_adapters(model_config: Mapping[str, Any]) -> None:
     """Refuse a serving config whose ``lora:`` block names adapters with no pinned digest:
     workers spawned with it would serve whatever each of their reads finds, rather than
     the weights the API server keyed the prefix cache under."""
-    block = (model_config.get("resources") or {}).get(LORA_RESOURCE_KEY) or {}
+    block = (model_config.get("resources") or {}).get(LORA_RESOURCE_KEY)
+    if not isinstance(block, Mapping):
+        return  # the `resources:` override step reports a block that is not a mapping
     unpinned = sorted(set(block.get("adapters") or ()) - set(block.get("adapter_digests") or ()))
     if unpinned:
         raise ValueError(

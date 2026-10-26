@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -42,7 +42,7 @@ from mstar.api_server.request_types import APIServerMessage, PreprocessInput, Re
 from mstar.api_server.served_models import Selected, ServedModels
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
-from mstar.engine.resources.lora.config import LoraSpec, lora_enabled
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, LoraSpec, lora_enabled
 from mstar.engine.resources.lora.serving import lora_spec, resolve_lora_adapters
 from mstar.model.base import declared_resources
 from mstar.model.multimodal import PromptPart
@@ -112,8 +112,14 @@ def resolve_lora_spec(model, model_config: dict | None) -> LoraSpec | None:
     and the targets the adapters touch are written into the spec and the config
     (``resolve_lora_adapters``). The conductor gets this config and spawns the workers
     with it, so their reads serve the weights whose digests key the API server's prefix
-    cache."""
-    if model is None or not model_config:
+    cache.
+
+    So a LoRA deployment's ``resources:`` block is read here, before the conductor's
+    ``validate_deployment``; one without LoRA reads nothing here."""
+    if model is None or not model_config or not lora_enabled(model_config):
+        return None
+    # validate_deployment reports a `lora:` value that is not a mapping
+    if not isinstance(model_config["resources"][LORA_RESOURCE_KEY], Mapping):
         return None
     spec = lora_spec(declared_resources(model, model_config))
     resolve_lora_adapters(spec, model_config)
