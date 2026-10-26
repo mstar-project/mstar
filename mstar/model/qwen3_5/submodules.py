@@ -85,6 +85,8 @@ logger = logging.getLogger(__name__)
 class LLMSubmodule(ARNodeSubmodule):
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
+    # every row's tokens, image tokens included, go through the adapted linears
+    segment_rows = True
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
@@ -777,6 +779,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
     # Patch-count buckets, one prompt per replay. 16384 patches merge to the
     # LLM's 4096 `prefill_vision` bucket; a larger prompt runs eagerly.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
+
+    # the frames' segments, in order, are the rows the tower's linears see (the
+    # merger's folded); the captured block loop declares its own (see there)
+    segment_rows = True
 
     def __init__(
         self, model: Qwen3_5VisionModel, config: Qwen3_5VisionConfig,

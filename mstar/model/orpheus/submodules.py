@@ -41,6 +41,9 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
       - mixed: prefill and decode rows in one batch
     """
 
+    # its segments, one per request, lay out LoRA's rows (see NodeSubmodule)
+    segment_rows = True
+
     def __init__(
         self,
         language_model: nn.Module,

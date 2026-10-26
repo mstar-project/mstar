@@ -904,6 +904,9 @@ serving YAML has a ``resources: lora:`` block. Orpheus is the reference
            ),
        ]
 
+   class OrpheusLLMSubmodule(ARNodeSubmodule):
+       segment_rows = True  # declare_step's segments lay out the rows its linears see
+
 The weights root states how the checkpoint lands on it once
 (``checkpoint_rules() -> CheckpointRules``: a prefix, a remap, the stacked-shard
 rules); its weight loader and ``module_lora_spec`` both use them, so adapters are
@@ -947,9 +950,10 @@ placed exactly as weights are.
   on its node under ``root_path``, after checking it is the declared target and that the
   pool's shard is its rank-local shape (a module built whole on a TP node fails here,
   not in a forward). The pool's step is the node's own segments
-  (``Resource.steps_from_segments``): ``declare_step``'s segments are, in order, the rows
-  its linears see (a request may have several: Chatterbox's cond and uncond copies), and
-  the engine (``declared_step``) adds a ``ResourceStep`` of them under the pool's key
+  (``Resource.steps_from_segments``), so binding requires ``segment_rows = True``:
+  ``declare_step``'s segments are, in order, the rows its linears see (a request may have
+  several: Chatterbox's cond and uncond copies), and the engine (``declared_step``) adds
+  a ``ResourceStep`` of them under the pool's key
   (Qwen3.5's vision encoder: one segment per frame, the merger's rows folding them). A
   node whose step is ``None`` declares no rows, so one that serves adapters returns a
   step with its segments even when nothing else needs one.

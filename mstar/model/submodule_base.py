@@ -526,10 +526,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # would pay for nothing.
     reads_device_loopback: bool = False
 
-    # the keys of this node's resources whose step is its segments
-    # (``Resource.steps_from_segments``), which ``declared_step`` adds; set by
-    # ``bind_node_resources``. A piecewise region that runs adapted modules declares its
-    # rows under them in its own step.
+    # True when ``declare_step``'s segments are, in order, the rows the node's computation
+    # sees, each a request's span of tokens (a request may have several, as CFG's cond and
+    # uncond copies): a resource whose step is the node's segments
+    # (``Resource.steps_from_segments``, a LoRA pool) addresses each row by them, so a
+    # node bound to one must say so.
+    segment_rows: bool = False
+    # the keys of this node's resources whose step is its segments, which
+    # ``declared_step`` adds; set by ``bind_node_resources``. A piecewise region that runs
+    # adapted modules declares its rows under them in its own step.
     segment_keys: tuple[str, ...] = ()
 
     def __init__(self):
@@ -556,14 +561,21 @@ class NodeSubmodule(torch.nn.Module, ABC):
         names a label this node doesn't have fails at bind rather than in the
         middle of a forward.
         """
+        self.segment_keys = tuple(
+            key for key, resource in resources.items() if getattr(resource, "steps_from_segments", False)
+        )
+        if self.segment_keys and not self.segment_rows:
+            raise ValueError(
+                f"{type(self).__name__} is bound to {list(self.segment_keys)}, whose step is "
+                "its segments, but does not say how its rows meet them: set `segment_rows = "
+                "True` when `declare_step`'s segments are, in order, the rows its "
+                "computation sees (each a request's span of tokens)"
+            )
         self.node_resources = resources
         for module in self.modules():
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:
                 bind(resources)
-        self.segment_keys = tuple(
-            key for key, resource in resources.items() if getattr(resource, "steps_from_segments", False)
-        )
         from mstar.model.components.lora.modules import bind_module_lora
 
         bind_module_lora(self, resources)

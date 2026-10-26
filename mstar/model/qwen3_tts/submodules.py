@@ -142,6 +142,8 @@ class TalkerSubmodule(ARNodeSubmodule):
     # eager alternative costs ~20 ms of launch overhead per request.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    # its segments, one per request, lay out LoRA's rows (see NodeSubmodule)
+    segment_rows = True
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS = CHATML_ASSISTANT_PREFIX_TOKEN_IDS
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = CHATML_ASSISTANT_SUFFIX_TOKEN_IDS
 

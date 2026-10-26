@@ -48,6 +48,7 @@ from mstar.model.components.lora.modules import (  # noqa: E402
     module_lora_spec,
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
+from mstar.model.submodule_base import NodeSubmodule  # noqa: E402
 
 HIDDEN = 8
 ROWS = [("r0", "a1", 3), ("r1", None, 2), ("r2", "a2", 4)]
@@ -140,6 +141,16 @@ class _Root(nn.Module):
 
 
 class _Node(nn.Module):  # a node submodule holding the root, as binding sees it
+    def __init__(self, root: nn.Module):
+        super().__init__()
+        self.inner = root
+
+
+class _SilentNode(NodeSubmodule):
+    """A node that does not say how its rows meet its segments (``segment_rows``)."""
+
+    prepare_inputs = forward = None
+
     def __init__(self, root: nn.Module):
         super().__init__()
         self.inner = root
@@ -416,7 +427,7 @@ def test_unbound_module_runs_the_pre_lora_forward(name):
 
 # --- what binding refuses ------------------------------------------------------------------
 
-def test_binding_refuses_a_second_delta_a_split_target_and_a_hand_spec(tmp_path):
+def test_binding_refuses_a_second_delta_a_silent_node_a_split_target_and_a_hand_spec(tmp_path):
     case = CASES["qkv"]
     paths, _ = _adapters(case, tmp_path)
     spec = serve(_spec(case), paths)
@@ -428,7 +439,12 @@ def test_binding_refuses_a_second_delta_a_split_target_and_a_hand_spec(tmp_path)
     with pytest.raises(ValueError, match="already holds a LoRA delta"):
         bind_module_lora(node, {"other": pool(spec)})
 
+    # a node that does not say how its rows meet the pool's segments
     root = _build(case, CommGroup.trivial(), weights)
+    with pytest.raises(ValueError, match="segment_rows"):
+        _SilentNode(root).bind_node_resources({"lora": pool(spec)})
+    assert type(root.layers[0].qkv_proj) is QKVParallelLinear
+
     # a target the pool splits over 2 ranks, on a module built whole: wrong columns
     with pytest.raises(ValueError, match="whole on every rank"):
         bind_module_lora(_Node(root), {"lora": pool(spec, rank=0, world=2)})

@@ -294,6 +294,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
     # Default MRoPE section for head_dim=128: [24, 20, 20]
     MROPE_SECTION = [24, 20, 20]
+    # its segments, one per request, lay out LoRA's rows (see NodeSubmodule)
+    segment_rows = True
 
     def __init__(
         self,
