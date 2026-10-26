@@ -236,6 +236,16 @@ Qwen3-Omni notes
 - The Triton kernels take launch configs tuned per GPU model from
   ``mstar/utils/fused_moe/configs/`` when one matches the expert sizes.
   ``benchmark/fused_moe/tune_fused_moe.py`` makes one on the local GPU.
+- Code2Wav decodes the first codec frames of a reply in chunks of 4, 8 and 16 frames,
+  then 25 at a time behind 25 frames of context (``codec_chunk_schedule``,
+  ``codec_chunk_frames`` and ``codec_left_context_frames`` in ``Code2WavConfig``), so
+  the first audio leaves after 4 frames, about 0.3 s of speech. Every window size is a
+  captured graph of its own, and a node whose MIOpen database doesn't have their
+  convolutions yet takes about 15 minutes longer to start the first time.
+- ``configs/qwen3omni_colocated_split3.yaml`` runs the Thinker (with the encoders), the
+  Talker and Code2Wav as three workers on one GPU (``rank_devices``), so their steps
+  overlap on the GPU instead of taking turns on one worker loop, as in
+  ``qwen3omni_colocated.yaml``. It serves more audio per second at high concurrency.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------

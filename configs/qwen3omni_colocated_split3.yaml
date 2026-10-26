@@ -1,0 +1,18 @@
+model: "qwen3_omni"
+max_seq_len: 32768
+# qwen3omni_colocated.yaml with the Thinker, the Talker and Code2Wav on three
+# workers that share GPU 0 (rank_devices), so their steps overlap on the GPU
+# instead of taking turns on one worker loop.
+resources:
+  thinker_kv:
+    max_num_pages: 256
+  talker_kv:
+    max_num_pages: 256
+node_groups:
+  - node_names: [audio_encoder, vision_encoder, Thinker]
+    ranks: [0]
+  - node_names: [Talker]
+    ranks: [1]
+  - node_names: [Code2Wav]
+    ranks: [2]
+rank_devices: {1: 0, 2: 0}
