@@ -23,6 +23,11 @@ and depformer run once over every row, while each row keeps its own cache
 The depformer stops after the last depth step any row samples
 (``depth_steps_needed``): the user's codebooks are always forced here, so a
 generate frame runs 8 of its 16 depth steps, and the first one runs 1.
+
+The generate step is captured as an accelerator graph: ``step`` is the
+tensor-only part the graph holds (8 depth steps), and ``commit`` folds each
+request's samples into its own cache afterwards, in ``postprocess``.
+Conditioning frames run eagerly.
 """
 
 from __future__ import annotations
@@ -36,7 +41,14 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import (
+    ARNodeInputs,
+    ARNodeSubmodule,
+    BatchedModelOutput,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+)
 
 from . import config as cfg
 from .components.delayed_cache import DelayedTokenCache
@@ -190,11 +202,83 @@ class LMSubmodule(ARNodeSubmodule):
         return self.run_frames([frame], backend, sample_text, sample_depth)[0]
 
     @staticmethod
-    def depth_steps(frames: list[LMFrame]) -> int:
-        """Depth steps a generate batch must run (0 for conditioning); reads the forced mask on the host."""
-        if frames[0].walk not in GENERATE_WALKS:
+    def depth_steps(graph_walk: str, provided: torch.Tensor) -> int:
+        """Depth steps a batch must run (0 for conditioning), from the ``[B, 17]`` forced mask; a host read.
+
+        A generate frame always has the user's codebooks forced, so it never
+        needs more than 8; the captured step runs exactly 8.
+        """
+        if graph_walk not in GENERATE_WALKS:
             return 0
-        return depth_steps_needed(torch.cat([frame.cache.target_provided[:, 1:, 0] for frame in frames]))
+        steps = depth_steps_needed(provided[:, 1:])
+        if steps > cfg.AUDIO_CODEBOOKS_PER_STREAM:
+            raise RuntimeError(f"a generate frame left a user codebook unforced ({steps} depth steps)")
+        return steps
+
+    def step(
+        self,
+        graph_walk: str,
+        embeds: torch.Tensor,
+        target: torch.Tensor,
+        provided: torch.Tensor,
+        backend,
+        sample_text: Callable[[torch.Tensor], torch.Tensor],
+        sample_depth: Callable[[torch.Tensor, int], torch.Tensor],
+        depth_steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Temporal forward, sampling and depformer for one frame of each row: tensors in, tensors out.
+
+        ``embeds`` is ``[B, D]``; ``target``/``provided`` the cache's ``[B, 17]``
+        target column and forced mask. Returns the raw sampled text ``[B]`` and
+        audio ``[B, 16]`` that ``commit`` folds into each row's cache. Nothing
+        here reads a tensor on the host, so the engine can capture it.
+        """
+        conditioning = graph_walk == cfg.CONDITIONING_WALK
+        hidden, text_logits = self.lm.temporal.forward_embeddings(embeds, backend, text_logits=not conditioning)
+        if conditioning:
+            return target[:, 0], target[:, 1:]
+        sampled_text = _sampled_token_ids(sample_text(text_logits.float()), target[:, 0], "text sampler")
+        next_text = torch.where(provided[:, 0], target[:, 0], sampled_text)
+
+        def sample_audio(logits: torch.Tensor, step: int) -> torch.Tensor:
+            return _sampled_token_ids(sample_depth(logits, step), target[:, 0], f"depth sampler step {step}")
+
+        audio = self.lm.depth.run_frame(
+            next_text, hidden, target[:, 1:], provided[:, 1:], sample_audio, steps=depth_steps
+        )
+        return sampled_text, audio
+
+    @staticmethod
+    def commit(frame: LMFrame, sampled_text: torch.Tensor, audio: torch.Tensor) -> NameToTensorList:
+        """Fold one row's ``[1]`` text and ``[1, 16]`` audio samples into its cache and emit its outputs."""
+        cache = frame.cache
+        output = cache.commit(sampled_text, audio)
+        if frame.restore_cache is not None:
+            cache.load(frame.restore_cache)
+        outputs = {"lm_state": [cache.state_tensor(frame.frame + 1)]}
+        if frame.walk in GENERATE_WALKS:
+            if output is None:
+                raise RuntimeError("generate frames always gather an output")
+            # Delay-0 channels from the previous step, delay-1 from this one ([PP] models/lm.py:899-952).
+            outputs["agent_frame"] = [output[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM].contiguous()]
+            # B=1 column views can report contiguous while retaining stride 17;
+            # worker byte serialization requires a physical stride of one.
+            outputs["text_frame"] = [output[:, 0, 0].clone(memory_format=torch.contiguous_format)]
+        return outputs
+
+    @staticmethod
+    def _target_rows(frames: list[LMFrame]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Snapshots of each row's target column and forced mask, ``[B, 17]``: commit rewrites the column."""
+        target = torch.cat([frame.cache.target[:, :, 0] for frame in frames])
+        provided = torch.cat([frame.cache.target_provided[:, :, 0] for frame in frames])
+        return target, provided
+
+    @staticmethod
+    def _check_walk(graph_walk: str, frames: list[LMFrame], provided: torch.Tensor) -> None:
+        if any(frame.walk != graph_walk for frame in frames):
+            raise ValueError("a PersonaPlex LM batch must hold one walk")
+        if graph_walk == cfg.CONDITIONING_WALK and not bool(provided.all()):
+            raise RuntimeError(f"conditioning frame {frames[0].frame} has an unprovided target")
 
     def run_frames(
         self,
@@ -204,56 +288,28 @@ class LMSubmodule(ARNodeSubmodule):
         sample_depth: Callable[[torch.Tensor, int], torch.Tensor],
         depth_steps: int | None = None,
     ) -> list[NameToTensorList]:
-        """Temporal forward, sampling, depformer and cache commits for one frame of each request.
+        """``step`` then ``commit`` for one frame of each request, as the engine runs them.
 
         Row ``i`` of the batch is ``frames[i]``; the samplers map ``[B, vocab]``
-        logits to ``[B]`` tokens. ``depth_steps`` is ``depth_steps(frames)``,
-        computed here when not given. Returns each request's outputs in order.
+        logits to ``[B]`` tokens. ``depth_steps`` defaults to what the forced
+        mask needs. Returns each request's outputs in order.
         """
         walk = frames[0].walk
-        if any(frame.walk != walk for frame in frames):
-            raise ValueError("a PersonaPlex LM batch must hold one walk")
-        conditioning = walk == cfg.CONDITIONING_WALK
+        target, provided = self._target_rows(frames)
+        self._check_walk(walk, frames, provided)
+        if depth_steps is None:
+            depth_steps = self.depth_steps(walk, provided)
         embeds = torch.cat([frame.embeds for frame in frames])
-        hidden, text_logits = self.lm.temporal.forward_embeddings(embeds, backend, text_logits=not conditioning)
-        # Snapshots: commit rewrites the target column these are read from.
-        target = torch.cat([frame.cache.target[:, :, 0] for frame in frames])
-        provided = torch.cat([frame.cache.target_provided[:, :, 0] for frame in frames])
-        if conditioning:
-            for frame in frames:
-                if not frame.cache.target_all_provided():
-                    raise RuntimeError(f"conditioning frame {frame.frame} has an unprovided target")
-            sampled_text, audio = target[:, 0], target[:, 1:]
-        else:
-            sampled_text = _sampled_token_ids(sample_text(text_logits.float()), target[:, 0], "text sampler")
-            next_text = torch.where(provided[:, 0], target[:, 0], sampled_text)
-            def sample_audio(logits: torch.Tensor, step: int) -> torch.Tensor:
-                return _sampled_token_ids(sample_depth(logits, step), target[:, 0], f"depth sampler step {step}")
-
-            if depth_steps is None:
-                depth_steps = self.depth_steps(frames)
-            audio = self.lm.depth.run_frame(
-                next_text, hidden, target[:, 1:], provided[:, 1:], sample_audio, steps=depth_steps
-            )
-        results = []
-        for row, frame in enumerate(frames):
-            cache = frame.cache
-            output = cache.commit(sampled_text[row : row + 1], audio[row : row + 1])
-            if frame.restore_cache is not None:
-                cache.load(frame.restore_cache)
-            outputs = {"lm_state": [cache.state_tensor(frame.frame + 1)]}
-            if not conditioning:
-                if output is None:
-                    raise RuntimeError("generate frames always gather an output")
-                # Delay-0 channels from the previous step, delay-1 from this one ([PP] models/lm.py:899-952).
-                outputs["agent_frame"] = [output[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM].contiguous()]
-                # B=1 column views can report contiguous while retaining stride 17;
-                # worker byte serialization requires a physical stride of one.
-                outputs["text_frame"] = [output[:, 0, 0].clone(memory_format=torch.contiguous_format)]
-            results.append(outputs)
-        return results
+        text, audio = self.step(walk, embeds, target, provided, backend, sample_text, sample_depth, depth_steps)
+        return [self.commit(frame, text[row : row + 1], audio[row : row + 1]) for row, frame in enumerate(frames)]
 
     # ------------------------------------------------------------------ engine contract
+    #
+    # prepare_inputs (per request) rebuilds the cache and stages its target
+    # column; preprocess stacks the batch's tensors; forward/forward_batched run
+    # ``step`` (captured for the generate walks); postprocess runs ``commit``
+    # per request. Capture padding rows are clones of the config's template,
+    # with tensors but no cache, so preprocess reads tensors only.
 
     def prepare_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs
@@ -261,17 +317,27 @@ class LMSubmodule(ARNodeSubmodule):
         del kwargs
         with torch.no_grad():
             frame = self.prepare_frame(graph_walk, fwd_info.step_metadata, inputs)
-        if frame is None:
-            return None
-        return ARNodeInputs(input_embeds=frame.embeds, input_seq_len=1, kwargs={"frame": frame})
+            if frame is None:
+                return None
+            target, provided = self._target_rows([frame])
+        return ARNodeInputs(input_embeds=frame.embeds, input_seq_len=1,
+                            tensor_inputs={"target": target, "provided": provided}, kwargs={"frame": frame})
 
     def preprocess(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]
     ) -> dict[str, Any]:
-        del graph_walk, engine_inputs
-        frames = [inp.kwargs["frame"] for inp in inputs]
+        del engine_inputs
         with torch.no_grad():
-            return {"frames": frames, "depth_steps": self.depth_steps(frames)}
+            target = torch.cat([inp.tensor_inputs["target"] for inp in inputs])
+            provided = torch.cat([inp.tensor_inputs["provided"] for inp in inputs])
+            frames = [inp.kwargs["frame"] for inp in inputs if "frame" in inp.kwargs]
+            self._check_walk(graph_walk, frames, provided[: len(frames)])
+            return {
+                "input_embeds": torch.cat([inp.input_embeds for inp in inputs]),
+                "target": target,
+                "provided": provided,
+                "depth_steps": self.depth_steps(graph_walk, provided),
+            }
 
     def declare_step(
         self,
@@ -294,17 +360,15 @@ class LMSubmodule(ARNodeSubmodule):
             steps=steps,
         )
 
-    def _run_engine_frames(
-        self, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame], depth_steps: int | None
-    ) -> list[NameToTensorList]:
+    def _engine_step(self, graph_walk, engine_inputs, input_embeds, target, provided, depth_steps):
         if self._backend is None:
             raise RuntimeError("LM resources are not bound")
         self._backend.begin()
         rids = engine_inputs.request_ids
         resources = engine_inputs.resources
         text_sampler, depth_sampler = resources.get(cfg.TEXT_SAMPLER), resources.get(cfg.DEPTH_SAMPLER)
-        return self.run_frames(
-            frames, self._backend,
+        return self.step(
+            graph_walk, input_embeds, target, provided, self._backend,
             lambda logits: text_sampler.sample(rids, logits),
             lambda logits, _step: depth_sampler.sample(rids, logits.float()),
             depth_steps,
@@ -312,20 +376,62 @@ class LMSubmodule(ARNodeSubmodule):
 
     @torch.no_grad()
     def forward(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame],
-        depth_steps: int | None = None, **kwargs
-    ):
-        del graph_walk, kwargs
-        return self._run_engine_frames(engine_inputs, frames, depth_steps)[0]
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
+        target: torch.Tensor, provided: torch.Tensor, depth_steps: int, **kwargs
+    ) -> NameToTensorList:
+        del kwargs
+        text, audio = self._engine_step(graph_walk, engine_inputs, input_embeds, target, provided, depth_steps)
+        return {"sampled_text": [text], "sampled_audio": [audio]}
 
     @torch.no_grad()
     def forward_batched(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, frames: list[LMFrame],
-        depth_steps: int | None = None, **kwargs
-    ) -> dict[str, NameToTensorList]:
-        del graph_walk, kwargs
-        outputs = self._run_engine_frames(engine_inputs, frames, depth_steps)
-        return dict(zip(engine_inputs.request_ids, outputs, strict=True))
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
+        target: torch.Tensor, provided: torch.Tensor, depth_steps: int, **kwargs
+    ) -> BatchedModelOutput:
+        # Row outputs: the engine clones the real rows once, so a later replay
+        # cannot overwrite them. No check_stop_buffers: the stop check must
+        # read the lm_state that postprocess adds.
+        del kwargs
+        text, audio = self._engine_step(graph_walk, engine_inputs, input_embeds, target, provided, depth_steps)
+        return BatchedModelOutput(row_outputs={"sampled_text": text, "sampled_audio": audio})
+
+    def postprocess(self, request_id, request_info, outputs, inputs=None, **kwargs) -> None:
+        """Commit this request's samples into its own cache (outside any captured graph)."""
+        del request_id, request_info, kwargs
+        frame = inputs.kwargs["frame"]
+        text = outputs.pop("sampled_text")[0].reshape(1)
+        audio = outputs.pop("sampled_audio")[0].reshape(1, cfg.NUM_AUDIO_CODEBOOKS)
+        outputs.update(self.commit(frame, text, audio))
+
+    def get_accelerator_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
+        """Capture the generate step at batch sizes up to the deployment's ``max_batch_size``.
+
+        The template row forces only the user's codebooks, as every generate
+        frame does, so the captured depformer runs 8 steps. A request's first
+        frame needs 1 of them; the other 7 are forced, so greedy output is
+        unchanged (sampling draws 7 extra samples on that frame).
+        """
+        del tp_world_size
+        from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+
+        dtype = self.lm.temporal.text_emb.weight.dtype
+        provided = torch.zeros(1, cfg.NUM_CODEBOOKS, dtype=torch.bool, device=device)
+        provided[:, 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM :] = True
+        template = ARNodeInputs(
+            input_embeds=torch.zeros(1, self.lm.config.dim, dtype=dtype, device=device), input_seq_len=1,
+            tensor_inputs={"target": torch.zeros(1, cfg.NUM_CODEBOOKS, dtype=torch.long, device=device),
+                           "provided": provided},
+        )
+        cap = self._max_batch_size
+        sizes = sorted({size for size in (1, 2, 4, 8, 16, 32) if size <= cap} | {cap})
+        return [BatchedAcceleratorGraphConfig(
+            capture_graph_walk=cfg.GENERATE_WALK,
+            replay_graph_walks=[cfg.GENERATE_WALK, cfg.GENERATE_AUDIO_WALK],
+            single_request_inputs=template,
+            capture_batch_sizes=sizes,
+            compile=False,
+            input_seq_dims={"input_embeds": 0, "target": 0, "provided": 0},
+        )]
 
     def check_stop(self, request_id: str, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
         """Finish the walk's loop after its last planned frame (read off ``lm_state``)."""

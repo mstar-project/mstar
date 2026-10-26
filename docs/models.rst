@@ -1179,8 +1179,8 @@ serves it as an **offline, preloaded-input replay**: the whole user WAV arrives
 with the request, the model advances once per 80 ms frame across all of it, and
 the response is an agent audio track time-aligned to the input (plus the
 agent's text stream). It is not turn-based: the agent may speak while the user
-speaks. Live ingress, barge-in, streamed output, CUDA graphs and tensor
-parallelism are out of scope.
+speaks. Live ingress, barge-in, streamed output and tensor parallelism are out
+of scope.
 
 .. code-block:: bash
 
@@ -1239,13 +1239,14 @@ implementation on GH200 and H100 GPUs:
 - Cancellation, recovery and malformed inputs (rejected with 400) are checked
   on both graph runtimes; a 20-minute mixed-load soak on the Rust runtime kept
   GPU memory flat.
-- The model runs eagerly (no CUDA graphs), so a step is bound by CPU overhead
-  (``benchmark/worker_phases``: the LM forward is most of each iteration, with
-  no GPU wait) and its speed varies between hosts. On one H100 an LM step took
-  about 30 ms for one request and 43 ms for four batched, and over HTTP one
-  17.7 s request finished in 0.53x real time and four concurrent ones in 0.61x
-  each (median), about 5.6 seconds of audio per second in total; on a slower
-  H100 host the step took about 58 ms.
+- The LM's generate step runs from CUDA graphs captured at batch sizes up to
+  ``max_batch_size`` (conditioning frames run eagerly). On one H100, over HTTP,
+  one 17.7 s request finished in 0.29x real time (5.1 s) and four concurrent
+  ones in 0.40x each (median), about 8.7 seconds of audio per second in total;
+  32 concurrent requests reached about 24. In one container with the graphs
+  on and off, one request took 4.7 to 5.0 s against 11.7 s: the eager step is
+  bound by CPU overhead (``benchmark/worker_phases``), so its speed also varies
+  between hosts.
 - Audio quality has not been formally assessed. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge; no listening study

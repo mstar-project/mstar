@@ -29,6 +29,7 @@ from mstar.model.personaplex.submodules import (
     _sampled_token_ids,
 )
 from mstar.model.personaplex.weights import PersonaPlexLM, build_lm, reference_lm_key
+from mstar.model.submodule_base import BatchedModelOutput
 
 FIXTURES = Path(__file__).parent / "fixtures/personaplex"
 TINY = cfg.LMArchConfig(
@@ -188,6 +189,27 @@ class _RowBackends:
                           for i, b in enumerate(self.backends)])
 
 
+def _engine_step(sub, walk, engine_inputs, node_inputs, batched=True):
+    """preprocess -> forward(_batched) -> the engine's row collection -> postprocess, per request."""
+    rids = engine_inputs.request_ids
+    staged = sub.preprocess(walk, engine_inputs, node_inputs)
+    if batched:
+        raw = sub.forward_batched(walk, engine_inputs, **staged)
+        # The stop check must read the lm_state postprocess adds, not a buffer of the forward's.
+        assert isinstance(raw, BatchedModelOutput) and raw.check_stop_buffers is None
+        rows = raw.clone_row_outputs(len(rids))
+        outputs = {rid: {name: [tensor[i : i + 1]] for name, tensor in rows.items()} for i, rid in enumerate(rids)}
+    else:
+        outputs = {rids[0]: sub.forward(walk, engine_inputs, **staged)}
+    for rid, inp in zip(rids, node_inputs, strict=True):
+        sub.postprocess(rid, None, outputs[rid], inp)
+    return outputs
+
+
+def _needed(sub, frames):
+    return sub.depth_steps(cfg.GENERATE_WALK, sub._target_rows(frames)[1])
+
+
 def _assert_same_outputs(got, want, what):
     assert got.keys() == want.keys(), what
     for name in want:
@@ -270,14 +292,15 @@ def test_forward_batched_returns_each_request_its_own_rows():
         want.append(sub.run_frame(frame, reference.backend, _greedy_text, _greedy_depth))
         runs.append(run)
         states.append(state)
-    frames = [sub.prepare_frame(cfg.GENERATE_WALK, run.meta, {**run.static, "lm_state": [state]})
-              for run, state in zip(runs, states, strict=True)]
+    node_inputs = [sub.prepare_inputs(cfg.GENERATE_WALK, SimpleNamespace(step_metadata=run.meta),
+                                      {**run.static, "lm_state": [state]})
+                   for run, state in zip(runs, states, strict=True)]
     sub._backend = _RowBackends([run.backend for run in runs])
     text_sampler, depth_sampler = Sampler(), Sampler()
     engine_inputs = SimpleNamespace(request_ids=["a", "b"], resources={
         cfg.TEXT_SAMPLER: text_sampler, cfg.DEPTH_SAMPLER: depth_sampler,
     })
-    got = sub.forward_batched(cfg.GENERATE_WALK, engine_inputs, frames)
+    got = _engine_step(sub, cfg.GENERATE_WALK, engine_inputs, node_inputs)
     assert set(got) == {"a", "b"}
     # The rows sample different text, so handing one row the other's tokens would show.
     assert text_sampler.tokens[0][0] != text_sampler.tokens[0][1]
@@ -410,7 +433,7 @@ def test_stopping_one_depth_step_early_changes_the_committed_state():
     for _ in range(meta["num_user_frames"]):
         frames = [sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
                   for run, state in ((full, full_state), (short, short_state))]
-        needed = sub.depth_steps([frames[1]])
+        needed = _needed(sub, [frames[1]])
         want = sub.run_frames([frames[0]], full.backend, _greedy_text, _greedy_depth, depth_steps=cfg.DEP_Q)[0]
         got = sub.run_frames([frames[1]], short.backend, _greedy_text, _greedy_depth, depth_steps=needed - 1)[0]
         full.backend.advance()
@@ -454,7 +477,7 @@ def test_batch_of_first_and_later_generate_frames_runs_the_longer_depformer():
         want.append(sub.run_frames([frame], solo.backend, _greedy_text, _greedy_depth, depth_steps=cfg.DEP_Q)[0])
         rows.append((batched, sub.prepare_frame(cfg.GENERATE_WALK, meta, {**batched.static, "lm_state": [states[1]]})))
     frames = [frame for _, frame in rows]
-    assert [sub.depth_steps([frame]) for frame in frames] == [1, cfg.AUDIO_CODEBOOKS_PER_STREAM]
+    assert [_needed(sub, [frame]) for frame in frames] == [1, cfg.AUDIO_CODEBOOKS_PER_STREAM]
     with _CountingDepth(sub) as counted:
         got = sub.run_frames(frames, _RowBackends([run.backend for run, _ in rows]), _greedy_text, counted.sample)
     assert counted.steps == list(range(cfg.AUDIO_CODEBOOKS_PER_STREAM))
@@ -474,6 +497,168 @@ def test_preprocess_passes_the_depth_step_count_to_forward():
     conditioning = sub.prepare_inputs(cfg.CONDITIONING_WALK, SimpleNamespace(step_metadata=meta),
                                       {**run.static, "lm_state": []})
     assert sub.preprocess(cfg.CONDITIONING_WALK, None, [conditioning])["depth_steps"] == 0
+
+
+def _reference_run_frames(sub, frames, backend):
+    """The LM frame step before it was split for capture (12c009973), kept as an independent control (greedy)."""
+    from mstar.model.personaplex.components.depformer import depth_steps_needed
+
+    walk = frames[0].walk
+    conditioning = walk == cfg.CONDITIONING_WALK
+    embeds = torch.cat([frame.embeds for frame in frames])
+    hidden, text_logits = sub.lm.temporal.forward_embeddings(embeds, backend, text_logits=not conditioning)
+    target = torch.cat([frame.cache.target[:, :, 0] for frame in frames])
+    provided = torch.cat([frame.cache.target_provided[:, :, 0] for frame in frames])
+    if conditioning:
+        sampled_text, audio = target[:, 0], target[:, 1:]
+    else:
+        sampled_text = _greedy_text(text_logits)
+        next_text = torch.where(provided[:, 0], target[:, 0], sampled_text)
+        audio = sub.lm.depth.run_frame(next_text, hidden, target[:, 1:], provided[:, 1:], _greedy_depth,
+                                       steps=depth_steps_needed(provided[:, 1:]))
+    results = []
+    for row, frame in enumerate(frames):
+        cache = frame.cache
+        output = cache.commit(sampled_text[row : row + 1], audio[row : row + 1])
+        if frame.restore_cache is not None:
+            cache.load(frame.restore_cache)
+        outputs = {"lm_state": [cache.state_tensor(frame.frame + 1)]}
+        if not conditioning:
+            outputs["agent_frame"] = [output[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM].contiguous()]
+            outputs["text_frame"] = [output[:, 0, 0].clone(memory_format=torch.contiguous_format)]
+        results.append(outputs)
+    return results
+
+
+class _GreedySampler:
+    def sample(self, request_ids, logits):
+        return logits.float().argmax(-1)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("batch", [1, 3])
+def test_engine_step_matches_the_pre_capture_frame_step_over_whole_requests(batch):
+    """prepare_inputs -> preprocess -> forward -> row collection -> postprocess, every frame, vs the old step.
+
+    Requests start at different frames, so batches mix walks' first and later frames.
+    """
+    sub = _tiny_submodule(seed=71)
+    cases = [_random_inputs(n_emb=1 + i % 2, n_text=2 + i, n_user=6, seed=171 + i) for i in range(batch)]
+    engine_runs = [_Run(sub, meta, voice, persona, codes) for voice, persona, codes, meta in cases]
+    reference_runs = [_Run(sub, meta, voice, persona, codes) for voice, persona, codes, meta in cases]
+    states = {"engine": [None] * batch, "reference": [None] * batch}
+    starts = [2 * i for i in range(batch)]
+    totals = [run.meta["conditioning_frames"] + run.meta["num_user_frames"] for run in engine_runs]
+    for tick in range(max(start + total for start, total in zip(starts, totals, strict=True))):
+        for walk in (cfg.CONDITIONING_WALK, cfg.GENERATE_WALK):
+            conditioning = walk == cfg.CONDITIONING_WALK
+            rows = [i for i in range(batch) if 0 <= tick - starts[i] < totals[i]
+                    and (tick - starts[i] < engine_runs[i].meta["conditioning_frames"]) == conditioning]
+            if not rows:
+                continue
+            node_inputs = [sub.prepare_inputs(walk, SimpleNamespace(step_metadata=engine_runs[i].meta), {
+                **engine_runs[i].static, "lm_state": [] if states["engine"][i] is None else [states["engine"][i]]})
+                for i in rows]
+            sub._backend = _RowBackends([engine_runs[i].backend for i in rows])
+            rids = [f"r{i}" for i in rows]
+            engine_inputs = SimpleNamespace(request_ids=rids, resources={
+                cfg.TEXT_SAMPLER: _GreedySampler(), cfg.DEPTH_SAMPLER: _GreedySampler()})
+            got = _engine_step(sub, walk, engine_inputs, node_inputs, batched=len(rows) > 1)
+            frames = [sub.prepare_frame(walk, reference_runs[i].meta, {
+                **reference_runs[i].static,
+                "lm_state": [] if states["reference"][i] is None else [states["reference"][i]]}) for i in rows]
+            want = _reference_run_frames(sub, frames, _RowBackends([reference_runs[i].backend for i in rows]))
+            for i in rows:
+                engine_runs[i].backend.advance()
+                reference_runs[i].backend.advance()
+            for k, i in enumerate(rows):
+                _assert_same_outputs(got[rids[k]], want[k], f"tick {tick} request {i} {walk}")
+                states["engine"][i] = got[rids[k]]["lm_state"][0]
+                states["reference"][i] = want[k]["lm_state"][0]
+
+
+@torch.no_grad()
+def test_captured_eight_step_depformer_matches_the_exact_count_on_first_and_later_frames():
+    sub = _tiny_submodule(seed=72)
+    case = _random_inputs(n_emb=1, n_text=2, n_user=4, seed=172)
+    (exact, fixed), (exact_state, fixed_state) = _conditioned_pair(sub, case)
+    meta = case[3]
+    for j in range(meta["num_user_frames"]):
+        frames = [sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
+                  for run, state in ((exact, exact_state), (fixed, fixed_state))]
+        want = sub.run_frames([frames[0]], exact.backend, _greedy_text, _greedy_depth)[0]
+        got = sub.run_frames([frames[1]], fixed.backend, _greedy_text, _greedy_depth,
+                             depth_steps=cfg.AUDIO_CODEBOOKS_PER_STREAM)[0]
+        exact.backend.advance()
+        fixed.backend.advance()
+        _assert_same_outputs(got, want, f"generate frame {j}")
+        exact_state, fixed_state = want["lm_state"][0], got["lm_state"][0]
+
+
+def test_capture_config_covers_both_generate_walks_up_to_the_batch_cap():
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+
+    for cap, sizes in ((1, [1]), (3, [1, 2, 3]), (8, [1, 2, 4, 8]), (12, [1, 2, 4, 8, 12]),
+                       (32, [1, 2, 4, 8, 16, 32])):
+        (config,) = LMSubmodule(PersonaPlexLM(TINY), max_batch_size=cap).get_accelerator_graph_configs(
+            torch.device("cpu"))
+        assert isinstance(config, BatchedAcceleratorGraphConfig) and config.capture_batch_sizes == sizes
+        assert config.capture_graph_walk == cfg.GENERATE_WALK
+        assert set(config.replay_graph_walks) == {cfg.GENERATE_WALK, cfg.GENERATE_AUDIO_WALK}
+        assert config.input_seq_dims == {"input_embeds": 0, "target": 0, "provided": 0}
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("real", [1, 3, 5])
+def test_padding_rows_from_the_capture_template_leave_real_rows_unchanged(real):
+    """Pad a real batch with the config's own template rows (as the runner does) and run the 8-step step."""
+    sub = _tiny_submodule(seed=73)
+    (config,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    bucket = next(size for size in config.capture_batch_sizes if size >= real)
+    cases = [_random_inputs(n_emb=1, n_text=1 + i, n_user=3, seed=173 + i) for i in range(real)]
+    padded_runs, solo_runs, node_inputs, frames = [], [], [], []
+    for voice, persona, codes, meta in cases:
+        for runs in (padded_runs, solo_runs):
+            run = _Run(sub, meta, voice, persona, codes)
+            _, state = run.walk(cfg.CONDITIONING_WALK, None)
+            runs.append((run, state))
+        run, state = padded_runs[-1]
+        node_inputs.append(sub.prepare_inputs(cfg.GENERATE_WALK, SimpleNamespace(step_metadata=meta),
+                                              {**run.static, "lm_state": [state]}))
+        run, state = solo_runs[-1]
+        frames.append(sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]}))
+    padding = config.get_node_inputs(bucket - real, 0)
+    assert all("frame" not in inp.kwargs for inp in padding)
+    staged = sub.preprocess(cfg.GENERATE_WALK, None, [*node_inputs, *padding])
+    # Every row is on its first generate frame (1 step); template rows need the 8 the capture records.
+    assert staged["input_embeds"].shape[0] == bucket
+    assert staged["depth_steps"] == (cfg.AUDIO_CODEBOOKS_PER_STREAM if padding else 1)
+    staged["depth_steps"] = cfg.AUDIO_CODEBOOKS_PER_STREAM  # a replay runs the captured step
+    sub._backend = _RowBackends([run.backend for run, _ in padded_runs]
+                                + [DenseTemporalCache(TINY.num_layers, TINY.rope_theta) for _ in padding])
+    rids = [f"r{i}" for i in range(bucket)]
+    engine_inputs = SimpleNamespace(request_ids=rids, resources={
+        cfg.TEXT_SAMPLER: _GreedySampler(), cfg.DEPTH_SAMPLER: _GreedySampler()})
+    raw = sub.forward_batched(cfg.GENERATE_WALK, engine_inputs, **staged)
+    rows = raw.clone_row_outputs(real)  # the engine keeps only the real rows
+    assert all(tensor.shape[0] == real for tensor in rows.values())
+    want = [sub.run_frame(frame, run.backend, _greedy_text, _greedy_depth)
+            for frame, (run, _) in zip(frames, solo_runs, strict=True)]
+    for i, inp in enumerate(node_inputs):
+        outputs = {name: [tensor[i : i + 1]] for name, tensor in rows.items()}
+        sub.postprocess(rids[i], None, outputs, inp)
+        _assert_same_outputs(outputs, want[i], f"row {i} of {bucket}")
+
+
+def test_a_generate_frame_with_a_free_user_codebook_is_refused():
+    """The captured step runs 8 depth steps; a frame needing more must fail loudly, not replay short."""
+    provided = torch.ones(2, cfg.NUM_CODEBOOKS, dtype=torch.bool)
+    provided[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM] = False
+    assert LMSubmodule.depth_steps(cfg.GENERATE_WALK, provided) == cfg.AUDIO_CODEBOOKS_PER_STREAM
+    provided[1, cfg.NUM_CODEBOOKS - 1] = False
+    with pytest.raises(RuntimeError, match="user codebook"):
+        LMSubmodule.depth_steps(cfg.GENERATE_WALK, provided)
+    assert LMSubmodule.depth_steps(cfg.CONDITIONING_WALK, provided) == 0
 
 
 @torch.no_grad()
@@ -497,13 +682,14 @@ def test_forward_accepts_eager_int32_sampler_tokens():
     run = _Run(sub, meta, voice, persona, codes)
     run.backend = DenseForwardBackend(TINY.num_layers, TINY.rope_theta)
     _, state = run.walk(cfg.CONDITIONING_WALK, None)
-    frame = sub.prepare_frame(cfg.GENERATE_WALK, meta, {**run.static, "lm_state": [state]})
+    node_inputs = sub.prepare_inputs(cfg.GENERATE_WALK, SimpleNamespace(step_metadata=meta),
+                                     {**run.static, "lm_state": [state]})
     sub._backend = run.backend
     text_sampler, depth_sampler = Int32Sampler(), Int32Sampler()
     engine_inputs = SimpleNamespace(request_ids=["request"], resources={
         cfg.TEXT_SAMPLER: text_sampler, cfg.DEPTH_SAMPLER: depth_sampler,
     })
-    got = sub.forward(cfg.GENERATE_WALK, engine_inputs, [frame])
+    got = _engine_step(sub, cfg.GENERATE_WALK, engine_inputs, [node_inputs], batched=False)["request"]
     assert (text_sampler.calls, depth_sampler.calls) == (1, 1)  # first generate frame: depth step 0 only
 
     reference = _Run(sub, meta, voice, persona, codes)
@@ -581,11 +767,14 @@ def test_lm_frame_validation_and_engine_hooks():
     node_inputs = sub.prepare_inputs(cfg.CONDITIONING_WALK, fwd_info, inputs)
     assert node_inputs.input_seq_len == 1 and node_inputs.input_embeds.shape == (1, TINY.dim)
     frame = node_inputs.kwargs["frame"]
-    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs]) == {"frames": [frame], "depth_steps": 0}
-    assert sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs, node_inputs]) == {
-        "frames": [frame, frame], "depth_steps": 0}
+    # preprocess hands the forward tensors only; the cache stays on the request's inputs for postprocess.
+    assert node_inputs.tensor_inputs["target"].shape == node_inputs.tensor_inputs["provided"].shape == (1, 17)
+    staged = sub.preprocess(cfg.CONDITIONING_WALK, None, [node_inputs, node_inputs])
+    assert set(staged) == {"input_embeds", "target", "provided", "depth_steps"} and staged["depth_steps"] == 0
+    assert staged["input_embeds"].shape == (2, TINY.dim) and staged["target"].shape == (2, 17)
+    assert torch.equal(staged["target"][1], frame.cache.target[0, :, 0])
     with pytest.raises(RuntimeError, match="not bound"):
-        sub.forward(cfg.CONDITIONING_WALK, None, [frame])
+        sub.forward(cfg.CONDITIONING_WALK, None, **staged)
     # One row takes the unbatched forward; the cap is the model kwarg.
     assert sub.can_batch(None, [node_inputs]) is False
     assert sub.can_batch(None, [node_inputs, node_inputs]) is True

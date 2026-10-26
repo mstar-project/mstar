@@ -1,4 +1,4 @@
-"""Opt-in observational hooks for CPU tensor ownership in actual server workers."""
+"""Opt-in hooks for harness-launched server workers: CPU tensor ownership observation, and an eager control."""
 
 import json
 import os
@@ -102,3 +102,11 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
         return result
 
     TensorCommunicationManager.force_cleanup_request = forced
+
+if os.environ.get("PERSONAPLEX_EAGER_CONTROL") == "1":
+    # A control server for graph-vs-eager comparisons: the LM declares no
+    # capture configs, so every step runs eager. Test tooling, not a product knob.
+    from mstar.model.personaplex.submodules import LMSubmodule
+
+    LMSubmodule.get_accelerator_graph_configs = lambda self, device, tp_world_size=1: []
+    print("PERSONAPLEX_EAGER_CONTROL: LM capture configs suppressed", flush=True)
