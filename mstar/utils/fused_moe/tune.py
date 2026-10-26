@@ -17,7 +17,7 @@ import torch
 import triton.language as tl
 
 from mstar.utils.fused_moe.align import moe_align_block_size
-from mstar.utils.fused_moe.kernels import config_path, invoke_fused_moe_kernel
+from mstar.utils.fused_moe.kernels import config_path, device_config_name, invoke_fused_moe_kernel
 
 BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512]
 
@@ -114,7 +114,7 @@ def main():
     parser.add_argument("--top-k", type=int, required=True)
     args = parser.parse_args()
     results = tune(args.experts, args.inter, args.hidden, args.top_k)
-    path = config_path(args.experts, 2 * args.inter, args.hidden)
+    path = config_path(args.experts, 2 * args.inter, args.hidden, device_config_name())
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(results, indent=2) + "\n")
     print(f"wrote {path}")

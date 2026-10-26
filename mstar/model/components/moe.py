@@ -90,8 +90,7 @@ _MM_OUT_DTYPE = hasattr(torch.ops.aten.mm, "dtype")
 # impl), so no extra kernel package is needed. The kernels only run on a GPU, see
 # the ``is_cuda`` check below.
 try:
-    from mstar.utils.fused_moe.backend import make_moe_backend
-    from mstar.utils.fused_moe.config import MoEProblem
+    from mstar.utils.fused_moe.backend import MoEProblem, make_moe_backend
 
     _HAS_FUSED = True
 except Exception as e:  # pragma: no cover -- exercised only when triton missing
