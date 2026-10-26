@@ -3938,8 +3938,9 @@ class KVManager(AttentionResource):
 
     def _host_pages(self, rid: str) -> int | None:
         """The host pages that moving every stream of ``rid`` takes, or None when ``rid`` can't move there: the
-        pool has no host memory, ``rid`` isn't resident, or a stream holds a cached image end `plan` hasn't copied."""
-        if self._cpu_pool is None or not self.is_resident(rid):
+        pool has no host memory, ``rid`` is guaranteed or isn't resident, or a stream holds a cached image end `plan`
+        hasn't copied."""
+        if self._cpu_pool is None or self._overrides[rid].guaranteed or not self.is_resident(rid):
             return None
         streams = self._streams[rid].values()
         if any(stream is pending for stream in streams for _, pending in self._image_ends):
