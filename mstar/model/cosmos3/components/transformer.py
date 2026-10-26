@@ -981,6 +981,17 @@ class Cosmos3OmniTransformer(nn.Module):
         cos, sin = self.rotary_emb(position_ids.unsqueeze(1), device=device, dtype=dtype)
         return cos.squeeze(0), sin.squeeze(0)
 
+    @torch.compiler.disable
+    def _gen_rotary(self, position_ids: torch.Tensor, device, dtype):
+        """``_rotary`` for the generation tower, kept eager inside the compiled
+        denoise step. Inductor fuses the interleaved mRoPE into one pointwise
+        kernel that Triton 3.7.1 miscompiles on sm_103 when a thread holds two
+        elements (wrong frequencies in odd slots), and pointwise autotuning
+        picks such a config at some token counts (121-frame 832x480 video).
+        The table depends only on positions, so eager costs a few small
+        kernels per step."""
+        return self._rotary(position_ids, device, dtype)
+
     def prefill_und(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor,
         label: str,
@@ -1044,7 +1055,7 @@ class Cosmos3OmniTransformer(nn.Module):
             gen_seq = torch.cat([gen_seq] * len(position_ids_per_branch), dim=0)
         cos_parts, sin_parts = [], []
         for pos in position_ids_per_branch:
-            c, s = self._rotary(pos, gen_seq.device, gen_seq.dtype)
+            c, s = self._gen_rotary(pos, gen_seq.device, gen_seq.dtype)
             cos_parts.append(c)
             sin_parts.append(s)
         cos = torch.cat(cos_parts, dim=0) if len(cos_parts) > 1 else cos_parts[0]
@@ -1153,7 +1164,7 @@ class Cosmos3OmniTransformer(nn.Module):
             )
             gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
 
-        cos, sin = self._rotary(position_ids, gen_seq.device, gen_seq.dtype)
+        cos, sin = self._gen_rotary(position_ids, gen_seq.device, gen_seq.dtype)
         gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, label, attn)
         gen_out = self.norm_moe_gen(gen_seq)
         preds_packed = self.proj_out(gen_out[vision_mse_loss_indexes])
@@ -1251,8 +1262,8 @@ class Cosmos3OmniTransformer(nn.Module):
 
         n = gen_seq.shape[0]
         gen_seq = torch.cat([gen_seq, gen_seq], dim=0)
-        cos_c, sin_c = self._rotary(position_ids_cond, gen_seq.device, gen_seq.dtype)
-        cos_u, sin_u = self._rotary(position_ids_uncond, gen_seq.device, gen_seq.dtype)
+        cos_c, sin_c = self._gen_rotary(position_ids_cond, gen_seq.device, gen_seq.dtype)
+        cos_u, sin_u = self._gen_rotary(position_ids_uncond, gen_seq.device, gen_seq.dtype)
         cos = torch.cat([cos_c, cos_u], dim=0)
         sin = torch.cat([sin_c, sin_u], dim=0)
 
@@ -1328,8 +1339,8 @@ class Cosmos3OmniTransformer(nn.Module):
                 gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
             gen_seqs.append(gen_seq)
             shapes.append(original_latent_shapes)
-            cc, sc = self._rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
-            cu, su = self._rotary(req["position_ids_uncond"], gen_seq.device, gen_seq.dtype)
+            cc, sc = self._gen_rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
+            cu, su = self._gen_rotary(req["position_ids_uncond"], gen_seq.device, gen_seq.dtype)
             cos_cond.append(cc)
             sin_cond.append(sc)
             cos_uncond.append(cu)
@@ -1420,11 +1431,11 @@ class Cosmos3OmniTransformer(nn.Module):
             gen_seq = torch.cat([gen_seq, action_seq], dim=0)
             gen_seqs.append(gen_seq)
             shapes.append(original_latent_shapes)
-            cc, sc = self._rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
+            cc, sc = self._gen_rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
             cos_cond.append(cc)
             sin_cond.append(sc)
             if with_cfg:
-                cu, su = self._rotary(req["position_ids_uncond"], gen_seq.device, gen_seq.dtype)
+                cu, su = self._gen_rotary(req["position_ids_uncond"], gen_seq.device, gen_seq.dtype)
                 cos_uncond.append(cu)
                 sin_uncond.append(su)
 
