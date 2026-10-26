@@ -220,7 +220,7 @@ def test_a_chat_class_listed_as_not_ported_passes_the_route_and_chat_checks(monk
 @pytest.mark.parametrize("fields", [{}, {"max_completion_tokens": 0}], ids=["fields", "zero-max"])
 @pytest.mark.parametrize("cls", CHAT_CLASSES)
 def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields, tmp_path):
-    """``max_completion_tokens: 0`` falls through to ``max_tokens`` in Python."""
+    """``max_completion_tokens: 0`` is kept, not replaced by ``max_tokens``, as in Python."""
     model = _model_of(cls)
     stub = _StubAPIServer()
     body = {**CHAT, **fields}

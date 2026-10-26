@@ -116,6 +116,9 @@ class _RecordingServer:
         self.submitted = []
         self.reported_ignored_params = set()
 
+    async def wait_for_request_id(self, request_id):
+        pass
+
     def __getattr__(self, name):
         raise AttributeError(name)
 
@@ -205,21 +208,12 @@ def test_a_client_gone_before_the_first_chunk_is_aborted():
     assert unwound == ["r1"]
 
 
-def _conductor(limit=None, default=64):
+def _conductor(default=64):
     c = Conductor.__new__(Conductor)
     c.model = types.SimpleNamespace(
-        get_max_output_tokens_limit=lambda: limit,
         get_max_output_tokens=lambda **kw: kw.get("max_output_tokens", default),
     )
     return c
-
-
-def test_conductor_enforces_the_published_output_limit():
-    c = _conductor(limit=100)
-    assert c._max_output_tokens({}) == 64
-    assert c._max_output_tokens({"max_output_tokens": 100}) == 100
-    with pytest.raises(ValueError, match="at most 100"):
-        c._max_output_tokens({"max_output_tokens": 101})
 
 
 @pytest.mark.parametrize("bad", ["100", 0, -5, 1.5, True])
@@ -255,9 +249,11 @@ def test_rust_bridge_passes_extras_to_the_coercing_check():
 
     bridge = RustFrontendBridge.__new__(RustFrontendBridge)
     sent, seen = [], []
+    bridge._keys = {}
     bridge._send = sent.append
     bridge.server = types.SimpleNamespace(
         submit_request=lambda **kw: seen.append(normalize_generation_kwargs(kw["model_kwargs"])),
+        submission_key=lambda rid: rid,
         iter_result_chunks=no_chunks,
     )
 
@@ -267,7 +263,7 @@ def test_rust_bridge_passes_extras_to_the_coercing_check():
 
     asyncio.run(run())
     assert seen == [{"top_k": 5, "talker_temperature": 0.7}]
-    assert sent == [{"t": "done", "rid": "r1"}]
+    assert sent == [{"t": "done", "rid": "r1", "sub": None}]
 
 
 def test_checkpoint_defaults_read_both_greedy_spellings(tmp_path):

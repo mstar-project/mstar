@@ -175,7 +175,7 @@ class RustFrontendBridge:
             # a refused input: an in-band error chunk carries its 400 to the client
             logger.info("submit %s refused: %s", rid, e)
             self._send({
-                "t": "chunk", "rid": rid, "modality": "error",
+                "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
                 "data": str(e).encode("utf-8"), "metadata": {"status": 400},
             })
             return

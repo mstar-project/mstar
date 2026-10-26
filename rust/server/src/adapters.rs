@@ -603,10 +603,10 @@ impl Adapter {
     }
 }
 
-/// `max_completion_tokens or max_tokens`, as Python reads them: a 0 falls
-/// through to `max_tokens`.
+/// `max_completion_tokens`, else `max_tokens`, as Python reads them: an
+/// explicit 0 is kept, so validation refuses it.
 fn chat_max_tokens(req: &ChatCompletionRequest) -> Option<i64> {
-    req.max_completion_tokens.filter(|&n| n != 0).or(req.max_tokens)
+    req.max_completion_tokens.or(req.max_tokens)
 }
 
 /// Text out of a chat's messages, with the standard sampling fields

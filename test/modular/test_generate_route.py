@@ -20,7 +20,10 @@ class _RecordingServer:
         self.streaming = kwargs["streaming"]
         return "r"
 
-    def async_stream_results(self, request_id, binary=False):
+    async def open_result_stream(self, request_id, raw_request=None):
+        return None
+
+    def async_stream_results(self, request_id, binary=False, chunks=None):
         async def body():
             yield b'{"modality": "text"}\n'
         return body()
