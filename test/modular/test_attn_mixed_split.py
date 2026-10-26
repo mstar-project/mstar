@@ -11,7 +11,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mstar.engine.resources.attn import plan_replay
 from mstar.engine.resources.attn.wrappers import (
     FlashInferMixedWrapper,
     FlashInferPrefillWrapper,
@@ -151,12 +150,10 @@ def _random_layout(rng, prompts):
 
 
 @requires_gpu
-def test_later_plans_match_a_first_plan(monkeypatch):
-    """Later plans of a wrapper replay FlashInfer's ``plan``; each must
-    attend exactly as a new wrapper's first plan of the same step, and as
-    the packed prefill wrapper over the real rows."""
-    # FlashInfer plans only the first real step itself, so the rest replay
-    monkeypatch.setattr(plan_replay, "_CHECK_FIRST", 1)
+def test_later_plans_match_a_first_plan():
+    """Later plans of a wrapper skip FlashInfer's ``plan`` for its planner;
+    each must attend exactly as a new wrapper's first plan of the same step,
+    and as the packed prefill wrapper over the real rows."""
     import numpy as np
 
     device = torch.device("cuda")
@@ -180,8 +177,8 @@ def test_later_plans_match_a_first_plan(monkeypatch):
         first.plan(causal=True, dtype=torch.bfloat16, **plan)
         reused.plan(causal=True, dtype=torch.bfloat16, **plan)
         if step > 0:
-            for w in (reused._prefill, reused._decode):
-                assert any(isinstance(r, plan_replay._Replay) for r in w._replay._replays.values())
+            assert reused._prefill._planner_args is not None
+            assert reused._decode._planner_args is not None
         for a, b in ((first._prefill, reused._prefill), (first._decode, reused._decode)):
             assert list(a.attn_wrapper._plan_info) == list(b.attn_wrapper._plan_info)
         real = int(plan["qo_indptr"][n])
