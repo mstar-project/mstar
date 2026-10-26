@@ -56,7 +56,7 @@ class LoraLoads:
         """Hand every pool the read and return at once. A pool that refuses outright (the
         name already served) fails the load without the rest being asked."""
         load = LoraLoad(body)
-        digest = None if body.lora_digest is None else bytes.fromhex(body.lora_digest)
+        digest = bytes.fromhex(body.lora_digest)
         for pool in pools:
             try:
                 load.reads.append((pool, pool.load_adapter_async(body.lora_name, body.lora_path, digest)))

@@ -107,11 +107,10 @@ class _Wait:
 
 
 class _Served(NamedTuple):
-    """Where an adapter is read from, and what its weights must digest to (None until
-    its first read, for an adapter that arrived without one)."""
+    """Where an adapter is read from, and what its weights must digest to."""
 
     path: str
-    digest: bytes | None
+    digest: bytes
 
 
 @dataclass(frozen=True)
@@ -333,11 +332,18 @@ class LoraAdapterPool(Resource):
         # adapter on a vision tower's pool): their rows address the zero adapter and
         # hold no slot. Known from the first admit that read one, on every rank alike.
         self._empty: set[str] = set()
+        unpinned = sorted(set(spec.adapters) - set(spec.adapter_digests))
+        if unpinned:
+            # each rank would serve whatever its own read finds
+            raise ValueError(
+                f"LoRA adapters {unpinned} have no pinned digest: the API server resolves "
+                "the serving config's adapters (resolve_lora_adapters)"
+            )
         # adapter -> where it is read from: those a new request may name, and those
         # unloaded while live requests still named them, kept until the last of those
         # requests is removed
         self._serving: dict[str, _Served] = {
-            name: _Served(path, spec.adapter_digests.get(name))
+            name: _Served(path, spec.adapter_digests[name])
             for name, path in spec.adapters.items()
         }
         self._retiring: dict[str, _Served] = {}
@@ -392,8 +398,7 @@ class LoraAdapterPool(Resource):
         # read adapters ahead, so a first request finds its adapter in the host tier
         for name in list(self._serving)[:spec.cpu_capacity]:
             served = self._serving[name]
-            adapter = self._store.load(name, served.path, served.digest)
-            self._pin_digest(name, served, adapter.digest)
+            self._store.load(name, served.path, served.digest)
 
         logger.info(
             "LoRA pool: %d slots (+ zero adapter), max rank %d, targets %s, %.2f MiB",
@@ -510,11 +515,11 @@ class LoraAdapterPool(Resource):
         """Whether a new request may name ``adapter`` here."""
         return adapter in self._serving
 
-    def load_adapter(self, name: str, path: str, digest: bytes | None = None) -> None:
+    def load_adapter(self, name: str, path: str, digest: bytes) -> None:
         """``load_adapter_async``, waited on."""
         self.load_adapter_async(name, path, digest).result()
 
-    def load_adapter_async(self, name: str, path: str, digest: bytes | None = None) -> Future:
+    def load_adapter_async(self, name: str, path: str, digest: bytes) -> Future:
         """Serve ``name`` from ``path``: read it on the reader thread, check it against the
         spec (and against ``digest``, the weights the API server checked), shard it for
         this rank into the host tier, and only then make it servable. The future fails if
@@ -525,12 +530,12 @@ class LoraAdapterPool(Resource):
             self._refuse_reload(name)
             return self._executor().submit(self._load, name, path, digest)
 
-    def _load(self, name: str, path: str, digest: bytes | None) -> None:
+    def _load(self, name: str, path: str, digest: bytes) -> None:
         adapter = self._store.read(name, path, digest)
         with self._lock:
             self._refuse_reload(name)
             self._store.put(adapter, keep=self._wanted())
-            self._serving[name] = _Served(path, adapter.digest)
+            self._serving[name] = _Served(path, digest)
         logger.info("LoRA pool: loaded %s from %s", name, path)
 
     def _refuse_reload(self, name: str) -> None:
@@ -906,26 +911,14 @@ class LoraAdapterPool(Resource):
                 return
             adapter = future.result()
             current = self._serving.get(name) or self._retiring.get(name)
-            if current is None or current.path != served.path or (
-                current.digest is not None and current.digest != adapter.digest
-            ):
+            if current is None or current != served:
                 return  # unloaded, or reloaded with other weights, while it was read
-            self._pin_digest(name, current, adapter.digest)
             self._store.put(adapter, keep=self._wanted())
 
     def _wanted(self) -> set[str]:
         """Caller holds the lock. Adapters a request still waits on: the host tier keeps
         them past ``cpu_capacity``, so a copy read for an admit is there when it runs."""
         return {self._adapter_of[rid] for rid in self._awaiting}
-
-    def _pin_digest(self, name: str, served: _Served, digest: bytes) -> None:
-        """An adapter that arrived with no digest takes its first read's, so a file
-        changed after it is refused rather than served under the name."""
-        if served.digest is not None:
-            return
-        for table in (self._serving, self._retiring):
-            if table.get(name) == served:
-                table[name] = served._replace(digest=digest)
 
     def _pick_slot(self, exclude=()) -> int | None:
         """An empty slot, else the unheld one released longest ago (ties to the lowest

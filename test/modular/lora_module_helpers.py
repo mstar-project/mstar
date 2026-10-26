@@ -22,6 +22,8 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.lora import LoraReqConfig, LoraSpec
+from mstar.engine.resources.lora.checkpoint import read_lora_file
+from mstar.engine.resources.lora.identity import adapter_digest
 from mstar.engine.resources.lora.pool import LoraAdapterPool
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
@@ -113,12 +115,22 @@ def write_peft(path, modules: dict[str, tuple[torch.Tensor, torch.Tensor]], alph
     return str(path)
 
 
+def pin_digests(spec: LoraSpec) -> LoraSpec:
+    """``spec`` with each adapter's digest pinned, as the API server pins the serving
+    config's (``resolve_lora_adapters``), but without checking that the adapter fits."""
+    spec.adapter_digests = {
+        name: adapter_digest(read_lora_file(path, convert_keys=spec.convert_keys))
+        for name, path in spec.adapters.items()
+    }
+    return spec
+
+
 def serve(spec: LoraSpec, adapters: dict[str, str], max_rank: int = 4, **kw) -> LoraSpec:
     """``spec`` sized as a deployment's YAML would, on the CPU reference backend in fp64."""
     spec.apply_yaml_overrides(max_slots=2, max_rank=max_rank, adapters=dict(adapters), **kw)
     spec.dtype = DTYPE
     spec.backend = "torch"
-    return spec
+    return pin_digests(spec)
 
 
 def pool(spec: LoraSpec, rank: int = 0, world: int = 1) -> LoraAdapterPool:

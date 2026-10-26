@@ -19,6 +19,8 @@ from safetensors.torch import save_file  # noqa: E402
 
 from mstar.engine.resources.lora import LoraReqConfig, ops  # noqa: E402
 from mstar.engine.resources.lora import backend as ref_ops  # noqa: E402
+from mstar.engine.resources.lora.checkpoint import read_lora_file  # noqa: E402
+from mstar.engine.resources.lora.identity import adapter_digest  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.lora.triton_backend import TritonLoraBackend  # noqa: E402
 from mstar.engine.resources.step import BucketKey, ResourceStep, Segment, SlotLease, StepContext  # noqa: E402
@@ -99,6 +101,9 @@ def make_pool(paths, *, head=False, rank=0, world=1):
     ))
     targets = ["lm_head", "embed_tokens"] if head else None
     spec.apply_yaml_overrides(max_slots=2, max_rank=16, adapters=dict(paths), targets=targets)
+    # pinned as the API server pins a serving config's adapters
+    spec.adapter_digests = {name: adapter_digest(read_lora_file(path, convert_keys=spec.convert_keys))
+                           for name, path in paths.items()}
     spec.backend = "triton"
     pool = LoraAdapterPool(spec, "cuda", dtype=torch.bfloat16, rank=rank, world_size=world)
     assert isinstance(pool.backend, TritonLoraBackend)

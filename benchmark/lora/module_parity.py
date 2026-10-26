@@ -530,10 +530,12 @@ def _lora_logits(spec_: ModelSpec, model, adapters: dict[str, str], prompts, rop
 
     from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig
     from mstar.engine.resources.lora.pool import LoraAdapterPool
+    from mstar.engine.resources.lora.store import check_adapters
     from mstar.engine.resources.step import StepContext
 
     spec = _lora_spec(model)
     spec.apply_yaml_overrides(max_slots=len(adapters), max_rank=_max_rank(adapters), adapters=adapters)
+    spec.adapter_digests = check_adapters(spec)  # as the API server pins them
     spec.dtype = torch.bfloat16
     pool = LoraAdapterPool(spec, "cuda")
     sub = _submodule(model, spec_.node)

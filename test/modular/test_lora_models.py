@@ -321,7 +321,7 @@ def _vision_pool(paths, max_slots=2):
     spec = qwen3_5_lora_spec(H.tiny_config(), vision_config()).for_node("vision_encoder")
     spec.apply_yaml_overrides(max_slots=max_slots, max_rank=4, adapters=dict(paths))
     spec.dtype, spec.backend = H.DTYPE, "torch"
-    return H.pool(spec)
+    return H.pool(H.pin_digests(spec))
 
 
 def _admit(lora_pool, step, rid, adapter, walk="encode", lease=None):

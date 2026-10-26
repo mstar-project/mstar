@@ -326,7 +326,7 @@ class LoadLoraAdapter(MessageBody):
     op_id: str
     lora_name: str
     lora_path: str
-    lora_digest: str | None = None
+    lora_digest: str
 
 
 @dataclass

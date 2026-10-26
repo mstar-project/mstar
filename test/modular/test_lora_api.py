@@ -308,7 +308,9 @@ def test_the_lora_endpoints_are_404_without_runtime_updates(monkeypatch):
     # nor does the conductor act on one
     out = _Outbox()
     for spec in (None, make_spec({})):
-        LoraAdapterOps(spec, ["worker_0"], out).load(LoadLoraAdapter(op_id="l", lora_name="a", lora_path="/p"))
+        LoraAdapterOps(spec, ["worker_0"], out).load(
+            LoadLoraAdapter(op_id="l", lora_name="a", lora_path="/p", lora_digest="ab" * 32)
+        )
     assert [a.status for a in out.answers()] == [404, 404] and out.to("worker_0") == []
     # with them on, a malformed name or path is a 400
     admin = LoraAdmin(SimpleNamespace(runtime_updates=True), ServedModels(base=(BASE,)), sent.append)
@@ -371,7 +373,7 @@ def test_a_load_is_answered_only_once_every_worker_acknowledged(paths):
     spec = make_spec({"a1": paths["a1"]}, runtime_updates=True)
     out = _Outbox()
     ops = LoraAdapterOps(spec, ["worker_0", "worker_1"], out)
-    ops.load(LoadLoraAdapter(op_id="op1", lora_name="a2", lora_path=paths["a2"]))
+    ops.load(LoadLoraAdapter(op_id="op1", lora_name="a2", lora_path=paths["a2"], lora_digest="ab" * 32))
     for worker in ("worker_0", "worker_1"):
         assert [m.message_type for m in out.to(worker)] == [WorkerMessageType.LOAD_LORA_ADAPTER]
     ops.ack(LoraAdapterAck(op_id="op1", worker_id="worker_0"))
@@ -397,7 +399,7 @@ def test_a_request_on_an_adapter_being_loaded_or_unloaded_is_refused(paths):
     def admit(rid, adapter):
         conductor._admit_request(SimpleNamespace(request_id=rid, model_kwargs={LORA_ADAPTER_KWARG: adapter}))
 
-    ops.load(LoadLoraAdapter(op_id="l", lora_name="a1", lora_path=paths["a1"]))
+    ops.load(LoadLoraAdapter(op_id="l", lora_name="a1", lora_path=paths["a1"], lora_digest="ab" * 32))
     admit("on_a1", "a1")
     admit("on_a2", "a2")
     ops.ack(LoraAdapterAck(op_id="l", worker_id="worker_0"))
@@ -413,7 +415,7 @@ def test_a_load_a_worker_never_answers_times_out_and_is_undone(paths):
     spec = make_spec({}, runtime_updates=True, runtime_update_timeout_s=10.0)
     out, clock = _Outbox(), SimpleNamespace(now=0.0)
     ops = LoraAdapterOps(spec, ["worker_0", "worker_1"], out, clock=lambda: clock.now)
-    ops.load(LoadLoraAdapter(op_id="op1", lora_name="a2", lora_path=paths["a2"]))
+    ops.load(LoadLoraAdapter(op_id="op1", lora_name="a2", lora_path=paths["a2"], lora_digest="ab" * 32))
     ops.ack(LoraAdapterAck(op_id="op1", worker_id="worker_0"))  # worker_1 never answers
     clock.now = 9.0
     ops.expire()
@@ -427,7 +429,7 @@ def test_a_load_a_worker_never_answers_times_out_and_is_undone(paths):
         assert out.to(worker)[-1].message_type == WorkerMessageType.UNLOAD_LORA_ADAPTER
     # a late ack is ignored, and the name is free for another try
     ops.ack(LoraAdapterAck(op_id="op1", worker_id="worker_1"))
-    ops.load(LoadLoraAdapter(op_id="op2", lora_name="a2", lora_path=paths["a2"]))
+    ops.load(LoadLoraAdapter(op_id="op2", lora_name="a2", lora_path=paths["a2"], lora_digest="ab" * 32))
     assert len(out.answers()) == 1 and out.to("worker_0")[-1].body.op_id == "op2"
 
 
@@ -593,17 +595,14 @@ def test_startup_refuses_every_bad_configured_adapter(tmp_path):
     LoraAdapterPool(make_spec({"good": good, "wide": wide}, cpu_capacity=1), "cpu")
 
 
-@pytest.mark.parametrize("pinned", [True, False])
-def test_a_file_changed_on_disk_is_refused_on_every_rank(paths, pinned):
-    """a1's file is overwritten after it was checked and before a worker first reads it.
-    Mechanism off (no digest pinned): the new weights are served."""
+def test_a_file_changed_on_disk_is_refused_on_every_rank(paths):
+    """a1's file is overwritten after it was checked (``make_spec`` pins its digest) and
+    before a worker first reads it."""
     path = paths["a1"]
-    digest = LoraAdapterStore(make_spec({}), pin=False).read("a1", path).digest
     barrier, pools = _Barrier(2), []
     for rank in range(2):
         # a2 first: the preload reads only it, so a1's first read comes after the change
         spec = make_spec({"a2": path, "a1": path}, max_slots=1, cpu_capacity=1)
-        spec.adapter_digests = {"a1": digest, "a2": digest} if pinned else {}
         pools.append(LoraAdapterPool(spec, "cpu", rank=rank, world_size=2, agree=barrier.for_rank(rank)))
     write_adapter(path, rank=2, seed=7)  # same name and shapes, other weights
     outcomes = [None, None]
@@ -617,9 +616,6 @@ def test_a_file_changed_on_disk_is_refused_on_every_rank(paths, pinned):
         t.start()
     for t in threads:
         t.join(timeout=30)
-    if not pinned:
-        assert all(outcome.ok for outcome in outcomes)
-        return
     for outcome in outcomes:
         assert not outcome.ok and isinstance(outcome.reason, AdmitRuntimeError)
         assert outcome.reason.request_ids == frozenset({"r1"})

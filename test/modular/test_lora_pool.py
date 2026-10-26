@@ -11,6 +11,7 @@ import pytest
 import torch
 
 pytest.importorskip("safetensors")
+from lora_module_helpers import pin_digests  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
 from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
@@ -83,12 +84,12 @@ def adapters(tmp_path):
 
 
 def make_spec(paths, max_slots=2, max_rank=4, cpu_capacity=8, dtype=torch.float64, **kw) -> LoraSpec:
-    return LoraSpec(
+    return pin_digests(LoraSpec(
         resource_key="lora", nodes={"LLM"}, num_layers=LAYERS,
         targets={"qkv": QKV, "o": O}, module_map=MODULE_MAP,
         max_slots=max_slots, max_rank=max_rank, cpu_capacity=cpu_capacity,
         adapters=dict(paths), dtype=dtype, backend="torch", **kw,
-    )
+    ))
 
 
 def make_pool(paths, **kw) -> LoraAdapterPool:
@@ -517,6 +518,11 @@ def test_the_api_server_pins_digests_and_narrows_targets_in_the_config_it_hands_
     # the conductor refuses the config before the API server resolved it
     with pytest.raises(ValueError, match=r"\['a3'\] have no pinned digest"):
         refuse_unresolved_lora_adapters(config)
+    # and a pool refuses one: each rank would serve whatever its own read finds
+    unpinned = make_spec({"a3": paths["a3"]})
+    unpinned.adapter_digests = {}
+    with pytest.raises(ValueError, match=r"\['a3'\] have no pinned digest"):
+        LoraAdapterPool(unpinned, "cpu")
     digests = resolve_lora_adapters(lora_spec(declared_resources(model, config)), config)
     block = config["resources"]["lora"]
     assert block["targets"] == ["o"] and block["adapter_digests"] == {"a3": digests["a3"].hex()}
