@@ -941,6 +941,7 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">errno</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">fcntl</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
@@ -950,12 +951,13 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">stat</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span><span class="p">,</span> <span class="n">ThreadPoolExecutor</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">CancelledError</span><span class="p">,</span> <span class="n">Future</span><span class="p">,</span> <span class="n">ThreadPoolExecutor</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">nullcontext</span> <span class="k">as</span> <span class="n">_nullcontext</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensor_store</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>  <span class="c1"># NameToTensorList, Rid re-exported</span>
@@ -1021,6 +1023,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span> <span class="o">=</span> <span class="s2">""</span>
     <span class="n">rx_time</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span> <span class="c1"># seconds</span>
+    <span class="c1"># uuids of the local buffers this read writes into</span>
+    <span class="n">transfer_uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="c1"># What the read moved over the transport (see count_read), set only while</span>
     <span class="c1"># transfer metrics are on and cleared once counted. Unannotated, so class</span>
     <span class="c1"># attributes rather than fields: a read with them off stores nothing more.</span>
@@ -1056,6 +1060,37 @@ window.runMermaid = runMermaid;</script>
             <span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span></div>
 </div>
 
+
+
+<div class="viewcode-block" id="FailedRead">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.FailedRead">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">FailedRead</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Edges of a request that will not be delivered because one of its</span>
+<span class="sd">    reads failed. ``error`` is that read's exception."""</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span>
+    <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]</span>
+    <span class="n">error</span><span class="p">:</span> <span class="ne">BaseException</span></div>
+
+
+
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">_KeptRead</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The local buffers of a read that failed or was torn down mid-transfer,</span>
+<span class="sd">    kept until every transfer into them has reported that it stopped.</span>
+
+<span class="sd">    ``future`` is set while the read still runs in the reader thread, which</span>
+<span class="sd">    owns its batch ids until it finishes. ``running`` holds the ids handed</span>
+<span class="sd">    over after that (local pointer -&gt; batch id), polled by the manager.</span>
+<span class="sd">    ``registered`` is index-parallel to ``buffers``. ``rid`` is None once the</span>
+<span class="sd">    request is torn down; ``request`` names it in logs."""</span>
+    <span class="n">rid</span><span class="p">:</span> <span class="n">Rid</span> <span class="o">|</span> <span class="kc">None</span>
+    <span class="n">request</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">buffers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
+    <span class="n">registered</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span>
+    <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">future</span><span class="p">:</span> <span class="n">Future</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">running</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
 
 
 <span class="c1">#: Earlier Mooncake releases let any host that reaches the TCP data port read</span>
@@ -1221,6 +1256,80 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1"># transfer_check_status: COMPLETED and FAILED free the batch; WAITING, and</span>
+<span class="c1"># TIMEOUT (a slice past MC_SLICE_TIMEOUT), mean slices may still be moving</span>
+<span class="n">_TRANSFER_COMPLETED</span> <span class="o">=</span> <span class="mi">1</span>
+<span class="n">_TRANSFER_FAILED</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+<span class="n">_TRANSFER_RUNNING</span> <span class="o">=</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+
+<span class="c1"># between a read's status polls. Each poll takes the GIL, which the sync read's</span>
+<span class="c1"># wait never did; polling faster slows a main thread that releases it often.</span>
+<span class="n">_READ_POLL_INTERVAL_S</span> <span class="o">=</span> <span class="mf">1e-4</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_read_error</span><span class="p">(</span><span class="n">future</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""How a finished read failed, or None. Only ``done()`` and ``result()``</span>
+<span class="sd">    are used: the SHM arena's ``_CudaEventFuture`` has nothing else."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — includes a cancelled read</span>
+        <span class="k">return</span> <span class="n">exc</span>
+    <span class="k">return</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_may_be_reading</span><span class="p">(</span><span class="n">future</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A read still running, or one that failed and so may have left</span>
+<span class="sd">    transfers running until :meth:`get_ready_tensors` takes them over."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">():</span>
+        <span class="k">return</span> <span class="kc">True</span>
+    <span class="n">error</span> <span class="o">=</span> <span class="n">_read_error</span><span class="p">(</span><span class="n">future</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">error</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">error</span><span class="p">,</span> <span class="n">CancelledError</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_submit_failed</span><span class="p">(</span><span class="n">batch_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A failed ``batch_transfer_async_read``: 0, or uint64 -1 from Mooncake</span>
+<span class="sd">    releases before 0.3.13."""</span>
+    <span class="k">return</span> <span class="n">batch_id</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">batch_id</span> <span class="o">==</span> <span class="mi">2</span><span class="o">**</span><span class="mi">64</span> <span class="o">-</span> <span class="mi">1</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_mooncake_transfer_timeout_s</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The timeout Mooncake's sync read applies before its 1 ns per byte:</span>
+<span class="sd">    ``MC_TRANSFER_TIMEOUT`` (read with atoi, at least 5), else 30."""</span>
+    <span class="n">raw</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MC_TRANSFER_TIMEOUT"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">raw</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">30</span>
+    <span class="n">match</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="sa">r</span><span class="s2">"\s*[+-]?\d+"</span><span class="p">,</span> <span class="n">raw</span><span class="p">)</span>
+    <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">5</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">()))</span> <span class="k">if</span> <span class="n">match</span> <span class="k">else</span> <span class="mi">5</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_local_hca_count</span><span class="p">(</span><span class="n">engine</span><span class="p">,</span> <span class="n">device_filter</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""HCAs in the engine's local topology under the device filter it was</span>
+<span class="sd">    initialized with: Mooncake's sync read tries a failed batch</span>
+<span class="sd">    ``numContexts() + 1`` times."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">topology</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">engine</span><span class="o">.</span><span class="n">get_local_topology</span><span class="p">(</span><span class="n">device_filter</span><span class="p">))</span>
+        <span class="k">return</span> <span class="nb">len</span><span class="p">({</span><span class="n">hca</span> <span class="k">for</span> <span class="n">tiers</span> <span class="ow">in</span> <span class="n">topology</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">tier</span> <span class="ow">in</span> <span class="n">tiers</span> <span class="k">for</span> <span class="n">hca</span> <span class="ow">in</span> <span class="n">tier</span><span class="p">})</span>
+    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — a topology we can't read means no retries</span>
+        <span class="k">return</span> <span class="mi">0</span>
+
+
+<div class="viewcode-block" id="AsyncReadError">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.AsyncReadError">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">AsyncReadError</span><span class="p">(</span><span class="ne">RuntimeError</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A Mooncake read that failed. ``running`` maps the local pointer of each</span>
+<span class="sd">    buffer whose transfer had not reported COMPLETED or FAILED to its batch</span>
+<span class="sd">    id; the reader stops polling them when it raises, and the manager that</span>
+<span class="sd">    keeps the buffers takes them over. ``unknown`` holds pointers whose</span>
+<span class="sd">    transfer state cannot be learned: a failed submit (which may have posted</span>
+<span class="sd">    part of the transfer) or a status this code does not know."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">message</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">running</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">unknown</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">message</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="o">=</span> <span class="n">running</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">unknown</span> <span class="o">=</span> <span class="n">unknown</span></div>
+
+
+
 <div class="viewcode-block" id="AsyncMooncakeReader">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.AsyncMooncakeReader">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AsyncMooncakeReader</span><span class="p">:</span>
@@ -1270,7 +1379,15 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_copy_stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
         <span class="n">start_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_read</span><span class="p">(</span><span class="n">read_info</span><span class="p">)</span>
+        <span class="n">end_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+        <span class="c1"># The caller points every read of one edge at its FutureAndPointers</span>
+        <span class="c1"># only when it wants the time (--log-stats or transfer metrics).</span>
+        <span class="k">if</span> <span class="n">read_info</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">fp</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">read_info</span><span class="p">:</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">fp</span><span class="o">.</span><span class="n">rx_time</span> <span class="o">=</span> <span class="p">(</span><span class="n">end_time</span> <span class="o">-</span> <span class="n">start_time</span><span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">read_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="s2">"TransferReadInfo"</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="c1"># group read_info by session id for batch read</span>
         <span class="n">grouped_read</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">read_info</span><span class="p">:</span>
@@ -1288,12 +1405,6 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">)</span>
                 <span class="k">if</span> <span class="n">status</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
                     <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Mooncake read failed. Status: </span><span class="si">{</span><span class="n">status</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="n">end_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
-        <span class="c1"># The caller points every read of one edge at its FutureAndPointers</span>
-        <span class="c1"># only when it wants the time (--log-stats or transfer metrics).</span>
-        <span class="k">if</span> <span class="n">read_info</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">fp</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">read_info</span><span class="p">:</span>
-                <span class="n">info</span><span class="o">.</span><span class="n">fp</span><span class="o">.</span><span class="n">rx_time</span> <span class="o">=</span> <span class="p">(</span><span class="n">end_time</span> <span class="o">-</span> <span class="n">start_time</span><span class="p">)</span>
 
 <div class="viewcode-block" id="AsyncMooncakeReader.wait_all">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.AsyncMooncakeReader.wait_all">[docs]</a>
@@ -1310,6 +1421,90 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Wait for pending writes and shut down the thread pool."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">wait_all</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">shutdown</span><span class="p">(</span><span class="n">wait</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="TrackedMooncakeReader">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TrackedMooncakeReader">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">TrackedMooncakeReader</span><span class="p">(</span><span class="n">AsyncMooncakeReader</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Tensor reads that say, when they fail, which transfers may still be</span>
+<span class="sd">    writing into their buffers.</span>
+
+<span class="sd">    Each tensor is its own batch, read with ``batch_transfer_async_read`` and</span>
+<span class="sd">    polled with ``transfer_check_status``, which reports on a batch's first</span>
+<span class="sd">    task only. The sync read gives up on a timeout or on one failed tensor</span>
+<span class="sd">    without waiting for the rest of its batch, and returns no handle to them.</span>
+<span class="sd">    Retries and the deadline are the sync read's.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">engine</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">max_workers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">3</span><span class="p">,</span> <span class="n">device_filter</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">engine</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">max_workers</span><span class="o">=</span><span class="n">max_workers</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_device_filter</span> <span class="o">=</span> <span class="n">device_filter</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_attempts</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_attempts_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_timeout_s</span> <span class="o">=</span> <span class="n">_mooncake_transfer_timeout_s</span><span class="p">()</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_read_attempts</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Counted on the first failed tensor, not at startup:</span>
+<span class="sd">        ``get_local_topology`` starts a second engine, about 1 s."""</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_attempts_lock</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_attempts</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_attempts</span> <span class="o">=</span> <span class="n">_local_hca_count</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device_filter</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_attempts</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">read_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="s2">"TransferReadInfo"</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Raises ``AsyncReadError``, after which this thread polls none of</span>
+<span class="sd">        the batch ids it hands over."""</span>
+        <span class="n">engine</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine</span>
+        <span class="n">deadline</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">_timeout_s</span> <span class="o">+</span> <span class="nb">sum</span><span class="p">(</span><span class="n">i</span><span class="o">.</span><span class="n">nbytes</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">read_info</span><span class="p">)</span> <span class="o">*</span> <span class="mf">1e-9</span>
+        <span class="n">running</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">TransferReadInfo</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">attempts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">fail</span><span class="p">(</span><span class="n">message</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">unknown</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">())</span> <span class="o">-&gt;</span> <span class="n">AsyncReadError</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">AsyncReadError</span><span class="p">(</span>
+                <span class="n">message</span><span class="p">,</span> <span class="p">{</span><span class="n">ptr</span><span class="p">:</span> <span class="n">batch_id</span> <span class="k">for</span> <span class="n">ptr</span><span class="p">,</span> <span class="p">(</span><span class="n">batch_id</span><span class="p">,</span> <span class="n">_</span><span class="p">)</span> <span class="ow">in</span> <span class="n">running</span><span class="o">.</span><span class="n">items</span><span class="p">()},</span> <span class="nb">set</span><span class="p">(</span><span class="n">unknown</span><span class="p">),</span>
+            <span class="p">)</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="n">info</span><span class="p">:</span> <span class="n">TransferReadInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">batch_id</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">batch_transfer_async_read</span><span class="p">(</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">source_session_id</span><span class="p">,</span> <span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">],</span> <span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">remote_ptr</span><span class="p">],</span> <span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">],</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">_submit_failed</span><span class="p">(</span><span class="n">batch_id</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="n">fail</span><span class="p">(</span><span class="s2">"Mooncake read submit failed"</span><span class="p">,</span> <span class="p">{</span><span class="n">info</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">})</span>
+            <span class="n">running</span><span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">batch_id</span><span class="p">,</span> <span class="n">info</span><span class="p">)</span>
+            <span class="n">attempts</span><span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">]</span> <span class="o">=</span> <span class="n">attempts</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">local_ptr</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+
+        <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">read_info</span><span class="p">:</span>
+            <span class="n">submit</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+        <span class="k">while</span> <span class="n">running</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">ptr</span><span class="p">,</span> <span class="p">(</span><span class="n">batch_id</span><span class="p">,</span> <span class="n">info</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="n">running</span><span class="o">.</span><span class="n">items</span><span class="p">()):</span>
+                <span class="n">status</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">transfer_check_status</span><span class="p">(</span><span class="n">batch_id</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">status</span> <span class="ow">in</span> <span class="n">_TRANSFER_RUNNING</span><span class="p">:</span>
+                    <span class="c1"># the read needs every tensor, so one still running is</span>
+                    <span class="c1"># enough to wait on; polling the rest costs GIL hand-offs</span>
+                    <span class="k">break</span>
+                <span class="k">del</span> <span class="n">running</span><span class="p">[</span><span class="n">ptr</span><span class="p">]</span>
+                <span class="k">if</span> <span class="n">status</span> <span class="o">==</span> <span class="n">_TRANSFER_COMPLETED</span><span class="p">:</span>
+                    <span class="k">continue</span>
+                <span class="k">if</span> <span class="n">status</span> <span class="o">!=</span> <span class="n">_TRANSFER_FAILED</span><span class="p">:</span>
+                    <span class="c1"># may or may not have freed the batch: never poll it again</span>
+                    <span class="k">raise</span> <span class="n">fail</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Mooncake read returned unknown status </span><span class="si">{</span><span class="n">status</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="p">{</span><span class="n">ptr</span><span class="p">})</span>
+                <span class="k">if</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">&gt;</span> <span class="n">deadline</span> <span class="ow">or</span> <span class="n">attempts</span><span class="p">[</span><span class="n">ptr</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_read_attempts</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="n">fail</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Mooncake read failed. Status: </span><span class="si">{</span><span class="n">status</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+                <span class="n">submit</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">running</span><span class="p">:</span>
+                <span class="k">break</span>
+            <span class="k">if</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">&gt;</span> <span class="n">deadline</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="n">fail</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Mooncake read timed out after </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_timeout_s</span><span class="si">}</span><span class="s2"> s"</span><span class="p">)</span>
+            <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="n">_READ_POLL_INTERVAL_S</span><span class="p">)</span>
+
+<div class="viewcode-block" id="TrackedMooncakeReader.transfer_status">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TrackedMooncakeReader.transfer_status">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">transfer_status</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``transfer_check_status`` of one batch this reader handed over."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine</span><span class="o">.</span><span class="n">transfer_check_status</span><span class="p">(</span><span class="n">batch_id</span><span class="p">)</span></div>
 </div>
 
 
@@ -1557,6 +1752,15 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">rid_to_str</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">Rid</span><span class="p">],</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">str</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_uuid_minter</span> <span class="o">=</span> <span class="n">TensorUuidMinter</span><span class="p">(</span><span class="n">my_entity_id</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">FutureAndPointers</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1"># rid -&gt; the error of its first failed read; held until cleanup_request</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_failed_read_errors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="ne">BaseException</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_failed_reads</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">FailedRead</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1"># buffers of failed or torn-down reads, freed once their transfers stop</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_kept_reads</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">_KeptRead</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1"># buffers whose transfers can't be known to have stopped: never freed</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_unreleasable_buffers</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1"># batch id -&gt; transfer_check_status; None: the transport reports nothing</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_transfer_status</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">read_finished</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># req_id -&gt; {(producer uuid, offset, nbytes, dims) -&gt; local uuid} for</span>
         <span class="c1"># the received slices ``_take_cached_read`` re-pointed, and req_id -&gt;</span>
@@ -2457,8 +2661,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        is read as a whole, so an edge joined from several producers splits</span>
 <span class="sd">        its read time between them by bytes (by tensors if it moved none)."""</span>
         <span class="n">src</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">read_src</span>
-        <span class="c1"># Counted once: a later future that raises leaves this entry pending</span>
-        <span class="c1"># for the next poll.</span>
+        <span class="c1"># Cleared, so this read is never counted twice.</span>
         <span class="n">ep</span><span class="o">.</span><span class="n">read_src</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">dst</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_transfer_dst</span> <span class="ow">or</span> <span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">next_node</span>
         <span class="n">seconds</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">rx_time</span> <span class="ow">or</span> <span class="mf">0.0</span>
@@ -2472,9 +2675,153 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">src</span><span class="p">,</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">rows</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="n">stats</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">seconds</span> <span class="o">*</span> <span class="n">row</span><span class="p">[</span><span class="n">col</span><span class="p">]</span> <span class="o">/</span> <span class="n">total</span><span class="p">)</span>
 
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_poll_read</span><span class="p">(</span><span class="n">ep</span><span class="p">:</span> <span class="n">FutureAndPointers</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""``(done, error)`` for a read. A read that finished cleanly drops its</span>
+<span class="sd">        future, so later polls of it (it can wait behind an earlier read of</span>
+<span class="sd">        its request) query nothing."""</span>
+        <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">():</span>
+            <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="kc">None</span>
+        <span class="n">error</span> <span class="o">=</span> <span class="n">_read_error</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="n">error</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_drop_failed_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ep</span><span class="p">:</span> <span class="n">FutureAndPointers</span><span class="p">,</span> <span class="n">error</span><span class="p">:</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Retire a finished read that will not be delivered.</span>
+
+<span class="sd">        ``error`` set: this read failed. Its transfers may still write into its</span>
+<span class="sd">        buffers, so they are kept until they report that they stopped, and the</span>
+<span class="sd">        producer is not acked; it reclaims its copy when the request is torn</span>
+<span class="sd">        down. ``error`` None: an earlier read of the request failed and this</span>
+<span class="sd">        one completed, so it is acked and its buffers go with the request.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_failed_read_errors</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+                    <span class="s2">"Tensor read for request </span><span class="si">%s</span><span class="s2"> failed: </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">rid_to_str</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">request_id</span><span class="p">),</span> <span class="nb">type</span><span class="p">(</span><span class="n">error</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">error</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_keep_read_buffers</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">error</span><span class="p">)</span>
+        <span class="n">error</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_failed_read_errors</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">error</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_failed_reads</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">FailedRead</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">,</span> <span class="n">error</span><span class="p">))</span>
+
+<div class="viewcode-block" id="TensorCommunicationManager.take_failed_reads">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.take_failed_reads">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">take_failed_reads</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">FailedRead</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Reads dropped by :meth:`get_ready_tensors` since the last call. The</span>
+<span class="sd">        caller fails their requests; their other reads are dropped as they</span>
+<span class="sd">        finish, until :meth:`cleanup_request`."""</span>
+        <span class="n">failed</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_failed_reads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_failed_reads</span><span class="p">,</span> <span class="p">[]</span>
+        <span class="k">return</span> <span class="n">failed</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_keep_read_buffers</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ep</span><span class="p">:</span> <span class="n">FutureAndPointers</span><span class="p">,</span> <span class="n">error</span><span class="p">:</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Take a read's buffers out of the store, so the request's teardown</span>
+<span class="sd">        cannot free them, and keep them until its transfers stop. ``error`` is</span>
+<span class="sd">        how the read failed; None for one still running at teardown."""</span>
+        <span class="n">buffers</span><span class="p">,</span> <span class="n">registered</span> <span class="o">=</span> <span class="p">[],</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">ep</span><span class="o">.</span><span class="n">transfer_uuids</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span><span class="n">uuid</span><span class="p">):</span>
+                <span class="k">continue</span>
+            <span class="n">buffers</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">))</span>
+            <span class="n">registered</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span><span class="n">uuid</span><span class="p">))</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_edge_name</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">remove_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">buffers</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">kept</span> <span class="o">=</span> <span class="n">_KeptRead</span><span class="p">(</span>
+            <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">rid_to_str</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">request_id</span><span class="p">),</span> <span class="n">buffers</span><span class="p">,</span> <span class="n">registered</span><span class="p">,</span>
+            <span class="nb">sum</span><span class="p">(</span><span class="n">b</span><span class="o">.</span><span class="n">nbytes</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">buffers</span><span class="p">),</span>
+        <span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+            <span class="s2">"Keeping </span><span class="si">%d</span><span class="s2"> bytes of read buffers for request </span><span class="si">%s</span><span class="s2"> until its "</span>
+            <span class="s2">"transfers report that they stopped"</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">request</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># unfinished when polled: how it ends is read from the future later</span>
+            <span class="n">kept</span><span class="o">.</span><span class="n">future</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span>
+        <span class="k">elif</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_take_over</span><span class="p">(</span><span class="n">kept</span><span class="p">,</span> <span class="n">error</span><span class="p">):</span>
+            <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_kept_reads</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">kept</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_take_over</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kept</span><span class="p">:</span> <span class="n">_KeptRead</span><span class="p">,</span> <span class="n">error</span><span class="p">:</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Adopt the batch ids a finished read handed over for ``kept``. False</span>
+<span class="sd">        if whether its transfers stopped cannot be learned: then its buffers</span>
+<span class="sd">        are never freed."""</span>
+        <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">error</span><span class="p">,</span> <span class="n">CancelledError</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">True</span>  <span class="c1"># completed after all, or never started</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_transfer_status</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">error</span><span class="p">,</span> <span class="n">AsyncReadError</span><span class="p">):</span>
+            <span class="n">why</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"its </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">error</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> does not say whether the transfer stopped"</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_never_free</span><span class="p">(</span><span class="n">kept</span><span class="p">,</span> <span class="n">why</span><span class="p">)</span>
+        <span class="n">ptrs</span> <span class="o">=</span> <span class="p">{</span><span class="n">buffer</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span> <span class="k">for</span> <span class="n">buffer</span> <span class="ow">in</span> <span class="n">kept</span><span class="o">.</span><span class="n">buffers</span><span class="p">}</span>
+        <span class="k">if</span> <span class="n">error</span><span class="o">.</span><span class="n">unknown</span> <span class="o">&amp;</span> <span class="n">ptrs</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_never_free</span><span class="p">(</span><span class="n">kept</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">error</span><span class="si">}</span><span class="s2">, so part of the transfer may be running"</span><span class="p">)</span>
+        <span class="n">kept</span><span class="o">.</span><span class="n">running</span> <span class="o">=</span> <span class="p">{</span><span class="n">ptr</span><span class="p">:</span> <span class="n">batch_id</span> <span class="k">for</span> <span class="n">ptr</span><span class="p">,</span> <span class="n">batch_id</span> <span class="ow">in</span> <span class="n">error</span><span class="o">.</span><span class="n">running</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">ptr</span> <span class="ow">in</span> <span class="n">ptrs</span><span class="p">}</span>
+        <span class="k">return</span> <span class="kc">True</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_never_free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kept</span><span class="p">:</span> <span class="n">_KeptRead</span><span class="p">,</span> <span class="n">why</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_unreleasable_buffers</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">buffers</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+            <span class="s2">"Read buffers of request </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%d</span><span class="s2"> bytes) stay allocated for the life of "</span>
+            <span class="s2">"the process: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">request</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">why</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_release_kept_reads</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Free each kept read whose transfers have all reported COMPLETED or</span>
+<span class="sd">        FAILED. Never blocks; any other status keeps the buffers."""</span>
+        <span class="n">still_kept</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">kept</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept_reads</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">kept</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">kept</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">():</span>
+                    <span class="n">still_kept</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">kept</span><span class="p">)</span>
+                    <span class="k">continue</span>
+                <span class="n">future</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">future</span> <span class="o">=</span> <span class="n">kept</span><span class="o">.</span><span class="n">future</span><span class="p">,</span> <span class="kc">None</span>
+                <span class="n">error</span> <span class="o">=</span> <span class="n">_read_error</span><span class="p">(</span><span class="n">future</span><span class="p">)</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_take_over</span><span class="p">(</span><span class="n">kept</span><span class="p">,</span> <span class="n">error</span><span class="p">):</span>
+                    <span class="k">continue</span>
+            <span class="k">for</span> <span class="n">ptr</span><span class="p">,</span> <span class="n">batch_id</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">running</span><span class="o">.</span><span class="n">items</span><span class="p">()):</span>
+                <span class="n">status</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_transfer_status</span><span class="p">(</span><span class="n">batch_id</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">status</span> <span class="ow">in</span> <span class="p">(</span><span class="n">_TRANSFER_COMPLETED</span><span class="p">,</span> <span class="n">_TRANSFER_FAILED</span><span class="p">):</span>
+                    <span class="c1"># both free the batch, so the id is never polled again</span>
+                    <span class="k">del</span> <span class="n">kept</span><span class="o">.</span><span class="n">running</span><span class="p">[</span><span class="n">ptr</span><span class="p">]</span>
+                <span class="k">elif</span> <span class="n">status</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_TRANSFER_RUNNING</span><span class="p">:</span>
+                    <span class="n">kept</span><span class="o">.</span><span class="n">running</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_never_free</span><span class="p">(</span><span class="n">kept</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"its transfer returned unknown status </span><span class="si">{</span><span class="n">status</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+                    <span class="k">break</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">kept</span><span class="o">.</span><span class="n">running</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_free_kept_read</span><span class="p">(</span><span class="n">kept</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">still_kept</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">kept</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_kept_reads</span> <span class="o">=</span> <span class="n">still_kept</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_free_kept_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kept</span><span class="p">:</span> <span class="n">_KeptRead</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">buffer</span><span class="p">,</span> <span class="n">registered</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">buffers</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">registered</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">registered</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">buffer</span><span class="o">.</span><span class="n">nbytes</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="n">ret_value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_engine</span><span class="o">.</span><span class="n">unregister_memory</span><span class="p">(</span><span class="n">buffer</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">())</span>
+            <span class="k">if</span> <span class="n">ret_value</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_never_free</span><span class="p">(</span><span class="n">kept</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"unregistering its buffers failed (</span><span class="si">{</span><span class="n">ret_value</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+                <span class="k">return</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="s2">"Freed </span><span class="si">%d</span><span class="s2"> bytes of read buffers kept for request </span><span class="si">%s</span><span class="s2">: its transfers "</span>
+            <span class="s2">"stopped"</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span> <span class="n">kept</span><span class="o">.</span><span class="n">request</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="c1"># the reader may still hold this read's future and its error</span>
+        <span class="n">kept</span><span class="o">.</span><span class="n">buffers</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+
 <div class="viewcode-block" id="TensorCommunicationManager.get_ready_tensors">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.get_ready_tensors">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_ready_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]]:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept_reads</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_release_kept_reads</span><span class="p">()</span>
         <span class="n">ready</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">still_pending</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">uuid_to_time</span> <span class="o">=</span> <span class="p">{}</span>
@@ -2484,10 +2831,11 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># must not reach the client ahead of the one before it</span>
         <span class="n">waiting</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="n">Rid</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="p">:</span>
-            <span class="n">done</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">()</span>
+            <span class="n">done</span><span class="p">,</span> <span class="n">error</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_poll_read</span><span class="p">(</span><span class="n">ep</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="p">(</span><span class="n">done</span> <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_failed_read_errors</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_drop_failed_read</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">error</span><span class="p">)</span>
+                <span class="k">continue</span>
             <span class="k">if</span> <span class="n">done</span> <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">waiting</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                    <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
                 <span class="k">if</span> <span class="n">stats</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">read_src</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_record_transfer</span><span class="p">(</span><span class="n">stats</span><span class="p">,</span> <span class="n">ep</span><span class="p">)</span>
                 <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">:</span>
@@ -2760,11 +3108,16 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        segment. Synchronous (SHM) reads complete inside ``start_read_tensors``</span>
 <span class="sd">        with ``future=None``, so they never count here; only outstanding</span>
 <span class="sd">        async (RDMA) futures do. Gates the READS_DONE ACK during a drain.</span>
+<span class="sd">        So does a failed read whose transfers have not all stopped: they may</span>
+<span class="sd">        still be reading the producer's memory.</span>
 <span class="sd">        """</span>
         <span class="k">return</span> <span class="nb">any</span><span class="p">(</span>
             <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="o">==</span> <span class="n">request_id</span>
-            <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">()</span>
+            <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">_may_be_reading</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span>
+        <span class="p">)</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span>
+            <span class="n">kept</span><span class="o">.</span><span class="n">rid</span> <span class="o">==</span> <span class="n">request_id</span> <span class="ow">and</span> <span class="p">(</span><span class="n">kept</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">kept</span><span class="o">.</span><span class="n">running</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">kept</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept_reads</span>
         <span class="p">)</span></div>
 
 
@@ -2777,7 +3130,25 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        referenced or persisted. Does NOT force-drop persisted signals — that</span>
 <span class="sd">        is the conductor-coordinated hard cleanup, see</span>
 <span class="sd">        :meth:`force_cleanup_request`.</span>
+
+<span class="sd">        Reads of the request still in ``pending`` that failed, or have not</span>
+<span class="sd">        finished, keep their buffers and are not acked: their transfers may</span>
+<span class="sd">        still write into the buffers freed below.</span>
 <span class="sd">        """</span>
+        <span class="n">leftover</span> <span class="o">=</span> <span class="p">[</span><span class="n">ep</span> <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="o">==</span> <span class="n">request_id</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">ep</span> <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="o">!=</span> <span class="n">request_id</span><span class="p">]</span>
+        <span class="n">ack_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="n">leftover</span><span class="p">:</span>
+            <span class="n">done</span><span class="p">,</span> <span class="n">error</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_poll_read</span><span class="p">(</span><span class="n">ep</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">done</span> <span class="ow">or</span> <span class="n">error</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_keep_read_buffers</span><span class="p">(</span><span class="n">ep</span><span class="p">,</span> <span class="n">error</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">ack_edges</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">kept</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept_reads</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">kept</span><span class="o">.</span><span class="n">rid</span> <span class="o">==</span> <span class="n">request_id</span><span class="p">:</span>
+                <span class="n">kept</span><span class="o">.</span><span class="n">rid</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_failed_read_errors</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_failed_reads</span> <span class="o">=</span> <span class="p">[</span><span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_failed_reads</span> <span class="k">if</span> <span class="n">f</span><span class="o">.</span><span class="n">request_id</span> <span class="o">!=</span> <span class="n">request_id</span><span class="p">]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">read_finished</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">buffered_shards</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">sharding_configs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
@@ -2793,11 +3164,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">continue</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_cleanup_by_uuid</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span>
-            <span class="n">request_id</span><span class="p">,</span>
-            <span class="nb">sum</span><span class="p">([</span><span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span> <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="o">==</span> <span class="n">request_id</span><span class="p">],</span> <span class="n">start</span><span class="o">=</span><span class="p">[]),</span>
-        <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">ep</span> <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="o">!=</span> <span class="n">request_id</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_collect_and_send_acks</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">ack_edges</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">slice_uuids</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">slice_origins</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
 
@@ -2865,7 +3232,11 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># the consumer has the engine copy ``nbytes`` from ``address + offset``</span>
         <span class="c1"># into a buffer it views with the descriptor's strides</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">needs_flat_layout</span> <span class="o">=</span> <span class="n">protocol</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">,</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_async_reader</span> <span class="o">=</span> <span class="n">AsyncMooncakeReader</span><span class="p">(</span><span class="n">engine</span><span class="o">.</span><span class="n">_engine</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_async_reader</span> <span class="o">=</span> <span class="n">TrackedMooncakeReader</span><span class="p">(</span>
+            <span class="n">engine</span><span class="o">.</span><span class="n">_engine</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+            <span class="n">device_filter</span><span class="o">=</span><span class="n">tcp_transfer_device</span> <span class="k">if</span> <span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span> <span class="k">else</span> <span class="s2">""</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_transfer_status</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_async_reader</span><span class="o">.</span><span class="n">transfer_status</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">transport_label</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
@@ -2967,12 +3338,14 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
 
             <span class="n">read_info</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="n">transfer_uuids</span> <span class="o">=</span> <span class="p">[]</span>
             <span class="c1"># Created before the reads and pointed at by each of them, so the</span>
             <span class="c1"># async reader can stamp ``rx_time`` on it when the read completes</span>
             <span class="c1"># (the reader runs on another thread; the object identity is</span>
             <span class="c1"># stable, only ``.future`` is filled in after submit).</span>
             <span class="n">fp</span> <span class="o">=</span> <span class="n">FutureAndPointers</span><span class="p">(</span>
-                <span class="n">future</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="o">=</span><span class="p">[</span><span class="n">graph_edge</span><span class="p">],</span> <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span>
+                <span class="n">future</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">graph_edges</span><span class="o">=</span><span class="p">[</span><span class="n">graph_edge</span><span class="p">],</span> <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
+                <span class="n">transfer_uuids</span><span class="o">=</span><span class="n">transfer_uuids</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">source_entity</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">:</span>
@@ -3014,6 +3387,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">remote_ptr</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">address</span> <span class="o">+</span> <span class="n">info</span><span class="o">.</span><span class="n">offset</span><span class="p">,</span>
                     <span class="n">nbytes</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">,</span>
                 <span class="p">))</span>
+                <span class="n">transfer_uuids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Started transfer read for uuid </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span> <span class="ow">or</span> <span class="n">fp</span><span class="o">.</span><span class="n">read_src</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">for</span> <span class="n">ri</span> <span class="ow">in</span> <span class="n">read_info</span><span class="p">:</span>

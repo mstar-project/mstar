@@ -32,6 +32,7 @@ mstar.communication.tensors
    
       AsyncMooncakeReader
       BufferedShards
+      FailedRead
       FutureAndPointers
       LocalTransferEngine
       MooncakeCommunicationManager
@@ -40,11 +41,18 @@ mstar.communication.tensors
       StoredOutputs
       TensorCommunicationManager
       TensorTransferEngine
+      TrackedMooncakeReader
       TransferReadInfo
    
    
 
    
+   
+   .. rubric:: Exceptions
+
+   .. autosummary::
+   
+      AsyncReadError
    
    
 

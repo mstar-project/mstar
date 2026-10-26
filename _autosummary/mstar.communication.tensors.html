@@ -653,12 +653,19 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.AsyncMooncakeReader.wait_all"><code class="docutils literal notranslate"><span class="pre">AsyncMooncakeReader.wait_all()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.AsyncReadError"><code class="docutils literal notranslate"><span class="pre">AsyncReadError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards"><code class="docutils literal notranslate"><span class="pre">BufferedShards</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.consolidate"><code class="docutils literal notranslate"><span class="pre">BufferedShards.consolidate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.is_done"><code class="docutils literal notranslate"><span class="pre">BufferedShards.is_done()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.shard_dim"><code class="docutils literal notranslate"><span class="pre">BufferedShards.shard_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.shards"><code class="docutils literal notranslate"><span class="pre">BufferedShards.shards</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.total_fanin"><code class="docutils literal notranslate"><span class="pre">BufferedShards.total_fanin</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FailedRead"><code class="docutils literal notranslate"><span class="pre">FailedRead</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FailedRead.error"><code class="docutils literal notranslate"><span class="pre">FailedRead.error</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FailedRead.graph_edges"><code class="docutils literal notranslate"><span class="pre">FailedRead.graph_edges</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FailedRead.request_id"><code class="docutils literal notranslate"><span class="pre">FailedRead.request_id</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -671,6 +678,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers.read_tensors"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers.read_tensors</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers.request_id"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers.rx_time"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers.rx_time</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers.transfer_uuids"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers.transfer_uuids</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.LocalTransferEngine"><code class="docutils literal notranslate"><span class="pre">LocalTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -750,6 +758,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_and_return_tensor_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_and_return_tensor_info_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_row_outputs_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_row_outputs_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.take_failed_reads"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.take_failed_reads()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.transfer_stats"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.transfer_stats</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.transport_label"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.transport_label</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.unlink_owned_files()</span></code></a></li>
@@ -762,6 +771,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorTransferEngine.get_session_id"><code class="docutils literal notranslate"><span class="pre">TensorTransferEngine.get_session_id()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorTransferEngine.register_memory"><code class="docutils literal notranslate"><span class="pre">TensorTransferEngine.register_memory()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorTransferEngine.unregister_memory"><code class="docutils literal notranslate"><span class="pre">TensorTransferEngine.unregister_memory()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TrackedMooncakeReader"><code class="docutils literal notranslate"><span class="pre">TrackedMooncakeReader</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TrackedMooncakeReader.transfer_status"><code class="docutils literal notranslate"><span class="pre">TrackedMooncakeReader.transfer_status()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TransferReadInfo"><code class="docutils literal notranslate"><span class="pre">TransferReadInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -817,32 +830,47 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.BufferedShards" title="mstar.communication.tensors.BufferedShards"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BufferedShards</span></code></a>(total_fanin, shard_dim, shards)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.FutureAndPointers" title="mstar.communication.tensors.FutureAndPointers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FutureAndPointers</span></code></a>(future, graph_edges[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.FailedRead" title="mstar.communication.tensors.FailedRead"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FailedRead</span></code></a>(request_id, graph_edges, error)</p></td>
+<td><p>Edges of a request that will not be delivered because one of its reads failed.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.FutureAndPointers" title="mstar.communication.tensors.FutureAndPointers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FutureAndPointers</span></code></a>(future, graph_edges, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.LocalTransferEngine" title="mstar.communication.tensors.LocalTransferEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LocalTransferEngine</span></code></a>(hostname)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.LocalTransferEngine" title="mstar.communication.tensors.LocalTransferEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LocalTransferEngine</span></code></a>(hostname)</p></td>
 <td><p>No-op engine for SHM / single-node — data is already in local GPU memory.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.MooncakeCommunicationManager" title="mstar.communication.tensors.MooncakeCommunicationManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MooncakeCommunicationManager</span></code></a>(my_entity_id, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.MooncakeCommunicationManager" title="mstar.communication.tensors.MooncakeCommunicationManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MooncakeCommunicationManager</span></code></a>(my_entity_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.MooncakeTransferEngine" title="mstar.communication.tensors.MooncakeTransferEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MooncakeTransferEngine</span></code></a>(hostname, protocol[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.MooncakeTransferEngine" title="mstar.communication.tensors.MooncakeTransferEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MooncakeTransferEngine</span></code></a>(hostname, protocol[, ...])</p></td>
 <td><p>Wraps mooncake.engine.TransferEngine for RDMA or TCP transport.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.SharedMemoryCommunicationManager" title="mstar.communication.tensors.SharedMemoryCommunicationManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager</span></code></a>(...[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.SharedMemoryCommunicationManager" title="mstar.communication.tensors.SharedMemoryCommunicationManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SharedMemoryCommunicationManager</span></code></a>(...[, ...])</p></td>
 <td><p>Tensor transport via file I/O to a tmpfs directory (<code class="docutils literal notranslate"><span class="pre">/dev/shm</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.StoredOutputs" title="mstar.communication.tensors.StoredOutputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StoredOutputs</span></code></a>(flat_uuids, flat_rids, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.StoredOutputs" title="mstar.communication.tensors.StoredOutputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StoredOutputs</span></code></a>(flat_uuids, flat_rids, ...)</p></td>
 <td><p>One batch's stored outputs, in the layout routing consumes.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.TensorCommunicationManager" title="mstar.communication.tensors.TensorCommunicationManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorCommunicationManager</span></code></a>(my_entity_id, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.TensorCommunicationManager" title="mstar.communication.tensors.TensorCommunicationManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorCommunicationManager</span></code></a>(my_entity_id, ...)</p></td>
 <td><p>Base class for inter-worker tensor transport.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.TensorTransferEngine" title="mstar.communication.tensors.TensorTransferEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorTransferEngine</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.TensorTransferEngine" title="mstar.communication.tensors.TensorTransferEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorTransferEngine</span></code></a>()</p></td>
 <td><p>Abstract interface for low-level memory registration and async reads.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.tensors.TrackedMooncakeReader" title="mstar.communication.tensors.TrackedMooncakeReader"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TrackedMooncakeReader</span></code></a>(engine, device[, ...])</p></td>
+<td><p>Tensor reads that say, when they fail, which transfers may still be writing into their buffers.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.TransferReadInfo" title="mstar.communication.tensors.TransferReadInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TransferReadInfo</span></code></a>(source_session_id, ...[, fp])</p></td>
 <td><p></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p class="rubric">Exceptions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.tensors.AsyncReadError" title="mstar.communication.tensors.AsyncReadError"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AsyncReadError</span></code></a>(message, running, unknown)</p></td>
+<td><p>A Mooncake read that failed.</p></td>
 </tr>
 </tbody>
 </table>
@@ -891,6 +919,27 @@ is ready before the background thread reads it.</p>
 
 </dd></dl>
 
+<dl class="py exception">
+<dt class="sig sig-object py" id="mstar.communication.tensors.AsyncReadError">
+<span class="property"><span class="k"><span class="pre">exception</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">AsyncReadError</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">message</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">running</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">unknown</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#AsyncReadError"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.AsyncReadError" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#RuntimeError" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a></p>
+<p>A Mooncake read that failed. <code class="docutils literal notranslate"><span class="pre">running</span></code> maps the local pointer of each
+buffer whose transfer had not reported COMPLETED or FAILED to its batch
+id; the reader stops polling them when it raises, and the manager that
+keeps the buffers takes them over. <code class="docutils literal notranslate"><span class="pre">unknown</span></code> holds pointers whose
+transfer state cannot be learned: a failed submit (which may have posted
+part of the transfer) or a status this code does not know.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>message</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>running</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>unknown</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.communication.tensors.BufferedShards">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">BufferedShards</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">total_fanin</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard_dim</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">shards</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">torch.Tensor</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#BufferedShards"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.BufferedShards" title="Link to this definition">#</a></dt>
@@ -937,8 +986,40 @@ is ready before the background thread reads it.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.communication.tensors.FailedRead">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">FailedRead</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_edges</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">error</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#FailedRead"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.FailedRead" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Edges of a request that will not be delivered because one of its
+reads failed. <code class="docutils literal notranslate"><span class="pre">error</span></code> is that read’s exception.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_edges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a><em>]</em>)</p></li>
+<li><p><strong>error</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#BaseException" title="(in Python v3.12)"><em>BaseException</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.communication.tensors.FailedRead.error">
+<span class="sig-name descname"><span class="pre">error</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#BaseException" title="(in Python v3.12)"><span class="pre">BaseException</span></a></span><a class="headerlink" href="#mstar.communication.tensors.FailedRead.error" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.communication.tensors.FailedRead.graph_edges">
+<span class="sig-name descname"><span class="pre">graph_edges</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><span class="pre">GraphEdge</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.communication.tensors.FailedRead.graph_edges" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.communication.tensors.FailedRead.request_id">
+<span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.communication.tensors.FailedRead.request_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.communication.tensors.FutureAndPointers">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">FutureAndPointers</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">future</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">concurrent.futures._base.Future</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_edges</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><span class="pre">mstar.graph.base.GraphEdge</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">''</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rx_time</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#FutureAndPointers"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.FutureAndPointers" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">FutureAndPointers</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">future:</span> <span class="pre">concurrent.futures._base.Future</span> <span class="pre">|</span> <span class="pre">None,</span> <span class="pre">graph_edges:</span> <span class="pre">list[mstar.graph.base.GraphEdge],</span> <span class="pre">request_id:</span> <span class="pre">int</span> <span class="pre">|</span> <span class="pre">str</span> <span class="pre">=</span> <span class="pre">'',</span> <span class="pre">rx_time:</span> <span class="pre">float</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">transfer_uuids:</span> <span class="pre">list[int]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#FutureAndPointers"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.FutureAndPointers" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -947,6 +1028,7 @@ is ready before the background thread reads it.</p>
 <li><p><strong>graph_edges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a><em>]</em>)</p></li>
 <li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>rx_time</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>transfer_uuids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1002,6 +1084,11 @@ is ready before the background thread reads it.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.communication.tensors.FutureAndPointers.rx_time">
 <span class="sig-name descname"><span class="pre">rx_time</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.communication.tensors.FutureAndPointers.rx_time" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.communication.tensors.FutureAndPointers.transfer_uuids">
+<span class="sig-name descname"><span class="pre">transfer_uuids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.communication.tensors.FutureAndPointers.transfer_uuids" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1438,6 +1525,9 @@ the graph runtime releasing a node’s consumed inputs, hands back.</p>
 referenced or persisted. Does NOT force-drop persisted signals — that
 is the conductor-coordinated hard cleanup, see
 <a class="reference internal" href="#mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request" title="mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request"><code class="xref py py-meth docutils literal notranslate"><span class="pre">force_cleanup_request()</span></code></a>.</p>
+<p>Reads of the request still in <code class="docutils literal notranslate"><span class="pre">pending</span></code> that failed, or have not
+finished, keep their buffers and are not acked: their transfers may
+still write into the buffers freed below.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1594,7 +1684,9 @@ before ACKing (which the soft path would otherwise defer forever).</p>
 <dd><p>Whether any async read for this request is still touching a remote
 segment. Synchronous (SHM) reads complete inside <code class="docutils literal notranslate"><span class="pre">start_read_tensors</span></code>
 with <code class="docutils literal notranslate"><span class="pre">future=None</span></code>, so they never count here; only outstanding
-async (RDMA) futures do. Gates the READS_DONE ACK during a drain.</p>
+async (RDMA) futures do. Gates the READS_DONE ACK during a drain.
+So does a failed read whose transfers have not all stopped: they may
+still be reading the producer’s memory.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
@@ -1937,6 +2029,19 @@ What is stored is what the general path would store: one uuid per
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.take_failed_reads">
+<span class="sig-name descname"><span class="pre">take_failed_reads</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.take_failed_reads"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.take_failed_reads" title="Link to this definition">#</a></dt>
+<dd><p>Reads dropped by <a class="reference internal" href="#mstar.communication.tensors.TensorCommunicationManager.get_ready_tensors" title="mstar.communication.tensors.TensorCommunicationManager.get_ready_tensors"><code class="xref py py-meth docutils literal notranslate"><span class="pre">get_ready_tensors()</span></code></a> since the last call. The
+caller fails their requests; their other reads are dropped as they
+finish, until <a class="reference internal" href="#mstar.communication.tensors.TensorCommunicationManager.cleanup_request" title="mstar.communication.tensors.TensorCommunicationManager.cleanup_request"><code class="xref py py-meth docutils literal notranslate"><span class="pre">cleanup_request()</span></code></a>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="#mstar.communication.tensors.FailedRead" title="mstar.communication.tensors.FailedRead"><em>FailedRead</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.transfer_stats">
 <span class="sig-name descname"><span class="pre">transfer_stats</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.observability.recorders.html#mstar.observability.recorders.EdgeTransfers" title="mstar.observability.recorders.EdgeTransfers"><span class="pre">EdgeTransfers</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.transfer_stats" title="Link to this definition">#</a></dt>
@@ -2032,6 +2137,41 @@ never imports or depends on a specific transport library.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>ptr</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TrackedMooncakeReader">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.tensors.</span></span><span class="sig-name descname"><span class="pre">TrackedMooncakeReader</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">engine</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_workers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">3</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device_filter</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">''</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TrackedMooncakeReader"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TrackedMooncakeReader" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.communication.tensors.AsyncMooncakeReader" title="mstar.communication.tensors.AsyncMooncakeReader"><code class="xref py py-class docutils literal notranslate"><span class="pre">AsyncMooncakeReader</span></code></a></p>
+<p>Tensor reads that say, when they fail, which transfers may still be
+writing into their buffers.</p>
+<p>Each tensor is its own batch, read with <code class="docutils literal notranslate"><span class="pre">batch_transfer_async_read</span></code> and
+polled with <code class="docutils literal notranslate"><span class="pre">transfer_check_status</span></code>, which reports on a batch’s first
+task only. The sync read gives up on a timeout or on one failed tensor
+without waiting for the rest of its batch, and returns no handle to them.
+Retries and the deadline are the sync read’s.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>max_workers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>device_filter</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TrackedMooncakeReader.transfer_status">
+<span class="sig-name descname"><span class="pre">transfer_status</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TrackedMooncakeReader.transfer_status"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TrackedMooncakeReader.transfer_status" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">transfer_check_status</span></code> of one batch this reader handed over.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>batch_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
@@ -2186,12 +2326,19 @@ worker of the old one may still unlink.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.AsyncMooncakeReader.wait_all"><code class="docutils literal notranslate"><span class="pre">AsyncMooncakeReader.wait_all()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.AsyncReadError"><code class="docutils literal notranslate"><span class="pre">AsyncReadError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards"><code class="docutils literal notranslate"><span class="pre">BufferedShards</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.consolidate"><code class="docutils literal notranslate"><span class="pre">BufferedShards.consolidate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.is_done"><code class="docutils literal notranslate"><span class="pre">BufferedShards.is_done()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.shard_dim"><code class="docutils literal notranslate"><span class="pre">BufferedShards.shard_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.shards"><code class="docutils literal notranslate"><span class="pre">BufferedShards.shards</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.BufferedShards.total_fanin"><code class="docutils literal notranslate"><span class="pre">BufferedShards.total_fanin</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FailedRead"><code class="docutils literal notranslate"><span class="pre">FailedRead</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FailedRead.error"><code class="docutils literal notranslate"><span class="pre">FailedRead.error</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FailedRead.graph_edges"><code class="docutils literal notranslate"><span class="pre">FailedRead.graph_edges</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FailedRead.request_id"><code class="docutils literal notranslate"><span class="pre">FailedRead.request_id</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -2204,6 +2351,7 @@ worker of the old one may still unlink.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers.read_tensors"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers.read_tensors</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers.request_id"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers.rx_time"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers.rx_time</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.FutureAndPointers.transfer_uuids"><code class="docutils literal notranslate"><span class="pre">FutureAndPointers.transfer_uuids</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.LocalTransferEngine"><code class="docutils literal notranslate"><span class="pre">LocalTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -2283,6 +2431,7 @@ worker of the old one may still unlink.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_and_return_tensor_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_and_return_tensor_info_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_and_return_tensor_info_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.store_row_outputs_batch"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.store_row_outputs_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.take_failed_reads"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.take_failed_reads()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.transfer_stats"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.transfer_stats</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.transport_label"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.transport_label</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.unlink_owned_files"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.unlink_owned_files()</span></code></a></li>
@@ -2295,6 +2444,10 @@ worker of the old one may still unlink.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorTransferEngine.get_session_id"><code class="docutils literal notranslate"><span class="pre">TensorTransferEngine.get_session_id()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorTransferEngine.register_memory"><code class="docutils literal notranslate"><span class="pre">TensorTransferEngine.register_memory()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorTransferEngine.unregister_memory"><code class="docutils literal notranslate"><span class="pre">TensorTransferEngine.unregister_memory()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TrackedMooncakeReader"><code class="docutils literal notranslate"><span class="pre">TrackedMooncakeReader</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TrackedMooncakeReader.transfer_status"><code class="docutils literal notranslate"><span class="pre">TrackedMooncakeReader.transfer_status()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TransferReadInfo"><code class="docutils literal notranslate"><span class="pre">TransferReadInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
