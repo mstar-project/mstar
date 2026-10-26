@@ -835,7 +835,8 @@ class VJepa2Model(Model):
         return ProcessPromptOutput(out, {"kv_layout": kv_layout})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {self.ROLLOUT_LOOP_NAME: self._rollout_horizon(model_kwargs)}
+        # a loop runs at least once
+        return {self.ROLLOUT_LOOP_NAME: max(1, self._rollout_horizon(model_kwargs))}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         if self.config.predictor_kind != "ac":
@@ -844,10 +845,6 @@ class VJepa2Model(Model):
             (self.PREFILL_VIDEO_ROLLOUT, self.ROLLOUT_LOOP_NAME),
             (self.PREFILL_VIDEO_ROLLOUT_STREAMING, self.ROLLOUT_LOOP_NAME),
         ))}}
-
-    def _rollout_horizon(self, model_kwargs: dict) -> int:
-        requested = int(model_kwargs.get("rollout_horizon", 2) or 2)
-        return max(1, min(requested, self.config.max_rollout_horizon))
 
     def request_kwargs(self) -> frozenset[str]:
         return REQUEST_KWARGS

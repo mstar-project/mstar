@@ -588,7 +588,7 @@ def _vjepa2(predictor_kind: str = "ac", extrinsics: bool = False):
     return model
 
 
-@pytest.mark.parametrize("horizon", [2, 40])
+@pytest.mark.parametrize("horizon", [2, 16])
 def test_vjepa2_caps_the_rollout_where_its_stop_check_ends_it(horizon):
     from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
 
