@@ -669,6 +669,8 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.resolve_spec_dependencies"><code class="docutils literal notranslate"><span class="pre">resolve_spec_dependencies()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.spec_dependency_problems"><code class="docutils literal notranslate"><span class="pre">spec_dependency_problems()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.unknown_overrides_message"><code class="docutils literal notranslate"><span class="pre">unknown_overrides_message()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -696,6 +698,12 @@ what those configs already describe.</p>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.resolve_spec_dependencies" title="mstar.engine.resources.spec.resolve_spec_dependencies"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_spec_dependencies</span></code></a>(specs)</p></td>
 <td><p>Index specs by resource key, checking uniqueness and <code class="docutils literal notranslate"><span class="pre">depends_on</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.spec_dependency_problems" title="mstar.engine.resources.spec.spec_dependency_problems"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_dependency_problems</span></code></a>(specs)</p></td>
+<td><p>Every duplicate resource key and undeclared <code class="docutils literal notranslate"><span class="pre">depends_on</span></code> in <code class="docutils literal notranslate"><span class="pre">specs</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.spec.unknown_overrides_message" title="mstar.engine.resources.spec.unknown_overrides_message"><code class="xref py py-obj docutils literal notranslate"><span class="pre">unknown_overrides_message</span></code></a>(unknown, declared)</p></td>
+<td><p></p></td>
 </tr>
 </tbody>
 </table>
@@ -899,6 +907,36 @@ would otherwise be a silently ineffective setting.</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.spec_dependency_problems">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.spec.</span></span><span class="sig-name descname"><span class="pre">spec_dependency_problems</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#spec_dependency_problems"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.spec_dependency_problems" title="Link to this definition">#</a></dt>
+<dd><p>Every duplicate resource key and undeclared <code class="docutils literal notranslate"><span class="pre">depends_on</span></code> in <code class="docutils literal notranslate"><span class="pre">specs</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.unknown_overrides_message">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.spec.</span></span><span class="sig-name descname"><span class="pre">unknown_overrides_message</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">unknown</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">declared</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#unknown_overrides_message"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.unknown_overrides_message" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>unknown</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>declared</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Collection" title="(in Python v3.12)"><em>Collection</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -970,6 +1008,8 @@ would otherwise be a silently ineffective setting.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">apply_yaml_overrides()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.resolve_spec_dependencies"><code class="docutils literal notranslate"><span class="pre">resolve_spec_dependencies()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.spec_dependency_problems"><code class="docutils literal notranslate"><span class="pre">spec_dependency_problems()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.unknown_overrides_message"><code class="docutils literal notranslate"><span class="pre">unknown_overrides_message()</span></code></a></li>
 </ul>
   </nav></div>
 

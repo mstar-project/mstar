@@ -1195,6 +1195,17 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="requested_transport">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.requested_transport">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">requested_transport</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``MSTAR_RUST_ZMQ`` as set, upper-cased: ``0``, ``1`` or ``AUTO``."""</span>
+    <span class="n">choice</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_RUST_ZMQ"</span><span class="p">,</span> <span class="s2">"AUTO"</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">choice</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"0"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">,</span> <span class="s2">"AUTO"</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got </span><span class="si">{</span><span class="n">choice</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">choice</span></div>
+
+
+
 <div class="viewcode-block" id="make_communicator">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.make_communicator">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">make_communicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseCommunicator</span><span class="p">:</span>
@@ -1212,9 +1223,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    flag can be set per-process — one entity at a time — while the rest of</span>
 <span class="sd">    the mesh stays on pyzmq.</span>
 <span class="sd">    """</span>
-    <span class="n">choice</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_RUST_ZMQ"</span><span class="p">,</span> <span class="s2">"AUTO"</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">choice</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"0"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">,</span> <span class="s2">"AUTO"</span><span class="p">):</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got </span><span class="si">{</span><span class="n">choice</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="n">choice</span> <span class="o">=</span> <span class="n">requested_transport</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">choice</span> <span class="o">!=</span> <span class="s2">"0"</span><span class="p">:</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="kn">import</span><span class="w"> </span><span class="nn">mstar_rust</span>

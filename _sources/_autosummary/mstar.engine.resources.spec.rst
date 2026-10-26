@@ -15,6 +15,8 @@ mstar.engine.resources.spec
    
       apply_yaml_overrides
       resolve_spec_dependencies
+      spec_dependency_problems
+      unknown_overrides_message
    
    
 

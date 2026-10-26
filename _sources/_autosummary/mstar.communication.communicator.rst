@@ -21,6 +21,7 @@ mstar.communication.communicator
    .. autosummary::
    
       make_communicator
+      requested_transport
    
    
 

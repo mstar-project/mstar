@@ -13,6 +13,7 @@ mstar.graph.base
 
    .. autosummary::
    
+      self_triggered
       top_level_entities
    
    

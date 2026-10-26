@@ -952,7 +952,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CachedPrefix</span><span class="p">,</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">,</span> <span class="n">Resource</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResourceReqConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">ResourceReqConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">FULL_ADMIT_NOT_READY</span><span class="p">,</span>
     <span class="n">FULL_ADMIT_OK</span><span class="p">,</span>
@@ -966,7 +966,9 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="topo_sort">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.topo_sort">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">topo_sort</span><span class="p">(</span><span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Resource</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">topo_sort</span><span class="p">(</span><span class="n">resources</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Resource</span> <span class="o">|</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Keys in dependency order; built resources at load, their specs when the</span>
+<span class="sd">    conductor validates a deployment."""</span>
     <span class="n">deps</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
         <span class="n">key</span><span class="p">:</span> <span class="nb">set</span><span class="p">(</span><span class="n">resource</span><span class="o">.</span><span class="n">depends_on</span><span class="p">())</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">resources</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
     <span class="p">}</span>

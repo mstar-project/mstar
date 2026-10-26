@@ -1788,6 +1788,21 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="self_triggered">
+<a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.self_triggered">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">self_triggered</span><span class="p">(</span><span class="n">entity</span><span class="p">:</span> <span class="s2">"GraphNode | Loop"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Whether the stream alone can re-run a top-level entity once it completes:</span>
+<span class="sd">    it is, or (a Loop) holds, a consumer with every input streamed. Completion</span>
+<span class="sd">    reseeds streaming readiness only for such nodes (see</span>
+<span class="sd">    ``WorkerGraphStateRegistry.reseed_streaming_ready``); a consumer with a</span>
+<span class="sd">    non-streamed input has to receive it again first."""</span>
+    <span class="k">return</span> <span class="nb">any</span><span class="p">(</span>
+        <span class="n">node</span><span class="o">.</span><span class="n">consumes_stream</span> <span class="ow">and</span> <span class="n">node</span><span class="o">.</span><span class="n">input_names</span> <span class="o">&lt;=</span> <span class="n">node</span><span class="o">.</span><span class="n">_streaming_inputs</span>
+        <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">entity</span><span class="o">.</span><span class="n">get_nodes</span><span class="p">()</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+    <span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="GraphStateRegistry">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">GraphStateRegistry</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>

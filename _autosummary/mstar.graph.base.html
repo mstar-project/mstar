@@ -793,6 +793,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry.reset_for_iter"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry.reset_for_iter()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.self_triggered"><code class="docutils literal notranslate"><span class="pre">self_triggered()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.top_level_entities"><code class="docutils literal notranslate"><span class="pre">top_level_entities()</span></code></a></li>
 </ul>
             </nav>
@@ -810,7 +811,10 @@
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.graph.base.top_level_entities" title="mstar.graph.base.top_level_entities"><code class="xref py py-obj docutils literal notranslate"><span class="pre">top_level_entities</span></code></a>(section)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.graph.base.self_triggered" title="mstar.graph.base.self_triggered"><code class="xref py py-obj docutils literal notranslate"><span class="pre">self_triggered</span></code></a>(entity)</p></td>
+<td><p>Whether the stream alone can re-run a top-level entity once it completes: it is, or (a Loop) holds, a consumer with every input streamed.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.graph.base.top_level_entities" title="mstar.graph.base.top_level_entities"><code class="xref py py-obj docutils literal notranslate"><span class="pre">top_level_entities</span></code></a>(section)</p></td>
 <td><p>The &quot;outer-level&quot; nodes and loops of a section, keyed by name: the entities a registry over it counts toward completion.</p></td>
 </tr>
 </tbody>
@@ -1797,6 +1801,24 @@ cleared: in the set only if its inputs are ALL streaming.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.graph.base.self_triggered">
+<span class="sig-prename descclassname"><span class="pre">mstar.graph.base.</span></span><span class="sig-name descname"><span class="pre">self_triggered</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">entity</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/base.html#self_triggered"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.base.self_triggered" title="Link to this definition">#</a></dt>
+<dd><p>Whether the stream alone can re-run a top-level entity once it completes:
+it is, or (a Loop) holds, a consumer with every input streamed. Completion
+reseeds streaming readiness only for such nodes (see
+<code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry.reseed_streaming_ready</span></code>); a consumer with a
+non-streamed input has to receive it again first.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>entity</strong> (<a class="reference internal" href="#mstar.graph.base.GraphNode" title="mstar.graph.base.GraphNode"><em>GraphNode</em></a><em> | </em><a class="reference internal" href="#mstar.graph.base.Loop" title="mstar.graph.base.Loop"><em>Loop</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.graph.base.top_level_entities">
 <span class="sig-prename descclassname"><span class="pre">mstar.graph.base.</span></span><span class="sig-name descname"><span class="pre">top_level_entities</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">section</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/base.html#top_level_entities"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.base.top_level_entities" title="Link to this definition">#</a></dt>
 <dd><p>The “outer-level” nodes and loops of a section, keyed by name: the
@@ -2006,6 +2028,7 @@ entities a registry over it counts toward completion.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.WorkerGraphStateRegistry.reset_for_iter"><code class="docutils literal notranslate"><span class="pre">WorkerGraphStateRegistry.reset_for_iter()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.self_triggered"><code class="docutils literal notranslate"><span class="pre">self_triggered()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.top_level_entities"><code class="docutils literal notranslate"><span class="pre">top_level_entities()</span></code></a></li>
 </ul>
   </nav></div>
