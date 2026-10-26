@@ -51,6 +51,7 @@ class CommandAPlusModel(Model):
         self._tokenizer = None
         self._detokenizer = None
         self._image_processor = None
+        self._image_tokens = None
 
     def get_graph_walk_graphs(self):
         def prefill(*inputs):
@@ -221,6 +222,16 @@ class CommandAPlusModel(Model):
             self._image_processor = AutoImageProcessor.from_pretrained(self.local_dir, local_files_only=True)
         return self._image_processor
 
+    def _get_image_tokens(self):
+        """The start and end of image ids, and one tile's tokens ending in its line break."""
+        if self._image_tokens is None:
+            start, end, line_break = self._get_tokenizer().convert_tokens_to_ids(
+                ["<|START_OF_IMG|>", "<|END_OF_IMG|>", "<|IMG_LINE_BREAK|>"],
+            )
+            tile = [self.vision_config.image_token_id] * self.vision_config.tokens_per_tile + [line_break]
+            self._image_tokens = start, end, tile
+        return self._image_tokens
+
     def process_prompt(
         self, prompt, input_modalities, output_modalities, tensors=None, prompt_parts=None, **kwargs,
     ):
@@ -286,10 +297,7 @@ class CommandAPlusModel(Model):
             raise ValueError(f"The prompt has {len(positions)} image placeholders for {len(images)} images")
         if not images:
             return ids, []
-        start_of_image, end_of_image, line_break = self._get_tokenizer().convert_tokens_to_ids(
-            ["<|START_OF_IMG|>", "<|END_OF_IMG|>", "<|IMG_LINE_BREAK|>"],
-        )
-        tile = [image_token] * self.vision_config.tokens_per_tile + [line_break]
+        start_of_image, end_of_image, tile = self._get_image_tokens()
         pieces, pixel_values, start = [], [], 0
         length = ids.numel() - len(images)
         for position, image in zip(positions, images, strict=True):
