@@ -422,7 +422,7 @@ class LLMSubmodule(ARNodeSubmodule):
             # last sampled token, read by slot (padding rows read slot 0)
             sampler: SamplerResource = engine_inputs.resources[SAMPLER]
             t0 = perf_counter() if PHASE_PERIOD else 0.0
-            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            ids = sampler.loopback_tokens()
             # rows whose last step ran elsewhere brought their token
             routed = [
                 i for i, inp in enumerate(inputs)
@@ -548,7 +548,7 @@ class LLMSubmodule(ARNodeSubmodule):
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         captured = self._captured_decode(engine_inputs, graph_walk)
         if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            input_ids = sampler.loopback_tokens()
         if (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
             # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
             # positions, inside the graph; the static cos/sin stay unread
@@ -566,7 +566,7 @@ class LLMSubmodule(ARNodeSubmodule):
             # only the last token of each prefill row feeds the head
             hidden = attn.select_last_hidden(hidden)
         logits = self.model.lm_head(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        return sampler.sample(logits)
 
     def forward(
         self,
