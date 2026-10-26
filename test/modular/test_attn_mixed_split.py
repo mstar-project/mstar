@@ -10,9 +10,11 @@ other order a one-token row after the run is a prefill row.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
+from mstar.engine.resources.attn import plan_replay
 from mstar.engine.resources.attn.wrappers import (
     FlashInferMixedWrapper,
     FlashInferPrefillWrapper,
@@ -175,3 +177,69 @@ def test_a_replay_of_another_layout_attends_as_the_packed_prefill_does():
     ref_out = ref.run(q[:real], cache)
     err = (out[:real].float() - ref_out.float()).abs().max().item()
     assert err <= 2e-2, f"max err {err}"
+
+
+def _random_rows(rng, prompts):
+    """A decode-first bucket: one-token rows, then ``prompts`` prompt rows."""
+    decode = int(rng.integers(0 if prompts else 1, BUCKET_BS - prompts + 1))
+    rows = [(1, int(rng.integers(0, 4 * PAGE))) for _ in range(decode)]
+    budget = BUCKET_TOKENS - decode
+    for _ in range(prompts):
+        rows.append((1 + int(rng.integers(1, budget // prompts)), int(rng.integers(0, 2 * PAGE))))
+    return rows
+
+
+@requires_gpu
+@pytest.mark.parametrize("tensor_cores", [True, False])
+def test_later_plans_match_a_first_plan(monkeypatch, tensor_cores):
+    """Later plans of a wrapper replay FlashInfer's ``plan``; each must
+    attend exactly as a new wrapper's first plan of the same step, and as
+    the packed prefill wrapper over the real rows."""
+    # FlashInfer plans only the first real step itself, so the rest replay
+    monkeypatch.setattr(plan_replay, "_CHECK_FIRST", 1)
+    device = torch.device("cuda")
+    rng = np.random.default_rng(0)
+
+    def mixed():
+        return FlashInferMixedWrapper(
+            decode_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
+            prefill_workspace=torch.empty(WS, dtype=torch.uint8, device=device),
+            batch_size=BUCKET_BS, max_total_tokens=BUCKET_TOKENS,
+            max_prefill_rows=MAX_PROMPTS, use_tensor_cores=tensor_cores, **_kw(device),
+        )
+
+    reused = mixed()
+    torch.manual_seed(0)
+    cache = torch.randn(BUCKET_BS * 16, 2, PAGE, KV_HEADS, DIM, device=device, dtype=torch.bfloat16)
+    for step in range(16):
+        rows = _random_rows(rng, prompts=step % (MAX_PROMPTS + 1))
+        plan, _ = _layout(rows)
+        n = len(rows)
+        q = torch.randn(BUCKET_TOKENS, QO_HEADS, DIM, device=device, dtype=torch.bfloat16)
+        first = mixed()
+        first.plan(causal=True, dtype=torch.bfloat16, **plan)
+        reused.plan(causal=True, dtype=torch.bfloat16, **plan)
+        if step > 0:
+            assert any(
+                isinstance(r, plan_replay._Replay)
+                for w in (reused._prefill, reused._decode) for r in w._replay._replays.values()
+            )
+        for a, b in ((first._prefill, reused._prefill), (first._decode, reused._decode)):
+            assert list(a.attn_wrapper._plan_info) == list(b.attn_wrapper._plan_info)
+        real = int(plan["qo_indptr"][n])
+        out = reused.run(q, cache)
+        assert torch.equal(first.run(q, cache)[:real], out[:real])
+
+        kvp = plan["paged_kv_indptr"]
+        ref = FlashInferPrefillWrapper(
+            workspace_buffer=torch.empty(WS, dtype=torch.uint8, device=device), **_kw(device),
+        )
+        ref.plan(
+            causal=True, dtype=torch.bfloat16,
+            qo_indptr=plan["qo_indptr"][: n + 1].clone(),
+            paged_kv_indptr=kvp[: n + 1].clone(),
+            paged_kv_indices=plan["paged_kv_indices"][: int(kvp[n])].clone(),
+            paged_kv_last_page_len=plan["paged_kv_last_page_len"][:n].clone(),
+        )
+        err = (out[:real].float() - ref.run(q[:real], cache).float()).abs().max().item()
+        assert err <= 2e-2, f"step {step}: max err {err}"

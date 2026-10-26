@@ -1,5 +1,6 @@
-"""A captured decode wrapper's later plans call FlashInfer's planner
-directly; they must leave the wrapper exactly as FlashInfer's own plan does."""
+"""A captured wrapper's later plans replay FlashInfer's plan
+(``PlanReplay``); they must leave the wrapper exactly as FlashInfer's own
+plan does, and attend the same."""
 
 from __future__ import annotations
 
@@ -11,8 +12,18 @@ pytest.importorskip("flashinfer")
 if not torch.cuda.is_available():
     pytest.skip("needs CUDA", allow_module_level=True)
 
-from mstar.engine.resources.attn import wrappers  # noqa: E402
+from mstar.engine.resources.attn import plan_replay, wrappers  # noqa: E402
 from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _replay_soon(monkeypatch):
+    # FlashInfer plans only the first real step itself, so the rest replay
+    monkeypatch.setattr(plan_replay, "_CHECK_FIRST", 1)
+
+
+def _replays(w) -> bool:
+    return any(isinstance(r, plan_replay._Replay) for r in w._replay._replays.values())
 
 PAGE, BS, QO, KV, HD, PAGES = 16, 8, 8, 2, 128, 512
 
@@ -39,14 +50,14 @@ def _batch(rng):
 def test_direct_plan_matches_flashinfer_plan():
     rng = np.random.default_rng(0)
     full, direct = _wrapper(), _wrapper()
+    full._replay = None  # FlashInfer's own plan every step
     cache = torch.randn(PAGES, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
     for step in range(12):
         batch = _batch(rng)
-        full._planner_args = None  # forget the direct planner: a full FlashInfer plan
         full.plan(dtype=torch.bfloat16, **batch)
         direct.plan(dtype=torch.bfloat16, **batch)
         if step == 0:
-            assert direct._planner_args is not None, "this configuration should take the direct path"
+            assert _replays(direct), "this configuration should be replayed"
         a, b = full.attn_wrapper, direct.attn_wrapper
         assert list(a._plan_info) == list(b._plan_info)
         for name in ("_paged_kv_indptr_buf", "_paged_kv_last_page_len_buf"):
@@ -85,14 +96,14 @@ def _prefill_batch(rng):
 def test_prefill_direct_plan_matches_flashinfer_plan():
     rng = np.random.default_rng(1)
     full, direct = _prefill_wrapper(), _prefill_wrapper()
+    full._replay = None  # FlashInfer's own plan every step
     cache = torch.randn(PAGES, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
     for step in range(12):
         batch = _prefill_batch(rng)
-        full._planner_key = None  # forget the direct planner: a full FlashInfer plan
         full.plan(causal=True, dtype=torch.bfloat16, **batch)
         direct.plan(causal=True, dtype=torch.bfloat16, **batch)
         if step == 0:
-            assert direct._planner_args is not None, "this configuration should take the direct path"
+            assert _replays(direct), "this configuration should be replayed"
         a, b = full.attn_wrapper, direct.attn_wrapper
         assert list(a._plan_info) == list(b._plan_info)
         for name in ("_qo_indptr_buf", "_paged_kv_indptr_buf", "_paged_kv_last_page_len_buf"):
