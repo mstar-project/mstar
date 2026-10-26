@@ -439,6 +439,9 @@ class InlineRouteStatus(IntEnum):
     # routed, but the send needs Python-side payloads: the caller finishes
     # with ``send_outputs``
     ROUTED = 2
+    # with ``stop_infos``: rows stop, so nothing is routed; ``stops`` has them
+    # and the caller stops them before routing on the general path
+    STOPS = 3
 
 
 class InlineRoute(NamedTuple):
@@ -449,6 +452,8 @@ class InlineRoute(NamedTuple):
     sent_rids: list[int]
     # the route for ``send_outputs`` to finish, under ROUTED
     route_output: "RouteOutput | None"
+    # per rid, the loops it stops, under STOPS
+    stops: dict[int, set[str]] | None = None
 
 
 class ReadyNodeSpec(NamedTuple):

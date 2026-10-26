@@ -46,6 +46,7 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     EdgeSpec,
     GraphRuntime,
+    InlineRoute,
     InlineRouteStatus,
     RequestWalks,
     RouteInput,
@@ -3404,7 +3405,20 @@ class Worker:
             request_ids=batch_N.node_batch.request_ids,
         )
         _pp_stage("prematerialize")
-        stops = self._check_stops_in_runtime(batch_N, host_rows)
+        # the same host copy, before stops, so a request ending here still indexes its pages
+        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
+
+        # A step where no row stops is checked, routed and sent in one runtime
+        # call; one where rows stop comes back unrouted, with its stops.
+        fused = self._stop_route_and_send_fast(batch_N, host_rows, engine)
+        if fused is not None and fused.status is not InlineRouteStatus.STOPS:
+            _pp_stage("stop_route_and_send")
+            if self.enable_nvtx:
+                range_pop(synchronize=False)
+            return
+        stops = None if fused is None else fused.stops
+        if stops is None:
+            stops = self._check_stops_in_runtime(batch_N, host_rows)
         if stops is None:
             stops = engine.check_stop_for_batch(
                 batch_N.node_batch, cpu_outputs, host_rows=host_rows,
@@ -3413,8 +3427,6 @@ class Worker:
             self._phase_record(
                 "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
             )
-        # the same host copy, before stops, so a request ending here still indexes its pages
-        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
         # What the stop check withheld (``StopCheck.withheld``), and an output
         # cut to an empty span, is not stored, so not routed: a streaming edge
         # then carries no item for the row, and the producer's item count
@@ -3495,15 +3507,7 @@ class Worker:
             engine.materialize_publish(batch_N.node_batch, stopped_rids)
             engine.finalize_stopped_requests(batch_N.node_batch, stopped_rids)
 
-        # CurrentForwardPassInfo also contains publication inherited from peer
-        # ranks. Buffer only what this worker produced for the conductor.
-        buffered_publish: set[int] = set()
-        for rid, published in batch_N.node_batch.resource_publish_info.items():
-            if published:
-                self.request_state.buffer_publish_info(
-                    rid, batch_N.partition, published,
-                )
-                buffered_publish.add(rid)
+        buffered_publish = self._buffer_publish(batch_N)
 
         _pp_stage("stop_loops")
         if self.enable_nvtx:
@@ -3638,18 +3642,24 @@ class Worker:
             logger.debug("runtime stop check failed (node=%s)", key[0], exc_info=True)
             return None
 
-    def _route_and_send_fast(
-        self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
-        rids: list[int], buffered_publish: set[int],
-    ) -> bool:
-        """Route and send a device-loopback step in one runtime call, with the
-        GIL released, reading the inline token column off the host rows.
+    def _buffer_publish(self, batch_N: PendingBatch) -> set[int]:
+        """Buffer this step's publication for the conductor; the rids that
+        published. CurrentForwardPassInfo also contains publication inherited
+        from peer ranks, so only what this worker produced goes."""
+        buffered: set[int] = set()
+        for rid, published in batch_N.node_batch.resource_publish_info.items():
+            if published:
+                self.request_state.buffer_publish_info(rid, batch_N.partition, published)
+                buffered.add(rid)
+        return buffered
 
-        Qualifies only where ``_store_and_route`` would take its device-loopback
+    def _inline_column(
+        self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
+    ) -> "tuple[str, str, torch.Tensor] | None":
+        """``(signal, host buffer, column)`` for a step ``route_and_send_inline``
+        can take: where ``_store_and_route`` would take its device-loopback
         branch and ``_stream_and_send`` would add nothing Python-side before
-        the send. Returns False, having done nothing, otherwise.
-        """
-        rt = self._graph_runtime
+        the send. None otherwise."""
         batch = batch_N.batch
         signals = batch.output_signals
         if (
@@ -3657,28 +3667,85 @@ class Worker:
             host_rows is None or SAMPLED_LOGPROB in host_rows.buffers
             or batch.request_walks or self.enable_prof
             or batch_N.node_batch.stream_partition_done_rids
-            or not getattr(rt, "supports_route_and_send_inline", False)
+            or not getattr(self._graph_runtime, "supports_route_and_send_inline", False)
             or not self._all_on_device(
                 engine, batch_N.node_name, batch_N.graph_walk, signals,
             )
         ):
-            return False
+            return None
         inline = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
         signal = next((s for s in inline if s in signals), None)
         if signal is None:
-            return False
+            return None
         buf = host_rows.buffers.get(inline[signal])
         if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
+            return None
+        return signal, inline[signal], buf.reshape(buf.shape[0], -1)[:, 0]
+
+    def _route_and_send_fast(
+        self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
+        rids: list[int], buffered_publish: set[int],
+    ) -> bool:
+        """Route and send a device-loopback step in one runtime call, with the
+        GIL released, reading the inline token column off the host rows
+        (``_inline_column``). Returns False, having done nothing, otherwise."""
+        inline_col = self._inline_column(batch_N, host_rows, engine)
+        if inline_col is None:
             return False
-        column = buf.reshape(buf.shape[0], -1)[:, 0]
-        inline = rt.route_and_send_inline(
-            partition=batch_N.partition, graph_walk=batch.graph_walk,
-            node_name=batch_N.node_name, output_signals=signals, rids=rids,
-            inline_signal=signal, inline_column=column,
+        signal, _, column = inline_col
+        inline = self._graph_runtime.route_and_send_inline(
+            partition=batch_N.partition, graph_walk=batch_N.batch.graph_walk,
+            node_name=batch_N.node_name, output_signals=batch_N.batch.output_signals,
+            rids=rids, inline_signal=signal, inline_column=column,
             row_rids=list(host_rows.request_ids),
         )
         if inline.status is InlineRouteStatus.NOT_ROUTED:
             return False
+        self._finish_inline_route(batch_N, inline, rids, engine, buffered_publish)
+        return True
+
+    def _stop_route_and_send_fast(
+        self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
+    ) -> InlineRoute | None:
+        """The stop check (``_check_stops_in_runtime``) and
+        ``_route_and_send_fast`` in one runtime call, for a step whose stop
+        policies read the inline column. When no row stops it routes and
+        sends; when rows stop it routes nothing and returns them (STOPS), and
+        the caller stops them first. None, having done nothing, where it does
+        not apply: the step has stream-terminated or failed rows, or does not
+        qualify for either call."""
+        nb = batch_N.node_batch
+        key = (batch_N.node_name, nb.step_context.graph_walk)
+        if key not in self._stop_token_signal or nb.final_stream_rids or nb.failed_requests:
+            return None
+        inline_col = self._inline_column(batch_N, host_rows, engine)
+        if inline_col is None:
+            return None
+        signal, buffer, column = inline_col
+        if self._stop_token_signal[key] not in (None, buffer):
+            return None
+        rids = list(batch_N.batch.request_to_worker_graph)
+        inline = self._graph_runtime.route_and_send_inline(
+            partition=batch_N.partition, graph_walk=batch_N.batch.graph_walk,
+            node_name=batch_N.node_name, output_signals=batch_N.batch.output_signals,
+            rids=rids, inline_signal=signal, inline_column=column,
+            row_rids=list(host_rows.request_ids), stop_infos=nb.per_request_info_wrapped,
+        )
+        if inline.status is InlineRouteStatus.NOT_ROUTED:
+            return None
+        if inline.status is not InlineRouteStatus.STOPS:
+            # no row stopped, so nothing else precedes the route's tail
+            self._finish_inline_route(
+                batch_N, inline, rids, engine, self._buffer_publish(batch_N),
+            )
+        return inline
+
+    def _finish_inline_route(
+        self, batch_N: PendingBatch, inline: InlineRoute, rids: list[int], engine,
+        buffered_publish: set[int],
+    ) -> None:
+        """What follows a SENT or ROUTED ``route_and_send_inline``."""
+        rt = self._graph_runtime
         rt.update_dynamic_loop_iters(
             batch_N.node_batch.per_request_info, batch_N.partition,
         )
@@ -3688,15 +3755,15 @@ class Worker:
             if route_output.freed_inputs.uuids:
                 self.tensor_manager.cleanup_collectable(*route_output.freed_inputs)
             self._register_outputs(route_output)
+            signals = batch_N.batch.output_signals
             stored = StoredOutputs([], [], [], [0] * (len(rids) * len(signals)))
             self._stream_and_send(
                 batch_N, rids, stored, route_output, signals, engine,
                 buffered_publish,
             )
-            return True
+            return
         for rid in inline.sent_rids:
             self.request_state.flush_publish_info(rid, batch_N.partition)
-        return True
 
     def _store_and_route(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,

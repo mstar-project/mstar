@@ -689,17 +689,29 @@ class RustGraphRuntime(GraphRuntime):
 
         stop_rids, stop_rules, missing = check(rids)
         if missing:
-            # first check of these requests on this walk: give their limits
-            cap = (1 << 32) - 1
-            limits = [[p.limits(infos[rid]) for rid in missing] for p in policies.values()]
-            self._rust.set_stop_limits(
-                graph_walk, missing,
-                [[min(lim.max_iters, cap) for lim in col] for col in limits],
-                [[lim.ignore_eos for lim in col] for col in limits],
-            )
+            self._set_stop_limits(graph_walk, missing, policies, infos)
             more_rids, more_rules, _ = check(missing)
             stop_rids += more_rids
             stop_rules += more_rules
+        return self._stops_by_rid(policies, stop_rids, stop_rules)
+
+    def _set_stop_limits(
+        self, graph_walk: str, rids: list[int], policies: dict[str, StopPolicy],
+        infos: Mapping[int, CurrentForwardPassInfo],
+    ) -> None:
+        """The first check of ``rids`` on this walk: give Rust their limits."""
+        cap = (1 << 32) - 1
+        limits = [[p.limits(infos[rid]) for rid in rids] for p in policies.values()]
+        self._rust.set_stop_limits(
+            graph_walk, rids,
+            [[min(lim.max_iters, cap) for lim in col] for col in limits],
+            [[lim.ignore_eos for lim in col] for col in limits],
+        )
+
+    @staticmethod
+    def _stops_by_rid(
+        policies: dict[str, StopPolicy], stop_rids: list[int], stop_rules: list[int],
+    ) -> dict[int, set[str]]:
         loops = list(policies)
         stops: dict[int, set[str]] = {}
         for rid, k in zip(stop_rids, stop_rules, strict=True):
@@ -713,21 +725,41 @@ class RustGraphRuntime(GraphRuntime):
         output_signals: list[str], rids: list[int],
         inline_signal: str, inline_column: torch.Tensor,
         row_rids: list[int],
+        stop_infos: Mapping[int, CurrentForwardPassInfo] | None = None,
     ) -> InlineRoute:
         """``complete_and_route_batch`` + ``send_outputs`` for a device-loopback
         step, one crossing with the GIL released (see the Rust side).
 
         ``inline_column`` is a 1-D host view (row i for ``row_rids[i]``) the
-        caller keeps alive; Rust reads it in place.
+        caller keeps alive; Rust reads it in place. With ``stop_infos`` the
+        (node, walk)'s declared stop policies run first over the same column
+        (``check_stops``); if a row stops, nothing is routed (STOPS).
         """
-        out = self._rust.route_and_send_inline(
-            partition=partition, graph_walk=graph_walk, node_name=node_name,
-            output_signals=list(output_signals), rids=rids, inline_signal=inline_signal,
-            inline_ptr=inline_column.data_ptr(), inline_rows=inline_column.shape[0],
-            inline_stride=inline_column.stride(0),
-            inline_dtype=_dtype_name(inline_column.dtype), row_rids=row_rids,
-        )
+
+        def call():
+            return self._rust.route_and_send_inline(
+                partition=partition, graph_walk=graph_walk, node_name=node_name,
+                output_signals=list(output_signals), rids=rids, inline_signal=inline_signal,
+                inline_ptr=inline_column.data_ptr(), inline_rows=inline_column.shape[0],
+                inline_stride=inline_column.stride(0),
+                inline_dtype=_dtype_name(inline_column.dtype), row_rids=row_rids,
+                check_stops=stop_infos is not None,
+            )
+
+        out = call()
+        if out.status == InlineRouteStatus.STOPS and out.missing:
+            # first check of these requests on this walk: give their limits
+            policies = self._stop_policies[(node_name, graph_walk)]
+            self._set_stop_limits(graph_walk, list(out.missing), policies, stop_infos)
+            out = call()
         status = InlineRouteStatus(out.status)
+        if status is InlineRouteStatus.STOPS:
+            if out.missing:
+                raise RuntimeError("route_and_send_inline: stop limits missing after setting them")
+            stops = self._stops_by_rid(
+                self._stop_policies[(node_name, graph_walk)], list(out.stop_rids), list(out.stop_rules),
+            )
+            return InlineRoute(status, out.completion_id, [], None, stops)
         route = None
         if status is InlineRouteStatus.ROUTED:
             route = self._route_output(out.take_route())
