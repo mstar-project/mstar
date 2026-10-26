@@ -41,6 +41,7 @@ from mstar.model.base import (  # noqa: E402
     PrefixKeys,
     ProcessPromptOutput,
     Span,
+    declared_resources,
     serving_resources,
 )
 
@@ -119,7 +120,7 @@ def _worker(model, config: dict) -> PreprocessWorkerThread:
 
 def _served(config: dict) -> ServedModels:
     """The API server's selection, from the adapters its startup check digested."""
-    digests = resolve_lora_adapters(lora_spec(serving_resources(_Model(), config)), config)
+    digests = resolve_lora_adapters(lora_spec(declared_resources(_Model(), config)), config)
     return ServedModels(base=("stub",), roots={n: adapter_prefix_root(d) for n, d in digests.items()})
 
 

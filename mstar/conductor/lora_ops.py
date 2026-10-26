@@ -51,9 +51,9 @@ class _PendingOp:
 class LoraAdapterOps:
     """The conductor's half of ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``.
 
-    ``spec`` is the deployment's ``LoraSpec`` (None for a deployment without LoRA);
-    ``workers`` are the workers hosting its nodes; ``send(peer, message)`` is the
-    conductor's communicator; ``clock`` its monotonic time.
+    ``spec`` is a LoRA pool's spec, whose runtime-update settings every pool shares (None
+    for a deployment without LoRA); ``workers`` are the workers hosting the pools' nodes;
+    ``send(peer, message)`` is the conductor's communicator; ``clock`` its monotonic time.
     """
 
     def __init__(

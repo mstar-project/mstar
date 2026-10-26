@@ -422,13 +422,23 @@ def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     ]
 
 
+def declared_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment declares: ``enabled_resources`` with the YAML's
+    overrides applied. A ``per_node`` spec is whole here, as the API server checks
+    requests and adapters against it; ``serving_resources`` splits it."""
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = enabled_resources(model, model_config)
+    apply_yaml_overrides(specs, model_config)
+    return specs
+
+
 def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
-    """The specs the deployment's engines build of its ``enabled_resources``, the YAML's
-    overrides applied: each as declared, except a split one (``NodeResourceSpec.for_node``),
-    which gives one per node."""
+    """The specs a deployment builds of its declared ones: each ``per_node`` spec as its
+    instances (``NodeResourceSpec.for_node``)."""
     built: list[NodeResourceSpec] = []
     for spec in specs:
-        if type(spec).for_node is NodeResourceSpec.for_node:
+        if not spec.per_node:
             built.append(spec)
             continue
         instances = (spec.for_node(node) for node in sorted(spec.nodes))
@@ -448,18 +458,15 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
 
 
 def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
-    """The resource specs a deployment builds: ``enabled_resources``, the YAML's
-    ``resources:`` overrides applied; each engine splits a split spec for its nodes.
+    """The resource specs a deployment builds: ``declared_resources``, as
+    ``built_resources``.
 
     Every process that reads specs resolves them here, so the conductor validates
-    requests against what the workers built. ``validate_deployment`` takes the same
-    steps, reporting every problem rather than the first.
+    requests against what the workers built, under the same keys.
+    ``validate_deployment`` takes the same steps, reporting every problem rather than
+    the first.
     """
-    from mstar.engine.resources.spec import apply_yaml_overrides
-
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
-    return specs
+    return built_resources(declared_resources(model, model_config))
 
 
 class Model(ABC):

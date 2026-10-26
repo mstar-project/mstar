@@ -300,12 +300,13 @@ class LoraSpec(NodeResourceSpec):
 
     Opt-in (``NodeResourceSpec.opt_in``): built only for a deployment whose serving config
     has a ``resources: lora:`` block. One spec covers every node an adapter reaches (an
-    LLM and its vision tower), and each node gets a pool of its own (``for_node``): the
+    LLM and its vision tower), and each node gets a pool of its own (``per_node``): the
     nodes may sit in different lockstep instances, whose ranks must make the same slot
     decisions.
     """
 
     opt_in: ClassVar[bool] = True
+    per_node: ClassVar[bool] = True
 
     num_layers: int
     targets: dict[str, LoraTarget]

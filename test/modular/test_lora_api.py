@@ -41,7 +41,6 @@ from mstar.api_server.openai.adapters import SubmitArgs  # noqa: E402
 from mstar.api_server.request_types import APIServerMessage, LoraAdapterResult, RequestFailed  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
 from mstar.communication.wire import decode, encode  # noqa: E402
-from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.conductor.lora_ops import LoraAdapterOps  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig  # noqa: E402
@@ -236,19 +235,6 @@ def test_submit_request_refuses_an_unserved_adapter_kwarg():
             server.submit_request(**common, model_kwargs=kwargs, request_id="c")
         assert err.value.status_code == 400
     assert len(submitted) == 3 and "c" not in server._live
-
-
-def test_the_conductor_opens_a_request_with_the_specs_config():
-    """The spec builds the request's config from the kwarg, under its declared key, which
-    each node's pool takes; a base-model request carries none, which leaves the pools idle."""
-    conductor = object.__new__(Conductor)
-    conductor.model = SimpleNamespace(get_request_resource_configs=lambda **kw: {})
-    conductor._kv_labels = {}
-    conductor._resource_specs_cache = {LORA_RESOURCE_KEY: make_spec({})}
-    assert conductor._get_resource_configs({LORA_ADAPTER_KWARG: "sql"}, {}) == {
-        LORA_RESOURCE_KEY: LoraReqConfig("sql"),
-    }
-    assert conductor._get_resource_configs({}, {}) == {}
 
 
 # --- the admin endpoints -----------------------------------------------------------------

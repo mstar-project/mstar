@@ -151,20 +151,14 @@ class SubmoduleManagement:
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
-    # the key a request's config for each of the node's per-node instances
-    # (`NodeResourceSpec.for_node`) is carried under: the declared one
-    config_keys: Mapping[str, str] = field(default_factory=dict)
     # the keys of the node's idle-capable resources (`Resource.idle_capture`)
     idle_keys: tuple[str, ...] = field(init=False, default=())
-    # the keys their request configs are carried under
-    _idle_config_keys: tuple[str, ...] = field(init=False, default=())
 
     def __post_init__(self):
         self.idle_keys = tuple(key for key, res in self.resources.items() if res.idle_capture)
         if len(self.idle_keys) > 1:
             # a step is idle or not as a whole, so one idle twin can't serve two resources
             raise ValueError(f"a node takes at most one idle-capable resource; got {list(self.idle_keys)}")
-        self._idle_config_keys = tuple(self.config_keys.get(key, key) for key in self.idle_keys)
         # Two hazards want a second slot, both of them the host running ahead of
         # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
         # reading, and ``force_double_buffer`` is the same for a resource
@@ -226,7 +220,7 @@ class SubmoduleManagement:
         except for a row dropped while the plan thread leases (below): one rank can then
         replay the idle graph and another the plain one, which is safe only because an
         idle-capable resource's kernels hold no collective (``Resource.idle_capture``)."""
-        keys = self._idle_config_keys
+        keys = self.idle_keys
         if not keys:
             return False
         for rid in rids:
@@ -503,8 +497,6 @@ class Engine:
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
-        # a per-node instance's key -> the declared key its request configs carry
-        self._config_keys: dict[str, str] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
@@ -545,7 +537,7 @@ class Engine:
 
         self._classify_tp_roles(node_names, parallel_groups)
 
-        for spec in self._instances(specs, node_names, model):
+        for spec in specs:
             relevant_nodes = spec.nodes & node_names
             if len(relevant_nodes) == 0:
                 continue # resource not needed
@@ -618,7 +610,6 @@ class Engine:
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
                 fp32_precision=node_fp32_precision(node_name, submodule),
-                config_keys={k: self._config_keys[k] for k in resources if k in self._config_keys},
             )
             submodule.bind_node_resources(resources)
             if getattr(submodule, "reads_device_loopback", False):
@@ -628,32 +619,6 @@ class Engine:
                     enable = getattr(resource, "enable_device_loopback_reader", None)
                     if enable is not None:
                         enable()
-
-    def _instances(
-        self, specs: list[NodeResourceSpec], node_names: set[str], model: "Model | None",
-    ) -> list[NodeResourceSpec]:
-        """The specs this engine builds: each as declared, except a split one
-        (``NodeResourceSpec.for_node``), which gives one per node hosted here, each
-        recorded against the declared key its requests' configs carry."""
-        keyed = keyed_labels(model) if model is not None else {}
-        built: list[NodeResourceSpec] = []
-        for spec in specs:
-            if type(spec).for_node is NodeResourceSpec.for_node:
-                built.append(spec)
-                continue
-            if spec.resource_key in keyed:
-                # prefix chains, and rank 0's leases a follower replays, name the
-                # declared key
-                raise ValueError(
-                    f"resource {spec.resource_key!r} is split per node, so it cannot hold "
-                    "prefix-keyed labels"
-                )
-            for node in sorted(spec.nodes & node_names):
-                instance = spec.for_node(node)
-                if instance is not None:
-                    built.append(instance)
-                    self._config_keys[instance.resource_key] = spec.resource_key
-        return built
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -2761,12 +2726,6 @@ class Engine:
         self, request_id: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
     ) -> None:
-        if overrides and self._config_keys:
-            # a per-node instance takes the config carried under its declared key
-            overrides = {
-                **overrides,
-                **{key: overrides[declared] for key, declared in self._config_keys.items() if declared in overrides},
-            }
         self._runner.ingest_request(request_id, overrides)
 
     def remove_request(self, request_id: str) -> set[str]:

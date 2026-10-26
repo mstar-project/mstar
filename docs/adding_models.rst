@@ -937,7 +937,7 @@ placed exactly as weights are.
   ``module_lora_spec`` and declares one, ``join_lora_specs(llm, vision)``: its targets
   name their nodes, a checkpoint module belongs to the node whose ``adapter_roots`` claim
   it most specifically, so one adapter file serves both, and each node gets a pool of its
-  own (``LoraSpec.for_node``). The one ``lora:`` block sizes them all.
+  own (``LoraSpec.per_node``, keyed ``lora@<node>``). The one ``lora:`` block sizes them all.
 - **Binding and rows.** ``NodeSubmodule.bind_node_resources`` binds every module placed
   on its node under ``root_path``, after checking it is the declared target and that the
   pool's shard is its rank-local shape (a module built whole on a TP node fails here,

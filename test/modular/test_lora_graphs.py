@@ -416,18 +416,17 @@ def _info(adapter=None):
     return SimpleNamespace(resource_configs={} if adapter is None else {LORA_RESOURCE_KEY: LoraReqConfig(adapter)})
 
 
-def _mgmt(idle_keys, runner=None, config_keys=None):
+def _mgmt(idle_keys, runner=None):
     from mstar.engine.engine import SubmoduleManagement
 
     resource = SimpleNamespace(idle_capture=True, force_double_buffer=False, supports_preplan=False)
     return SubmoduleManagement(
         SimpleNamespace(cg_key_info=lambda walk, info, **kw: "cfg"), None, None, None,
         resources=dict.fromkeys(idle_keys, resource), accelerator_graph_runner=runner,
-        config_keys=config_keys or {},
     )
 
 
-def _engine_with(captured, idle_keys=(LORA_RESOURCE_KEY,), config_keys=None):
+def _engine_with(captured, idle_keys=(LORA_RESOURCE_KEY,)):
     """An engine whose node captured the decode buckets ``captured``, (bs, idle) pairs."""
     from mstar.engine.accelerator_graph_runner import AcceleratorGraphBucket, AcceleratorGraphRunner
     from mstar.engine.engine import Engine
@@ -441,7 +440,7 @@ def _engine_with(captured, idle_keys=(LORA_RESOURCE_KEY,), config_keys=None):
         for bs, idle in captured
     }
     engine = object.__new__(Engine)
-    engine._submodules = {"LLM": _mgmt(idle_keys, runner, config_keys)}
+    engine._submodules = {"LLM": _mgmt(idle_keys, runner)}
     return engine
 
 
@@ -478,24 +477,30 @@ def test_the_lease_takes_the_idle_twin_only_when_no_row_carries_a_config(rows, c
     assert (lease is None or not lease.bucket.idle) and not batch.step_context.idle
 
 
-def test_a_per_node_pool_reads_its_rows_configs_under_the_declared_key():
-    """A node's pool is keyed ``lora@<node>`` while the request carries its config under
-    ``lora``: a row on an adapter keeps the step on the plain capture, and the pool is
-    opened with that config at ingest. Mechanism off (no key map): every step reads idle,
-    and the adapter never applies."""
-    from mstar.engine.engine import Engine
+def test_each_nodes_pool_reads_the_config_the_conductor_opens_a_request_with():
+    """One spec over two nodes is served as a pool per node (``serving_resources``),
+    keyed ``lora@<node>`` in the conductor as on the workers: a request on an adapter is
+    opened with a config under each pool's key, so a row on it keeps each node's step on
+    the plain capture. A base-model request carries none."""
+    import dataclasses
 
-    rows = {"b0": None, "r": "a1"}
-    for config_keys, idle in (({"lora@LLM": LORA_RESOURCE_KEY}, False), ({}, True)):
-        engine = _engine_with({(8, False), (8, True)}, idle_keys=("lora@LLM",), config_keys=config_keys)
-        batch = _batch({rid: _info(name) for rid, name in rows.items()})
-        assert engine.reserve_replay_slot(batch).bucket.idle is idle
-    ingested = []
-    engine = object.__new__(Engine)
-    engine._config_keys = {"lora@LLM": LORA_RESOURCE_KEY}
-    engine._runner = SimpleNamespace(ingest_request=lambda rid, overrides: ingested.append(overrides))
-    engine.add_request("r", {LORA_RESOURCE_KEY: LoraReqConfig("a1")})
-    assert ingested[0]["lora@LLM"] == LoraReqConfig("a1")
+    from mstar.conductor.conductor import Conductor
+    from mstar.engine.resources.lora import LORA_ADAPTER_KWARG
+
+    spec = P.make_spec({})
+    spec.nodes = {"LLM", "vision"}
+    spec.targets = {"qkv": dataclasses.replace(P.QKV, node="LLM"), "o": dataclasses.replace(P.O, node="vision")}
+    conductor = object.__new__(Conductor)
+    conductor.model = SimpleNamespace(get_node_resources=lambda: [spec], get_request_resource_configs=lambda **kw: {})
+    conductor.model_config = {"resources": {LORA_RESOURCE_KEY: {}}}
+    conductor._kv_labels = {}
+    configs = conductor._get_resource_configs({LORA_ADAPTER_KWARG: "a1"}, {})
+    assert configs == {"lora@LLM": LoraReqConfig("a1"), "lora@vision": LoraReqConfig("a1")}
+    assert conductor._get_resource_configs({}, {}) == {}
+    for key in configs:
+        engine = _engine_with({(8, False), (8, True)}, idle_keys=(key,))
+        batch = _batch({"b0": SimpleNamespace(resource_configs={}), "r": SimpleNamespace(resource_configs=configs)})
+        assert not engine.reserve_replay_slot(batch).bucket.idle
 
 
 def test_a_row_dropped_while_the_plan_thread_leases_decides_nothing():

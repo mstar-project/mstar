@@ -491,16 +491,17 @@ def test_the_api_server_pins_digests_and_narrows_targets_in_the_config_it_hands_
     from types import SimpleNamespace
 
     from mstar.engine.resources.lora.serving import lora_spec, resolve_lora_adapters, served_lora_targets
-    from mstar.model.base import serving_resources
+    from mstar.model.base import declared_resources, serving_resources
 
     _, paths = adapters
     assert served_lora_targets(make_spec({"a3": paths["a3"]}, runtime_updates=True)) is None
     model = SimpleNamespace(get_node_resources=lambda: [make_spec({})])
     config = {"resources": {"lora": {"adapters": {"a3": paths["a3"]}, "max_slots": 2}}}
-    digests = resolve_lora_adapters(lora_spec(serving_resources(model, config)), config)
+    digests = resolve_lora_adapters(lora_spec(declared_resources(model, config)), config)
     block = config["resources"]["lora"]
     assert block["targets"] == ["o"] and block["adapter_digests"] == {"a3": digests["a3"].hex()}
-    worker = lora_spec(serving_resources(model, config))
+    (worker,) = serving_resources(model, config)
+    assert worker.resource_key == "lora@LLM"
     assert set(worker.targets) == {"o"} and worker.adapter_digests == digests
     # mechanism off: without the API server's list a worker builds every target
     del block["targets"]

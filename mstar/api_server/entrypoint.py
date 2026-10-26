@@ -44,7 +44,7 @@ from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.engine.resources.lora.config import LoraSpec, lora_enabled
 from mstar.engine.resources.lora.serving import lora_spec, resolve_lora_adapters
-from mstar.model.base import serving_resources
+from mstar.model.base import declared_resources
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -115,7 +115,7 @@ def resolve_serving_config(model, model_config: dict | None) -> LoraSpec | None:
     LoRA spec, resolved likewise; None without one."""
     if model is None or not model_config:
         return None
-    spec = lora_spec(serving_resources(model, model_config))
+    spec = lora_spec(declared_resources(model, model_config))
     resolve_lora_adapters(spec, model_config)
     return spec
 

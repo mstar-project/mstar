@@ -34,7 +34,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
-from mstar.engine.resources.lora.serving import lora_spec
+from mstar.engine.resources.lora.config import LoraSpec
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import (
     ForwardPassArgs,
@@ -689,18 +689,20 @@ class Conductor:
         return configs
 
     def _lora_ops(self) -> LoraAdapterOps:
-        """Runtime LoRA loads and unloads, for the deployment's LoRA spec and the
-        workers hosting its nodes. Built on first use."""
+        """Runtime LoRA loads and unloads, for the deployment's LoRA pools (one per node,
+        ``LoraSpec.per_node``) and the workers hosting their nodes. Built on first use."""
         ops = getattr(self, "_lora_ops_cache", None)
         if ops is None:
-            spec = lora_spec(self._resource_specs().values())
-            nodes = spec.nodes if spec is not None else set()
+            pools = [spec for spec in self._resource_specs().values() if isinstance(spec, LoraSpec)]
+            nodes = set().union(*(spec.nodes for spec in pools))
             workers = [
                 worker_id for worker_id in self.worker_ids
                 if any(nodes & set(wg.section.get_nodes())
                        for wg in self._per_worker_graphs[worker_id])
             ]
-            ops = self._lora_ops_cache = LoraAdapterOps(spec, workers, self.communicator.send)
+            ops = self._lora_ops_cache = LoraAdapterOps(
+                pools[0] if pools else None, workers, self.communicator.send,
+            )
         return ops
 
     def _derive_worker_info(self):
