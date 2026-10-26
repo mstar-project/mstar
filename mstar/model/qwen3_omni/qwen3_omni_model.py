@@ -1658,6 +1658,7 @@ class Qwen3OmniModel(Model):
         )
 
         from mstar.model.components.hf_attention import build_hf_encoder
+        from mstar.model.components.patch_embed import LinearPatchEmbed
         from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
@@ -1689,6 +1690,8 @@ class Qwen3OmniModel(Model):
             modules=[ModuleAndPrefix(vision_encoder, prefix="thinker.visual")],
             device=device,
         )
+        # One GEMM over the pre-cut patches: MIOpen builds a conv kernel per image size.
+        vision_encoder.patch_embed = LinearPatchEmbed(vision_encoder.patch_embed.proj)
         vision_encoder.eval()
 
         from mstar.model.qwen3_omni.submodules import VisionEncoderSubmodule
