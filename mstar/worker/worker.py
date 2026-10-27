@@ -209,20 +209,6 @@ def _wait_ms(raw: str) -> float:
     return value
 
 
-def resolve_enable_pre_plan(model_config: dict | None, env) -> bool:
-    """Whether a worker runs the plan thread: ``pre_plan:`` in the serve yaml
-    (default true), with ``MSTAR_PRE_PLAN_SPEC`` overriding it so an A/B needs
-    no config edit. A ``pre_plan`` that is not a YAML boolean is refused: the
-    string "false" would otherwise read as true."""
-    env_value = env.get("MSTAR_PRE_PLAN_SPEC")
-    if env_value is not None:
-        return env_value == "1"
-    value = (model_config or {}).get("pre_plan", True)
-    if not isinstance(value, bool):
-        raise ValueError(f"pre_plan must be true or false, got {value!r}")
-    return value
-
-
 def _env_number(name: str, default, parse, minimum):
     """A numeric tuning knob from the environment.
 
@@ -449,18 +435,6 @@ class Worker:
         self._host_rows_slot = 0
         self._stream_buffer_rids = set()
 
-        # ``pre_plan:`` in the serve yaml, with MSTAR_PRE_PLAN_SPEC overriding
-        # it so an A/B needs no config edit. Resolved once here and handed to
-        # the engine, which needs the same answer for its slot count.
-        #
-        # TODO: per-model is the coarse form. Whether a step pre-plans is
-        # already decided per (node, walk) by ``StepRunner._preplan_keys_for``;
-        # only the plan thread and the slot count are per-worker. Pre-planning
-        # hides host planning behind GPU work, so it wins on a deep decoder
-        # (large-v3 32 layers, qwen3-asr 28) and loses on a shallow one
-        # (turbo's 4), where the step is too short to hide in and the extra
-        # thread is just GIL contention.
-        self._enable_pre_plan = resolve_enable_pre_plan(model_config, os.environ)
 
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
@@ -572,7 +546,6 @@ class Worker:
             model=model,
             enable_nvtx=self.enable_nvtx,
             enable_prof=self.enable_prof,
-            enable_pre_plan=self._enable_pre_plan,
             device_capability=self.device_capability,
         )
 
@@ -4684,10 +4657,9 @@ class Worker:
         # on prev_advance_event (signaled right after advance_seq_lens(N) on
         # the GPU thread, ~tens of µs into replay)
         #
-        # Default ON; `pre_plan:` in the serve yaml or MSTAR_PRE_PLAN_SPEC=0
-        # falls back to the double-buffer-without-pre-plan baseline. Resolved
-        # in __init__ so the engine sees the same answer.
-        pre_plan_spec = self._enable_pre_plan
+        # Default ON; `knobs: {pre_plan: false}` or MSTAR_PRE_PLAN_SPEC=0
+        # falls back to the double-buffer-without-pre-plan baseline.
+        pre_plan_spec = knobs.pre_plan_enabled()
         launch_wait_s = self._launch_wait_s
         plan_executor = None
         if pre_plan_spec:

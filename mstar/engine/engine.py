@@ -59,6 +59,7 @@ from mstar.model.submodule_base import (
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
+from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
@@ -132,9 +133,6 @@ class SubmoduleManagement:
     # the runner capture ran with, graphs or none: a bucket it didn't capture
     # runs eager, and the floor covers eager steps only up to its largest
     capture_runner: AcceleratorGraphRunner | None = None
-    # Whether this worker runs a plan thread at all; see `Worker.__init__`.
-    # Only the slot count depends on it here.
-    enable_pre_plan: bool = True
     # the submodule's declared float32 settings; None keeps the process default
     fp32_precision: Fp32Precision | None = None
 
@@ -164,7 +162,7 @@ class SubmoduleManagement:
         # TODO: submodule-wide, so a capture touching neither kind still pays
         # double the buffers. Each runner could size its own count from the
         # resources its captures touch, as PiecewiseCudaGraphRunner does.
-        preplan_enabled = self.enable_pre_plan
+        preplan_enabled = knobs.pre_plan_enabled()
         self._forced_double_buffer = any(
             res.force_double_buffer for res in self.resources.values()
         )
@@ -180,7 +178,7 @@ class SubmoduleManagement:
             # MSTAR_NUM_SLOTS=1 is the knob for turning double-buffering off,
             # but neither hazard has a single-buffered form: one slot puts the
             # next step's staging on top of a DMA that may not have retired.
-            # Turn pre-planning off (`pre_plan: false` in the serve yaml, or
+            # Turn pre-planning off (`knobs: {pre_plan: false}`, or
             # MSTAR_PRE_PLAN_SPEC=0) to drop to a single slot.
             logger.warning(
                 "MSTAR_NUM_SLOTS=%d, but a resource on this node needs "
@@ -465,7 +463,6 @@ class Engine:
         self, graph_runtime: GraphRuntime,
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
-        enable_pre_plan: bool = True,
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
@@ -497,9 +494,6 @@ class Engine:
         self._tp_follower_nodes: set[str] = set()
 
         self._enable_nvtx = enable_nvtx
-        # the worker resolved this from the serve config; the slot count below
-        # has to agree with whether a plan thread actually exists
-        self._enable_pre_plan = enable_pre_plan
         self._enable_profile = enable_profile
 
     def load_model(
@@ -590,7 +584,6 @@ class Engine:
                 forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
-                enable_pre_plan=self._enable_pre_plan,
                 fp32_precision=node_fp32_precision(node_name, submodule),
             )
             submodule.bind_node_resources(resources)

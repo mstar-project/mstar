@@ -327,8 +327,6 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._phase_period, w._phase_buf = 0, {}
     w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
     w.tp_async_sched, w.is_tp_follower = False, False
-    w._enable_pre_plan = False  # what Worker.__init__ resolves from MSTAR_PRE_PLAN_SPEC=0 above
-    w.tp_async_sched = False
     w._in_flight_rids = set()
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
     w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)

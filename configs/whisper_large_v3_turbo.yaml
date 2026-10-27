@@ -9,7 +9,8 @@ max_concurrent_requests: 64
 # overlaps (measured +11% RTFx at c=1, +6% at c=32 with it off). large-v3 and
 # qwen3_asr are deep enough to want it on, which is why this is per-config
 # and not a changed default.
-pre_plan: false
+knobs:
+  pre_plan: false
 resources:
   kv_cache:
     cpu_offload_pages: 128

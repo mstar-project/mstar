@@ -82,7 +82,6 @@ class EngineManager:
         graph_runtime: GraphRuntime,
         enable_nvtx: bool = False,
         enable_prof: bool=False,
-        enable_pre_plan: bool = True,
         device_capability: DeviceCapability | None = None,
     ) -> "EngineManager":
         """Build the engine and load this worker's nodes into it.
@@ -143,7 +142,6 @@ class EngineManager:
             graph_runtime=graph_runtime,
             autocast_dtype=autocast_dtype,
             enable_nvtx=enable_nvtx,
-            enable_pre_plan=enable_pre_plan,
             enable_profile=enable_prof,
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
