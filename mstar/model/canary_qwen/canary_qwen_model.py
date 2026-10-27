@@ -181,6 +181,9 @@ class CanaryQwenModel(Model):
     def get_max_output_tokens_limit(self) -> int:
         return self.MAX_OUTPUT_TOKENS
 
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([
             GraphNode(
@@ -309,6 +312,9 @@ class CanaryQwenModel(Model):
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
+
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)

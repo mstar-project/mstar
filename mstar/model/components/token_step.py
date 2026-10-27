@@ -44,7 +44,8 @@ class TokenStepNode:
         return True
 
     def max_batch_size(self, graph_walk: str) -> int | None:
-        # decode is bounded by the largest capture; prefill isn't captured
+        # the engine caps decode at its largest capture config, and with accelerator
+        # graphs off leaves it uncapped; prefill isn't captured
         return None if graph_walk == self.DECODE_WALK else self.MAX_PREFILL_BATCH_SIZE
 
     def postprocess(

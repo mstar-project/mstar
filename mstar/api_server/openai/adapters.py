@@ -1132,6 +1132,10 @@ class _UntimedTranscriptionAdapter(OpenAIAdapter):
     """The FastConformer ASR models' adapters: plain text, which a
     SentencePiece vocabulary starts with a space."""
 
+    # greedy, unconditioned windows: a retry could only swap a correct
+    # transcript for a sampled one
+    compression_ratio_threshold = None
+
     def stream_text(self, raw: str) -> str:
         # parse_transcript strips the text, so the deltas drop the leading
         # space too; lstrip keeps a growing stream growing

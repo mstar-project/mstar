@@ -12,7 +12,7 @@ import torch
 from mstar.api_server.openai.adapters import CanaryAdapter
 from mstar.api_server.openai.protocol import TranscriptionRequest
 from mstar.model.canary.canary_model import CanaryModel
-from mstar.model.canary.config import LANGUAGES, PROMPT_LENGTH, CanaryModelConfig, check_task
+from mstar.model.canary.config import LANGUAGES, MEL_SETTINGS, PROMPT_LENGTH, CanaryModelConfig, check_task
 from mstar.model.canary.decoder import CanaryDecoderModel, sinusoid_positions
 
 SPECIALS = [
@@ -43,7 +43,18 @@ def snapshot(tmp_path):
     config = {"model_type": "canary", "eos_token_id": 3, "encoder_config": encoder, "decoder_config": decoder}
     (tmp_path / "config.json").write_text(json.dumps(config))
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer))
+    mel = {**MEL_SETTINGS, "feature_extractor_type": "ParakeetFeatureExtractor", "feature_size": 128}
+    (tmp_path / "processor_config.json").write_text(json.dumps({"feature_extractor": mel}))
     return tmp_path
+
+
+def test_refuses_a_mel_front_end_it_does_not_compute(snapshot):
+    path = snapshot / "processor_config.json"
+    processor = json.loads(path.read_text())
+    processor["feature_extractor"]["hop_length"] = 320
+    path.write_text(json.dumps(processor))
+    with pytest.raises(ValueError, match="hop_length"):
+        CanaryModelConfig.from_pretrained(snapshot)
 
 
 def test_prompt_tokens(snapshot):
@@ -109,6 +120,8 @@ def test_graph_and_limits(snapshot):
     assert model.get_max_output_tokens(max_output_tokens=None) == 64 - 9
     # published, so the conductor refuses a larger request instead of cutting it short
     assert model.get_max_output_tokens_limit() == 64 - 9
+    # the request's max_output_tokens caps the loop, not the graph's max_iters
+    assert model.get_loop_caps(max_output_tokens=10) == {"decode_loop": 10}
 
 
 def test_request_cap_must_fit_the_kv_pools(snapshot):

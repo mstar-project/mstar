@@ -171,6 +171,9 @@ class CanaryModel(Model):
     def get_max_output_tokens_limit(self) -> int:
         return self.get_max_output_tokens()
 
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([
             GraphNode(
@@ -278,7 +281,7 @@ class CanaryModel(Model):
         context = int(self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH))
         kv_layout = {
             KV_CACHE: {"main": LabelLayout(
-                spans=(Span("ids", "prefill", len(prompt_ids), len(prompt_ids), "text_inputs"),),
+                spans=(Span("rows", "prefill", len(prompt_ids), len(prompt_ids), "text_inputs"),),
                 growth=(("decode_loop", 1),),
             )},
             CROSS_KV_CACHE: {CONTEXT_LABEL: LabelLayout(
@@ -295,6 +298,9 @@ class CanaryModel(Model):
             KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))},
             CROSS_KV_CACHE: {CONTEXT_LABEL: KVLabel()},
         }
+
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)

@@ -24,6 +24,9 @@ CROSS_KV_CACHE = "cross_kv_cache"
 CROSS_ATTN = "cross_attn"
 CONTEXT_LABEL = "main"
 
+# the HF feature extractor's settings that NemoLogMel implements
+MEL_SETTINGS = dict(sampling_rate=16_000, n_fft=512, win_length=400, hop_length=160, preemphasis=0.97)
+
 # the decoder prompt is 9 tokens for every task (``prompt_ids``)
 PROMPT_LENGTH = 9
 
@@ -67,6 +70,11 @@ class CanaryModelConfig:
         hf = json.loads((local_dir / "config.json").read_text())
         dec = hf["decoder_config"]
         tok = json.loads((local_dir / "tokenizer.json").read_text())
+        mel = json.loads((local_dir / "processor_config.json").read_text())["feature_extractor"]
+        expected = {**MEL_SETTINGS, "feature_size": hf["encoder_config"]["num_mel_bins"]}
+        unsupported = {k: mel.get(k) for k, v in expected.items() if mel.get(k) != v}
+        if unsupported:
+            raise ValueError(f"unsupported mel front end settings {unsupported}; expected {expected}")
         if dec.get("hidden_act", "relu") != "relu":
             raise ValueError(f"unsupported Canary decoder activation {dec['hidden_act']!r}")
         return cls(
