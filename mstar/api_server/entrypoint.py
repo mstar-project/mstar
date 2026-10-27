@@ -59,7 +59,7 @@ from mstar.observability.metrics import (
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
-from mstar.utils.client_errors import client_error_text
+from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
@@ -2090,10 +2090,15 @@ async def generate_ws(websocket: WebSocket):
             else:
                 reply(late, binary)  # the call ended meanwhile: leave it be
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
-            text, _ = client_error_text(
-                exc, f"generate/ws append for {request_id} failed", log=logger, type_name=False,
-            )
-            error, status = f"append rejected: {text}", 400 if isinstance(exc, ValueError) else 500
+            if isinstance(exc, ValueError):  # the client's fault: no traceback
+                text, status = scrub_paths(str(exc)), 400
+                logger.warning("generate/ws append for %s refused: %s", request_id, text)
+            else:
+                text, _ = client_error_text(
+                    exc, f"generate/ws append for {request_id} failed", log=logger, type_name=False,
+                )
+                status = 500
+            error = f"append rejected: {text}"
             # the call's stream sends the error and no finish; False if the
             # call ended meanwhile, and then the append was late
             if not api_server.reject_input(key, error, status):
