@@ -2092,7 +2092,7 @@ async def generate_ws(websocket: WebSocket):
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
             if isinstance(exc, ValueError):  # the client's fault: no traceback
                 text, status = scrub_paths(str(exc)), 400
-                logger.warning("generate/ws append for %s refused: %s", request_id, text)
+                logger.info("generate/ws append for %s refused: %s", request_id, text)
             else:
                 text, _ = client_error_text(
                     exc, f"generate/ws append for {request_id} failed", log=logger, type_name=False,

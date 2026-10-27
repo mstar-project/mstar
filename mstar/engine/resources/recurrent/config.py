@@ -24,7 +24,7 @@ class RecurrentBlockConfig:
 
     ``shape`` is opaque to the pool. ``shard_dims`` names the axes divided
     across ranks. A ``dtype`` of None is the engine's compute dtype (what its
-    KV caches store), resolved by the pool, which never writes it back.
+    KV caches store), resolved by ``resolved_dtype`` and never written back.
     """
 
     shape: tuple[int, ...]
@@ -34,6 +34,11 @@ class RecurrentBlockConfig:
     def __post_init__(self):
         self.shape = tuple(self.shape)
         self._unsharded_shape = self.shape
+
+    def resolved_dtype(self, kv_dtype: torch.dtype | None) -> torch.dtype:
+        """The dtype the pool stores this block in; a resource planned against
+        the pool reads it here rather than from ``dtype``."""
+        return self.dtype or kv_dtype or torch.get_default_dtype()
 
     def shard(self, num_shards: int) -> None:
         from mstar.distributed.utils import divide
@@ -83,7 +88,7 @@ class DeltaNetGeometry(RecurrentGeometry):
 
     def to_blocks(
         self,
-        state_dtype: torch.dtype = torch.float32,
+        state_dtype: torch.dtype | None = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
     ) -> dict[str, RecurrentBlockConfig]:
         """Pool blocks for this geometry; head counts are pre-sharding."""
@@ -175,7 +180,7 @@ class Mamba2Geometry(RecurrentGeometry):
 
     def to_blocks(
         self,
-        state_dtype: torch.dtype = torch.float32,
+        state_dtype: torch.dtype | None = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
     ) -> dict[str, RecurrentBlockConfig]:
         """Pool blocks for this geometry; head counts pre-sharding (heads and
@@ -267,6 +272,7 @@ class RecurrentStateConfig:
         resource can both shard the shared config."""
         for block in self.blocks.values():
             block.shard(num_shards)
+
 
 @dataclass
 class RecurrentStateSpec(NodeResourceSpec):

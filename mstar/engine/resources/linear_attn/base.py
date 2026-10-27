@@ -12,7 +12,6 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, Mamba2Geometry
-from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ class LinearAttnManager(AttentionResource):
                 config=spec.config,
                 geometry=Mamba2Geometry.from_blocks(pool_config.blocks),
                 num_layers=pool_config.num_layers,
-                state_dtype=RecurrentStatePool.block_dtype(pool_config.blocks["ssm"], info.kv_dtype),
+                state_dtype=pool_config.blocks["ssm"].resolved_dtype(info.kv_dtype),
                 has_sink=not pool_config.disable_sink_slot,
                 device=info.device,
             )
@@ -56,7 +55,7 @@ class LinearAttnManager(AttentionResource):
                 max_rows_in_combined=info.max_rows_in_combined,
                 geometry=geometry,
                 num_layers=pool_config.num_layers,
-                state_dtype=RecurrentStatePool.block_dtype(pool_config.blocks["state"], info.kv_dtype),
+                state_dtype=pool_config.blocks["state"].resolved_dtype(info.kv_dtype),
                 has_sink=not pool_config.disable_sink_slot,
                 device=info.device,
             )
