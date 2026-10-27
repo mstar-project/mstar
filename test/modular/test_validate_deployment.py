@@ -469,6 +469,16 @@ def test_prefix_stream_laying_out_an_undeclared_resource_is_refused(tmp_path):
 # -- every problem at once ----------------------------------------------------
 
 
+def test_client_stream_settings_are_reported_with_the_rest(tmp_path):
+    """The API server reads these, but the conductor reports them."""
+    cfg = _cfg(tmp_path, client_streams={"audio_in": {"max_items": 3}}, max_call_input_mb=0)
+    assert _problems(_Model(refuse_yaml="no admit queue"), cfg) == [
+        "no admit queue",
+        "max_call_input_mb must be a positive number of MiB, not 0",
+        "serving config limits unknown client stream(s) ['audio_in']; this model takes []",
+    ]
+
+
 def test_problems_from_every_stage_are_reported_together(tmp_path, monkeypatch):
     """A knob, a YAML key, the model's hook, placement and a resource override
     come back in one error, and no worker is started."""
