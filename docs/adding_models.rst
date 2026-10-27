@@ -2418,6 +2418,10 @@ streams (audio and video, say): each has its own buffer and its own end.
   stream's end with how many items it carried. Every rank gets each item whole, so a client
   stream can't take a ``sharding_config.shard_dim`` entry (startup refuses one). Once the
   consuming partition ends, later appends for its streams are answered as late.
+- A consumer with nothing to do on the step that ends its last stream
+  (``is_final_stream_chunk``; empty when the last item was taken before the end arrived)
+  returns None from ``prepare_inputs``. The row still completes its node, so its loop ends
+  and its partition reports done. None on any other chunk drops the row from the step. Every rank sees the same chunk, so all decline alike.
 
 Checklist
 ---------

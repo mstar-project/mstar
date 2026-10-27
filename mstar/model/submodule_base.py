@@ -695,8 +695,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
         **kwargs
-    ) -> NodeInputs:
-        pass
+    ) -> NodeInputs | None:
+        """One request's inputs for this step, built on the host.
+
+        None declines the row. On the step that takes its streams' final chunk
+        (``is_final_stream_chunk``) the row still completes its node: its loop
+        ends and its partition reports done. On any other step it is dropped.
+        Every rank sees the same chunk, so all of them decline alike.
+        """
 
     def split_inputs(
         self,

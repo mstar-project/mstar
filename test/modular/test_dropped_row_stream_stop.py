@@ -1,5 +1,6 @@
 """A row that leaves a step (its prepare_inputs, postprocess or check_stop
-raised, or prepare_inputs declined it) must not end its streams on that step.
+raised) must not end its streams on that step, and a row prepare_inputs
+declined on its stream's final chunk must.
 
 ``final_stream_rids`` drives the stream-terminated loop stop in
 ``Worker._postprocess_batch``: every rid in it gets its innermost loop stopped,
@@ -177,10 +178,14 @@ def test_a_failed_prepare_inputs_row_does_not_fail_the_batch():
     assert set(w.reported) == {2}
 
 
-def test_a_declined_row_is_not_stopped():
-    batch, runtime, _ = _postprocess(_Sub(skip={2}))
-    assert runtime.stopped == [1]
-    assert 2 not in batch.final_stream_rids
+def test_a_row_that_declines_its_final_chunk_still_ends_its_streams():
+    # no dummy forward is needed to end the loop on an empty final chunk
+    batch, runtime, w = _postprocess(_Sub(skip={2}))
+    assert sorted(runtime.stopped) == [1, 2]
+    assert not w.reported
+    assert batch.request_ids == [1]
+    assert batch.final_stream_rids == {1, 2}
+    assert batch.stream_partition_done_rids == {1, 2}
 
 
 def test_a_failed_check_stop_row_does_not_fail_the_batch():
