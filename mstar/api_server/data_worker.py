@@ -44,7 +44,7 @@ from mstar.communication.tensors import (
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels
+from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels, names_checkpoint
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -155,13 +155,22 @@ def _preprocess_loop(**kwargs):
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
-    """Page size per KV resource whose prefix cache is on, after this deployment's YAML has been applied."""
+    """Page size per KV resource whose prefix cache can open, after this deployment's YAML has been applied."""
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, model_config)
+    # each node's smallest lockstep instance among the node groups that run it
+    instance: dict[str, int] = {}
+    for group in model_config.get("node_groups") or []:
+        size = int(group.get("tp_size", 1)) * int(group.get("sp_size", 1))
+        for node in group.get("node_names") or []:
+            instance[node] = min(size, instance.get(node, size))
     return {
         spec.resource_key: spec.config.page_size
         for spec in specs
-        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.prefix_cache
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+        and spec.config.prefix_cache_opens(
+            min((instance.get(node, 1) for node in spec.nodes), default=1), names_checkpoint(model),
+        )
     }
 
 
@@ -706,7 +715,8 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            if model_kwargs.get("prefix_cache") is not False:
+            # read as KVReqConfig.prefix_cache is: unset or None is on, otherwise its truth
+            if model_kwargs.get("prefix_cache") is None or model_kwargs["prefix_cache"]:
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
                 ))

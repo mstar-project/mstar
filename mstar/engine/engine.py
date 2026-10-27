@@ -874,15 +874,18 @@ class Engine:
                 self._keyed_walks.setdefault(node, set()).update(
                     walk for label in by_label.values() for walk in label.keys.walks
                 )
-        # a cache another engine holds is taken as open when its config says so
+        # a cache another engine holds is taken as open when the rule says so at
+        # one rank: that pool's world size is its own engine's to apply
         opened_keys = {
             key for key in declared
-            if key not in self._resources and specs_by_key[key].config.prefix_cache
+            if key not in self._resources
+            and specs_by_key[key].config.prefix_cache_opens(1, checkpoint_named=checkpoint is not None)
         }
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config
-                if config.prefix_cache and not config.prefix_cache_salt:
+                # the world-size half of the rule is the pool's own (enable_prefix_cache)
+                if config.prefix_cache and not config.prefix_cache_opens(1, checkpoint_named=False):
                     logger.info(
                         "KV %s: prefix cache off: %s names no checkpoint, so "
                         "builds that differ only in their weights cannot be "

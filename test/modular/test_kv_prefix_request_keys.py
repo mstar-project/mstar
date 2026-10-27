@@ -93,6 +93,10 @@ class _Model:
     def max_input_files(self):
         return {}
 
+    def checkpoint_path(self):
+        # a model that names no checkpoint and sets no salt keys nothing
+        return "/a/checkpoint"
+
     def get_node_resources(self):
         return [KVSpec(
             resource_key="kv", nodes={"LLM"},

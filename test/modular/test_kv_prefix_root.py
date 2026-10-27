@@ -463,11 +463,14 @@ def test_a_walk_the_cache_cannot_serve_whole_is_refused_at_startup(node, model, 
     assert problems and re.search(message, problems[0]), problems
 
 
-def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(monkeypatch):
+# the model names no checkpoint, so the cache, another engine's, opens only with a salt
+@pytest.mark.parametrize(("salt", "vit"), [("s", True), ("", None)], ids=["salted", "unsalted"])
+def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(monkeypatch, salt, vit):
     engine = Engine.__new__(Engine)
     engine._resources = {}
     engine._device = torch.device("cuda")
-    engine._open_prefix_caches({KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=_kv().config)}, _laid_out())
+    kv = _kv(prefix_cache_salt=salt).config
+    engine._open_prefix_caches({KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv)}, _laid_out())
     # "vae" is an encoder that no layout walk runs, like an edit's.
     engine._submodules = {
         name: SimpleNamespace(submodule=SimpleNamespace(forward=None, forward_batched=None))
@@ -479,7 +482,7 @@ def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(m
     engine._compile_submodules()
 
     compiled = {name: mgmt.forward for name, mgmt in engine._submodules.items()}
-    assert compiled == {"vit": True, "LLM": None, "vae": None}, (
+    assert compiled == {"vit": vit, "LLM": None, "vae": None}, (
         "an image encoder left to recompile caches KV it no longer computes for the same "
         "file, or a node the cache never keys from lost the compile main gives it"
     )

@@ -108,6 +108,18 @@ class PagedKVConfig(KVConfig):
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
 
+    def prefix_cache_opens(self, world_size: int, checkpoint_named: bool) -> bool:
+        """Whether a pool of this config opens its prefix cache. Every input is
+        fixed at startup: ``world_size`` is the pool's lockstep instance, and a
+        model that names no checkpoint needs a salt, or builds that differ only
+        in their weights could not be told apart. The conductor's routing reads
+        the same rule the workers open their caches by."""
+        return (
+            self.prefix_cache
+            and (world_size == 1 or self.prefix_cache_tp)
+            and (checkpoint_named or bool(self.prefix_cache_salt))
+        )
+
     @property
     def latent_dim(self) -> int:
         """Per-token cache width under MLA."""

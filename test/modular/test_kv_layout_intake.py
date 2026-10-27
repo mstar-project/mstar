@@ -62,6 +62,9 @@ class _Model(Model):
     def __init__(self, layout=LAYOUT, max_seq_len=4096):
         self._layout, self._max_seq_len = layout, max_seq_len
 
+    def checkpoint_path(self):
+        return "/a/checkpoint"
+
     def get_node_resources(self):
         return [KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=self._max_seq_len, max_num_pages=64, page_size=PS,
@@ -119,11 +122,11 @@ class _Model(Model):
         return None
 
 
-def _preprocess(model: _Model, model_kwargs: dict) -> dict:
+def _preprocess(model: _Model, model_kwargs: dict, **config) -> dict:
     worker = PreprocessWorkerThread(
         *(queue.Queue() for _ in range(8)), stop_event=threading.Event(), communicator=_Comm(),
         tensor_manager=_StubTensorManager(), model=model,
-        model_config={"model": "stub", "resources": {"kv": {"page_size": PS}}},
+        model_config={"model": "stub", "resources": {"kv": {"page_size": PS}}, **config},
     )
     worker._process_input(PreprocessInput(
         request_id="r", text="hello", file_paths=None, input_modalities=["text"],
@@ -187,6 +190,24 @@ def test_a_layout_reaches_its_streams_as_footprints(tmp_path, monkeypatch, prefi
 
     assert kv._streams["r"]["main"].footprint == -(-(PROMPT + 30) // PS)
     assert kv._ensure_label("r", "uncond").footprint == -(-(10 + 2 * 40 + 7) // PS)
+
+
+class _NamesNoCheckpoint(_Model):
+    checkpoint_path = Model.checkpoint_path
+
+
+@pytest.mark.parametrize("model,config,model_kwargs,keyed", [
+    (_Model, {}, {}, True),
+    # replicas of two ranks: the pool keeps its cache closed (prefix_cache_tp is refused with replicas)
+    (_Model, {"node_groups": [{"node_names": ["llm", "talker"], "ranks": [0, 1, 2, 3], "tp_size": 2}]}, {}, False),
+    # off, as the worker reads KVReqConfig.prefix_cache
+    (_Model, {}, {"prefix_cache": 0}, False),
+    # no checkpoint and no salt to root the cache in: the engine keeps it closed
+    (_NamesNoCheckpoint, {}, {}, False),
+], ids=["keyed", "dp_tp", "prefix_cache_0", "no_checkpoint"])
+def test_a_prompt_is_keyed_only_where_its_cache_opens(model, config, model_kwargs, keyed):
+    kwargs = _preprocess(model(), model_kwargs, **config)
+    assert ("prefix_keys" in kwargs) == keyed
 
 
 def test_a_cap_past_its_loop_is_refused(tmp_path, monkeypatch):

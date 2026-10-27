@@ -685,13 +685,13 @@ class KVManager(AttentionResource):
             if self._world_size == 1:
                 keyed.update(named.growth)
             self._keyed_walks[label] = frozenset(keyed)
-        if not self.config.prefix_cache:
-            return False
-        if self._world_size > 1 and not self.config.prefix_cache_tp:
-            logger.info(
-                "KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)",
-                self.name, self._world_size,
-            )
+        # the engine has closed the cache of a model that names no checkpoint before this
+        if not self.config.prefix_cache_opens(self._world_size, checkpoint_named=True):
+            if self.config.prefix_cache:
+                logger.info(
+                    "KV %s: prefix cache off at world size %d (prefix_cache_tp opts in)",
+                    self.name, self._world_size,
+                )
             return False
         self._prefix_root = root
         self._index = PrefixIndex(self._arena)

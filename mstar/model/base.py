@@ -178,6 +178,12 @@ def keyed_labels(model: "Model") -> dict[str, dict[str, KVLabel]]:
     return keyed
 
 
+def names_checkpoint(model: "Model") -> bool:
+    """Whether ``model`` overrides ``checkpoint_path``, read without calling it,
+    which may download the checkpoint (BAGEL's does)."""
+    return type(model).checkpoint_path is not Model.checkpoint_path
+
+
 def video_metadata_dict(metadata_obj) -> dict:
     # torchcodec>=0.9 reports pixel_aspect_ratio as a Fraction, which the wire codec rejects.
     return {k: float(v) if isinstance(v, Fraction) else v for k, v in asdict(metadata_obj).items()}
@@ -581,6 +587,8 @@ class Model(ABC):
 
         The prefix cache hashes the checkpoint's manifest into its root. None leaves
         the weights out, so the cache stays shut unless the deployment sets a salt.
+        An override returns a path: processes that must not download it read the
+        override alone (``names_checkpoint``).
         """
         return None
 
