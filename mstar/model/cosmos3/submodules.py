@@ -1586,11 +1586,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # forward
     # ------------------------------------------------------------------
 
-    # Run the transformer in the model's native bf16, NOT the engine autocast:
-    # autocast keeps norms in fp32, perturbing the velocity ~1 ULP/step, which
-    # the multi-step denoise amplifies. The reference runs the transformer in
-    # pure bf16 and the loop state around it in fp32 (LATENT_DTYPE).
-    @torch.autocast(device_type="cuda", enabled=False)
     def _states(self, engine_inputs: ModelInputsFromEngine) -> dict:
         """The batch's per-request states: the engine-injected view when
         present, else the submodule's own store (paths that build their own
@@ -1609,6 +1604,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         resources = engine_inputs.resources or self.node_resources
         return resources[key]
 
+    # The reference runs the transformer in pure bf16 and the loop state around
+    # it in fp32 (LATENT_DTYPE), so the forward opts out of the engine autocast.
+    # Autocast keeps norms in fp32, perturbing the velocity ~1 ULP/step, which
+    # the multi-step denoise amplifies, and it runs matmuls in bf16, the fp32
+    # time embedder and the scheduler step's einsum included.
+    @torch.autocast(device_type="cuda", enabled=False)
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, **kwargs):
         rid = engine_inputs.request_ids[0]
         if graph_walk in PREFILL_WALKS:
