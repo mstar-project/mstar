@@ -143,8 +143,8 @@ async def _anthropic(require: str, raw_request: Request, handle):
     try:
         result = await handle(api, model_name, adapter, body)
     except Exception as e:  # noqa: BLE001 — surface as an Anthropic error
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _anthropic_error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
+        err = _exception_error(e, raw_request.url.path)
+        return _anthropic_error(err.status_code, json.loads(bytes(err.body))["error"]["message"])
     if isinstance(result, dict):
         return JSONResponse(result)
     return StreamingResponse(result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
@@ -176,8 +176,7 @@ async def responses(raw_request: Request):
     try:
         result = await serving_responses.create_response(api, model_name, adapter, body, raw_request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)))
+        return _exception_error(e, "/v1/responses")
     if isinstance(result, dict):
         return JSONResponse(result)
     return StreamingResponse(result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"})

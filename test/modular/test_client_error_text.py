@@ -268,6 +268,13 @@ _ROUTES = [
      {"json": {"model": "wan22", "prompt": "a cat"}}),
     ("/v1/images/edits", "bagel", "serving_images", "create_image_edit",
      {"files": {"image": ("in.png", b"\x89PNG")}, "data": {"prompt": "x"}}),
+    # the chat APIs GLM's adapter serves besides chat completions
+    ("/v1/messages", "glm52", "serving_messages", "create_message",
+     {"json": {"model": "glm52", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}}),
+    ("/v1/messages/count_tokens", "glm52", "serving_messages", "count_tokens",
+     {"json": {"model": "glm52", "messages": [{"role": "user", "content": "hi"}]}}),
+    ("/v1/responses", "glm52", "serving_responses", "create_response",
+     {"json": {"model": "glm52", "input": "hi"}}),
 ]
 
 
