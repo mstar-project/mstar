@@ -540,6 +540,12 @@ class LTX25Model(Model):
         shapes = self.vae_compile_shapes
         if shapes is None:
             shapes = self.capture_shapes
+        for h, w, f, fps in shapes:
+            # a shape no request can have would warm a decode that never runs
+            try:
+                self.resolve_request({"height": h, "width": w, "num_frames": f, "fps": fps})
+            except ValueError as e:
+                raise ValueError(f"vae_compile_shapes: {e}") from None
         return [
             shape_from_metadata(self.config, {"height": h, "width": w, "num_frames": f, "fps": fps})
             for h, w, f, fps in dict.fromkeys(shapes)
@@ -592,9 +598,10 @@ class LTX25Model(Model):
             from diffusers import AutoencoderKLLTX2Video
 
             vae = AutoencoderKLLTX2Video.from_pretrained(str(snapshot / "vae"), torch_dtype=torch.bfloat16)
+            warm = self._decode_shapes()
             return LTXVideoDecoderSubmodule(
                 vae.to(device).eval(), self.config, tile_min_pixels=self.vae_tile_min_pixels,
-                compile_decode=self.vae_compile, warmup_shapes=self._decode_shapes(),
+                compile_decode=self.vae_compile and bool(warm), warmup_shapes=warm,
             )
         if node_name == UPSAMPLER_NODE:
             from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video

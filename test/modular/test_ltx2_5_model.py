@@ -484,6 +484,9 @@ def test_vae_compile_shapes_are_independent_of_the_dit_captures():
     assert model.capture_buckets() == [(GENERATE_AV_WALK, model._decode_shapes()[0])]
     assert sizes(model) == [(17, 30, 16), (34, 60, 16)]
     assert sizes(_make_model(vae_compile_shapes=[])) == []
+    # a shape no request can have (1080 isn't on the 32-pixel grid) is refused, not warmed
+    with pytest.raises(ValueError, match="vae_compile_shapes"):
+        _make_model(vae_compile_shapes=[[1080, 1920, 121, 24]])._decode_shapes()
 
 
 def test_warmed_vae_decoder_compiles_only_warmed_shapes():

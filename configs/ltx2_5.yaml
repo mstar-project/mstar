@@ -12,8 +12,9 @@ model_kwargs:
   # reference pipeline's kernel, for parity runs
   attention_backend: flashinfer
   max_batch_size: 4
-  # the video VAE decode compiled for the capture (and refine) shapes, ~55 dB from the eager
-  # decode; false for bit-exact output
+  # the video VAE decode compiled for the capture shapes (a two-stage 1088x1920 decode runs
+  # eager unless listed in vae_compile_shapes), ~55 dB from the eager decode; false for
+  # bit-exact output
   vae_compile: true
 
 node_groups:
