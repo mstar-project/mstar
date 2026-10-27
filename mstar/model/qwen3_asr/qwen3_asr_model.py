@@ -52,7 +52,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
-from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_file
+from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.qwen3_asr.config import (
     ASR_TEXT_TAG,
@@ -328,7 +328,7 @@ class Qwen3ASRModel(Model):
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         del device
-        waveform = load_audio_file(filepath, self.config.sampling_rate)
+        waveform = load_speech_file(filepath, self.config.sampling_rate, self.config.max_audio_seconds)
         return TensorAndMetadata(
             data=waveform, metadata=dict(sample_rate=self.config.sampling_rate, num_channels=1),
         )

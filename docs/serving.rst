@@ -42,6 +42,15 @@ mstar serve
    * - ``--gpus``
      - all visible
      - Sets ``CUDA_VISIBLE_DEVICES`` (e.g. ``0`` or ``0,1,2``).
+   * - ``-O``, ``--compile-level``
+     - ``MSTAR_COMPILE_LEVEL``, else ``1``
+     - How much the captured forwards' compiles tune at startup. ``-O0``: torch.compile's
+       default mode, no tuning. ``-O1``: coordinate descent, which fuses the decode GEMMs
+       with their epilogues. ``-O2``: full max-autotune, which adds the GEMM template
+       search. Qwen3.5-0.8B on an H200 with an empty cache started in 170 s / 320 s /
+       1,294 s at the same throughput; Qwen3-TTS was 25-30% slower at ``-O0`` (c=1).
+       Use ``-O2`` for numbers quoted against other engines. Compiles a model runs itself
+       (e.g. a diffusion VAE decode) keep their own mode.
    * - ``--config``
      - model default
      - Override the resolved default config with a path to your own YAML.
@@ -230,8 +239,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - Maximum sequence length (sizes the KV cache).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. Each node of a
-       walk must be placed by exactly one entry for that walk.
+       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
+       ``ep_config`` block picks TP or EP for the group's MoE experts.
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -275,24 +284,36 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        JIT or CUDA-graph capture can exceed that default.
    * - ``tp_allreduce``
      - *(optional)* Small-message all-reduce path of every TP and SP group:
-       ``nccl`` (default), ``symm_oneshot`` or ``symm_multimem``; any other value
-       fails at startup. The last two send
+       ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
+       any other value fails at startup. ``flashinfer`` sends 2-D bf16 CUDA messages
+       up to ``tp_allreduce_max_kb`` through FlashInfer's one-kernel all-reduce.
+       The symmetric-memory modes send
        contiguous bf16 and fp32 CUDA messages up to ``tp_allreduce_max_kb`` through
        torch symmetric memory: one-shot reads every peer's buffer over NVLink and
        reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
        Larger messages stay on NCCL, and so does one-shot inside a
        ``torch.compile``'d forward. Both are CUDA-graph capturable. Reduction order
        differs from NCCL's, so bf16 results can differ at the last bit. Falls back
-       to NCCL, with a warning, where symmetric memory cannot be set up on every
+       to NCCL, with a warning, where the chosen path cannot be set up on every
        rank of the group.
    * - ``tp_allreduce_max_kb``
-     - *(optional)* Largest message, in KiB, the symmetric-memory path takes;
+     - *(optional)* Largest message, in KiB, the non-NCCL path takes;
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
    * - ``tp_async_sched``
      - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
        (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
        overrides it).
+   * - ``knobs``
+     - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
+       ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
+       ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs`` and
+       ``gc_gen0_threshold``
+       (``true``/``false`` or an integer). Each one's environment variable
+       (``MSTAR_DEVICE_LOOPBACK`` and so on; see
+       :doc:`environment_variables`) overrides it when set, and an unknown name
+       fails at startup. For example ``knobs: {kv_plan_cache: 1,
+       ingraph_decode_rope: true}``.
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /
@@ -396,6 +417,48 @@ A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1
 weight loaders then shard parameters automatically, with no model-code changes. See
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
+
+**Expert parallelism.** By default a TP group shards every MoE expert along its
+intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
+whole experts. Attention and dense MLPs stay TP-sharded:
+
+.. code-block:: yaml
+
+   model: "qwen3_omni"
+   max_seq_len: 32768
+   node_groups:
+     - node_names: [Thinker]
+       ranks: [0, 1]
+       tp_size: 2
+       ep_config:
+         parallel: ep          # each rank holds 64 of the 128 experts at full width
+     - {node_names: [audio_encoder, vision_encoder], ranks: [0]}
+     - {node_names: [Talker], ranks: [2]}
+     - {node_names: [Code2Wav], ranks: [2]}
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``ep_config`` key
+     - Meaning
+   * - ``parallel``
+     - ``tp`` (default) or ``ep``.
+   * - ``ep_group``
+     - The ranks EP spans. Only ``tp``, the group's TP ranks, exists today.
+   * - ``debug_check_routing``
+     - Device-assert that every rank routes each token to the same experts. Costs one
+       all-gather per MoE layer; off by default. Needs ``parallel: ep``.
+   * - ``log_expert_load_every``
+     - Every N steps, log the per-rank and per-layer expert load. 0 (default) is off.
+       Needs ``parallel: ep``.
+   * - ``mask_padding``
+     - Skip CUDA-graph padding rows in the routed experts, TP or EP. Off by default;
+       it gave no throughput gain on Qwen3-Omni at 8 GPUs.
+
+The number of experts must divide evenly by the group size. A node must be declared
+EP-enabled by the model; an ``ep_config`` on any other node, an unknown key, or two
+per-walk groups giving one node different ``ep_config`` blocks fails at start-up. See
+``configs/qwen3omni_thinker_ep2.yaml``.
 
 model_kwargs
 ------------

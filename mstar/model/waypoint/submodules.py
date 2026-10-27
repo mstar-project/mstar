@@ -5,6 +5,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_runner import compile_kwargs
 from mstar.engine.resources import AttentionStep, RingKVStep, SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.waypoint.components.dit import WaypointDiT
@@ -66,6 +67,11 @@ def _rollout_capture_batch_sizes(step_batch_size: int) -> list[int]:
         bs *= 2
     sizes.append(step_batch_size)
     return sizes
+
+
+# The prime-walk capture and the decode compile share this mode. max-autotune
+# until the default compile level (mstar serve -O) is measured on Waypoint.
+_COMPILE_MODE = "max-autotune-no-cudagraphs"
 
 
 class _SingleRequestMixin:
@@ -144,16 +150,11 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         self.dit = dit
         self.taehv = taehv
         self.config = config
-        # Matches the engine's own capture options (``compile=True`` ->
-        # ``torch.compile(mode="max-autotune-no-cudagraphs", fullgraph=False,
-        # dynamic=False)``) so Inductor picks the same kernels bit-for-bit.
-        # Wrapping just the decode call keeps the engine from compiling across
-        # the denoise/decode boundary.
+        # The prime-walk capture's own arguments, so Inductor picks the same
+        # kernels bit-for-bit. Wrapping just the decode call keeps the engine
+        # from compiling across the denoise/decode boundary.
         self._decode_latent = (
-            torch.compile(
-                decode_latent, mode="max-autotune-no-cudagraphs",
-                fullgraph=False, dynamic=False,
-            )
+            torch.compile(decode_latent, **compile_kwargs(_COMPILE_MODE))
             if config.accelerator_graph else decode_latent
         )
 
@@ -713,6 +714,7 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
                 dtype=self.ae_dtype, device=device,
             )
             configs.append(BatchedAcceleratorGraphConfig(
+                compile_mode=_COMPILE_MODE,
                 capture_graph_walk=PRIME_WALK,
                 single_request_inputs=NodeInputs(
                     tensor_inputs={"image": image},

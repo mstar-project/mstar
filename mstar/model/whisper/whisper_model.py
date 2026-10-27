@@ -61,10 +61,10 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
-from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_file
+from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import ByteLevelDetokenizer
+from mstar.model.utils import ByteLevelDetokenizer, check_kv_pools_fit, kv_pages
 from mstar.model.whisper.config import (
     ALIGN_WALK,
     ATTN,
@@ -182,12 +182,6 @@ class WhisperModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
-    @staticmethod
-    def _cache_pages(tokens: int, page_size: int, requests: int) -> int:
-        """Pages for ``requests`` sequences of ``tokens`` each, plus the sink
-        page every KV cache keeps out of circulation."""
-        return 1 + requests * -(-tokens // page_size)
-
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Decoder self-attention KV + a separate encoder-context KV.
 
@@ -206,7 +200,7 @@ class WhisperModel(Model):
             max_seq_len=self.config.max_target_positions,
             num_qo_heads=self.config.decoder_attention_heads,
             page_size=page_size,
-            max_num_pages=self._cache_pages(
+            max_num_pages=kv_pages(
                 self.config.max_target_positions, page_size, requests,
             ),
         )
@@ -220,7 +214,7 @@ class WhisperModel(Model):
             max_seq_len=self.config.max_source_positions,
             num_qo_heads=self.config.decoder_attention_heads,
             page_size=page_size,
-            max_num_pages=self._cache_pages(
+            max_num_pages=kv_pages(
                 self.config.max_source_positions, page_size, requests,
             ),
         )
@@ -273,49 +267,16 @@ class WhisperModel(Model):
         }
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a request cap the decoder caches cannot hold.
-
-        A request keeps its encoder context from prefill to its last token, so
-        nothing frees cross-attention pages but a finished request. Past the
-        pool a prefill batch is refused and the worker offloads decoding
-        requests to admit it, which costs far more than queueing would. So
-        ``max_concurrent_requests`` requests at full length must fit in each
-        cache next to its sink page; the conductor queues the rest.
-        """
+        """Refuse a request cap the decoder caches cannot hold: a request keeps
+        its encoder context from prefill to its last token, so nothing frees
+        cross-attention pages but a finished request. Also note the decoder's
+        tensor-parallel size, which word timestamps need to be 1."""
         self._decoder_tp_size = max(
             (int(group.get("tp_size", 1)) for group in config.get("node_groups") or []
              if DECODER_NODE in (group.get("node_names") or [])),
             default=1,
         )
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning(
-                "%s sets no max_concurrent_requests: past the requests the decoder "
-                "caches hold, the worker offloads decoding requests to admit new "
-                "ones instead of queueing them", config_path,
-            )
-            return
-        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-            raise ValueError(
-                f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}"
-            )
-        overrides = config.get("resources") or {}
-        for spec in self.get_node_resources():
-            if not isinstance(spec, KVSpec):
-                continue
-            kv = spec.config
-            override = overrides.get(spec.resource_key) or {}
-            page_size = int(override.get("page_size", kv.page_size))
-            max_num_pages = int(override.get("max_num_pages", kv.max_num_pages))
-            need = self._cache_pages(kv.max_seq_len, page_size, cap)
-            if need > max_num_pages:
-                raise ValueError(
-                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
-                    f"need {need} pages of resources.{spec.resource_key} "
-                    f"({-(-kv.max_seq_len // page_size)} per request and the sink page), "
-                    f"which has {max_num_pages}; raise max_num_pages or lower "
-                    "max_concurrent_requests"
-                )
+        check_kv_pools_fit(self, config, config_path, logger)
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
@@ -564,8 +525,11 @@ class WhisperModel(Model):
     # -------------------------------------------------------------------
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
+        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
+
         del device  # decoded on the CPU; the mel front end runs there too
-        waveform = load_audio_file(filepath, self.config.sampling_rate)
+        # the route windows long uploads; past one window process_prompt drops the rest
+        waveform = load_speech_file(filepath, self.config.sampling_rate, MAX_AUDIO_SECONDS)
         return TensorAndMetadata(
             data=waveform, metadata=dict(sample_rate=self.config.sampling_rate, num_channels=1),
         )

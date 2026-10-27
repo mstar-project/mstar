@@ -2493,6 +2493,15 @@ impl GraphRuntime {
             if several_walks {
                 rid_walk.insert(rid, (walk_sym, wg));
             }
+            // No group means singleton / non-TP, which is rank 0. The
+            // conductor counts one report per request, so a rank wrongly
+            // claiming rank 0 multiplies that count by tp_size.
+            let node_sym = self.interner.get(&input.node_name);
+            let is_first_tp_rank = self
+                .info(rid)
+                .zip(node_sym)
+                .and_then(|(i, n)| i.shard.as_ref()?.group_of(n, walk_sym))
+                .is_none_or(|g| g.tp_rank == Some(0));
             // Slice this rid's uuids back out of the flat, rid-major layout.
             let mut by_signal: FxHashMap<Sym, Vec<TensorRef>> =
                 FxHashMap::default();
@@ -2559,7 +2568,9 @@ impl GraphRuntime {
                 .filter(|e| e.persist && !e.streaming)
                 .map(|e| (e.name, e.tensors.clone()))
                 .collect();
-            {
+            // Leader only, as in Python: a follower does not keep the
+            // tensors behind these edges, so its counts would name freed ones.
+            if is_first_tp_rank {
                 // First edge of a signal name wins, as in Python's
                 // _count_new_tokens: one output routed twice is two edges
                 // over the SAME tensors.
@@ -2627,17 +2638,7 @@ impl GraphRuntime {
             
             speculative.insert(rid, was_speculative);
 
-            // No group means singleton / non-TP, which is rank 0. The
-            // conductor counts one report per request, so a rank wrongly
-            // claiming rank 0 multiplies that count by tp_size.
-            let node_sym = self.interner.get(&input.node_name);
-            first_tp_rank.insert(
-                rid,
-                self.info(rid)
-                    .zip(node_sym)
-                    .and_then(|(i, n)| i.shard.as_ref()?.group_of(n, walk_sym))
-                    .is_none_or(|g| g.tp_rank == Some(0)),
-            );
+            first_tp_rank.insert(rid, is_first_tp_rank);
 
             // Sweep EVERY worker graph this request runs in this walk, not
             // just the one owning the completed node: a wg can become done
@@ -3174,11 +3175,13 @@ impl GraphRuntime {
     /// -- because that is the shape `ParallelList` already holds it in.
     /// Zipping them into tuples on the Python side just to unzip here is a
     /// per-rid interpreted loop per argument, every forward pass.
+    ///
+    /// `skip_rids` failed after routing: none of their frames go out.
     #[pyo3(signature = (
         completion_id, info_rids, request_infos,
         ntc_rids, new_token_counts,
         consumed_rids, stream_tokens_consumed, prof_rids, profiling,
-        publish_rids, publications,
+        publish_rids, publications, skip_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send_outputs(
@@ -3197,6 +3200,7 @@ impl GraphRuntime {
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
         publications: Vec<Option<Vec<u8>>>,
+        skip_rids: Vec<u32>,
     ) -> PyResult<Vec<u32>> {
         // Released for the whole frame phase rather than around each send.
         // Nothing below touches Python: the arguments arrive already
@@ -3241,6 +3245,14 @@ impl GraphRuntime {
                 .map(|c| c.speculative.clone())
                 .unwrap_or_default();
             let mut plan = self.take_send_plan(completion_id)?;
+            if !skip_rids.is_empty() {
+                let skip: FxHashSet<u32> = skip_rids.into_iter().collect();
+                plan.to_workers.retain(|w| !skip.contains(&w.rid));
+                plan.persist.retain(|(rid, ..)| !skip.contains(rid));
+                plan.emit.retain(|(rid, ..)| !skip.contains(rid));
+                plan.emit_inline.retain(|(rid, ..)| !skip.contains(rid));
+                plan.completed.retain(|(rid, ..)| !skip.contains(rid));
+            }
             let partition = plan.partition.clone();
             let encoded: FxHashMap<u32, Option<Vec<u8>>> =
                 request_infos.into_iter().collect();

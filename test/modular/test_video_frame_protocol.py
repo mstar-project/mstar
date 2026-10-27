@@ -205,6 +205,11 @@ class _ReadyTensorManager:
         self.dereferenced = []
         self.cleaned = []
 
+    def take_failed_reads(self):
+
+        return []
+
+
     def get_ready_tensors(self):
         ready, self.ready = self.ready, {}
         return {

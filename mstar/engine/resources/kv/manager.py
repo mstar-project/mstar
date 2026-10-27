@@ -55,8 +55,10 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
+from mstar.utils.profiler import PhaseLaps
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +237,8 @@ class CacheStream:
     # a failed retrieve, latched: the future is consumed once, but every later
     # readiness check has to keep reporting the stream as unusable
     read_error: BaseException | None = None
+    # what a client may see of it (no server paths or internal text)
+    read_error_text: str = ""
     # None while the stream is unkeyed, and once its keys stop describing it
     chain: PrefixChain | None = None
     # pages the index matched for this stream and is holding for it, from the
@@ -1776,9 +1780,7 @@ class KVManager(AttentionResource):
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
                 # to allocate on a near-full arena and hold the batch.
-                if segment.span == 0 or self._on_sink(ctx, segment.request_id) or (
-                    sink and (segment.request_id, segment.label) in sink
-                ):
+                if not self._reserves(ctx, sink, segment):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
@@ -1793,7 +1795,9 @@ class KVManager(AttentionResource):
                     segment.request_id, segment.label, seq_len,
                 )
                 if not alloc_res.success:
-                    return AdmitOutcome(ok=False, reason=alloc_res.error)
+                    return AdmitOutcome(
+                        ok=False, reason=self._sized_refusal(step, ctx, alloc_res.error),
+                    )
                 if alloc_res.new_pages:
                     self._admit_reserved_pages.setdefault(
                         (segment.request_id, segment.label), []
@@ -1806,7 +1810,7 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
-                if self._on_sink(ctx, segment.request_id) or (sink and (segment.request_id, segment.label) in sink):
+                if self._sinks(ctx, sink, segment):
                     continue
                 stream = self._streams.get(
                     segment.request_id, {}
@@ -1823,6 +1827,81 @@ class KVManager(AttentionResource):
         # retention is applied at commit (see `_apply_retention`)
 
         return ADMIT_OK
+
+    def _sized_refusal(
+        self, step: KVStep, ctx: StepContext, error: AdmitFailedReason,
+    ) -> AdmitFailedReason:
+        """``error`` with the step's ``rows_fit`` and ``rows_fit_alone`` filled
+        in, or a terminal refusal naming a request of the step that needs more
+        pages than the whole pool has, the one ``error`` names first: no
+        eviction can make that fit, so retrying it only spins until the client
+        gives up. Caller holds ``_lock``.
+
+        A request's footprint is every distinct page it would hold after the
+        step: the ones its streams hold already, counted once where labels or
+        requests share them, plus the ones `admit` would still reserve for each
+        stream. A segment that runs against the sink holds and needs nothing,
+        and a span-0 one needs nothing beyond what it holds, as in `admit`. The
+        pool is every page but the sink, cached prefixes included, since those
+        can be evicted. ``rows_sized`` is how many real rows were counted.
+        """
+        if not isinstance(error, AllocationFailed):
+            return error
+        page_size = self.config.page_size
+        sink = step.sink
+        held: dict[str, set[int]] = {}
+        needed: dict[tuple[str, str], int] = {}
+        for segment in step.segments:
+            rid = segment.request_id
+            if self._on_sink(ctx, rid):
+                continue
+            # a row with every label on the sink still counts as a row that fits
+            rows_pages = held.setdefault(rid, set())
+            if self._sinks(ctx, sink, segment):
+                continue
+            stream = self._streams.get(rid, {}).get(segment.label)
+            pages = () if stream is None else stream.page_indices
+            rows_pages.update(pages)
+            if not self._reserves(ctx, sink, segment):
+                continue
+            stored = 0 if stream is None else stream.stored_len
+            key = (rid, segment.label)
+            more = -(-(stored + segment.span) // page_size) - len(pages)
+            needed[key] = max(needed.get(key, 0), more)
+        extra: dict[str, int] = {}
+        for (rid, _), more in needed.items():
+            extra[rid] = extra.get(rid, 0) + max(more, 0)
+        capacity = self.config.max_num_pages - 1
+        rows = list(held)
+        # every row, not only the named one: a row refused ahead of one that
+        # fills the pool names itself, and the eviction then takes the filler,
+        # the only row holding pages
+        for rid in sorted(rows, key=lambda rid: rid != error.request_id):
+            own = len(held[rid]) + extra.get(rid, 0)
+            if own > capacity:
+                # the client reads this text, and the rid is the worker's
+                # handle, not an id it sent
+                return AdmitRuntimeError(
+                    message=(
+                        f"The request needs {own} pages of {self.name} for this "
+                        f"step, more than the {capacity} the pool holds; raise "
+                        "max_num_pages or shorten the request."
+                    ),
+                    request_ids=frozenset({rid}),
+                )
+        if error.request_id in rows:
+            error.rows_fit = rows.index(error.request_id)
+        resident: set[int] = set()
+        new = alone = 0
+        for rid in rows:
+            resident |= held[rid]
+            new += extra.get(rid, 0)
+            if len(resident) + new > capacity:
+                break
+            alone += 1
+        error.rows_fit_alone = alone
+        error.rows_sized = len(rows)
+        return error
 
     def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
         """Give back the pages this admit freshly acquired, and clear the
@@ -2371,6 +2450,9 @@ class KVManager(AttentionResource):
             "KV preplan is already pending; clear_preplan before planning a "
             "different step ahead"
         )
+        laps = PhaseLaps(
+            "res.pre_plan.kv_cache." if ctx.is_preplan else "res.plan.kv_cache."
+        )
         self.reset_default_cursors()
         if self._preplanned:
             if self._preplan_key == self._plan_key(step, ctx):
@@ -2386,6 +2468,7 @@ class KVManager(AttentionResource):
                 self._preplan_marked = []
                 # the promoted step runs; the plan cache still describes it
                 self.clear_preplan(promoted=True)
+                laps.lap("promote")
                 return res
             # A different step reached the GPU thread before the one planned
             # ahead (e.g. a new request's prefill while a decode step sits
@@ -2404,9 +2487,11 @@ class KVManager(AttentionResource):
 
         if self._indptr_ring is not None:
             self._indptr_ring.begin_plan()
+        laps.lap("forks")
         res = None
         if self._plan_cache_mode and not pending:
             res = self._fast_decode_plan(step, ctx)
+            laps.lap("fast_decode" if res is not None else "fast_decode_miss")
         if res is None or self._plan_cache_mode == 2:
             full = KVPlanOutputs(
                 {
@@ -2432,7 +2517,9 @@ class KVManager(AttentionResource):
                 res = full
                 if self._plan_cache_mode and not pending:
                     self._remember_decode_plan(step, ctx, res)
+            laps.lap("full")
         self._setup_plan_states(res, ctx, ctx.slot_lease)
+        laps.lap("setup_states")
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
             self._preplanned = True
@@ -2458,6 +2545,20 @@ class KVManager(AttentionResource):
             if not KVManager._on_sink(ctx, rid)
             and (step.fork_rids is None or rid in step.fork_rids)
         ]
+
+    @staticmethod
+    def _sinks(ctx: StepContext, sink: frozenset, segment: Segment) -> bool:
+        """Whether ``segment`` runs against SINK_PAGE: its row does (see
+        `_on_sink`), or the step puts its label there."""
+        return KVManager._on_sink(ctx, segment.request_id) or bool(
+            sink and (segment.request_id, segment.label) in sink
+        )
+
+    @staticmethod
+    def _reserves(ctx: StepContext, sink: frozenset, segment: Segment) -> bool:
+        """Whether `admit` reserves pages for ``segment``: it writes tokens,
+        and not against the sink. `_sized_refusal` counts the same ones."""
+        return bool(segment.span) and not KVManager._sinks(ctx, sink, segment)
 
     @staticmethod
     def _on_sink(ctx: StepContext, rid) -> bool:
@@ -3461,16 +3562,17 @@ class KVManager(AttentionResource):
                 future.result()
             except Exception as e:
                 stream.read_error = e
+                stream.read_error_text, _ = client_error_text(
+                    e, f"KV retrieve for request {rid} label {label!r} failed", log=logger,
+                )
             else:
                 stream.read_pending = False
         if stream.host_copy is not None and stream.host_copy.landed:
             stream.host_copy = None
             stream.read_pending = stream.read_future is not None
         if stream.read_error is not None:
-            err = stream.read_error
             return False, AdmitRuntimeError(
-                f"KV retrieve for request {rid} label {label!r} failed: "
-                f"{type(err).__name__}: {err}"
+                f"KV retrieve for request {rid} label {label!r} failed: {stream.read_error_text}"
             )
         return not stream.read_pending, None
 

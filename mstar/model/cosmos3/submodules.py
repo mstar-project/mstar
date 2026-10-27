@@ -2571,12 +2571,11 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
             vision = torch.stack(frames, dim=1).unsqueeze(0).to(device=device, dtype=torch.float32)
         elif image:
             # load_image gives [C, H, W] in [0, 1]. Image-to-video follows the
-            # deployment's conditioning_resize recipe: "stretch" is the
-            # diffusers VideoProcessor resize-normalize the Nano/Super
-            # checkpoints were validated against (also what the action modes
-            # use for their repeated frame), "aspect_crop" the diffusers 0.40
-            # cover-scale + center-crop recipe of the Edge yamls.
-            if is_action or self.config.conditioning_resize == "stretch":
+            # deployment's conditioning_resize recipe (components/conditioning.py).
+            # Action modes keep diffusers' VideoProcessor resize, since their
+            # reference recipes (resolution buckets and padding in diffusers)
+            # are not ported.
+            if is_action:
                 frame = self._video_processor.preprocess(image[0], height=height, width=width).to(
                     device=device, dtype=torch.float32
                 )
@@ -3240,6 +3239,8 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
         compile_decode = (env == "1") if env is not None else bool(self.config.compile_reasoner_decode)
         return [
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk=REASONER_DECODE_WALK,
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),

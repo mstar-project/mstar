@@ -22,6 +22,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
        for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
        HiFT vocoder, PerTh watermark. 24 kHz. Multilingual covers 23 languages.
+   * - ``command_a_plus`` *(Experimental)*
+     - ``CohereLabs/command-a-plus-05-2026-bf16``
+     - Command A+ text and image chat: a 218B-parameter MoE (25B active) with
+       sliding-window attention. Tested on 4x GB200 at TP4; see the notes below.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -128,6 +132,17 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text
        in 1,600+ languages with no language code. Not autoregressive; batched across
        requests. Apache-2.0.
+   * - ``canary``
+     - ``nvidia/canary-1b-v2``
+     - FastConformer encoder + Transformer decoder: speech recognition in 25 European
+       languages and translation to or from English (``language``, English if unset, and
+       ``target_language`` or ``task="translate"``). Clips up to 40 s; longer uploads are
+       windowed. No timestamps.
+   * - ``canary_qwen``
+     - ``nvidia/canary-qwen-2.5b``
+     - English speech recognition by an LLM: Canary's FastConformer encoder projected into
+       Qwen3-1.7B (LoRA merged at load). Clips up to 40 s; longer uploads are windowed. The
+       OpenAI ``prompt`` is ignored. No timestamps.
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
@@ -219,7 +234,7 @@ Omnilingual ASR notes
 - The CTC head covers every language at once: ``language``, ``prompt`` and ``temperature``
   have no effect (the reference ignores a language code for CTC models too), and
   decoding is a per-frame argmax. There are no timestamps: ``srt`` / ``vtt`` get one cue
-  spanning the file and ``verbose_json`` an empty segment list. Nothing detects the
+  per window and ``verbose_json`` one segment per window, timed to the windows. Nothing detects the
   language either: ``verbose_json``'s ``language`` is the request's ``language`` as given,
   or null. ``/v1/realtime`` is not supported.
 - ``dtype`` defaults to ``bfloat16``, the reference's inference dtype; ``float32`` also
@@ -232,6 +247,31 @@ Omnilingual ASR notes
 - Parity scripts against Meta's pipeline live in ``test/omnilingual_asr/``
   (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
   fairseq2).
+
+FastConformer ASR (``canary``, ``canary_qwen``) notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
+  torchcodec, which needs FFmpeg.
+- One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.
+- Request fields, the same on ``/v1/audio/transcriptions`` and in ``/generate``'s
+  ``model_kwargs``:
+
+  - ``canary``: ``language`` (the speech's, default ``en``; one of bg, hr, cs, da, nl, en,
+    et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk),
+    ``target_language`` (a translation to or from English; the OpenAI route also takes
+    ``task="translate"``) and ``punctuation`` (default on).
+  - ``canary_qwen``: English only (checked on the OpenAI route). ``instruction``
+    replaces the trained one, "Transcribe the following:"; ``/generate``'s text is unused.
+
+- A request holds up to 40.96 s. ``/v1/audio/transcriptions`` cuts longer uploads (up to
+  30 min) into windows at quiet moments and joins their text. Neither model emits
+  timestamps.
+- Their YAMLs size the KV caches for ``max_concurrent_requests`` (64),
+  and startup refuses a cap the caches can't hold.
+- Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
+  smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
+  together.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
@@ -304,6 +344,48 @@ refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends.
+
+Command A+ (``command_a_plus``)
+-------------------------------
+
+Text and image chat on Command A+: 32 MoE layers (128 routed experts, top-8,
+plus an always-on shared expert), with three sliding-window (4096) layers for
+every global one. Served on ``POST /generate`` (there is no OpenAI adapter
+yet)::
+
+    mstar serve command_a_plus --gpus 0,1,2,3
+    curl -s http://localhost:8000/generate -F 'text=What is in this image?' -F 'files=@cat.jpg'
+
+Images are tiled like transformers' ``Cohere2VisionProcessor`` (up to 12
+512x512 tiles plus a thumbnail, 256 tokens each) and encoded on the first LLM
+rank. In ``messages``, an image is a ``{"type": "image"}`` item; the uploaded
+files fill them in order.
+
+Install the ``command_a_plus`` extra, and point ``CUDA_HOME`` at a toolkit
+matching PyTorch's CUDA version so the fused-MoE alignment op can JIT-build.
+The ~437 GB of BF16 weights are never downloaded automatically: download the
+checkpoint and set ``model_kwargs.checkpoint_dir`` in
+``configs/command_a_plus_tp4.yaml``, the default (TP4, 65536-token
+``max_seq_len``). Its 8192-page KV pool fits on GB200; on 141 GB GPUs such as
+H200, set ``resources.kv_cache.max_num_pages`` to 2048. Tokenizer and config
+metadata are pinned to one checkpoint revision.
+``configs/command_a_plus_tp8.yaml`` targets 8x 80 GB GPUs and keeps NCCL's
+all-reduce until FlashInfer's is measured there.
+
+``model_kwargs={"messages": [{"role": ..., "content": ...}, ...]}`` with
+``system`` / ``user`` / ``assistant`` turns goes through the chat template; a
+plain ``text`` prompt is one user turn. Sampling defaults to temperature 0.9,
+top-p 0.95 and repetition penalty 1.04. The model reasons before answering, so
+give it a generous ``max_output_tokens``; a prompt plus ``max_output_tokens``
+(2048 when unset) longer than ``max_seq_len`` is rejected.
+
+On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
+Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer`` at TP4).
+On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
+64 (``benchmark/command_a_plus/bench_http.py``); ``validate_checkpoint.py``
+there checks parity against Hugging Face, with ``--images`` for image prompts.
+Not supported yet: FP8 weights, prefill CUDA graphs, and reclaiming KV pages
+outside the sliding window.
 
 Kokoro notes
 ------------
@@ -623,9 +705,10 @@ Chatterbox notes
 - Requests: ``/v1/audio/speech`` with ``input``, ``voice`` (``default`` = the
   voice shipped in the checkpoint, or a preset name resolved under the
   deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
-  ``ref_audio`` (data URL of a reference clip, 5-30 s, cloning; an http(s)
-  URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the
-  server are refused), ``exaggeration`` (0-2, emotion intensity, default 0.5),
+  ``ref_audio`` (data URL or bare base64 of a reference clip, 5-30 s,
+  cloning; an http(s) URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``;
+  paths on the server, clips over 60 s and clips below 8 kHz are refused),
+  ``exaggeration`` (0-2, emotion intensity, default 0.5),
   ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
   ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
   whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;
@@ -748,6 +831,16 @@ Cosmos3 environment requirements
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
+
+Cosmos3 image-to-video conditioning
+-----------------------------------
+
+An image-to-video request's conditioning image is scaled to cover the output
+size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
+NVIDIA's cosmos-framework and diffusers 0.40 and later. Setting
+``conditioning_resize: stretch`` under the config YAML's ``model_kwargs``
+resizes it to the output size instead (antialiased bilinear, aspect ratio not
+kept), as diffusers 0.39 did. Action requests ignore the setting.
 
 Cosmos3-Edge reasoner and action loop
 -------------------------------------
