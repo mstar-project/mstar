@@ -32,10 +32,12 @@ from mstar.model.submodule_base import (
 )
 from mstar.utils.h2d import to_device_nonblocking
 
-# Encoder frames a decode iteration is captured over: 41 s of audio, and
-# Parakeet's 610 s request limit. A step costs the same whatever the length,
-# so one bucket serves every shorter clip, padded; a longer clip runs eager.
-FRAME_BUCKETS = (512, 8192)
+# Encoder frames a decode iteration is captured over: 41 s and 164 s of audio,
+# and Parakeet's 610 s request limit. A step costs the same whatever the length,
+# so one bucket serves every shorter clip, padded; a longer clip runs eager. The
+# middle bucket's captures hold 16 rows, where more than 4 minute-long clips
+# would run eager in the widest.
+FRAME_BUCKETS = (512, 2048, 8192)
 CAPTURE_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
 # rows x frames per capture, which bounds each bucket's static frames buffer
 MAX_BATCH_FRAMES = 64 * 512
