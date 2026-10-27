@@ -47,6 +47,7 @@ from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils import profiler
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.ipc_format import (
     AbortRequest,
     ConductorMessage,
@@ -909,18 +910,16 @@ class PreprocessWorkerThread:
         ``traceback`` False logs one line, for an error already logged where
         it happened.
         """
-        if traceback:
-            logger.error("%s failed for request %s", stage, request_id, exc_info=exc)
-        else:
-            logger.error(
-                "%s failed for request %s: %s: %s", stage, request_id, type(exc).__name__, exc,
-            )
+        text, _ = client_error_text(
+            exc, f"{stage} failed for request {request_id}", log=logger,
+            traceback=traceback,
+        )
         status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
         chunks = [
             ResultChunk(
                 request_id=request_id,
                 modality="error",
-                data=f"{stage} failed: {type(exc).__name__}: {exc}".encode("utf-8"),
+                data=f"{stage} failed: {text}".encode("utf-8"),
                 metadata={"status": status},
             )
             for _ in range(max(count, 1))
