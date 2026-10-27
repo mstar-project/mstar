@@ -8,8 +8,16 @@ sees the request. A multi-stage model's ``<stage>_<knob>`` (``talker_temperature
 follows the rule for ``<knob>``.
 """
 
-import math
 import re
+
+from mstar.engine.resources.sampler.config import (
+    BOOL_KNOBS,
+    INT_KNOB_RULES,
+    REAL_KNOB_RULES,
+    check_bool_knob,
+    check_int_knob,
+    check_real_knob,
+)
 
 
 def check_seed(seed) -> None:
@@ -26,18 +34,18 @@ def check_seed(seed) -> None:
         raise ValueError(f"seed must fit in a signed 64-bit integer, got {seed}.")
 
 
-# knob -> (rule text, predicate) for real-valued knobs
-_REAL_RULES = {
-    "temperature": (">= 0 (0 is greedy)", lambda v: v >= 0),
-    "top_p": ("in (0, 1] (1 is off; greedy is temperature 0)", lambda v: 0 < v <= 1),
-    "min_p": ("in [0, 1] (0 is off)", lambda v: 0 <= v <= 1),
-    "repetition_penalty": ("> 0 (1 is off)", lambda v: v > 0),
-}
+def offset_seed(seed: int, i: int) -> int:
+    """``seed + i`` wrapped to signed int64, as the Rust frontend computes it."""
+    return (seed + i + 2**63) % 2**64 - 2**63
+
+
+# knob -> (rule text, predicate); the sampling ones are the sampler's own
+_REAL_RULES = {**REAL_KNOB_RULES}
 _INT_RULES = {
-    "top_k": (">= 0 (0 is off)", lambda v: v >= 0),
+    **INT_KNOB_RULES,
     "max_output_tokens": (">= 1", lambda v: v >= 1),
 }
-_BOOL_KNOBS = ("ignore_eos", "penalize_prompt", "do_sample")
+_BOOL_KNOBS = (*BOOL_KNOBS, "do_sample")
 
 # other names for max_output_tokens, in precedence order after it
 MAX_OUTPUT_TOKENS_ALIASES = ("max_new_tokens", "max_completion_tokens", "max_tokens")
@@ -90,17 +98,11 @@ def normalize_generation_kwargs(model_kwargs: dict | None) -> dict:
             kwargs[key] = value = _coerce_int(value)
             check_seed(value)
         elif (name := _knob(key, _REAL_RULES)) is not None:
-            rule, ok = _REAL_RULES[name]
             kwargs[key] = value = _coerce_real(value)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{key} must be a number {rule}; got {value!r}")
-            if not math.isfinite(value) or not ok(value):
-                raise ValueError(f"{key} must be a finite number {rule}; got {value!r}")
+            check_real_knob(key, value, *_REAL_RULES[name])
         elif (name := _knob(key, _INT_RULES)) is not None:
-            rule, ok = _INT_RULES[name]
             kwargs[key] = value = _coerce_int(value)
-            if isinstance(value, bool) or not isinstance(value, int) or not ok(value):
-                raise ValueError(f"{key} must be an integer {rule}; got {value!r}")
-        elif _knob(key, _BOOL_KNOBS) is not None and not isinstance(value, bool):
-            raise ValueError(f"{key} must be true or false; got {value!r}")
+            check_int_knob(key, value, *_INT_RULES[name])
+        elif _knob(key, _BOOL_KNOBS) is not None:
+            check_bool_knob(key, value)
     return kwargs

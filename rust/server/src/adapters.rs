@@ -238,8 +238,8 @@ fn size_kwargs(mk: &mut Map<String, Value>, size: Option<&str>) -> Result<(), St
 
 /// The OpenAI-standard sampling fields → a model's `model_kwargs` keys.
 struct Sampling<'a> {
-    temperature: Option<f64>,
-    top_p: Option<f64>,
+    temperature: Option<Value>,
+    top_p: Option<Value>,
     seed: Option<i64>,
     max_tokens: Option<i64>,
     temperature_key: &'a str,
@@ -250,10 +250,10 @@ struct Sampling<'a> {
 
 fn apply_sampling(mk: &mut Map<String, Value>, s: Sampling) {
     if let Some(t) = s.temperature {
-        set_default(mk, s.temperature_key, json_num(t));
+        set_default(mk, s.temperature_key, t);
     }
     if let Some(p) = s.top_p {
-        set_default(mk, s.top_p_key, json_num(p));
+        set_default(mk, s.top_p_key, p);
     }
     if let Some(seed) = s.seed {
         set_default(mk, "seed", Value::from(seed));
@@ -367,8 +367,8 @@ impl Adapter {
                 apply_sampling(
                     &mut mk,
                     Sampling {
-                        temperature: req.temperature,
-                        top_p: req.top_p,
+                        temperature: req.temperature.clone(),
+                        top_p: req.top_p.clone(),
                         seed: req.seed,
                         max_tokens: chat_max_tokens(req),
                         temperature_key: "thinker_temperature",
@@ -405,8 +405,8 @@ impl Adapter {
                 apply_sampling(
                     &mut mk,
                     Sampling {
-                        temperature: req.temperature,
-                        top_p: req.top_p,
+                        temperature: req.temperature.clone(),
+                        top_p: req.top_p.clone(),
                         seed: req.seed,
                         max_tokens: None,
                         temperature_key: "talker_temperature",
@@ -432,8 +432,8 @@ impl Adapter {
                 apply_sampling(
                     &mut mk,
                     Sampling {
-                        temperature: req.temperature,
-                        top_p: req.top_p,
+                        temperature: req.temperature.clone(),
+                        top_p: req.top_p.clone(),
                         seed: req.seed,
                         max_tokens: None,
                         temperature_key: "temperature",
@@ -621,8 +621,8 @@ fn text_chat(
     apply_sampling(
         &mut mk,
         Sampling {
-            temperature: req.temperature,
-            top_p: req.top_p,
+            temperature: req.temperature.clone(),
+            top_p: req.top_p.clone(),
             seed: req.seed,
             max_tokens: chat_max_tokens(req),
             temperature_key: "temperature",
