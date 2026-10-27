@@ -123,6 +123,17 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text
        in 1,600+ languages with no language code. Not autoregressive; batched across
        requests. Apache-2.0.
+   * - ``canary``
+     - ``nvidia/canary-1b-v2``
+     - FastConformer encoder + Transformer decoder: speech recognition in 25 European
+       languages and translation to or from English (``language``, English if unset, and
+       ``target_language`` or ``task="translate"``). Clips up to 40 s; longer uploads are
+       windowed. No timestamps.
+   * - ``canary_qwen``
+     - ``nvidia/canary-qwen-2.5b``
+     - English speech recognition by an LLM: Canary's FastConformer encoder projected into
+       Qwen3-1.7B (LoRA merged at load). Clips up to 40 s; longer uploads are windowed. The
+       OpenAI ``prompt`` is ignored. No timestamps.
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
@@ -214,7 +225,7 @@ Omnilingual ASR notes
 - The CTC head covers every language at once: ``language``, ``prompt`` and ``temperature``
   have no effect (the reference ignores a language code for CTC models too), and
   decoding is a per-frame argmax. There are no timestamps: ``srt`` / ``vtt`` get one cue
-  spanning the file and ``verbose_json`` an empty segment list. Nothing detects the
+  per window and ``verbose_json`` one segment per window, timed to the windows. Nothing detects the
   language either: ``verbose_json``'s ``language`` is the request's ``language`` as given,
   or null. ``/v1/realtime`` is not supported.
 - ``dtype`` defaults to ``bfloat16``, the reference's inference dtype; ``float32`` also
@@ -227,6 +238,31 @@ Omnilingual ASR notes
 - Parity scripts against Meta's pipeline live in ``test/omnilingual_asr/``
   (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
   fairseq2).
+
+FastConformer ASR (``canary``, ``canary_qwen``) notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
+  torchcodec, which needs FFmpeg.
+- One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.
+- Request fields, the same on ``/v1/audio/transcriptions`` and in ``/generate``'s
+  ``model_kwargs``:
+
+  - ``canary``: ``language`` (the speech's, default ``en``; one of bg, hr, cs, da, nl, en,
+    et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk),
+    ``target_language`` (a translation to or from English; the OpenAI route also takes
+    ``task="translate"``) and ``punctuation`` (default on).
+  - ``canary_qwen``: English only (checked on the OpenAI route). ``instruction``
+    replaces the trained one, "Transcribe the following:"; ``/generate``'s text is unused.
+
+- A request holds up to 40.96 s. ``/v1/audio/transcriptions`` cuts longer uploads (up to
+  30 min) into windows at quiet moments and joins their text. Neither model emits
+  timestamps.
+- Their YAMLs size the KV caches for ``max_concurrent_requests`` (64),
+  and startup refuses a cap the caches can't hold.
+- Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
+  smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
+  together.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
