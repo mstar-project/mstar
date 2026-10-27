@@ -58,7 +58,7 @@ class RecurrentAddressing:
     """
 
     slot_indices: torch.Tensor  # [rows] int32, `pad_index` where nothing is addressed
-    has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
+    has_state: torch.Tensor     # [rows] bool, False for a slot with no saved state (fresh, or the sink)
     num_rows: int               # the rows the step declared, a replay's padding rows included
     # The same two on the host, as built: a backend that splits rows between
     # kernels by them must not read the device copies back
@@ -140,26 +140,36 @@ class RecurrentStatePool(Resource):
         """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""
         return self._blocks[name][layer_idx]
 
-    def gather(self, name: str, rows: RecurrentAddressing, layer_idx: int = 0) -> torch.Tensor:
-        """Block ``name`` of these rows' slots, ``[rows, *shape]`` (a copy).
+    def gather(
+        self, name: str, layer_idx: int = 0, *, label: str = "main", start: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Block ``name`` of this step's rows under ``label``, ``[rows, *shape]``
+        (a copy), in the order the step declared them.
 
-        ``rows`` is the step's addressing (``addressing``), so a captured and an
-        eager forward address their slots the same way; padding rows read the
-        sink. A pool without one refuses (``_need_sink``)."""
+        It addresses rows through the step's plan, so a captured and an eager
+        forward read the same slots. A row with no saved state (a request's
+        first step, or a padding row on the sink) reads ``start``, zeros when
+        none is given. A pool without a sink refuses (``_need_sink``)."""
         if self.config.disable_sink_slot:
             self._need_sink("gather")
-        index = rows.slot_indices[: rows.num_rows].long()
-        return self._blocks[name][layer_idx].index_select(0, index)
+        rows = self.addressing(label)
+        out = self._blocks[name][layer_idx].index_select(0, rows.slot_indices[: rows.num_rows].long())
+        fresh = ~rows.has_state[: rows.num_rows].view(-1, *(1,) * (out.dim() - 1))
+        return torch.where(fresh, 0 if start is None else start, out)
 
-    def scatter_(
-        self, name: str, rows: RecurrentAddressing, value: torch.Tensor, layer_idx: int = 0,
-    ) -> None:
-        """Write ``value [rows, *shape]`` into block ``name`` of these rows'
-        slots; padding rows write the sink, which a pool without one refuses."""
+    def scatter_(self, name: str, value: torch.Tensor, layer_idx: int = 0, *, label: str = "main") -> None:
+        """Write ``value [rows, *shape]`` into block ``name`` of this step's rows
+        under ``label``, in the order ``gather`` reads them; padding rows write
+        the sink, which a pool without one refuses."""
         if self.config.disable_sink_slot:
             self._need_sink("scatter_")
-        index = rows.slot_indices[: rows.num_rows].long()
-        self._blocks[name][layer_idx].index_copy_(0, index, value)
+        rows = self.addressing(label)
+        if value.shape[0] != rows.num_rows:
+            raise ValueError(
+                f"recurrent state pool {self._name!r} label {label!r}: {value.shape[0]} rows "
+                f"for a step that declared {rows.num_rows}"
+            )
+        self._blocks[name][layer_idx].index_copy_(0, rows.slot_indices[: rows.num_rows].long(), value)
 
     def _need_sink(self, op: str) -> None:
         # Without a sink, rows with no slot address NO_SLOT, which index_select
