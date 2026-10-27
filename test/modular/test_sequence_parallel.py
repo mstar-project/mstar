@@ -7,9 +7,6 @@ the whole sequence, for the ``[S, H, D]`` and ``[B, S, H, D]`` layouts.
 
 from __future__ import annotations
 
-import os
-import socket
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -22,12 +19,6 @@ from mstar.model.components.distributed.sequence_parallel import sp_seq_split, u
 HEADS = 6
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _group(rank: int, world: int) -> CommGroup:
     group = CommGroup(rank, rank, list(range(world)))
     group.device_group = dist.group.WORLD
@@ -35,13 +26,12 @@ def _group(rank: int, world: int) -> CommGroup:
     return group
 
 
-def _run(fn, world, *args):
-    mp.spawn(_entry, args=(fn, world, _free_port(), args), nprocs=world)
+def _run(fn, world, store_path, *args):
+    mp.spawn(_entry, args=(fn, world, str(store_path), args), nprocs=world)
 
 
-def _entry(rank, fn, world, port, args):
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
-    dist.init_process_group("gloo", rank=rank, world_size=world)
+def _entry(rank, fn, world, store_path, args):
+    dist.init_process_group("gloo", init_method=f"file://{store_path}", rank=rank, world_size=world)
     torch.set_num_threads(1)
     try:
         fn(rank, world, *args)
@@ -78,8 +68,8 @@ def _exchanges(rank, world, total, batched, negative):
 @pytest.mark.parametrize(
     "world,total", [(2, 6), (2, 7), (3, 9), (3, 11)], ids=["2-even", "2-uneven", "3-even", "3-uneven"],
 )
-def test_all_to_all_exchanges(world, total, batched, negative):
-    _run(_exchanges, world, total, batched, negative)
+def test_all_to_all_exchanges(tmp_path, world, total, batched, negative):
+    _run(_exchanges, world, tmp_path / "store", total, batched, negative)
 
 
 def _sdpa(batched):
@@ -105,5 +95,5 @@ def _attention(rank, world, total, batched):
 
 @pytest.mark.parametrize("batched", [False, True], ids=["SHD", "BSHD"])
 @pytest.mark.parametrize("world,total", [(2, 6), (3, 11)], ids=["2-even", "3-uneven"])
-def test_ulysses_attention_matches_one_rank(world, total, batched):
-    _run(_attention, world, total, batched)
+def test_ulysses_attention_matches_one_rank(tmp_path, world, total, batched):
+    _run(_attention, world, tmp_path / "store", total, batched)
