@@ -153,6 +153,14 @@ ATTN = "attn"
 ATTN_GEN = "attn_gen"
 SAMPLER = "sampler"
 
+# Image/video denoise state (initial noise, latents between steps, the guidance
+# combine and the scheduler step) is fp32, as diffusers' pipeline keeps it; only
+# the transformer input is bf16. Windowed rollouts keep their latents in the
+# model dtype.
+LATENT_DTYPE = torch.float32
+# The conditioning encode runs in the VAE checkpoint's dtype, as the reference does.
+ENCODE_DTYPE = torch.bfloat16
+
 # The reasoner's walks and its decode loop.
 REASONER_PREFILL_WALKS = (REASONER_PREFILL_WALK, REASONER_PREFILL_VISION_WALK)
 REASONER_DECODE_LOOP = "reasoner_decode_loop"
@@ -231,6 +239,13 @@ def native_flow_sigmas(num_inference_steps: int, num_train_timesteps: int):
     import numpy as np
 
     return np.linspace(1.0 - 1.0 / num_train_timesteps, 0.0, num_inference_steps + 1)[:-1]
+
+
+def _guided(cond_v: torch.Tensor, uncond_v: torch.Tensor, gs: float, dtype: torch.dtype) -> torch.Tensor:
+    """Classifier-free guidance combine in the loop-state dtype."""
+    cond_v = cond_v.to(dtype)
+    uncond_v = uncond_v.to(dtype)
+    return uncond_v + gs * (cond_v - uncond_v)
 
 
 @dataclass(frozen=True)
@@ -1140,7 +1155,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # seeded windowed request is deterministic end to end.
                 st.add("ar_generator", gen)
             latents = torch.randn(
-                st["latent_shape"], generator=gen, device=device, dtype=self.transformer.proj_in.weight.dtype
+                st["latent_shape"], generator=gen, device=device,
+                dtype=self.transformer.proj_in.weight.dtype if windowed else LATENT_DTYPE,
             )
             cond_latents = st.get("cond_latents")
             if cond_latents is not None:
@@ -1572,10 +1588,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # forward
     # ------------------------------------------------------------------
 
-    # Run in the model's native bf16, NOT the engine autocast: autocast keeps
-    # norms in fp32, perturbing the velocity ~1 ULP/step — harmless for one
-    # image step but amplified geometrically over the multi-step video denoise.
-    # The reference pipeline runs pure bf16; parity requires matching it.
+    # Run the transformer in the model's native bf16, NOT the engine autocast:
+    # autocast keeps norms in fp32, perturbing the velocity ~1 ULP/step, which
+    # the multi-step denoise amplifies. The reference runs the transformer in
+    # pure bf16 and the loop state around it in fp32 (LATENT_DTYPE).
     @torch.autocast(device_type="cuda", enabled=False)
     def _states(self, engine_inputs: ModelInputsFromEngine) -> dict:
         """The batch's per-request states: the engine-injected view when
@@ -1686,7 +1702,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         cfg_active = self._cfg_active(st, step_index)
 
         if not cfg_active:
-            velocity = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL)
+            velocity = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL).to(latents.dtype)
         elif self.batched_cfg:
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents,
@@ -1699,11 +1715,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 CFG_BATCHED_LABEL,
                 attn,
             )
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
         else:
             cond_v = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL)
             uncond_v = self._denoise(attn, st["uncond"], latents, vision_timesteps, UNCOND_LABEL)
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            velocity = _guided(cond_v, uncond_v, st["gs"], latents.dtype)
 
         new_latents = self._scheduler_step(st, velocity, t, latents)
         if st.get("vmask") is not None:
@@ -2014,7 +2030,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, ti, t, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
-            velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
+            velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
             new_latents = self._scheduler_step(st, velocity, t, lat)
             if st.get("vmask") is not None:
                 # Video-to-video: re-inject the clean conditioning frames, as in
@@ -2186,7 +2202,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             capture_batch_sizes = [int(x) for x in bs_env.split(",")]
         else:
             capture_batch_sizes = list(self.gen_capture_batch_sizes)
-        dtype = self.transformer.proj_in.weight.dtype
+        # the static latents buffer holds the fp32 loop state; windowed bf16
+        # latents copy into it exactly
+        dtype = LATENT_DTYPE
         # The 2D (TP x SP) captured denoise graph hits a CUDA illegal access at
         # 480p+ in the combined Ulysses all-gather + TP all-reduce path (pure-TP and
         # pure-SP capture cleanly; only the combination at this scale). For 2D,
@@ -2428,10 +2446,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if request_info.graph_walk not in GEN_WALKS or "cond_v" not in outputs:
             return
         st = self.request_states[request_id]
-        velocity = outputs["uncond_v"][0] + st["gs"] * (
-            outputs["cond_v"][0] - outputs["uncond_v"][0]
-        )
         latents = inputs.tensor_inputs["latents"]
+        velocity = _guided(outputs["cond_v"][0], outputs["uncond_v"][0], st["gs"], latents.dtype)
         time_index = inputs.tensor_inputs["time_index"]
         outputs.clear()
         # step_index is in range here: prepare_inputs vetoes the loop's extra
@@ -2509,10 +2525,10 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
 
     def __init__(self, vae, config):
         super().__init__()
-        # Dedicated fp32 instance (not shared with the decoder node): encode
-        # runs fp32 everywhere (reference behavior; TF32 is the fast conv3d
-        # path pre-9.16 cuDNN) while the decode dtype is cuDNN-gated — sharing
-        # would re-cast the full VAE weights every encode/decode interleave.
+        # Dedicated instance (not shared with the decoder node): the encode
+        # runs in ENCODE_DTYPE while the decode dtype is cuDNN-gated, and
+        # sharing would re-cast the full VAE weights every encode/decode
+        # interleave.
         self.vae = vae
         self.config = config
         self._video_processor = None
@@ -2611,18 +2627,18 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         condition_indexes=None, latent_shape=None, **kwargs,
     ):
         vae = self.vae
-        # The engine may cast the submodule; re-assert the fp32 encode weights.
-        if next(vae.parameters()).dtype != torch.float32:
-            vae.float()
+        # bf16 like the reference pipeline's encode and latent normalization (the
+        # checkpoint is bf16, so the cast is lossless). An fp32 encode moves the
+        # anchor latent enough to move the whole i2v trajectory.
+        if next(vae.parameters()).dtype != ENCODE_DTYPE:
+            vae.to(ENCODE_DTYPE)
         device = vision.device
-        mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=torch.float32, device=device)).view(
+        mean = torch.tensor(vae.config.latents_mean, dtype=ENCODE_DTYPE, device=device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=ENCODE_DTYPE, device=device)).view(
             1, -1, 1, 1, 1
         )
-        # fp32 outside autocast; pipeline-side latent normalization; the DiT
-        # consumes the latents in its bf16 checkpoint dtype.
         with torch.autocast(device_type=device.type, enabled=False):
-            raw_mu = vae.encode(vision).latent_dist.mode()
+            raw_mu = vae.encode(vision.to(ENCODE_DTYPE)).latent_dist.mode()
         latents = ((raw_mu - mean) * inv_std).to(torch.bfloat16)
         if condition_indexes:
             full = torch.zeros(latent_shape, device=device, dtype=latents.dtype)
@@ -2770,7 +2786,8 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # only the uint8 frames cross the SHM edge to the data worker, not a 4x
         # larger fp32 tensor — the decoded video transfer dominates the fixed cost
         # at higher resolutions. Contiguous whatever layout the decoder ended in.
-        return (decoded / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8).contiguous()
+        # fp32 and rounded like diffusers' postprocess (bf16 math and truncation cost ~1 LSB)
+        return (decoded.float() / 2 + 0.5).clamp(0, 1).mul(255).round().to(torch.uint8).contiguous()
 
     def _decode_pixels(self, latents: torch.Tensor) -> torch.Tensor:
         """Latents -> uint8 pixel frames ``[1, 3, T, H, W]``."""
