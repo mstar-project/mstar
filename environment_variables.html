@@ -869,7 +869,14 @@ the conductor sets <code class="docutils literal notranslate"><span class="pre">
 sockets listen on loopback only. A value you set, or a set
 <code class="docutils literal notranslate"><span class="pre">NCCL_SOCKET_FAMILY</span></code>, is kept as is.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">NCCL_GRAPH_REGISTER</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>NCCL’s own variable. On, NCCL registers the buffers a CUDA graph
+captures, which succeeds on <code class="docutils literal notranslate"><span class="pre">expandable_segments</span></code> memory, and
+Cosmos3 SP4 with batched captures then gave wrong images (#897).
+Workers on CUDA set <code class="docutils literal notranslate"><span class="pre">0</span></code> unless you set it.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">lo</span></code></p></td>
 <td><p>PyTorch’s variable for the Gloo groups next to each TP/SP group.
 Same rule: the conductor sets <code class="docutils literal notranslate"><span class="pre">lo</span></code> for its workers unless you set
