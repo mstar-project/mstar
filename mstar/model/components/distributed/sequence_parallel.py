@@ -14,10 +14,12 @@ is unchanged — while every pointwise op (norms, MLP, residuals) runs on the
 These helpers take an ``sp_group`` (a :class:`CommGroup` over the SP axis of the
 mesh; trivial when ``sp_size == 1``) and are model-independent: any attention that
 projects to ``[tokens, heads, head_dim]`` and calls a ``run_attention(q, k, v)``
-can use :func:`ulysses_attention`. ``seq_sizes`` is the per-rank token count along
-the sequence (need not be equal — sequences indivisible by ``sp`` are handled
-without padding); the scatter/gather of the residual stream at the model boundary
-uses the same split.
+can use :func:`ulysses_attention`, which takes ``seq_dim`` / ``head_dim`` for other
+layouts such as ``[batch, tokens, heads, head_dim]``; :func:`sp_head_slice` and
+:func:`sp_head_gather` assume ``[tokens, heads, head_dim]``. ``seq_sizes`` is the
+per-rank token count along the sequence (need not be equal — sequences indivisible
+by ``sp`` are handled without padding); the scatter/gather of the residual stream
+at the model boundary uses the same split.
 """
 from __future__ import annotations
 
