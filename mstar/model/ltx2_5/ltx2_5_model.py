@@ -619,6 +619,7 @@ class LTX25Model(Model):
                 (vae.latents_mean, vae.latents_std, float(vae_cfg["scaling_factor"])),
                 (audio_vae.latents_mean, audio_vae.latents_std),
                 self.config,
+                max_batch_size=self.max_batch_size,
             )
             del vae, audio_vae
             return submodule.to(device)
