@@ -218,7 +218,7 @@ def _conductor(default=64):
 
 @pytest.mark.parametrize("bad", ["100", 0, -5, 1.5, True])
 def test_conductor_refuses_a_cap_the_run_loop_cannot_compare(bad):
-    """A string or null cap used to raise inside the run loop and hang the request."""
+    """A cap the run loop cannot compare is refused at admission; in the loop it would raise and hang."""
     with pytest.raises(ValueError, match="max_output_tokens"):
         _conductor()._max_output_tokens({"max_output_tokens": bad})
 
