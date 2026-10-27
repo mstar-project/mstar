@@ -604,7 +604,7 @@ class LTX25Model(Model):
                 compile_decode=self.vae_compile and bool(warm), warmup_shapes=warm,
             )
         if node_name == UPSAMPLER_NODE:
-            from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video
+            from diffusers import AutoencoderKLLTX2Video
             from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
 
             upsampler = LTX2LatentUpsamplerModel.from_pretrained(
@@ -612,16 +612,13 @@ class LTX25Model(Model):
             )
             # the latent statistics only; the VAEs themselves live on the decoder nodes
             vae_cfg = AutoencoderKLLTX2Video.load_config(str(snapshot / "vae"))
-            vae = AutoencoderKLLTX2Video.from_pretrained(str(snapshot / "vae"), torch_dtype=torch.float32)
-            audio_vae = AutoencoderKLLTX2Audio.from_pretrained(str(snapshot / "audio_vae"), torch_dtype=torch.float32)
             submodule = LTXLatentUpsamplerSubmodule(
                 upsampler.eval(),
-                (vae.latents_mean, vae.latents_std, float(vae_cfg["scaling_factor"])),
-                (audio_vae.latents_mean, audio_vae.latents_std),
+                (*weight_loader.latent_stats(snapshot / "vae"), float(vae_cfg["scaling_factor"])),
+                weight_loader.latent_stats(snapshot / "audio_vae"),
                 self.config,
                 max_batch_size=self.max_batch_size,
             )
-            del vae, audio_vae
             return submodule.to(device)
         if node_name == AUDIO_DECODER_NODE:
             from diffusers import AutoencoderKLLTX2Audio
