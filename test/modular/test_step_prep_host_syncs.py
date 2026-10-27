@@ -206,7 +206,8 @@ def test_omnivoice_postprocess_reads_no_tensor():
             ("counter", _fwd("r", "speech_gen", _omnivoice_meta(steps), UNMASK_LOOP_NAME, k)),
             ("edge", _fwd("r", "speech_gen", _omnivoice_meta(steps))),
         ):
-            outputs = {"c_logits": [logits.clone()], "u_logits": [logits.flip(-1)]}
+            # scoring ran batched in forward_batched; postprocess gets its per-cell result
+            outputs = {"pred_tokens": [logits.argmax(-1)], "scores": [logits.max(-1).values]}
             with _HostReads() as reads:
                 sub.postprocess("r", info, outputs, inputs=node_inputs)
             results[name] = (outputs, reads.reads)
@@ -214,6 +215,20 @@ def test_omnivoice_postprocess_reads_no_tensor():
         assert results["edge"][1], "the edge path should read the step on the host"
         assert torch.equal(results["counter"][0]["audio_tokens"][0], results["edge"][0]["audio_tokens"][0])
         assert torch.equal(results["counter"][0]["step_index"][0], results["edge"][0]["step_index"][0])
+
+
+def test_omnivoice_preprocess_reads_no_tensor():
+    """The batched preprocess takes each item's iteration (the sampler's seed
+    offset) from the loop counter too, not from the step edge."""
+    sub, cfg = _omnivoice()
+    steps, k = 4, 2
+    info = _fwd("r", "speech_gen", _omnivoice_meta(steps), UNMASK_LOOP_NAME, k)
+    node_inputs = sub.prepare_inputs("speech_gen", info, _omnivoice_inputs(cfg, k))
+    engine_inputs = SimpleNamespace(request_ids=["r"], per_request_info={"r": info})
+    with _HostReads() as reads:
+        out = sub.preprocess("speech_gen", engine_inputs, [node_inputs])
+    assert reads.reads == []
+    assert out["items"][0].iteration == k
 
 
 # ---------------------------------------------------------------- Cosmos3

@@ -565,6 +565,16 @@ The spec types are:
        ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
        ``enable_top_p_first`` are capabilities of the same kind. See
        ``SamplingReqConfig`` above.
+   * - ``DiffusionSamplerSpec(vocab_size=..., num_rows=..., forbidden_class=...)``
+     - A sampler for discrete (masked) diffusion. ``sample(request_ids, c_logits,
+       u_logits, seq_lens, iterations)`` scores every position of a packed
+       ``[rows, positions, vocab]`` tensor and returns ``(tokens, logprobs)``, with the
+       max log-probability per position for a confidence-ranked reveal. Which positions to
+       reveal stays in the model. Per request, ``DiffusionSamplingReqConfig`` carries
+       ``guidance_scale`` (classifier-free guidance, 0 is off and the caller may pass
+       ``u_logits=None``), ``temperature`` (0 is greedy) and ``top_ratio`` (the vocabulary
+       fraction kept before the Gumbel draw). The draw is seeded per request from the
+       conductor seed and the iteration. OmniVoice uses it.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
