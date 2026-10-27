@@ -150,10 +150,51 @@ def test_audio_placeholders_line_up_for_any_clips(model, seconds):
 
 
 @needs_ckpt
+def test_spoken_reply_system_prompt_with_and_without_the_voice_clip(model):
+    """By default a spoken reply's system message carries the voice clip (upstream's
+    audio_assistant prompt); with ``voice_prompt=False`` it is the request's text system
+    prompt. Both use the speech template, which ends the prompt on <|tts_bos|>."""
+    from mstar.model.multimodal import PromptPart
+
+    tts_bos = model.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
+    parts = [PromptPart("text", "Say hello.")]
+    voiced = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts).new_input_tensors
+    assert voiced["audio_positions"][0].numel() > 0
+    assert voiced["text_inputs"][0][-1].item() == tts_bos
+    plain = model.process_prompt(
+        None, ["text"], ["text", "audio"], prompt_parts=parts,
+        voice_prompt=False, system_prompt="You are a helpful assistant.",
+    ).new_input_tensors
+    assert "audio_positions" not in plain
+    assert plain["text_inputs"][0][-1].item() == tts_bos
+    assert "You are a helpful assistant." in model.tokenizer.decode(plain["text_inputs"][0])
+    with pytest.raises(ValueError, match="unknown MiniCPM-o voice"):
+        model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, voice_prompt=False, voice="nope")
+
+
+@needs_ckpt
+def test_spoken_reply_text_fits_the_tts(model):
+    """The TTS speaks the whole reply within its positions: a spoken reply's text
+    budget defaults under that, and asking for more is refused (a 400)."""
+    from mstar.model.multimodal import PromptPart
+
+    parts = [PromptPart("text", "Say hello.")]
+    limit = model.speech_max_text_tokens
+    assert limit + 2 + 2047 == model.tts_config.max_position_embeddings
+    out = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts)
+    assert out.metadata["max_output_tokens"] == min(2048, limit)
+    assert "max_output_tokens" not in model.process_prompt(
+        None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit).metadata
+    with pytest.raises(ValueError, match="spoken reply"):
+        model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit + 1)
+    # text replies are not capped
+    assert "max_output_tokens" not in model.process_prompt(
+        None, ["text"], ["text"], prompt_parts=parts, max_output_tokens=8192).metadata
 def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
     """The LLM's layout: one span over every prompt row (placeholders included),
     written by the prefill walk the request takes, then a row per decode step."""
-    from mstar.model.minicpm_o.config import DECODE_LOOP, LLM_KV
+    from mstar.model.base import LabelLayout
+    from mstar.model.minicpm_o.config import DECODE_LOOP, LLM_KV, TTS_KV
     from mstar.model.multimodal import PromptPart
 
     out = model.process_prompt(
@@ -166,7 +207,14 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
     assert (span.walk, span.length, span.advance) == ("prefill_image", rows, rows)
     assert out.metadata["kv_layout"][LLM_KV]["main"].growth == ((DECODE_LOOP, 1),)
     assert model.get_loop_caps(max_output_tokens=7) == {DECODE_LOOP: 7}
-    assert set(model.kv_labels()) == {LLM_KV}
+    assert set(model.kv_labels()) == {LLM_KV, TTS_KV}
+    # a text reply opens the TTS's pool with nothing in it; a spoken one prefills its
+    # condition (two rows and a row per LLM step) and then writes a row per code
+    assert out.metadata["kv_layout"][TTS_KV]["main"] == LabelLayout()
+    spoken = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=[PromptPart("text", "Hi.")])
+    tts = spoken.metadata["kv_layout"][TTS_KV]["main"]
+    assert [(s.walk, s.length) for s in tts.spans] == [("tts_prefill", 2)]
+    assert tts.growth == ((DECODE_LOOP, 1), ("tts_decode_loop", 1))
 
 
 @needs_ckpt
@@ -208,4 +256,6 @@ def test_every_node_gets_only_its_resources(model):
         "LLM": {"llm_kv", "llm_attn", "llm_pos", "llm_sampler"},
         "vision_encoder": {"vision_attn", "resampler_attn"},
         "audio_encoder": {"audio_attn"},
+        "TTS": {"tts_kv", "tts_attn", "tts_pos", "tts_sampler"},
+        "Token2Wav": {"t2w_state", "t2w_enc1_kv", "t2w_enc2_kv", "t2w_dit_kv"},
     }

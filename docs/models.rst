@@ -76,8 +76,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Qwen3.8-27B on the Qwen3.5 code above (same architecture); ships a TP4 config.
    * - ``minicpm_o`` *(Beta)*
      - ``openbmb/MiniCPM-o-4_5``
-     - Omni-modal chat (text/image/audio in, text out): Qwen3-8B over a navit SigLIP +
-       resampler and a Whisper-medium encoder. Half-duplex only.
+     - Omni-modal chat (text/image/audio in, text and speech out): Qwen3-8B over a navit
+       SigLIP + resampler and a Whisper-medium encoder; a Llama TTS and a streaming
+       flow-matching vocoder for speech. Half-duplex only.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -349,6 +350,22 @@ refused and the MTP head is skipped. The chat template's new
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends.
 
+MiniCPM-o 4.5 (``minicpm_o``)
+------------------------------
+
+Text, image and audio in; text, or text and 24 kHz speech, out, as upstream's half-duplex
+``chat()``: the LLM (Qwen3-8B) writes the reply, a TTS reads it into speech codes, and a
+streaming flow-matching vocoder (Step-Audio2's token2wav) turns them into audio. Ask for
+speech with ``output_modalities`` including ``"audio"``; the bundled ``default`` voice is the
+only one. ``voice_prompt: false`` in the request's kwargs uses the request's
+``system_prompt`` instead of upstream's voice-clip system message, as vllm-omni does.
+``streaming_generate``, video input and full duplex are not supported.
+
+``configs/minicpm_o.yaml`` runs three workers on one GPU (LLM and encoders, TTS, vocoder);
+it sets ``mps: true``, so their kernels overlap (see *Several workers on one GPU* in :doc:`serving`). Each spoken
+reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks, so their
+``max_slots`` cap concurrent spoken replies. The ``minicpm_o`` extra installs ``onnx``, used
+only to read the voice encoders' weights.
 Command A+ (``command_a_plus``)
 -------------------------------
 

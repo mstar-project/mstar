@@ -1679,8 +1679,10 @@ class PiecewiseAcceleratorGraphRunner:
         self._node_name = node_name
         self._prepared_shapes: list | None = None
 
+        # [] captures nothing: an eager-only region, which ``run`` still drives
+        # through its step
         self._capture_batch_sizes = sorted(
-            config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+            self.CAPTURE_BATCH_SIZES if config.capture_batch_sizes is None else config.capture_batch_sizes
         )
 
         self._graphs: dict[PiecewiseGraphKey, PiecewiseGraphData] = {}
@@ -1730,6 +1732,10 @@ class PiecewiseAcceleratorGraphRunner:
     @property
     def any_graphs(self) -> bool:
         return bool(self._graphs)
+
+    @property
+    def eager_fallback(self) -> bool:
+        return self._config.eager_fallback
 
     def _dummy_key(self, shape: PiecewiseCaptureShape, slot: int) -> str:
         """Padding rows are per slot, as in ``CudaGraphRunner``: a slot's plan
@@ -2100,6 +2106,44 @@ class PiecewiseAcceleratorGraphRunner:
             )
         self._step_runner.plan(step)
 
+    def _run_eager(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        request_ids: list[int] | None,
+        seq_lens: list[int] | None,
+        real_bs: int,
+        real_total_tokens: int | None,
+    ) -> PiecewiseOutput:
+        """The region's callable run eagerly, through the same step lifecycle as a
+        replay, so its resources hold a plan for exactly these rows."""
+        step = None
+        if request_ids is not None and self._config.declare_step is not None:
+            step = self._config.declare_step(
+                list(request_ids), list(seq_lens) if seq_lens is not None else [self._config.seq_len] * real_bs,
+            )
+            if step is not None:
+                step.set_ctx(StepContext(
+                    request_ids=tuple(request_ids), graph_walk=PIECEWISE_WALK,
+                    slot=self._current_slot, capture=False,
+                ))
+                outcome = self._step_runner.admit(step)
+                if not outcome.ok:
+                    raise RuntimeError(f"piecewise {self._label!r} eager admit failed: {outcome.reason}")
+                self._step_runner.plan(step)
+        ids = list(request_ids) if request_ids is not None else []
+        out = self._normalize_output(self._config.capture_fn(PiecewiseCallInputs(
+            static_inputs=static_inputs,
+            engine_inputs=ModelInputsFromEngine(
+                request_ids=ids, per_request_info=dummy_metadata(ids, PIECEWISE_WALK),
+                resources=dict(self._resources),
+            ),
+            kwargs=self._config.forward_kwargs,
+        )))
+        if step is not None:
+            self._step_runner.commit(step)
+        is_packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
+        return PiecewiseOutput(out, real_total_tokens if is_packed else real_bs)
+
     @staticmethod
     def _normalize_output(out) -> dict[str, torch.Tensor]:
         """Coerce the captured callable's return into ``{name: Tensor}``.
@@ -2192,6 +2236,11 @@ class PiecewiseAcceleratorGraphRunner:
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
         is baked into the graph.
+
+        With no captured graph for the shape and ``config.eager_fallback``, the
+        region runs eagerly on ``static_inputs`` as given, its step declared,
+        planned and committed over the real rows alone: the caller's path is the
+        same either way.
         """
         if real_bs is None:
             if request_ids is not None:
@@ -2208,10 +2257,12 @@ class PiecewiseAcceleratorGraphRunner:
         real_total_tokens = sum(seq_lens) if seq_lens is not None else None
         data = self._resolve(real_bs, real_total_tokens if is_packed else None)
         if data is None:
-            raise RuntimeError(
-                f"piecewise {self._label!r}: no captured graph for bs={real_bs}, "
-                f"total_tokens={real_total_tokens}"
-            )
+            if not self._config.eager_fallback:
+                raise RuntimeError(
+                    f"piecewise {self._label!r}: no captured graph for bs={real_bs}, "
+                    f"total_tokens={real_total_tokens}"
+                )
+            return self._run_eager(static_inputs, request_ids, seq_lens, real_bs, real_total_tokens)
 
         for name, value in static_inputs.items():
             buffer = data.static_inputs.get(name)

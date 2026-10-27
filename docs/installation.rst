@@ -135,6 +135,11 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[minicpm_o]``
+     - MiniCPM-o 4.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``soundfile``, ``torchaudio`` / ``torchcodec``, ``Pillow``, ``huggingface-hub``,
+       and ``onnx``, which only reads the voice-prompt models' weights out of the
+       checkpoint's ``.onnx`` files.
    * - ``.[fish_s2_pro]``
      - Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.

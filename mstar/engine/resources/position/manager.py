@@ -26,7 +26,7 @@ from mstar.engine.resources.position.config import (
 from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
-from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
+from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, AdmitRuntimeError, StepContext
 
 
 @dataclass
@@ -137,6 +137,23 @@ class RopeManager(PositionManager):
             ).float()
             self._rope_table_key = (rotary_dim, config.rope_scale, config.rope_theta)
 
+        if config.fused:
+            if (config.llama31_params or config.interleave or config.rope_dtype not in (None, torch.float32)
+                    or config.rope_table_dtype is not None):
+                raise NotImplementedError(
+                    "PositionConfig.fused supports standard non-interleaved float32 RoPE only"
+                )
+            rotary_dim = config.rotary_dim or head_dim
+            if rotary_dim is None:
+                raise ValueError(
+                    "fused RoPE needs PositionConfig.rotary_dim or the "
+                    "dependent KV cache's head_dim"
+                )
+            self._fused_rotary_dim = rotary_dim
+            self._fused_cache = self._build_rope_cache(
+                rotary_dim, config.rope_scale, config.rope_theta, torch.float32,
+            )
+
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
 
@@ -198,6 +215,18 @@ class RopeManager(PositionManager):
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
+
+    def admit(self, step: PositionStep, ctx: StepContext) -> AdmitOutcome:
+        if self._config.fused and step.pos_ids is None and not ctx.capture:
+            # the fused path indexes its table on the device, unchecked
+            for segment in step.segments or ():
+                if ctx.is_padding_row(segment.request_id):
+                    continue
+                end = self._counters.get(segment.request_id, {}).get(segment.label, 0) + segment.span
+                if end > self._max_seq_len:
+                    return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
+                        f"{segment.request_id!r} reaches position {end}; RoPE covers {self._max_seq_len}"))
+        return ADMIT_OK
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
@@ -526,6 +555,40 @@ class RopeManager(PositionManager):
         freqs = torch.outer(positions, inv_freq)
         return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype)
 
+    def _check_fused_args(self, rotary_dim, interleave, rope_scale, rope_theta, rope_dtype, kwargs) -> None:
+        """The fused table is built once from the config, so a call can't change it."""
+        config = self._config
+        given = {
+            "rotary_dim": (rotary_dim, self._fused_rotary_dim),
+            "interleave": (interleave, config.interleave),
+            "rope_scale": (rope_scale, config.rope_scale),
+            "rope_theta": (rope_theta, config.rope_theta),
+            "rope_dtype": (rope_dtype, torch.float32),
+        }
+        differ = sorted(key for key, (value, built) in given.items() if value is not None and value != built)
+        # Llama 3.1's factors change nothing at scale 1, which the shared layers pass by default
+        llama31 = [k for k in ("low_freq_factor", "high_freq_factor", "old_context_len") if kwargs.get(k) is not None]
+        if llama31 and (rope_scale if rope_scale is not None else config.rope_scale) != 1:
+            differ += llama31
+        if differ:
+            raise ValueError(f"fused RoPE is built from the PositionConfig; this call overrides {differ}")
+
+    def _apply_qk_fused(
+        self, q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Non-interleaved RoPE in float32 over the cached table, returned in the
+        inputs' dtype (as FlashInfer's kernel computes and stores it)."""
+        half = self._fused_rotary_dim // 2
+        cos, sin = self._fused_cache.index_select(0, pos_ids.long()).unsqueeze(1).split(half, dim=-1)
+
+        def rotate(x: torch.Tensor) -> torch.Tensor:
+            xf = x.float()
+            x1, x2 = xf[..., :half], xf[..., half:2 * half]
+            out = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin, xf[..., 2 * half:]], dim=-1)
+            return out.to(x.dtype)
+
+        return rotate(q), rotate(k)
+
     def apply_qk(
         self,
         q: torch.Tensor,
@@ -540,6 +603,9 @@ class RopeManager(PositionManager):
     ):
         pos_ids = self._current_pos_ids[label]
         config = self._config
+        if config.fused and q.device.type == "cuda":
+            self._check_fused_args(rotary_dim, interleave, rope_scale, rope_theta, rope_dtype, kwargs)
+            return self._apply_qk_fused(q, k, pos_ids[:q.shape[0]])
 
         orig_dtype = q.dtype
         rope_dtype = rope_dtype if rope_dtype is not None else config.rope_dtype

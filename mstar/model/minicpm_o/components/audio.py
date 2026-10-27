@@ -90,14 +90,22 @@ class MiniCPMOAudio(nn.Module):
         for layer in self.apm.layers:
             layer.self_attn.qkv_proj.bias.data.zero_()
 
+    def encode(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The transformer stack and projector over packed frames: shape-only in
+        the frame count, so a submodule can capture it."""
+        return self.audio_projection_layer(self.apm.encode(hidden_states))
+
+    def pool(self, hidden: torch.Tensor, frames_per_piece: list[int]) -> torch.Tensor:
+        """5x average pool within each piece; ``AvgPool1d`` drops each tail."""
+        pooled = []
+        for piece in hidden.split(frames_per_piece):
+            pooled.append(F.avg_pool1d(piece.transpose(0, 1)[None], self.config.pool_step)[0].transpose(0, 1))
+        return torch.cat(pooled)
+
     def forward(self, features: list[torch.Tensor], frames_per_piece: list[int]) -> torch.Tensor:
         """Mel pieces -> ``[total_tokens, output_dim]``, pieces end to end.
 
         ``frames_per_piece`` is each piece's post-conv frame count, known on
         the host; the pooled token count per piece follows from it.
         """
-        hidden = self.audio_projection_layer(self.apm.encode(self.apm.frontend(features)))
-        pooled = []
-        for piece in hidden.split(frames_per_piece):
-            pooled.append(F.avg_pool1d(piece.transpose(0, 1)[None], self.config.pool_step)[0].transpose(0, 1))
-        return torch.cat(pooled)
+        return self.pool(self.encode(self.apm.frontend(features)), frames_per_piece)

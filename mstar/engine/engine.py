@@ -703,7 +703,8 @@ class Engine:
                         pw_runner.warmup_and_capture(
                             None if planned is None else {bucket for region, bucket in planned if region == label}
                         )
-                    if pw_runner.any_graphs:
+                    # an eager-fallback region serves calls without graphs, so it is kept
+                    if pw_runner.any_graphs or pw_runner.eager_fallback:
                         captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
         if plan is not None:
