@@ -2734,6 +2734,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         self, request_id: Rid, graph_edges: list[GraphEdge],
         graph_walk: str | None = None
     ):
+        if not any(e.tensor_info for e in graph_edges):
+            return []  # signal-only edges: no stream context to pay for
         # Run H2D copies on a dedicated stream so they overlap with the
         # consumer's in-flight default-stream work. We make default wait
         # for the H2D stream at the end so downstream kernels see the data.
