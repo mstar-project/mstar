@@ -297,6 +297,17 @@ def test_a_prompt_with_a_video_keys_only_its_leading_text(model):
         "a prompt with a video keyed other than its leading text"
     )
 
+
+def test_a_request_that_asks_for_audio_turns_the_prefix_cache_off(model):
+    cache = {
+        tuple(out): model.process_prompt(["Say hi."], ["text"], out, tensors={}).metadata.get("prefix_cache")
+        for out in (["text"], ["text", "audio"])
+    }
+
+    assert cache == {("text",): None, ("text", "audio"): False}, (
+        "a hit would skip the Thinker rows the Talker reads, or a text reply lost the cache"
+    )
+
 def _audio(attn_implementation: str = "sdpa") -> AudioEncoderSubmodule:
     # The tensors `prepare_inputs` builds depend only on the clip's length and the encoder's
     # windows, so a small encoder is enough.

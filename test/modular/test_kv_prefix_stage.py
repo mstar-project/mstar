@@ -60,7 +60,10 @@ class _Answering(Resource):
 class _Submodule:
     """Cuts the way a real AR submodule does, without being a torch module."""
 
-    split_inputs = ARNodeSubmodule.split_inputs
+    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
+        return ARNodeSubmodule.split_inputs(
+            self, graph_walk, fwd_info, inputs, start, end,
+        )
 
     @staticmethod
     def declare_step(inputs: NodeInputs) -> int:
@@ -178,6 +181,24 @@ def test_a_walk_carrying_anything_opaque_never_probes(opaque):
     assert resource.resolved == 0, (
         f"a walk carrying {sorted(opaque)} was probed and would have been cut "
         "to a length only one of its labels agreed to"
+    )
+
+
+class _Overriding(_Submodule):
+    """Overrides `split_inputs` without cutting its ``tensor_inputs``."""
+
+    def split_inputs(self, graph_walk, fwd_info, inputs, start, end):
+        return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+
+
+def test_overriding_split_inputs_alone_never_probes_a_walk_carrying_tensor_inputs():
+    resource = _Answering(96)
+    engine = _engine({"kv": resource}, {NODE: ["kv"]})
+    engine._submodules[NODE].submodule = _Overriding()
+    inputs = _inputs(tensor_inputs={"extra": torch.zeros(PROMPT)})
+
+    assert _stage(engine, inputs) is inputs and resource.resolved == 0, (
+        "a submodule that never set cuts_tensor_inputs was probed, and its cut raises mid-step"
     )
 
 
