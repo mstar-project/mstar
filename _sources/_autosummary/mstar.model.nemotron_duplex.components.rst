@@ -29,6 +29,7 @@ mstar.model.nemotron\_duplex.components
 
    audio_codec
    conformer
+   dft
    eartts_talker
    nemotron_h
    rnnt

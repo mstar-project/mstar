@@ -942,7 +942,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.communication.communicator</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">fcntl</span>
+<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">collections</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">fcntl</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
@@ -959,7 +960,7 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">#: ``rust/`` crate's version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching</span>
 <span class="c1">#: install - e.g. a stale wheel after an upgrade - takes over the mesh</span>
 <span class="c1">#: silently, so the factory warns when the imported version differs.</span>
-<span class="n">EXPECTED_MSTAR_RUST_VERSION</span> <span class="o">=</span> <span class="s2">"0.1.0"</span>
+<span class="n">EXPECTED_MSTAR_RUST_VERSION</span> <span class="o">=</span> <span class="s2">"0.1.1"</span>
 
 
 <span class="c1">#: The entity whose endpoint stands for the whole deployment: the one every</span>
@@ -990,6 +991,16 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        entity_id: worker_xyz, conductor, or api_server</span>
 <span class="sd">        """</span>
         <span class="k">pass</span></div>
+
+
+<div class="viewcode-block" id="BaseCommunicator.try_send_bytes">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator.try_send_bytes">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">try_send_bytes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Send a message already encoded with ``self.codec`` without</span>
+<span class="sd">        blocking: False, with nothing sent, when the peer is at its high-water</span>
+<span class="sd">        mark. A loop that must keep reading its own input while a peer is slow</span>
+<span class="sd">        sends with this and retries later (see ``OutboxCommunicator``)."""</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> has no non-blocking send"</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="BaseCommunicator.get_all_new_messages">
@@ -1156,13 +1167,26 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">"</span><span class="si">%s</span><span class="s2"> to send a message </span><span class="si">%s</span><span class="s2"> to entity </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span><span class="p">,</span> <span class="n">msg</span><span class="p">,</span> <span class="n">entity_id</span>
         <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_push_socket</span><span class="p">(</span><span class="n">entity_id</span><span class="p">)</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">msg</span><span class="p">))</span></div>
+
+
+<div class="viewcode-block" id="ZMQCommunicator.try_send_bytes">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.try_send_bytes">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">try_send_bytes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_push_socket</span><span class="p">(</span><span class="n">entity_id</span><span class="p">)</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">flags</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">NOBLOCK</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Again</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">return</span> <span class="kc">True</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_push_socket</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">entity_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">:</span>
             <span class="n">sock</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">PUSH</span><span class="p">)</span>
             <span class="n">sock</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_endpoint</span><span class="p">(</span><span class="n">entity_id</span><span class="p">))</span>
             <span class="n">sock</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">LINGER</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="n">entity_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">sock</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="n">entity_id</span><span class="p">]</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">msg</span><span class="p">))</span></div>
-
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="n">entity_id</span><span class="p">]</span>
 
 <div class="viewcode-block" id="ZMQCommunicator.get_all_new_messages">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.get_all_new_messages">[docs]</a>
@@ -1212,7 +1236,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="make_communicator">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.make_communicator">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">make_communicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseCommunicator</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">make_communicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="n">nonblocking_send</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseCommunicator</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Construct the process's communicator, selecting the transport.</span>
 
 <span class="sd">    ``MSTAR_RUST_ZMQ`` selects it (see ``docs/environment_variables.rst``):</span>
@@ -1226,6 +1250,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    The two are wire-compatible (same endpoints, same codec), so the</span>
 <span class="sd">    flag can be set per-process — one entity at a time — while the rest of</span>
 <span class="sd">    the mesh stays on pyzmq.</span>
+
+<span class="sd">    ``nonblocking_send`` is for a communicator ``OutboxCommunicator`` wraps,</span>
+<span class="sd">    which needs ``try_send_bytes``: an extension built before</span>
+<span class="sd">    ``ZmqCommunicator.try_send`` falls back to pyzmq under ``AUTO`` and</span>
+<span class="sd">    raises under ``1``. Every other caller keeps such a build.</span>
 <span class="sd">    """</span>
     <span class="n">choice</span> <span class="o">=</span> <span class="n">requested_transport</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">choice</span> <span class="o">!=</span> <span class="s2">"0"</span><span class="p">:</span>
@@ -1251,9 +1280,71 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"expected </span><span class="si">%s</span><span class="s2"> — a stale wheel may be shadowing the "</span>
                     <span class="s2">"vendored rust/ build (rebuild with `maturin develop "</span>
                     <span class="s2">"--release`)"</span><span class="p">,</span> <span class="n">version</span><span class="p">,</span> <span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="p">)</span>
-            <span class="k">return</span> <span class="n">RustZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">nonblocking_send</span> <span class="ow">or</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mstar_rust</span><span class="o">.</span><span class="n">ZmqCommunicator</span><span class="p">,</span> <span class="s2">"try_send"</span><span class="p">):</span>
+                <span class="k">return</span> <span class="n">RustZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+            <span class="c1"># built before try_send: every send the outbox makes would fail.</span>
+            <span class="c1"># Only this process's outbox falls back; pyzmq shares the wire.</span>
+            <span class="n">stale</span> <span class="o">=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"mstar_rust </span><span class="si">{</span><span class="n">version</span><span class="si">}</span><span class="s2"> predates ZmqCommunicator.try_send; "</span>
+                     <span class="s2">"rebuild it with `maturin develop --release` in rust/"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">choice</span> <span class="o">==</span> <span class="s2">"1"</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="n">stale</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"</span><span class="si">%s</span><span class="s2">. Using pyzmq for this non-blocking sender meanwhile"</span><span class="p">,</span> <span class="n">stale</span><span class="p">)</span>
     <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"control mesh transport: pyzmq (MSTAR_RUST_ZMQ=</span><span class="si">%s</span><span class="s2">)"</span><span class="p">,</span> <span class="n">choice</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">ZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="OutboxCommunicator">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.OutboxCommunicator">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">OutboxCommunicator</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A communicator whose sends never block: a send the peer can't take now</span>
+<span class="sd">    (at its high-water mark) is queued, in order behind any earlier one to the</span>
+<span class="sd">    same peer, and retried by ``flush``.</span>
+
+<span class="sd">    For a loop that peers block on while it sends to them (the API server's</span>
+<span class="sd">    preprocess thread, against the conductor and the workers): if it blocked on</span>
+<span class="sd">    a full peer it would stop reading the input that peer waits to deliver, and</span>
+<span class="sd">    the two would wait on each other for good. Everything else is the wrapped</span>
+<span class="sd">    communicator's.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">inner</span><span class="p">:</span> <span class="n">BaseCommunicator</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_inner</span> <span class="o">=</span> <span class="n">inner</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_outbox</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">collections</span><span class="o">.</span><span class="n">deque</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+
+<div class="viewcode-block" id="OutboxCommunicator.send">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.OutboxCommunicator.send">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">send</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">msg</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># Encoded here, queued or not: a message the codec refuses fails its</span>
+        <span class="c1"># sender now, as a blocking send would, rather than at the head of the</span>
+        <span class="c1"># queue where it would hold up every later message.</span>
+        <span class="n">data</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_inner</span><span class="o">.</span><span class="n">codec</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+        <span class="n">backlog</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outbox</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">entity_id</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">backlog</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_inner</span><span class="o">.</span><span class="n">try_send_bytes</span><span class="p">(</span><span class="n">entity_id</span><span class="p">,</span> <span class="n">data</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_outbox</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">entity_id</span><span class="p">,</span> <span class="n">collections</span><span class="o">.</span><span class="n">deque</span><span class="p">())</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">data</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="OutboxCommunicator.flush">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.OutboxCommunicator.flush">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">flush</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Send what peers can take now; True if anything is still queued.</span>
+
+<span class="sd">        A queued message whose send fails outright (not just a full peer) is</span>
+<span class="sd">        dropped and logged: there is no caller left to raise to, and keeping</span>
+<span class="sd">        it would stop every message behind it."""</span>
+        <span class="k">for</span> <span class="n">entity_id</span><span class="p">,</span> <span class="n">backlog</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outbox</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">while</span> <span class="n">backlog</span><span class="p">:</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_inner</span><span class="o">.</span><span class="n">try_send_bytes</span><span class="p">(</span><span class="n">entity_id</span><span class="p">,</span> <span class="n">backlog</span><span class="p">[</span><span class="mi">0</span><span class="p">]):</span>
+                        <span class="k">break</span>
+                <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — that message's failure alone</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">"Dropping a queued message to </span><span class="si">%s</span><span class="s2"> that failed to send"</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">)</span>
+                <span class="n">backlog</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+        <span class="k">return</span> <span class="nb">any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_outbox</span><span class="o">.</span><span class="n">values</span><span class="p">())</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__getattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_inner</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span></div>
 
 </pre></div>
 

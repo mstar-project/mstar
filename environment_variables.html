@@ -702,7 +702,11 @@ documented here as they are introduced.</p>
 this can be set per-process while the rest of the mesh stays on
 pyzmq. Under <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH=AUTO</span></code>, <code class="docutils literal notranslate"><span class="pre">0</span></code> also keeps that
 worker’s graph runtime on Python – the Rust one cannot share a
-pyzmq transport.</p></td>
+pyzmq transport. An extension built before 0.1.1 has no
+non-blocking <code class="docutils literal notranslate"><span class="pre">try_send</span></code>, which the API server’s preprocess thread
+sends with: for that thread alone, <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> then uses pyzmq with a
+warning and <code class="docutils literal notranslate"><span class="pre">1</span></code> raises, asking for a rebuild. The conductor, the
+workers and the rest of the API server keep the Rust transport.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code></p></td>
@@ -1097,7 +1101,10 @@ ingest.</p></td>
 </div>
 <section id="rust-frontend-limitations">
 <h3>Rust frontend limitations<a class="headerlink" href="#rust-frontend-limitations" title="Link to this heading">#</a></h3>
-<p>The Rust frontend carries no audio encoder or media muxer (the Python frontend
+<p>The Rust frontend serves no <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, so a model’s live client input
+(appends to a running request, see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>) needs the Python frontend;
+over <code class="docutils literal notranslate"><span class="pre">/generate</span></code> such a model’s input ends when the request is submitted.</p>
+<p>It also carries no audio encoder or media muxer (the Python frontend
 uses <code class="docutils literal notranslate"><span class="pre">soundfile</span></code> / <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code>), so two surfaces degrade:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> produces only <code class="docutils literal notranslate"><span class="pre">wav</span></code> and <code class="docutils literal notranslate"><span class="pre">pcm</span></code>. Any other

@@ -942,7 +942,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.request_types</h1><div class="highlight"><pre>
-<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.loop_indices</span><span class="w"> </span><span class="kn">import</span> <span class="n">NestedLoopIndices</span>
@@ -1099,7 +1100,32 @@ window.runMermaid = runMermaid;</script>
     <span class="n">prompt_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># The id the client knows the request by; ``request_id`` is the API</span>
     <span class="c1"># server's key for this one submission.</span>
-    <span class="n">client_request_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">client_request_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># the client streams the opening ends; the others stay open for appends</span>
+    <span class="n">ends</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span></div>
+
+
+
+<div class="viewcode-block" id="ClientAppend">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.ClientAppend">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ClientAppend</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""One append to a running request's client streams, queued behind the</span>
+<span class="sd">    request's own ``PreprocessInput`` so its chunks stay in order. The</span>
+<span class="sd">    streams in ``ends`` end after this chunk. Stays inside the API server</span>
+<span class="sd">    process."""</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">file_paths</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">ends</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
+    <span class="n">text</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># per modality, in file_paths' order, the client stream each file names (None: unnamed)</span>
+    <span class="n">file_streams</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># this append's own model_kwargs; the opening's stay the request's</span>
+    <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Answers the append as late, with an error naming why; called from the</span>
+    <span class="c1"># preprocess thread when the model routes items to a stream the client</span>
+    <span class="c1"># already ended. None: nobody to answer.</span>
+    <span class="n">on_late</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">],</span> <span class="kc">None</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span></div>
 
 </pre></div>
 

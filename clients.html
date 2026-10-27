@@ -772,10 +772,14 @@ curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8000/gene
 <h2>WebSocket <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code><a class="headerlink" href="#websocket-generate-ws" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> is the same request over one persistent WebSocket, for control loops
 that cannot afford an HTTP round trip per step (robot policies, streaming world models).
+The server negotiates per-message deflate on its WebSocket routes unless the deployment
+turns it off (<code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code> in <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>, as the Nemotron VoiceChat
+configs do).
 Each message is one request with the <code class="docutils literal notranslate"><span class="pre">/generate</span></code> fields — <code class="docutils literal notranslate"><span class="pre">text</span></code>, <code class="docutils literal notranslate"><span class="pre">files</span></code> as
 <code class="docutils literal notranslate"><span class="pre">[{&quot;name&quot;:</span> <span class="pre">...,</span> <span class="pre">&quot;data&quot;:</span> <span class="pre">...}]</span></code>, <code class="docutils literal notranslate"><span class="pre">input_modalities</span></code>, <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code>,
 <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, <code class="docutils literal notranslate"><span class="pre">request_id</span></code> — sent either as a JSON text frame (<code class="docutils literal notranslate"><span class="pre">data</span></code> base64) or
-as a msgpack binary frame (<code class="docutils literal notranslate"><span class="pre">data</span></code> raw bytes). Replies use the same encoding as the
+as a msgpack binary frame (<code class="docutils literal notranslate"><span class="pre">data</span></code> raw bytes); a field sent as <code class="docutils literal notranslate"><span class="pre">null</span></code> counts as
+absent. Replies use the same encoding as the
 message: one frame per result chunk, <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;modality&quot;,</span> <span class="pre">&quot;data&quot;,</span> <span class="pre">&quot;metadata&quot;}</span></code>,
 then <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;finish&quot;:</span> <span class="pre">true}</span></code>. A rejected message answers
 <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;error&quot;:</span> <span class="pre">...}</span></code> and the socket stays open; a request that fails after it
@@ -807,6 +811,75 @@ they were sent, so of two under one <code class="docutils literal notranslate"><
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">examples/cosmos3_action_ws_client.py</span></code> is a complete openpi-style client that runs this
 loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.</p>
+<p><strong>Live input.</strong> A model that listens while it runs (a full-duplex speech model) keeps a
+request’s input open after the opening message, so the opening message may carry no media
+at all. An append feeds the running request more input, in order, while its output keeps
+streaming back:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>{"request_id": ..., "append": {"text": ..., "files": [{"name": ..., "data": ..., "stream": ...}],
+                               "model_kwargs": {...}}}
+</pre></div>
+</div>
+<p>Every field of the record is optional, but an append needs text, files or <code class="docutils literal notranslate"><span class="pre">end_input</span></code>.
+<code class="docutils literal notranslate"><span class="pre">stream</span></code> names the client stream a file is for (the model decides when it is absent; a
+name the model doesn’t have is rejected), and <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> are this append’s own: they
+reach only the model’s <code class="docutils literal notranslate"><span class="pre">process_stream_chunk</span></code>, so they mean what that model reads from
+them, and the opening message’s still hold for the request (its sampling settings, say).
+<code class="docutils literal notranslate"><span class="pre">&quot;append&quot;:</span> <span class="pre">[files]</span></code> is short for <code class="docutils literal notranslate"><span class="pre">&quot;append&quot;:</span> <span class="pre">{&quot;files&quot;:</span> <span class="pre">[files]}</span></code>. What a model takes
+in an append is its own. An append of text alone that the model turns into no stream item
+is rejected; text sent with files reaches the model, and if it ignores the text, the text
+is dropped without an error. <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;end_input&quot;:</span> <span class="pre">true}</span></code>
+ends the input, alone or on an append (or on the opening message, for a one-shot
+request). The request then finishes as usual. Such a model treats every request over the
+socket as live, so a one-shot request to it carries <code class="docutils literal notranslate"><span class="pre">end_input:</span> <span class="pre">true</span></code> on its opening
+message: without it, the request waits for appends until it times out (or, with no
+<code class="docutils literal notranslate"><span class="pre">request_id</span></code>, is refused). A model may take several client streams
+(audio and video, say); <code class="docutils literal notranslate"><span class="pre">end_input</span></code> may then name the ones it ends, as a list
+(<code class="docutils literal notranslate"><span class="pre">&quot;end_input&quot;:</span> <span class="pre">[&quot;video_in&quot;]</span></code>), and the call’s input has ended once every stream has.
+An append that names a stream already ended, as a file’s <code class="docutils literal notranslate"><span class="pre">stream</span></code> or in
+<code class="docutils literal notranslate"><span class="pre">end_input</span></code>, is answered as late, as one after <code class="docutils literal notranslate"><span class="pre">end_input:</span> <span class="pre">true</span></code> is (below). So is
+one whose files name no stream and that the model routes to a stream already ended:
+what it carried for that stream is dropped, uncounted, and the rest goes on. The opening
+message’s files may name a <code class="docutils literal notranslate"><span class="pre">stream</span></code> too, which is checked the same way (a name the
+model doesn’t have gets a 400), but the model routes the opening’s files itself.</p>
+<p>A live call needs a <code class="docutils literal notranslate"><span class="pre">request_id</span></code>; only the socket that opened it can append to it, and
+closing the socket aborts it. A message is an append if it carries <code class="docutils literal notranslate"><span class="pre">append</span></code> at its top
+level, or <code class="docutils literal notranslate"><span class="pre">end_input</span></code> (true or a list) and no <code class="docutils literal notranslate"><span class="pre">text</span></code> or <code class="docutils literal notranslate"><span class="pre">files</span></code>; the fields inside
+an append’s record never open a request, and a message that opens a request under the
+call’s id gets a 409 while the call goes on. An append carries its text, files and
+<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> inside the record: beside it they are rejected. A <code class="docutils literal notranslate"><span class="pre">null</span></code> field counts as absent, inside
+the record too. Input resets the request timeout. A rejected append (an unknown file type,
+say) ends the call with its error (<code class="docutils literal notranslate"><span class="pre">status</span></code> 400), and no finish follows, since the input
+it carried is lost. So does an append the server then fails to load or process (a corrupt
+file, say), with that failure’s status, as for a request’s own files, and so does input
+past a limit the model or the deployment sets on how much a stream may carry over a call
+(<code class="docutils literal notranslate"><span class="pre">client_streams</span></code> in <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>), with a 400 that names the limit. An append after
+<code class="docutils literal notranslate"><span class="pre">end_input</span></code>, or after the model has ended the call, or to a request this socket has no
+live call under, gets <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;append&quot;:</span> <span class="pre">true,</span> <span class="pre">&quot;error&quot;}</span></code>: a reply to that append,
+not the end of a request, and the call goes on. A live call that opens while the server
+is at <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> ends at once with <code class="docutils literal notranslate"><span class="pre">status</span></code> 503, rather than wait for a
+slot and start that far behind its input; a one-shot request waits in the queue. Other
+models ignore <code class="docutils literal notranslate"><span class="pre">end_input</span></code>, and an append to them is rejected.
+Live input needs the Python frontend: <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> serves no <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>.
+The append size that serves best is the model’s: Nemotron VoiceChat runs a live step as one
+CUDA graph only for an append of exactly 80 ms (1280 samples at 16 kHz) onto a call whose
+audio so far is a whole number of 80 ms frames. Keep the opening clip and every append a
+multiple of 1280 samples: one that is not (a one-second opening clip, 16000 samples) keeps
+the call off the graph for the rest of its life. Other sizes are served the same, more
+slowly (see <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>).</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">msgpack</span><span class="o">.</span><span class="n">packb</span><span class="p">({</span><span class="s2">"request_id"</span><span class="p">:</span> <span class="s2">"call"</span><span class="p">,</span> <span class="s2">"output_modalities"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">]}))</span>
+<span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">microphone_chunks</span><span class="p">():</span>  <span class="c1"># e.g. 80 ms WAV files</span>
+    <span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">msgpack</span><span class="o">.</span><span class="n">packb</span><span class="p">({</span><span class="s2">"request_id"</span><span class="p">:</span> <span class="s2">"call"</span><span class="p">,</span>
+                           <span class="s2">"append"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"chunk.wav"</span><span class="p">,</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">chunk</span><span class="p">}]}))</span>
+<span class="c1"># the record form: text, files aimed at a stream, and settings for this append,</span>
+<span class="c1"># which only the model's process_stream_chunk reads</span>
+<span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">msgpack</span><span class="o">.</span><span class="n">packb</span><span class="p">({</span><span class="s2">"request_id"</span><span class="p">:</span> <span class="s2">"call"</span><span class="p">,</span> <span class="s2">"append"</span><span class="p">:</span> <span class="p">{</span>
+    <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"and now in French"</span><span class="p">,</span>
+    <span class="s2">"files"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"chunk.wav"</span><span class="p">,</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">chunk</span><span class="p">,</span> <span class="s2">"stream"</span><span class="p">:</span> <span class="s2">"audio_in"</span><span class="p">}],</span>
+    <span class="s2">"model_kwargs"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"gain"</span><span class="p">:</span> <span class="mf">2.0</span><span class="p">},</span>  <span class="c1"># what this model's hook reads, not a sampling setting</span>
+<span class="p">}}))</span>
+<span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">msgpack</span><span class="o">.</span><span class="n">packb</span><span class="p">({</span><span class="s2">"request_id"</span><span class="p">:</span> <span class="s2">"call"</span><span class="p">,</span> <span class="s2">"end_input"</span><span class="p">:</span> <span class="kc">True</span><span class="p">}))</span>
+</pre></div>
+</div>
 </section>
 <section id="python-sdk">
 <h2>Python SDK<a class="headerlink" href="#python-sdk" title="Link to this heading">#</a></h2>

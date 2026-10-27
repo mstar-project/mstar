@@ -946,16 +946,21 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources``):</span>
 
-<span class="sd">    conformer_encoder  (none)                    16 kHz speech -&gt; per-frame LLM embeds (+ RNN-T)</span>
+<span class="sd">    conformer_encoder  encoder_kv,                16 kHz speech -&gt; per-frame LLM embeds (+ RNN-T); per</span>
+<span class="sd">                       encoder_state,             session, its attention window, its layers' conv state</span>
+<span class="sd">                       encoder_front              and its audio / mel tails</span>
 <span class="sd">    nano_llm           nano_kv, nano_attn,        Nemotron-H hybrid Mamba-2 / attention / MLP (9B):</span>
 <span class="sd">                       mamba_state, mamba,        paged KV for the 4 attention layers, recurrent-pool</span>
 <span class="sd">                       nano_sampler               slots for the 27 Mamba-2 layers, the text sampler</span>
-<span class="sd">    eartts_talker      talker_kv, talker_attn,    Gemma3 talker -&gt; 31 RVQ codes per frame; two KV</span>
-<span class="sd">                       talker_pos                 labels per session (cond / uncond) in one plan</span>
-<span class="sd">    audio_codec        (none)                    RVQ codes -&gt; 22.05 kHz PCM, per-request left context</span>
+<span class="sd">    eartts_talker      talker_kv, talker_attn,    Gemma3 talker -&gt; 31 RVQ codes per frame (two KV</span>
+<span class="sd">                       talker_pos, codec_state    labels per session, cond / uncond, in one plan),</span>
+<span class="sd">                                                  decoded in the same step to 80 ms of 22.05 kHz</span>
+<span class="sd">                                                  PCM against the call's codec stream state</span>
 
 <span class="sd">Both autoregressive nodes keep their whole state in engine resources and capture</span>
-<span class="sd">their decode step as a CUDA graph; the encoder and the codec run eager.</span>
+<span class="sd">their decode step as a CUDA graph (the talker's with its codec decode). The</span>
+<span class="sd">encoder keeps a call's state in its bounded KV and two pools, and a live step</span>
+<span class="sd">(or its layer stack) replays a piecewise CUDA graph.</span>
 <span class="sd">"""</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -972,6 +977,10 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">AcceleratorGraphConfig</span><span class="p">,</span>
     <span class="n">BatchedAcceleratorGraphConfig</span><span class="p">,</span>
+    <span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">,</span>
+    <span class="n">PiecewiseBatchedConfig</span><span class="p">,</span>
+    <span class="n">PiecewiseCallInputs</span><span class="p">,</span>
+    <span class="n">PiecewiseCaptureShape</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">AttentionStep</span><span class="p">,</span>
@@ -982,14 +991,23 @@ window.runMermaid = runMermaid;</script>
     <span class="n">SlotLease</span><span class="p">,</span>
     <span class="n">SubmoduleStep</span><span class="p">,</span>
 <span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.bounded</span><span class="w"> </span><span class="kn">import</span> <span class="n">BoundedKVStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.linear_attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">LinearAttnStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.recurrent</span><span class="w"> </span><span class="kn">import</span> <span class="n">RecurrentStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.nemotron_duplex.components.audio_codec</span><span class="w"> </span><span class="kn">import</span> <span class="n">AudioCodec</span><span class="p">,</span> <span class="n">CodecStreamAudio</span><span class="p">,</span> <span class="n">CodecStreamState</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.nemotron_duplex.components.conformer</span><span class="w"> </span><span class="kn">import</span> <span class="n">ConformerStreamer</span><span class="p">,</span> <span class="n">StreamState</span><span class="p">,</span> <span class="n">device_counts</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.nemotron_duplex.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">AUDIO_IN</span><span class="p">,</span>
+    <span class="n">CODEC_STATE</span><span class="p">,</span>
+    <span class="n">ENCODER_FRONT</span><span class="p">,</span>
+    <span class="n">ENCODER_KV</span><span class="p">,</span>
+    <span class="n">ENCODER_STATE</span><span class="p">,</span>
     <span class="n">MAMBA</span><span class="p">,</span>
     <span class="n">MAMBA_STATE</span><span class="p">,</span>
     <span class="n">NANO_ATTN</span><span class="p">,</span>
     <span class="n">NANO_KV</span><span class="p">,</span>
     <span class="n">NANO_SAMPLER</span><span class="p">,</span>
+    <span class="n">SESSION_BATCH_SIZES</span><span class="p">,</span>
     <span class="n">TALKER_ATTN</span><span class="p">,</span>
     <span class="n">TALKER_CFG_LABEL</span><span class="p">,</span>
     <span class="n">TALKER_KV</span><span class="p">,</span>
@@ -1040,9 +1058,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">disable_torch_compile</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="c1"># Decode batch sizes captured as CUDA graphs: one row per live session per</span>
-    <span class="c1"># 80 ms tick. The recurrent pool holds a slot per row (padding rows take</span>
-    <span class="c1"># one transiently), so the model's pool sizing covers the largest bucket.</span>
-    <span class="n">DECODE_CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">]</span>
+    <span class="c1"># 80 ms tick. The recurrent pool holds a slot per session; padding rows</span>
+    <span class="c1"># take none (they address the sink).</span>
+    <span class="n">DECODE_CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="n">SESSION_BATCH_SIZES</span>
     <span class="n">DECODE_KEY</span> <span class="o">=</span> <span class="s2">"decode"</span>            <span class="c1"># the steady-state capture's bucket key (cg_key_info)</span>
     <span class="n">PROMPT_DONE_KEY</span> <span class="o">=</span> <span class="s2">"prompt_consumed"</span>   <span class="c1"># set once the request's first step (prompt + frame) has run</span>
 
@@ -1172,6 +1190,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="n">NameToTensorList</span><span class="p">,</span>
+        <span class="n">is_final_stream_chunk</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ARNodeInputs</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Host-side bookkeeping only; the embedding lookups and AddFusion run in</span>
@@ -1182,20 +1201,22 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">"prev_text"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tok</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="s2">"prev_text"</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">text_bos_id</span><span class="p">),</span>
                 <span class="s2">"prev_func"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tok</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="s2">"prev_func"</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">text_pad_id</span><span class="p">),</span>
             <span class="p">}</span>
-            <span class="c1"># The terminal stream chunk (producer_done race) can arrive with the</span>
-            <span class="c1"># key present but no tensor: run a no-audio step, the loop stops</span>
-            <span class="c1"># this iteration on the final-chunk signal.</span>
+            <span class="c1"># The terminal stream chunk is empty when the stream's last frame</span>
+            <span class="c1"># was taken before its end reached this worker: run a no-audio step,</span>
+            <span class="c1"># which ends the loop (postprocess drops what it samples).</span>
             <span class="n">frames</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"audio_frame"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">[]</span>
             <span class="k">if</span> <span class="n">frames</span><span class="p">:</span>
                 <span class="n">tensors</span><span class="p">[</span><span class="s2">"audio_frame"</span><span class="p">]</span> <span class="o">=</span> <span class="n">frames</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+            <span class="n">ends_loop</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">is_final_stream_chunk</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">frames</span>
             <span class="c1"># The system prompt rides the loop as ``text_inputs``: real ids on</span>
             <span class="c1"># the session's first step, the NO_PROMPT sentinel afterwards.</span>
             <span class="n">prompt</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prompt_ids</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">prompt</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">tensors</span><span class="p">[</span><span class="s2">"prompt_ids"</span><span class="p">]</span> <span class="o">=</span> <span class="n">prompt</span>
                 <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span><span class="n">input_seq_len</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">prompt</span><span class="o">.</span><span class="n">numel</span><span class="p">())</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">tensor_inputs</span><span class="o">=</span><span class="n">tensors</span><span class="p">,</span>
-                                    <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"mode"</span><span class="p">:</span> <span class="n">_MODE_PROMPT_FRAME</span><span class="p">})</span>
-            <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span><span class="n">input_seq_len</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">tensor_inputs</span><span class="o">=</span><span class="n">tensors</span><span class="p">,</span> <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"mode"</span><span class="p">:</span> <span class="n">_MODE_FRAME</span><span class="p">})</span>
+                                    <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"mode"</span><span class="p">:</span> <span class="n">_MODE_PROMPT_FRAME</span><span class="p">,</span> <span class="s2">"ends_loop"</span><span class="p">:</span> <span class="n">ends_loop</span><span class="p">})</span>
+            <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span><span class="n">input_seq_len</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">tensor_inputs</span><span class="o">=</span><span class="n">tensors</span><span class="p">,</span>
+                                <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"mode"</span><span class="p">:</span> <span class="n">_MODE_FRAME</span><span class="p">,</span> <span class="s2">"ends_loop"</span><span class="p">:</span> <span class="n">ends_loop</span><span class="p">})</span>
         <span class="k">if</span> <span class="s2">"combined_embeds"</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
             <span class="n">emb</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"combined_embeds"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
             <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span><span class="n">input_embeds</span><span class="o">=</span><span class="n">emb</span><span class="p">,</span> <span class="n">input_seq_len</span><span class="o">=</span><span class="n">emb</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"mode"</span><span class="p">:</span> <span class="n">_MODE_EMBEDS</span><span class="p">})</span>
@@ -1365,6 +1386,12 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># frame's AddFusion (the decode loop's prev_text / prev_func edges).</span>
         <span class="c1"># The prompt, if any, went with this step. Later steps use the capture.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">PROMPT_DONE_KEY</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+        <span class="n">inputs</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"inputs"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">inputs</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"ends_loop"</span><span class="p">):</span>
+            <span class="c1"># the empty terminal chunk's step only ends the loop: one token per</span>
+            <span class="c1"># frame, as offline, so nothing it sampled leaves the node</span>
+            <span class="n">outputs</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+            <span class="k">return</span>
         <span class="k">if</span> <span class="s2">"new_token"</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
             <span class="n">outputs</span><span class="p">[</span><span class="s2">"prev_text"</span><span class="p">]</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="s2">"new_token"</span><span class="p">]</span>
         <span class="k">if</span> <span class="s2">"new_func"</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
@@ -1384,18 +1411,45 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="ConformerEncoderSubmodule">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.ConformerEncoderSubmodule">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ConformerEncoderSubmodule</span><span class="p">(</span><span class="n">NodeSubmodule</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""Fast-Conformer streaming STT encoder: raw 16 kHz audio -&gt; per-frame</span>
-<span class="sd">    LLM-space embeddings, emitted one frame per stream item so the LLM's</span>
-<span class="sd">    ``FixedChunkPolicy(1)`` paces the frame-synchronous decode loop.</span>
+<span class="w">    </span><span class="sd">"""Fast-Conformer streaming STT encoder: the call's 16 kHz audio -&gt;</span>
+<span class="sd">    per-frame LLM-space embeddings, emitted one frame per stream item so the</span>
+<span class="sd">    LLM's ``FixedChunkPolicy(1)`` paces the frame-synchronous decode loop.</span>
+
+<span class="sd">    Audio arrives as the client streams it, one chunk per step, and the live</span>
+<span class="sd">    calls' chunks run in one batched streamer pass (``ConformerStreamer``, which</span>
+<span class="sd">    describes the state a call carries across chunks and its numerics), except</span>
+<span class="sd">    that a step holding a chunk of more than a second (an upload, a large</span>
+<span class="sd">    append) is not batched (``can_batch``): the engine then runs each call of</span>
+<span class="sd">    it on its own. A call's state is bounded whatever its length: its newest audio and</span>
+<span class="sd">    mel frames (the ``ENCODER_FRONT`` pool), the conv tails (``ENCODER_STATE``)</span>
+<span class="sd">    and the last 70 frames of each layer's attention keys and values</span>
+<span class="sd">    (``ENCODER_KV``, which also runs the attention); its host counters live in</span>
+<span class="sd">    its per-request state, and its frame count is its position in the KV.</span>
+
+<span class="sd">    A call one frame of audio further on the frame grid (every live step of a</span>
+<span class="sd">    client appending 80 ms) runs whole as a CUDA graph (``STEP_REGION``). The</span>
+<span class="sd">    other calls take the front end eagerly, then the layer stack as a graph</span>
+<span class="sd">    (``LAYERS_REGION``) when each got at most one frame (a live step, the</span>
+<span class="sd">    call's end), else eagerly (a one-shot upload, a large append). In a step</span>
+<span class="sd">    whose other calls take the eager layers, or when the whole-step region has</span>
+<span class="sd">    no graph for its calls, those calls run eagerly too.</span>
 
 <span class="sd">    Holds the perception stack plus the RNN-T decoder/joint (loaded; the</span>
-<span class="sd">    user-transcript channel is not emitted yet). Declares no resources.</span>
+<span class="sd">    user-transcript channel is not emitted yet).</span>
 <span class="sd">    """</span>
 
-    <span class="c1"># Variable-length per-utterance audio: torch.compile would recompile per</span>
-    <span class="c1"># shape (and inductor raised on some shapes). Runs once per request, so</span>
-    <span class="c1"># eager is fine; revisit with the batched-encoder perf pass.</span>
+    <span class="c1"># The captured regions are not compiled (compile=False); the eager front end</span>
+    <span class="c1"># takes variable-length chunks.</span>
     <span class="n">disable_torch_compile</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="n">STEP_REGION</span> <span class="o">=</span> <span class="s2">"conformer_step"</span>
+    <span class="n">LAYERS_REGION</span> <span class="o">=</span> <span class="s2">"conformer_layers"</span>
+    <span class="n">CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="n">SESSION_BATCH_SIZES</span>
+
+    <span class="n">STATE_KEY</span> <span class="o">=</span> <span class="s2">"encoder_stream"</span>         <span class="c1"># a call's StreamState</span>
+    <span class="c1"># Longest chunk batched with other calls': a pass pads every call to its</span>
+    <span class="c1"># longest chunk. One second is a judgement, not a measured crossover.</span>
+    <span class="n">BATCHED_CHUNK_S</span> <span class="o">=</span> <span class="mf">1.0</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">perception</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">rnnt_decoder</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">rnnt_joint</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
                  <span class="n">config</span><span class="p">:</span> <span class="n">NemotronDuplexConfig</span><span class="p">):</span>
@@ -1404,29 +1458,296 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">rnnt_decoder</span> <span class="o">=</span> <span class="n">rnnt_decoder</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">rnnt_joint</span> <span class="o">=</span> <span class="n">rnnt_joint</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_streamer</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="ConformerEncoderSubmodule.prepare_inputs">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.ConformerEncoderSubmodule.prepare_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputs</span><span class="p">:</span>
-        <span class="c1"># ``audio_features`` is the raw 16 kHz mono waveform; the perception</span>
-        <span class="c1"># stack does mel + subsampling + encoder internally.</span>
-        <span class="n">wav</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"audio_features"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
-        <span class="k">if</span> <span class="n">wav</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="n">wav</span> <span class="o">=</span> <span class="n">wav</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>                                     <span class="c1"># (1, N)</span>
-        <span class="k">if</span> <span class="s2">"audio_seqlens"</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
-            <span class="n">lens</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">"audio_seqlens"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">wav</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">lens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">wav</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]],</span> <span class="n">device</span><span class="o">=</span><span class="n">wav</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">NodeInputs</span><span class="p">(</span><span class="n">tensor_inputs</span><span class="o">=</span><span class="p">{</span><span class="s2">"wav"</span><span class="p">:</span> <span class="n">wav</span><span class="p">,</span> <span class="s2">"lens"</span><span class="p">:</span> <span class="n">lens</span><span class="p">})</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">is_final_stream_chunk</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputs</span><span class="p">:</span>
+        <span class="c1"># ``audio_in`` is one chunk of raw 16 kHz mono audio</span>
+        <span class="n">chunk</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">AUDIO_IN</span><span class="p">)</span>
+        <span class="n">wav</span> <span class="o">=</span> <span class="n">chunk</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="k">if</span> <span class="n">chunk</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="c1"># the client stream releases one item per step; only its final flush is empty</span>
+        <span class="k">assert</span> <span class="n">wav</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">is_final_stream_chunk</span><span class="p">,</span> <span class="s2">"an empty chunk before the end of the stream"</span>
+        <span class="c1"># The session cap is audio_in's max_items, which the client stream</span>
+        <span class="c1"># enforces before a sample reaches here. Read, not counted here: admit</span>
+        <span class="c1"># can refuse the step and run this again. The previous step's forward</span>
+        <span class="c1"># has returned, so the state is current.</span>
+        <span class="n">st</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">rid_handle</span><span class="p">)</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">STATE_KEY</span><span class="p">)</span>
+        <span class="n">samples</span> <span class="o">=</span> <span class="p">(</span><span class="n">st</span><span class="o">.</span><span class="n">samples</span> <span class="k">if</span> <span class="n">st</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="p">(</span><span class="n">wav</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="k">if</span> <span class="n">wav</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="n">stt</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">perception</span><span class="o">.</span><span class="n">config</span>
+        <span class="k">if</span> <span class="n">is_final_stream_chunk</span> <span class="ow">and</span> <span class="n">samples</span> <span class="o">&lt;=</span> <span class="n">stt</span><span class="o">.</span><span class="n">n_fft</span> <span class="o">//</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="c1"># too short to featurize (offline can't either): fail rather than reply to nothing</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"the call ended with </span><span class="si">{</span><span class="mi">1000</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">samples</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">stt</span><span class="o">.</span><span class="n">sample_rate</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2"> ms of audio; "</span>
+                <span class="sa">f</span><span class="s2">"it needs more than </span><span class="si">{</span><span class="mi">1000</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="p">(</span><span class="n">stt</span><span class="o">.</span><span class="n">n_fft</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">stt</span><span class="o">.</span><span class="n">sample_rate</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2"> ms"</span>
+            <span class="p">)</span>
+        <span class="n">final</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">is_final_stream_chunk</span><span class="p">)</span>
+        <span class="n">at</span> <span class="o">=</span> <span class="n">st</span> <span class="ow">or</span> <span class="n">StreamState</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">NodeInputs</span><span class="p">(</span>
+            <span class="n">tensor_inputs</span><span class="o">=</span><span class="p">{}</span> <span class="k">if</span> <span class="n">wav</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">{</span><span class="s2">"chunk"</span><span class="p">:</span> <span class="n">wav</span><span class="p">},</span>
+            <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span>
+                <span class="s2">"final"</span><span class="p">:</span> <span class="n">final</span><span class="p">,</span>
+                <span class="c1"># whether the whole-step region can serve the call: decided</span>
+                <span class="c1"># here, once, for the declaration and the forward to share</span>
+                <span class="s2">"steady"</span><span class="p">:</span> <span class="n">st</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">streamer</span><span class="o">.</span><span class="n">is_steady</span><span class="p">(</span><span class="n">st</span><span class="p">,</span> <span class="n">wav</span><span class="p">,</span> <span class="n">final</span><span class="p">),</span>
+                <span class="c1"># the call's position in ENCODER_KV and the frames this step adds</span>
+                <span class="s2">"position"</span><span class="p">:</span> <span class="n">at</span><span class="o">.</span><span class="n">position</span><span class="p">,</span>
+                <span class="s2">"n"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">streamer</span><span class="o">.</span><span class="n">new_frames</span><span class="p">(</span><span class="n">at</span><span class="p">,</span> <span class="n">samples</span><span class="p">,</span> <span class="n">final</span><span class="p">),</span>
+            <span class="p">},</span>
+            <span class="n">input_seq_len</span><span class="o">=</span><span class="mi">0</span> <span class="k">if</span> <span class="n">wav</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">wav</span><span class="o">.</span><span class="n">numel</span><span class="p">(),</span>   <span class="c1"># samples, for can_batch</span>
+        <span class="p">)</span></div>
 
+
+<div class="viewcode-block" id="ConformerEncoderSubmodule.preprocess">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.ConformerEncoderSubmodule.preprocess">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">inputs</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">"chunk"</span><span class="p">:</span> <span class="p">[</span><span class="n">inp</span><span class="o">.</span><span class="n">tensor_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"chunk"</span><span class="p">)</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">],</span>
+            <span class="s2">"final"</span><span class="p">:</span> <span class="p">[</span><span class="n">inp</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"final"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">],</span>
+            <span class="s2">"steady"</span><span class="p">:</span> <span class="p">[</span><span class="n">inp</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"steady"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">],</span>
+            <span class="s2">"n"</span><span class="p">:</span> <span class="p">[</span><span class="n">inp</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"n"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">],</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="ConformerEncoderSubmodule.can_batch">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.ConformerEncoderSubmodule.can_batch">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">can_batch</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">,</span> <span class="n">model_inputs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="c1"># A pass pads every call to its longest chunk, so a chunk of more than</span>
+        <span class="c1"># BATCHED_CHUNK_S keeps its step from being batched, and the engine runs</span>
+        <span class="c1"># each call's step on its own (declare, admit, plan, forward, commit).</span>
+        <span class="c1"># Such chunks are uploads and large appends, so it is a rare step.</span>
+        <span class="n">longest</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">BATCHED_CHUNK_S</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">perception</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sample_rate</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="n">model_inputs</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">or</span> <span class="nb">all</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">input_seq_len</span> <span class="o">&lt;=</span> <span class="n">longest</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">model_inputs</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ConformerEncoderSubmodule.max_batch_size">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.ConformerEncoderSubmodule.max_batch_size">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_batch_size</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># The engine caps a batch at its whole-forward graphs only; past the</span>
+        <span class="c1"># widest region capture every call of the step would run eagerly.</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">CAPTURE_BATCH_SIZES</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span></div>
+
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_declare</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">keys</span><span class="p">,</span> <span class="n">kv</span><span class="p">:</span> <span class="n">BoundedKVStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">SubmoduleStep</span><span class="p">(</span>
+            <span class="n">segments</span><span class="o">=</span><span class="p">[</span><span class="n">Segment</span><span class="p">(</span><span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">"main"</span><span class="p">,</span> <span class="n">span</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">],</span>
+            <span class="n">steps</span><span class="o">=</span><span class="p">{</span><span class="o">**</span><span class="p">{</span><span class="n">key</span><span class="p">:</span> <span class="n">RecurrentStep</span><span class="p">()</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">},</span> <span class="n">ENCODER_KV</span><span class="p">:</span> <span class="n">kv</span><span class="p">},</span>
+        <span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_kv_step</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">spans</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">positions</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BoundedKVStep</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Each call's new frames (``spans``) at its position in the stream."""</span>
+        <span class="k">return</span> <span class="n">BoundedKVStep</span><span class="p">(</span>
+            <span class="n">segments</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">Segment</span><span class="p">(</span><span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">"main"</span><span class="p">,</span> <span class="n">span</span><span class="o">=</span><span class="n">n</span><span class="p">)</span>
+                           <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">spans</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)),</span>
+            <span class="n">positions</span><span class="o">=</span><span class="n">positions</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_region_kv_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BoundedKVStep</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A region's calls each add one frame. A capture's or a replay's padding</span>
+<span class="sd">        row has no stream state, so it gets no position: the resource plans it</span>
+<span class="sd">        as padding."""</span>
+        <span class="n">positions</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
+            <span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+            <span class="n">st</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">state</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">state</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">STATE_KEY</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">st</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">positions</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">st</span><span class="o">.</span><span class="n">position</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_step</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">),</span> <span class="n">positions</span><span class="p">)</span>
+
+<div class="viewcode-block" id="ConformerEncoderSubmodule.declare_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.ConformerEncoderSubmodule.declare_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">declare_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">slot_lease</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">piecewise_leases</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                     <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">slot_lease</span><span class="p">,</span> <span class="n">kwargs</span>
+        <span class="c1"># A live step where every call is one frame on replays STEP_REGION</span>
+        <span class="c1"># over the whole batch, at the bucket its lease names, and the region's</span>
+        <span class="c1"># own step owns every resource. Each such call already holds its slots,</span>
+        <span class="c1"># from a first step declared below, so that step's admit reserves nothing.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">STEP_REGION</span> <span class="ow">in</span> <span class="p">(</span><span class="n">piecewise_leases</span> <span class="ow">or</span> <span class="p">{})</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">kwargs</span><span class="p">[</span><span class="s2">"steady"</span><span class="p">]</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="c1"># Otherwise this step reserves and plans every call's slots and new</span>
+        <span class="c1"># frames, and the eager path reads that plan. A region the forward still</span>
+        <span class="c1"># replays for some calls re-plans their rows into its own buffers, after</span>
+        <span class="c1"># the eager path has read this plan. It can't own those rows instead: its</span>
+        <span class="c1"># lease names the whole batch's bucket, not the sub-batch's, which may</span>
+        <span class="c1"># have no graph, and its admit can't refuse a call that has no slot yet.</span>
+        <span class="n">spans</span> <span class="o">=</span> <span class="p">[</span><span class="n">inp</span><span class="o">.</span><span class="n">kwargs</span><span class="p">[</span><span class="s2">"n"</span><span class="p">]</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">]</span>
+        <span class="n">positions</span> <span class="o">=</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="n">inp</span><span class="o">.</span><span class="n">kwargs</span><span class="p">[</span><span class="s2">"position"</span><span class="p">]</span> <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">inp</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)}</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_declare</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="p">(</span><span class="n">ENCODER_FRONT</span><span class="p">,</span> <span class="n">ENCODER_STATE</span><span class="p">),</span>
+                             <span class="bp">self</span><span class="o">.</span><span class="n">_kv_step</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">spans</span><span class="p">,</span> <span class="n">positions</span><span class="p">))</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">streamer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ConformerStreamer</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streamer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_streamer</span> <span class="o">=</span> <span class="n">ConformerStreamer</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">perception</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streamer</span>
+
+<div class="viewcode-block" id="ConformerEncoderSubmodule.get_piecewise_accelerator_graph_configs">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.ConformerEncoderSubmodule.get_piecewise_accelerator_graph_configs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_piecewise_accelerator_graph_configs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""A live step, one frame of audio per call, whole (``STEP_REGION``); and</span>
+<span class="sd">        the layer stack alone for any step with at most one frame per call</span>
+<span class="sd">        (``LAYERS_REGION``)."""</span>
+        <span class="k">del</span> <span class="n">tp_world_size</span>
+        <span class="n">stt</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">perception</span><span class="o">.</span><span class="n">config</span>
+        <span class="n">frame_samples</span> <span class="o">=</span> <span class="n">stt</span><span class="o">.</span><span class="n">hop_length</span> <span class="o">*</span> <span class="n">stt</span><span class="o">.</span><span class="n">subsampling_factor</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">step_inputs</span><span class="p">(</span><span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+            <span class="k">return</span> <span class="p">{</span><span class="s2">"chunk"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">frame_samples</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)}</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">layers_inputs</span><span class="p">(</span><span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+            <span class="k">return</span> <span class="p">{</span>
+                <span class="s2">"x"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">stt</span><span class="o">.</span><span class="n">d_model</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+                <span class="s2">"n"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+            <span class="p">}</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">region</span><span class="p">(</span><span class="n">fn</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">keys</span><span class="p">,</span> <span class="n">lease</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PiecewiseBatchedConfig</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">PiecewiseBatchedConfig</span><span class="p">(</span>
+                <span class="n">capture_fn</span><span class="o">=</span><span class="n">fn</span><span class="p">,</span> <span class="n">make_static_inputs</span><span class="o">=</span><span class="n">inputs</span><span class="p">,</span>
+                <span class="n">declare_step</span><span class="o">=</span><span class="k">lambda</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_declare</span><span class="p">(</span>
+                    <span class="n">request_ids</span><span class="p">,</span> <span class="n">keys</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_region_kv_step</span><span class="p">(</span><span class="n">request_ids</span><span class="p">)),</span>
+                <span class="n">seq_len</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">capture_batch_sizes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">CAPTURE_BATCH_SIZES</span><span class="p">,</span> <span class="nb">compile</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">lease_before_step</span><span class="o">=</span><span class="n">lease</span><span class="p">,</span>
+            <span class="p">)</span>
+
+        <span class="n">regions</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">STEP_REGION</span><span class="p">:</span> <span class="n">region</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_step_region</span><span class="p">,</span> <span class="n">step_inputs</span><span class="p">,</span> <span class="p">(</span><span class="n">ENCODER_FRONT</span><span class="p">,</span> <span class="n">ENCODER_STATE</span><span class="p">),</span> <span class="kc">True</span><span class="p">),</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">LAYERS_REGION</span><span class="p">:</span> <span class="n">region</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_layers_region</span><span class="p">,</span> <span class="n">layers_inputs</span><span class="p">,</span> <span class="p">(</span><span class="n">ENCODER_STATE</span><span class="p">,),</span> <span class="kc">False</span><span class="p">),</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">streamer</span><span class="o">.</span><span class="n">has_steady_step</span><span class="p">:</span>
+            <span class="k">del</span> <span class="n">regions</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">STEP_REGION</span><span class="p">]</span>
+        <span class="k">return</span> <span class="n">regions</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_step_region</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">call</span><span class="p">:</span> <span class="n">PiecewiseCallInputs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+        <span class="n">front</span><span class="p">,</span> <span class="n">pool</span> <span class="o">=</span> <span class="n">call</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="n">ENCODER_FRONT</span><span class="p">],</span> <span class="n">call</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="n">ENCODER_STATE</span><span class="p">]</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">"y"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">streamer</span><span class="o">.</span><span class="n">steady_step</span><span class="p">(</span><span class="n">call</span><span class="o">.</span><span class="n">static_inputs</span><span class="p">[</span><span class="s2">"chunk"</span><span class="p">],</span> <span class="n">front</span><span class="p">,</span> <span class="n">call</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="n">ENCODER_KV</span><span class="p">],</span> <span class="n">pool</span><span class="p">)}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_layers_region</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">call</span><span class="p">:</span> <span class="n">PiecewiseCallInputs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+        <span class="n">pool</span> <span class="o">=</span> <span class="n">call</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="n">ENCODER_STATE</span><span class="p">]</span>
+        <span class="n">s</span> <span class="o">=</span> <span class="n">call</span><span class="o">.</span><span class="n">static_inputs</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">"y"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">streamer</span><span class="o">.</span><span class="n">layers</span><span class="p">(</span><span class="n">s</span><span class="p">[</span><span class="s2">"x"</span><span class="p">],</span> <span class="n">call</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="n">ENCODER_KV</span><span class="p">],</span> <span class="n">pool</span><span class="p">,</span> <span class="n">s</span><span class="p">[</span><span class="s2">"n"</span><span class="p">])}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_stream_state</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StreamState</span><span class="p">:</span>
+        <span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="n">st</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">STATE_KEY</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">st</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">st</span> <span class="o">=</span> <span class="n">StreamState</span><span class="p">()</span>
+            <span class="n">state</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">STATE_KEY</span><span class="p">,</span> <span class="n">st</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">st</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_to_device</span><span class="p">(</span><span class="n">chunks</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The step's chunks on the device in one copy: a copy per call, from</span>
+<span class="sd">        pageable memory, would each wait for its transfer."""</span>
+        <span class="n">host</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">chunks</span><span class="p">)</span> <span class="k">if</span> <span class="n">c</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">c</span><span class="o">.</span><span class="n">device</span> <span class="o">!=</span> <span class="n">device</span><span class="p">]</span>
+        <span class="n">moved</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">chunks</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">host</span><span class="p">:</span>
+            <span class="n">flat</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">chunks</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">host</span><span class="p">])</span>
+            <span class="k">if</span> <span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cuda"</span><span class="p">:</span>
+                <span class="n">flat</span> <span class="o">=</span> <span class="n">flat</span><span class="o">.</span><span class="n">pin_memory</span><span class="p">()</span>
+            <span class="n">parts</span> <span class="o">=</span> <span class="n">flat</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="o">.</span><span class="n">split</span><span class="p">([</span><span class="n">chunks</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">host</span><span class="p">])</span>
+            <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">part</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">host</span><span class="p">,</span> <span class="n">parts</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+                <span class="n">moved</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">part</span>
+        <span class="k">return</span> <span class="n">moved</span>
+
+<div class="viewcode-block" id="ConformerEncoderSubmodule.forward_batched">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.ConformerEncoderSubmodule.forward_batched">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward_batched</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">chunk</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">final</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">steady</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="n">rids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">engine_inputs</span><span class="o">.</span><span class="n">request_ids</span><span class="p">)</span>
+        <span class="n">device</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">perception</span><span class="o">.</span><span class="n">proj</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">device</span>
+        <span class="n">streamer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">streamer</span>
+        <span class="n">states</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_stream_state</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">]</span>
+        <span class="n">chunks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_to_device</span><span class="p">(</span><span class="n">chunk</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
+        <span class="n">runners</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">piecewise_runners</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="n">frames</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">rids</span><span class="p">)</span>
+
+        <span class="c1"># calls one frame of audio further on the frame grid: the whole step as one graph, run last</span>
+        <span class="n">step_runner</span><span class="p">,</span> <span class="n">layers_runner</span> <span class="o">=</span> <span class="n">runners</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">STEP_REGION</span><span class="p">),</span> <span class="n">runners</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">LAYERS_REGION</span><span class="p">)</span>
+
+        <span class="k">def</span><span class="w"> </span><span class="nf">layers_graph</span><span class="p">(</span><span class="n">rows</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">            </span><span class="sd">"""Whether the layer region takes these calls' new frames: at most one each."""</span>
+            <span class="n">new</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">rows</span> <span class="k">if</span> <span class="n">n</span><span class="p">[</span><span class="n">i</span><span class="p">]]</span>
+            <span class="k">return</span> <span class="p">(</span><span class="nb">bool</span><span class="p">(</span><span class="n">new</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">max</span><span class="p">(</span><span class="n">n</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">new</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">layers_runner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                    <span class="ow">and</span> <span class="n">layers_runner</span><span class="o">.</span><span class="n">can_run</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">new</span><span class="p">)))</span>
+
+        <span class="k">if</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># declare_step left every resource to the region, which its lease says can replay the batch</span>
+            <span class="k">assert</span> <span class="nb">all</span><span class="p">(</span><span class="n">steady</span><span class="p">),</span> <span class="s2">"an encoder step declared nothing but is not all steady"</span>
+            <span class="n">steady</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">rids</span><span class="p">)))</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># This step's KV plan writes every call's new frames, so the region (which</span>
+            <span class="c1"># writes its calls' under its own plan) may serve the steady calls only when</span>
+            <span class="c1"># that plan goes unused: the other calls' frames, if any, all go through the</span>
+            <span class="c1"># layer region. Otherwise, or with no graph for them, they run eagerly too.</span>
+            <span class="n">rest</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">s</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">steady</span><span class="p">)</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">s</span><span class="p">]</span>
+            <span class="n">steady</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">s</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">steady</span><span class="p">)</span> <span class="k">if</span> <span class="n">s</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">steady</span> <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span><span class="n">step_runner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">step_runner</span><span class="o">.</span><span class="n">can_run</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">steady</span><span class="p">))</span>
+                               <span class="ow">and</span> <span class="p">(</span><span class="ow">not</span> <span class="nb">any</span><span class="p">(</span><span class="n">n</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">rest</span><span class="p">)</span> <span class="ow">or</span> <span class="n">layers_graph</span><span class="p">(</span><span class="n">rest</span><span class="p">))):</span>
+                <span class="n">steady</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">steady_chunks</span> <span class="o">=</span> <span class="p">[</span><span class="n">chunks</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">steady</span><span class="p">]</span>
+        <span class="n">eager_n</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">steady</span><span class="p">:</span>
+            <span class="n">chunks</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">eager_n</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="mi">0</span>     <span class="c1"># the eager pass leaves these calls as they are</span>
+
+        <span class="c1"># The rest: the same math eagerly, reading this step's plans where it</span>
+        <span class="c1"># uses them, before any region plans its own; its layers as a graph when</span>
+        <span class="c1"># no call got more than a frame. A chunk of more than a second comes in</span>
+        <span class="c1"># a step of its own (see can_batch).</span>
+        <span class="n">enc</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">steady</span><span class="p">)</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">rids</span><span class="p">):</span>
+            <span class="n">enc</span> <span class="o">=</span> <span class="n">streamer</span><span class="o">.</span><span class="n">front</span><span class="p">(</span><span class="n">states</span><span class="p">,</span> <span class="n">chunks</span><span class="p">,</span> <span class="n">final</span><span class="p">,</span> <span class="n">eager_n</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="n">ENCODER_FRONT</span><span class="p">])</span>
+        <span class="k">if</span> <span class="n">enc</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">new</span> <span class="o">=</span> <span class="p">[</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">enc</span><span class="o">.</span><span class="n">n</span><span class="p">)</span> <span class="k">if</span> <span class="n">k</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">layers_graph</span><span class="p">(</span><span class="n">new</span><span class="p">):</span>
+                <span class="c1"># only the calls with a frame: the region plans its own rows</span>
+                <span class="n">y</span> <span class="o">=</span> <span class="n">layers_runner</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">static_inputs</span><span class="o">=</span><span class="p">{</span><span class="s2">"x"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">enc</span><span class="o">.</span><span class="n">x</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">new</span><span class="p">]),</span>
+                                                     <span class="s2">"n"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">new</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)},</span>
+                                      <span class="n">request_ids</span><span class="o">=</span><span class="p">[</span><span class="n">rids</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">new</span><span class="p">])[</span><span class="s2">"y"</span><span class="p">]</span>
+                <span class="n">y</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">new</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">y</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_layers</span><span class="p">(</span><span class="n">enc</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="n">ENCODER_KV</span><span class="p">],</span>
+                                       <span class="n">engine_inputs</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="n">ENCODER_STATE</span><span class="p">],</span> <span class="n">device</span><span class="p">)</span>
+            <span class="n">streamer</span><span class="o">.</span><span class="n">advance</span><span class="p">(</span><span class="n">states</span><span class="p">,</span> <span class="n">enc</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">new</span><span class="p">:</span>
+                <span class="n">frames</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">y</span><span class="p">[</span><span class="n">i</span><span class="p">][:</span> <span class="n">enc</span><span class="o">.</span><span class="n">n</span><span class="p">[</span><span class="n">i</span><span class="p">]]</span>
+
+        <span class="k">if</span> <span class="n">steady</span><span class="p">:</span>
+            <span class="n">y</span> <span class="o">=</span> <span class="n">step_runner</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">static_inputs</span><span class="o">=</span><span class="p">{</span><span class="s2">"chunk"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">steady_chunks</span><span class="p">)},</span>
+                                <span class="n">request_ids</span><span class="o">=</span><span class="p">[</span><span class="n">rids</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">steady</span><span class="p">])[</span><span class="s2">"y"</span><span class="p">]</span>
+            <span class="k">for</span> <span class="n">row</span><span class="p">,</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">steady</span><span class="p">):</span>
+                <span class="n">st</span> <span class="o">=</span> <span class="n">states</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+                <span class="n">st</span><span class="o">.</span><span class="n">samples</span> <span class="o">+=</span> <span class="n">streamer</span><span class="o">.</span><span class="n">frame_samples</span>
+                <span class="n">st</span><span class="o">.</span><span class="n">mels</span> <span class="o">+=</span> <span class="n">streamer</span><span class="o">.</span><span class="n">c</span><span class="o">.</span><span class="n">subsampling_factor</span>
+                <span class="n">st</span><span class="o">.</span><span class="n">frames</span> <span class="o">+=</span> <span class="mi">1</span>
+                <span class="n">frames</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">y</span><span class="p">[</span><span class="n">row</span><span class="p">]</span>
+        <span class="c1"># One stream item per frame: a single (T, H) tensor would be ONE item,</span>
+        <span class="c1"># which the chunk policy could not slice. No check_stop, so nothing to</span>
+        <span class="c1"># copy to the host for one.</span>
+        <span class="k">return</span> <span class="n">BatchedModelOutput</span><span class="p">(</span>
+            <span class="n">per_rid_outputs</span><span class="o">=</span><span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="p">{</span><span class="s2">"audio_frame"</span><span class="p">:</span> <span class="p">[]</span> <span class="k">if</span> <span class="n">f</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">list</span><span class="p">(</span><span class="n">f</span><span class="p">)}</span>
+                             <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">rids</span><span class="p">,</span> <span class="n">frames</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)},</span>
+            <span class="n">check_stop_buffers</span><span class="o">=</span><span class="p">{},</span>
+        <span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_eager_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">enc</span><span class="p">,</span> <span class="n">kv</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The layer stack eagerly over ``enc``, on this step's plans: each call's new frames."""</span>
+        <span class="n">y</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">streamer</span><span class="o">.</span><span class="n">layers</span><span class="p">(</span><span class="n">enc</span><span class="o">.</span><span class="n">x</span><span class="p">,</span> <span class="n">kv</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device_counts</span><span class="p">(</span><span class="n">enc</span><span class="o">.</span><span class="n">n</span><span class="p">,</span> <span class="n">device</span><span class="p">))</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">row</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span> <span class="k">for</span> <span class="n">row</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">y</span><span class="p">,</span> <span class="n">enc</span><span class="o">.</span><span class="n">n</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)]</span>
 
 <div class="viewcode-block" id="ConformerEncoderSubmodule.forward">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.ConformerEncoderSubmodule.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">wav</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">lens</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NameToTensorList</span><span class="p">:</span>
-        <span class="n">audio_embeds</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">perception</span><span class="p">(</span><span class="n">wav</span><span class="p">,</span> <span class="n">lens</span><span class="p">)</span>                  <span class="c1"># (1, T, H)</span>
-        <span class="c1"># One stream item per frame: a single (T, H) tensor would be ONE item</span>
-        <span class="c1"># (the whole utterance), which the chunk policy could not slice.</span>
-        <span class="k">return</span> <span class="p">{</span><span class="s2">"audio_frame"</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">audio_embeds</span><span class="p">[</span><span class="mi">0</span><span class="p">])}</span>                <span class="c1"># T x (H,)</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NameToTensorList</span><span class="p">:</span>
+        <span class="c1"># one call's step: preprocess's lists of one row</span>
+        <span class="n">rid</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">request_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">forward_batched</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span><span class="o">.</span><span class="n">per_rid_outputs</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span></div>
 </div>
 
 
@@ -1448,6 +1769,13 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    own seeded generator, in ``preprocess`` -- so a session's speech does not</span>
 <span class="sd">    depend on its batch mates and the whole step is a CUDA graph replay for</span>
 <span class="sd">    all-decode batches.</span>
+
+<span class="sd">    The same step decodes each session's new codes to its 80 ms of PCM</span>
+<span class="sd">    (``codec_step``): the codec is causal, so the call's decoder stream state in</span>
+<span class="sd">    ``CODEC_STATE`` is all a frame needs, and a frame's audio leaves with the</span>
+<span class="sd">    step that made its codes. A call's PCM equals the full decode of its frames:</span>
+<span class="sd">    its first frame drops the overlap-add's trimmed left edge, and its last step</span>
+<span class="sd">    emits the right edge (``postprocess``).</span>
 <span class="sd">    """</span>
 
     <span class="n">disable_torch_compile</span> <span class="o">=</span> <span class="kc">True</span>
@@ -1456,12 +1784,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">GEN_KEY</span> <span class="o">=</span> <span class="s2">"talker_gen"</span>
     <span class="n">DECODE_KEY</span> <span class="o">=</span> <span class="s2">"decode"</span>            <span class="c1"># the steady-state capture's bucket key (cg_key_info)</span>
     <span class="n">SPEAKER</span> <span class="o">=</span> <span class="s2">"Aria"</span>
-    <span class="n">DECODE_CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">]</span>
+    <span class="n">DECODE_CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="n">SESSION_BATCH_SIZES</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">talker</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">NemotronDuplexConfig</span><span class="p">,</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">talker</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">NemotronDuplexConfig</span><span class="p">,</span> <span class="n">codec</span><span class="p">:</span> <span class="n">AudioCodec</span><span class="p">,</span>
                  <span class="n">subword_to_char</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">char_pad_idx</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">talker</span> <span class="o">=</span> <span class="n">talker</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">codec</span> <span class="o">=</span> <span class="n">codec</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_s2c</span> <span class="o">=</span> <span class="n">subword_to_char</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_char_pad</span> <span class="o">=</span> <span class="n">char_pad_idx</span>
@@ -1536,20 +1865,24 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="EarTTSTalkerSubmodule.prepare_inputs">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.prepare_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ARNodeInputs</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">is_final_stream_chunk</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ARNodeInputs</span><span class="p">:</span>
         <span class="c1"># The LLM streams the sampled agent text token under "new_token". A</span>
         <span class="c1"># session's first step also prefills the speaker warm-up.</span>
         <span class="n">chunk</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"new_token"</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">chunk</span><span class="p">:</span>
             <span class="n">tok</span> <span class="o">=</span> <span class="n">chunk</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="c1"># a very short clip ends the token stream on an empty chunk; run a PAD</span>
-            <span class="c1"># frame, since a skipped rid in a stream-ended loop breaks the stop</span>
+            <span class="c1"># The token stream ends on an empty chunk when its last token was</span>
+            <span class="c1"># taken before its end reached this worker (or the clip yielded no</span>
+            <span class="c1"># token). Run a PAD frame, since a skipped rid in a stream-ended loop</span>
+            <span class="c1"># breaks the stop; it only ends the loop, so postprocess drops it.</span>
             <span class="n">dev</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">talker</span><span class="o">.</span><span class="n">embed_code</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">device</span>
             <span class="n">tok</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">text_pad_id</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">)</span>
         <span class="n">first</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_first_step</span><span class="p">(</span><span class="n">fwd_info</span><span class="o">.</span><span class="n">rid_handle</span><span class="p">)</span>
         <span class="n">span</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">warmup_len</span> <span class="o">+</span> <span class="mi">1</span> <span class="k">if</span> <span class="n">first</span> <span class="k">else</span> <span class="mi">1</span>
-        <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span><span class="n">input_ids</span><span class="o">=</span><span class="n">tok</span><span class="p">,</span> <span class="n">input_seq_len</span><span class="o">=</span><span class="n">span</span><span class="p">,</span> <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"first"</span><span class="p">:</span> <span class="n">first</span><span class="p">})</span></div>
+        <span class="n">final</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">is_final_stream_chunk</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">ARNodeInputs</span><span class="p">(</span><span class="n">input_ids</span><span class="o">=</span><span class="n">tok</span><span class="p">,</span> <span class="n">input_seq_len</span><span class="o">=</span><span class="n">span</span><span class="p">,</span>
+                            <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"first"</span><span class="p">:</span> <span class="n">first</span><span class="p">,</span> <span class="s2">"final"</span><span class="p">:</span> <span class="n">final</span><span class="p">,</span> <span class="s2">"ends_loop"</span><span class="p">:</span> <span class="n">final</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">chunk</span><span class="p">})</span></div>
 
 
 <div class="viewcode-block" id="EarTTSTalkerSubmodule.declare_step">
@@ -1579,6 +1912,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">TALKER_KV</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">(</span><span class="n">combined_labels</span><span class="o">=</span><span class="p">{(</span><span class="s2">"main"</span><span class="p">,</span> <span class="s2">"uncond"</span><span class="p">):</span> <span class="n">TALKER_CFG_LABEL</span><span class="p">}),</span>
                 <span class="n">TALKER_ATTN</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">(</span><span class="n">causal</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
                 <span class="n">TALKER_POS</span><span class="p">:</span> <span class="n">PositionStep</span><span class="p">(),</span>
+                <span class="c1"># one decoded frame per session, a slot each</span>
+                <span class="n">CODEC_STATE</span><span class="p">:</span> <span class="n">RecurrentStep</span><span class="p">(</span><span class="n">segments</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span>
+                    <span class="n">Segment</span><span class="p">(</span><span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">"main"</span><span class="p">,</span> <span class="n">span</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">)),</span>
             <span class="p">},</span>
         <span class="p">)</span></div>
 
@@ -1665,9 +2001,16 @@ window.runMermaid = runMermaid;</script>
             <span class="n">num_iter</span><span class="o">=</span><span class="n">e</span><span class="o">.</span><span class="n">inference_num_iter</span><span class="p">,</span> <span class="n">guidance_scale</span><span class="o">=</span><span class="n">e</span><span class="o">.</span><span class="n">inference_guidance_scale</span><span class="p">,</span>
             <span class="n">noise_scale</span><span class="o">=</span><span class="n">e</span><span class="o">.</span><span class="n">inference_noise_scale</span><span class="p">,</span> <span class="n">top_p</span><span class="o">=</span><span class="n">e</span><span class="o">.</span><span class="n">inference_top_p</span><span class="p">,</span> <span class="n">noise</span><span class="o">=</span><span class="n">noise</span><span class="p">,</span>
         <span class="p">)</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>                                                      <span class="c1"># [N, Q]</span>
-        <span class="c1"># One copy out of the graph for the batch, a [1, Q] view per request.</span>
-        <span class="c1"># Nothing for check_stop, the stream's end stops the loop.</span>
-        <span class="k">return</span> <span class="n">BatchedModelOutput</span><span class="p">(</span><span class="n">row_outputs</span><span class="o">=</span><span class="p">{</span><span class="s2">"codec_tokens"</span><span class="p">:</span> <span class="n">codes</span><span class="p">},</span> <span class="n">check_stop_buffers</span><span class="o">=</span><span class="p">{})</span></div>
+        <span class="n">pool</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">resources</span><span class="p">[</span><span class="n">CODEC_STATE</span><span class="p">]</span>
+        <span class="n">audio</span> <span class="o">=</span> <span class="n">codec_step</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">codes</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span>
+        <span class="c1"># One copy out of the graph per name, a row view per request. Nothing</span>
+        <span class="c1"># for check_stop, the stream's end stops the loop.</span>
+        <span class="k">return</span> <span class="n">BatchedModelOutput</span><span class="p">(</span><span class="n">row_outputs</span><span class="o">=</span><span class="p">{</span>
+            <span class="s2">"codec_tokens"</span><span class="p">:</span> <span class="n">codes</span><span class="p">,</span>                                        <span class="c1"># the next frame's prev_codes</span>
+            <span class="s2">"audio_chunk"</span><span class="p">:</span> <span class="n">pcm16</span><span class="p">(</span><span class="n">audio</span><span class="o">.</span><span class="n">final</span><span class="p">),</span>                            <span class="c1"># [N, wav_to_token_ratio]</span>
+            <span class="c1"># a call's last samples, had it ended before / after this frame</span>
+            <span class="s2">"audio_end"</span><span class="p">:</span> <span class="n">pcm16</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">audio</span><span class="o">.</span><span class="n">end_before</span><span class="p">,</span> <span class="n">audio</span><span class="o">.</span><span class="n">end_after</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)),</span>
+        <span class="p">},</span> <span class="n">check_stop_buffers</span><span class="o">=</span><span class="p">{})</span></div>
 
 
 <div class="viewcode-block" id="EarTTSTalkerSubmodule.forward">
@@ -1679,147 +2022,63 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="EarTTSTalkerSubmodule.postprocess">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.postprocess">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">postprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">request_info</span><span class="p">,</span> <span class="n">outputs</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="n">inputs</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"inputs"</span><span class="p">)</span>
+        <span class="n">flags</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">kwargs</span> <span class="k">if</span> <span class="n">inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="n">flags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"ends_loop"</span><span class="p">):</span>
+            <span class="c1"># The empty final chunk's PAD frame only ends the loop (one audio</span>
+            <span class="c1"># frame per text token, as offline): it emits the call's right</span>
+            <span class="c1"># edge as it stood before this frame, or nothing for a call that</span>
+            <span class="c1"># never had a frame.</span>
+            <span class="n">end</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"audio_end"</span><span class="p">)</span>
+            <span class="n">outputs</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">end</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">flags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"first"</span><span class="p">):</span>
+                <span class="n">outputs</span><span class="p">[</span><span class="s2">"audio_chunk"</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">end</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="o">...</span><span class="p">,</span> <span class="p">:</span><span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="o">.</span><span class="n">stream_edge</span><span class="p">]]</span>
+            <span class="k">return</span>
         <span class="c1"># This frame's codes are the next frame's ``prev_codes`` (metadata only:</span>
         <span class="c1"># the tensor is already a copy out of the graph's output buffer).</span>
         <span class="k">if</span> <span class="s2">"codec_tokens"</span> <span class="ow">in</span> <span class="n">outputs</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">PREV_CODES_KEY</span><span class="p">,</span> <span class="n">outputs</span><span class="p">[</span><span class="s2">"codec_tokens"</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">PREV_CODES_KEY</span><span class="p">,</span> <span class="n">outputs</span><span class="p">[</span><span class="s2">"codec_tokens"</span><span class="p">][</span><span class="mi">0</span><span class="p">])</span>
+        <span class="k">if</span> <span class="s2">"audio_chunk"</span> <span class="ow">in</span> <span class="n">outputs</span> <span class="ow">and</span> <span class="p">(</span><span class="n">flags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"first"</span><span class="p">)</span> <span class="ow">or</span> <span class="n">flags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"final"</span><span class="p">)):</span>
+            <span class="c1"># the full decode trims the overlap-add's left edge, and ends on the</span>
+            <span class="c1"># samples after the last frame's final ones</span>
+            <span class="n">pcm</span><span class="p">,</span> <span class="n">edge</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="s2">"audio_chunk"</span><span class="p">][</span><span class="mi">0</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="o">.</span><span class="n">stream_edge</span>
+            <span class="k">if</span> <span class="n">flags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"first"</span><span class="p">):</span>
+                <span class="n">pcm</span> <span class="o">=</span> <span class="n">pcm</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">edge</span><span class="p">:]</span>
+            <span class="k">if</span> <span class="n">flags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"final"</span><span class="p">):</span>
+                <span class="n">pcm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">pcm</span><span class="p">,</span> <span class="n">outputs</span><span class="p">[</span><span class="s2">"audio_end"</span><span class="p">][</span><span class="mi">0</span><span class="p">][</span><span class="o">...</span><span class="p">,</span> <span class="n">edge</span><span class="p">:]],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+            <span class="n">outputs</span><span class="p">[</span><span class="s2">"audio_chunk"</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">pcm</span><span class="p">]</span></div>
 </div>
 
 
 
-<div class="viewcode-block" id="AudioCodecDecoderSubmodule">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.AudioCodecDecoderSubmodule">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">AudioCodecDecoderSubmodule</span><span class="p">(</span><span class="n">NodeSubmodule</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""RVQ codec decoder: talker codes -&gt; 22.05 kHz int16 PCM (streaming).</span>
-
-<span class="sd">    The codec is causal with a multi-frame receptive field, so decoding each</span>
-<span class="sd">    chunk in isolation clicks at the boundaries. Each request keeps a rolling</span>
-<span class="sd">    context of its previous ``codec_left_context_frames`` code frames (in its</span>
-<span class="sd">    ``PerRequestState``); a chunk of NEW frames is decoded as ``context + new``</span>
-<span class="sd">    and only the new frames' samples are emitted. Same "decode with left</span>
-<span class="sd">    context, emit the tail" math as the verified standalone path, but O(1) per</span>
-<span class="sd">    chunk instead of re-decoding the whole history. The inverse STFT's last</span>
-<span class="sd">    ``n_fft - hop`` samples of a window still lack the following frames'</span>
-<span class="sd">    overlap, so a chunk holds those samples back and the next chunk emits them</span>
-<span class="sd">    recomputed with its context: the emitted stream is the full-history decode</span>
-<span class="sd">    sample for sample; the final chunk emits its held tail too.</span>
-<span class="sd">    Requests whose windows have the same length are decoded in one batched</span>
-<span class="sd">    call. Declares no resources.</span>
-<span class="sd">    """</span>
-
-    <span class="c1"># Per-request context is keyed by request id -&gt; eager; fp32 codec.</span>
-    <span class="n">disable_torch_compile</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="n">disable_autocast</span> <span class="o">=</span> <span class="kc">True</span>
-
-    <span class="n">CONTEXT_KEY</span> <span class="o">=</span> <span class="s2">"codec_ctx"</span>
-    <span class="n">TAIL_KEY</span> <span class="o">=</span> <span class="s2">"codec_tail"</span>              <span class="c1"># the last chunk's held-back samples, int16</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">codec</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">NemotronDuplexConfig</span><span class="p">):</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">codec</span> <span class="o">=</span> <span class="n">codec</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
-        <span class="c1"># samples at a window's right edge without their overlap-add partners</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_hold</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">codec</span><span class="p">,</span> <span class="s2">"n_fft"</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span> <span class="o">-</span> <span class="nb">int</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">codec</span><span class="p">,</span> <span class="s2">"hop_length"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)),</span> <span class="mi">0</span><span class="p">)</span>
-
-<div class="viewcode-block" id="AudioCodecDecoderSubmodule.prepare_inputs">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.AudioCodecDecoderSubmodule.prepare_inputs">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">is_final_stream_chunk</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputs</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="c1"># ``codec_tokens`` is this chunk's NEW RVQ frames (T_new, num_q); the</span>
-        <span class="c1"># Talker-&gt;Codec connection is a non-overlapping FixedChunkPolicy, so the</span>
-        <span class="c1"># left context comes from per-request state, not the stream.</span>
-        <span class="n">flush</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"flush"</span><span class="p">:</span> <span class="nb">bool</span><span class="p">(</span><span class="n">is_final_stream_chunk</span><span class="p">)}</span>
-        <span class="n">chunk</span> <span class="o">=</span> <span class="n">inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"codec_tokens"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">chunk</span><span class="p">:</span>
-            <span class="c1"># a frame count divisible by the chunk size ends on an empty final</span>
-            <span class="c1"># chunk; run it to flush the tail. Skipping it hangs a batched stream</span>
-            <span class="k">return</span> <span class="n">NodeInputs</span><span class="p">(</span><span class="n">kwargs</span><span class="o">=</span><span class="n">flush</span><span class="p">)</span> <span class="k">if</span> <span class="n">is_final_stream_chunk</span> <span class="k">else</span> <span class="kc">None</span>
-        <span class="n">codes</span> <span class="o">=</span> <span class="n">chunk</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-        <span class="k">if</span> <span class="n">codes</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">3</span><span class="p">:</span>
-            <span class="c1"># the stream stacks the talker's [1, num_q] frames to (T_new, 1, num_q);</span>
-            <span class="c1"># a whole window handed over at once is (1, T_new, num_q)</span>
-            <span class="n">codes</span> <span class="o">=</span> <span class="n">codes</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">codes</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>                  <span class="c1"># (T_new, num_q)</span>
-        <span class="k">elif</span> <span class="n">codes</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="n">codes</span> <span class="o">=</span> <span class="n">codes</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>                                  <span class="c1"># single frame -&gt; (1, num_q)</span>
-        <span class="k">return</span> <span class="n">NodeInputs</span><span class="p">(</span><span class="n">tensor_inputs</span><span class="o">=</span><span class="p">{</span><span class="s2">"codes"</span><span class="p">:</span> <span class="n">codes</span><span class="p">},</span> <span class="n">kwargs</span><span class="o">=</span><span class="n">flush</span><span class="p">,</span> <span class="n">input_seq_len</span><span class="o">=</span><span class="n">codes</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span></div>
+<div class="viewcode-block" id="codec_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.codec_step">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">codec_step</span><span class="p">(</span><span class="n">codec</span><span class="p">:</span> <span class="n">AudioCodec</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">codes</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CodecStreamAudio</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Decode each row's next code frames ``[B, T, num_quantizers]`` against its</span>
+<span class="sd">    stream state in ``pool`` (``CODEC_STATE``, at the step's rows):</span>
+<span class="sd">    gather the state, decode only the new frames, scatter the state back. A</span>
+<span class="sd">    fresh slot is zeros, the decoder's causal padding, so a call's first frame</span>
+<span class="sd">    needs nothing else. Fixed-shape, so a graph captures it."""</span>
+    <span class="n">blocks</span> <span class="o">=</span> <span class="n">codec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_blocks</span>
+    <span class="n">stages</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">codec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">channels</span><span class="p">)</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span><span class="n">device_type</span><span class="o">=</span><span class="n">codes</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span><span class="p">,</span> <span class="n">enabled</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+        <span class="n">state</span> <span class="o">=</span> <span class="n">CodecStreamState</span><span class="p">(</span>
+            <span class="n">tails</span><span class="o">=</span><span class="p">[</span><span class="n">t</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">stages</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">pool</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="sa">f</span><span class="s2">"stage</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span><span class="o">.</span><span class="n">unbind</span><span class="p">(</span><span class="mi">1</span><span class="p">)],</span>
+            <span class="n">overlap</span><span class="o">=</span><span class="n">pool</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="s2">"overlap"</span><span class="p">),</span>
+        <span class="p">)</span>
+        <span class="n">audio</span><span class="p">,</span> <span class="n">state</span> <span class="o">=</span> <span class="n">codec</span><span class="o">.</span><span class="n">decode_stream</span><span class="p">(</span><span class="n">codes</span><span class="p">,</span> <span class="n">state</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">stages</span><span class="p">):</span>
+            <span class="n">tails</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">state</span><span class="o">.</span><span class="n">tails</span><span class="p">[</span><span class="n">i</span> <span class="o">*</span> <span class="n">blocks</span><span class="p">:(</span><span class="n">i</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">blocks</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+            <span class="n">pool</span><span class="o">.</span><span class="n">scatter_</span><span class="p">(</span><span class="sa">f</span><span class="s2">"stage</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">tails</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pool</span><span class="o">.</span><span class="n">block</span><span class="p">(</span><span class="sa">f</span><span class="s2">"stage</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">dtype</span><span class="p">))</span>
+        <span class="n">pool</span><span class="o">.</span><span class="n">scatter_</span><span class="p">(</span><span class="s2">"overlap"</span><span class="p">,</span> <span class="n">state</span><span class="o">.</span><span class="n">overlap</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">audio</span></div>
 
 
-<div class="viewcode-block" id="AudioCodecDecoderSubmodule.preprocess">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.AudioCodecDecoderSubmodule.preprocess">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">preprocess</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">inputs</span><span class="p">):</span>
-        <span class="k">return</span> <span class="p">{</span>
-            <span class="s2">"codes"</span><span class="p">:</span> <span class="p">[</span><span class="n">inp</span><span class="o">.</span><span class="n">tensor_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"codes"</span><span class="p">)</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">],</span>
-            <span class="s2">"flush"</span><span class="p">:</span> <span class="p">[</span><span class="n">inp</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"flush"</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">],</span>
-        <span class="p">}</span></div>
 
-
-<div class="viewcode-block" id="AudioCodecDecoderSubmodule.can_batch">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.AudioCodecDecoderSubmodule.can_batch">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">can_batch</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">,</span> <span class="n">model_inputs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">True</span></div>
-
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">_window</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">codes</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">"""This request's ``context + new`` code window and its context length."""</span>
-        <span class="n">prev</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">CONTEXT_KEY</span><span class="p">)</span>             <span class="c1"># (n_ctx, num_q) or None</span>
-        <span class="k">if</span> <span class="n">prev</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">codes</span><span class="p">,</span> <span class="mi">0</span>
-        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">prev</span><span class="p">,</span> <span class="n">codes</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span> <span class="n">prev</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
-
-<div class="viewcode-block" id="AudioCodecDecoderSubmodule.forward_batched">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.AudioCodecDecoderSubmodule.forward_batched">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward_batched</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">codes</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NameToTensorList</span><span class="p">]:</span>
-        <span class="n">lc</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">eartts</span><span class="o">.</span><span class="n">codec_left_context_frames</span>
-        <span class="n">rids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">engine_inputs</span><span class="o">.</span><span class="n">request_ids</span><span class="p">)</span>
-        <span class="n">flush</span> <span class="o">=</span> <span class="n">flush</span> <span class="ow">or</span> <span class="p">[</span><span class="kc">False</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">rids</span><span class="p">)</span>
-        <span class="n">out</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NameToTensorList</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="n">windows</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">c</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="nb">zip</span><span class="p">(</span><span class="n">rids</span><span class="p">,</span> <span class="n">codes</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)):</span>
-            <span class="k">if</span> <span class="n">c</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="c1"># an empty final chunk: nothing to decode, emit what was held</span>
-                <span class="n">tail</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">TAIL_KEY</span><span class="p">)</span>
-                <span class="n">out</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"audio_chunk"</span><span class="p">:</span> <span class="p">[</span><span class="n">tail</span> <span class="k">if</span> <span class="n">tail</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int16</span><span class="p">)]}</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">windows</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_window</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">c</span><span class="p">)</span>
-        <span class="c1"># one decode per distinct window length (steady state: every request is</span>
-        <span class="c1"># at the full context + chunk length, so one call for the whole batch)</span>
-        <span class="n">by_len</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="p">(</span><span class="n">full</span><span class="p">,</span> <span class="n">_</span><span class="p">)</span> <span class="ow">in</span> <span class="n">windows</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="n">by_len</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">full</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
-        <span class="k">for</span> <span class="n">tf</span><span class="p">,</span> <span class="n">idxs</span> <span class="ow">in</span> <span class="n">by_len</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="n">batch</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">windows</span><span class="p">[</span><span class="n">i</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">idxs</span><span class="p">])</span><span class="o">.</span><span class="n">long</span><span class="p">()</span>   <span class="c1"># (G, Tf, num_q)</span>
-            <span class="n">code_len</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="nb">len</span><span class="p">(</span><span class="n">idxs</span><span class="p">),),</span> <span class="n">tf</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">batch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
-            <span class="n">audio</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">code_len</span><span class="p">)</span>               <span class="c1"># (G, 1, samples)</span>
-            <span class="n">wav</span> <span class="o">=</span> <span class="n">audio</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>                                      <span class="c1"># (G, samples)</span>
-            <span class="n">spf</span> <span class="o">=</span> <span class="n">wav</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">//</span> <span class="n">tf</span>                                    <span class="c1"># samples per frame</span>
-            <span class="k">for</span> <span class="n">row</span><span class="p">,</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">idxs</span><span class="p">):</span>
-                <span class="n">full</span><span class="p">,</span> <span class="n">n_ctx</span> <span class="o">=</span> <span class="n">windows</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
-                <span class="c1"># the new frames' samples, less the right edge held for the next</span>
-                <span class="c1"># chunk, plus the previous chunk's held edge now that its</span>
-                <span class="c1"># overlap partners exist (a first chunk has nothing held)</span>
-                <span class="n">start</span> <span class="o">=</span> <span class="n">n_ctx</span> <span class="o">*</span> <span class="n">spf</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hold</span> <span class="k">if</span> <span class="n">n_ctx</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">else</span> <span class="mi">0</span>
-                <span class="n">end</span> <span class="o">=</span> <span class="n">wav</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">if</span> <span class="n">flush</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">else</span> <span class="n">wav</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hold</span>
-                <span class="n">pcm</span> <span class="o">=</span> <span class="p">(</span><span class="n">wav</span><span class="p">[</span><span class="n">row</span><span class="p">,</span> <span class="n">start</span><span class="p">:]</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mi">32767</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int16</span><span class="p">)</span>
-                <span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">rids</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
-                <span class="n">state</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">CONTEXT_KEY</span><span class="p">,</span> <span class="n">full</span><span class="p">[</span><span class="o">-</span><span class="n">lc</span><span class="p">:]</span><span class="o">.</span><span class="n">detach</span><span class="p">())</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hold</span><span class="p">:</span>
-                    <span class="n">state</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">TAIL_KEY</span><span class="p">,</span> <span class="n">pcm</span><span class="p">[</span><span class="n">end</span> <span class="o">-</span> <span class="n">start</span> <span class="p">:])</span>
-                <span class="n">out</span><span class="p">[</span><span class="n">rids</span><span class="p">[</span><span class="n">i</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"audio_chunk"</span><span class="p">:</span> <span class="p">[</span><span class="n">pcm</span><span class="p">[:</span> <span class="n">end</span> <span class="o">-</span> <span class="n">start</span><span class="p">]]}</span>
-        <span class="k">return</span> <span class="n">out</span></div>
-
-
-<div class="viewcode-block" id="AudioCodecDecoderSubmodule.forward">
-<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.AudioCodecDecoderSubmodule.forward">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">codes</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NameToTensorList</span><span class="p">:</span>
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">codes</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>                              <span class="c1"># one request's window</span>
-            <span class="n">codes</span> <span class="o">=</span> <span class="p">[</span><span class="n">codes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">codes</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">3</span> <span class="k">else</span> <span class="n">codes</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">codes</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])]</span>
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">flush</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
-            <span class="n">flush</span> <span class="o">=</span> <span class="p">[</span><span class="n">flush</span><span class="p">]</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">forward_batched</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">codes</span><span class="o">=</span><span class="n">codes</span><span class="p">,</span> <span class="n">flush</span><span class="o">=</span><span class="n">flush</span><span class="p">)[</span><span class="n">engine_inputs</span><span class="o">.</span><span class="n">request_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span></div>
-</div>
+<div class="viewcode-block" id="pcm16">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.pcm16">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">pcm16</span><span class="p">(</span><span class="n">wav</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">wav</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="mi">32767</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int16</span><span class="p">)</span></div>
 
 </pre></div>
 

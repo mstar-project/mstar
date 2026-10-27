@@ -25,7 +25,11 @@ Communication
        this can be set per-process while the rest of the mesh stays on
        pyzmq. Under ``MSTAR_RUST_GRAPH=AUTO``, ``0`` also keeps that
        worker's graph runtime on Python -- the Rust one cannot share a
-       pyzmq transport.
+       pyzmq transport. An extension built before 0.1.1 has no
+       non-blocking ``try_send``, which the API server's preprocess thread
+       sends with: for that thread alone, ``AUTO`` then uses pyzmq with a
+       warning and ``1`` raises, asking for a rebuild. The conductor, the
+       workers and the rest of the API server keep the Rust transport.
    * - ``MSTAR_RUST_GRAPH``
      - ``AUTO``
      - Which graph runtime a worker builds (see
@@ -354,7 +358,11 @@ Read by the ``mstar-server`` binary and its bridge
 Rust frontend limitations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The Rust frontend carries no audio encoder or media muxer (the Python frontend
+The Rust frontend serves no ``/generate/ws``, so a model's live client input
+(appends to a running request, see :doc:`clients`) needs the Python frontend;
+over ``/generate`` such a model's input ends when the request is submitted.
+
+It also carries no audio encoder or media muxer (the Python frontend
 uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
 
 * ``/v1/audio/speech`` produces only ``wav`` and ``pcm``. Any other

@@ -1247,7 +1247,21 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FAIL_REQUESTS</span> <span class="o">=</span> <span class="s2">"fail_requests"</span>
     <span class="n">READS_DONE</span> <span class="o">=</span> <span class="s2">"reads_done"</span>
     <span class="n">WORKER_STATUS</span> <span class="o">=</span> <span class="s2">"worker_status"</span>
-    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span></div>
+    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span>
+    <span class="n">CLIENT_STREAM_INPUT</span> <span class="o">=</span> <span class="s2">"client_stream_input"</span></div>
+
+
+
+<div class="viewcode-block" id="ClientStreamInput">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ClientStreamInput">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ClientStreamInput</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The next chunk of a running request's client streams (see</span>
+<span class="sd">    ``mstar.streaming.topology.CLIENT``): stored tensors by edge name, and</span>
+<span class="sd">    the streams that end after it. An ended stream takes no more chunks."""</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">signals</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">ended</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
 
 
 
@@ -1263,7 +1277,11 @@ window.runMermaid = runMermaid;</script>
     <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span>
     <span class="c1"># The client's request_id. ``request_id`` is the API server's key for this</span>
     <span class="c1"># one submission, never reused; the seed still derives from the client's.</span>
-    <span class="n">client_request_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">client_request_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># For a model with client streams, the opening's own client input: its</span>
+    <span class="c1"># first chunk and the streams it ends, forwarded once the request is</span>
+    <span class="c1"># admitted. A stream it leaves open makes it a live call.</span>
+    <span class="n">client_input</span><span class="p">:</span> <span class="n">ClientStreamInput</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 

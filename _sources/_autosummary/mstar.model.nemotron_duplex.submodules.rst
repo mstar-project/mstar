@@ -9,6 +9,13 @@ mstar.model.nemotron\_duplex.submodules
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      codec_step
+      pcm16
+   
    
 
    
@@ -17,7 +24,6 @@ mstar.model.nemotron\_duplex.submodules
 
    .. autosummary::
    
-      AudioCodecDecoderSubmodule
       ConformerEncoderSubmodule
       EarTTSTalkerSubmodule
       NemotronHLLMSubmodule

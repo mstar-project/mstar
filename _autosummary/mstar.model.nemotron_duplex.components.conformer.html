@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.model.nemotron_duplex.components.rnnt" href="mstar.model.nemotron_duplex.components.rnnt.html" />
+    <link rel="next" title="mstar.model.nemotron_duplex.components.dft" href="mstar.model.nemotron_duplex.components.dft.html" />
     <link rel="prev" title="mstar.model.nemotron_duplex.components.audio_codec" href="mstar.model.nemotron_duplex.components.audio_codec.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -660,9 +660,23 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerLayer.forward"><code class="docutils literal notranslate"><span class="pre">ConformerLayer.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.advance"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.advance()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.front"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.front()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.is_steady"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.is_steady()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.layers"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.layers()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.new_frames"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.new_frames()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.steady_step"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.steady_step()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConvSubsampling"><code class="docutils literal notranslate"><span class="pre">ConvSubsampling</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConvSubsampling.calc_length"><code class="docutils literal notranslate"><span class="pre">ConvSubsampling.calc_length()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConvSubsampling.forward"><code class="docutils literal notranslate"><span class="pre">ConvSubsampling.forward()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs"><code class="docutils literal notranslate"><span class="pre">EncoderInputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs.n"><code class="docutils literal notranslate"><span class="pre">EncoderInputs.n</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs.x"><code class="docutils literal notranslate"><span class="pre">EncoderInputs.x</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.Perception"><code class="docutils literal notranslate"><span class="pre">Perception</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -675,6 +689,19 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.Preprocessor.forward"><code class="docutils literal notranslate"><span class="pre">Preprocessor.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState"><code class="docutils literal notranslate"><span class="pre">StreamState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.frames"><code class="docutils literal notranslate"><span class="pre">StreamState.frames</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.mels"><code class="docutils literal notranslate"><span class="pre">StreamState.mels</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.position"><code class="docutils literal notranslate"><span class="pre">StreamState.position</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.samples"><code class="docutils literal notranslate"><span class="pre">StreamState.samples</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.device_counts"><code class="docutils literal notranslate"><span class="pre">device_counts()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.encoder_kv_config"><code class="docutils literal notranslate"><span class="pre">encoder_kv_config()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.encoder_state_blocks"><code class="docutils literal notranslate"><span class="pre">encoder_state_blocks()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.final_encoder_frames"><code class="docutils literal notranslate"><span class="pre">final_encoder_frames()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.final_mel_frames"><code class="docutils literal notranslate"><span class="pre">final_mel_frames()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.front_state_blocks"><code class="docutils literal notranslate"><span class="pre">front_state_blocks()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -703,6 +730,30 @@ LayerNorm over channels – which is why the checkpoint has only weight+bias and
 no running stats), Macaron 0.5 FF scaling, <code class="docutils literal notranslate"><span class="pre">xscaling=False</span></code>, <code class="docutils literal notranslate"><span class="pre">use_bias=False</span></code>
 on all FF/attn/conv linears, Swish (SiLU) activations, mel power spectrum with
 preemphasis 0.97.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.device_counts" title="mstar.model.nemotron_duplex.components.conformer.device_counts"><code class="xref py py-obj docutils literal notranslate"><span class="pre">device_counts</span></code></a>(values, device)</p></td>
+<td><p>Host counts on the device without a blocking copy, which would wait for every kernel queued ahead of this step.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.encoder_kv_config" title="mstar.model.nemotron_duplex.components.conformer.encoder_kv_config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">encoder_kv_config</span></code></a>(config, max_slots)</p></td>
+<td><p>A call's attention keys and values, per layer: each new frame attends the <code class="docutils literal notranslate"><span class="pre">att_context_size[0]</span></code> frames before it and itself, so the KV keeps that many.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.encoder_state_blocks" title="mstar.model.nemotron_duplex.components.conformer.encoder_state_blocks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">encoder_state_blocks</span></code></a>(config[, dtype])</p></td>
+<td><p>A call's conv state, per layer: the last <code class="docutils literal notranslate"><span class="pre">kernel</span> <span class="pre">-</span> <span class="pre">1</span></code> inputs of its depthwise conv (its attention window is the bounded KV, <code class="docutils literal notranslate"><span class="pre">ENCODER_KV</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.final_encoder_frames" title="mstar.model.nemotron_duplex.components.conformer.final_encoder_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">final_encoder_frames</span></code></a>(config, mels, samples, ...)</p></td>
+<td><p>Encoder frames that no later audio can change, given at least one mel frame: frame <code class="docutils literal notranslate"><span class="pre">j</span></code> reads mel frames up to <code class="docutils literal notranslate"><span class="pre">8</span> <span class="pre">*</span> <span class="pre">j</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.final_mel_frames" title="mstar.model.nemotron_duplex.components.conformer.final_mel_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">final_mel_frames</span></code></a>(config, samples, final)</p></td>
+<td><p>Mel frames whose 512-sample window is complete, for a call of more than <code class="docutils literal notranslate"><span class="pre">n_fft/2</span></code> samples: frame m spans <code class="docutils literal notranslate"><span class="pre">[m</span> <span class="pre">*</span> <span class="pre">hop</span> <span class="pre">-</span> <span class="pre">n_fft/2,</span> <span class="pre">m</span> <span class="pre">*</span> <span class="pre">hop</span> <span class="pre">+</span> <span class="pre">n_fft/2)</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.front_state_blocks" title="mstar.model.nemotron_duplex.components.conformer.front_state_blocks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">front_state_blocks</span></code></a>(config)</p></td>
+<td><p>A call's front-end state, all a later step reads: its newest preemphasized samples (<code class="docutils literal notranslate"><span class="pre">sig</span></code>; every sample until its first mel frame, then the window of the next one), its newest mel frames (<code class="docutils literal notranslate"><span class="pre">mel</span></code>; the subsampling window of the next encoder frame) and its last raw sample, for the preemphasis.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -712,14 +763,23 @@ preemphasis 0.97.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.ConformerLayer" title="mstar.model.nemotron_duplex.components.conformer.ConformerLayer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ConformerLayer</span></code></a>(config)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.ConvSubsampling" title="mstar.model.nemotron_duplex.components.conformer.ConvSubsampling"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ConvSubsampling</span></code></a>(config)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer" title="mstar.model.nemotron_duplex.components.conformer.ConformerStreamer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ConformerStreamer</span></code></a>(perception)</p></td>
+<td><p>Runs a <code class="docutils literal notranslate"><span class="pre">Perception</span></code> incrementally over a batch of calls, matching what it computes over each whole call up to float rounding: about 1e-6 in fp32, about 1% relative in bf16, where each chunking takes different kernel shapes.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.ConvSubsampling" title="mstar.model.nemotron_duplex.components.conformer.ConvSubsampling"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ConvSubsampling</span></code></a>(config)</p></td>
 <td><p>Causal dw-striding subsampling (factor 8): CausalConv2d, ReLU, (depthwise CausalConv2d, pointwise, ReLU) x2 -&gt; Linear(4352 -&gt; d_model).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs" title="mstar.model.nemotron_duplex.components.conformer.EncoderInputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">EncoderInputs</span></code></a>(x, n)</p></td>
+<td><p>A step's new encoder-input frames, <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">(B,</span> <span class="pre">t,</span> <span class="pre">D)</span></code> zero-padded to the most any call got, and per call its new ones.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.Perception" title="mstar.model.nemotron_duplex.components.conformer.Perception"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Perception</span></code></a>([config])</p></td>
 <td><p>Full perception stack: preprocessor + conformer encoder + LLM projection.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.Preprocessor" title="mstar.model.nemotron_duplex.components.conformer.Preprocessor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Preprocessor</span></code></a>(config)</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.StreamState" title="mstar.model.nemotron_duplex.components.conformer.StreamState"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamState</span></code></a>()</p></td>
+<td><p>One call's place in its audio stream: host counters, which drive every slice so a step needs no sync.</p></td>
 </tr>
 </tbody>
 </table>
@@ -788,6 +848,167 @@ registered hooks while the latter silently ignores them.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.ConformerStreamer">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">ConformerStreamer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">perception</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#ConformerStreamer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Runs a <code class="docutils literal notranslate"><span class="pre">Perception</span></code> incrementally over a batch of calls, matching what it
+computes over each whole call up to float rounding: about 1e-6 in fp32, about
+1% relative in bf16, where each chunking takes different kernel shapes.</p>
+<ul class="simple">
+<li><p>Mel: frames are computed once their window is complete, from the
+preemphasized signal, with the featurizer’s own ops.</p></li>
+<li><p>Subsampling: the strided convs are recomputed over a window that starts
+16 mel frames before the first new output frame. An output frame reads
+15 mel frames, so the first two outputs of the window are discarded and
+the rest are exact; the window starts on a multiple of 8 so the strides
+line up with the offline ones.</p></li>
+<li><p>Layers: each new frame attends the 70 frames before it and itself in the
+bounded KV, which keeps a call’s last 70 keys/values per layer; the
+depthwise conv reads its cached last 8 inputs.</p></li>
+</ul>
+<p>A call’s state is its host counters (<code class="docutils literal notranslate"><span class="pre">StreamState</span></code>), two pool slots, the
+front end’s (<code class="docutils literal notranslate"><span class="pre">front_state_blocks</span></code>) and the conv tails
+(<code class="docutils literal notranslate"><span class="pre">encoder_state_blocks</span></code>), and its bounded-KV slot. The resources’ plans
+for a step come from the positions its declaration gives
+(<code class="docutils literal notranslate"><span class="pre">StreamState.frames</span></code>). <code class="docutils literal notranslate"><span class="pre">steady_step</span></code> is a whole step for calls that
+append exactly one frame of audio, all device work over fixed shapes, so it
+can replay as a CUDA graph; <code class="docutils literal notranslate"><span class="pre">front</span></code> + <code class="docutils literal notranslate"><span class="pre">layers</span></code> take any step.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>perception</strong> (<a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.Perception" title="mstar.model.nemotron_duplex.components.conformer.Perception"><em>Perception</em></a>)</p>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.advance">
+<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">advance</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enc</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#ConformerStreamer.advance"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.advance" title="Link to this definition">#</a></dt>
+<dd><p>Count the step’s frames into each call’s state, once its layers ran.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>sts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.StreamState" title="mstar.model.nemotron_duplex.components.conformer.StreamState"><em>StreamState</em></a><em>]</em>)</p></li>
+<li><p><strong>enc</strong> (<a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs" title="mstar.model.nemotron_duplex.components.conformer.EncoderInputs"><em>EncoderInputs</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.front">
+<span class="sig-name descname"><span class="pre">front</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sts</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunks</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">final</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">n</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">front</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#ConformerStreamer.front"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.front" title="Link to this definition">#</a></dt>
+<dd><p>Append each call’s chunk; the <code class="docutils literal notranslate"><span class="pre">n</span></code> encoder-input frames it made final
+(<code class="docutils literal notranslate"><span class="pre">new_frames</span></code>, counted before the step), or None when no call has one.
+A call with no chunk and not at its end is left as it is.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>sts</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.StreamState" title="mstar.model.nemotron_duplex.components.conformer.StreamState"><em>StreamState</em></a><em>]</em>)</p></li>
+<li><p><strong>chunks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>torch.Tensor</em></a><em> | </em><em>None</em><em>]</em>)</p></li>
+<li><p><strong>final</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>]</em>)</p></li>
+<li><p><strong>n</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>front</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool" title="mstar.engine.resources.recurrent.RecurrentStatePool"><em>RecurrentStatePool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs" title="mstar.model.nemotron_duplex.components.conformer.EncoderInputs">EncoderInputs</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.is_steady">
+<span class="sig-name descname"><span class="pre">is_steady</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">st</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">final</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#ConformerStreamer.is_steady"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.is_steady" title="Link to this definition">#</a></dt>
+<dd><p>Whether <code class="docutils literal notranslate"><span class="pre">steady_step</span></code> serves this call’s step: one frame of audio
+onto a call already two frames in, on the frame grid.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>st</strong> (<a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.StreamState" title="mstar.model.nemotron_duplex.components.conformer.StreamState"><em>StreamState</em></a>)</p></li>
+<li><p><strong>chunk</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>final</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.layers">
+<span class="sig-name descname"><span class="pre">layers</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">n</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#ConformerStreamer.layers"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.layers" title="Link to this definition">#</a></dt>
+<dd><p>The layer stack over <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">(B,</span> <span class="pre">t,</span> <span class="pre">D)</span></code> and the projection. Attention
+runs on <code class="docutils literal notranslate"><span class="pre">kv</span></code> under the plan its step declared; the conv tails are read
+and written in <code class="docutils literal notranslate"><span class="pre">pool</span></code> at its step’s rows. <code class="docutils literal notranslate"><span class="pre">n</span></code> is each call’s new frames,
+a device <code class="docutils literal notranslate"><span class="pre">(B,)</span></code> count (<code class="docutils literal notranslate"><span class="pre">n</span> <span class="pre">&lt;=</span> <span class="pre">t</span></code>; a call with none keeps its conv
+tails as they were).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>kv</strong> (<a class="reference internal" href="mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager" title="mstar.engine.resources.kv.bounded.manager.BoundedKVManager"><em>BoundedKVManager</em></a>)</p></li>
+<li><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool" title="mstar.engine.resources.recurrent.RecurrentStatePool"><em>RecurrentStatePool</em></a>)</p></li>
+<li><p><strong>n</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>torch.Tensor</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)">torch.Tensor</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.new_frames">
+<span class="sig-name descname"><span class="pre">new_frames</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">st</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">samples</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">final</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#ConformerStreamer.new_frames"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.new_frames" title="Link to this definition">#</a></dt>
+<dd><p>The encoder frames a step makes final for a call at <code class="docutils literal notranslate"><span class="pre">st</span></code> that then
+has <code class="docutils literal notranslate"><span class="pre">samples</span></code> of audio, counted on the host before the step runs, so
+its declaration can name them and <code class="docutils literal notranslate"><span class="pre">front</span></code> make them. Also without a
+new mel frame: the end of the call can make its last frame final.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>st</strong> (<a class="reference internal" href="#mstar.model.nemotron_duplex.components.conformer.StreamState" title="mstar.model.nemotron_duplex.components.conformer.StreamState"><em>StreamState</em></a>)</p></li>
+<li><p><strong>samples</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>final</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.steady_step">
+<span class="sig-name descname"><span class="pre">steady_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">chunk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">front</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#ConformerStreamer.steady_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.steady_step" title="Link to this definition">#</a></dt>
+<dd><p>One frame for each call, from <code class="docutils literal notranslate"><span class="pre">chunk</span> <span class="pre">(B,</span> <span class="pre">frame_samples)</span></code>: the new
+mel frames, the subsampling window and the layers, all on the device.
+It is captured, so its STFT is a matmul: a graph must not hold a cuFFT
+plan, which the plan cache can destroy (see <code class="docutils literal notranslate"><span class="pre">dft</span></code>).</p>
+<p>A call <code class="docutils literal notranslate"><span class="pre">S</span> <span class="pre">=</span> <span class="pre">(k</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">fs</span></code> samples in has <code class="docutils literal notranslate"><span class="pre">8(k</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">-</span> <span class="pre">1</span></code> mel frames and
+<code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">-</span> <span class="pre">1</span></code> encoder frames. This frame of audio adds mel frames
+<code class="docutils literal notranslate"><span class="pre">8k</span> <span class="pre">-</span> <span class="pre">9</span> <span class="pre">..</span> <span class="pre">8k</span> <span class="pre">-</span> <span class="pre">2</span></code> and encoder frame <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">-</span> <span class="pre">1</span></code>, whose subsampling
+window is the 15 mel frames before them plus them (the third output).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>chunk</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>torch.Tensor</em></a>)</p></li>
+<li><p><strong>front</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool" title="mstar.engine.resources.recurrent.RecurrentStatePool"><em>RecurrentStatePool</em></a>)</p></li>
+<li><p><strong>kv</strong> (<a class="reference internal" href="mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager" title="mstar.engine.resources.kv.bounded.manager.BoundedKVManager"><em>BoundedKVManager</em></a>)</p></li>
+<li><p><strong>pool</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.html#mstar.engine.resources.recurrent.RecurrentStatePool" title="mstar.engine.resources.recurrent.RecurrentStatePool"><em>RecurrentStatePool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)">torch.Tensor</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.ConvSubsampling">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">ConvSubsampling</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#ConvSubsampling"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.ConvSubsampling" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
@@ -831,6 +1052,34 @@ registered hooks while the latter silently ignores them.</p>
 </ul>
 </dd>
 </dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.EncoderInputs">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">EncoderInputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">n</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#EncoderInputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>A step’s new encoder-input frames, <code class="docutils literal notranslate"><span class="pre">x</span> <span class="pre">(B,</span> <span class="pre">t,</span> <span class="pre">D)</span></code> zero-padded to the
+most any call got, and per call its new ones.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>n</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.EncoderInputs.n">
+<span class="sig-name descname"><span class="pre">n</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs.n" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.EncoderInputs.x">
+<span class="sig-name descname"><span class="pre">x</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs.x" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
 </dd></dl>
 
 </dd></dl>
@@ -907,6 +1156,150 @@ registered hooks while the latter silently ignores them.</p>
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.StreamState">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">StreamState</span></span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#StreamState"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.StreamState" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>One call’s place in its audio stream: host counters, which drive every
+slice so a step needs no sync. The audio and mel frames a later step still
+reads live in the <code class="docutils literal notranslate"><span class="pre">front</span></code> pool (<code class="docutils literal notranslate"><span class="pre">front_state_blocks</span></code>).</p>
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.StreamState.frames">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">frames</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.frames" title="Link to this definition">#</a></dt>
+<dd><p>Encoder frames emitted.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.StreamState.mels">
+<span class="sig-name descname"><span class="pre">mels</span></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.mels" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.StreamState.position">
+<span class="sig-name descname"><span class="pre">position</span></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.position" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.StreamState.samples">
+<span class="sig-name descname"><span class="pre">samples</span></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.samples" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.device_counts">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">device_counts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">values</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#device_counts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.device_counts" title="Link to this definition">#</a></dt>
+<dd><p>Host counts on the device without a blocking copy, which would wait for
+every kernel queued ahead of this step.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.encoder_kv_config">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">encoder_kv_config</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_slots</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#encoder_kv_config"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.encoder_kv_config" title="Link to this definition">#</a></dt>
+<dd><p>A call’s attention keys and values, per layer: each new frame attends the
+<code class="docutils literal notranslate"><span class="pre">att_context_size[0]</span></code> frames before it and itself, so the KV keeps that
+many. In the engine’s compute dtype, as <code class="docutils literal notranslate"><span class="pre">encoder_state_blocks</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.ConformerSTTConfig" title="mstar.model.nemotron_duplex.config.ConformerSTTConfig"><em>ConformerSTTConfig</em></a>)</p></li>
+<li><p><strong>max_slots</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.kv.bounded.config.html#mstar.engine.resources.kv.bounded.config.BoundedKVConfig" title="mstar.engine.resources.kv.bounded.config.BoundedKVConfig"><em>BoundedKVConfig</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.encoder_state_blocks">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">encoder_state_blocks</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#encoder_state_blocks"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.encoder_state_blocks" title="Link to this definition">#</a></dt>
+<dd><p>A call’s conv state, per layer: the last <code class="docutils literal notranslate"><span class="pre">kernel</span> <span class="pre">-</span> <span class="pre">1</span></code> inputs of its
+depthwise conv (its attention window is the bounded KV, <code class="docutils literal notranslate"><span class="pre">ENCODER_KV</span></code>).
+By default in the engine’s compute dtype, which the layers compute it in:
+stored in another, a call’s frames drift from the offline ones.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.ConformerSTTConfig" title="mstar.model.nemotron_duplex.config.ConformerSTTConfig"><em>ConformerSTTConfig</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.config.RecurrentBlockConfig" title="mstar.engine.resources.recurrent.config.RecurrentBlockConfig"><em>RecurrentBlockConfig</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.final_encoder_frames">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">final_encoder_frames</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mels</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">samples</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">final</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#final_encoder_frames"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.final_encoder_frames" title="Link to this definition">#</a></dt>
+<dd><p>Encoder frames that no later audio can change, given at least one mel
+frame: frame <code class="docutils literal notranslate"><span class="pre">j</span></code> reads mel frames up to <code class="docutils literal notranslate"><span class="pre">8</span> <span class="pre">*</span> <span class="pre">j</span></code>. At the end, every frame
+offline would produce.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.ConformerSTTConfig" title="mstar.model.nemotron_duplex.config.ConformerSTTConfig"><em>ConformerSTTConfig</em></a>)</p></li>
+<li><p><strong>mels</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>samples</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>final</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.final_mel_frames">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">final_mel_frames</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">samples</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">final</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#final_mel_frames"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.final_mel_frames" title="Link to this definition">#</a></dt>
+<dd><p>Mel frames whose 512-sample window is complete, for a call of more than
+<code class="docutils literal notranslate"><span class="pre">n_fft/2</span></code> samples: frame m spans <code class="docutils literal notranslate"><span class="pre">[m</span> <span class="pre">*</span> <span class="pre">hop</span> <span class="pre">-</span> <span class="pre">n_fft/2,</span> <span class="pre">m</span> <span class="pre">*</span> <span class="pre">hop</span> <span class="pre">+</span> <span class="pre">n_fft/2)</span></code>.
+At the end of the call every frame counts, the last ones over the reflected
+right edge, as offline.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.ConformerSTTConfig" title="mstar.model.nemotron_duplex.config.ConformerSTTConfig"><em>ConformerSTTConfig</em></a>)</p></li>
+<li><p><strong>samples</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>final</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.conformer.front_state_blocks">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.conformer.</span></span><span class="sig-name descname"><span class="pre">front_state_blocks</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/conformer.html#front_state_blocks"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.conformer.front_state_blocks" title="Link to this definition">#</a></dt>
+<dd><p>A call’s front-end state, all a later step reads: its newest
+preemphasized samples (<code class="docutils literal notranslate"><span class="pre">sig</span></code>; every sample until its first mel frame,
+then the window of the next one), its newest mel frames (<code class="docutils literal notranslate"><span class="pre">mel</span></code>; the
+subsampling window of the next encoder frame) and its last raw sample, for
+the preemphasis. Right-aligned: the newest sample / frame is last.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>config</strong> (<a class="reference internal" href="mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.ConformerSTTConfig" title="mstar.model.nemotron_duplex.config.ConformerSTTConfig"><em>ConformerSTTConfig</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.config.RecurrentBlockConfig" title="mstar.engine.resources.recurrent.config.RecurrentBlockConfig"><em>RecurrentBlockConfig</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -930,11 +1323,11 @@ registered hooks while the latter silently ignores them.</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.model.nemotron_duplex.components.rnnt.html"
+       href="mstar.model.nemotron_duplex.components.dft.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.model.nemotron_duplex.components.rnnt</p>
+        <p class="prev-next-title">mstar.model.nemotron_duplex.components.dft</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -965,9 +1358,23 @@ registered hooks while the latter silently ignores them.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerLayer.forward"><code class="docutils literal notranslate"><span class="pre">ConformerLayer.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.advance"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.advance()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.front"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.front()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.is_steady"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.is_steady()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.layers"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.layers()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.new_frames"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.new_frames()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConformerStreamer.steady_step"><code class="docutils literal notranslate"><span class="pre">ConformerStreamer.steady_step()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConvSubsampling"><code class="docutils literal notranslate"><span class="pre">ConvSubsampling</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConvSubsampling.calc_length"><code class="docutils literal notranslate"><span class="pre">ConvSubsampling.calc_length()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.ConvSubsampling.forward"><code class="docutils literal notranslate"><span class="pre">ConvSubsampling.forward()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs"><code class="docutils literal notranslate"><span class="pre">EncoderInputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs.n"><code class="docutils literal notranslate"><span class="pre">EncoderInputs.n</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.EncoderInputs.x"><code class="docutils literal notranslate"><span class="pre">EncoderInputs.x</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.Perception"><code class="docutils literal notranslate"><span class="pre">Perception</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -980,6 +1387,19 @@ registered hooks while the latter silently ignores them.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.Preprocessor.forward"><code class="docutils literal notranslate"><span class="pre">Preprocessor.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState"><code class="docutils literal notranslate"><span class="pre">StreamState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.frames"><code class="docutils literal notranslate"><span class="pre">StreamState.frames</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.mels"><code class="docutils literal notranslate"><span class="pre">StreamState.mels</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.position"><code class="docutils literal notranslate"><span class="pre">StreamState.position</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.StreamState.samples"><code class="docutils literal notranslate"><span class="pre">StreamState.samples</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.device_counts"><code class="docutils literal notranslate"><span class="pre">device_counts()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.encoder_kv_config"><code class="docutils literal notranslate"><span class="pre">encoder_kv_config()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.encoder_state_blocks"><code class="docutils literal notranslate"><span class="pre">encoder_state_blocks()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.final_encoder_frames"><code class="docutils literal notranslate"><span class="pre">final_encoder_frames()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.final_mel_frames"><code class="docutils literal notranslate"><span class="pre">final_mel_frames()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.conformer.front_state_blocks"><code class="docutils literal notranslate"><span class="pre">front_state_blocks()</span></code></a></li>
 </ul>
   </nav></div>
 

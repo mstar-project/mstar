@@ -18,6 +18,7 @@ mstar.utils.ipc\_format
    .. autosummary::
    
       AbortRequest
+      ClientStreamInput
       ConductorMessage
       ConductorMessageType
       DrainRequest

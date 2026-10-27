@@ -942,8 +942,9 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.streaming.topology</h1><div class="highlight"><pre>
-<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
+<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.chunk_policy</span><span class="w"> </span><span class="kn">import</span> <span class="n">ChunkPolicy</span>
@@ -967,15 +968,43 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1"># The producer of a stream the client feeds into a running request:</span>
+<span class="c1"># ``Connection(from_partition=CLIENT, ...)``. It names no partition, so it has</span>
+<span class="c1"># no walks, worker or partition state; the API server appends its chunks and</span>
+<span class="c1"># ends it when the client's input ends.</span>
+<span class="n">CLIENT</span> <span class="o">=</span> <span class="s2">"client"</span>
+
+
+<div class="viewcode-block" id="ClientStreamLimits">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.ClientStreamLimits">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ClientStreamLimits</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Bounds on what the client feeds one client stream; None is unbounded.</span>
+<span class="sd">    A bound the model declares is the most its consumer can take; a</span>
+<span class="sd">    deployment may lower it (``client_streams:`` in the serving config, see</span>
+<span class="sd">    :func:`client_stream_limits`)."""</span>
+    <span class="c1"># What the stream may carry over the call's life, each item counting</span>
+    <span class="c1"># item_size(item): a call past it ends with a 400.</span>
+    <span class="n">max_items</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># How much of max_items one item uses: 1 when None. A stream of</span>
+    <span class="c1"># variable-length chunks counts their frames or samples.</span>
+    <span class="n">item_size</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">Any</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># what item_size counts, for the error a call past max_items gets</span>
+    <span class="n">unit</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"items"</span></div>
+
+
+
 <div class="viewcode-block" id="Connection">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.Connection">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Connection</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Defines a streaming connection between two partitions."""</span>
+<span class="w">    </span><span class="sd">"""Defines a streaming connection between two partitions, or from the</span>
+<span class="sd">    client (``from_partition=CLIENT``) into one. Only a client stream takes</span>
+<span class="sd">    ``limits``: a partition's output is bounded by the model itself."""</span>
     <span class="n">from_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">to_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">edge_name</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">chunk_policy_factory</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="n">ChunkPolicy</span><span class="p">]</span></div>
+    <span class="n">chunk_policy_factory</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="n">ChunkPolicy</span><span class="p">]</span>
+    <span class="n">limits</span><span class="p">:</span> <span class="n">ClientStreamLimits</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -989,7 +1018,40 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    streaming data flow between partitions via StreamBuffers.</span>
 <span class="sd">    """</span>
     <span class="n">partitions</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
-    <span class="n">connections</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Connection</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
+    <span class="n">connections</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Connection</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">CLIENT</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">partitions</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">CLIENT</span><span class="si">!r}</span><span class="s2"> is reserved for client streams; rename the partition"</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">connections</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span> <span class="o">==</span> <span class="n">CLIENT</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"the client only produces streams; </span><span class="si">{</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2"> flows into it"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">conn</span><span class="o">.</span><span class="n">limits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">conn</span><span class="o">.</span><span class="n">from_partition</span> <span class="o">!=</span> <span class="n">CLIENT</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2"> has limits but is not a client stream"</span><span class="p">)</span>
+
+<div class="viewcode-block" id="PartitionTopology.client_connections">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology.client_connections">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">client_connections</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Connection</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The streams the client feeds."""</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">conn</span> <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">connections</span> <span class="k">if</span> <span class="n">conn</span><span class="o">.</span><span class="n">from_partition</span> <span class="o">==</span> <span class="n">CLIENT</span><span class="p">]</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="client_stream_limits">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.client_stream_limits">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">client_stream_limits</span><span class="p">(</span>
+    <span class="n">topology</span><span class="p">:</span> <span class="n">PartitionTopology</span><span class="p">,</span> <span class="n">model_config</span><span class="p">:</span> <span class="n">Mapping</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ClientStreamLimits</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Each client stream's limits: the model's declaration, with the serving</span>
+<span class="sd">    config's ``client_streams: {&lt;edge name&gt;: {max_items}}`` applied, as</span>
+<span class="sd">    ``validate_deployment`` accepted it (see</span>
+<span class="sd">    ``mstar.validation.client_streams``)."""</span>
+    <span class="n">overrides</span> <span class="o">=</span> <span class="p">(</span><span class="n">model_config</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"client_streams"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="p">:</span> <span class="p">(</span><span class="n">conn</span><span class="o">.</span><span class="n">limits</span> <span class="ow">or</span> <span class="n">ClientStreamLimits</span><span class="p">())</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="o">**</span><span class="p">(</span><span class="n">overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}))</span>
+        <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="n">topology</span><span class="o">.</span><span class="n">client_connections</span><span class="p">()</span>
+    <span class="p">}</span></div>
 
 </pre></div>
 

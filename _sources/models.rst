@@ -584,15 +584,25 @@ Fish Audio S2-Pro notes
 Nemotron VoiceChat (``nemotron_duplex``) notes
 ----------------------------------------------
 
-- Four nodes in four async partitions, joined by streaming edges:
-  ``conformer_encoder`` (16 kHz audio → one LLM-space embedding per 80 ms frame)
+- Three nodes in three async partitions, joined by streaming edges, with the
+  user's audio a client stream (``audio_in``) into the first:
+  ``conformer_encoder`` (16 kHz audio → one LLM-space embedding per 80 ms frame,
+  streamed: each chunk runs the layers over its new frames only, against the
+  call's cached last 70 frames, so a step costs the same however long the call
+  is; it emits the frames no later audio can change, the last ones at the end
+  of input)
   → ``nano_llm`` (frame-synchronous decode loop: each step fuses one audio frame
   with the previous agent-text and tool-call tokens, emits one agent-text token)
-  → ``eartts_talker`` (one text token → 31 RVQ codes) → ``audio_codec`` (codes →
-  PCM: each 5-frame chunk is decoded with the previous 3 frames as left context,
-  which covers the decoder's receptive field, and a window's last 12 samples,
-  the inverse-STFT overlap, are held back and emitted with the next chunk, so
-  the stream equals the full-history decode sample for sample).
+  → ``eartts_talker`` (one text token → 31 RVQ codes, decoded by the RVQ codec
+  in the same step to that frame's 80 ms of PCM, which goes straight to the
+  client: no codec step of its own, so a frame's audio leaves with the step
+  that made its codes. The decoder is causal, so each call keeps its stream
+  state in a recurrent-state pool, ``codec_state``: each ConvNeXt block's last
+  6 inputs and the inverse STFT's 12-sample overlap, ~95 KiB a slot in bf16. A
+  step decodes only the call's new frame against that state, and a fresh,
+  zeroed slot is the decoder's causal padding, so a call's PCM equals the full
+  decode of its frames from its first frame; at 32 sessions the decode is
+  ~100 GMAC per 80 ms tick, inside the talker's CUDA graph).
   The decode loops are stream-terminated: they end when the upstream stream
   closes, not on EOS, which is an ordinary per-frame token in duplex speech.
 - ``nano_llm`` declares a paged KV cache over its four attention layers with
@@ -600,10 +610,22 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   positional encoding, so no position resource), a recurrent-state pool holding
   the 27 Mamba-2 layers' conv window and SSM state, one slot per session
   (``mamba_state``: 32 sessions by default, ~137 MB per slot in fp32, tunable
-  with ``max_slots`` / ``state_dtype``; the shipped configs set
-  ``max_concurrent_requests: 32`` to match, so raise the two together), the Mamba-2 resource planned on it
+  with ``max_slots``), the Mamba-2 resource planned on it
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
   captured as a CUDA graph for batch sizes 1 to 32.
+- Every per-session resource is sized for 32 sessions: a slot in each of
+  ``mamba_state``, ``encoder_state``, ``encoder_front`` and ``codec_state`` (``max_slots``, one
+  more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
+  no sink), and its pages in ``nano_kv`` and
+  ``talker_kv`` (``max_num_pages``; both sized from ``max_session_s``, and the
+  nano's from ``max_prompt_tokens`` too). The shipped configs set a
+  conservative ``max_concurrent_requests: 16`` (below); raising it to 32 needs
+  no other change, and to serve more, raise the cap and all six with it. The server
+  refuses to start with a cap one of them cannot hold, since a session past
+  any of them would wait on admit, and its frames with it, until another ends.
+  The nano, the talker and the encoder each run at most 32 sessions
+  a step, their widest CUDA graph; more are split over several steps rather
+  than run eagerly.
 - ``eartts_talker`` advances every live session in one backbone pass per frame
   through the engine's paged KV (``talker_kv`` / ``talker_attn`` /
   ``talker_pos``): each session owns two streams, the conditional and the
@@ -619,12 +641,26 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (its 38-token speaker warm-up) runs eager. The talker KV pool is 1025 pages
   of 128 positions (28 GiB): 32 sessions x 2 streams x 16 pages plus a sink
   page, enough for ``max_session_s`` (160 s) per session, with no
-  sliding-window eviction yet; longer audio gets a 400.
+  sliding-window eviction yet; longer audio is refused (below).
 - Measured on one H100 80GB (``benchmark/nemotron_duplex/sessions.py`` on the
   106-frame demo clip, three repeats): 24-25 ms per 80 ms tick with one
   session, 61-64 ms with 32 concurrent sessions, 76-85 ms with 40, 87-92 ms
   with 48 and 95-97 ms with 64 (2026-10-08). 32 is the most that keep up with
-  real time, hence the shipped cap; every session received all its frames. Served audio is checked for intelligibility by
+  real time, hence the pools' size; every session received all its frames.
+  Those are one-shot replays (the whole clip uploaded, so the server runs as
+  fast as it can). Live calls paced in real time over ``/generate/ws``
+  (``test/nemotron_duplex/live_ws_request.py``, 80 ms appends, 2026-10-17, one
+  H100): input-to-token lag p50 48 ms with one call and about 100-120 ms with
+  8, which keep up; from 24 calls up the server fell behind real time, so lag
+  grew over the call. Capturing the encoder's live step (below) took its host
+  time at 32 calls from 23.6 to 8.4 ms and cut live lag 2-6x at 16-32 calls
+  (paced runs interleaved against the uncaptured encoder, ``MSTAR_SHM_ARENA=1``);
+  32 calls staggered over 2 s all finish, heard latency p50 2.1-2.3 s (from the
+  user stopping to agent audio playable without gaps). With the codec in the
+  talker's step, on one H200: 16 live calls keep real time whether they start
+  together or 2 s apart; 32 all finish but sit at the edge of real time (one run
+  kept up with 32 started together, another did not; later runs kept up at 32),
+  so the shipped cap is a conservative 16. Served audio is checked for intelligibility by
   transcribing it (``test/nemotron_duplex/asr_check.py``, Whisper
   large-v3-turbo): MaskGIT sampling is knife-edge, so attention-backend
   numerics change the waveform but not the words.
@@ -638,20 +674,67 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   ``pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark`` (the base checkpoint
   ships only the RNN-T tokenizer); prefetch both repositories on machines
   without egress.
-- Inputs are a single user-only 16 kHz mono clip (the request's ``audio``) plus
-  an optional system prompt (the request's text, primed before the first frame
-  exactly as the reference does). The model answers in the frames *after* the
-  user stops, so append a few seconds of trailing silence to the clip. The
-  checkpoint's demo recordings are two-channel conversations (user left, agent
-  right); feed the left channel only. ``test/nemotron_duplex/duplex_request.py``
-  prepares such a clip from the bundled ``turn_taking.wav`` and sends it;
-  ``parity_compare.py`` runs the standalone reference path on the same clip
-  and checks the served text against it token for token (bf16, the serving
-  precision, must match exactly; the fp32 oracle can differ where the agent's
-  turn-taking decision is a knife-edge, which its printed logit margins show).
-- Default deployment: ``configs/nemotron_duplex.yaml`` (all four nodes on one
-  GPU); ``configs/nemotron_duplex_disagg.yaml`` puts the encoder+LLM, the talker
-  and the codec on three ranks. Launch with ``--tensor-comm-protocol SHM`` on a
+- Inputs are user-only 16 kHz mono audio plus an optional system prompt (the
+  request's text, primed before the first frame exactly as the reference
+  does): one clip uploaded with the request, or a live call over
+  ``/generate/ws``, ``append`` messages until ``end_input`` (see
+  :doc:`clients`; a one-shot request over the socket carries ``end_input:
+  true`` on its opening message, or it waits for appends). Output is clocked by
+  the input, one agent frame per 80 ms of user audio, so a live client keeps
+  streaming (silence included) for as long as it wants the agent to talk. The
+  model answers in the frames *after* the user stops, so append a few seconds
+  of trailing silence to a clip. The checkpoint's demo recordings are
+  two-channel conversations (user left, agent right); feed the left channel
+  only.
+- Limits: a call is capped at ``max_session_s`` (160 s) of audio. An upload, or
+  any one file, past it gets a 400, as does one of more than two channels, and so
+  does a live call whose appends pass it: ``audio_in`` declares the session's
+  samples as its ``max_items``, which the client stream counts before the encoder
+  sees them (raise ``max_session_s``, not the stream's limit, for longer calls). A
+  call that ends with no more than 16 ms of audio, which the encoder cannot
+  featurize, fails with a 500 (the worker reports it without a client status).
+  Appends must be 16 kHz audio (they are neither
+  resampled nor rescaled one by one, which would put a seam at every append).
+  Send appends of 80 ms or more: the encoder takes one append per step, so
+  shorter appends need several steps per frame and fall behind once a step
+  takes longer than an append.
+- Encoder numerics, measured on CPU at the checkpoint's dimensions with random
+  weights: an upload is one encoder pass, bit for bit the offline encoder's in
+  fp32 and under bf16 autocast, save the last frame when the end of input
+  reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends put
+  the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
+  autocast. So live and one-shot text should agree token for token in fp32
+  (inferred from those frames, not measured on served text); under the served
+  bf16 a different chunking can flip a knife-edge frame such as the agent's
+  turn start.
+- The encoder keeps each call's state in a slot per session of three
+  resources: its attention keys and values in a bounded KV (``encoder_kv``),
+  which keeps a call's last 70 frames per layer and runs the attention, each new
+  frame over the 70 before it, with the relative-position term as a band of
+  distances; its conv inputs (``encoder_state``); and its newest audio and mel
+  frames (``encoder_front``), the last two recurrent-state pools. A
+  call that appends one frame of audio (1280 samples) on the frame grid, every
+  live step of an 80 ms client, runs its whole step as a CUDA graph (the grid is
+  the call's start: an opening clip or append that is not a multiple of 1280
+  samples keeps the call off it for good); other calls take the front end
+  eagerly, then the layer stack as a graph when each got at most one frame (a
+  live step, the call's end), or eagerly (a one-shot upload, a large append:
+  a chunk over a second is not batched with other calls, so the engine runs
+  each call of that step on its own). Appends of other sizes are served the same,
+  without the whole-step graph.
+- Checks: ``test/nemotron_duplex/duplex_request.py`` prepares a clip from the
+  bundled ``turn_taking.wav`` and sends it; ``parity_compare.py`` runs the
+  standalone reference path on the same clip and checks the served text
+  against it token for token (bf16, the serving precision, must match save the
+  last frame; the fp32 oracle can differ where the agent's turn-taking decision
+  is a knife-edge, which its printed logit margins show).
+  ``live_ws_request.py`` streams a clip in 80 ms appends and reports per-frame
+  lag; with ``--compare-one-shot`` it checks that a live call sending the whole
+  clip as one append matches the upload save the last frame, and reports where
+  the paced call's text first differs from it.
+- Default deployment: ``configs/nemotron_duplex.yaml`` (all three nodes on one
+  GPU); ``configs/nemotron_duplex_disagg.yaml`` puts the encoder+LLM and the
+  talker (with its codec) on two ranks. Launch with ``--tensor-comm-protocol SHM`` on a
   single node. Text samples at ``temperature: 0.7, top_p: 0.9`` by default;
   send ``temperature: 0`` for greedy. The talker's mixture-of-Gaussians sampling
   is stochastic by design and seeded per request.

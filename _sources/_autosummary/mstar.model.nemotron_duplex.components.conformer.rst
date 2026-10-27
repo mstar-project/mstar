@@ -9,6 +9,17 @@ mstar.model.nemotron\_duplex.components.conformer
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      device_counts
+      encoder_kv_config
+      encoder_state_blocks
+      final_encoder_frames
+      final_mel_frames
+      front_state_blocks
+   
    
 
    
@@ -19,9 +30,12 @@ mstar.model.nemotron\_duplex.components.conformer
    
       ConformerEncoder
       ConformerLayer
+      ConformerStreamer
       ConvSubsampling
+      EncoderInputs
       Perception
       Preprocessor
+      StreamState
    
    
 

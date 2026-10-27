@@ -973,6 +973,24 @@ window.runMermaid = runMermaid;</script>
 <span class="n">TALKER_ATTN</span> <span class="o">=</span> <span class="s2">"talker_attn"</span>         <span class="c1"># attention planned over TALKER_KV</span>
 <span class="n">TALKER_POS</span> <span class="o">=</span> <span class="s2">"talker_pos"</span>           <span class="c1"># positions / RoPE for the talker (per-layer theta at call time)</span>
 <span class="n">TALKER_CFG_LABEL</span> <span class="o">=</span> <span class="s2">"_cfg"</span>           <span class="c1"># the two talker streams combined into one plan (cond rows, then uncond)</span>
+<span class="n">AUDIO_IN</span> <span class="o">=</span> <span class="s2">"audio_in"</span>               <span class="c1"># the client stream carrying the user's audio into the Encoder</span>
+<span class="n">ENCODER_STATE</span> <span class="o">=</span> <span class="s2">"encoder_state"</span>     <span class="c1"># recurrent-state pool: each call's streaming-encoder conv tails</span>
+<span class="n">ENCODER_FRONT</span> <span class="o">=</span> <span class="s2">"encoder_front"</span>     <span class="c1"># recurrent-state pool: each call's streaming-encoder audio and mel tails</span>
+<span class="n">CODEC_STATE</span> <span class="o">=</span> <span class="s2">"codec_state"</span>         <span class="c1"># recurrent-state pool: each call's streaming codec decoder state</span>
+<span class="n">ENCODER_KV</span> <span class="o">=</span> <span class="s2">"encoder_kv"</span>           <span class="c1"># bounded KV: each call's streaming-encoder attention window, per layer</span>
+
+<span class="c1"># Every node's CUDA-graph batch sizes: a row per live session, up to the sessions</span>
+<span class="c1"># a deployment serves by default (``NemotronDuplexModel.DEFAULT_SESSIONS``).</span>
+<span class="n">SESSION_BATCH_SIZES</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">]</span>
+
+
+<div class="viewcode-block" id="session_too_long">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.session_too_long">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">session_too_long</span><span class="p">(</span><span class="n">max_session_s</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="ne">ValueError</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The one error for a call whose audio outgrows ``max_session_s``, whichever</span>
+<span class="sd">    stage sees it first."""</span>
+    <span class="k">return</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"the call's audio passed </span><span class="si">{</span><span class="n">max_session_s</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2"> s, the longest session this server takes"</span><span class="p">)</span></div>
+
 
 
 <div class="viewcode-block" id="NanoConfig">
@@ -1127,15 +1145,6 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># generation) so audio is reproducible AND does not land on rare collapse-to-</span>
     <span class="c1"># constant-code RNG states that an uncontrolled global RNG occasionally hits.</span>
     <span class="n">inference_seed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
-
-    <span class="c1"># Streaming codec chunking (engine Talker-&gt;Codec connection): decode `chunk` new</span>
-    <span class="c1"># code frames with `left_context` prior frames so the causal codec has enough</span>
-    <span class="c1"># receptive field, emitting only the new tail (see AudioCodecDecoderSubmodule).</span>
-    <span class="n">codec_chunk_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">5</span>
-    <span class="c1"># The decoder only looks back ~2.3 code frames (three causal k=7 blocks at</span>
-    <span class="c1"># 9 positions per frame, plus the iSTFT window), so 3 frames of context give</span>
-    <span class="c1"># the same samples as decoding the whole history.</span>
-    <span class="n">codec_left_context_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">3</span>
 
     <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">22050</span></div>
 

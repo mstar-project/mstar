@@ -9,6 +9,12 @@ mstar.streaming.topology
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      client_stream_limits
+   
    
 
    
@@ -17,6 +23,7 @@ mstar.streaming.topology
 
    .. autosummary::
    
+      ClientStreamLimits
       Connection
       PartitionTopology
       StreamingGraphEdge

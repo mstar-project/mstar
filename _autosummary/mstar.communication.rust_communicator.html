@@ -658,6 +658,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.poll_for_messages"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.poll_for_messages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.register_event_for_poll"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.register_event_for_poll()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.send"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.send()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.try_send_bytes"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.try_send_bytes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.wait_for_work"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.wait_for_work()</span></code></a></li>
 </ul>
 </li>
@@ -793,6 +794,26 @@ a message is available (buffered here, delivered by
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.rust_communicator.RustZMQCommunicator.try_send_bytes">
+<span class="sig-name descname"><span class="pre">try_send_bytes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">entity_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">data</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/rust_communicator.html#RustZMQCommunicator.try_send_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.rust_communicator.RustZMQCommunicator.try_send_bytes" title="Link to this definition">#</a></dt>
+<dd><p>Send a message already encoded with <code class="docutils literal notranslate"><span class="pre">self.codec</span></code> without
+blocking: False, with nothing sent, when the peer is at its high-water
+mark. A loop that must keep reading its own input while a peer is slow
+sends with this and retries later (see <code class="docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>data</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.rust_communicator.RustZMQCommunicator.wait_for_work">
 <span class="sig-name descname"><span class="pre">wait_for_work</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout_ms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">50</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/rust_communicator.html#RustZMQCommunicator.wait_for_work"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.rust_communicator.RustZMQCommunicator.wait_for_work" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -863,6 +884,7 @@ a message is available (buffered here, delivered by
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.poll_for_messages"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.poll_for_messages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.register_event_for_poll"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.register_event_for_poll()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.send"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.send()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.try_send_bytes"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.try_send_bytes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.rust_communicator.RustZMQCommunicator.wait_for_work"><code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator.wait_for_work()</span></code></a></li>
 </ul>
 </li>

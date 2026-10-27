@@ -9,6 +9,12 @@ mstar.model.nemotron\_duplex.config
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      session_too_long
+   
    
 
    

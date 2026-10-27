@@ -33,6 +33,7 @@ mstar.communication.communicator
    
       BaseCommunicator
       CommProtocol
+      OutboxCommunicator
       ZMQCommunicator
    
    

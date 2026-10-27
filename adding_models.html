@@ -692,7 +692,10 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-bagel">Worked example: BAGEL</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-whisper">Worked example: Whisper</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-an-image-dit-on-the-diffusion-scaffold">Worked example: an image DiT on the diffusion scaffold</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#streams-from-the-client">Streams from the client</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checklist">Checklist</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing">Testing</a></li>
 </ul>
@@ -1253,9 +1256,12 @@ Whether the penalty runs on a given step is decided from the
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec(config=RecurrentStateConfig(...))</span></code></p></td>
 <td><p>Fixed-size per-request state that carries between steps (an LSTM’s <code class="docutils literal notranslate"><span class="pre">h</span></code> and
-<code class="docutils literal notranslate"><span class="pre">c</span></code>, a cursor, a conv tail): one slot per request, <code class="docutils literal notranslate"><span class="pre">blocks</span></code> naming a shape and
-dtype for each piece, <code class="docutils literal notranslate"><span class="pre">num_layers</span></code> copies of each, <code class="docutils literal notranslate"><span class="pre">max_slots</span></code> slots with slot 0
-the sink that padding rows address. <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> gives each row a
+<code class="docutils literal notranslate"><span class="pre">c</span></code>, a cursor, a conv tail, a Mamba or gated-DeltaNet layer’s conv window and SSM
+state, a streaming encoder’s caches): one slot per request and label, <code class="docutils literal notranslate"><span class="pre">blocks</span></code>
+naming a shape and dtype for each piece (dtype None: the engine’s compute dtype,
+what its KV caches store), <code class="docutils literal notranslate"><span class="pre">num_layers</span></code> copies of each, <code class="docutils literal notranslate"><span class="pre">max_slots</span></code> slots
+(deployment-tunable) with slot 0 the sink that padding rows address. A recurrent
+kernel reads the step’s <code class="docutils literal notranslate"><span class="pre">addressing</span></code>. <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> gives each row a
 <code class="docutils literal notranslate"><span class="pre">RecurrentStep</span></code> segment with span &gt;= 1. The forward reads its rows with
 <code class="docutils literal notranslate"><span class="pre">pool.gather(name,</span> <span class="pre">start=...)</span></code> and writes them back with
 <code class="docutils literal notranslate"><span class="pre">pool.scatter_(name,</span> <span class="pre">value)</span></code>; both follow the step’s plan, so there is no
@@ -1533,7 +1539,9 @@ within itself and matches the offline mask. <code class="docutils literal notran
 <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>). A per-query window takes no sink, and its right context is 0.
 <code class="docutils literal notranslate"><span class="pre">retention</span></code> may be a single <code class="docutils literal notranslate"><span class="pre">SinkWindow</span></code> when it does not depend on the source length.
 <code class="docutils literal notranslate"><span class="pre">BoundedKVConfig(dtype=None)</span></code> stores the cache in the engine’s KV dtype, for layers that
-compute in it.</p>
+compute in it. Nemotron VoiceChat’s streaming encoder (<code class="docutils literal notranslate"><span class="pre">ENCODER_KV</span></code>,
+<code class="docutils literal notranslate"><span class="pre">encoder_kv_config</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/model/nemotron_duplex/components/conformer.py</span></code>) is the
+per-query example.</p>
 </section>
 </section>
 </section>
@@ -2743,6 +2751,56 @@ such a consumer sharing its worker graph with another top-level node or <code cl
 stream-consuming walk split over worker graphs, unless every consumer also waits on a
 non-streamed input and all the walk’s worker graphs run on the same workers. That input
 must arrive once per pass (from the conductor, say); startup cannot check this.</p>
+<section id="streams-from-the-client">
+<h3>Streams from the client<a class="headerlink" href="#streams-from-the-client" title="Link to this heading">#</a></h3>
+<p>A model that listens while it runs (a full-duplex speech model, say) takes its live input
+as a stream the client feeds. Declare it like any other connection, with the reserved
+producer <code class="docutils literal notranslate"><span class="pre">CLIENT</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.topology</span><span class="w"> </span><span class="kn">import</span> <span class="n">CLIENT</span><span class="p">,</span> <span class="n">Connection</span>
+
+<span class="n">Connection</span><span class="p">(</span><span class="n">from_partition</span><span class="o">=</span><span class="n">CLIENT</span><span class="p">,</span> <span class="n">to_partition</span><span class="o">=</span><span class="s2">"Encoder"</span><span class="p">,</span> <span class="n">edge_name</span><span class="o">=</span><span class="s2">"audio_in"</span><span class="p">,</span>
+           <span class="n">chunk_policy_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="n">FixedChunkPolicy</span><span class="p">(</span><span class="n">chunk_size</span><span class="o">=</span><span class="mi">1</span><span class="p">))</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">CLIENT</span></code> is not a partition: it has no walks and no worker, and it must not appear in
+<code class="docutils literal notranslate"><span class="pre">partitions</span></code>. The node that lists <code class="docutils literal notranslate"><span class="pre">audio_in</span></code> in its <code class="docutils literal notranslate"><span class="pre">input_names</span></code> (with
+<code class="docutils literal notranslate"><span class="pre">consumes_stream=True</span></code>) consumes it through a <code class="docutils literal notranslate"><span class="pre">StreamBuffer</span></code> and the connection’s
+chunk policy, exactly as it would a stream from another partition. Its partition
+self-triggers from the stream, so its forward-pass args send no inputs. That node must be
+the only one, in any walk, that takes the edge; the conductor checks this at startup, and
+that the model implements <code class="docutils literal notranslate"><span class="pre">process_stream_chunk</span></code>. A partition may take several client
+streams (audio and video, say): each has its own buffer and its own end.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">process_stream_chunk(chunk)</span></code> turns each append the client sends into stream items,
+keyed by client edge name. <code class="docutils literal notranslate"><span class="pre">chunk</span></code> is a <code class="docutils literal notranslate"><span class="pre">ClientChunk</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar.model.base</span></code>):
+<code class="docutils literal notranslate"><span class="pre">text</span></code>; <code class="docutils literal notranslate"><span class="pre">tensors</span></code> and <code class="docutils literal notranslate"><span class="pre">input_metadata</span></code>, the append’s files loaded as for a request
+(<code class="docutils literal notranslate"><span class="pre">audio_inputs</span></code> and so on); <code class="docutils literal notranslate"><span class="pre">streams</span></code>, per <code class="docutils literal notranslate"><span class="pre">tensors</span></code> list the client stream each
+file names (<code class="docutils literal notranslate"><span class="pre">None</span></code> where the client named none, so the model decides);
+<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, the append’s own; and <code class="docutils literal notranslate"><span class="pre">request_kwargs</span></code>, the opening message’s.
+Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> for an append the model doesn’t take (the client gets a 400). An
+append of text alone that yields no item is refused rather than dropped, but the data
+worker can’t tell which items text sent with files yielded: refuse such text yourself
+if the model takes none. Keep it stateless; the
+consuming node keeps its own state, in its resources or <code class="docutils literal notranslate"><span class="pre">request_state</span></code>.</p></li>
+<li><p>Tensors <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> returns under a client edge’s name are the stream’s first
+chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.</p></li>
+<li><p>A client stream may declare limits, <code class="docutils literal notranslate"><span class="pre">Connection(...,</span> <span class="pre">limits=ClientStreamLimits(...))</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar.streaming.topology</span></code>), which the client-stream layer enforces before any of
+the model’s code runs: <code class="docutils literal notranslate"><span class="pre">max_items</span></code>, what the stream may carry over a call’s life,
+each item counting <code class="docutils literal notranslate"><span class="pre">item_size(item)</span></code> (1 by default; a stream of variable-length
+chunks counts their frames or samples, named by <code class="docutils literal notranslate"><span class="pre">unit</span></code>). A call past
+<code class="docutils literal notranslate"><span class="pre">max_items</span></code> ends with a 400 that names the limit, so the consumer need not check a
+session cap of its own. Declare the most the consumer can take: a deployment may
+lower a declared bound under <code class="docutils literal notranslate"><span class="pre">client_streams:</span></code> (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>), but not raise
+it.</p></li>
+<li><p>A stream ends when the client ends it: <code class="docutils literal notranslate"><span class="pre">end_input:</span> <span class="pre">true</span></code> ends all of the call’s
+streams, a list of names only those. The consumer gets <code class="docutils literal notranslate"><span class="pre">producer_done</span></code> for that edge
+and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
+Over <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> the client appends and ends input explicitly (see
+<a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>); every other route ends the input as soon as the request is submitted.
+<code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> is on the Python frontend only, not <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>.</p></li>
+</ul>
+</section>
 </section>
 <section id="checklist">
 <h2>Checklist<a class="headerlink" href="#checklist" title="Link to this heading">#</a></h2>
@@ -2909,7 +2967,10 @@ for a full omni-modal model.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-bagel">Worked example: BAGEL</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-whisper">Worked example: Whisper</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-an-image-dit-on-the-diffusion-scaffold">Worked example: an image DiT on the diffusion scaffold</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#streams-from-the-client">Streams from the client</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checklist">Checklist</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing">Testing</a></li>
 </ul>

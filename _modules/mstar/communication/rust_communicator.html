@@ -1088,6 +1088,14 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_inner</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">entity_id</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">msg</span><span class="p">))</span></div>
 
 
+<div class="viewcode-block" id="RustZMQCommunicator.try_send_bytes">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.rust_communicator.html#mstar.communication.rust_communicator.RustZMQCommunicator.try_send_bytes">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">try_send_bytes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_register</span><span class="p">(</span><span class="n">entity_id</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_inner</span><span class="o">.</span><span class="n">try_send</span><span class="p">(</span><span class="n">entity_id</span><span class="p">,</span> <span class="n">data</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="RustZMQCommunicator.get_all_new_messages">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.rust_communicator.html#mstar.communication.rust_communicator.RustZMQCommunicator.get_all_new_messages">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_all_new_messages</span><span class="p">(</span>

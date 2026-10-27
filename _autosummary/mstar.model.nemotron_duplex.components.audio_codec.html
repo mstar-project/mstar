@@ -655,11 +655,24 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.ae_decode"><code class="docutils literal notranslate"><span class="pre">AudioCodec.ae_decode()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.ae_encode"><code class="docutils literal notranslate"><span class="pre">AudioCodec.ae_encode()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.decode"><code class="docutils literal notranslate"><span class="pre">AudioCodec.decode()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.decode_stream"><code class="docutils literal notranslate"><span class="pre">AudioCodec.decode_stream()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.dequantize"><code class="docutils literal notranslate"><span class="pre">AudioCodec.dequantize()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.encode"><code class="docutils literal notranslate"><span class="pre">AudioCodec.encode()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.load_weights"><code class="docutils literal notranslate"><span class="pre">AudioCodec.load_weights()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.quantize"><code class="docutils literal notranslate"><span class="pre">AudioCodec.quantize()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.remap"><code class="docutils literal notranslate"><span class="pre">AudioCodec.remap()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.stream_edge"><code class="docutils literal notranslate"><span class="pre">AudioCodec.stream_edge</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio"><code class="docutils literal notranslate"><span class="pre">CodecStreamAudio</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.end_after"><code class="docutils literal notranslate"><span class="pre">CodecStreamAudio.end_after</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.end_before"><code class="docutils literal notranslate"><span class="pre">CodecStreamAudio.end_before</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.final"><code class="docutils literal notranslate"><span class="pre">CodecStreamAudio.final</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState"><code class="docutils literal notranslate"><span class="pre">CodecStreamState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState.overlap"><code class="docutils literal notranslate"><span class="pre">CodecStreamState.overlap</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState.tails"><code class="docutils literal notranslate"><span class="pre">CodecStreamState.tails</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.ConvNeXtBlock"><code class="docutils literal notranslate"><span class="pre">ConvNeXtBlock</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -671,6 +684,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.ProjectedRVQ.encode"><code class="docutils literal notranslate"><span class="pre">ProjectedRVQ.encode()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.check_window_envelope"><code class="docutils literal notranslate"><span class="pre">check_window_envelope()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.codec_state_blocks"><code class="docutils literal notranslate"><span class="pre">codec_state_blocks()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -703,11 +718,29 @@ decoder: 512 -&gt;1536 -&gt;[1536]x3 -&gt;768 -&gt;[768]x3 -&gt;384 -&gt;[384]x3
 <p>The encoder’s spectrogram/STFT and the decoder’s inverse-STFT overlap-add are
 ported verbatim. ConvNeXt blocks are <em>causal</em> (left-padded) and use a
 channel-dim LayerNorm with eps 1e-6.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.audio_codec.check_window_envelope" title="mstar.model.nemotron_duplex.components.audio_codec.check_window_envelope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_window_envelope</span></code></a>(window, hop_length)</p></td>
+<td><p>Refuse a window and hop whose overlap-add has a gap at any frame count.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.audio_codec.codec_state_blocks" title="mstar.model.nemotron_duplex.components.audio_codec.codec_state_blocks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">codec_state_blocks</span></code></a>(config[, dtype])</p></td>
+<td><p>A decode stream's state as recurrent-pool blocks: per decoder stage, its blocks' conv tails <code class="docutils literal notranslate"><span class="pre">(num_blocks,</span> <span class="pre">channels,</span> <span class="pre">kernel</span> <span class="pre">-</span> <span class="pre">1)</span></code> (by default in the engine's compute dtype, which the blocks compute in), and the inverse STFT's overlap (<code class="docutils literal notranslate"><span class="pre">CodecStreamState.overlap</span></code>, float32).</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec" title="mstar.model.nemotron_duplex.components.audio_codec.AudioCodec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AudioCodec</span></code></a>([config])</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio" title="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CodecStreamAudio</span></code></a>(final, end_before, end_after)</p></td>
+<td><p>One decode step's samples, float32.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState" title="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState"><code class="xref py py-obj docutils literal notranslate"><span class="pre">CodecStreamState</span></code></a>(tails, overlap)</p></td>
+<td><p>What a decode stream carries from one step to the next.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.nemotron_duplex.components.audio_codec.ConvNeXtBlock" title="mstar.model.nemotron_duplex.components.audio_codec.ConvNeXtBlock"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ConvNeXtBlock</span></code></a>(dim[, expand, kernel])</p></td>
 <td><p>Causal 1D ConvNeXt block (ports NeMo <code class="docutils literal notranslate"><span class="pre">ConvNeXt1d</span></code>).</p></td>
@@ -729,13 +762,15 @@ channel-dim LayerNorm with eps 1e-6.</p>
 </dl>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.ae_decode">
-<span class="sig-name descname"><span class="pre">ae_decode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">constrain_value_range</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#AudioCodec.ae_decode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.ae_decode" title="Link to this definition">#</a></dt>
-<dd><p>Continuous latents <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">T',</span> <span class="pre">latent]</span></code> -&gt; waveform <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">1,</span> <span class="pre">T]</span></code>.</p>
+<span class="sig-name descname"><span class="pre">ae_decode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">constrain_value_range</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">by_matmul</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#AudioCodec.ae_decode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.ae_decode" title="Link to this definition">#</a></dt>
+<dd><p>Continuous latents <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">T',</span> <span class="pre">latent]</span></code> -&gt; waveform <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">1,</span> <span class="pre">T]</span></code>; <code class="docutils literal notranslate"><span class="pre">by_matmul</span></code>
+as <code class="docutils literal notranslate"><span class="pre">_spec_to_wav</span></code> takes it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>constrain_value_range</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>by_matmul</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -760,15 +795,41 @@ channel-dim LayerNorm with eps 1e-6.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.decode">
-<span class="sig-name descname"><span class="pre">decode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">code</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">code_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">constrain_value_range</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#AudioCodec.decode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.decode" title="Link to this definition">#</a></dt>
-<dd><p>Codes <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">T',</span> <span class="pre">num_quantizers]</span></code> -&gt; (waveform <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">1,</span> <span class="pre">T]</span></code>, wav_len).</p>
+<span class="sig-name descname"><span class="pre">decode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">code</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">code_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">constrain_value_range</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">by_matmul</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#AudioCodec.decode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.decode" title="Link to this definition">#</a></dt>
+<dd><p>Codes <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">T',</span> <span class="pre">num_quantizers]</span></code> -&gt; (waveform <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">1,</span> <span class="pre">T]</span></code>, wav_len); <code class="docutils literal notranslate"><span class="pre">by_matmul</span></code>
+as <code class="docutils literal notranslate"><span class="pre">_spec_to_wav</span></code> takes it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>code</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>code_len</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>constrain_value_range</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>by_matmul</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.decode_stream">
+<span class="sig-name descname"><span class="pre">decode_stream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">code</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">state</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#AudioCodec.decode_stream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.decode_stream" title="Link to this definition">#</a></dt>
+<dd><p>Decode a stream’s next code frames <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">T,</span> <span class="pre">num_quantizers]</span></code> given its
+<code class="docutils literal notranslate"><span class="pre">state</span></code> (zeros for a stream’s first frames, which is the causal zero
+padding of the full decode): the samples these frames make final, and
+the state after them. Over a stream, <code class="docutils literal notranslate"><span class="pre">audio.final</span></code> (less
+<code class="docutils literal notranslate"><span class="pre">stream_edge</span></code> samples at the first frame) followed by the last step’s
+<code class="docutils literal notranslate"><span class="pre">audio.end_after</span></code> is the full decode of all its frames.</p>
+<p>Every step is the same fixed-shape work, so a CUDA graph captures it; the
+inverse DFT is a matmul (see <code class="docutils literal notranslate"><span class="pre">dft</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>code</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>state</strong> (<a class="reference internal" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState" title="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState"><em>CodecStreamState</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference internal" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio" title="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio"><em>CodecStreamAudio</em></a>, <a class="reference internal" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState" title="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState"><em>CodecStreamState</em></a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -832,6 +893,81 @@ channel-dim LayerNorm with eps 1e-6.</p>
 </dl>
 </dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.stream_edge">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">stream_edge</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.stream_edge" title="Link to this definition">#</a></dt>
+<dd><p>a
+stream’s first frame emits that many fewer, and its end that many more.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Samples the full decode trims off each end of its overlap-add</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.audio_codec.</span></span><span class="sig-name descname"><span class="pre">CodecStreamAudio</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">final</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end_before</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end_after</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#CodecStreamAudio"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>One decode step’s samples, float32. <code class="docutils literal notranslate"><span class="pre">end_before</span></code> / <code class="docutils literal notranslate"><span class="pre">end_after</span></code> are the
+stream’s last <code class="docutils literal notranslate"><span class="pre">stream_edge</span></code> samples had it ended before / after this step’s
+frames: the full decode normalizes its right edge by the partial window sum.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>final</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>end_before</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>end_after</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.end_after">
+<span class="sig-name descname"><span class="pre">end_after</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.end_after" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.end_before">
+<span class="sig-name descname"><span class="pre">end_before</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.end_before" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.final">
+<span class="sig-name descname"><span class="pre">final</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.final" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.audio_codec.</span></span><span class="sig-name descname"><span class="pre">CodecStreamState</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tails</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">overlap</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#CodecStreamState"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>What a decode stream carries from one step to the next.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tails</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>overlap</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState.overlap">
+<span class="sig-name descname"><span class="pre">overlap</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState.overlap" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState.tails">
+<span class="sig-name descname"><span class="pre">tails</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState.tails" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -852,19 +988,16 @@ pointwise expand -&gt; GELU -&gt; pointwise project, with a residual add.</p>
 </dl>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.ConvNeXtBlock.forward">
-<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#ConvNeXtBlock.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.ConvNeXtBlock.forward" title="Link to this definition">#</a></dt>
-<dd><p>Define the computation performed at every call.</p>
-<p>Should be overridden by all subclasses.</p>
-<div class="admonition note">
-<p class="admonition-title">Note</p>
-<p>Although the recipe for forward pass needs to be defined within
-this function, one should call the <code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code> instance afterwards
-instead of this since the former takes care of running the
-registered hooks while the latter silently ignores them.</p>
-</div>
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tail</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#ConvNeXtBlock.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.ConvNeXtBlock.forward" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">tail</span></code>, for a stream, is the block’s previous <code class="docutils literal notranslate"><span class="pre">kernel</span> <span class="pre">-</span> <span class="pre">1</span></code> inputs
+<code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">C,</span> <span class="pre">kernel</span> <span class="pre">-</span> <span class="pre">1]</span></code>; without one the block pads with zeros, as at the
+stream’s start.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>tail</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
@@ -921,6 +1054,46 @@ entry per residual level; <code class="docutils literal notranslate"><span class
 
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.check_window_envelope">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.audio_codec.</span></span><span class="sig-name descname"><span class="pre">check_window_envelope</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">window</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hop_length</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#check_window_envelope"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.check_window_envelope" title="Link to this definition">#</a></dt>
+<dd><p>Refuse a window and hop whose overlap-add has a gap at any frame count.
+A sample within one window of either end sees the same frames for every
+count of at least <code class="docutils literal notranslate"><span class="pre">ceil(win</span> <span class="pre">/</span> <span class="pre">hop)</span></code>, and an interior one the full periodic
+overlap, so the counts up to twice that and one more cover them all.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>window</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>hop_length</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.nemotron_duplex.components.audio_codec.codec_state_blocks">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.nemotron_duplex.components.audio_codec.</span></span><span class="sig-name descname"><span class="pre">codec_state_blocks</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/nemotron_duplex/components/audio_codec.html#codec_state_blocks"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.nemotron_duplex.components.audio_codec.codec_state_blocks" title="Link to this definition">#</a></dt>
+<dd><p>A decode stream’s state as recurrent-pool blocks: per decoder stage, its
+blocks’ conv tails <code class="docutils literal notranslate"><span class="pre">(num_blocks,</span> <span class="pre">channels,</span> <span class="pre">kernel</span> <span class="pre">-</span> <span class="pre">1)</span></code> (by default in the
+engine’s compute dtype, which the blocks compute in), and the inverse STFT’s
+overlap (<code class="docutils literal notranslate"><span class="pre">CodecStreamState.overlap</span></code>, float32).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.CodecConfig" title="mstar.model.nemotron_duplex.config.CodecConfig"><em>CodecConfig</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.config.RecurrentBlockConfig" title="mstar.engine.resources.recurrent.config.RecurrentBlockConfig"><em>RecurrentBlockConfig</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -974,11 +1147,24 @@ entry per residual level; <code class="docutils literal notranslate"><span class
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.ae_decode"><code class="docutils literal notranslate"><span class="pre">AudioCodec.ae_decode()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.ae_encode"><code class="docutils literal notranslate"><span class="pre">AudioCodec.ae_encode()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.decode"><code class="docutils literal notranslate"><span class="pre">AudioCodec.decode()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.decode_stream"><code class="docutils literal notranslate"><span class="pre">AudioCodec.decode_stream()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.dequantize"><code class="docutils literal notranslate"><span class="pre">AudioCodec.dequantize()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.encode"><code class="docutils literal notranslate"><span class="pre">AudioCodec.encode()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.load_weights"><code class="docutils literal notranslate"><span class="pre">AudioCodec.load_weights()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.quantize"><code class="docutils literal notranslate"><span class="pre">AudioCodec.quantize()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.remap"><code class="docutils literal notranslate"><span class="pre">AudioCodec.remap()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.AudioCodec.stream_edge"><code class="docutils literal notranslate"><span class="pre">AudioCodec.stream_edge</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio"><code class="docutils literal notranslate"><span class="pre">CodecStreamAudio</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.end_after"><code class="docutils literal notranslate"><span class="pre">CodecStreamAudio.end_after</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.end_before"><code class="docutils literal notranslate"><span class="pre">CodecStreamAudio.end_before</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamAudio.final"><code class="docutils literal notranslate"><span class="pre">CodecStreamAudio.final</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState"><code class="docutils literal notranslate"><span class="pre">CodecStreamState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState.overlap"><code class="docutils literal notranslate"><span class="pre">CodecStreamState.overlap</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.CodecStreamState.tails"><code class="docutils literal notranslate"><span class="pre">CodecStreamState.tails</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.ConvNeXtBlock"><code class="docutils literal notranslate"><span class="pre">ConvNeXtBlock</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -990,6 +1176,8 @@ entry per residual level; <code class="docutils literal notranslate"><span class
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.ProjectedRVQ.encode"><code class="docutils literal notranslate"><span class="pre">ProjectedRVQ.encode()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.check_window_envelope"><code class="docutils literal notranslate"><span class="pre">check_window_envelope()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.nemotron_duplex.components.audio_codec.codec_state_blocks"><code class="docutils literal notranslate"><span class="pre">codec_state_blocks()</span></code></a></li>
 </ul>
   </nav></div>
 
