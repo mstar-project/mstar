@@ -287,6 +287,9 @@ class RustFrontendBridge:
 
     def run(self) -> None:
         """Blocking serve loop (the ``uvicorn.run`` replacement)."""
+        # with the message thread: tokens pass from it to this loop. The Rust
+        # process is already running, so it keeps the process mask.
+        self.server.pin_result_thread()
         try:
             asyncio.run(self._serve())
         except KeyboardInterrupt:

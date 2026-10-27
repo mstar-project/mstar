@@ -58,13 +58,15 @@ from mstar.observability.metrics import (
 )
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
-from mstar.utils import profiler
+from mstar.utils import knobs, profiler
 from mstar.utils.client_errors import client_error_text, scrub_paths
+from mstar.utils.cpu_list import format_cpu_list
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
+from mstar.utils.step_threads import PINNABLE, StepCore, api_thread_cpu, pin_step_thread
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +373,11 @@ class DeadConductorError(RuntimeError):
 class APIServer:
     """Accept multimodal requests, forward to conductor, collect results."""
 
+    # The CPU the message thread and the Rust frontend's bridge share (None:
+    # not pinned) and the process mask; see ``mstar.utils.step_threads``.
+    _result_core: StepCore = StepCore(None, "not chosen")
+    _process_cpus: frozenset[int] = frozenset()
+
     def __init__(
         self,
         socket_path_prefix: str = "/tmp/mstar",
@@ -417,6 +424,7 @@ class APIServer:
         ) if model is not None else frozenset()
         self.takes_stream_input = bool(self.client_streams)
         self._model_config = model_config
+        self._choose_result_cpu()
 
         # Before any tensor manager; the conductor and workers inherit it.
         ensure_deployment_token()
@@ -489,6 +497,30 @@ class APIServer:
         reads. Read on first use, after the conductor's validate_deployment
         has accepted it, so a bad value is reported with the rest."""
         return _call_input_limit(self._model_config)
+
+    def _choose_result_cpu(self) -> None:
+        """Pick the CPU the result threads share (the workers leave it out of
+        theirs) and log it."""
+        if not PINNABLE:
+            return
+        knobs.configure((self._model_config or {}).get("knobs"))
+        self._process_cpus = frozenset(os.sched_getaffinity(0))
+        mask = format_cpu_list(self._process_cpus)
+        cpu = api_thread_cpu(knobs.step_thread_core(), self._process_cpus)
+        self._result_core = StepCore(cpu, f"last CPU of the process mask {mask}")
+        if cpu is None:
+            logger.info("API server: result threads not pinned (step_thread_core %s, mask %s)",
+                        knobs.step_thread_core(), mask)
+        else:
+            logger.info("API server: message thread and frontend bridge on CPU %d (%s)",
+                        cpu, self._result_core.source)
+
+    def pin_result_thread(self) -> None:
+        """Move the calling thread to the result threads' CPU. Every step's
+        tokens pass from the message thread to the frontend's bridge; on one
+        CPU each handoff wakes a core that is already running."""
+        if self._result_core.cpu is not None:
+            pin_step_thread(self._result_core.cpu, self._process_cpus)
 
     def finalize_setup(self) -> None:
         """Block until the conductor signals that every worker has finished
@@ -916,6 +948,7 @@ class APIServer:
         """Drain the ZMQ pull socket and route results to pending requests.
         Also watches the conductor process. Once it exits, every pending
         request is failed and the HTTP server is told to stop."""
+        self.pin_result_thread()
         next_liveness_check = 0.0
         while self.running:
             now = time.monotonic()

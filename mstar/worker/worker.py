@@ -92,10 +92,17 @@ from mstar.utils.profiler import (
     range_pop,
     range_push,
 )
+from mstar.utils.step_threads import (
+    PINNABLE,
+    StepCore,
+    api_thread_cpu,
+    choose_step_core,
+    pin_step_thread,
+    smt_order,
+)
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
-from mstar.worker.step_threads import PINNABLE, StepCore, choose_step_core, pin_step_thread, smt_order
 from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -2206,6 +2213,7 @@ class Worker:
             return
         self._process_cpus = frozenset(os.sched_getaffinity(0))
         setting = knobs.step_thread_core()
+        api_cpu = api_thread_cpu(setting, self._process_cpus, smt_order)
         devices = local_worker_devices or [str(self.device)]
         slot = worker_ids.index(self.worker_id) if local_worker_devices else 0
         local_cpus = [
@@ -2214,7 +2222,7 @@ class Worker:
             for d in map(torch.device, devices)
         ]
         self._step_core = choose_step_core(
-            setting, slot, local_cpus, self._process_cpus, order=smt_order,
+            setting, slot, local_cpus, self._process_cpus - {api_cpu}, order=smt_order,
         )
         if self._step_core.cpu is None:
             logger.info("Worker %s: step threads not pinned (%s)", self.worker_id, self._step_core.source)

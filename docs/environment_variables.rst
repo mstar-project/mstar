@@ -494,9 +494,13 @@ Worker scheduling
        mask, so a ``taskset`` or cgroup pin is respected. When the mask has
        fewer than one CPU per worker plus one, nothing is pinned. ``off``
        leaves the threads on the process mask; a number is the first worker's
-       CPU, and the next workers take the allowed CPUs above it. Everything
-       else in the worker (intra-op pools, transport threads) keeps the
-       process mask. Each worker logs its CPU and how it was chosen. Read by
+       CPU, and the next workers take the allowed CPUs above it. The API
+       server's message thread and the Rust frontend's bridge, which every
+       step's tokens pass through next, share the last CPU of the mask, and
+       the workers leave that one out (unless ``off``, or the mask has fewer
+       than three CPUs). Everything else (intra-op pools, transport threads,
+       the API server's data worker) keeps the process mask. Each worker and
+       the API server log their CPU and how it was chosen. Read by
        ``knobs.step_thread_core``; no effect where ``os.sched_setaffinity``
        is missing (macOS, Windows).
    * - ``MSTAR_DECODE_BUCKETS``

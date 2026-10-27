@@ -780,7 +780,7 @@ class Conductor:
             self._mps = MpsDaemon()
             self._mps.start()
         # every worker runs on this host; each picks its step-thread CPU knowing
-        # the others' devices (see mstar.worker.step_threads)
+        # the others' devices (see mstar.utils.step_threads)
         devices = [worker_device(self.device_type, rank, self.rank_devices) for rank in self._sorted_ranks]
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(

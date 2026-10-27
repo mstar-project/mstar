@@ -19,11 +19,11 @@ from mstar.platforms import (  # noqa: E402
     CpuPlatform,
     CudaPlatform,
     RocmPlatform,
-    interface,  # noqa: E402
+    interface,
 )
+from mstar.utils import step_threads  # noqa: E402
 from mstar.utils.cpu_list import format_cpu_list, parse_cpu_list  # noqa: E402
-from mstar.worker import step_threads  # noqa: E402
-from mstar.worker.step_threads import StepCore, choose_step_core  # noqa: E402
+from mstar.utils.step_threads import StepCore, api_thread_cpu, choose_step_core  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 NODE0, NODE1 = parse_cpu_list("0-31,128-159"), parse_cpu_list("32-63,160-191")
@@ -95,6 +95,19 @@ def test_off_and_explicit_values():
     assert _cpus(0, [None, None], parse_cpu_list("0-1")) == [None, None]
 
 
+def test_the_api_server_takes_the_last_cpu_and_the_workers_leave_it():
+    assert api_thread_cpu("auto", HOST, smt) == 127  # the last first hardware thread
+    assert api_thread_cpu("auto", parse_cpu_list("32-39"), smt) == 39
+    assert api_thread_cpu(34, parse_cpu_list("32-39"), smt) == 39
+    assert api_thread_cpu("off", HOST, smt) is None
+    assert api_thread_cpu("auto", {4, 5}, smt) is None  # too small to spare one
+    # the workers build their table without it
+    allowed = parse_cpu_list("37-39")
+    api = api_thread_cpu("auto", allowed, smt)
+    assert _cpus("auto", [None], allowed - {api}) == [37]
+    assert _cpus("auto", [None, None], allowed - {api}) == [None, None]
+
+
 # ── local CPU list ─────────────────────────────────────────────────────────
 
 def test_cpu_lists_round_trip():
@@ -154,6 +167,15 @@ def test_the_worker_picks_its_row_and_logs_it(monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
         w._choose_step_core(["worker_0", "worker_1", "worker_2"], ["cuda:0", "cuda:1", "cuda:2"])
     assert w._step_core.cpu == 1 and w._process_cpus == HOST
+
+    # the API server's CPU (the last of the mask) is never a worker's
+    monkeypatch.setattr(worker_mod.os, "sched_getaffinity", lambda pid: {37, 38, 39}, raising=False)
+    w = _bare_worker(worker_id="worker_0", device="cpu")
+    w._choose_step_core(["worker_0", "worker_1"], ["cpu", "cpu"])
+    assert w._step_core.cpu is None  # 37 and 38 for two workers leave nothing else
+    w._choose_step_core(["worker_0"], ["cpu"])
+    assert w._step_core.cpu == 37
+    monkeypatch.setattr(worker_mod.os, "sched_getaffinity", lambda pid: set(HOST), raising=False)
     assert "step threads (main, GPU, plan) on CPU 1 (local to its device: 0-31,128-159; " \
            "cuda:1, worker 2 of 3, allowed 0-255)" in caplog.text
 
@@ -178,6 +200,64 @@ def test_without_sched_setaffinity_the_worker_pins_nothing(monkeypatch, caplog):
         w._choose_step_core(["worker_1"], None)
     assert w._step_core.cpu is None and "no sched_setaffinity" in caplog.text
     w._pin_step_thread()  # a no-op, never reaches os.sched_setaffinity
+
+
+# ── API server ─────────────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not step_threads.PINNABLE, reason="needs os.sched_setaffinity (Linux)")
+def test_the_api_message_thread_and_the_bridge_move_to_the_result_cpu(monkeypatch):
+    from api_server_helpers import make_test_api_server
+
+    from mstar.api_server.rust_frontend import RustFrontendBridge
+
+    allowed = frozenset(os.sched_getaffinity(0))
+    if len(allowed) < 2:
+        pytest.skip("needs two allowed CPUs")
+    cpu = max(allowed)
+    exited = SimpleNamespace(pid=5, is_alive=lambda: False, exitcode=1)
+    server = make_test_api_server(
+        conductor_proc=exited, _liveness_interval_s=0.0, _result_core=StepCore(cpu, "test"), _process_cpus=allowed,
+        communicator=SimpleNamespace(get_all_new_messages=list),
+    )
+    seen = {}
+
+    def message_thread():
+        server._process_messages()  # finds the conductor gone and returns
+        seen["message"] = os.sched_getaffinity(0)
+
+    async def serve():
+        seen["bridge"] = os.sched_getaffinity(0)
+
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.server = server
+    monkeypatch.setattr(bridge, "_serve", serve, raising=False)
+    # both pin the thread that runs them; keep that off pytest's own thread
+    for target in (message_thread, bridge.run):
+        t = threading.Thread(target=target)
+        t.start()
+        t.join(30)
+    assert seen == {"message": {cpu}, "bridge": {cpu}}
+    # a server built without a CPU (tests, ``off``, macOS) pins nothing
+    make_test_api_server().pin_result_thread()
+
+
+def test_the_api_server_logs_its_choice(monkeypatch, caplog):
+    from api_server_helpers import make_test_api_server
+
+    from mstar.api_server import entrypoint
+
+    monkeypatch.setattr(entrypoint, "PINNABLE", True)
+    monkeypatch.setattr(entrypoint.os, "sched_getaffinity", lambda pid: set(range(32, 40)), raising=False)
+    monkeypatch.delenv("MSTAR_STEP_THREAD_CORE", raising=False)
+    server = make_test_api_server(_model_config={"knobs": {"step_thread_core": "auto"}})
+    with caplog.at_level(logging.INFO, logger="mstar.api_server.entrypoint"):
+        server._choose_result_cpu()
+    assert server._result_core.cpu == 39
+    assert "message thread and frontend bridge on CPU 39 (last CPU of the process mask 32-39)" in caplog.text
+    server = make_test_api_server(_model_config={"knobs": {"step_thread_core": False}})
+    server._choose_result_cpu()
+    assert server._result_core.cpu is None
+    entrypoint.knobs.configure(None)
 
 
 class _StopLoopError(BaseException):

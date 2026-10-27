@@ -1,13 +1,15 @@
-"""The CPU a worker's step threads share.
+"""The CPUs that the threads a step passes through share.
 
 A step passes between the worker's main thread, its GPU thread and its plan
 thread several times (submit, launch, done, commit, plan ready), and each
 handoff blocks one thread and wakes another. Woken on another core, a thread
 first waits for that core to leave a deep idle state and then runs on cold
 caches; woken on the core the other thread just released, it starts at once.
-So the three threads share one CPU, a distinct one per worker on the host.
-Everything else in the process (intra-op pools, transport threads) keeps the
-process mask.
+So the three threads share one CPU, a distinct one per worker on the host. The
+API server's result threads (the message thread, and the Rust frontend's
+bridge) hand every step's tokens on the same way and share one CPU of their
+own. Everything else (intra-op pools, transport threads, the data worker)
+keeps the process mask.
 """
 from __future__ import annotations
 
@@ -39,6 +41,20 @@ def smt_order(cpu: int) -> tuple[int, int]:
             return sorted(parse_cpu_list(f.read())).index(cpu), cpu
     except (OSError, ValueError):
         return 0, cpu
+
+
+def api_thread_cpu(
+    setting: str | int, allowed: Collection[int],
+    order: Callable[[int], tuple[int, int]] = smt_order,
+) -> int | None:
+    """The CPU the API server's result threads share: the last allowed CPU
+    (first hardware threads before siblings), or None when the setting is
+    ``off`` or the mask is too small to spare one. The workers leave it out of
+    their table, so the API server can pick it without knowing their devices.
+    """
+    if setting == "off" or len(allowed) < 3:
+        return None
+    return max(allowed, key=lambda c: (-order(c)[0], c))
 
 
 def choose_step_core(
