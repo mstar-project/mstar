@@ -1,4 +1,8 @@
-"""Chunked prefill: the token budget, chunk bookkeeping and output accumulation."""
+"""Chunked prefill: the token budget and chunk bookkeeping.
+
+What a chunk's output means is the node's Loop's business, covered in
+``test/rust/test_runtime_parity.py``.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +15,6 @@ import torch
 
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.worker.batch_builder import fill_token_budget
-from mstar.worker.chunk_outputs import ChunkOutputAccumulator
 
 # ── the token budget ────────────────────────────────────────────────────
 
@@ -85,70 +88,6 @@ def test_the_head_runs_over_budget_rather_than_nothing():
     take, dropped = fill_token_budget(["p0"], {"p0": 100}, set(), 10)
     assert take == {"p0": 100}
     assert not dropped
-
-
-# ── output accumulation ─────────────────────────────────────────────────
-
-
-def test_held_chunks_come_back_concatenated_in_order():
-    acc = ChunkOutputAccumulator()
-    acc.hold(0, "LLM", {"states": [torch.tensor([1.0])]})
-    acc.hold(0, "LLM", {"states": [torch.tensor([2.0])]})
-
-    out = acc.release(0, "LLM", {"states": [torch.tensor([3.0])], "new_token": [torch.tensor([7])]})
-
-    assert out["states"][0].tolist() == [1.0, 2.0, 3.0]
-    assert out["new_token"][0].tolist() == [7]
-    assert acc.release(0, "LLM", {"x": []}) == {"x": []}, "released once"
-
-
-def test_concat_joins_along_the_declared_dim():
-    from mstar.model.submodule_base import ChunkedPrefillOutputPolicy
-
-    acc = ChunkOutputAccumulator()
-    acc.hold(0, "LLM", {"mask": [torch.zeros(2, 3)]})
-
-    out = acc.release(0, "LLM", {"mask": [torch.ones(2, 4)]}, {"mask": ChunkedPrefillOutputPolicy(dim=1)})
-
-    assert out["mask"][0].shape == (2, 7)
-
-
-def test_list_keeps_every_chunk():
-    from mstar.model.submodule_base import ChunkedPrefillOutputMode, ChunkedPrefillOutputPolicy
-
-    acc = ChunkOutputAccumulator()
-    acc.hold(0, "LLM", {"states": [torch.tensor([1.0])]})
-
-    out = acc.release(
-        0, "LLM", {"states": [torch.tensor([2.0])]},
-        {"states": ChunkedPrefillOutputPolicy(mode=ChunkedPrefillOutputMode.LIST)},
-    )
-
-    assert [t.tolist() for t in out["states"]] == [[1.0], [2.0]]
-
-
-def test_concat_joins_each_tensor_of_an_edge_with_its_own():
-    """An edge of several tensors per chunk (one per layer, say) stays several."""
-    acc = ChunkOutputAccumulator()
-    acc.hold(0, "LLM", {"layers": [torch.tensor([1.0]), torch.tensor([10.0])]})
-
-    out = acc.release(0, "LLM", {"layers": [torch.tensor([2.0]), torch.tensor([20.0])]})
-
-    assert [t.tolist() for t in out["layers"]] == [[1.0, 2.0], [10.0, 20.0]]
-
-
-def test_a_final_chunk_with_no_outputs_still_releases_the_held_ones():
-    acc = ChunkOutputAccumulator()
-    acc.hold(0, "LLM", {"states": [torch.tensor([1.0])]})
-
-    assert acc.release(0, "LLM", {})["states"][0].tolist() == [1.0]
-
-
-def test_a_removed_request_leaves_nothing_held():
-    acc = ChunkOutputAccumulator()
-    acc.hold(0, "LLM", {"states": [torch.tensor([1.0])]})
-    acc.drop(0)
-    assert acc.release(0, "LLM", {}) == {}
 
 
 # ── engine: prepare once, cut per chunk ─────────────────────────────────
@@ -429,18 +368,6 @@ def test_a_continuing_decode_row_is_estimated_at_one_token():
         assert llm.speculative_input_seq_len(prompt_walk, None, 64) == 64
         assert llm.speculative_input_seq_len(prompt_walk, None, -1) is None
 
-
-def test_final_keeps_only_the_last_chunk_and_holds_nothing_before():
-    from mstar.model.submodule_base import ChunkedPrefillOutputMode, ChunkedPrefillOutputPolicy
-
-    final = {"token": ChunkedPrefillOutputPolicy(mode=ChunkedPrefillOutputMode.FINAL)}
-    acc = ChunkOutputAccumulator()
-    acc.hold(0, "LLM", {"token": [torch.tensor([1])], "states": [torch.tensor([1.0])]}, final)
-
-    assert "token" not in acc._held[(0, "LLM")]
-    out = acc.release(0, "LLM", {"token": [torch.tensor([9])], "states": [torch.tensor([2.0])]}, final)
-    assert out["token"][0].tolist() == [9]
-    assert out["states"][0].tolist() == [1.0, 2.0]
 
 
 # ── engine: the serving config's max_batch_tokens ──────────────────────

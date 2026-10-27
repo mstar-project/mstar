@@ -282,24 +282,6 @@ def _split_pos_ids(
     return pos_ids[..., start:end]
 
 
-class ChunkedPrefillOutputMode(Enum):
-    # each tensor torch.cat across the chunks along `dim`: the unchunked output
-    CONCAT = "concat"
-    # every chunk's tensors in chunk order, for a consumer that takes the pieces
-    LIST = "list"
-    # the final chunk's tensors alone; earlier chunks' are dropped, never held.
-    # A non-final chunk's rows are never stop-checked (held first), so FINAL on a
-    # sampled-token edge needs no drop in postprocess (see keep_final_chunk_samples).
-    FINAL = "final"
-
-
-@dataclass(frozen=True)
-class ChunkedPrefillOutputPolicy:
-    """How a chunked node's output edge is put back together at its final chunk."""
-    mode: ChunkedPrefillOutputMode = ChunkedPrefillOutputMode.CONCAT
-    dim: int = 0
-
-
 @dataclass(frozen=True)
 class ChunkingPolicy:
     """How a walk's prefill may be split across steps; the default is not at all."""
@@ -324,8 +306,6 @@ class ChunkingPolicy:
     max_chunks: int = 1
     # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
     max_batch_tokens: int | None = None
-    # output edge -> how its chunks are joined; unlisted edges CONCAT on dim 0
-    output_policies: Mapping[str, ChunkedPrefillOutputPolicy] = field(default_factory=dict)
     # whether a row may start past its cached prefix, asked before prepare; None is always
     reuses_cached_prefix: Callable[[CurrentForwardPassInfo], bool] | None = None
     # whether a first chunk reserves the KV the whole prefill needs, so a

@@ -1731,14 +1731,15 @@ def no_chunk_floor(monkeypatch):
 class _ChunkingEngine(_SizedEngine):
     """A 4-token budget; ``p0``'s walk can be chunked and it is 10 tokens long."""
 
-    def __init__(self, cached=None, walk_caps=None, **kw):
+    def __init__(self, cached=None, walk_caps=None, budget=4, **kw):
         super().__init__(unready=(), **kw)
         self.cached = cached or {}
         self.walk_caps = walk_caps
+        self.budget = budget
 
     def get_max_batch_tokens(self, node_name, graph_walk):
         del node_name, graph_walk
-        return 4
+        return self.budget
 
     def walk_token_caps(self, node_name, graph_walk):
         del node_name, graph_walk
@@ -1801,14 +1802,12 @@ def test_a_request_removed_mid_prompt_leaves_no_chunk_state():
     sched.get_tensor = lambda uuid: uuid
     manager = _Manager(["p0", "p1"], walks={"p0": "prefill", "p1": "prefill"})
     _next_batch(sched, manager)
-    sched.chunk_outputs.hold("p0", NODE, {"hidden": ["a held chunk"]})
     assert ("p0", NODE) in sched.chunk_progress
 
     for rid in ("p0", "p1"):
         sched.clear_rid(rid, rid)
 
     assert not sched.chunk_progress and not sched.cached_prefix
-    assert not sched.chunk_outputs.holds("p0", NODE)
 
 
 def test_a_walk_cap_holds_its_rows_within_the_steps_budget():
@@ -1887,9 +1886,12 @@ def test_the_chunk_floor_does_not_pad_a_last_chunk():
 
     first = _next_batch(sched, _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"}))
 
-    # the decode rows leave 2 of 4; the prompt's last 3 run whole, not cut to 2 or padded to 4
+    # the decode rows leave 2 of 4; the prompt's last 3 run whole, not cut to 2
+    # or padded to 4, so it takes no range. The worker reads that as a final
+    # chunk and ends the row's chunk Loop (test_chunk_loop_stop.py).
     assert first.chunk_ranges == {}
     assert sorted(first.request_to_worker_graph) == ["d0", "d1", "p0"]
+
 
 
 def test_a_merge_with_no_rows_to_size_never_estimates_its_own():

@@ -978,19 +978,35 @@ Two more methods control batching and CUDA graphs: ``can_batch`` with
 
 **Chunked prefill (optional).** A walk with long prompts can run each across several steps,
 at most a token budget per step, so the decode rows batched beside it keep running. Three
-methods opt a walk in:
+methods opt a walk in. The policy is declared on the **model**, not the submodule, because
+the graph build reads it: a chunkable walk runs the node inside a Loop, one iteration per
+chunk, and the model passes its walk dict through ``apply_chunking`` to get that. A walk
+declared chunkable whose node was left unwrapped is refused at startup.
 
-- ``get_chunking_policy(graph_walk)`` returns a ``ChunkingPolicy``: ``chunkable=True``;
-  ``max_batch_tokens``, the step's budget (a combined walk that carries chunked rows sets
-  one too, since its steps run under it); ``output_policies`` for an output edge whose
-  chunks are not joined by concatenating on dim 0 (``ChunkedPrefillOutputMode.CONCAT``,
-  ``LIST`` or ``FINAL``); ``reuses_cached_prefix`` when a row may have to write a
+- ``Model.get_chunking_policies()`` returns ``{node: (ChunkingPolicy, ...)}``, each policy
+  naming the ``walks`` it covers: ``chunkable=True``; ``max_batch_tokens``, the step's
+  budget (a combined walk that carries chunked rows sets one too, since its steps run
+  under it); ``max_chunks``, the chunk Loop's runaway guard, for which the model's longest
+  prompt is always safe; ``accumulated_outputs`` for an output edge a consumer needs every
+  chunk of, which then arrives as one item per chunk (any other edge carries the final
+  chunk's tensors alone, earlier chunks' dropped as the loop advances);
+  ``reuses_cached_prefix`` when a row may have to write a
   cached prefix again rather than start past it; and ``reserve_whole_prefill``, on by
   default, which has a row's first chunk reserve the state its whole prefill needs so a
   part-done row cannot wedge on a full pool. Turn it off for a walk whose state grows by
   something other than the tokens a step runs, where that count would reserve the wrong
   amount; a resource reads it as ``StepContext.reserve_whole_prefill`` and must check it
   before reserving by ``StepContext.chunk_tokens_after``.
+
+  A **streaming** consumer of a gathered edge needs one more decision, because its
+  ``ChunkPolicy`` counts items and a chunked producer sends one per chunk: to a
+  ``FixedChunkPolicy(1)`` the pieces look like separate items and it reads only the
+  first. Set ``Connection.join_dim`` to have the consumer's ``StreamBuffer`` join them
+  into the single item it expects, on arrival -- it owns those tensors outright, so
+  there is no cross-stream ordering to get wrong. Leave it unset for a consumer that
+  can take the pieces as they come, which is the better answer where the consumer can
+  do it; ``join_dim`` is for one that conditions on the whole prompt or whose shapes
+  are captured.
 - ``get_input_sequence_len(graph_walk, fwd_info, inputs)`` gives a row's length from its
   input shapes, before ``prepare_inputs`` runs. The scheduler cuts the row by it, and a
   row whose prepared input turns out another length fails.

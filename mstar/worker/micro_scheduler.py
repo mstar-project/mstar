@@ -18,7 +18,6 @@ from mstar.worker.batch_builder import (
     BatchBuildResult,
     make_batch_builder,
 )
-from mstar.worker.chunk_outputs import ChunkOutputAccumulator
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -295,7 +294,6 @@ class MicroScheduler:
         # (rid, node) -> cached prefix a measured, not yet chunked row starts past
         self.cached_prefix: dict[tuple[int, str], int] = {}
         # their non-final chunks' outputs, routed with the final chunk
-        self.chunk_outputs = ChunkOutputAccumulator()
         self._warned_removed_rid = False
         self.sched_type = sched_type
 
@@ -1233,7 +1231,12 @@ class MicroScheduler:
     ) -> None:
         """Stamp the [start, end) each chunked row runs this step, with the
         total it was measured at; a row first cut here starts its progress.
-        A row whose chunk is still in flight starts where that chunk ends."""
+        A row whose chunk is still in flight starts where that chunk ends.
+
+        A row whose walk has no token budget is never measured, so it gets no
+        range at all. The worker reads an absent range as having run whole,
+        which is what ends its chunk Loop.
+        """
         for rid in batch.request_to_worker_graph:
             key = (rid, batch.node_name)
             progress = self.chunk_progress.get(key)
@@ -1579,7 +1582,6 @@ class MicroScheduler:
             del self.chunk_progress[key]
         for key in [key for key in self.cached_prefix if key[0] == rid]:
             del self.cached_prefix[key]
-        self.chunk_outputs.drop(rid)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
         self.clear_wire_rid(rid_str)

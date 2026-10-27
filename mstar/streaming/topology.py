@@ -27,6 +27,15 @@ class Connection:
     to_partition: str
     edge_name: str
     chunk_policy_factory: Callable[[], ChunkPolicy]
+    # Dim to join a chunked producer's pieces on, or None to keep them apart.
+    # A node whose prefill is chunked emits one piece per chunk, but its
+    # consumer's ChunkPolicy counts ITEMS -- so to a FixedChunkPolicy(1) the
+    # pieces look like separate items and it reads only the first. Joining them
+    # here, on the consumer, keeps the item the consumer already expects. Done
+    # on arrival rather than at the producer deliberately: the consumer owns
+    # these tensors outright, so there is no cross-stream ordering to get
+    # wrong, which is where the producer-side join went wrong before.
+    join_dim: int | None = None
 
 
 @dataclass

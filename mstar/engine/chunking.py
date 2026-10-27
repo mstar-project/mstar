@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 from mstar.model.submodule_base import (
     NO_CHUNKING,
-    ChunkedPrefillOutputPolicy,
     ChunkingPolicy,
     NodeInputs,
 )
@@ -166,11 +165,6 @@ class ChunkingManagement:
         if self._overrides.get((node_name, graph_walk), 0) is None:
             return False
         return self.policy(node_name, graph_walk).chunkable
-
-    def output_policies(
-        self, node_name: str, graph_walk: str,
-    ) -> Mapping[str, ChunkedPrefillOutputPolicy]:
-        return self.policy(node_name, graph_walk).output_policies
 
     def check_budget(self, batch: "ExecutingBatch", node_inputs: list[NodeInputs]) -> None:
         """Warn when a step runs over the budget it was scheduled under: that of

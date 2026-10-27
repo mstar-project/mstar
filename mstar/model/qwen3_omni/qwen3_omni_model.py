@@ -590,12 +590,15 @@ class Qwen3OmniModel(Model):
                     to_partition="Talker",
                     edge_name="thinker_states",
                     chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    # the Thinker's prefill chunks are pieces of one prompt
+                    join_dim=0,
                 ),
                 Connection(
                     from_partition="Thinker",
                     to_partition="Talker",
                     edge_name="thinker_mask",
                     chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    join_dim=0,
                 ),
                 Connection(
                     from_partition="Talker",

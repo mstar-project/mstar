@@ -51,7 +51,6 @@ from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
     BatchedModelOutput,
-    ChunkedPrefillOutputPolicy,
     ChunkingPolicy,
     HostRows,
     InputMetadata,
@@ -1176,23 +1175,34 @@ class Engine:
     def extend_prefix_chains(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
         host_rows: HostRows | None = None,
+        skip_rids: Collection[int] = (),
     ) -> None:
-        """Key what this step generated, from the stop check's host copy."""
+        """Key what this step generated, from the stop check's host copy.
+
+        ``skip_rids`` names rows whose sampled token is not a real sample -- a
+        prompt's non-final chunk -- so keying the chain on it would key a
+        token the request never generated.
+        """
         keys = self._runner.prefix_chain_keys(batch.node_name)
         if not keys:
             return
+        rids = batch.request_ids
+        if skip_rids:
+            rids = [rid for rid in rids if rid not in skip_rids]
+            if not rids:
+                return
         # The batch call keys each row under its own walk, so a combined-walk
         # step takes it too; only the absence of host rows falls through.
         if host_rows is not None:
             ctx = batch.step_context
             self._runner.extend_prefix_chains_batch(
-                batch.request_ids, batch.node_name,
+                rids, batch.node_name,
                 # a step of one walk passes the walk: no call per row
                 ctx.walk_of if ctx.request_walks else ctx.graph_walk,
                 host_rows, outputs, keys=keys,
             )
             return
-        for rid in batch.request_ids:
+        for rid in rids:
             per_rid = outputs.get(rid)
             if isinstance(per_rid, dict):
                 self._runner.extend_prefix_chains(
@@ -2343,11 +2353,6 @@ class Engine:
 
     def supports_chunked_prefill(self, node_name: str, graph_walk: str) -> bool:
         return self._chunking.chunkable(node_name, graph_walk)
-
-    def chunked_prefill_output_policies(
-        self, node_name: str, graph_walk: str,
-    ) -> Mapping[str, ChunkedPrefillOutputPolicy]:
-        return self._chunking.output_policies(node_name, graph_walk)
 
     def declares_input_sequence_len(self, node_name: str) -> bool:
         """Whether the node's submodule reports row lengths before prepare."""

@@ -1356,6 +1356,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         device = self.get_device()
 
         if graph_walk == "talker_prefill":
+            # One item, whether or not the Thinker's prefill was chunked: its
+            # per-chunk pieces are joined on arrival by the StreamBuffer
+            # (Connection.join_dim), so the Talker sees what it always did.
             selected_hidden = inputs["thinker_states"][0].to(device)
             multimodal_mask = inputs["thinker_mask"][0]
             input_embeds = self._get_talker_embeds(
