@@ -47,7 +47,7 @@ def _batch_sizes(bucket: int) -> list[int]:
 
 class TransducerSubmodule(NodeSubmodule):
     """Each decode iteration replays, per frame bucket, the pool's gather,
-    ``CHUNK`` compiled greedy steps and the scatter.
+    ``chunk`` compiled greedy steps and the scatter.
 
     The head is small (a 640-wide LSTM and joint) and its argmax decides every
     token, so it runs in fp32 outside the engine's autocast and TF32. The
@@ -64,11 +64,14 @@ class TransducerSubmodule(NodeSubmodule):
 
     def __init__(
         self, head: TransducerHead, compile_step: bool = True, frame_buckets=FRAME_BUCKETS,
-        encoder_dtype: torch.dtype = torch.float32,
+        encoder_dtype: torch.dtype = torch.float32, chunk: int = CHUNK,
     ):
         super().__init__()
         self.head = head
         self.frame_buckets = tuple(frame_buckets)
+        # steps an iteration; the model's loop cap counts CHUNK, so only tests
+        # that drive the node by hand pass fewer
+        self.chunk = chunk
         # the encoder output's dtype, which the captures' frames buffers take
         self.encoder_dtype = encoder_dtype
         # where a fresh slot starts, and every padding row; in full fp32, as
@@ -234,7 +237,7 @@ class TransducerSubmodule(NodeSubmodule):
             f"{encoder_states.shape[0]} rows of frames for a step that addresses {rows.num_rows}"
         )
         state = self._read_state(pool, rows)
-        tokens, active = self.head.advance(encoder_states, lengths, state, CHUNK, self._step, prompt_ids)
+        tokens, active = self.head.advance(encoder_states, lengths, state, self.chunk, self._step, prompt_ids)
         for name, value in state.items():
             pool.scatter_(name, rows, value)
         # tokens are -1 where a step emitted none
@@ -263,7 +266,7 @@ class TransducerSubmodule(NodeSubmodule):
         # the loop cap, which never binds (`decode_iterations`)
         num_frames = info.step_metadata.get(NUM_FRAMES)
         done = info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
-        return num_frames is not None and done >= self.head.config.decode_iterations(num_frames)
+        return num_frames is not None and done >= self.head.config.decode_iterations(num_frames, self.chunk)
 
     def check_stop(
         self,

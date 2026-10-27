@@ -20,8 +20,11 @@ from torch import nn
 
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 
-# greedy steps per decode iteration: one graph replay each
-CHUNK = 16
+# greedy steps per decode iteration, one graph replay each. An iteration
+# costs every row the engine's and the worker's per-step work, which at 16
+# outweighed the idle steps of 64; at 64 a LibriSpeech clip takes 1.2
+# iterations on average.
+CHUNK = 64
 # frames an RNN-T step scores at once: wider windows cost more joint work, over
 # a 13k vocabulary, than the blank steps they save. TDT scores one: its
 # durations already skip most blank frames.
@@ -72,10 +75,11 @@ class TransducerConfig:
             "symbols": RecurrentBlockConfig((), torch.int64),
         }
 
-    def decode_iterations(self, num_frames: int) -> int:
-        """The most decode iterations a clip of ``num_frames`` can take: a frame
-        takes at most ``max_symbols_per_step`` steps, so this never binds."""
-        return max(1, math.ceil(self.max_symbols_per_step * num_frames / CHUNK))
+    def decode_iterations(self, num_frames: int, chunk: int = CHUNK) -> int:
+        """The most decode iterations of ``chunk`` steps a clip of ``num_frames``
+        can take: a frame takes at most ``max_symbols_per_step`` steps, so this
+        never binds."""
+        return max(1, math.ceil(self.max_symbols_per_step * num_frames / chunk))
 
 
 class LSTMWeights(nn.Module):

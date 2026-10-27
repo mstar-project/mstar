@@ -29,6 +29,7 @@ from mstar.engine.resources.recurrent import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 from mstar.model.components.fastconformer import FastConformerConfig
+from mstar.model.components.transducer import CHUNK
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
     NUM_FRAMES,
@@ -43,6 +44,8 @@ from mstar.model.submodule_base import BatchedModelOutput, HostRows, ModelInputs
 from mstar.utils.precision import ieee_fp32_matmul
 
 BUCKETS = (8, 32)
+# steps an iteration, fewer than the node's CHUNK, so that requests span several iterations
+TEST_CHUNK = 16
 # (iteration the request joins at, its frames): 1 and 5 in the narrow bucket, 17 and 30 in the wide one
 ARRIVALS = ((0, 17), (0, 1), (1, 30), (2, 5), (2, 30), (3, 1), (3, 17), (5, 5), (6, 30), (8, 1))
 # 5 usable, fewer than the requests: slots are freed and handed out again
@@ -203,7 +206,7 @@ class Harness:
         self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=self.device))
         self.resources = {TRANSDUCER_STATE: self.pool}
         self.runner = StepRunner(self.resources, node_resources={"transducer": [TRANSDUCER_STATE]})
-        self.node = TransducerSubmodule(head, compile_step=compile_step, frame_buckets=BUCKETS)
+        self.node = TransducerSubmodule(head, compile_step=compile_step, frame_buckets=BUCKETS, chunk=TEST_CHUNK)
         # as the engine does at load
         self.node.requires_grad_(False)
         self.node.bind_node_resources(self.resources)
@@ -416,7 +419,7 @@ def test_loop_caps_and_stop_check_agree():
     cfg = head.config
     for n in (1, 5, 17, 30):
         steps = cfg.max_symbols_per_step * n  # every frame at the guard, the most it takes
-        assert (cfg.decode_iterations(n) - 1) * 16 < steps <= cfg.decode_iterations(n) * 16
+        assert (cfg.decode_iterations(n) - 1) * CHUNK < steps <= cfg.decode_iterations(n) * CHUNK
     model = object.__new__(ParakeetModel)
     model.config = ParakeetModelConfig("parakeet_rnnt", FastConformerConfig(), cfg)
     assert model.get_loop_caps(**{NUM_FRAMES: 30}) == {DECODE_LOOP: cfg.decode_iterations(30)}
