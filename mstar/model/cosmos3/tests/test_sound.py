@@ -23,7 +23,7 @@ import torch.nn.functional as F  # noqa: F401 — keeps parity harness imports u
 from mstar.model.cosmos3.components.packing import build_static_inputs
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
-from mstar.model.cosmos3.submodules import sound_frames
+from mstar.model.cosmos3.submodules import LATENT_DTYPE, sound_frames
 from mstar.model.cosmos3.tests.test_engine_cache import (
     _engine_resources,
     _forward_step,
@@ -292,14 +292,15 @@ def _sound_scenario():
     lat_t = 1 + (FRAMES - 1) // mpipe.vae_scale_temporal
     _, t_s = sound_frames({"num_frames": FRAMES, "fps": 24.0}, model.get_submodule("dit").config)
     gen = torch.Generator(device=device).manual_seed(SEED)
-    init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
+    # the served loop state's dtype, so the engine path and the fused pipeline step the same latents
+    init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=LATENT_DTYPE)
     # The fused pipeline draws its sound noise from `generator` after the video
     # latents; with explicit `latents` that is the generator's first draw, so a
     # same-state generator here reproduces it for the engine loop.
     sgen = torch.Generator(device=device).manual_seed(SEED + 1)
     from diffusers.utils.torch_utils import randn_tensor
 
-    sound_init = randn_tensor((1, model.config.sound_dim, t_s), generator=sgen, device=device, dtype=dtype)
+    sound_init = randn_tensor((1, model.config.sound_dim, t_s), generator=sgen, device=device, dtype=LATENT_DTYPE)
     sgen2 = torch.Generator(device=device).manual_seed(SEED + 1)
     lat_fused, sound_fused = mpipe(
         prompt=PROMPT, negative_prompt="", num_frames=FRAMES, height=H, width=W,

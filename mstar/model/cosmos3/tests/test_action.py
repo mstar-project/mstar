@@ -29,6 +29,7 @@ from mstar.model.cosmos3.components.packing import (
 )
 from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
 from mstar.model.cosmos3.config import Cosmos3Config
+from mstar.model.cosmos3.submodules import LATENT_DTYPE
 from mstar.model.cosmos3.tests.test_engine_cache import (
     _engine_resources,
     _forward_step,
@@ -328,8 +329,11 @@ def test_action_engine_matches_fused() -> None:
         video_latents=cond_latent, num_frames=nf, height=h, width=w, fps=fps, action_fps=fps,
         num_inference_steps=steps, guidance_scale=1.0, flow_shift=fshift, generator=gen)
 
+    # the served loop state's dtype, as the fused pipeline draws it
     gen2 = torch.Generator(device=device).manual_seed(0)
-    a_noise = randn_tensor((1, chunk, dit.transformer.action_dim), generator=gen2, device=device, dtype=dtype)
+    a_noise = randn_tensor(
+        (1, chunk, dit.transformer.action_dim), generator=gen2, device=device, dtype=LATENT_DTYPE
+    )
     a_noise[..., raw:] = 0
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
@@ -346,7 +350,7 @@ def test_action_engine_matches_fused() -> None:
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": [torch.tensor(cond_ids, dtype=torch.long, device=device)]})
     _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
     fwd.graph_walk = "action_gen"
-    latents, action_latents = cond_latent.clone(), a_noise.clone()
+    latents, action_latents = cond_latent.to(LATENT_DTYPE), a_noise.clone()
     time_index = torch.zeros(1, dtype=torch.long, device=device)
     for _ in range(steps):
         ni = dit.prepare_inputs("action_gen", fwd, {

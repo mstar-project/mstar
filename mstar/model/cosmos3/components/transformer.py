@@ -762,7 +762,8 @@ class Cosmos3OmniTransformer(nn.Module):
         in-projection + the action modality embedding, then scatter-add the
         timestep embedding to the noisy (predicted) action tokens only. Returns
         [T, hidden]."""
-        packed = self.action_proj_in(action_latents, action_domain_id)[0]  # [T, hidden]
+        # the denoise loop keeps its action latents in fp32; the projection takes them in the model dtype
+        packed = self.action_proj_in(action_latents.to(target_dtype), action_domain_id)[0]  # [T, hidden]
         packed = packed + self.action_modality_embed.to(packed.dtype)
         ts = action_timesteps * self.config.timestep_scale
         ts_embeds = self.time_embedder(self.time_proj(ts)).to(target_dtype)

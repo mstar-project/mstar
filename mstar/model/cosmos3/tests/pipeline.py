@@ -229,11 +229,9 @@ class Cosmos3Pipeline:
             use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
         )
 
-        # The loop state is fp32 like the served image/video path and the reference
-        # pipeline; the sound walk keeps the model dtype, as served.
-        loop_dtype = dtype if generate_sound else torch.float32
+        # The loop state is fp32 like the served path and the reference pipeline.
         latents, has_image_condition = self._prepare_latents(
-            image, num_frames, height, width, generator, latents, device, loop_dtype
+            image, num_frames, height, width, generator, latents, device, torch.float32
         )
         latent_shape = tuple(latents.shape)
 
@@ -279,7 +277,7 @@ class Cosmos3Pipeline:
             hop = int(round(self.config.sound_sample_rate / self.config.sound_latent_fps))
             sound_frames = max(1, math.ceil(target / hop))
             sound_latents = randn_tensor(
-                (1, self.config.sound_dim, sound_frames), generator=generator, device=device, dtype=dtype
+                (1, self.config.sound_dim, sound_frames), generator=generator, device=device, dtype=torch.float32
             )
 
         cond = build_static_inputs(
@@ -303,7 +301,7 @@ class Cosmos3Pipeline:
                 kwargs["sound_tokens"] = [sound_latents[0].to(dtype)]
                 kwargs["sound_timesteps"] = torch.full((sound_frames,), t.item(), device=device)
             preds_vision, preds_sound = self.transformer(**kwargs)
-            return preds_vision[0], (preds_sound[0] if generate_sound else None)
+            return preds_vision[0].float(), (preds_sound[0].float() if generate_sound else None)
 
         # A fresh per-call scheduler built like the served node's (karras off
         # on the native flow schedule, the request's flow shift); the template
@@ -315,12 +313,10 @@ class Cosmos3Pipeline:
             cond_v, cond_s = _forward(cond_static, vision_tokens, vision_timesteps, t)
             if guidance_scale != 1.0:
                 uncond_v, uncond_s = _forward(uncond_static, vision_tokens, vision_timesteps, t)
-                cond_v, uncond_v = cond_v.to(latents.dtype), uncond_v.to(latents.dtype)
                 velocity = uncond_v + guidance_scale * (cond_v - uncond_v)
                 sound_v = (uncond_s + guidance_scale * (cond_s - uncond_s)) if generate_sound else None
             else:
-                velocity = cond_v.to(latents.dtype)
-                sound_v = cond_s
+                velocity, sound_v = cond_v, cond_s
             if generate_sound:
                 # Joint [video | sound] scheduler step (one multistep history).
                 nv = velocity.numel()
@@ -380,6 +376,8 @@ class Cosmos3Pipeline:
         from diffusers.utils.torch_utils import randn_tensor
 
         device, dtype = self.device, self.dtype
+        # The loop state is fp32 like the served path; the transformer takes its inputs in ``dtype``.
+        loop_dtype = torch.float32
         action_dim = self.transformer.action_dim
         if num_frames is None:
             num_frames = action_chunk_size + 1
@@ -410,12 +408,14 @@ class Cosmos3Pipeline:
                 act = act[:action_chunk_size]
             clean_action = torch.zeros((action_chunk_size, action_dim), dtype=torch.float32)
             clean_action[:, :raw_action_dim] = act[:, :raw_action_dim]
-            clean_action = clean_action.to(device=device, dtype=dtype).unsqueeze(0)
-            action_clean_mask = torch.ones((1, action_chunk_size, 1), device=device, dtype=dtype)
+            clean_action = clean_action.to(device=device, dtype=loop_dtype).unsqueeze(0)
+            action_clean_mask = torch.ones((1, action_chunk_size, 1), device=device, dtype=loop_dtype)
         else:
-            clean_action = torch.zeros((1, action_chunk_size, action_dim), device=device, dtype=dtype)
-            action_clean_mask = torch.zeros((1, action_chunk_size, 1), device=device, dtype=dtype)
-        a_noise = randn_tensor((1, action_chunk_size, action_dim), generator=generator, device=device, dtype=dtype)
+            clean_action = torch.zeros((1, action_chunk_size, action_dim), device=device, dtype=loop_dtype)
+            action_clean_mask = torch.zeros((1, action_chunk_size, 1), device=device, dtype=loop_dtype)
+        a_noise = randn_tensor(
+            (1, action_chunk_size, action_dim), generator=generator, device=device, dtype=loop_dtype
+        )
         a_noise[..., raw_action_dim:] = 0
         clean_action[..., raw_action_dim:] = 0
         action_latents = action_clean_mask * clean_action + (1.0 - action_clean_mask) * a_noise
@@ -426,15 +426,15 @@ class Cosmos3Pipeline:
             if video is None:
                 raise ValueError("Cosmos3 action generation requires `video` or `video_latents`.")
             video_latents = self._encode_video(video.to(device=device, dtype=dtype))
-        cond_latent = video_latents.to(device=device, dtype=dtype)
+        cond_latent = video_latents.to(device=device, dtype=loop_dtype)
         latent_shape = tuple(cond_latent.shape)
         t_lat = latent_shape[2]
 
         vis_clean = set(vision_condition_frame_indexes(mode, t_lat))
-        vmask = torch.zeros((1, 1, t_lat, 1, 1), device=device, dtype=dtype)
+        vmask = torch.zeros((1, 1, t_lat, 1, 1), device=device, dtype=loop_dtype)
         for f in vis_clean:
             vmask[:, :, f] = 1.0
-        v_noise = randn_tensor(latent_shape, generator=generator, device=device, dtype=dtype)
+        v_noise = randn_tensor(latent_shape, generator=generator, device=device, dtype=loop_dtype)
         latents = vmask * cond_latent + (1.0 - vmask) * v_noise
         velocity_mask = 1.0 - vmask  # 1 where the video is predicted
 
@@ -465,12 +465,14 @@ class Cosmos3Pipeline:
                 action_tokens=action_latents.to(dtype), action_timesteps=ats, action_domain_id=domain_t,
             )
             v_c, a_c, _ = self.transformer(**cond_static, **step_kwargs)
+            v_c, a_c = v_c[0].float(), a_c.float()
             if do_cfg:
                 v_u, a_u, _ = self.transformer(**uncond_static, **step_kwargs)
-                video_v = v_u[0] + guidance_scale * (v_c[0] - v_u[0])
+                v_u, a_u = v_u[0].float(), a_u.float()
+                video_v = v_u + guidance_scale * (v_c - v_u)
                 action_v = a_u + guidance_scale * (a_c - a_u)
             else:
-                video_v, action_v = v_c[0], a_c
+                video_v, action_v = v_c, a_c
 
             video_v = video_v * velocity_mask
             action_v = action_v * action_velocity_mask
