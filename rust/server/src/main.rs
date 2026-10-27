@@ -1245,11 +1245,13 @@ async fn generate_finish(
         let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
-                Out::Error { message, .. } => {
-                    let mut s = json!({"error": message}).to_string();
-                    s.push('\n');
-                    s.into_bytes()
-                }
+                // The Python /generate's error chunk, status in its metadata,
+                // which the SDK raises on.
+                Out::Error { status, message } => ndjson_line(&ResultChunk {
+                    modality: "error".to_string(),
+                    data: message.into_bytes(),
+                    metadata: json!({"status": status}),
+                }),
             }))
         });
         return Response::builder()

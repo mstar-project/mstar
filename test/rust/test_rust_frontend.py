@@ -707,6 +707,65 @@ def test_nonstreaming_backend_error_maps_to_real_status():
         assert code == 400, (code, body)
 
 
+class _MidStreamErrorStub(_StubAPIServer):
+    """A text chunk, then the data plane's terminal error chunk."""
+
+    def __init__(self, status):
+        super().__init__()
+        self.status = status
+
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("text", b"Hello ")
+        yield _Chunk("error", b"Error in worker: boom", {"status": self.status})
+
+
+@pytest.mark.parametrize("status", [400, 500])
+def test_a_failed_generate_stream_ends_on_the_same_line_on_both_frontends(status, monkeypatch):
+    """The Python /generate ends the stream with the error chunk itself, its
+    status in ``metadata``, which the SDK raises on; mstar-server must send the
+    same line. Both frontends encode the same chunks."""
+    pytest.importorskip("fastapi")
+    import base64
+    import urllib.parse
+
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    stub = _MidStreamErrorStub(status)
+
+    class _PythonServer(entrypoint.APIServer):
+        """The real /generate stream encoding over the stub's chunks."""
+
+        def __init__(self):
+            self.enable_nvtx = False
+
+        async def wait_for_request_id(self, request_id):
+            pass
+
+        def submit_request(self, **kwargs):
+            return kwargs["request_id"]
+
+        def iter_result_chunks(self, request_id):
+            return stub.iter_result_chunks(request_id)
+
+    form = {"text": "hi", "output_modalities": "text", "streaming": "true"}
+    monkeypatch.setattr(entrypoint, "api_server", _PythonServer())
+    py = TestClient(entrypoint.app).post("/generate", data=form)
+    with _model_stack("qwen3_omni", stub) as (port, _up):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/generate", data=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            rust_status, rust_lines = r.status, [json.loads(line) for line in r.read().splitlines()]
+
+    assert (rust_status, rust_lines) == (py.status_code, [json.loads(line) for line in py.content.splitlines()])
+    assert rust_lines[-1] == {
+        "modality": "error", "data": base64.b64encode(b"Error in worker: boom").decode(),
+        "metadata": {"status": status},
+    }
+
+
 _EDIT_BOUNDARY = "----editboundary"
 _EDIT_FORM = (
     f'--{_EDIT_BOUNDARY}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nmake it neon\r\n'
