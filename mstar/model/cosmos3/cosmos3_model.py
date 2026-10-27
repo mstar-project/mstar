@@ -151,6 +151,9 @@ _REQUEST_KWARGS = frozenset({
     "session_id", "resume_session", "end_session", "session_timeout_s",
 })
 
+# the loops built with max_iters = max_inference_steps, one iteration per step; not the windowed one
+DENOISE_LOOPS = (IMAGE_GEN_LOOP, VIDEO_GEN_LOOP, VIDEO_SOUND_GEN_LOOP, ACTION_GEN_LOOP, ACTION_VIDEO_GEN_LOOP)
+
 
 def _int_kwarg(mk: dict, key: str, default, lo: int | None = None, hi: int | None = None):
     """A request integer, strictly typed; ``ValueError`` outside ``[lo, hi]``."""
@@ -446,7 +449,12 @@ class Cosmos3Model(Model):
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # The reasoner's stop check allows max_tokens - 1 iterations, and a loop runs at least one.
-        return {REASONER_DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+        caps = {REASONER_DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+        # a denoise loop runs one iteration per step, so the conductor refuses steps past max_iters
+        steps = model_kwargs.get("num_inference_steps")
+        if isinstance(steps, int) and not isinstance(steps, bool) and steps >= 1:
+            caps.update(dict.fromkeys(DENOISE_LOOPS, steps))
+        return caps
 
     def get_request_resource_configs(
         self,
@@ -1372,7 +1380,7 @@ class Cosmos3Model(Model):
         else:
             default_steps = self.config.num_inference_steps
         steps = _int_kwarg(
-            mk, "num_inference_steps", default_steps, lo=1, hi=self.config.max_inference_steps,
+            mk, "num_inference_steps", default_steps, lo=1,
         )
         default_guidance = (
             self.config.guidance_scale_action if action_mode is not None else self.config.guidance_scale

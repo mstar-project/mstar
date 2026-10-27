@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from huggingface_hub.constants import HF_HUB_CACHE
 from huggingface_hub.errors import EntryNotFoundError
 
 import mstar.model.bagel.bagel_model as bagel_mod
@@ -55,7 +56,9 @@ def _loop_conductor(model) -> Conductor:
 
 def _bagel_model(**sampling) -> BagelModel:
     model = BagelModel.__new__(BagelModel)
-    model.config = SimpleNamespace(vocab_size=32, num_timesteps=50, **BAGEL_CONFIG_DEFAULTS)
+    model.config = SimpleNamespace(
+        vocab_size=32, num_timesteps=50, max_latent_size=64, latent_downsample=16, **BAGEL_CONFIG_DEFAULTS,
+    )
     model.sampling_defaults = {**BAGEL_CONFIG_DEFAULTS, **sampling}
     model._has_cfg_parallel = False
     model._image_gen_remote_handoff = False
@@ -93,7 +96,7 @@ def test_bagel_request_kwargs_cover_what_bagel_and_its_adapter_read():
 ])
 def test_bagel_out_of_range_knobs_are_a_400(kwargs):
     with pytest.raises(ValueError, match=next(iter(kwargs))):
-        check_request_kwargs(kwargs)
+        check_request_kwargs(kwargs, max_side=1024, stride=16)
 
 
 def test_bagel_valid_knobs_pass():
@@ -101,8 +104,8 @@ def test_bagel_valid_knobs_pass():
         "cfg_text_scale": 4, "cfg_img_scale": 1.0, "cfg_interval": (0.4, 1.0),
         "cfg_renorm_type": "text_channel", "cfg_renorm_min": 0.0,
         "think_mode": True, "image_preprocess": "vllm", "width": 512, "height": 1024,
-    })
-    check_request_kwargs(None)
+    }, max_side=1024, stride=16)
+    check_request_kwargs(None, max_side=1024, stride=16)
 
 
 def test_bagel_process_prompt_rejects_before_tokenizing():
@@ -475,7 +478,12 @@ def test_qwen3_omni_request_kwargs_spot_checks(omni_released):
 
 # ── whisper ─────────────────────────────────────────────────────────────────
 
-WHISPER_CACHED = Path("/shared/home/s129652-bf47ee/mminf_cache/hf/hub/models--openai--whisper-large-v3/snapshots")
+# the HF cache, or a mminf_cache on the cluster; empty on CI
+WHISPER_CACHED = [
+    snapshot
+    for hub in (HF_HUB_CACHE, *glob.glob("/shared/home/*/mminf_cache/hf/hub"))
+    for snapshot in glob.glob(f"{hub}/models--openai--whisper-large-v3/snapshots/*")
+]
 
 
 def _whisper_model(defaults=None) -> WhisperModel:
@@ -548,9 +556,9 @@ def test_whisper_checkpoint_generation_config_sets_the_defaults(tmp_path):
     _whisper_sampler(model).validate(_whisper_spec(model))
 
 
-@pytest.mark.skipif(not WHISPER_CACHED.is_dir(), reason="whisper-large-v3 not cached")
+@pytest.mark.skipif(not WHISPER_CACHED, reason="whisper-large-v3 not cached")
 def test_whisper_real_checkpoint_declares_no_sampling_so_greedy_stays():
-    snapshot = next(WHISPER_CACHED.iterdir())
+    snapshot = Path(WHISPER_CACHED[0])
     assert whisper_sampling_defaults(snapshot) == WHISPER_DEFAULT_SAMPLING
 
 
