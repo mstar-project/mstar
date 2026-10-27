@@ -679,6 +679,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.host_has_state"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.host_has_state</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.host_slot_indices"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.host_slot_indices</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.num_rows"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.num_rows</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.scatter_index"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.scatter_index</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.slot_indices"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.slot_indices</span></code></a></li>
 </ul>
 </li>
@@ -716,6 +717,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.cleanup"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.clear_preplan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.commit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.commit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.gather"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.gather()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.ingest_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.num_free_slots"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.num_free_slots</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.pad_index"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.pad_index</span></code></a></li>
@@ -723,6 +725,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.remove_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.reset_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.rollback_admit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.rollback_admit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.scatter_"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.scatter_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.supports_preplan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.supports_preplan</span></code></a></li>
 </ul>
 </li>
@@ -934,7 +937,7 @@ the conv channels both shard on their leading axis).</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentAddressing">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.recurrent.</span></span><span class="sig-name descname"><span class="pre">RecurrentAddressing</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">slot_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_state</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_slot_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_has_state</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentAddressing"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentAddressing" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.recurrent.</span></span><span class="sig-name descname"><span class="pre">RecurrentAddressing</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">slot_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_state</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_slot_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">host_has_state</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scatter_index</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentAddressing"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentAddressing" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Where one label’s rows live this step: the pool’s whole plan output.</p>
 <p>Token layout (cu_seqlens, chunk metadata) is the backend’s to build.</p>
@@ -946,6 +949,7 @@ the conv channels both shard on their leading axis).</p>
 <li><p><strong>num_rows</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>host_slot_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>host_has_state</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>scatter_index</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -967,6 +971,11 @@ the conv channels both shard on their leading axis).</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentAddressing.num_rows">
 <span class="sig-name descname"><span class="pre">num_rows</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentAddressing.num_rows" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentAddressing.scatter_index">
+<span class="sig-name descname"><span class="pre">scatter_index</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentAddressing.scatter_index" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1130,13 +1139,14 @@ resource can both shard the shared config.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentStatePool">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.recurrent.</span></span><span class="sig-name descname"><span class="pre">RecurrentStatePool</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentStatePool"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentStatePool" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.recurrent.</span></span><span class="sig-name descname"><span class="pre">RecurrentStatePool</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'recurrent_state'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentStatePool"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentStatePool" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.Resource" title="mstar.engine.resources.base.Resource"><code class="xref py py-class docutils literal notranslate"><span class="pre">Resource</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>torch.device</em></a>)</p></li>
 <li><p><strong>config</strong> (<a class="reference internal" href="#mstar.engine.resources.recurrent.RecurrentStateConfig" title="mstar.engine.resources.recurrent.RecurrentStateConfig"><em>RecurrentStateConfig</em></a>)</p></li>
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1258,6 +1268,32 @@ earlier call already sized.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentStatePool.gather">
+<span class="sig-name descname"><span class="pre">gather</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'main'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentStatePool.gather"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentStatePool.gather" title="Link to this definition">#</a></dt>
+<dd><p>Block <code class="docutils literal notranslate"><span class="pre">name</span></code> of this step’s rows under <code class="docutils literal notranslate"><span class="pre">label</span></code>, <code class="docutils literal notranslate"><span class="pre">[rows,</span> <span class="pre">*shape]</span></code>
+(a copy), in the order the step declared them.</p>
+<p>It addresses rows through the step’s plan, so a captured and an eager
+forward read the same slots. A row with no saved state (a request’s
+first step, or a padding row on the sink) reads <code class="docutils literal notranslate"><span class="pre">start</span></code>, zeros when
+none is given. A row must declare span &gt;= 1 to reach its own slot; a
+zero-span row addresses the sink, so it reads <code class="docutils literal notranslate"><span class="pre">start</span></code>. A pool without
+a sink refuses (<code class="docutils literal notranslate"><span class="pre">_need_sink</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>layer_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>start</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentStatePool.ingest_request">
 <span class="sig-name descname"><span class="pre">ingest_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">overrides</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentStatePool.ingest_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentStatePool.ingest_request" title="Link to this definition">#</a></dt>
 <dd><p>Must be idempotent: the conductor sends one NewRequest per partition,
@@ -1336,6 +1372,27 @@ that.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.recurrent.config.html#mstar.engine.resources.recurrent.config.RecurrentStep" title="mstar.engine.resources.recurrent.config.RecurrentStep"><em>RecurrentStep</em></a>)</p></li>
 <li><p><strong>ctx</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext" title="mstar.engine.resources.step.StepContext"><em>StepContext</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.recurrent.RecurrentStatePool.scatter_">
+<span class="sig-name descname"><span class="pre">scatter_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer_idx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'main'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/recurrent/pool.html#RecurrentStatePool.scatter_"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.recurrent.RecurrentStatePool.scatter_" title="Link to this definition">#</a></dt>
+<dd><p>Write <code class="docutils literal notranslate"><span class="pre">value</span> <span class="pre">[rows,</span> <span class="pre">*shape]</span></code> into block <code class="docutils literal notranslate"><span class="pre">name</span></code> of this step’s rows
+under <code class="docutils literal notranslate"><span class="pre">label</span></code>, in the order <code class="docutils literal notranslate"><span class="pre">gather</span></code> reads them; padding rows write
+the sink, which a pool without one refuses.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>value</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>layer_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1516,6 +1573,7 @@ admit and copied at plan (pre) or commit (post).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.host_has_state"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.host_has_state</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.host_slot_indices"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.host_slot_indices</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.num_rows"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.num_rows</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.scatter_index"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.scatter_index</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentAddressing.slot_indices"><code class="docutils literal notranslate"><span class="pre">RecurrentAddressing.slot_indices</span></code></a></li>
 </ul>
 </li>
@@ -1553,6 +1611,7 @@ admit and copied at plan (pre) or commit (post).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.cleanup"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.clear_preplan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.commit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.commit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.gather"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.gather()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.ingest_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.num_free_slots"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.num_free_slots</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.pad_index"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.pad_index</span></code></a></li>
@@ -1560,6 +1619,7 @@ admit and copied at plan (pre) or commit (post).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.remove_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.reset_request"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.rollback_admit"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.rollback_admit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.scatter_"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.scatter_()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.recurrent.RecurrentStatePool.supports_preplan"><code class="docutils literal notranslate"><span class="pre">RecurrentStatePool.supports_preplan</span></code></a></li>
 </ul>
 </li>

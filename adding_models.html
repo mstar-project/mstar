@@ -1251,6 +1251,19 @@ Whether the penalty runs on a given step is decided from the
 <code class="docutils literal notranslate"><span class="pre">enable_top_p_first</span></code> are capabilities of the same kind. See
 <code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code> above.</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec(config=RecurrentStateConfig(...))</span></code></p></td>
+<td><p>Fixed-size per-request state that carries between steps (an LSTM’s <code class="docutils literal notranslate"><span class="pre">h</span></code> and
+<code class="docutils literal notranslate"><span class="pre">c</span></code>, a cursor, a conv tail): one slot per request, <code class="docutils literal notranslate"><span class="pre">blocks</span></code> naming a shape and
+dtype for each piece, <code class="docutils literal notranslate"><span class="pre">num_layers</span></code> copies of each, <code class="docutils literal notranslate"><span class="pre">max_slots</span></code> slots with slot 0
+the sink that padding rows address. <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> gives each row a
+<code class="docutils literal notranslate"><span class="pre">RecurrentStep</span></code> segment with span &gt;= 1. The forward reads its rows with
+<code class="docutils literal notranslate"><span class="pre">pool.gather(name,</span> <span class="pre">start=...)</span></code> and writes them back with
+<code class="docutils literal notranslate"><span class="pre">pool.scatter_(name,</span> <span class="pre">value)</span></code>; both follow the step’s plan, so there is no
+addressing to fetch, and eager and captured steps reach the same slots. A row with
+no saved state (a request’s first step, or a padding row) reads <code class="docutils literal notranslate"><span class="pre">start</span></code>, zeros
+when none is given. <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code> need the sink, so leave
+<code class="docutils literal notranslate"><span class="pre">disable_sink_slot</span></code> unset. Parakeet’s transducer decode is the example.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -1313,16 +1326,20 @@ node samples.</p></td>
 <td><p>The three or four specs above, plus a second <code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> for the encoder context
 and a <code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code> over that second cache.</p></td>
 </tr>
-<tr class="row-even"><td><p>A node that samples with two different sets of parameters</p></td>
+<tr class="row-even"><td><p>A node that carries per-request state between steps of a loop (an RNN-T
+decoder, recurrent attention)</p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec</span></code>, read and written with <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p>A node that samples with two different sets of parameters</p></td>
 <td><p>Two <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> objects that both name the node, under different keys.</p></td>
 </tr>
-<tr class="row-odd"><td><p>An encoder tower that attends within the segments of one packed forward</p></td>
+<tr class="row-even"><td><p>An encoder tower that attends within the segments of one packed forward</p></td>
 <td><p>A <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code>, and nothing else. No <code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> and no
 <code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code>: there is no cache to page and no counter to advance. Needed
 only if the tower’s attention must run inside a CUDA graph; see
 <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p>ViT, VAE or audio encoder, codec decoder, projection stage, combine stage</p></td>
+<tr class="row-odd"><td><p>ViT, VAE or audio encoder, codec decoder, projection stage, combine stage</p></td>
 <td><p>Usually nothing. Declare no spec that names the node, unless the node needs the
 row above.</p></td>
 </tr>

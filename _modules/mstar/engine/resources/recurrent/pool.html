@@ -954,7 +954,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Sequence</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -1007,12 +1007,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    """</span>
 
     <span class="n">slot_indices</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>  <span class="c1"># [rows] int32, `pad_index` where nothing is addressed</span>
-    <span class="n">has_state</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>     <span class="c1"># [rows] bool, False where the slot reads as zeros</span>
-    <span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span>               <span class="c1"># real rows, before a capture bucket's padding</span>
+    <span class="n">has_state</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>     <span class="c1"># [rows] bool, False for a slot with no saved state (fresh, or the sink)</span>
+    <span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span>               <span class="c1"># the rows the step declared, a replay's padding rows included</span>
     <span class="c1"># The same two on the host, as built: a backend that splits rows between</span>
     <span class="c1"># kernels by them must not read the device copies back</span>
     <span class="n">host_slot_indices</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">host_has_state</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">host_has_state</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># scatter_'s int64 copy of slot_indices, keyed by whether a graph capture made it</span>
+    <span class="n">scatter_index</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span></div>
 
 
 
@@ -1028,12 +1030,14 @@ window.runMermaid = runMermaid;</script>
         <span class="n">config</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span>
         <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
-        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">)</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">RecurrentStateConfig</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">RecurrentStateConfig</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"recurrent_state"</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
+        <span class="c1"># the resource key, for errors</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_name</span> <span class="o">=</span> <span class="n">name</span>
 
         <span class="c1"># One [num_layers, max_slots, *shape] tensor per block. Layer-major so</span>
         <span class="c1"># `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert</span>
@@ -1095,6 +1099,61 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_blocks</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="n">layer_idx</span><span class="p">]</span></div>
 
+
+<div class="viewcode-block" id="RecurrentStatePool.gather">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.recurrent.pool.html#mstar.engine.resources.recurrent.RecurrentStatePool.gather">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">gather</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"main"</span><span class="p">,</span> <span class="n">start</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Block ``name`` of this step's rows under ``label``, ``[rows, *shape]``</span>
+<span class="sd">        (a copy), in the order the step declared them.</span>
+
+<span class="sd">        It addresses rows through the step's plan, so a captured and an eager</span>
+<span class="sd">        forward read the same slots. A row with no saved state (a request's</span>
+<span class="sd">        first step, or a padding row on the sink) reads ``start``, zeros when</span>
+<span class="sd">        none is given. A row must declare span &gt;= 1 to reach its own slot; a</span>
+<span class="sd">        zero-span row addresses the sink, so it reads ``start``. A pool without</span>
+<span class="sd">        a sink refuses (``_need_sink``)."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">disable_sink_slot</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_need_sink</span><span class="p">(</span><span class="s2">"gather"</span><span class="p">)</span>
+        <span class="n">rows</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">addressing</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_blocks</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="n">layer_idx</span><span class="p">]</span><span class="o">.</span><span class="n">index_select</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">rows</span><span class="o">.</span><span class="n">slot_indices</span><span class="p">[:</span> <span class="n">rows</span><span class="o">.</span><span class="n">num_rows</span><span class="p">])</span>
+        <span class="n">fresh</span> <span class="o">=</span> <span class="o">~</span><span class="n">rows</span><span class="o">.</span><span class="n">has_state</span><span class="p">[:</span> <span class="n">rows</span><span class="o">.</span><span class="n">num_rows</span><span class="p">]</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">*</span><span class="p">(</span><span class="mi">1</span><span class="p">,)</span> <span class="o">*</span> <span class="p">(</span><span class="n">out</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">fresh</span><span class="p">,</span> <span class="mi">0</span> <span class="k">if</span> <span class="n">start</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">start</span><span class="p">,</span> <span class="n">out</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RecurrentStatePool.scatter_">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.recurrent.pool.html#mstar.engine.resources.recurrent.RecurrentStatePool.scatter_">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">scatter_</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"main"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Write ``value [rows, *shape]`` into block ``name`` of this step's rows</span>
+<span class="sd">        under ``label``, in the order ``gather`` reads them; padding rows write</span>
+<span class="sd">        the sink, which a pool without one refuses."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">disable_sink_slot</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_need_sink</span><span class="p">(</span><span class="s2">"scatter_"</span><span class="p">)</span>
+        <span class="n">rows</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">addressing</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">value</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">!=</span> <span class="n">rows</span><span class="o">.</span><span class="n">num_rows</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"recurrent state pool </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_name</span><span class="si">!r}</span><span class="s2"> label </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2">: </span><span class="si">{</span><span class="n">value</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2"> rows "</span>
+                <span class="sa">f</span><span class="s2">"for a step that declared </span><span class="si">{</span><span class="n">rows</span><span class="o">.</span><span class="n">num_rows</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="c1"># index_copy_ needs int64: cast once per step, not per block and layer. A capture</span>
+        <span class="c1"># records its own cast, so a replay recomputes it from that replay's plan.</span>
+        <span class="n">capturing</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_current_stream_capturing</span><span class="p">()</span>
+        <span class="n">index</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">scatter_index</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">capturing</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">index</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">index</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">scatter_index</span><span class="p">[</span><span class="n">capturing</span><span class="p">]</span> <span class="o">=</span> <span class="n">rows</span><span class="o">.</span><span class="n">slot_indices</span><span class="p">[:</span> <span class="n">rows</span><span class="o">.</span><span class="n">num_rows</span><span class="p">]</span><span class="o">.</span><span class="n">long</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_blocks</span><span class="p">[</span><span class="n">name</span><span class="p">][</span><span class="n">layer_idx</span><span class="p">]</span><span class="o">.</span><span class="n">index_copy_</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">index</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_need_sink</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">op</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># Without a sink, rows with no slot address NO_SLOT, which index_select</span>
+        <span class="c1"># and index_copy_ refuse: an IndexError on the CPU, a device-side</span>
+        <span class="c1"># assert that kills the worker on CUDA.</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"recurrent state pool </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_name</span><span class="si">!r}</span><span class="s2"> has no sink slot "</span>
+            <span class="sa">f</span><span class="s2">"(disable_sink_slot), so </span><span class="si">{</span><span class="n">op</span><span class="si">}</span><span class="s2"> has no slot for a padding row; "</span>
+            <span class="s2">"unset RecurrentStateConfig.disable_sink_slot to use gather / scatter_"</span>
+        <span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">num_free_slots</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1193,7 +1252,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_forget_taken</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">is_real_row</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">():</span>
             <span class="k">if</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_padding_row</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">):</span>
-                <span class="c1"># reads its state without extending it, or a padding row</span>
+                <span class="c1"># a zero-span row is addressed at the sink, like a padding row:</span>
+                <span class="c1"># it neither reads nor writes its own slot</span>
                 <span class="k">continue</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_alloc</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_out_of_slots</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">)</span>
