@@ -588,7 +588,7 @@ async def create_transcription(
             tails: dict[int, Window] = {}
             collected = 0
             async for window in _parallel(api, adapter, req, windows, inflight, raw_request):
-                tail = _tail(adapter, req, planner, window)
+                tail = await asyncio.to_thread(_tail, adapter, req, planner, window)
                 if tail is not None:
                     _submit(api, adapter, req, tail, streaming=False, inflight=inflight)
                     tails[collected] = tail
