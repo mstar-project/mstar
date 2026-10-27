@@ -36,10 +36,11 @@ def sdpa_attention(
     q, k, v = (t.transpose(1, 2) for t in (q, k, v))
     if not return_lse:
         return F.scaled_dot_product_attention(q, k, v, is_causal=False).transpose(1, 2)
-    flash = (torch.ops.aten._scaled_dot_product_flash_attention if q.is_cuda
-             else torch.ops.aten._scaled_dot_product_flash_attention_for_cpu)
-    out, lse = flash(q, k, v)[:2]
-    return out.transpose(1, 2), lse.float().transpose(1, 2)
+    # SDPA doesn't return the log-sum-exp; the queries that ask for it (replicated audio
+    # over a video shard) are short, so the scores are cheap to materialise
+    scores = (q.float() @ k.float().transpose(-2, -1)) * q.shape[-1] ** -0.5
+    out = torch.softmax(scores, dim=-1) @ v.float()
+    return out.to(q.dtype).transpose(1, 2), torch.logsumexp(scores, dim=-1).transpose(1, 2)
 
 
 def joint_attention(
