@@ -341,7 +341,8 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
             return set()
         token = outputs["new_token"][0].item()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        decoded_tokens = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
+        # The loop index is zero-based; count the prefill token and this iteration's.
+        decoded_tokens = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
         if (not ignore_eos and token in self.config.stop_token_ids) or \
                 decoded_tokens >= request_info.max_tokens:
             return {"decode_loop"}

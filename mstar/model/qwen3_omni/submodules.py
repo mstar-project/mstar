@@ -1107,8 +1107,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
         token = outputs["new_token"][0].item()
         ignore_eos= request_info.resource_configs[THINKER_SAMPLER].ignore_eos
         eos_token_id = self.config.im_end_token_id
+        # The loop index is zero-based; count the prefill token and this iteration's.
         if (not ignore_eos and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) + 1 >= request_info.max_tokens):
+                (request_info.dynamic_loop_iter_counts.get("thinker_decode_loop", 0) + 2 >= request_info.max_tokens):
             return {"thinker_decode_loop"}
         return set()
 

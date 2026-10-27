@@ -216,8 +216,9 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         token = outputs["new_token"][0].item()
         eos_token_id = self.config.stop_token_id
         ignore_eos= request_info.resource_configs[SAMPLER].ignore_eos
+        # The loop index is zero-based; count the prefill token and this iteration's.
         if (not ignore_eos and eos_token_id == token) or \
-                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
+                (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens):
             return {"decode_loop"}
         return set()
 

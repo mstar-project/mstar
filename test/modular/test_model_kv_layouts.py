@@ -43,7 +43,7 @@ def _orpheus():
     return model
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
+@pytest.mark.parametrize("max_tokens", [1, 2, 64])
 def test_orpheus_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 
@@ -58,6 +58,7 @@ def test_orpheus_caps_decode_where_its_stop_check_ends_it(max_tokens):
         llm.check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
+    assert 1 + cap == max(2, max_tokens), "prefill's token and decode's don't add up to max_tokens"
 
 
 def _bagel():
@@ -439,7 +440,7 @@ def _higgs():
     return model
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
+@pytest.mark.parametrize("max_tokens", [1, 2, 64])
 def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
 
@@ -452,9 +453,10 @@ def test_higgs_caps_decode_where_its_stop_check_ends_it(max_tokens):
         llm.check_stop, "decode_loop", "decode", 1024,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
+    assert 1 + cap == max(2, max_tokens), "prefill's token and decode's don't add up to max_tokens"
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
+@pytest.mark.parametrize("max_tokens", [1, 2, 64])
 def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     from mstar.model.qwen3_5.submodules import LLMSubmodule
@@ -470,13 +472,14 @@ def test_qwen3_5_caps_decode_where_its_stop_check_ends_it(max_tokens):
         check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
     ), "the cap and the stop check end decode on different iterations"
+    assert 1 + cap["decode_loop"] == max(2, max_tokens), "prefill's token and decode's don't add up to max_tokens"
 
 
 def _omni_submodule():
     return SimpleNamespace(config=SimpleNamespace(im_end_token_id=0, talker=SimpleNamespace(codec_eos_token_id=0)))
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
+@pytest.mark.parametrize("max_tokens", [1, 2, 64])
 def test_qwen3_omni_caps_the_thinkers_decode_where_its_stop_check_ends_it(max_tokens):
     pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.config import THINKER_SAMPLER
@@ -490,6 +493,9 @@ def test_qwen3_omni_caps_the_thinkers_decode_where_its_stop_check_ends_it(max_to
         2048, {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=max_tokens,
         resource_configs={THINKER_SAMPLER: SamplingReqConfig(ignore_eos=True)},
     ), "the cap and the stop check end decode on different iterations"
+    assert 1 + cap["thinker_decode_loop"] == max(2, max_tokens), (
+        "prefill's token and decode's don't add up to max_tokens"
+    )
 
 
 @pytest.mark.parametrize("talker_max_tokens", [0, 1, 64])
@@ -637,7 +643,7 @@ def _whisper():
     return model
 
 
-@pytest.mark.parametrize("max_tokens", [1, 1000])
+@pytest.mark.parametrize("max_tokens", [1, 2, 1000])
 def test_whisper_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.whisper.config import SAMPLER
     from mstar.model.whisper.submodules import WhisperDecoderSubmodule
@@ -645,11 +651,14 @@ def test_whisper_caps_decode_where_its_stop_check_ends_it(max_tokens):
     model = _whisper()
     bound = model.get_max_output_tokens(max_output_tokens=max_tokens)
 
-    assert model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == _stops_after(
+    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
+
+    assert cap == _stops_after(
         WhisperDecoderSubmodule(None, model.config).check_stop, "decode_loop", "decode", 2048,
         {"new_token": [torch.tensor([NOT_EOS])]}, max_tokens=bound,
         resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=True)},
     ), "the cap and the stop check end decode on different iterations"
+    assert 1 + cap == max(2, bound), "prefill's token and decode's don't add up to max_tokens"
 
 
 @pytest.mark.parametrize("seconds", [1.0, 29.0, 45.0])
