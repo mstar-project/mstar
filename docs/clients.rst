@@ -123,22 +123,25 @@ they were sent, so of two under one ``request_id`` it is the later one that gets
 
    with websockets.sync.client.connect("ws://localhost:8000/generate/ws", max_size=None) as ws:
        ws.send(msgpack.packb({
-           "text": "pick up the mug",
-           "files": [{"name": "obs.jpg", "data": open("obs.jpg", "rb").read()}],
+           "text": prompt,  # task + view, duration and resolution text
+           "files": [{"name": "obs.png", "data": open("obs.png", "rb").read()}],  # 736x544 composite
            "output_modalities": ["action"],
-           "model_kwargs": {"action_mode": "policy", "domain_name": "droid_lerobot",
-                            "raw_action_dim": 10, "action_chunk_size": 32},
+           "model_kwargs": {"action_mode": "policy", "robot_state": joints + [gripper]},
            "request_id": "step-0",
        }, use_bin_type=True))
        while True:
            reply = msgpack.unpackb(ws.recv(), raw=False)
            if reply.get("modality") == "action":
-               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)
+               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)[:, :8]
            if reply.get("finish") or reply.get("error"):
                break
 
-``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
-loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+The DROID configs supply the chunk (32 rows), fps, size and embodiment, and the reply's
+first 8 columns are the 7 joint positions and the gripper position (see the Cosmos3
+section of :doc:`models`). ``examples/cosmos3_action_ws_client.py`` is a complete
+openpi-style client that builds the observation image and prompt the way NVIDIA's RoboLab
+server does for the DROID policies, runs this loop at a fixed observation rate and reports
+chunks/s, actions/s and latency percentiles.
 
 **Live input.** A model that listens while it runs (a full-duplex speech model) keeps a
 request's input open after the opening message, so the opening message may carry no media

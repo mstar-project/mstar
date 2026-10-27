@@ -158,8 +158,8 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model == "cosmos3_droid":
         lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
         lines.append("                           images=[\"frame.jpg\"], output_modalities=(\"action\",),")
-        lines.append("                           action_mode=\"policy\", domain_name=\"droid_lerobot\",")
-        lines.append("                           raw_action_dim=10, action_chunk_size=16)")
+        lines.append("                           action_mode=\"policy\",")
+        lines.append("                           robot_state=[-0.07, 0.26, 0.02, -2.21, 0.02, 2.48, 0.79, 0.0])")
     if model == "qwen3_omni":
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
     if model == "omnivoice":
