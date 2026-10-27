@@ -38,7 +38,7 @@ def _fake_worker() -> Worker:
     w._reset_skip_plan_flags = w.resets.append
     w._rid_str = str
     w.despeculated = []
-    w._pending_removes = set()
+    w._pending_removes = {}
     w._pending_drains = set()
     w._draining_rids = set()
     w.scheduler = SimpleNamespace(failed_rids=set())
@@ -56,6 +56,9 @@ def _fake_worker() -> Worker:
     )
     # No stream buffers in the fake, so _return_streaming_edge no-ops.
     w.request_state = SimpleNamespace(per_request_info={})
+    w.engine_manager = SimpleNamespace(
+        get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
+    )
     return w
 
 
@@ -128,7 +131,7 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     w.engine_manager = SimpleNamespace(get_engine=lambda name: engine)
     released = []
     node_batch = SimpleNamespace(
-        node_name="dit", launch_started_event=None, preplanned_rids=("a",),
+        node_name="dit", launch_started_event=None, preplanned_rids=("a",), read_check_rids=None,
         request_ids=("a",), release_waiters=lambda: released.append(True),
         per_request_info={"a": SimpleNamespace(request_id="a")},
     )

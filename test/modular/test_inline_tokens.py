@@ -66,6 +66,11 @@ class _TM:
     def start_read_tensors(self, request_id, graph_edges, graph_walk=None):
         return []
 
+    def take_failed_reads(self):
+
+        return []
+
+
     def get_ready_tensors(self):
         return {}
 

@@ -225,6 +225,14 @@ class ZMQCommunicator(BaseCommunicator):
         return messages
 
 
+def requested_transport() -> str:
+    """``MSTAR_RUST_ZMQ`` as set, upper-cased: ``0``, ``1`` or ``AUTO``."""
+    choice = os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper()
+    if choice not in ("0", "1", "AUTO"):
+        raise ValueError(f"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got {choice!r}")
+    return choice
+
+
 def make_communicator(*args, **kwargs) -> BaseCommunicator:
     """Construct the process's communicator, selecting the transport.
 
@@ -240,9 +248,7 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
     flag can be set per-process — one entity at a time — while the rest of
     the mesh stays on pyzmq.
     """
-    choice = os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper()
-    if choice not in ("0", "1", "AUTO"):
-        raise ValueError(f"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got {choice!r}")
+    choice = requested_transport()
     if choice != "0":
         try:
             import mstar_rust

@@ -289,8 +289,8 @@ def test_drain_refcount_discharged_by_the_serial_path():
 
 def test_drain_refcount_discharged_by_a_direct_head_pop():
     """The async follower retires heads without ``_try_schedule_tp_follow``:
-    building one into a speculation, dropping one whose parent step closed, or
-    voiding one on its parent's verdict. All three pop the head directly."""
+    building one into a speculation, or dropping one whose parent step closed.
+    Both pop the head directly."""
     sched = _sched()
     sched.register_tp_follow(_head(["r0", "r1"]))
     assert sched.pending_tp_follow_count == {"r0": 1, "r1": 1}

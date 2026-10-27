@@ -50,7 +50,7 @@ def _runtime_at_prefill() -> tuple[PythonGraphRuntime, int]:
     )
     rid = runtime.add_request(
         request_id="r", partition="default", graph_walk=WALK, partition_worker_graph_ids=[0],
-        worker_graph_to_workers=ParallelList([0], [["worker0"]]),
+        worker_graph_to_workers=ParallelList([0], [["worker0"]]), loop_caps={},
     )
     block = ColumnarEdgeSpecs.empty()
     block.add_edge(rid, GraphEdge(name="prompt", next_node="prefill"))

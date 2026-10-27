@@ -102,12 +102,16 @@ class WorkerGraphQueues:
         queue = self.per_request_queues[request_id]
         return queue.wg_state_registry.is_done
 
-    def add_request(self, request_id: int):
+    def add_request(self, request_id: int, loop_caps: dict[str, int]):
         """
         Initialize queues for a new request
         """
         section_copy = pickle.loads(self._section_blob)
         queue = WorkerGraphIO(section_copy, wg_id=self.worker_graph_id)
+        for name, cap in loop_caps.items():
+            loop = queue.loops.get(name)
+            if loop is not None:
+                loop.max_iters = min(loop.max_iters, cap)
         queue.register_communication_info(
             self.tensor_manager, request_id
         )

@@ -7,7 +7,19 @@ import torch
 
 from mstar.engine.resources.base import AttentionResource, Resource
 from mstar.engine.resources.runner import StepRunner
+from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight
+
+
+def per_request_outputs(raw, request_ids) -> dict[str, dict[str, list[torch.Tensor]]]:
+    """A forward's outputs as the engine hands them to ``postprocess``: row ``i`` of each row
+    output (a ``[1, ...]`` view) for ``request_ids[i]``, a per-request entry taking precedence."""
+    out = BatchedModelOutput.coerce(raw)
+    merged = {rid: dict(out.per_rid_outputs.get(rid, {})) for rid in request_ids}
+    for name, rows in (out.row_outputs or {}).items():
+        for i, rid in enumerate(request_ids):
+            merged[rid].setdefault(name, [rows[i:i + 1]])
+    return merged
 
 
 def fake_quantize_fp8_block(
