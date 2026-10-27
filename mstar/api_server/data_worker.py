@@ -964,6 +964,24 @@ class PreprocessWorkerThread:
             for conn in self.model.get_partition_topology().client_connections() if conn.step_rows is not None
         }
 
+    @cached_property
+    def _turn_tokens(self) -> tuple[int, int] | None:
+        return getattr(self.model, "turn_tokens", None)
+
+    def _turn_metadata(self, ids: list[int], loop_indices: NestedLoopIndices | None) -> dict:
+        """For a model that declares ``turn_tokens``: ``step``, the iteration
+        of the loop that emitted the chunk, so a client pairs its text and
+        audio by step without counting chunks; and ``turn``, the marks
+        (``"start"`` / ``"end"``) of the turn tokens among ``ids`` in order,
+        read before ``postprocess``, which may drop them."""
+        meta = {}
+        if loop_indices is not None and loop_indices.loop_name_order:
+            meta["step"] = loop_indices.loop_indices[loop_indices.loop_name_order[-1]]
+        start, end = self._turn_tokens
+        if marks := ["start" if t == start else "end" for t in ids if t in (start, end)]:
+            meta["turn"] = marks
+        return meta
+
     def _cut_and_charge(self, call: ClientCall, items: NameToTensorList) -> NameToTensorList:
         """A call's new stream items as they are sent: cut on their streams'
         ``step_rows`` grid, then charged as cut, so ``max_items`` bounds what
@@ -1323,7 +1341,8 @@ class PreprocessWorkerThread:
                     request_id=request_id,
                     modality=item.modality,
                     data=postprocessed,
-                    metadata={},
+                    metadata=(self._turn_metadata([item.value] if item.modality == "text" else [], item.loop_indices)
+                              if self._turn_tokens else {}),
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1426,6 +1445,9 @@ class PreprocessWorkerThread:
 
                         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                             tensor_info.uuid] or {}
+                        if modality in ("text", "audio") and self._turn_tokens:
+                            ids = tensor.flatten().tolist() if modality == "text" else []
+                            chunk_metadata = {**chunk_metadata, **self._turn_metadata(ids, loop_indices)}
                         # Audio is emitted as headerless 16-bit PCM; surface the
                         # model's output sample rate + channel count so clients can
                         # wrap it.

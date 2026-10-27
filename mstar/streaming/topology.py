@@ -50,12 +50,20 @@ class ClientStreamLimits(NamedTuple):
     unit: str = "items"
 
 
+class ClientAudio(NamedTuple):
+    """What an item of an audio client stream is: mono audio at
+    ``sample_rate``. A route that translates a client's own codec and rate
+    (``/v1/realtime``) delivers it one step (the stream's ``step_rows``)
+    per item."""
+    sample_rate: int
+
+
 @dataclass
 class Connection:
     """Defines a streaming connection between two partitions, or from the
     client (``from_partition=CLIENT``) into one. Only a client stream takes
-    ``limits`` or ``step_rows``: a partition's output is bounded and stepped
-    by the model itself."""
+    ``limits``, ``step_rows`` or ``audio``: a partition's output is bounded
+    and stepped by the model itself."""
     from_partition: str
     to_partition: str
     edge_name: str
@@ -68,6 +76,7 @@ class Connection:
     # grid; a shorter item passes as sent. The consumer's, so not a
     # deployment setting.
     step_rows: int | None = None
+    audio: ClientAudio | None = None
 
 
 @dataclass
@@ -86,13 +95,16 @@ class PartitionTopology:
         for conn in self.connections:
             if conn.to_partition == CLIENT:
                 raise ValueError(f"the client only produces streams; {conn.edge_name!r} flows into it")
-            if conn.limits is not None and conn.from_partition != CLIENT:
-                raise ValueError(f"{conn.edge_name!r} has limits but is not a client stream")
+            if (conn.limits is not None or conn.audio is not None) and conn.from_partition != CLIENT:
+                raise ValueError(f"{conn.edge_name!r} has limits or audio but is not a client stream")
             if conn.step_rows is not None and conn.from_partition != CLIENT:
                 raise ValueError(f"{conn.edge_name!r} has step_rows but only a client stream is cut")
             rows = conn.step_rows
             if rows is not None and (isinstance(rows, bool) or not isinstance(rows, int) or rows < 1):
                 raise ValueError(f"{conn.edge_name!r}'s step_rows must be a positive integer, not {rows!r}")
+            if conn.audio is not None and rows is None:
+                # the frame a route cuts the caller's audio into
+                raise ValueError(f"{conn.edge_name!r} declares audio, so it needs step_rows")
 
     def client_connections(self) -> list[Connection]:
         """The streams the client feeds."""
