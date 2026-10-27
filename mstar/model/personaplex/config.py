@@ -179,8 +179,9 @@ LM_PARTITION, CODEC_PARTITION, CODEC_WALK = "LM", "Codec", "codec_chunk"
 STREAM_CHUNK_SCHEDULE = (4, 8, 16)
 STREAM_CHUNK_FRAMES = 25
 # Agent frames of left context each block is decoded behind. Mimi's decoder transformer attends
-# 250 steps (125 frames) per layer, but its 8 stacked layers reach further back; 500 frames brings
-# a long reply to the TF32 rounding floor of a whole-clip decode (measured on the checkpoint).
+# 250 steps (125 frames) per layer, but its 8 stacked layers reach further back. On a long reply
+# measured on the checkpoint under TF32, 500 frames gave the same error against a whole-clip decode
+# as 1,000; this is not a general error bound.
 STREAM_CONTEXT_FRAMES = 500
 # Frames before a block's new ones that Mimi's causal SEANet decoder reruns over: its receptive
 # field, so only the transformer pays for the long context.

@@ -1203,8 +1203,9 @@ time. The first chunk holds 4 frames (320 ms of audio), then 8, 16 and 25
 frames (2 s) each, a ramp like Qwen3-TTS's for its 12 Hz codec, so a running
 stream needs few decodes. Each block is decoded behind the request's last 500 frames: Mimi's
 decoder transformer attends 125 frames per layer, but its 8 stacked layers
-reach further back, and 500 frames keeps a long reply at the rounding floor of
-a whole-track decode (the same trade-off as Qwen3-TTS's codec). Only the
+reach further back. On a long reply measured under TF32, 500 frames gave the
+same error against a whole-track decode as 1,000; this is not a general error
+bound. Qwen3-TTS's codec makes the same trade-off. Only the
 transformer runs over that context; the causal SEANet decoder reruns over 4
 frames before the new ones, its receptive field. A request's audio does not
 depend on how the stream groups its frames. ``python -m
