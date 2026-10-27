@@ -1126,13 +1126,19 @@ those tokens. The message is <code class="docutils literal notranslate"><span cl
 <span class="pre">reuse;</span> <span class="pre">either</span> <span class="pre">drop</span> <span class="pre">the</span> <span class="pre">stream</span> <span class="pre">or</span> <span class="pre">give</span> <span class="pre">the</span> <span class="pre">resource</span> <span class="pre">the</span> <span class="pre">prefix</span> <span class="pre">hooks</span></code>.</p></li>
 </ul>
 <p>Some requests stay uncached even when the model keys a label. The engine checks each
-request’s inputs on the keyed walk and cuts a prefix only from inputs that the default
-<code class="docutils literal notranslate"><span class="pre">split_inputs</span></code> can slice. A request whose inputs carry <code class="docutils literal notranslate"><span class="pre">tensor_inputs</span></code>, <code class="docutils literal notranslate"><span class="pre">kwargs</span></code> or
+request’s inputs on the keyed walk and cuts a prefix only from inputs that
+<code class="docutils literal notranslate"><span class="pre">split_inputs</span></code> can slice. A request whose inputs carry <code class="docutils literal notranslate"><span class="pre">kwargs</span></code> or
 <code class="docutils literal notranslate"><span class="pre">resource_step_info</span></code> is never probed; BAGEL’s guided requests carry <code class="docutils literal notranslate"><span class="pre">requires_cfg</span></code>
-there. BAGEL keys an understanding prompt’s text and images, and a generation’s first
-span when it is text: an edit’s images are resized before their walks see them, and a
-file’s digest doesn’t cover the resize. A label under a sliding window files pages only
-up to its protected prefix, which the window never releases.</p>
+there. The default <code class="docutils literal notranslate"><span class="pre">split_inputs</span></code> slices only the sequence, so a request whose inputs
+carry <code class="docutils literal notranslate"><span class="pre">tensor_inputs</span></code> is probed only when the submodule sets <code class="docutils literal notranslate"><span class="pre">cuts_tensor_inputs</span></code>
+and overrides <code class="docutils literal notranslate"><span class="pre">split_inputs</span></code> to cut those tensors. For a label keyed over several
+walks, where a keyed node streams into a partition other than its own, a request that
+runs that partition is not cached either, since a hit would skip the rows the node
+streams for the tokens the cache holds. BAGEL
+keys an understanding prompt’s text and images, and a generation’s first span when it
+is text: an edit’s images are resized before their walks see them, and a file’s digest
+doesn’t cover the resize. A label under a sliding window files pages only up to its
+protected prefix, which the window never releases.</p>
 </section>
 </section>
 <section id="step-2a-declare-your-resources">
@@ -1646,10 +1652,13 @@ that the graph routes downstream. Read resources from
 <p>The engine applies <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> to both <code class="docutils literal notranslate"><span class="pre">forward</span></code> and <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>, for
 every submodule. It also captures CUDA graphs for them when you declare capture
 configs (see <a class="reference internal" href="#step-5"><span class="std std-ref">Step 5</span></a>). To disable compilation for a submodule, set the
-class attribute <code class="docutils literal notranslate"><span class="pre">disable_torch_compile</span> <span class="pre">=</span> <span class="pre">True</span></code>. Keep the compiled paths
-compile-friendly. If a helper must not be traced, because it uses data-dependent
-Python control flow or forces a host synchronization, exclude it explicitly with
-<code class="docutils literal notranslate"><span class="pre">&#64;torch.compiler.disable</span></code>.</p>
+class attribute <code class="docutils literal notranslate"><span class="pre">disable_torch_compile</span> <span class="pre">=</span> <span class="pre">True</span></code>. An encoder whose output feeds a
+prefix cache layout walk compiles with dynamic shapes instead. One that marks every
+dimension that varies with <code class="docutils literal notranslate"><span class="pre">torch._dynamo.mark_dynamic</span></code> in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> sets
+<code class="docutils literal notranslate"><span class="pre">marks_dynamic_dims</span> <span class="pre">=</span> <span class="pre">True</span></code> and compiles as any other submodule. Keep the compiled
+paths compile-friendly. If a helper must not be traced, because it uses
+data-dependent Python control flow or forces a host synchronization, exclude it
+explicitly with <code class="docutils literal notranslate"><span class="pre">&#64;torch.compiler.disable</span></code>.</p>
 <p>Some submodules must run in their own parameter dtype. One example is an fp32 vocoder
 that is numerically sensitive. Such a submodule sets <code class="docutils literal notranslate"><span class="pre">disable_autocast</span> <span class="pre">=</span> <span class="pre">True</span></code>. The
 engine then does not cast its parameters to the autocast dtype, does not wrap its

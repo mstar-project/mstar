@@ -2139,6 +2139,10 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="ARNodeSubmodule">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ARNodeSubmodule</span><span class="p">(</span><span class="n">NodeSubmodule</span><span class="p">):</span>
+    <span class="c1"># Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.</span>
+    <span class="c1"># The engine probes the prefix cache for a walk that carries them only then.</span>
+    <span class="n">cuts_tensor_inputs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
 <div class="viewcode-block" id="ARNodeSubmodule.split_inputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.split_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">split_inputs</span><span class="p">(</span>

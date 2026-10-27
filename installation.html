@@ -815,7 +815,8 @@ when installing both.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[qwen3_omni]</span></code></p></td>
 <td><p>Qwen3-Omni runtime: the BAGEL set plus <code class="docutils literal notranslate"><span class="pre">qwen-omni-utils</span></code>, <code class="docutils literal notranslate"><span class="pre">datasets</span></code>, and
-<code class="docutils literal notranslate"><span class="pre">ninja</span></code> (speeds up the JIT build of the vendored MoE align kernel).
+<code class="docutils literal notranslate"><span class="pre">ninja</span></code> (speeds up the JIT build of the vendored MoE align kernel). It needs
+<code class="docutils literal notranslate"><span class="pre">transformers&gt;=5.18</span></code>, whose <code class="docutils literal notranslate"><span class="pre">transformers.vision_utils</span></code> the vision encoder uses.
 <strong>Also needs</strong> <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>, which is installed separately —
 see <a class="reference internal" href="#flash-attn-qwen3-omni-lingbot-world">flash-attn (Qwen3-Omni, LingBot-World)</a>.</p></td>
 </tr>
@@ -973,8 +974,9 @@ its dependencies:</p>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> pins <code class="docutils literal notranslate"><span class="pre">transformers==4.57.3</span></code> and <code class="docutils literal notranslate"><span class="pre">accelerate==1.12.0</span></code>. Installed with
 them, it can’t share an environment with <code class="docutils literal notranslate"><span class="pre">diffusers&gt;=0.40</span></code> (Wan 2.2, Cosmos3,
-FLUX.2 [klein]), which needs <code class="docutils literal notranslate"><span class="pre">huggingface-hub&gt;=1.23</span></code>, or with OmniVoice, which needs
-<code class="docutils literal notranslate"><span class="pre">transformers&gt;=5.3</span></code>, and installing it after them downgrades their dependencies.
+FLUX.2 [klein]), which needs <code class="docutils literal notranslate"><span class="pre">huggingface-hub&gt;=1.23</span></code>, or with OmniVoice
+(<code class="docutils literal notranslate"><span class="pre">transformers&gt;=5.3</span></code>) or Qwen3-Omni (<code class="docutils literal notranslate"><span class="pre">transformers&gt;=5.18</span></code>). Installing it after them
+downgrades their dependencies.
 mstar reads only the speech-tokenizer source files and runs them under transformers
 4.57.3 or 5.x, so the package’s own requirements are not needed. <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">check</span></code> still
 lists them (<code class="docutils literal notranslate"><span class="pre">transformers==4.57.3</span></code>, <code class="docutils literal notranslate"><span class="pre">accelerate==1.12.0</span></code>, <code class="docutils literal notranslate"><span class="pre">gradio</span></code>, <code class="docutils literal notranslate"><span class="pre">sox</span></code> and
