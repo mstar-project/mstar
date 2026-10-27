@@ -333,7 +333,9 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
     w.wakeup_event = SimpleNamespace(register_future=stub)
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
-    w.scheduler = SimpleNamespace(take_admit_errors=dict, get_next_batch=next_batch)
+    w.scheduler = SimpleNamespace(
+        take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub,
+    )
     for name in ("_verify_tp_async_sched_agrees", "_init_engine_thread", "_await_admit_settled",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
                  "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
@@ -404,9 +406,9 @@ def test_prefix_lookups_count_each_request_once_through_the_engines_probe():
     m = _metrics(eng)
     prompt = list(range(100))
     keys = _seed(kv, prompt)
-    kv.ingest_request("hit", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(100)))
+    kv.ingest_request("hit", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     other = _keys(list(range(1000, 1100)))
-    kv.ingest_request("miss", KVReqConfig(prefix_keys={"main": other}, prefix_layout=_layout(100)))
+    kv.ingest_request("miss", KVReqConfig(prefix_keys={"main": other}, kv_layout=_layout(100)))
     assert _prefix(m) == ({}, {})
 
     batch = _prepare(eng, PREFILL, hit=100, miss=100)
@@ -467,15 +469,15 @@ def test_prefix_lookups_before_start_counting_are_not_counted():
     eng = _engine([kv], keyed=True)
     m = _metrics(eng, counting=False)
     keys = _seed(kv, list(range(100)))
-    kv.ingest_request("warmup-0", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(100)))
+    kv.ingest_request("warmup-0", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     _prepare(eng, PREFILL, **{"warmup-0": 100})
     assert _prefix(m) == ({}, {})
 
     m.start_counting()
     assert _prefix(m) == ({(NODE,): 0}, {(NODE,): 0})
     other = _keys(list(range(1000, 1100)))
-    kv.ingest_request("miss", KVReqConfig(prefix_keys={"main": other}, prefix_layout=_layout(100)))
-    kv.ingest_request("hit", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(100)))
+    kv.ingest_request("miss", KVReqConfig(prefix_keys={"main": other}, kv_layout=_layout(100)))
+    kv.ingest_request("hit", KVReqConfig(prefix_keys={"main": keys}, kv_layout=_layout(100)))
     _prepare(eng, PREFILL, miss=100, hit=100)
     assert _prefix(m) == ({(NODE,): 200}, {(NODE,): 96})
 
@@ -669,6 +671,8 @@ def test_the_worker_process_hands_the_interval_to_the_worker(monkeypatch):
     built = []
 
     class _Worker:
+        tensor_manager = SimpleNamespace(names_unique_per_launch=False)  # owns no files
+
         def __init__(self, **kwargs):
             built.append(kwargs)
 
@@ -677,7 +681,7 @@ def test_the_worker_process_hands_the_interval_to_the_worker(monkeypatch):
 
     monkeypatch.setattr(worker_mod, "Worker", _Worker)
     monkeypatch.setattr(conductor_mod, "apply_process_env_defaults", lambda: None)
-    monkeypatch.setattr(conductor_mod, "_exit_when_orphaned", lambda worker_id: None)
+    monkeypatch.setattr(conductor_mod, "_exit_when_orphaned", lambda *a, **k: None)
     monkeypatch.setattr(conductor_mod.signal, "signal", lambda *a: None)
     monkeypatch.setattr(conductor_mod.logging, "basicConfig", lambda **k: None)
     conductor_mod._worker_process_target(

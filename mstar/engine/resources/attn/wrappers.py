@@ -188,9 +188,13 @@ class FlashInferPrefillWrapper:
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
+        window_left: int = -1,
         **kwargs
     ):
         """Plan attention and compute KV write indices.
+
+        ``window_left`` is the number of preceding positions each query sees;
+        -1 is unbounded.
 
         In CUDA graph mode, updates static buffers via .copy_() so that
         the same GPU addresses are used during graph replay.
@@ -230,6 +234,7 @@ class FlashInferPrefillWrapper:
             q_data_type=dtype,
             # host lengths, so plan neither rebuilds them nor copies pageable ones
             seq_lens=kv_lens,
+            window_left=window_left,
         )
         if self._pinned_done is not None:
             # every copy out of the staging buffers is issued: the next
@@ -343,6 +348,7 @@ class FlashInferDecodeWrapper:
         paged_kv_last_page_len: torch.Tensor,
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
+        window_left: int = -1,
         **kwargs
     ):
         """Plan decode attention and compute KV write locations.
@@ -350,6 +356,7 @@ class FlashInferDecodeWrapper:
         For decode, each request appends exactly 1 token. The write
         location is the last page at position = last_page_len (before
         the append; after append it becomes last_page_len).
+        ``window_left`` is as in the prefill wrapper's ``plan``.
 
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
@@ -383,6 +390,7 @@ class FlashInferDecodeWrapper:
                 q_data_type=dtype,
                 # host lengths, so plan skips rebuilding them (`get_seq_lens`)
                 seq_lens=kv_lens,
+                window_left=window_left,
             )
         finally:
             if self.enable_nvtx:
@@ -489,6 +497,7 @@ class FlashInferMixedWrapper:
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
+        window_left: int = -1,
         **kwargs,
     ):
         from mstar.engine.resources.kv.plan import HostLens
@@ -580,7 +589,7 @@ class FlashInferMixedWrapper:
             paged_kv_indices=self._pin("d_indices", d_indices, torch.int32),
             paged_kv_last_page_len=self._pin("d_last", d_last, torch.int32),
             kv_lens=self._pin("d_lens", d_lens, torch.int32).as_subclass(HostLens),
-            dtype=dtype,
+            dtype=dtype, window_left=window_left,
         )
         self._prefill.plan(
             qo_indptr=torch.from_numpy(p_qo),
@@ -588,7 +597,7 @@ class FlashInferMixedWrapper:
             paged_kv_indices=torch.from_numpy(p_idx),
             paged_kv_last_page_len=torch.from_numpy(p_last),
             kv_lens=torch.from_numpy(p_lens).as_subclass(HostLens),
-            causal=causal, dtype=dtype,
+            causal=causal, dtype=dtype, window_left=window_left,
         )
         self._done.record()
 

@@ -96,6 +96,23 @@ from mstar.utils.h2d import PinnedStager
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
 
+
+def prefill_rows(prompt_layout: Sequence[int], language_id: int, speaker: bool) -> int:
+    """The rows `TalkerSubmodule._build_prefill` writes, where ``speaker`` is True when a
+    speaker tag or x-vector takes a row."""
+    instruct_len, text_len, stream_text, ref_text_len, ref_frames = prompt_layout
+    prefix = len(CHATML_ASSISTANT_PREFIX_TOKEN_IDS)
+    # the role, then every codec tag but codec BOS
+    rows = instruct_len + prefix + (3 if language_id < 0 else 4) + int(speaker) + 1
+    if ref_frames:
+        # codec BOS and the reference frames. When the text isn't streamed, both transcripts and TTS EOS come first
+        text = ref_text_len - prefix - 2 + text_len + 1
+        return rows + 1 + ref_frames + (0 if stream_text else text)
+    # a streamed prompt adds its first text token over codec BOS. Any other adds its text and TTS EOS,
+    # then TTS PAD over codec BOS
+    return rows + (1 if stream_text else text_len + 2)
+
+
 # ===========================================================================
 # 1. TalkerSubmodule - autoregressive 12 Hz codec-frame generation
 # ===========================================================================
@@ -433,6 +450,10 @@ class TalkerSubmodule(ARNodeSubmodule):
                 speaker_embed=inputs["speaker_embed"][0] if "speaker_embed" in inputs else None,
                 ref_codes=inputs["ref_codes"][0] if "ref_codes" in inputs else None,
             )
+            speaker = int(step_metadata[SPEAKER_ID_KEY]) >= 0 or "speaker_embed" in inputs
+            assert input_embeds.shape[0] == prefill_rows(
+                step_metadata[PROMPT_LAYOUT_KEY], int(step_metadata[LANGUAGE_ID_KEY]), speaker,
+            ), f"the prefill built {input_embeds.shape[0]} rows, not the count `prefill_rows` lays out"
             state = self.request_state(fwd_info.rid_handle)
         elif graph_walk == "talker_decode":
             state = self.request_state(fwd_info.rid_handle)
@@ -779,9 +800,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         generated = int(
             self.request_state(request_id).get("generated_frames", 0)
         )
-        max_tokens = request_info.step_metadata.get(
-            "talker_max_tokens", request_info.max_tokens
-        )
+        max_tokens = request_info.max_tokens
         sampling_config = request_info.resource_configs.get(TALKER_SAMPLER)
         ignore_eos = bool(getattr(sampling_config, "ignore_eos", False))
         reached_eos = (
