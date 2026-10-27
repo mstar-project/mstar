@@ -77,7 +77,7 @@ the modules listed in [test/cpu-mac-exclude.txt](test/cpu-mac-exclude.txt):
 - `test_waypoint_benchmark_videos.py`
 
 The first three invoke compiled FlexAttention, which requires AVX2 with the
-pinned PyTorch 2.9.1 CPU implementation. The video test hits an illegal
+pinned PyTorch CPU implementation (seen with 2.9.1). The video test hits an illegal
 instruction in PyAV 19.0.1 encoding in the tested Apple VM; this also reproduces
 without mstar. The entire modules are excluded,
 including their portable structural cases. The runner prints the exclusions

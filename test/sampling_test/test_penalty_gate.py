@@ -39,7 +39,7 @@ class _RecordingSampler:
     def sync_seen_token_masks(self, seen_masks, keep=None):
         self.synced += 1
 
-    def sample(self, request_ids, logits, apply_penalty=False):
+    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True):
         self.sampled_with.append(apply_penalty)
         return torch.zeros(len(request_ids), dtype=torch.long)
 

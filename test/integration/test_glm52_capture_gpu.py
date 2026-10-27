@@ -20,6 +20,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.model.glm52._testing import per_request_outputs
 from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
 from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -186,8 +187,7 @@ class _Node:
         finally:
             if lease is not None:
                 self.cg.release(lease, len(rids))
-        # a dict, or (with #258's graph runner) a BatchedModelOutput
-        out = getattr(raw, "per_rid_outputs", raw)
+        out = per_request_outputs(raw, out_ids)
         return {rid: {k: list(v) for k, v in out[out_ids[i]].items()} for i, rid in enumerate(rids)}
 
     def generate(self) -> dict[str, list[int]]:
@@ -292,10 +292,9 @@ def test_paged_dsa_capture_matches_eager(tmp_path, monkeypatch, topk, compiled):
     own when the bucket is wider than index_topk and dense attention when not; decode is sparse
     for every row over the serving window, through the slot's re-planned sparse wrapper."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
-    if not compiled:
-        monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
     overrides = dict(dsa_long_context=True, index_topk=topk, index_n_heads=16,
-                     index_head_dim=64, max_seq_len=64)  # the indexer ropes its first 64 dims
+                     index_head_dim=64, max_seq_len=64,  # the indexer ropes its first 64 dims
+                     graph_compile=compiled)
     model, submodule = _load(tmp_path, monkeypatch, False, cfg_overrides=overrides)
     walks = [c.capture_graph_walk for c in submodule.get_accelerator_graph_configs(DEVICE)]
     assert walks == ["decode", "prefill"]

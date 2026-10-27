@@ -263,8 +263,8 @@ class _FailSecondRead(_MemmoveEngine):
 
 
 def test_a_failed_read_does_not_count_the_reads_before_it_again():
-    """A read whose future raises leaves the poll's earlier entries pending,
-    so the next poll sees them again; they count once."""
+    """A read whose future raises is dropped and handed to take_failed_reads;
+    the read delivered before it counts once, the failed one not at all."""
     producer, consumer = _mooncake("worker_0"), _mooncake("worker_1")
     consumer._async_reader = AsyncMooncakeReader(_FailSecondRead(), device="cpu")
     try:
@@ -278,9 +278,11 @@ def test_a_failed_read_does_not_count_the_reads_before_it_again():
         for future in [ep.future for ep in consumer.pending]:
             with contextlib.suppress(RuntimeError):
                 future.result(timeout=5)
-        for _ in range(3):
-            with pytest.raises(RuntimeError, match="Mooncake read failed"):
-                consumer.get_ready_tensors()
+        assert [e.name for e in consumer.get_ready_tensors()["r1"]] == ["h"]
+        for _ in range(2):
+            assert consumer.get_ready_tensors() == {}
+        (failed,) = consumer.take_failed_reads()
+        assert failed.request_id == "r1" and [e.name for e in failed.graph_edges] == ["g"]
         assert _series(stats.snapshot())[("enc", "llm", "TCP")][:3] == (16, 1, 1)
     finally:
         producer._async_reader.shutdown()

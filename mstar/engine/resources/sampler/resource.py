@@ -1,7 +1,6 @@
 
 
 from dataclasses import asdict
-from time import perf_counter
 
 import torch
 
@@ -12,11 +11,17 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
-from mstar.engine.resources.sampler.utils import AcceleratorGraphableSampler, Sampler, SamplerBuffers
+from mstar.engine.resources.sampler.utils import (
+    AcceleratorGraphableSampler,
+    GenerationHistory,
+    Sampler,
+    SamplerBuffers,
+    SamplingConfig,
+)
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
-from mstar.utils.profiler import PHASE_PERIOD, phase_record
+from mstar.utils.profiler import PhaseLaps
 
 
 class SamplerResource(Resource):
@@ -34,13 +39,34 @@ class SamplerResource(Resource):
         device: torch.device,
         comm_group: JointGroups | None=None,
         enable_min_p: bool = False,
+        max_repetition_window: int = 0,
+        min_tokens_stop_ids: tuple[int, ...] = (),
+        enable_top_p_first: bool = False,
     ):
         self._track_seen_tokens = enable_repetion_penalty
         self._enable_min_p = enable_min_p
         self._vocab_size = vocab_size if self._track_seen_tokens else None
+        self._max_repetition_window = max_repetition_window
+        self._enable_top_p_first = enable_top_p_first
+        if max_repetition_window < 0:
+            raise ValueError(f"max_repetition_window={max_repetition_window} must be >= 0")
+        # What each request has generated, for the windowed penalty and the
+        # min-tokens floor; shared by the eager and graph samplers, and built
+        # only when the spec enables one of them. The filter order needs none.
+        self._history: GenerationHistory | None = None
+        self._stop_ids: torch.Tensor | None = None
+        if max_repetition_window or min_tokens_stop_ids:
+            self._history = GenerationHistory(max_repetition_window, device)
+        if min_tokens_stop_ids:
+            self._stop_ids = torch.tensor(
+                sorted(set(min_tokens_stop_ids)), dtype=torch.long, device=device,
+            )
         self._sampler = Sampler(
             device=device,
-            tp_group=comm_group
+            tp_group=comm_group,
+            history=self._history,
+            stop_ids=self._stop_ids,
+            enable_top_p_first=enable_top_p_first,
         )
         # Two flags, because they have different lifetimes.
         #
@@ -60,6 +86,7 @@ class SamplerResource(Resource):
         # off-graph on the GPU thread's critical path, so dropping it when it
         # cannot matter is the whole point of the split.
         self._apply_penalty_this_step: bool = enable_repetion_penalty
+        self._apply_filters_this_step: bool = True
         self._penalty_needed_this_step: bool = enable_repetion_penalty
         # Resident requests that asked for a penalty. Held as a set rather than
         # recomputed per step: `admit` is on the per-step path and this only
@@ -111,6 +138,9 @@ class SamplerResource(Resource):
             device=info.device,
             comm_group=info.joint_comm_group,
             enable_min_p=spec.enable_min_p,
+            max_repetition_window=spec.max_repetition_window,
+            min_tokens_stop_ids=tuple(spec.min_tokens_stop_ids),
+            enable_top_p_first=spec.enable_top_p_first,
         )
 
     def build_accelerator_graph_buffers(
@@ -134,6 +164,13 @@ class SamplerResource(Resource):
             vocab_size=self._vocab_size,
             cg_slots=self._cg_slots,
             enable_min_p=self._enable_min_p,
+            # CUDA-only (requests asking for them are refused elsewhere), so
+            # another device's captured sampler is left exactly as it was
+            **(dict(
+                history=self._history,
+                stop_ids=self._stop_ids,
+                enable_top_p_first=self._enable_top_p_first,
+            ) if self._device.type == "cuda" else {}),
             ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter(),
         )
 
@@ -166,13 +203,55 @@ class SamplerResource(Resource):
                 f"request {rid!r} asks for min_p={resolved.min_p} but the node's "
                 "SamplerSpec has enable_min_p=False"
             )
+        problem = self._generation_controls_problem(resolved)
+        if problem is not None:
+            self._sampler.remove_request(rid)
+            raise ValueError(f"request {rid!r} {problem}")
         # after the refusals, so a refused request leaves no stale entry
-        if resolved.repetition_penalty != 1.0:
+        if resolved.presence_penalty != 1.0:
             self._penalty_rids.add(rid)
+        if self._history is not None:
+            self._history.register(rid)
         if self._cg_buffers is not None:
             self._cg_buffers.register_request(
                 rid, sampling_config=self._sampler._sampling_config[rid]
             )
+
+    def _generation_controls_problem(self, cfg: SamplingConfig) -> str | None:
+        """Why this node cannot serve ``cfg``'s generation-aware settings, if
+        it cannot. Each needs its capability on the spec: the graph-captured
+        sampler carries only those, so honouring one eagerly but not in graph
+        would make sampling depend on the path."""
+        if cfg.repetition_window < 0 or cfg.min_tokens < 0 or cfg.top_p_min_keep < 1:
+            return (
+                f"asks for repetition_window={cfg.repetition_window}, "
+                f"min_tokens={cfg.min_tokens}, top_p_min_keep={cfg.top_p_min_keep}; "
+                "the first two must be >= 0 and the last >= 1"
+            )
+        if cfg.repetition_window > self._max_repetition_window:
+            return (
+                f"asks for repetition_window={cfg.repetition_window} but the node's "
+                f"SamplerSpec has max_repetition_window={self._max_repetition_window}"
+            )
+        if cfg.repetition_window > 0 and not cfg.repetition_penalty > 0:
+            return f"asks for a windowed repetition_penalty={cfg.repetition_penalty}; it must be > 0"
+        if cfg.min_tokens > 0 and self._stop_ids is None:
+            return (
+                f"asks for min_tokens={cfg.min_tokens} but the node's SamplerSpec "
+                "has no min_tokens_stop_ids"
+            )
+        if (cfg.top_p_first or cfg.top_p_min_keep > 1) and not self._enable_top_p_first:
+            return (
+                f"asks for top_p_first={cfg.top_p_first}, top_p_min_keep="
+                f"{cfg.top_p_min_keep} but the node's SamplerSpec has "
+                "enable_top_p_first=False"
+            )
+        if (cfg.uses_history or cfg.uses_filter_order) and self._sampler.device.type != "cuda":
+            return (
+                "asks for repetition_window, min_tokens, top_p_first or "
+                f"top_p_min_keep, which are CUDA-only (device {self._sampler.device})"
+            )
+        return None
 
     def ingest_capture_row(self, rid: str):
         """A capture padding row: default config, no seen-token mask, and the
@@ -192,6 +271,9 @@ class SamplerResource(Resource):
         alone and the penalty would let the model repeat the rest. A walk the
         cache serves whole runs no plan, so its tokens are kept until the next
         walk that does.
+
+        The generation history needs nothing here: it counts generated tokens
+        only, and a cached prefix is prompt.
         """
         del node_name, graph_walk
         # a walk that prefills from embeddings has no ids to keep
@@ -204,13 +286,16 @@ class SamplerResource(Resource):
         self._sampler.remove_request(rid)
         self._penalty_rids.discard(rid)
         self._cached_prefix.pop(rid, None)
+        if self._history is not None:
+            self._history.unregister(rid)
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
 
     def _set_penalty_flags(self, step: SamplerStep, ctx: StepContext):
-        """Settle this step's two penalty flags.
+        """Settle this step's two penalty flags (and whether it filters).
         """
         if not ctx.is_preplan:
+            self._apply_filters_this_step = step.apply_filters
             self._apply_penalty_this_step = (
                 self._track_seen_tokens and step.apply_penalty
             )
@@ -231,7 +316,9 @@ class SamplerResource(Resource):
         configs = self._sampler._sampling_config
         penalised = [
             rid for rid in ctx.request_ids
+            # the plain attribute first: this runs every step, the property rarely
             if rid in configs and configs[rid].repetition_penalty != 1.0
+            and configs[rid].presence_penalty != 1.0
         ]
         assert not penalised, (
             "repetition-penalty bookkeeping was skipped for a step carrying "
@@ -331,8 +418,9 @@ class SamplerResource(Resource):
             self._step_slot = (cg_slot, padded_bs)
 
     def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
-        """Gather the per-step RNG offset + seen-token mask into this step's
-        slot, inline so they reflect the previous step's committed tokens.
+        """Gather the per-step RNG offset + seen-token mask (and the
+        generation history, if any) into this step's slot, inline so they
+        reflect the previous step's committed tokens.
 
         The mask half is the expensive half and is skipped whenever the penalty
         is inert this step — see the flags in `__init__`. The RNG offset is
@@ -348,6 +436,8 @@ class SamplerResource(Resource):
             ctx.request_ids, padded_bs, cg_slot,
             gather_seen_tokens=self._penalty_needed_this_step,
         )
+        if self._history is not None:
+            self._history.gather_step(ctx.request_ids, padded_bs)
 
     def commit(self, step: SamplerStep, ctx: StepContext):
         # None on an eager step, which never gathered one
@@ -355,6 +445,9 @@ class SamplerResource(Resource):
             return
         kept = step.kept_rids
         keep = None if kept is None else [rid in kept for rid in ctx.request_ids]
+        if self._history is not None:
+            # gathered and scattered outside the graph, whichever way the offsets go
+            self._history.scatter_step(self._cg_buffers.keep_mask(keep))
         if self._cg_buffers.ingraph_scatter:
             # the captured sample scattered both rows itself
             if self._penalty_needed_this_step:
@@ -363,16 +456,13 @@ class SamplerResource(Resource):
                     keep=keep,
                 )
             return
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        laps = PhaseLaps("res.commit.sampler.")
         keep_gpu = self._cg_buffers.keep_mask(keep)
         self._cg_buffers.scatter_offset(ctx.slot_lease.slot, keep=keep_gpu)
-        if PHASE_PERIOD:
-            phase_record("res.commit.sampler.offset", perf_counter() - t0)
-            t0 = perf_counter()
+        laps.lap("offset")
         if self._keep_last_token:
             self._cg_buffers.scatter_last_token(ctx.slot_lease.slot, keep=keep_gpu)
-            if PHASE_PERIOD:
-                phase_record("res.commit.sampler.last_token", perf_counter() - t0)
+            laps.lap("last_token")
         # Skipped when nothing read the mask this step: there is then nothing to
         # copy back, and the rows go stale only for requests at penalty 1.0,
         # which never read them. See `_penalty_live` for why that stays sound.
@@ -404,11 +494,12 @@ class SamplerResource(Resource):
             # change the result, so leaving the kernel on costs nothing.
             return self._cg_sampler.sample(
                 request_ids, logits,
-                apply_penalty=self._apply_penalty_this_step
+                apply_penalty=self._apply_penalty_this_step,
+                apply_filters=self._apply_filters_this_step,
             )
         tokens = self._sampler.sample(
             request_ids, logits, apply_penalty=self._apply_penalty_this_step,
-            kept_rids=self._kept_rids,
+            apply_filters=self._apply_filters_this_step, kept_rids=self._kept_rids,
         )
         # An eager step has no per-step row to scatter from: write the masters
         # by request, so the next step can still read its token on the device.

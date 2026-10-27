@@ -93,6 +93,11 @@ class _TensorManager:
     def register_for_send(self, request_id, tensor_infos):
         pass
 
+    def take_failed_reads(self):
+
+        return []
+
+
     def get_ready_tensors(self):
         # the loop polls this after its release queues and before in_queue
         hook, self.on_ready = getattr(self, "on_ready", None), None

@@ -213,7 +213,8 @@ class PythonGraphRuntime(GraphRuntime):
         partition: str,
         graph_walk: str,
         partition_worker_graph_ids: list[int],
-        worker_graph_to_workers: ParallelList[int, list[str]]
+        worker_graph_to_workers: ParallelList[int, list[str]],
+        loop_caps: dict[str, int],
     ) -> int:
         # The conductor sends one NewRequest PER PARTITION, so this runs
         # several times for one request; they all share the first's handle.
@@ -255,7 +256,7 @@ class PythonGraphRuntime(GraphRuntime):
 
         for graph_id in partition_worker_graph_ids:
             if graph_id in self._queues:
-                self._queues[graph_id].add_request(handle)
+                self._queues[graph_id].add_request(handle, loop_caps)
 
         self._request_info[handle].partition_info[partition] = GraphRuntimePartitionInfo(
             graph_walk=graph_walk,

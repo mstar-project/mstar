@@ -19,12 +19,15 @@ no fused params) just call ``load_weights_into(module, weights)``.
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -161,6 +164,8 @@ def load_weights_into(
     apply_stacked = _StackedMatcher(stacked_params or [])
     params_dict = dict(module.named_parameters())
     loaded: set[str] = set()
+    dropped: list[str] = []
+    num_dropped = 0
 
     for name, tensor in weights:
         if skip_predicate is not None and skip_predicate(name):
@@ -176,11 +181,24 @@ def load_weights_into(
             # Not an error: the checkpoint may carry extra keys (lm_head
             # ties, kv-scale, etc.). Caller can verify completeness via
             # the returned set.
+            num_dropped += 1
+            if len(dropped) < 3:
+                dropped.append(target)
             continue
 
         _dispatch_loader(params_dict[target], tensor, shard_id)
         loaded.add(target)
 
+    if num_dropped:
+        # Dropped keys are fine while every parameter got a weight. Both at
+        # once usually means the key layout drifted from the module's.
+        unloaded = len(params_dict) - len(loaded)
+        logger.log(
+            logging.WARNING if unloaded else logging.INFO,
+            "%s: %d checkpoint keys matched no parameter (e.g. %s); %d of %d "
+            "parameters got no weight",
+            type(module).__name__, num_dropped, dropped, unloaded, len(params_dict),
+        )
     return loaded
 
 
