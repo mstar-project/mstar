@@ -236,6 +236,30 @@ def test_irfft_as_a_matmul_is_torch_irfft(n):
     fp32_fft = (torch.fft.irfft(spec, n=n, dim=-2) - exact).abs().max()
     assert (got - exact).abs().max() <= fp32_fft + 1e-7 * exact.abs().max()
 
+
+def test_ffmpeg_check_reads_torchcodecs_flag(monkeypatch):
+    """Since FFmpeg became optional, torchcodec's decoders import without it and
+    torchcodec records whether its FFmpeg ops loaded. The check reads that flag,
+    so a missing FFmpeg stays the server's error; an older torchcodec, which has
+    no flag, fails the import instead."""
+    import sys
+    import types
+
+    from mstar.model.components import audio_features
+
+    decoders = types.SimpleNamespace(AudioDecoder=object)
+    monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    for flag, expected in ((False, False), (True, True), (None, True)):
+        if flag is None:
+            monkeypatch.delitem(sys.modules, "torchcodec._core.ops", raising=False)
+        else:
+            monkeypatch.setitem(sys.modules, "torchcodec._core.ops", types.SimpleNamespace(_FFMPEG_AVAILABLE=flag))
+        audio_features._ffmpeg_decoder_loads.cache_clear()
+        assert audio_features._ffmpeg_decoder_loads() is expected
+    audio_features._ffmpeg_decoder_loads.cache_clear()
+
+
 def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch):
     from mstar.model.components import audio_features
 
