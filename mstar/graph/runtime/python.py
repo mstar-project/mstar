@@ -1626,7 +1626,8 @@ class PythonGraphRuntime(GraphRuntime):
                     if not (stream_items_eligible(e) and builder.try_add(self.get_rid_string(rid), e))
                 ]
                 if rest:
-                    self._send_input_signals(rid, worker_id, rest, fwd_info, partition)
+                    # streamed edges only: the receiver doesn't read the info
+                    self._send_input_signals(rid, worker_id, rest, None, partition)
 
             if info is not None:
                 for worker_id, edges in [

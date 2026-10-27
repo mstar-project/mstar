@@ -2988,8 +2988,11 @@ impl GraphRuntime {
             }
 
             // Which rids will actually produce a frame carrying
-            // `per_request_info`: an INPUT_SIGNALS to a peer, or a
-            // WORKER_GRAPHS_DONE. EmitToClient does not carry it.
+            // `per_request_info`: an INPUT_SIGNALS to a peer with a
+            // non-streamed edge, or a WORKER_GRAPHS_DONE. EmitToClient does
+            // not carry it, and neither does a streamed edge: the receiver
+            // reads the info only alongside a non-streamed one
+            // (`Worker._process_new_inputs`).
             //
             // `is_local` is the whole point. A node in a SIBLING worker graph
             // on this worker compiles to External (Orpheus streams new_token
@@ -3000,6 +3003,9 @@ impl GraphRuntime {
             // take_send_plan's own skip.
             let me_now = self.shard.me;
             for (e, &is_local) in edges.iter().zip(&ingested_locally) {
+                if e.streaming {
+                    continue;
+                }
                 let dest = match e.dest {
                     Dest::External(d) => d,
                     Dest::Local(d) if e.declined_local => self.g(wg).node(d).name,
