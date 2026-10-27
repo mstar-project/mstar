@@ -155,6 +155,26 @@ def unlink_files(file_paths: dict[str, list[str]] | None) -> None:
                 pass
 
 
+def _cut_on_grid(
+    tensors: list[torch.Tensor], start: int, step: int,
+) -> tuple[list[torch.Tensor], int]:
+    """``tensors``, each longer than ``step`` rows split along dim 0 wherever
+    the running row count, ``start`` before the first, crosses a multiple of
+    ``step``; and the count after them. The pieces are views."""
+    out = []
+    for t in tensors:
+        n = t.shape[0]
+        if n <= step:
+            out.append(t)
+        else:
+            head = -start % step
+            sizes = ([head] if head else []) + [step] * ((n - head) // step)
+            tail = n - sum(sizes)
+            out.extend(t.split(sizes + ([tail] if tail else [])))
+        start += n
+    return out, start
+
+
 def _preprocess_loop(**kwargs):
     worker = PreprocessWorkerThread(**kwargs)
     worker.run()
@@ -508,6 +528,8 @@ class ClientCall:
     ended: set[str] = field(default_factory=set)
     # stream edge -> what it carried, charged against its max_items
     charged: dict[str, int] = field(default_factory=dict)
+    # stream edge -> rows it carried, for its step_rows grid
+    rows: dict[str, int] = field(default_factory=dict)
 
 
 class PreprocessWorkerThread:
@@ -748,7 +770,7 @@ class PreprocessWorkerThread:
         call = None
         if self._client_edges:
             call = self._client_calls[input.request_id] = ClientCall(ended=set(input.ends))
-            self._charge_stream_items(call, stream_items)
+            stream_items = self._cut_and_charge(call, stream_items)
         initial_signals = self._store_persisted(input.request_id, tensors)
         if stream_items:
             call.held.append(self._store_held(input.request_id, stream_items))
@@ -830,7 +852,7 @@ class PreprocessWorkerThread:
                 if chunk.text and not any(items.values()):
                     raise ValueError("this model takes no text in an append")
                 items = self._without_ended_streams(call, chunk, items)
-                self._charge_stream_items(call, items)
+                items = self._cut_and_charge(call, items)
             items = {name: tensors for name, tensors in items.items() if tensors}
             if items:
                 self._send_stream_items(request_id, call, self._store_held(request_id, items))
@@ -930,6 +952,28 @@ class PreprocessWorkerThread:
             for name, limits in client_stream_limits(self.model.get_partition_topology(), self._model_config).items()
             if limits.max_items is not None
         }
+
+    @cached_property
+    def _step_rows(self) -> dict[str, int]:
+        """The client streams whose consumer steps a fixed number of rows,
+        which this thread cuts their items to."""
+        if self.model is None:
+            return {}
+        return {
+            conn.edge_name: conn.step_rows
+            for conn in self.model.get_partition_topology().client_connections() if conn.step_rows is not None
+        }
+
+    def _cut_and_charge(self, call: ClientCall, items: NameToTensorList) -> NameToTensorList:
+        """A call's new stream items as they are sent: cut on their streams'
+        ``step_rows`` grid, then charged as cut, so ``max_items`` bounds what
+        the consumer gets."""
+        out = dict(items)
+        for name, step in self._step_rows.items():
+            if items.get(name):
+                out[name], call.rows[name] = _cut_on_grid(items[name], call.rows.get(name, 0), step)
+        self._charge_stream_items(call, out)
+        return out
 
     def _charge_stream_items(self, call: ClientCall, items: NameToTensorList) -> None:
         """Charge a call's new stream items to their streams' ``max_items``;

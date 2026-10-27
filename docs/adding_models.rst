@@ -2268,6 +2268,16 @@ streams (audio and video, say): each has its own buffer and its own end.
   session cap of its own. Declare the most the consumer can take: a deployment may
   lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise
   it.
+- A consumer that steps a fixed number of rows (dim 0) at a time from the stream's
+  start, such as one encoder frame of audio, declares it as
+  ``Connection(..., step_rows=N)``. The client-stream layer cuts a longer item wherever
+  the call's running row count crosses a multiple of ``N``, so an upload streams as
+  steps no longer than a live append's, each whole one on the call's grid, and batches
+  with the live calls; a shorter item passes as sent, and ``max_items`` counts the items
+  as cut, so a stream without ``item_size`` counts the pieces, not the client's items.
+  Take ``N`` from the consuming component, from the same call that sizes its state, so
+  that the two agree. It is the model's, not a deployment's, to set, and only a client
+  stream takes it.
 - A stream ends when the client ends it: ``end_input: true`` ends all of the call's
   streams, a list of names only those. The consumer gets ``producer_done`` for that edge
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.

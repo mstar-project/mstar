@@ -34,12 +34,14 @@ CLIENT = "client"
 
 
 class ClientStreamLimits(NamedTuple):
-    """Bounds on what the client feeds one client stream; None is unbounded.
+    """Bounds on what one client stream carries to its consumer; None is unbounded.
     A bound the model declares is the most its consumer can take; a
     deployment may lower it (``client_streams:`` in the serving config, see
     :func:`client_stream_limits`)."""
     # What the stream may carry over the call's life, each item counting
-    # item_size(item): a call past it ends with a 400.
+    # item_size(item) as the consumer gets it (after a step_rows cut, so
+    # without item_size it counts the pieces, not the client's items): a call
+    # past it ends with a 400.
     max_items: int | None = None
     # How much of max_items one item uses: 1 when None. A stream of
     # variable-length chunks counts their frames or samples.
@@ -52,12 +54,20 @@ class ClientStreamLimits(NamedTuple):
 class Connection:
     """Defines a streaming connection between two partitions, or from the
     client (``from_partition=CLIENT``) into one. Only a client stream takes
-    ``limits``: a partition's output is bounded by the model itself."""
+    ``limits`` or ``step_rows``: a partition's output is bounded and stepped
+    by the model itself."""
     from_partition: str
     to_partition: str
     edge_name: str
     chunk_policy_factory: Callable[[], ChunkPolicy]
     limits: ClientStreamLimits | None = None
+    # The rows (dim 0) the consumer steps at a time from the stream's start,
+    # such as an encoder frame of audio. A client stream's item longer than
+    # that is cut where the call's running row count crosses a multiple of
+    # it, so each piece is at most one step and each whole one starts on the
+    # grid; a shorter item passes as sent. The consumer's, so not a
+    # deployment setting.
+    step_rows: int | None = None
 
 
 @dataclass
@@ -78,6 +88,11 @@ class PartitionTopology:
                 raise ValueError(f"the client only produces streams; {conn.edge_name!r} flows into it")
             if conn.limits is not None and conn.from_partition != CLIENT:
                 raise ValueError(f"{conn.edge_name!r} has limits but is not a client stream")
+            if conn.step_rows is not None and conn.from_partition != CLIENT:
+                raise ValueError(f"{conn.edge_name!r} has step_rows but only a client stream is cut")
+            rows = conn.step_rows
+            if rows is not None and (isinstance(rows, bool) or not isinstance(rows, int) or rows < 1):
+                raise ValueError(f"{conn.edge_name!r}'s step_rows must be a positive integer, not {rows!r}")
 
     def client_connections(self) -> list[Connection]:
         """The streams the client feeds."""

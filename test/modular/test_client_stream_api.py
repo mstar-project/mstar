@@ -556,6 +556,56 @@ def test_a_deployment_lowers_a_streams_max_items(tmp_path):
     assert b"passed 2 samples" in wt.out_queue.get_nowait().data
 
 
+class _FramedModel(_ListeningModel):
+    """``audio_in``'s consumer steps 4 samples at a time, on the call's grid."""
+
+    def __init__(self, limits=None):
+        super().__init__()
+        self.limits = limits
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["Ear"], connections=[
+            Connection(from_partition=CLIENT, to_partition="Ear", edge_name="audio_in",
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), limits=self.limits,
+                       step_rows=4),
+        ])
+
+
+def _sent_pieces(sent):
+    """Per INPUT_SIGNALS, the length of each ``audio_in`` item it carries."""
+    return [[dims[0] for dims in items] for _rank, edge, items, _done in _signals(sent) if edge == "audio_in"]
+
+
+def test_an_upload_is_cut_on_the_streams_grid_across_appends(tmp_path):
+    """An item longer than ``step_rows`` is cut where the call's running
+    length crosses a multiple of it, so the consumer gets no item longer than
+    a step and every whole one on its grid; a shorter one passes as sent."""
+    wt, sent, _tm = _thread(_FramedModel())
+    _open(wt, files={"audio": [_audio_file(tmp_path, "clip.raw", 10)]})
+    _route(wt)
+    wt._process_stream_input(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 7)]}))
+    wt._process_stream_input(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "b.raw", 4)]}))
+
+    # 0..10, then 10..17 (grid at 12, 16), then 17..21 whole: no longer than a step
+    assert _sent_pieces(sent) == [[4, 4, 2], [2, 4, 1], [4]]
+
+
+@pytest.mark.parametrize("limits, passed", [
+    (ClientStreamLimits(max_items=10, item_size=torch.numel, unit="samples"), b"passed 10 samples"),
+    (ClientStreamLimits(max_items=3), b"passed 3 items"),
+])
+def test_a_cut_stream_charges_what_its_consumer_gets(tmp_path, limits, passed):
+    """``max_items`` bounds the items as cut: by their size the cut changes
+    nothing, and counted, each piece is an item."""
+    wt, sent, _tm = _thread(_FramedModel(limits))
+    _open(wt, files={"audio": [_audio_file(tmp_path, "clip.raw", 10)]})
+    _route(wt)
+    wt._process_waiting_input(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 1)]}))
+
+    assert passed in wt.out_queue.get_nowait().data
+    assert _sent_pieces(sent) == [[4, 4, 2]]
+
+
 class _TwoStreams(_ListeningModel):
     """``audio_in`` and ``video_in``; a file that names no stream goes to video_in."""
 

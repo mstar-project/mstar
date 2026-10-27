@@ -532,9 +532,14 @@ def test_bad_client_stream_settings_fail_startup(config, match):
     assert _refused(_Bounded(ClientStreamLimits()), match, config)
 
 
-def test_only_a_client_stream_takes_limits():
-    with pytest.raises(ValueError, match="not a client stream"):
+@pytest.mark.parametrize("producer, declared, match", [
+    ("A", {"limits": ClientStreamLimits(max_items=1)}, "not a client stream"),
+    ("A", {"step_rows": 4}, "only a client stream is cut"),
+    *((CLIENT, {"step_rows": rows}, "positive integer") for rows in (0, -4, True, 2.5)),
+])
+def test_a_topology_refuses_a_stream_declaration_it_cannot_serve(producer, declared, match):
+    with pytest.raises(ValueError, match=match):
         PartitionTopology(partitions=["A", "B"], connections=[Connection(
-            from_partition="A", to_partition="B", edge_name="x",
-            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), limits=ClientStreamLimits(max_items=1),
+            from_partition=producer, to_partition="B", edge_name="x",
+            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1), **declared,
         )])
