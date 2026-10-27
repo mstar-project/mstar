@@ -6,12 +6,12 @@ chunks a step did not keep, and settles which streams a step ends.
 """
 from __future__ import annotations
 
-import torch
+from collections.abc import Iterable
 
 from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, GraphSection
-from mstar.graph.runtime.base import ColumnarEdgeSpecs, InputTensors
-from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, InputTensors
+from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge, collate
 from mstar.streaming.topology import Connection
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -103,13 +103,13 @@ class StreamBufferManager:
 
     def route_tensor(self, request_id: int, edge: GraphEdge) -> None:
         """Route a streaming tensor to its request's StreamBuffer for this
-        edge. The buffer holds the item by its handle: the read's usage
+        edge. The buffer holds the item by its uuid: the read's usage
         reference passes to it, and the tensor is looked up when the
         consuming batch is built (``input_tensors``)."""
         req_info = self._request_state.per_request_info.get(request_id)
         stream_buf = req_info.stream_buffers[edge.name]
         for info in edge.tensor_info:
-            stream_buf.put(info.uuid, info)
+            stream_buf.put(info.uuid, info.uuid)
 
     def _partition_walk(self, request_id: int, partition: str) -> str | None:
         req_info = self._request_state.per_request_info.get(request_id)
@@ -163,24 +163,19 @@ class StreamBufferManager:
         if not self._enter_chunk_walk(sbuf, edge_name, request_id, allow_walk_change):
             return None
         chunk = sbuf.pop_chunk()
-        # The chunk's items as the buffer holds them: their tensor infos, or
-        # none for an empty chunk (producer done, nothing left). The edge
-        # carries every item; ``input_tensors`` stacks them when the consuming
-        # batch is built.
-        items = chunk.data.get("data") or []
+        # The chunk's items as the buffer holds them: their uuids, or none for
+        # an empty chunk (producer done, nothing left). The edge carries every
+        # item; ``input_tensors`` stacks them when the consuming batch is built.
+        uuids = list(chunk.data.get("data") or [])
         tm = self._tensor_manager
-        if items:
+        if uuids:
             # the edge's own reference, dropped once its node consumes it
-            tm.increment_ref_batch_uniform([info.uuid for info in items])
+            tm.increment_ref_batch_uniform(uuids)
         if chunk.released:
             # the buffer's references to the items it advanced past; after
             # the increment, so an item in both stays alive
-            tm.dereference_batch_uniform([info.uuid for info in chunk.released])
-        edge = GraphEdge(
-            next_node=consumer_node, name=edge_name, tensor_info=list(items),
-            _final_stream_chunk=chunk.is_final,
-        )
-        return StreamingEdge(edge, chunk.info)
+            tm.dereference_batch_uniform(list(chunk.released))
+        return StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
 
     def poll(self) -> list[tuple[int, StreamingEdge]]:
         """Every request's ready chunks, popped. A buffer nothing has touched
@@ -210,17 +205,17 @@ class StreamBufferManager:
 
     def return_edge(self, request_id: int, streaming_edge: StreamingEdge) -> None:
         """Hand a chunk back to its StreamBuffer after it was refused, by the
-        graph's ingest or by a speculation rolling its ingests back."""
+        graph's ingest or by a speculation rolling its ingests back. Never
+        one the graph still holds: its items would be released twice."""
         req_info = self._request_state.per_request_info.get(request_id)
         if req_info is None:
             return
-        sbuf = req_info.stream_buffers.get(streaming_edge.edge.name)
+        sbuf = req_info.stream_buffers.get(streaming_edge.name)
         if sbuf is not None:
             sbuf.store_uningested_edge(streaming_edge)
         # The step that took the final chunk will not run; the stream is live again.
-        edge = streaming_edge.edge
-        if edge._final_stream_chunk:
-            req_info.ended_streams.discard(edge.name)
+        if streaming_edge.chunk.is_final:
+            req_info.ended_streams.discard(streaming_edge.name)
 
     def mark_ingested(self, request_id: int, streaming_edge: StreamingEdge) -> None:
         """Remember the chunk the graph accepted, for the batch that consumes it.
@@ -234,9 +229,27 @@ class StreamBufferManager:
         req_info = self._request_state.per_request_info.get(request_id)
         if req_info is None:
             return
-        sbuf = req_info.stream_buffers.get(streaming_edge.edge.name)
+        sbuf = req_info.stream_buffers.get(streaming_edge.name)
         if sbuf is not None:
             sbuf.ingested_chunk = streaming_edge.chunk
+
+    @staticmethod
+    def edge_block(polled: Iterable[tuple[int, StreamingEdge]]) -> ColumnarEdgeSpecs:
+        """Popped chunks as the runtime's ingest columns, in ``polled`` order."""
+        block = ColumnarEdgeSpecs.empty()
+        for rid, se in polled:
+            block.add(rid, se.name, se.uuids, se.chunk.is_final, next_node=se.next_node)
+        return block
+
+    @staticmethod
+    def edge_specs(polled: Iterable[tuple[int, StreamingEdge]]) -> list[EdgeSpec]:
+        """Popped chunks as a speculation prep's streaming edges, in ``polled`` order."""
+        return [
+            EdgeSpec(
+                signal=se.name, next_node=se.next_node, uuids=se.uuids,
+                is_final_streaming_chunk=se.chunk.is_final,
+            ) for _rid, se in polled
+        ]
 
     # -- what a step consumes ---------------------------------------------------
 
@@ -244,9 +257,8 @@ class StreamBufferManager:
         self, edges: ColumnarEdgeSpecs, node_name: str, rids, skip_missing: bool = False,
     ) -> InputTensors:
         """``edges.to_input_tensors``, with each stream chunk into ``node_name``
-        collated: a chunk's edge carries one uuid per item, and the items are
-        stacked here, when the consuming batch is built. A one-item chunk is
-        that item, unstacked."""
+        collated (``collate``): a chunk's edge carries one uuid per item, and
+        the items are stacked here, when the consuming batch is built."""
         tm = self._tensor_manager
         out = edges.to_input_tensors(
             tm.get_tensor, rids, skip_missing=skip_missing, get_tensors=tm.get_tensors,
@@ -257,7 +269,7 @@ class StreamBufferManager:
                 for name in signals:
                     items = inputs.get(name)
                     if items is not None and len(items) > 1:
-                        inputs[name] = [torch.stack(items)]
+                        inputs[name] = [collate(items)]
         return out
 
     def chunks_for(
