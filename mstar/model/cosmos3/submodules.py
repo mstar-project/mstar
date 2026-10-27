@@ -158,8 +158,6 @@ SAMPLER = "sampler"
 # keeps it; only the transformer input is bf16. Windowed rollouts keep their
 # latents in the model dtype.
 LATENT_DTYPE = torch.float32
-# The conditioning encode runs in the VAE checkpoint's dtype, as the reference does.
-ENCODE_DTYPE = torch.bfloat16
 
 # The reasoner's walks and its decode loop.
 REASONER_PREFILL_WALKS = (REASONER_PREFILL_WALK, REASONER_PREFILL_VISION_WALK)
@@ -2518,8 +2516,8 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
     def __init__(self, vae, config):
         super().__init__()
         # Dedicated instance (not shared with the decoder node): the encode
-        # runs in ENCODE_DTYPE while the decode dtype is cuDNN-gated, and
-        # sharing would re-cast the full VAE weights every encode/decode
+        # runs in the checkpoint's bf16 while the decode dtype is cuDNN-gated,
+        # and sharing would re-cast the full VAE weights every encode/decode
         # interleave.
         self.vae = vae
         self.config = config
@@ -2619,18 +2617,15 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         condition_indexes=None, latent_shape=None, **kwargs,
     ):
         vae = self.vae
-        # bf16 like the reference pipeline's encode and latent normalization (the
-        # checkpoint is bf16, so the cast is lossless). An fp32 encode moves the
-        # anchor latent enough to move the whole i2v trajectory.
-        if next(vae.parameters()).dtype != ENCODE_DTYPE:
-            vae.to(ENCODE_DTYPE)
+        # The encode and the latent normalization run in the VAE's dtype, bf16 like
+        # the reference pipeline's. An fp32 encode moves the anchor latent enough
+        # to move the whole i2v trajectory.
+        dtype = vae.dtype
         device = vision.device
-        mean = torch.tensor(vae.config.latents_mean, dtype=ENCODE_DTYPE, device=device).view(1, -1, 1, 1, 1)
-        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=ENCODE_DTYPE, device=device)).view(
-            1, -1, 1, 1, 1
-        )
+        mean = torch.tensor(vae.config.latents_mean, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+        inv_std = (1.0 / torch.tensor(vae.config.latents_std, dtype=dtype, device=device)).view(1, -1, 1, 1, 1)
         with torch.autocast(device_type=device.type, enabled=False):
-            raw_mu = vae.encode(vision.to(ENCODE_DTYPE)).latent_dist.mode()
+            raw_mu = vae.encode(vision.to(dtype)).latent_dist.mode()
         latents = ((raw_mu - mean) * inv_std).to(torch.bfloat16)
         if condition_indexes:
             full = torch.zeros(latent_shape, device=device, dtype=latents.dtype)

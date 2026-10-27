@@ -1943,16 +1943,17 @@ class Cosmos3Model(Model):
         return vae.to(device).eval()
 
     def _build_encode_vae(self, device: str):
-        # The encoder node keeps its own fp32 instance instead of sharing the
-        # decoder's: encode always runs fp32 while the decode dtype is
-        # cuDNN-gated (bf16 from 9.16), so a shared instance would re-cast the
-        # full VAE weights on every encode/decode interleave.
+        # The encoder node keeps its own instance instead of sharing the
+        # decoder's: the encode runs in the checkpoint's bf16, as the reference
+        # does, while the decode dtype is cuDNN-gated (bf16 from 9.16), so a
+        # shared instance would re-cast the full VAE weights on every
+        # encode/decode interleave.
         if self.skip_weight_loading:
             return None
         from diffusers import AutoencoderKLWan
 
-        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
-        return vae.float().to(device).eval()
+        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"), torch_dtype=torch.bfloat16)
+        return vae.to(device).eval()
 
     def _build_vision_model(self, device: str):
         """The reasoner's vision tower + projector, from ``vision_encoder/``."""
