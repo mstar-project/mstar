@@ -36,6 +36,7 @@ from mstar.api_server import media_io
 from mstar.api_server.openai._util import release_unread, rid
 from mstar.api_server.openai.protocol import VoiceCard, VoiceList
 from mstar.api_server.openai.speech_chunking import split_sentences
+from mstar.utils.generation_kwargs import offset_seed
 
 
 def _plan_chunks(req, adapter, text: str) -> list[str]:
@@ -64,8 +65,7 @@ def _chunk_kwargs(model_kwargs: dict, index: int) -> dict:
     kwargs.pop("sentence_chunking", None)
     seed = kwargs.get("seed")
     if isinstance(seed, int) and not isinstance(seed, bool) and index:
-        # the conductor's seed is an int64: a seed near the top wraps instead of overflowing
-        kwargs["seed"] = (seed + index) % 2**63
+        kwargs["seed"] = offset_seed(seed, index)
     return kwargs
 
 
@@ -81,7 +81,7 @@ def list_voices(api) -> VoiceList | None:
     )
 
 
-async def create_speech(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
+async def create_speech(api, model_name, adapter, req, raw_request=None):
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
     # before any upload or GPU work: a format we cannot produce is the client's error
     try:
@@ -117,23 +117,16 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
         pending = [submit(i) for i in range(min(lookahead, len(chunks)))]
         if req.stream:
             raw_pcm = fmt == "pcm"
-            # Look at the first result before committing to a 200: a request the
-            # engine rejects (bad voice, dead worker, ...) must surface as an HTTP
-            # error, not as an empty WAV.
-            first_iter = api.iter_result_chunks(pending[0])
+            # a request the engine rejects gets its status, not an empty WAV
             try:
-                first = await anext(first_iter, None)
-                if _is_error(first):
-                    # Read it to the end so the finished request isn't aborted.
-                    await _drain(first_iter)
-                    raise _http_error(first)
+                first_iter = await api.open_result_stream(pending[0], raw_request)
             except BaseException:
                 # The first piece released itself; release the ones submitted ahead.
                 release_unread(api, pending, 1)
                 raise
             stream_owns_uploads = True
             return StreamingResponse(
-                _stream_pcm(api, submit, len(chunks), pending, first_iter, first, sample_rate,
+                _stream_pcm(api, submit, len(chunks), pending, first_iter, sample_rate,
                             with_wav_header=not raw_pcm, file_paths=args.file_paths),
                 media_type="audio/pcm" if raw_pcm else "audio/wav",
                 headers={"Cache-Control": "no-cache"},
@@ -175,13 +168,8 @@ def _http_error(chunk) -> HTTPException:
     )
 
 
-async def _drain(iterator) -> None:
-    async for _ in iterator:
-        pass
-
-
 async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pending: list[str],
-                      first_iter, first, sample_rate: int, with_wav_header: bool = True,
+                      first_iter, sample_rate: int, with_wav_header: bool = True,
                       file_paths: dict[str, list[str]] | None = None):
     read = 0  # pieces read to the end; the rest are released if the stream stops early
     try:
@@ -191,12 +179,7 @@ async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pendin
             if len(pending) < num_chunks:
                 # Keep the next chunk generating while this one plays.
                 pending.append(submit(len(pending)))
-            if index == 0:
-                iterator, head = first_iter, first
-            else:
-                iterator, head = api.iter_result_chunks(pending[index]), None
-            if head is not None and head.modality == "audio" and head.data:
-                yield head.data
+            iterator = first_iter if index == 0 else api.iter_result_chunks(pending[index])
             error = None
             async for c in iterator:
                 # Read past an error to the end: leaving early would abort a

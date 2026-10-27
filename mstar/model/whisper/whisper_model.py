@@ -270,10 +270,10 @@ class WhisperModel(Model):
     # -------------------------------------------------------------------
 
     def get_max_output_tokens(self, **model_kwargs):
-        # The learned position table caps prompt + generated tokens at
-        # max_target_positions (448); the forced decoder prompt takes 4.
-        # A larger request is refused by the conductor, not clamped.
-        return model_kwargs.get("max_output_tokens", self.config.max_target_positions - 4)
+        # the position table holds the forced decoder prompt plus the output;
+        # a larger request is refused by the conductor, not clamped
+        prompt = self.config.decoder_prompt_len()
+        return model_kwargs.get("max_output_tokens", self.config.max_target_positions - prompt)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([

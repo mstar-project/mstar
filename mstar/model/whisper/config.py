@@ -103,9 +103,11 @@ class WhisperModelConfig:
             raise ValueError(
                 f"Unknown Whisper task {task!r}; available: {list(self.task_to_id)}"
             )
-        return [
-            self.decoder_start_token_id,
-            self.lang_to_id[lang_token],
-            self.task_to_id[task],
-            self.no_timestamps_token_id,
-        ]
+        return self._decoder_prompt(self.lang_to_id[lang_token], self.task_to_id[task])
+
+    def decoder_prompt_len(self) -> int:
+        """Tokens the forced decoder prompt takes, whatever the language and task."""
+        return len(self._decoder_prompt(0, 0))
+
+    def _decoder_prompt(self, lang_id: int, task_id: int) -> list[int]:
+        return [self.decoder_start_token_id, lang_id, task_id, self.no_timestamps_token_id]

@@ -26,6 +26,8 @@ np = pytest.importorskip("numpy")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server.entrypoint import APIServer  # noqa: E402
+
 
 class _Chunk:
     def __init__(self, modality, data, metadata=None):
@@ -40,6 +42,8 @@ class _StubModel:
 
 
 class _StubAPI:
+    open_result_stream = APIServer.open_result_stream
+
     def __init__(self, model_name="bagel"):
         self.model_name = model_name
         self.model = _StubModel()
@@ -471,7 +475,7 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
     """Tokens that were waiting together leave as one body frame (one write
     on the socket), still one SSE event per token for the client; a chunk
     of another modality gets a frame of its own."""
-    from mstar.api_server.openai.serving_chat import _stream
+    from mstar.api_server.openai.serving_chat import _stream_events
 
     class _Batches:
         async def iter_result_chunk_batches(self, request_id):
@@ -479,7 +483,8 @@ def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
             yield [_Chunk("text", b"d"), _Chunk("audio", b"\x00\x01"), _Chunk("text", b"e")]
 
     async def _collect():
-        return [frame async for frame in _stream(_Batches(), "bagel", "rid", 24000)]
+        batches = _Batches().iter_result_chunk_batches("rid")
+        return [frame async for frame in _stream_events(batches, "bagel", "rid", 24000)]
 
     frames = asyncio.run(_collect())
     # abc (the role rides on a), d, audio, e, stop, DONE
@@ -536,16 +541,18 @@ def _stream_events(client, model="bagel"):
     return text, events
 
 
-def test_chat_stream_error_type_follows_the_status(client_and_stub):
-    """A 4xx from the data worker (a ValueError or TypeError in preprocess)
-    is the client's error, not a server_error."""
+def test_a_chat_stream_refused_up_front_gets_its_status(client_and_stub):
+    """A 4xx before the first token is the response's status, as on ``/generate``."""
     client, stub = client_and_stub
     stub.model_name = "bagel"
     stub.next_chunks = [_Chunk("error", b"ValueError: unknown domain 'x'", {"status": 400})]
-    _, events = _stream_events(client)
-    assert events[-1]["error"] == {
-        "message": "ValueError: unknown domain 'x'", "type": "invalid_request_error", "code": 400,
-    }
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "bagel", "messages": [{"role": "user", "content": "go"}], "stream": True},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["message"] == "ValueError: unknown domain 'x'"
+    assert r.json()["error"]["type"] == "invalid_request_error"
     assert stub.aborted == []
 
 

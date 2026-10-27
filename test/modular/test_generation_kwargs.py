@@ -14,7 +14,8 @@ from mstar.api_server import entrypoint
 from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.request_types import ResultChunk
 from mstar.conductor.conductor import Conductor
-from mstar.utils.generation_kwargs import check_seed, normalize_generation_kwargs
+from mstar.model.base import Model
+from mstar.utils.generation_kwargs import check_seed, normalize_generation_kwargs, offset_seed
 
 
 def test_null_is_unset():
@@ -107,6 +108,9 @@ def test_length_aliases_fold_into_max_output_tokens_in_order():
 
 
 class _Model:
+    ENGINE_KWARGS = Model.ENGINE_KWARGS
+    LENGTH_KWARGS = Model.LENGTH_KWARGS
+
     def request_kwargs(self):
         return frozenset({"temperature"})
 
@@ -125,7 +129,6 @@ class _RecordingServer:
         self.model = _Model()
         self.chunks = list(chunks)
         self.submitted = []
-        self.reported_ignored_params = set()
 
     async def wait_for_request_id(self, request_id):
         pass
@@ -185,15 +188,16 @@ def test_a_refused_stream_gets_its_status_not_a_200(monkeypatch):
     assert "min_p" in response.json()["detail"]
 
 
-def test_an_unread_key_warns_once_then_drops_to_debug(caplog):
+def test_an_unread_key_warns_on_every_request_and_keeps_no_state(caplog):
     server = _RecordingServer()
     with caplog.at_level("DEBUG", logger=entrypoint.logger.name):
         for _ in range(3):
             server._report_ignored_params({"initial_prompt": "x"})
-        server._report_ignored_params({"initial_prompt": "x", "timestamps": "word"})
+        server._report_ignored_params({"seed": 1, "prefix_cache": True, "max_output_tokens": 4})
     levels = [r.levelname for r in caplog.records if "does not read" in r.getMessage()]
-    # a key not seen before warns again, naming the whole set
-    assert levels == ["WARNING", "DEBUG", "DEBUG", "WARNING"]
+    # keys the conductor reads are never reported
+    assert levels == ["WARNING"] * 3
+    assert vars(server).keys() == {"model", "chunks", "submitted"}
 
 
 def test_a_client_gone_before_the_first_chunk_is_aborted():
@@ -208,8 +212,8 @@ def test_a_client_gone_before_the_first_chunk_is_aborted():
                 unwound.append(request_id)   # the real iterator aborts here
 
     class _GoneClient:
-        async def is_disconnected(self):
-            return True
+        async def receive(self):
+            return {"type": "http.disconnect"}
 
     async def run():
         chunks = await _Server().open_result_stream("r1", _GoneClient())
@@ -316,3 +320,35 @@ def test_submit_request_refuses_a_bad_seed_before_registering():
             text="hi", input_modalities=["text"], output_modalities=["text"],
             model_kwargs={"seed": 2**64},
         )
+
+
+def test_a_client_still_waiting_keeps_its_stream():
+    """A pending first read is not mistaken for a disconnect, and nothing polls."""
+    ok = ResultChunk(request_id="r1", modality="text", data=b"hi")
+
+    class _Server(_RecordingServer):
+        async def iter_result_chunks(self, request_id):
+            await asyncio.sleep(0.01)
+            yield ok
+
+    class _WaitingClient:
+        receives = 0
+
+        async def receive(self):
+            self.receives += 1
+            await asyncio.Event().wait()
+
+    async def run():
+        client = _WaitingClient()
+        chunks = await _Server().open_result_stream("r1", client)
+        return [c async for c in chunks], client.receives
+
+    assert asyncio.run(asyncio.wait_for(run(), timeout=5)) == ([ok], 1)
+
+
+@pytest.mark.parametrize(("seed", "i", "expected"), [
+    (-5, 1, -4), (2**63 - 1, 1, -(2**63)), (7, 2, 9),
+])
+def test_offset_seed_wraps_as_a_signed_int64(seed, i, expected):
+    """Matches the Rust frontend's ``wrapping_add``."""
+    assert offset_seed(seed, i) == expected

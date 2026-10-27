@@ -33,6 +33,7 @@ from test_rust_frontend import (
     _wait_healthy,
 )
 
+from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, OpenAIAdapter
 from mstar.api_server.rust_frontend import OPENAI_ADAPTER_ENV, openai_adapter_class
 
@@ -243,6 +244,8 @@ def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields,
 
 class _PythonServer:
     """What the Python routes call on APIServer, replying as the stub does."""
+
+    open_result_stream = APIServer.open_result_stream
 
     def __init__(self, model_name, upload_dir):
         self.model_name, self.upload_dir, self.model = model_name, upload_dir, None

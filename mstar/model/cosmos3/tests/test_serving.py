@@ -17,9 +17,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.conductor.conductor import Conductor
 from mstar.engine.resources import SamplingReqConfig
 from mstar.model.base import MAX_OUTPUT_TOKENS
-from mstar.model.cosmos3.cosmos3_model import SAMPLER, Cosmos3Model
+from mstar.model.cosmos3.cosmos3_model import DENOISE_LOOPS, SAMPLER, Cosmos3Model
 from mstar.model.utils import load_generation_defaults
 
 NANO_DIR = Path(os.environ.get("COSMOS3_NANO_DIR", "/nonexistent-cosmos3-nano"))
@@ -96,11 +97,10 @@ def test_gen_params_and_step_metadata() -> None:
     )
     assert p["num_inference_steps"] == 3
     assert p["guidance_scale"] == 2.5
-    # Outside the loop's bounds is a 400, not a clamp; the image/video defaults
-    # differ by mode.
-    for steps in (0, model.config.max_inference_steps + 1):
-        with pytest.raises(ValueError, match="num_inference_steps must be in"):
-            model._resolve_gen_params({"num_inference_steps": steps}, ["text"], ["image"])
+    # below 1 is a 400 here; past the loop, the conductor's get_loop_caps check
+    # refuses it. The image/video defaults differ by mode.
+    with pytest.raises(ValueError, match="num_inference_steps must be >= 1"):
+        model._resolve_gen_params({"num_inference_steps": 0}, ["text"], ["image"])
     assert model._resolve_gen_params({}, ["text"], ["image"])[
         "num_inference_steps"
     ] == model.config.num_inference_steps
@@ -859,8 +859,7 @@ def test_sampler_defaults(contract_model, tmp_path) -> None:
 
 
 @pytest.mark.parametrize("mk, match", [
-    ({"num_inference_steps": 0}, "num_inference_steps must be in"),
-    ({"num_inference_steps": 101}, "num_inference_steps must be in"),
+    ({"num_inference_steps": 0}, "num_inference_steps must be >= 1"),
     ({"num_inference_steps": 2.5}, "num_inference_steps must be an integer"),
     ({"num_inference_steps": "20"}, "num_inference_steps must be an integer"),
     ({"size": "abc"}, "size must be"),
@@ -882,6 +881,21 @@ def test_sampler_defaults(contract_model, tmp_path) -> None:
 def test_generator_rejects(contract_model, mk, match) -> None:
     with pytest.raises(ValueError, match=match):
         contract_model._resolve_gen_params(mk, ["text"], ["image"])
+
+
+def test_steps_past_the_denoise_loop_are_refused_by_the_conductor(contract_model) -> None:
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = contract_model
+    conductor._loop_max_iters = {
+        name: loop.max_iters
+        for walk in contract_model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    top = contract_model.config.max_inference_steps
+    caps = conductor._loop_caps({"num_inference_steps": top})
+    assert {caps[name] for name in DENOISE_LOOPS} == {top}
+    with pytest.raises(ValueError, match="iterations"):
+        conductor._loop_caps({"num_inference_steps": top + 1})
 
 
 def test_generator_accepts(contract_model) -> None:

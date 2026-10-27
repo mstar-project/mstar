@@ -124,14 +124,15 @@ class CommandAPlusModel(Model):
         ]
 
     def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
-        defaults = dict(temperature=0.9, top_p=0.95, top_k=0,
+        defaults = dict(temperature=0.9, top_p=0.95, top_k=0, min_p=0.0,
                         repetition_penalty=1.04, ignore_eos=False)
         supplied = model_kwargs or {}
         return {SAMPLER: SamplingReqConfig(**{key: supplied.get(key, val) for key, val in defaults.items()})}
 
     def request_kwargs(self):
         return frozenset({
-            "messages", "max_output_tokens", "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos",
+            "messages", "max_output_tokens", "temperature", "top_p", "top_k", "min_p", "repetition_penalty",
+            "ignore_eos",
         })
 
     def get_loop_caps(self, **model_kwargs):

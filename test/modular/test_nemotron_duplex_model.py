@@ -306,7 +306,7 @@ def test_request_kwargs_are_the_sampling_knobs_it_reads():
     model = _make_model()
     declared = model.request_kwargs()
     base = model.get_request_resource_configs({}, {})[NANO_SAMPLER]
-    sent = {"temperature": 0.0, "top_p": 0.5, "repetition_penalty": 1.3, "ignore_eos": True}
+    sent = {"temperature": 0.0, "top_p": 0.5, "min_p": 0.2, "repetition_penalty": 1.3, "ignore_eos": True}
     assert declared == set(sent)
     for key, value in sent.items():
         assert getattr(base, key) != value
