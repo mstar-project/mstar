@@ -81,7 +81,9 @@ from __future__ import annotations
 import dataclasses
 import glob
 import inspect
+import json
 import re
+from collections import Counter
 from pathlib import Path
 
 import msgpack
@@ -89,6 +91,7 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
@@ -138,6 +141,7 @@ from mstar.model.gr00t_n17.submodules import (
     Gr00tN17VisionEncoderSubmodule,
     Gr00tN17VLBridgeSubmodule,
 )
+from mstar.model.gr00t_n17.weight_loader import _remapper
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
@@ -1607,7 +1611,7 @@ def test_the_opted_out_bridge_hands_the_loop_bf16_spans(tmp_path):
 # accelerator graphs
 # ----------------------------------------------------------------------------
 
-_SERVING = Path(__file__).resolve().parents[2] / "configs" / "gr00t_n17.yaml"
+_SERVING = Path(__file__).resolve().parents[3] / "configs" / "gr00t_n17.yaml"
 
 
 def _constructed(path: Path, **model_kwargs) -> Gr00tN17Model:
@@ -1916,6 +1920,68 @@ def test_the_five_nodes_build_at_the_checkpoints_widths_on_meta():
     assert len(dt.model.transformer_blocks) == 32
     assert sum(p.numel() for p in dt.parameters()) > 1_000_000_000
     assert all(p.device.type == "meta" for p in dt.parameters())
+
+
+# The module each node's checkpoint tensors are named against: the wrapped component, or the
+# submodule itself (`_create_submodule`).
+_LOAD_TARGET = {
+    VISION_ENCODER: lambda node: node.model,
+    VL_BRIDGE: lambda node: node.model,
+    STATE_ENCODER: lambda node: node,
+    DENOISE_STEP: lambda node: node,
+}
+
+
+def _meta_node(node: str):
+    model = _model(Gr00tN17Config.from_hf(_GR00T, _BACKBONE))
+    model._repo_dir = _GR00T
+    with torch.device("meta"):
+        return model, _unloaded(model, node)
+
+
+@pytest.mark.skipif(not (_GR00T.exists() and _BACKBONE), reason="checkpoint not cached")
+@pytest.mark.parametrize("node", list(_LOAD_TARGET))
+def test_the_checkpoints_tensors_name_and_shape_each_nodes_parameters(node):
+    """Every tensor the loader's remapper routes to ``node`` is one of its parameters at the
+    checkpoint's shape, and every parameter gets one; shapes come off the safetensors
+    headers, so no tensor is read."""
+    _, built = _meta_node(node)
+    weight_map = json.loads((_GR00T / "model.safetensors.index.json").read_text())["weight_map"]
+    remap = _remapper(node)
+    checkpoint = {}
+    for key, shard in weight_map.items():
+        if name := remap(key):
+            with safe_open(str(_GR00T / shard), framework="pt") as shard_file:
+                checkpoint[name] = shard_file.get_slice(key).get_shape()
+
+    assert checkpoint == {name: list(p.shape) for name, p in _LOAD_TARGET[node](built).named_parameters()}
+
+
+@pytest.mark.skipif(not (_GR00T.exists() and _BACKBONE), reason="checkpoint not cached")
+def test_the_denoise_steps_checkpoint_pieces_and_widths():
+    """467 tensors over four pieces: the stack's 456 is 32 blocks x 14, the timestep
+    encoder's 4 and the output projections' 4, so no ``norm_out`` and no 33rd block. The
+    blocks alternate cross (keys 2048 wide) and self, cross first, and the position table
+    holds 1024 rows for the 40 action rows the DT reads, so a slice off the front never raises."""
+    model, node = _meta_node(DENOISE_STEP)
+    config = model.config
+    remap = _remapper(DENOISE_STEP)
+    weight_map = json.loads((_GR00T / "model.safetensors.index.json").read_text())["weight_map"]
+    names = [name for key in weight_map if (name := remap(key))]
+
+    assert Counter(name.partition(".")[0] for name in names) == {
+        "action_encoder": 6, "model": 456, "action_decoder": 4, "position_embedding": 1,
+    }
+    assert len(names) == 467
+    assert (config.backbone_embedding_dim, config.dit.inner_dim) == (2048, 1536)
+    assert config.dit.num_layers == 32
+    assert [block.attn1.to_k.in_features for block in node.model.transformer_blocks] == [
+        config.backbone_embedding_dim if index % 2 == 0 else config.dit.inner_dim
+        for index in range(config.dit.num_layers)
+    ]
+    assert node.position_embedding.weight.shape == (config.max_seq_len, config.input_embedding_dim)
+    assert node.position_embedding.weight.shape == (1024, 1536)
+    assert config.action_horizon + 1 == 41 < config.max_seq_len
 
 
 @pytest.mark.skipif(not (_GR00T.exists() and _BACKBONE), reason="checkpoint not cached")
