@@ -572,6 +572,7 @@ class StepRunner:
             self._pre_admitted = None
         results = step.ctx.plan_results
         results.clear()
+        step.ctx.plan_phase = phase
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"{phase}.{key}")
@@ -626,6 +627,7 @@ class StepRunner:
         than the live one; the later full `plan` promotes it. Results are left
         in `ctx.plan_results` for the dependents in this same subset."""
         results = step.ctx.plan_results
+        step.ctx.plan_phase = "res.pre_plan"
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_plan.{key}")
