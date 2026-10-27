@@ -8,8 +8,11 @@ from collections.abc import Iterable
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from mstar.model.command_a_plus.config import CommandAPlusVisionConfig
+
+_ATTENTION_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
 class SiglipAttention(nn.Module):
@@ -64,8 +67,13 @@ class SiglipEmbeddings(nn.Module):
         self.position_embedding = nn.Embedding((config.image_size // config.patch_size) ** 2, config.hidden_size)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        patches = self.patch_embedding(pixel_values.to(self.patch_embedding.weight.dtype))
-        return patches.flatten(2).transpose(1, 2) + self.position_embedding.weight
+        # The conv as a matmul: cuDNN picks its algorithm by batch size, which would
+        # make a tile's embeddings depend on the other tiles in the call.
+        weight = self.patch_embedding.weight
+        p = weight.shape[-1]
+        patches = pixel_values.to(weight.dtype).unfold(2, p, p).unfold(3, p, p)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).flatten(3).flatten(1, 2)
+        return F.linear(patches, weight.flatten(1), self.patch_embedding.bias) + self.position_embedding.weight
 
 
 class CommandAPlusProjector(nn.Module):
@@ -113,8 +121,10 @@ class CommandAPlusVisionEncoder(nn.Module):
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """``[tiles, 3, size, size]`` to ``[tiles * tokens_per_tile, text_hidden]``, tile-major."""
         x = self.embeddings(pixel_values)
-        for layer in self.layers:
-            x = layer(x)
+        # cuDNN attention builds a plan per new tile count, ~0.5 s each on GB200
+        with sdpa_kernel(_ATTENTION_BACKENDS):
+            for layer in self.layers:
+                x = layer(x)
         return self.projector(self.post_layernorm(x)).flatten(0, 1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:

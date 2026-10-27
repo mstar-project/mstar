@@ -146,12 +146,20 @@ def test_a_per_request_stage_failure_reaches_the_client_as_an_error_id(tmp_path,
 
 
 class _FailingServer:
+    takes_stream_input = False
+
     def __init__(self, exc, upload_dir=None):
         self.exc = exc
         self.upload_dir = upload_dir
 
     async def wait_for_request_id(self, request_id):
         return None
+
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key):
+        pass
 
     def submit_request(self, **kwargs):
         raise self.exc

@@ -66,6 +66,7 @@ def _conductor(requests, drain_ttl_s=120.0):
     c._early_reads_done_deadlines = deque()
     c._early_abort_deadlines = deque()
     c.waiting_queue = []
+    c._client_streams = {}
     c.enable_prof = False
     c.enable_nvtx = False
     c.max_concurrent_requests = None
