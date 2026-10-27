@@ -14,7 +14,8 @@
 model: "nemotron_duplex"
 max_seq_len: 12288
 
-# Sessions at once; the overflow queues. Each session holds a slot in
+# Sessions at once; a live call past it gets a 503 (only one-shot requests
+# queue). Each session holds a slot in
 # resources mamba_state, encoder_state, encoder_front and encoder_kv and its
 # pages in nano_kv and talker_kv, all sized for 32 (DEFAULT_SESSIONS); to raise
 # the cap, raise their max_slots (cap + 1 for the recurrent pools, for the
