@@ -291,7 +291,7 @@ def test_process_prompt_renders_the_chat(make, tmp_path):
     mk = adapters.get_adapter("glm52").chat_to_request(
         _chat(tools=[WEATHER], reasoning_effort="high"), tmp_path).model_kwargs
     out = m.process_prompt("ignored", ["text"], ["text"], **mk)
-    assert out["text_inputs"][0].tolist() == [1, 2, 3]
+    assert out.new_input_tensors["text_inputs"][0].tolist() == [1, 2, 3]
     messages, kw = m._tokenizer.calls[-1]
     assert [x["role"] for x in messages] == ["system", "user"]
     assert kw["tools"] == [WEATHER] and kw["reasoning_effort"] == "high"
@@ -354,7 +354,7 @@ def test_the_data_worker_tags_text_chunks_with_usage():
     wt.enable_prof = wt.enable_nvtx = False
     wt.request_output_state = {"r1": RequestOutputState(order={"u1": (0, None)}, next_sequence=1, prompt_tokens=7)}
     edge = SimpleNamespace(name="text_output", tensor_info=[SimpleNamespace(uuid="u1")])
-    wt.tensor_manager = SimpleNamespace(get_ready_tensors=lambda: {"r1": [edge]},
+    wt.tensor_manager = SimpleNamespace(get_ready_tensors=lambda: {"r1": [edge]}, take_failed_reads=lambda: [],
                                         get_tensor=lambda uuid: torch.tensor([4, 9]), dereference=lambda uuid: None)
     assert wt._process_read_tensors() is True
     assert wt.out_queue.get_nowait().metadata == {"tokens": 2, "prompt_tokens": 7, "stop_token": True}
