@@ -2187,12 +2187,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             capture_batch_sizes = list(self.gen_capture_batch_sizes)
         dtype = self.transformer.proj_in.weight.dtype
-        # The 2D (TP x SP) captured denoise graph hit a CUDA illegal access at
-        # 480p+ when the Ulysses exchange was an all-gather, composed with the TP
-        # all-reduce (pure-TP and pure-SP capture cleanly; only the combination at
-        # this scale). Not yet re-checked on the all-to-all exchange. For 2D,
-        # capture only the smallest tier; 480p+ runs eager (correct, just no graph).
-        two_d = self.transformer.sp_group.world_size > 1 and self.transformer.comm_group.world_size > 1
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
         # The capture is bit-faithful at every resolution (the rotary uses a
@@ -2202,8 +2196,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # Capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W).
         max_area = int(os.environ.get(
             "COSMOS3_GRAPH_MAX_LATENT_AREA", self.config.graph_max_latent_area))
-        if two_d:
-            max_area = min(max_area, 1000)  # 256p latent 240 captures; 480p 1560 does not
         # Video tiers (height, width, frames): a plain clip length and/or the
         # windowed rollout's window; one graph per latent shape serves t2v,
         # i2v and chained windows (see ``_capture_key``).
