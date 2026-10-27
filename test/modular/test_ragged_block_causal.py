@@ -95,7 +95,7 @@ def wrapper(**overrides) -> RaggedBlockCausalWrapper:
 
 
 def graph_wrapper() -> RaggedBlockCausalWrapper:
-    return wrapper(max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, use_cuda_graph=True)
+    return wrapper(max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True)
 
 
 # --- the layout (host only) ------------------------------------------------
@@ -233,5 +233,5 @@ def test_lease_plans_a_graph_wrapper_sized_by_the_bucket():
     lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="encode", bs=1, num_tokens=MAX_TOKENS))
     m.plan(step([20, 9]), ctx(2, lease=lease))
     w = m._wrapper("main")
-    assert w.use_cuda_graph and w.max_total_tokens == MAX_TOKENS
+    assert w.accelerator_graph and w.max_total_tokens == MAX_TOKENS
     assert w.max_blocks == max_blocks(MAX_SEGMENTS, MAX_TOKENS, BLOCK)

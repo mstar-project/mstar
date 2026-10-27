@@ -26,6 +26,7 @@ from mstar.engine.resources import (
     StepContext,
     StepRunner,
 )
+from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep
 from mstar.engine.resources.kv.manager import KVManager
@@ -33,12 +34,31 @@ from mstar.engine.resources.position.config import PositionSpec, PositionStep, P
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.model.base import PrefixStream
-from mstar.worker.engine_manager import (
-    _refuse_uncacheable_positions,
-    _refuse_unknown_walks,
-    _refuse_unskippable_resources,
+from mstar.graph.base import GraphNode, Loop
+from mstar.model.base import KVLabel, PrefixKeys
+from mstar.validation.resources import (
+    _uncacheable_positions,
+    _unknown_prefix_walks,
+    _unskippable_resources,
 )
+
+
+def _raise_first(problems):
+    """The checks report every problem; these tests look at one."""
+    for problem in problems:
+        raise ValueError(problem)
+
+
+def _refuse_uncacheable_positions(specs, model):
+    _raise_first(_uncacheable_positions(specs, model))
+
+
+def _refuse_unskippable_resources(specs, model):
+    _raise_first(_unskippable_resources(specs, model))
+
+
+def _refuse_unknown_walks(model):
+    _raise_first(_unknown_prefix_walks(model))
 
 KV = "kv"
 ROPE = "rope"
@@ -124,7 +144,7 @@ class _Node:
 def test_the_step_after_a_hit_is_placed_past_the_matched_prefix():
     node = _Node()
 
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, 96)
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
 
     assert node.step(4) == [96, 97, 98, 99], (
         "the step was placed on top of the prefix the cache matched"
@@ -141,7 +161,7 @@ def test_a_request_that_matched_nothing_still_starts_at_zero():
 
 def test_the_counter_is_seeded_once_and_then_advances_on_its_own():
     node = _Node()
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, 96)
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
 
     first = node.step(4)
     second = node.step(2)
@@ -152,17 +172,17 @@ def test_the_counter_is_seeded_once_and_then_advances_on_its_own():
 
 def test_a_shorter_match_never_rewinds_the_counter():
     node = _Node()
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, 96)
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
     node.step(4)
 
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, 32)
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 32, 32))
 
     assert node.step(1) == [100], "a stale match pulled the counter backwards"
 
 
 def test_a_label_the_request_writes_after_its_hit_starts_at_zero():
     node = _Node()
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, 96)
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
     node.step(4)
 
     assert node.step(2, label="cfg_text") == [0, 1], (
@@ -173,7 +193,7 @@ def test_a_label_the_request_writes_after_its_hit_starts_at_zero():
 
 def test_a_reset_forgets_what_the_cache_matched():
     node = _Node()
-    node.rope.apply_cached_prefix(RID, NODE, WALK, None, 96)
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, CachedPrefix("main", 96, 96))
 
     node.reset()
 
@@ -212,8 +232,9 @@ class _Model:
     def __init__(self, *keyed: str):
         self._keyed = keyed
 
-    def prefix_key_streams(self):
-        return {key: {} for key in self._keyed}
+    def kv_labels(self):
+        keyed = KVLabel(keys=PrefixKeys("text_inputs", ("prefill",)))
+        return {key: {"main": keyed} for key in self._keyed}
 
 
 def test_a_declared_node_over_a_block_scheme_is_refused_at_load():
@@ -310,11 +331,14 @@ class _Walking:
         self._walk = walk
         self._runs = runs
 
-    def prefix_key_streams(self):
-        return {KV: {"main": PrefixStream("text_inputs", "ids", self._walk, "decode")}}
+    def kv_labels(self):
+        return {KV: {"main": KVLabel(growth=(("decode", "decode_loop"),), keys=PrefixKeys(
+            "text_inputs", (self._walk,), growth=True,
+        ))}}
 
     def get_graph_walk_graphs(self):
-        return {walk: None for walk in self._runs}
+        llm = GraphNode(name="llm", input_names=["text_inputs"], outputs=[])
+        return {walk: Loop(name="decode_loop", max_iters=8, outputs=[], section=llm) for walk in self._runs}
 
 
 def test_a_stream_naming_a_walk_the_model_never_runs_is_refused_at_load():

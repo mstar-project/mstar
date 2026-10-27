@@ -53,7 +53,16 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata, video_metadata_dict
+from mstar.model.base import (
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    TensorAndMetadata,
+    video_metadata_dict,
+)
+from mstar.model.media_limits import VideoBudget
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -159,6 +168,7 @@ class VJepa2Model(Model):
     PREPROCESS_ONLY_KWARGS = (
         "actions", "states", "extrinsics", "context_mask", "target_mask", "goal_hidden",
     )
+    LENGTH_KWARGS = ("max_output_tokens", "rollout_horizon")
 
     PREFILL_VIDEO = "prefill_video"
     PREFILL_VIDEO_ENCODER_ONLY = "prefill_video_encoder_only"
@@ -615,6 +625,11 @@ class VJepa2Model(Model):
             step,
         )
 
+        height = getattr(metadata_obj, "height", None)
+        width = getattr(metadata_obj, "width", None)
+        if not (height and width):
+            height, width = decoder[indices[0]].shape[-2:]
+        VideoBudget().add(height, width, len(indices))
         get_at = getattr(decoder, "get_frames_at", None)
         if get_at is not None:
             logger.info("load_video: calling get_frames_at(%d indices)", len(indices))
@@ -644,7 +659,7 @@ class VJepa2Model(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Pre-process raw video (and optional AC inputs) for the first forward pass.
 
         Expects the data worker to have populated ``tensors["video_inputs"]``
@@ -779,7 +794,28 @@ class VJepa2Model(Model):
                 if m is not None:
                     out[mask_name] = [torch.as_tensor(m, dtype=torch.long)]
 
-        return out
+        kv_layout = {}
+        if self.config.predictor_kind == "ac":
+            # a rollout frame is its action and state tokens, an extrinsics token if used, then its spatial tokens
+            frame = (3 if self.config.ac_predictor.use_extrinsics else 2) + self.config.grid_size ** 2
+            rollout = self._initial_walk(kwargs) in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING)
+            kv_layout[KV_CACHE] = {"main": LabelLayout(growth=((self.ROLLOUT_LOOP_NAME, frame),) if rollout else ())}
+        return ProcessPromptOutput(out, {"kv_layout": kv_layout})
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {self.ROLLOUT_LOOP_NAME: self._rollout_horizon(model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        if self.config.predictor_kind != "ac":
+            return {}
+        return {KV_CACHE: {"main": KVLabel(growth=(
+            (self.PREFILL_VIDEO_ROLLOUT, self.ROLLOUT_LOOP_NAME),
+            (self.PREFILL_VIDEO_ROLLOUT_STREAMING, self.ROLLOUT_LOOP_NAME),
+        ))}}
+
+    def _rollout_horizon(self, model_kwargs: dict) -> int:
+        requested = int(model_kwargs.get("rollout_horizon", 2) or 2)
+        return max(1, min(requested, self.config.max_rollout_horizon))
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "video":
@@ -895,8 +931,7 @@ class VJepa2Model(Model):
             # graph's Loop is always built with ``max_iters=config.max_rollout_horizon``.
             # Streaming variant uses the same horizon logic — the submodule
             # doesn't distinguish walks.
-            requested = int((model_kwargs or {}).get("rollout_horizon", 2) or 2)
-            step_metadata["rollout_horizon"] = max(1, min(requested, self.config.max_rollout_horizon))
+            step_metadata["rollout_horizon"] = self._rollout_horizon(model_kwargs or {})
 
         unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
         return ForwardPassArgs(

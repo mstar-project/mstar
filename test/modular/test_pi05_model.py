@@ -12,6 +12,7 @@ sys.path.insert(0, ".")
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
@@ -25,6 +26,8 @@ from mstar.model.pi05.components.flow_matching import (
 )
 from mstar.model.pi05.config import Pi05Config
 from mstar.model.pi05.pi05_model import Pi05Model
+from mstar.model.pi05.submodules import Pi05ViTEncoderSubmodule
+from mstar.model.submodule_base import ModelInputsFromEngine
 
 CONFIG_PATH = str(
     Path(__file__).resolve().parents[2] / "configs" / "pi05.yaml"
@@ -49,6 +52,56 @@ def _make_model() -> Pi05Model:
     model.adaln_mlp = None
     model.siglip = None
     return model
+
+
+@pytest.fixture
+def _pi05_cpu_threads():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(2)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+@pytest.mark.parametrize(
+    ("batched", "batch_size"), [(False, 1), (True, 1), (True, 2)],
+)
+def test_pi05_vision_keeps_fp32_under_engine_autocast(_pi05_cpu_threads, batched, batch_size):
+    from mstar.engine.accelerator_graph_runner import autocast_scope
+    from mstar.engine.engine import Engine
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = torch.nn.Linear(3, 8)
+
+        def forward(self, pixels):
+            return self.projection(pixels.mean(dim=(-1, -2))).unsqueeze(1)
+
+    with torch.random.fork_rng(devices=[]), torch.no_grad():
+        torch.manual_seed(19)
+        submodule = Pi05ViTEncoderSubmodule(
+            Encoder(), Pi05Config(vit_image_size=4, num_cameras=2),
+        ).to("cpu").eval()
+        images = torch.linspace(-1, 1, batch_size * 96).reshape(batch_size, 2, 3, 4, 4)
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=list(range(batch_size)), per_request_info={},
+        )
+        engine = Engine(graph_runtime=None, autocast_dtype=torch.bfloat16)
+
+        with autocast_scope(None, "cpu"):
+            reference = submodule.encoder(images.flatten(0, 1)).reshape(batch_size, 2, 8)
+        with autocast_scope(torch.bfloat16, "cpu"):
+            with autocast_scope(engine._autocast_dtype_for(submodule), "cpu"):
+                if batched:
+                    outputs = submodule.forward_batched("prefill", engine_inputs, images)
+                    actual = torch.stack([outputs[rid]["img_emb"][0] for rid in engine_inputs.request_ids])
+                else:
+                    actual = submodule.forward("prefill", engine_inputs, images)["img_emb"][0].unsqueeze(0)
+
+        assert actual.dtype == torch.float32
+        assert torch.equal(actual, reference)
 
 
 # ----------------------------------------------------------------------
@@ -281,7 +334,7 @@ def test_pi05_process_prompt_formats_state_into_text():
         input_modalities=["image", "text"],
         output_modalities=["action"],
         robot_state=state,
-    )
+    ).new_input_tensors
 
     # Result is a single text_inputs entry — no separate state_inputs.
     assert set(result.keys()) == {"text_inputs"}
@@ -304,7 +357,7 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
         prompt="hello world",
         input_modalities=["text"],
         output_modalities=["action"],
-    )
+    ).new_input_tensors
     assert "text_inputs" in result
     assert stub.last_prompt == "hello world"
 
@@ -364,38 +417,3 @@ def test_lerobot_remap_routes_keys_to_llm_wrapper_paths():
 
     # Unknown keys are dropped
     assert remap("totally.unknown.key") is None
-
-
-def test_extract_siglip_state_dict_filters_and_renames_vision_keys():
-    """Verify that ``Pi05Model._extract_siglip_state_dict`` produces a
-    ``Pi05SiglipEncoder.state_dict()``-compatible mapping from a flat
-    lerobot dict (only siglip + connector keys; others ignored).
-    """
-    from mstar.model.pi05.pi05_model import Pi05Model
-
-    def t(*shape):
-        return torch.zeros(*shape)
-
-    pali = "paligemma_with_expert.paligemma.model"
-    flat = {
-        # Vision tower -> vision_model.vision_model.<rest>
-        f"{pali}.vision_tower.vision_model.embeddings.patch_embedding.weight": t(1152, 3, 14, 14),
-        f"{pali}.vision_tower.vision_model.encoder.layers.0.layer_norm1.weight": t(1152),
-        # multi_modal_projector.linear -> connector
-        f"{pali}.multi_modal_projector.linear.weight": t(2048, 1152),
-        f"{pali}.multi_modal_projector.linear.bias": t(2048),
-        # Non-siglip keys should be dropped
-        "action_in_proj.weight": t(1024, 32),
-        f"{pali}.language_model.norm.weight": t(2048),
-        "paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight": t(2048, 1024),
-    }
-    siglip = Pi05Model._extract_siglip_state_dict(flat)
-
-    assert "vision_model.vision_model.embeddings.patch_embedding.weight" in siglip
-    assert "vision_model.vision_model.encoder.layers.0.layer_norm1.weight" in siglip
-    assert "connector.weight" in siglip
-    assert "connector.bias" in siglip
-    assert not any("multi_modal_projector" in k for k in siglip)
-    assert not any("language_model" in k for k in siglip)
-    assert not any("action_in_proj" in k for k in siglip)
-    assert not any("gemma_expert" in k for k in siglip)

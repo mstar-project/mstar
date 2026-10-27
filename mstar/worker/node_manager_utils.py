@@ -14,7 +14,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.model.base import WorkerGraph
-from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +102,16 @@ class WorkerGraphQueues:
         queue = self.per_request_queues[request_id]
         return queue.wg_state_registry.is_done
 
-    def add_request(self, request_id: int):
+    def add_request(self, request_id: int, loop_caps: dict[str, int]):
         """
         Initialize queues for a new request
         """
         section_copy = pickle.loads(self._section_blob)
         queue = WorkerGraphIO(section_copy, wg_id=self.worker_graph_id)
+        for name, cap in loop_caps.items():
+            loop = queue.loops.get(name)
+            if loop is not None:
+                loop.max_iters = min(loop.max_iters, cap)
         queue.register_communication_info(
             self.tensor_manager, request_id
         )
@@ -299,3 +303,15 @@ class RequestStateManager:
 
     def get_partition_for_node(self, node_name: str) -> str | None:
         return self.node_to_partition.get(node_name)
+
+    def ingested_stream_chunks(self, request_id: int, node_name: str) -> dict[str, StreamChunkInfo]:
+        """Edge name -> the chunk each of ``node_name``'s input streams last
+        handed the graph: the one the request's next step there consumes."""
+        req_info = self.per_request_info.get(request_id)
+        if req_info is None:
+            return {}
+        return {
+            name: sbuf.ingested_chunk
+            for name, sbuf in req_info.stream_buffers_by_consumer.get(node_name, {}).items()
+            if sbuf.ingested_chunk is not None
+        }

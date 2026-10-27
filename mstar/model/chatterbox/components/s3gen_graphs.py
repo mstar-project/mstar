@@ -27,7 +27,11 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.cuda_graph_runner import capture_into_graph
+from mstar.engine.accelerator_graph_backend import (
+    CapturedGraph,
+)
+from mstar.engine.accelerator_graph_runner import capture_into_graph
+from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ Output = torch.Tensor | tuple[torch.Tensor, ...]
 
 @dataclass
 class _CapturedGraph:
-    graph: object  # torch.cuda.CUDAGraph (or a stand-in with ``replay``)
+    graph: CapturedGraph  # torch.cuda.CUDAGraph (or a stand-in with ``replay``)
     inputs: Tensors  # static buffers the graph reads
     output: Output  # static tensors the graph writes
 
@@ -128,7 +132,7 @@ class ShapeGraphs:
 
     @staticmethod
     def _capturable(tensors: Tensors) -> bool:
-        return next(iter(tensors.values())).is_cuda
+        return DeviceCapability.of(next(iter(tensors.values())).device).graph_backend is not None
 
     @staticmethod
     def _load(entry: _CapturedGraph, tensors: Tensors) -> None:
@@ -154,16 +158,18 @@ class ShapeGraphs:
         twice before the very first capture), then capture it into the shared
         pool with the engine's capture helper, which undoes a failed capture's
         allocator and stream state."""
-        with torch.cuda.device(device):
+        backend = DeviceCapability.of(device).graph_backend
+        index = device.index if device.index is not None else torch.accelerator.current_device_index()
+        with torch.accelerator.device_index(index):
             if self._pool is None:
-                self._pool = torch.cuda.graph_pool_handle()
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
+                self._pool = backend.graph_pool_handle()
+            stream = backend.new_stream()
+            stream.wait_stream(backend.current_stream())
+            with backend.stream_context(stream):
                 for _ in range(2 if self.captures == 0 else 1):
                     run()
-            torch.cuda.current_stream().wait_stream(stream)
-            torch.cuda.synchronize(device)
+            backend.current_stream().wait_stream(stream)
+            backend.synchronize()
             return capture_into_graph(run, self._pool, device, autocast_dtype=None)
 
 

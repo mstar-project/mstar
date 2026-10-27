@@ -1,16 +1,23 @@
 import errno
+import fcntl
 import hashlib
+import json
 import logging
+import math
 import os
 import platform
+import re
+import secrets
 import shutil
 import stat
+import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import nullcontext as _nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from mstar.communication.tensor_store import (  # NameToTensorList, Rid re-exported
@@ -20,6 +27,8 @@ from mstar.communication.tensor_store import (  # NameToTensorList, Rid re-expor
     TensorStore,
 )
 from mstar.distributed.base import ShardingConfig
+from mstar.observability.catalog import TRANSFER_API_SERVER
+from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
 
@@ -37,6 +46,7 @@ from mstar.communication.communicator import (
     BaseCommunicator,
     CommProtocol,
 )
+from mstar.communication.tensor_uuid import _DATA_WORKER as _DATA_WORKER_ENTITY
 from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
@@ -68,6 +78,171 @@ class FutureAndPointers:
     graph_edges: list[GraphEdge]
     request_id: Rid = ""
     rx_time: float | None = None # seconds
+    # uuids of the local buffers this read writes into
+    transfer_uuids: list[int] = field(default_factory=list)
+    # What the read moved over the transport (see count_read), set only while
+    # transfer metrics are on and cleared once counted. Unannotated, so class
+    # attributes rather than fields: a read with them off stores nothing more.
+    read_src = None
+    read_bytes = 0
+    read_tensors = 0
+    # src -> [bytes, tensors] for producers after the first: the conductor
+    # joins one name produced in several walks or nodes into one edge
+    read_more = None
+
+    def count_read(self, info: TensorPointerInfo) -> None:
+        """Count one tensor this read moved over the transport."""
+        src = info._source_node_name
+        if src is None:
+            # The data worker mints the request's inputs outside any node.
+            # Every worker output carries its node; the entity id is a
+            # bounded fallback should one ever arrive without.
+            src = (TRANSFER_API_SERVER if info.source_entity == _DATA_WORKER_ENTITY
+                   else info.source_entity)
+        if src == self.read_src:
+            self.read_bytes += info.nbytes
+            self.read_tensors += 1
+        elif self.read_src is None:
+            self.read_src, self.read_bytes, self.read_tensors = src, info.nbytes, 1
+        else:
+            more = self.read_more
+            if more is None:
+                more = self.read_more = {}
+            row = more.setdefault(src, [0, 0])
+            row[0] += info.nbytes
+            row[1] += 1
+
+
+@dataclass
+class FailedRead:
+    """Edges of a request that will not be delivered because one of its
+    reads failed. ``error`` is that read's exception."""
+    request_id: Rid
+    graph_edges: list[GraphEdge]
+    error: BaseException
+
+
+@dataclass
+class _KeptRead:
+    """The local buffers of a read that failed or was torn down mid-transfer,
+    kept until every transfer into them has reported that it stopped.
+
+    ``future`` is set while the read still runs in the reader thread, which
+    owns its batch ids until it finishes. ``running`` holds the ids handed
+    over after that (local pointer -> batch id), polled by the manager.
+    ``registered`` is index-parallel to ``buffers``. ``rid`` is None once the
+    request is torn down; ``request`` names it in logs."""
+    rid: Rid | None
+    request: str
+    buffers: list[torch.Tensor]
+    registered: list[bool]
+    nbytes: int
+    future: Future | None = None
+    running: dict[int, int] = field(default_factory=dict)
+
+
+#: Earlier Mooncake releases let any host that reaches the TCP data port read
+#: or write arbitrary process memory (CVE-2026-103764). NVD lists "before
+#: 0.3.13" because it points at a later refactor; the fix (Mooncake #2314)
+#: shipped in 0.3.12.post1, see https://github.com/kvcache-ai/Mooncake/issues/4626.
+MOONCAKE_PATCHED_VERSION = "0.3.12.post1"
+_MOONCAKE_DISTRIBUTIONS = (
+    "mooncake-transfer-engine",
+    "mooncake-transfer-engine-cuda13",
+    "mooncake-transfer-engine-non-cuda",
+)
+_mooncake_version_checked = False
+
+
+def _mooncake_dists_owning(engine_file: str | None, dists: list[str]) -> set[str]:
+    """Which of *dists* installed ``engine_file``, the Mooncake engine this
+    process imported: a RECORD entry that locates to it with its hash.
+
+    One replaced in the same directory keeps a hash that no longer matches,
+    and one installed elsewhere locates to another file. Empty when it can't
+    be told; a distribution whose metadata can't be read is skipped, since
+    this only refines a warning."""
+    import base64
+    from importlib.metadata import distribution
+    if engine_file is None:
+        return set()
+    try:
+        with open(engine_file, "rb") as fh:
+            digest = base64.urlsafe_b64encode(hashlib.sha256(fh.read()).digest()).rstrip(b"=").decode()
+    except OSError:
+        return set()
+    engine_path = os.path.realpath(engine_file)
+    found = set()
+    for dist in dists:
+        try:
+            for f in distribution(dist).files or []:
+                if (f.name == os.path.basename(engine_file) and f.hash is not None
+                        and f.hash.mode == "sha256" and f.hash.value == digest
+                        and os.path.realpath(f.locate()) == engine_path):
+                    found.add(dist)
+        except Exception:  # noqa: BLE001 - e.g. a corrupt RECORD
+            continue
+    return found
+
+
+def _warn_if_mooncake_unpatched() -> None:
+    """Warn once per process if the installed Mooncake predates that fix.
+
+    The extras require a patched release, so this only fires where the
+    environment was built without resolving them (``--no-deps``, a prebuilt
+    image). The distributions install the same ``mooncake`` package, and a
+    replaced one can leave its metadata behind, so with several installed
+    only the one that installed the imported engine counts; if that can't be
+    told, any unpatched one warns, since the warning blocks nothing."""
+    global _mooncake_version_checked
+    if _mooncake_version_checked:
+        return
+    _mooncake_version_checked = True
+    try:
+        from packaging.version import Version
+    except ImportError:
+        return
+    from importlib.metadata import PackageNotFoundError, version
+    installed: list[tuple[str, Version]] = []
+    for dist in _MOONCAKE_DISTRIBUTIONS:
+        try:
+            installed.append((dist, Version(version(dist))))
+        except PackageNotFoundError:
+            continue
+        except Exception:  # noqa: BLE001 - a version that can't be read or parsed (corrupt or stale metadata)
+            return
+    owner_unknown = False
+    if len(installed) > 1:
+        engine = sys.modules.get("mooncake.engine")
+        owners = _mooncake_dists_owning(getattr(engine, "__file__", None), [d for d, _ in installed])
+        if owners:
+            installed = [(d, v) for d, v in installed if d in owners]
+        else:
+            owner_unknown = True
+    patched = Version(MOONCAKE_PATCHED_VERSION)
+    unpatched = [(d, v) for d, v in installed if v < patched]
+    if unpatched and owner_unknown:
+        logger.warning(
+            "Several Mooncake distributions are installed (%s) and none can be "
+            "matched to the imported engine; if it comes from one that predates "
+            "%s, any host that can reach the transfer engine's TCP data port can "
+            "read or write this process's memory (CVE-2026-103764). Uninstall the "
+            "old ones, and keep the TCP and RDMA transports on a trusted network.",
+            ", ".join(f"{d} {v}" for d, v in installed), MOONCAKE_PATCHED_VERSION,
+        )
+    elif installed and len(unpatched) == len(installed):
+        logger.warning(
+            "Installed Mooncake (%s) predates %s: any host that can reach the "
+            "transfer engine's TCP data port can read or write this process's "
+            "memory (CVE-2026-103764). Upgrade it, and keep the TCP and RDMA "
+            "transports on a trusted network.",
+            ", ".join(f"{d} {v}" for d, v in installed), MOONCAKE_PATCHED_VERSION,
+        )
+
+
+class MemoryRegistrationError(RuntimeError):
+    """The transfer engine refused to register a tensor for remote reads, or a
+    buffer for a read into it."""
 
 
 # ---------------------------------------------------------------------------
@@ -116,11 +291,83 @@ class TransferReadInfo:
     fp: FutureAndPointers | None = None
 
 
+# transfer_check_status: COMPLETED and FAILED free the batch; WAITING, and
+# TIMEOUT (a slice past MC_SLICE_TIMEOUT), mean slices may still be moving
+_TRANSFER_COMPLETED = 1
+_TRANSFER_FAILED = -1
+_TRANSFER_RUNNING = (0, -2)
+
+# between a read's status polls. Each poll takes the GIL, which the sync read's
+# wait never did; polling faster slows a main thread that releases it often.
+_READ_POLL_INTERVAL_S = 1e-4
+
+
+def _read_error(future) -> BaseException | None:
+    """How a finished read failed, or None. Only ``done()`` and ``result()``
+    are used: the SHM arena's ``_CudaEventFuture`` has nothing else."""
+    try:
+        future.result()
+    except Exception as exc:  # noqa: BLE001 — includes a cancelled read
+        return exc
+    return None
+
+
+def _may_be_reading(future) -> bool:
+    """A read still running, or one that failed and so may have left
+    transfers running until :meth:`get_ready_tensors` takes them over."""
+    if not future.done():
+        return True
+    error = _read_error(future)
+    # a refused registration fails the read before it starts
+    return error is not None and not isinstance(error, (CancelledError, MemoryRegistrationError))
+
+
+def _submit_failed(batch_id: int) -> bool:
+    """A failed ``batch_transfer_async_read``: 0, or uint64 -1 from Mooncake
+    releases before 0.3.13."""
+    return batch_id == 0 or batch_id == 2**64 - 1
+
+
+def _mooncake_transfer_timeout_s() -> int:
+    """The timeout Mooncake's sync read applies before its 1 ns per byte:
+    ``MC_TRANSFER_TIMEOUT`` (read with atoi, at least 5), else 30."""
+    raw = os.environ.get("MC_TRANSFER_TIMEOUT")
+    if raw is None:
+        return 30
+    match = re.match(r"\s*[+-]?\d+", raw)
+    return max(5, int(match.group())) if match else 5
+
+
+def _local_hca_count(engine, device_filter: str) -> int:
+    """HCAs in the engine's local topology under the device filter it was
+    initialized with: Mooncake's sync read tries a failed batch
+    ``numContexts() + 1`` times."""
+    try:
+        topology = json.loads(engine.get_local_topology(device_filter))
+        return len({hca for tiers in topology.values() for tier in tiers for hca in tier})
+    except Exception:  # noqa: BLE001 — a topology we can't read means no retries
+        return 0
+
+
+class AsyncReadError(RuntimeError):
+    """A Mooncake read that failed. ``running`` maps the local pointer of each
+    buffer whose transfer had not reported COMPLETED or FAILED to its batch
+    id; the reader stops polling them when it raises, and the manager that
+    keeps the buffers takes them over. ``unknown`` holds pointers whose
+    transfer state cannot be learned: a failed submit (which may have posted
+    part of the transfer) or a status this code does not know."""
+
+    def __init__(self, message: str, running: dict[int, int], unknown: set[int]):
+        super().__init__(message)
+        self.running = running
+        self.unknown = unknown
+
+
 class AsyncMooncakeReader:
     """Background thread for non-blocking mooncake READ operations.
 
-    Follows SGLang's pattern: caller records CUDA event on default stream,
-    submits write task to thread pool. Worker thread waits on event via
+    The caller records a CUDA event on the default stream and
+    submits the write task to a thread pool. Worker thread waits on event via
     dedicated CUDA stream, then does blocking mooncake PUTs.
     The default stream is never blocked by store writes.
     """
@@ -129,10 +376,8 @@ class AsyncMooncakeReader:
         self, engine, device,
         max_workers: int = 3,
         max_batch_size=500,
-        enable_prof: bool=False
     ):
         self._engine = engine
-        self.enable_prof = enable_prof
         self.max_batch_size = max_batch_size
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._pending: list[Future] = []
@@ -162,7 +407,15 @@ class AsyncMooncakeReader:
             self._copy_stream.synchronize()
 
         start_time = time.perf_counter()
+        self._read(read_info)
+        end_time = time.perf_counter()
+        # The caller points every read of one edge at its FutureAndPointers
+        # only when it wants the time (--log-stats or transfer metrics).
+        if read_info[0].fp is not None:
+            for info in read_info:
+                info.fp.rx_time = (end_time - start_time)
 
+    def _read(self, read_info: list["TransferReadInfo"]) -> None:
         # group read_info by session id for batch read
         grouped_read = {}
         for info in read_info:
@@ -180,11 +433,6 @@ class AsyncMooncakeReader:
                 )
                 if status < 0:
                     raise RuntimeError(f"Mooncake read failed. Status: {status}")
-        end_time = time.perf_counter()
-        if self.enable_prof:
-            for info in read_info:
-                if info.fp is not None:
-                    info.fp.rx_time = (end_time - start_time)
 
     def wait_all(self):
         """Block until all pending writes complete. Re-raises exceptions."""
@@ -196,6 +444,119 @@ class AsyncMooncakeReader:
         """Wait for pending writes and shut down the thread pool."""
         self.wait_all()
         self._executor.shutdown(wait=True)
+
+
+class TrackedMooncakeReader(AsyncMooncakeReader):
+    """Tensor reads that say, when they fail, which transfers may still be
+    writing into their buffers.
+
+    Each tensor is its own batch, read with ``batch_transfer_async_read`` and
+    polled with ``transfer_check_status``, which reports on a batch's first
+    task only. The sync read gives up on a timeout or on one failed tensor
+    without waiting for the rest of its batch, and returns no handle to them.
+    Retries and the deadline are the sync read's.
+    """
+
+    def __init__(self, engine, device, max_workers: int = 3, device_filter: str = ""):
+        super().__init__(engine, device, max_workers=max_workers)
+        self._device_filter = device_filter
+        self._attempts: int | None = None
+        self._attempts_lock = threading.Lock()
+        self._timeout_s = _mooncake_transfer_timeout_s()
+
+    @property
+    def _read_attempts(self) -> int:
+        """Counted on the first failed tensor, not at startup:
+        ``get_local_topology`` starts a second engine, about 1 s."""
+        with self._attempts_lock:
+            if self._attempts is None:
+                self._attempts = _local_hca_count(self._engine, self._device_filter) + 1
+            return self._attempts
+
+    def _read(self, read_info: list["TransferReadInfo"]) -> None:
+        """Raises ``AsyncReadError``, after which this thread polls none of
+        the batch ids it hands over."""
+        engine = self._engine
+        deadline = time.monotonic() + self._timeout_s + sum(i.nbytes for i in read_info) * 1e-9
+        running: dict[int, tuple[int, TransferReadInfo]] = {}
+        attempts: dict[int, int] = {}
+
+        def fail(message: str, unknown: set[int] = frozenset()) -> AsyncReadError:
+            return AsyncReadError(
+                message, {ptr: batch_id for ptr, (batch_id, _) in running.items()}, set(unknown),
+            )
+
+        def submit(info: TransferReadInfo) -> None:
+            batch_id = engine.batch_transfer_async_read(
+                info.source_session_id, [info.local_ptr], [info.remote_ptr], [info.nbytes],
+            )
+            if _submit_failed(batch_id):
+                raise fail("Mooncake read submit failed", {info.local_ptr})
+            running[info.local_ptr] = (batch_id, info)
+            attempts[info.local_ptr] = attempts.get(info.local_ptr, 0) + 1
+
+        for info in read_info:
+            submit(info)
+        while running:
+            for ptr, (batch_id, info) in list(running.items()):
+                status = engine.transfer_check_status(batch_id)
+                if status in _TRANSFER_RUNNING:
+                    # the read needs every tensor, so one still running is
+                    # enough to wait on; polling the rest costs GIL hand-offs
+                    break
+                del running[ptr]
+                if status == _TRANSFER_COMPLETED:
+                    continue
+                if status != _TRANSFER_FAILED:
+                    # may or may not have freed the batch: never poll it again
+                    raise fail(f"Mooncake read returned unknown status {status}", {ptr})
+                if time.monotonic() > deadline or attempts[ptr] >= self._read_attempts:
+                    raise fail(f"Mooncake read failed. Status: {status}")
+                submit(info)
+            if not running:
+                break
+            if time.monotonic() > deadline:
+                raise fail(f"Mooncake read timed out after {self._timeout_s} s")
+            time.sleep(_READ_POLL_INTERVAL_S)
+
+    def transfer_status(self, batch_id: int) -> int:
+        """``transfer_check_status`` of one batch this reader handed over."""
+        return self._engine.transfer_check_status(batch_id)
+
+
+#: Mooncake's wheel per CUDA major. All of them install the same ``mooncake``
+#: package; the default one is built for CUDA 12.
+_MOONCAKE_WHEELS = {
+    "12": "mooncake-transfer-engine",
+    "13": "mooncake-transfer-engine-cuda13",
+}
+
+
+def _mooncake_install_hint(err: BaseException | None, torch_cuda: str | None) -> str:
+    """Say which Mooncake wheel loads next to this torch build."""
+    major = torch_cuda.split(".")[0] if torch_cuda else None
+    want = _MOONCAKE_WHEELS.get(major) if major else "mooncake-transfer-engine-non-cuda"
+    missing = re.search(r"libcudart\.so\.(\d+)", str(err))
+    if want is None or missing is None:
+        if want and isinstance(err, ModuleNotFoundError) and (err.name or "").startswith("mooncake"):
+            return f"Install {want} or use SHM protocol."
+        return "Install mooncake-transfer-engine or use SHM protocol."
+    needed = missing.group(1)
+    if needed == major:
+        fix = (
+            "`uv pip install nvidia-cuda-runtime-cu12`"
+            if needed == "12"
+            else f"put libcudart.so.{needed} on the library path"
+        )
+        return f"torch is built for CUDA {torch_cuda} too, so {fix}, or use SHM protocol."
+    torch_desc = f"built for CUDA {torch_cuda}" if major else "built without CUDA"
+    have = _MOONCAKE_WHEELS.get(needed)
+    uninstall = f"uv pip uninstall {have} && " if have else ""
+    return (
+        f"This Mooncake build needs the CUDA {needed} runtime, but torch is {torch_desc}. "
+        f"Switch to {want}: `{uninstall}uv pip install --reinstall --no-deps {want}`, "
+        "or use SHM protocol."
+    )
 
 
 class MooncakeTransferEngine(TensorTransferEngine):
@@ -218,8 +579,9 @@ class MooncakeTransferEngine(TensorTransferEngine):
             raise RuntimeError(
                 "Mooncake TransferEngine is required for RDMA/TCP protocol. "
                 f"Failed to load mooncake: {detail}. "
-                "Install mooncake-transfer-engine or use SHM protocol."
+                + _mooncake_install_hint(MOONCAKE_IMPORT_ERROR, torch.version.cuda)
             )
+        _warn_if_mooncake_unpatched()
 
         if protocol == CommProtocol.RDMA:
             transfer_device = ""
@@ -302,6 +664,21 @@ EdgeNameToTxInfo = dict[str, TxInfo]
 SourceAndEdgeToRxInfo = dict[tuple[str, str], RxInfo]
 
 
+def _is_dense(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` fills exactly its ``nbytes`` from ``data_ptr()``,
+    with no gaps or overlaps: contiguous up to a permutation of its dims."""
+    if tensor.numel() == 0:
+        return True
+    expected = 1
+    for stride, size in sorted(zip(tensor.stride(), tensor.shape, strict=True)):
+        if size == 1:
+            continue
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
 class TensorCommunicationManager(ABC):
     """Base class for inter-worker tensor transport.
 
@@ -316,6 +693,13 @@ class TensorCommunicationManager(ABC):
     key -- only ``rid_to_str`` cares, and its default (``str``) is the
     identity on strings.
     """
+
+    # Transfer metrics, off until enable_transfer_metrics(); class-level so a
+    # manager built without __init__ reads them as off too.
+    transfer_stats: EdgeTransfers | None = None
+    _transfer_dst: str | None = None
+    #: The ``transport`` label: the protocol the bytes move over.
+    transport_label: str = CommProtocol.SHM.value
 
     def __init__(
         self,
@@ -342,7 +726,21 @@ class TensorCommunicationManager(ABC):
         self.rid_to_str: Callable[[Rid], str] = str
         self._uuid_minter = TensorUuidMinter(my_entity_id)
         self.pending: list[FutureAndPointers] = []
+        # rid -> the error of its first failed read; held until cleanup_request
+        self._failed_read_errors: dict[Rid, BaseException] = {}
+        self._failed_reads: list[FailedRead] = []
+        # buffers of failed or torn-down reads, freed once their transfers stop
+        self._kept_reads: list[_KeptRead] = []
+        # buffers whose transfers can't be known to have stopped: never freed
+        self._unreleasable_buffers: list[torch.Tensor] = []
+        # batch id -> transfer_check_status; None: the transport reports nothing
+        self._transfer_status: Callable[[int], int] | None = None
         self.read_finished: dict[Rid, set[int]] = {}
+        # req_id -> {(producer uuid, offset, nbytes, dims) -> local uuid} for
+        # the received slices ``_take_cached_read`` re-pointed, and req_id ->
+        # {local uuid -> producer uuid} so their acks name the producer's.
+        self.slice_uuids: dict[Rid, dict[tuple[int, int, int, tuple[int, ...]], int]] = {}
+        self.slice_origins: dict[Rid, dict[int, int]] = {}
 
         self.req_rx_info: dict[Rid, SourceAndEdgeToRxInfo] = {}
         self.req_tx_info: dict[Rid, EdgeNameToTxInfo] = {}
@@ -353,9 +751,13 @@ class TensorCommunicationManager(ABC):
 
         # req_id -> cfg
         self.sharding_configs: dict[Rid, ShardingConfig] = {}
-        # req_id -> {name -> shards}
-        self.buffered_shards: dict[Rid, dict[str, BufferedShards]] = {}
+        # req_id -> {(name, consumer node) -> shards}: two nodes on this
+        # worker can gather the same signal, or one gather it while the other
+        # takes its slice whole
+        self.buffered_shards: dict[Rid, dict[tuple[str, str], BufferedShards]] = {}
         self.uuid_to_shard_dim: dict[int, int | None] = {}
+        self._flat_copy_stream: torch.cuda.Stream | None = None
+        self._flat_copy_pending = False
 
     @property
     def needs_cpu_tensor(self) -> bool:
@@ -364,7 +766,52 @@ class TensorCommunicationManager(ABC):
         False for transports that read device memory (TCP / RDMA)."""
         return False
 
+    #: Whether a consumer reads a stored tensor as ``nbytes`` contiguous bytes
+    #: from its ``address`` (Mooncake RDMA / TCP), so the store must hold a
+    #: layout that one flat read reproduces. False for transports that
+    #: serialize a contiguous copy at send time (SHM). An attribute, not a
+    #: property: every store call reads it.
+    needs_flat_layout: bool = False
+
     # ---- shared: store ----
+    def _flat_layout(
+        self, tensor: torch.Tensor, sharded: bool,
+        ready_event: torch.cuda.Event | None = None,
+    ) -> torch.Tensor:
+        """``tensor`` if one flat read of its ``nbytes`` from ``data_ptr()``
+        reproduces it, else a contiguous copy. Only for a non-contiguous
+        tensor on a ``needs_flat_layout`` transport.
+
+        A dense permutation (a transpose) is kept as is: the consumer
+        rebuilds it from the strides. A sharded tensor must be contiguous,
+        since its slices are byte ranges of rows. A CUDA copy runs on a side
+        stream so it does not queue behind the next step; the store waits for
+        it before returning the descriptors.
+
+        The side stream is ordered after the producer only by ``ready_event``
+        (the step's completion event). Without one, the producer's writes must
+        already be complete when the store is called, not just queued ahead on
+        some stream: the default-stream sync of ``skip_cuda_sync=False``, or
+        the caller's own wait.
+        """
+        if not sharded and _is_dense(tensor):
+            return tensor
+        if not tensor.is_cuda:
+            return tensor.contiguous()
+        stream = self._flat_copy_stream
+        if stream is None:
+            stream = self._flat_copy_stream = torch.cuda.Stream(device=tensor.device)
+        if ready_event is not None:
+            stream.wait_event(ready_event)
+        with torch.cuda.stream(stream):
+            copy = tensor.contiguous()
+        self._flat_copy_pending = True
+        return copy
+
+    def _wait_flat_copies(self) -> None:
+        self._flat_copy_pending = False
+        self._flat_copy_stream.synchronize()
+
     @staticmethod
     def _host_copies_by_tensor(
         tensors: NameToTensorList, cpu_tensors: NameToTensorList | None,
@@ -462,6 +909,7 @@ class TensorCommunicationManager(ABC):
             self._host_copies_by_tensor(tensors, cpu_tensors)
             if out_cpu is not None else {}
         )
+        flat = self.needs_flat_layout
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
@@ -474,6 +922,8 @@ class TensorCommunicationManager(ABC):
                 # it here unconditionally so TensorPointerInfo dims/strides
                 # match what receivers will read.
                 canonical = self._ensure_leading_shard_dim(shard_dim, tensor)
+                if flat and not canonical.is_contiguous():
+                    canonical = self._flat_layout(canonical, shard_dim is not None)
                 # Built before the put: the store keeps the descriptor so an
                 # edge can be rebuilt from its uuid alone. This is the same
                 # object the edge carries, so later in-place edits (the
@@ -528,7 +978,8 @@ class TensorCommunicationManager(ABC):
         # (which waits for *only* the producing step, not the queued next
         # step), so the unconditional default-stream sync here would
         # uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from
-        # those call sites.
+        # those call sites, and only once the producer's writes are complete:
+        # a flat-layout copy (``_flat_layout``) reads them during this call.
         if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         request_ids: list[Rid] = []
@@ -545,6 +996,8 @@ class TensorCommunicationManager(ABC):
         self.tensor_store.put_tensor_batch_multi(
             request_ids, uuids, canonicals, infos, cpu_tensors=cpus,
         )
+        if self._flat_copy_pending:
+            self._wait_flat_copies()
         return tensor_info
 
     def store_row_outputs_batch(
@@ -587,6 +1040,7 @@ class TensorCommunicationManager(ABC):
             tp_rank=tp_rank,
         )
         want_cpu = host_rows is not None and self.needs_cpu_tensor
+        flat = self.needs_flat_layout
         # signal -> the row tensor it views, learned from the first request
         # that has it and checked on every other
         alias: dict[str, str] = {}
@@ -637,6 +1091,11 @@ class TensorCommunicationManager(ABC):
                             return None
                         alias[signal] = name
                         if name not in template:
+                            # rows of one tensor share a layout; one that a
+                            # flat read cannot reproduce is copied per tensor
+                            # by the general path
+                            if flat and not row_views[name][0].is_contiguous():
+                                return None
                             template[name] = self._row_template(
                                 views, columns, host_rows if want_cpu else None, name,
                             )
@@ -717,6 +1176,7 @@ class TensorCommunicationManager(ABC):
         graph_walk: str | None=None,
         skip_cuda_sync: bool = False,
         cpu_tensors: dict[Rid, NameToTensorList] | None = None,
+        ready_event: torch.cuda.Event | None = None,
     ) -> StoredOutputs:
         """Store a whole output batch and return the columns routing needs.
 
@@ -737,6 +1197,11 @@ class TensorCommunicationManager(ABC):
         ``cpu_tensors`` mirrors ``outputs`` with host copies the caller already
         made (e.g. the stop check's), matched as in ``_host_copies_by_tensor``;
         kept only if ``needs_cpu_tensor``.
+
+        ``skip_cuda_sync=True`` as in ``store_and_return_tensor_info``: the
+        producer's writes must be complete, unless ``ready_event`` (the
+        producing step's completion event) is given, which a flat-layout copy
+        waits on before it reads them.
         """
         if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
@@ -748,6 +1213,7 @@ class TensorCommunicationManager(ABC):
         canonicals: list[torch.Tensor] = []
         want_cpu = cpu_tensors is not None and self.needs_cpu_tensor
         cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
+        flat = self.needs_flat_layout
 
         columnar = self.tensor_store.has_put_tensor_batch_columns
         infos: list[TensorPointerInfo] = []
@@ -806,6 +1272,10 @@ class TensorCommunicationManager(ABC):
                         canonical = self._ensure_leading_shard_dim(
                             shard_dim, tensor,
                         )
+                        if flat and not canonical.is_contiguous():
+                            canonical = self._flat_layout(
+                                canonical, shard_dim is not None, ready_event,
+                            )
                         flat_uuids.append(tensor_uuid)
                         flat_rids.append(request_id)
                         signal_idxs.append(i)
@@ -844,6 +1314,8 @@ class TensorCommunicationManager(ABC):
                 self.uuid_to_shard_dim.pop(uuid, None)
                 self.uuid_to_edge_name.pop(uuid, None)
             raise
+        if self._flat_copy_pending:
+            self._wait_flat_copies()
         return StoredOutputs(flat_uuids, flat_rids, signal_idxs, num_tensors)
 
     def _tensor_info(
@@ -872,28 +1344,37 @@ class TensorCommunicationManager(ABC):
         self,
         safety_hold_uuids: set[int],
         routed_edges: list[GraphEdge],
+        transferred_refs: list[int] | tuple[int, ...] = (),
     ):
-        """Adjust ref counts from the safety hold (1) to the actual fanout.
+        """Replace producer and completed-loop cache holds with actual fanout.
 
         Called after ``process_node_outputs`` determines the real routing.
         ``safety_hold_uuids`` is the set of UUIDs that were given ref=1 by
         ``increment_ref_batch_uniform`` after
         ``store_and_return_tensor_info_batch``.
         ``routed_edges`` is the flat list of all edges that will actually be
-        consumed (local ingestion, remote send, persist, emit, streaming).
+        consumed (local ingestion, remote send, emit, streaming). Persist
+        markers must already be set; persistence itself is not a counted read.
+        ``transferred_refs`` lists cache holds relinquished by finished loops,
+        including repeated UUIDs held by multiple nested loops. Keep these
+        holds alive until routing and persist marking have finished.
         """
-        actual_counts: dict[int, int] = {uuid: 0 for uuid in safety_hold_uuids}
+        # Each tensor's change: minus its holds (the producer's safety hold,
+        # plus every loop hold handed over), plus one per routed reader. Older
+        # accumulated tensors are included even if this pass minted none.
+        deltas: dict[int, int] = dict.fromkeys(safety_hold_uuids, -1)
+        for uuid in transferred_refs:
+            deltas[uuid] = deltas.get(uuid, 0) - 1
         for edge in routed_edges:
             for info in edge.tensor_info:
-                if info.uuid in actual_counts:
-                    actual_counts[info.uuid] += 1
+                if info.uuid in deltas:
+                    deltas[info.uuid] += 1
 
         up_uuids: list[int] = []
         up_counts: list[int] = []
         down_uuids: list[int] = []
         down_counts: list[int] = []
-        for uuid, count in actual_counts.items():
-            delta = count - 1  # subtract the safety hold of 1
+        for uuid, delta in deltas.items():
             if delta > 0:
                 up_uuids.append(uuid)
                 up_counts.append(delta)
@@ -963,6 +1444,10 @@ class TensorCommunicationManager(ABC):
         rebuilding a descriptor so the callee can read its uuid costs ~2.2us
         each (15 attribute crossings plus the dataclass), and the caller
         already has the uuids. ``skip_cuda_sync`` as for ``register_for_send``.
+
+        Returns ``{request_id: error}`` for the requests whose tensors the
+        transfer engine refused to register, or None if there were none; the
+        other requests' tensors are registered all the same.
         """
         ...
 
@@ -997,13 +1482,22 @@ class TensorCommunicationManager(ABC):
             # Canonical layout has shard_dim leading and is contiguous, so a
             # contiguous byte range maps to a contiguous range of rows along
             # dim 0. Slicing along dim 0 keeps the view contiguous.
-            bytes_per_row = canonical_tensor[0].nbytes
-            assert info.offset % bytes_per_row == 0 and info.nbytes % bytes_per_row == 0, (
-                f"slice offset {info.offset} / nbytes {info.nbytes} not aligned "
-                f"to canonical row size {bytes_per_row}"
+            bytes_per_row = (
+                canonical_tensor.element_size()
+                * math.prod(canonical_tensor.shape[1:])
             )
-            start = info.offset // bytes_per_row
-            end = start + info.nbytes // bytes_per_row
+            if bytes_per_row == 0:
+                # Rows of zero bytes (a [4, 0] tensor) carry no offset to
+                # recover the start from, and hold nothing to read: only the
+                # row count matters.
+                start, end = 0, info.dims[0]
+            else:
+                assert info.offset % bytes_per_row == 0 and info.nbytes % bytes_per_row == 0, (
+                    f"slice offset {info.offset} / nbytes {info.nbytes} not aligned "
+                    f"to canonical row size {bytes_per_row}"
+                )
+                start = info.offset // bytes_per_row
+                end = start + info.nbytes // bytes_per_row
             slice_view = canonical_tensor[start:end]
             new_uuid = self._uuid_minter.mint()
             self.uuid_to_shard_dim[new_uuid] = shard_dim
@@ -1015,6 +1509,40 @@ class TensorCommunicationManager(ABC):
             # After the re-point, so the descriptor the store keeps already
             # names the slice rather than the producer's tensor.
             self.tensor_store.put_tensor(request_id, new_uuid, slice_view, info)
+
+    def _take_cached_read(self, request_id: Rid, info: TensorPointerInfo) -> bool:
+        """Whether an earlier edge already read the bytes ``info`` names, in
+        which case this edge's ref on them is taken here.
+
+        The store is keyed by uuid, and every slice the fanout cuts from one
+        producer tensor carries that tensor's uuid. A slice other than the one
+        stored under it is re-pointed to a uuid of this process's, which the
+        caller reads into when this returns False; its ack still names the
+        producer's uuid (``_collect_and_send_acks``). A slice is matched by its
+        dims as well as its bytes: rows of zero bytes (a ``[4, 0]`` tensor) give
+        every slice offset 0 and nbytes 0.
+        """
+        store = self.tensor_store
+        if not store.check_uuid_presence(info.uuid):
+            return False
+        stored = store.get_info(info.uuid)
+        dims = tuple(info.dims)
+        if (stored.offset == info.offset and stored.nbytes == info.nbytes
+                and tuple(stored.dims) == dims):
+            store.increment_ref(info.uuid, 1)
+            return True
+        key = (info.uuid, info.offset, info.nbytes, dims)
+        slices = self.slice_uuids.setdefault(request_id, {})
+        local = slices.get(key)
+        if local is not None and store.check_uuid_presence(local):
+            info.uuid = local
+            store.increment_ref(local, 1)
+            return True
+        local = self._uuid_minter.mint()
+        slices[key] = local
+        self.slice_origins.setdefault(request_id, {})[local] = info.uuid
+        info.uuid = local
+        return False
 
     @abstractmethod
     def start_read_tensors(
@@ -1033,24 +1561,33 @@ class TensorCommunicationManager(ABC):
     # ---- shared: polling & ACKs ----
 
     def _collect_and_send_acks(
-        self, request_id: Rid, graph_edges: list[GraphEdge],
+        self, request_id: Rid | None, graph_edges: list[GraphEdge],
+        wire_request_id: str | None = None,
     ):
+        """``wire_request_id`` overrides ``rid_to_str(request_id)``, for a
+        request that no longer has a handle."""
         acks: dict[str, dict[int, int]] = {}
+        origins = self.slice_origins.get(request_id)
         for edge in graph_edges:
             for info in edge.tensor_info:
+                uuid = info.uuid
+                if origins:
+                    uuid = origins.get(uuid, uuid)
                 if info.source_entity not in acks:
                     acks[info.source_entity] = {}
-                acks[info.source_entity][info.uuid] = acks[info.source_entity].get(
-                    info.uuid, 0) + 1
+                acks[info.source_entity][uuid] = acks[info.source_entity].get(
+                    uuid, 0) + 1
         for source_entity, tensors in acks.items():
             if source_entity == self.my_entity_id:
                 continue
+            if wire_request_id is None:
+                wire_request_id = self.rid_to_str(request_id)
             self.communicator.send(
                 source_entity,
                 WorkerMessage(
                     message_type=WorkerMessageType.TENSOR_RECEIVED,
                     body=TensorReceived(
-                        request_id=self.rid_to_str(request_id),
+                        request_id=wire_request_id,
                         successful_tensors=tensors,
                         failed_tensor_ids=[],
                     ),
@@ -1058,28 +1595,201 @@ class TensorCommunicationManager(ABC):
             )
 
     def ack_unread_tensors(
-        self, request_id: Rid, graph_edges: list[GraphEdge],
+        self, request_id: str, graph_edges: list[GraphEdge],
     ):
-        """Ack result tensors for an already-removed request without reading them.
+        """Ack tensors for an already-removed request without reading them.
 
-        The producer holds these output buffers until it gets the
-        TENSOR_RECEIVED ack; emit it here so it can reclaim them.
+        The producer holds these buffers until it gets the TENSOR_RECEIVED ack;
+        emit it here so it can reclaim them. ``request_id`` is the wire string:
+        a removed request has no handle on a worker.
         """
-        self._collect_and_send_acks(request_id, graph_edges)
+        self._collect_and_send_acks(None, graph_edges, wire_request_id=request_id)
+
+    def enable_transfer_metrics(self) -> EdgeTransfers:
+        """Count what this manager reads from now on (see ``EdgeTransfers``).
+        Called once, before or while reads run on the reading thread."""
+        if self.my_entity_id == _DATA_WORKER_ENTITY:
+            self._transfer_dst = TRANSFER_API_SERVER
+        self.transfer_stats = EdgeTransfers(self.transport_label)
+        return self.transfer_stats
+
+    def _record_transfer(self, stats: EdgeTransfers, ep: FutureAndPointers) -> None:
+        """One delivered edge read: one transfer per producing node. The edge
+        is read as a whole, so an edge joined from several producers splits
+        its read time between them by bytes (by tensors if it moved none)."""
+        src = ep.read_src
+        # Cleared, so this read is never counted twice.
+        ep.read_src = None
+        dst = self._transfer_dst or ep.graph_edges[0].next_node
+        seconds = ep.rx_time or 0.0
+        if ep.read_more is None:
+            stats.record(src, dst, ep.read_bytes, ep.read_tensors, seconds)
+            return
+        rows = {src: [ep.read_bytes, ep.read_tensors], **ep.read_more}
+        total = sum(r[0] for r in rows.values())
+        col = 0 if total else 1
+        total = total or sum(r[1] for r in rows.values())
+        for src, row in rows.items():
+            stats.record(src, dst, row[0], row[1], seconds * row[col] / total)
+
+    @staticmethod
+    def _poll_read(ep: FutureAndPointers) -> tuple[bool, BaseException | None]:
+        """``(done, error)`` for a read. A read that finished cleanly drops its
+        future, so later polls of it (it can wait behind an earlier read of
+        its request) query nothing."""
+        if ep.future is None:
+            return True, None
+        if not ep.future.done():
+            return False, None
+        error = _read_error(ep.future)
+        if error is None:
+            ep.future = None
+        return True, error
+
+    def _drop_failed_read(self, ep: FutureAndPointers, error: BaseException | None) -> None:
+        """Retire a finished read that will not be delivered.
+
+        ``error`` set: this read failed. Its transfers may still write into its
+        buffers, so they are kept until they report that they stopped, and the
+        producer is not acked; it reclaims its copy when the request is torn
+        down. ``error`` None: an earlier read of the request failed and this
+        one completed, so it is acked and its buffers go with the request.
+        """
+        if error is None:
+            self._collect_and_send_acks(ep.request_id, ep.graph_edges)
+        else:
+            if ep.request_id not in self._failed_read_errors:
+                logger.error(
+                    "Tensor read for request %s failed: %s: %s",
+                    self.rid_to_str(ep.request_id), type(error).__name__, error,
+                )
+            self._keep_read_buffers(ep, error)
+        error = self._failed_read_errors.setdefault(ep.request_id, error)
+        self._failed_reads.append(FailedRead(ep.request_id, ep.graph_edges, error))
+
+    def take_failed_reads(self) -> list[FailedRead]:
+        """Reads dropped by :meth:`get_ready_tensors` since the last call. The
+        caller fails their requests; their other reads are dropped as they
+        finish, until :meth:`cleanup_request`."""
+        failed, self._failed_reads = self._failed_reads, []
+        return failed
+
+    def _keep_read_buffers(self, ep: FutureAndPointers, error: BaseException | None) -> None:
+        """Take a read's buffers out of the store, so the request's teardown
+        cannot free them, and keep them until its transfers stop. ``error`` is
+        how the read failed; None for one still running at teardown."""
+        buffers, registered = [], []
+        for uuid in ep.transfer_uuids:
+            if not self.tensor_store.check_uuid_presence(uuid):
+                continue
+            buffers.append(self.tensor_store.get_tensor(uuid))
+            registered.append(self.tensor_store.is_registered(uuid))
+            self.uuid_to_shard_dim.pop(uuid, None)
+            self.uuid_to_edge_name.pop(uuid, None)
+            self.tensor_store.remove_tensor(uuid)
+        if not buffers:
+            return
+        kept = _KeptRead(
+            ep.request_id, self.rid_to_str(ep.request_id), buffers, registered,
+            sum(b.nbytes for b in buffers),
+        )
+        logger.warning(
+            "Keeping %d bytes of read buffers for request %s until its "
+            "transfers report that they stopped", kept.nbytes, kept.request,
+        )
+        if error is None and ep.future is not None:
+            # unfinished when polled: how it ends is read from the future later
+            kept.future = ep.future
+        elif not self._take_over(kept, error):
+            return
+        self._kept_reads.append(kept)
+
+    def _take_over(self, kept: _KeptRead, error: BaseException | None) -> bool:
+        """Adopt the batch ids a finished read handed over for ``kept``. False
+        if whether its transfers stopped cannot be learned: then its buffers
+        are never freed."""
+        if error is None or isinstance(error, (CancelledError, MemoryRegistrationError)):
+            return True  # completed after all, or never started
+        if self._transfer_status is None or not isinstance(error, AsyncReadError):
+            why = f"its {type(error).__name__} does not say whether the transfer stopped"
+            return self._never_free(kept, why)
+        ptrs = {buffer.data_ptr() for buffer in kept.buffers}
+        if error.unknown & ptrs:
+            return self._never_free(kept, f"{error}, so part of the transfer may be running")
+        kept.running = {ptr: batch_id for ptr, batch_id in error.running.items() if ptr in ptrs}
+        return True
+
+    def _never_free(self, kept: _KeptRead, why: str) -> bool:
+        self._unreleasable_buffers.extend(kept.buffers)
+        logger.warning(
+            "Read buffers of request %s (%d bytes) stay allocated for the life of "
+            "the process: %s", kept.request, kept.nbytes, why,
+        )
+        return False
+
+    def _release_kept_reads(self) -> None:
+        """Free each kept read whose transfers have all reported COMPLETED or
+        FAILED. Never blocks; any other status keeps the buffers."""
+        still_kept = []
+        for kept in self._kept_reads:
+            if kept.future is not None:
+                if not kept.future.done():
+                    still_kept.append(kept)
+                    continue
+                future, kept.future = kept.future, None
+                error = _read_error(future)
+                if not self._take_over(kept, error):
+                    continue
+            for ptr, batch_id in list(kept.running.items()):
+                status = self._transfer_status(batch_id)
+                if status in (_TRANSFER_COMPLETED, _TRANSFER_FAILED):
+                    # both free the batch, so the id is never polled again
+                    del kept.running[ptr]
+                elif status not in _TRANSFER_RUNNING:
+                    kept.running.clear()
+                    self._never_free(kept, f"its transfer returned unknown status {status}")
+                    break
+            else:
+                if not kept.running:
+                    self._free_kept_read(kept)
+                else:
+                    still_kept.append(kept)
+        self._kept_reads = still_kept
+
+    def _free_kept_read(self, kept: _KeptRead) -> None:
+        for buffer, registered in zip(kept.buffers, kept.registered, strict=True):
+            if not registered or not buffer.nbytes:
+                continue
+            ret_value = self.transfer_engine.unregister_memory(buffer.data_ptr())
+            if ret_value != 0:
+                self._never_free(kept, f"unregistering its buffers failed ({ret_value})")
+                return
+        logger.info(
+            "Freed %d bytes of read buffers kept for request %s: its transfers "
+            "stopped", kept.nbytes, kept.request,
+        )
+        # the reader may still hold this read's future and its error
+        kept.buffers.clear()
 
     def get_ready_tensors(self, graph_walk: str | None=None) -> dict[Rid, list[GraphEdge]]:
+        if self._kept_reads:
+            self._release_kept_reads()
         ready: dict[Rid, list[GraphEdge]] = {}
         still_pending = []
         uuid_to_time = {}
+        stats = self.transfer_stats
         # the async reader finishes a request's reads in any order, so a read
         # that is done waits for the ones started before it: a streamed token
         # must not reach the client ahead of the one before it
         waiting: set[Rid] = set()
         for ep in self.pending:
-            done = ep.future is None or ep.future.done()
+            done, error = self._poll_read(ep)
+            if error is not None or (done and ep.request_id in self._failed_read_errors):
+                self._drop_failed_read(ep, error)
+                continue
             if done and ep.request_id not in waiting:
-                if ep.future is not None:
-                    ep.future.result()
+                if stats is not None and ep.read_src is not None:
+                    self._record_transfer(stats, ep)
                 for edge in ep.graph_edges:
                     ready.setdefault(ep.request_id, []).append(edge)
                     logger.debug(
@@ -1104,8 +1814,12 @@ class TensorCommunicationManager(ABC):
                     final_ready.setdefault(req_id, []).append(edge)
                     continue
                 # Already-emitted edge re-surfacing (re-delivery / retry): skip
-                # the buffering path and pass through unchanged.
-                if any(info.uuid in seen_uuids for info in edge.tensor_info):
+                # the buffering path and pass through unchanged. Only when
+                # every tensor was: a slice re-pointed to a local uuid
+                # (``_take_cached_read``) can sit beside one reused from an
+                # earlier edge, so the first-read bookkeeping below is per
+                # tensor.
+                if all(info.uuid in seen_uuids for info in edge.tensor_info):
                     final_ready.setdefault(req_id, []).append(edge)
                     continue
 
@@ -1116,7 +1830,7 @@ class TensorCommunicationManager(ABC):
                     per_source: dict[str, list[int]] = {}  # source -> [bytes, count]
                     edge_rx_time = 0.0
                     for info in edge.tensor_info:
-                        if info.source_entity == self.my_entity_id:
+                        if info.source_entity == self.my_entity_id or info.uuid in seen_uuids:
                             continue
                         agg = per_source.setdefault(info.source_entity, [0, 0])
                         agg[0] += info.nbytes
@@ -1135,23 +1849,26 @@ class TensorCommunicationManager(ABC):
                         )
 
                 shard_dim = edge._shard_dim
-                if edge.name not in self.buffered_shards.get(req_id, {}):
+                buf_key = (edge.name, edge.next_node)
+                if buf_key not in self.buffered_shards.get(req_id, {}):
                     total_fanin = edge._total_fanin
                     if total_fanin > 1:
-                        self.buffered_shards[req_id][edge.name] = BufferedShards(
+                        self.buffered_shards[req_id][buf_key] = BufferedShards(
                             total_fanin=total_fanin, shard_dim=shard_dim,
                             shards={},
                         )
 
                 tensors: list[torch.Tensor] = []
                 for info in edge.tensor_info:
-                    self.tensor_store.dereference(info.uuid, 1)
-                    seen_uuids.add(info.uuid)
+                    if info.uuid not in seen_uuids:
+                        # a first read holds a transit ref; a reused one does not
+                        self.tensor_store.dereference(info.uuid, 1)
+                        seen_uuids.add(info.uuid)
                     self.uuid_to_shard_dim[info.uuid] = shard_dim
                     tensors.append(self.get_tensor(info.uuid))
 
-                if edge.name in self.buffered_shards.get(req_id, {}):
-                    buf = self.buffered_shards[req_id][edge.name]
+                if buf_key in self.buffered_shards.get(req_id, {}):
+                    buf = self.buffered_shards[req_id][buf_key]
                     buf.shards.setdefault(
                         edge.tensor_info[0].source_tp_rank, []
                     ).extend(tensors)
@@ -1187,7 +1904,7 @@ class TensorCommunicationManager(ABC):
                             self.uuid_to_shard_dim[uuid_] = None
                             new_infos.append(info)
                         edge.tensor_info = new_infos
-                        del self.buffered_shards[req_id][edge.name]
+                        del self.buffered_shards[req_id][buf_key]
                         final_ready.setdefault(req_id, []).append(edge)
                     # else: still waiting on more shards; don't emit yet
                 else:
@@ -1233,6 +1950,13 @@ class TensorCommunicationManager(ABC):
         if shard_dim is None:
             return tensor
         return self._undo_leading_shard_dim(shard_dim, tensor)
+
+    def drop_host_copies(self) -> None:
+        """Forget the host copies stored with a step's outputs once that step's
+        sends are done. They are views of buffers the producer reuses on its
+        next step, and a tensor can be sent in a later step than the one that
+        stored it (a loop's accumulated output is sent when the loop ends)."""
+        self.tensor_store.drop_cpu_tensors()
 
     def set_persist(self, uuid: int, persist: bool):
         self.tensor_store.set_metadata(uuid, persist=persist)
@@ -1297,11 +2021,16 @@ class TensorCommunicationManager(ABC):
         segment. Synchronous (SHM) reads complete inside ``start_read_tensors``
         with ``future=None``, so they never count here; only outstanding
         async (RDMA) futures do. Gates the READS_DONE ACK during a drain.
+        So does a failed read whose transfers have not all stopped: they may
+        still be reading the producer's memory.
         """
         return any(
             ep.request_id == request_id
-            and ep.future is not None and not ep.future.done()
+            and ep.future is not None and _may_be_reading(ep.future)
             for ep in self.pending
+        ) or any(
+            kept.rid == request_id and (kept.future is not None or kept.running)
+            for kept in self._kept_reads
         )
 
     def cleanup_request(self, request_id: Rid, force: bool = False):
@@ -1311,7 +2040,25 @@ class TensorCommunicationManager(ABC):
         referenced or persisted. Does NOT force-drop persisted signals — that
         is the conductor-coordinated hard cleanup, see
         :meth:`force_cleanup_request`.
+
+        Reads of the request still in ``pending`` that failed, or have not
+        finished, keep their buffers and are not acked: their transfers may
+        still write into the buffers freed below.
         """
+        leftover = [ep for ep in self.pending if ep.request_id == request_id]
+        self.pending = [ep for ep in self.pending if ep.request_id != request_id]
+        ack_edges: list[GraphEdge] = []
+        for ep in leftover:
+            done, error = self._poll_read(ep)
+            if not done or error is not None:
+                self._keep_read_buffers(ep, error)
+            else:
+                ack_edges.extend(ep.graph_edges)
+        for kept in self._kept_reads:
+            if kept.rid == request_id:
+                kept.rid = None
+        self._failed_read_errors.pop(request_id, None)
+        self._failed_reads = [f for f in self._failed_reads if f.request_id != request_id]
         self.read_finished.pop(request_id, None)
         self.buffered_shards.pop(request_id, None)
         self.sharding_configs.pop(request_id, None)
@@ -1327,11 +2074,9 @@ class TensorCommunicationManager(ABC):
                 continue
             self._cleanup_by_uuid(uuid)
 
-        self._collect_and_send_acks(
-            request_id,
-            sum([ep.graph_edges for ep in self.pending if ep.request_id == request_id], start=[]),
-        )
-        self.pending = [ep for ep in self.pending if ep.request_id != request_id]
+        self._collect_and_send_acks(request_id, ack_edges)
+        self.slice_uuids.pop(request_id, None)
+        self.slice_origins.pop(request_id, None)
 
     def force_cleanup_request(self, request_id: Rid):
         """Unconditional teardown: drop every tensor for the request and unlink
@@ -1341,6 +2086,16 @@ class TensorCommunicationManager(ABC):
         before ACKing (which the soft path would otherwise defer forever).
         """
         self.cleanup_request(request_id, force=True)
+
+    #: True when no other launch can write a file under this manager's names
+    #: (see ``SharedMemoryCommunicationManager``); irrelevant to transports
+    #: that write no files.
+    names_unique_per_launch = False
+
+    def unlink_owned_files(self) -> None:  # noqa: B027
+        """Unlink the shared-memory files this process wrote for its peers and
+        still owns. A no-op here: only the SHM file transport (and the arena's
+        spills) writes any."""
 
 
 # ---------------------------------------------------------------------------
@@ -1374,10 +2129,18 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             enable_prof=enable_prof
         )
         self.protocol = protocol
-        self._async_reader = AsyncMooncakeReader(
+        # the consumer has the engine copy ``nbytes`` from ``address + offset``
+        # into a buffer it views with the descriptor's strides
+        self.needs_flat_layout = protocol in (CommProtocol.RDMA, CommProtocol.TCP)
+        self._async_reader = TrackedMooncakeReader(
             engine._engine, device=device,
-            enable_prof=enable_prof
+            device_filter=tcp_transfer_device if protocol == CommProtocol.TCP else "",
         )
+        self._transfer_status = self._async_reader.transfer_status
+
+    @property
+    def transport_label(self) -> str:
+        return self.protocol.value
 
     def register_for_send(self, request_id, tensor_infos, skip_cuda_sync=False):
         if not skip_cuda_sync and self._on_cuda:
@@ -1395,9 +2158,14 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         uuids avoids rebuilding one per tensor."""
         if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
+        failed: dict[Rid, str] = {}
         for request_id, uuids in per_request:
-            for uuid in uuids:
-                self._register_one(request_id, uuid)
+            try:
+                for uuid in uuids:
+                    self._register_one(request_id, uuid)
+            except MemoryRegistrationError as exc:
+                failed[request_id] = str(exc)
+        return failed or None
 
     def _register_one(self, request_id: Rid, uuid: int) -> None:
         """Pin one tensor for remote reads. The caller owns the CUDA sync."""
@@ -1408,17 +2176,20 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             logger.debug("Registering %s for send", uuid)
             tensor = self.tensor_store.get_tensor(uuid)
             t0 = time.perf_counter()
+            # Mooncake rejects a 0-byte region, and a reader of an empty
+            # tensor copies nothing (see start_read_tensors), so there is
+            # nothing to pin.
             ret_value = self.transfer_engine.register_memory(
                 tensor.data_ptr(), tensor.nbytes
-            )
+            ) if tensor.nbytes else 0
             if PHASE_PERIOD:
                 phase_record(
                     "tensors.register_memory", time.perf_counter() - t0,
                 )
             if ret_value != 0:
-                raise RuntimeError(
+                raise MemoryRegistrationError(
                     f"Mooncake memory registration failed for request id "
-                    f"{request_id}, uuid {uuid}."
+                    f"{self.rid_to_str(request_id)}, uuid {uuid}: {ret_value}"
                 )
             if self.enable_prof:
                 # RDMA: the receiver does the actual read, so the sender-side
@@ -1440,11 +2211,24 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         if registered is None:
             registered = self.tensor_store.is_registered(uuid)
         if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP) and registered:
-            ret_value = self.transfer_engine.unregister_memory(
-                self.tensor_store.get_tensor(uuid).data_ptr()
-            )
-            if ret_value != 0:
-                raise RuntimeError("Mooncake memory unregistration failed.")
+            tensor = self.tensor_store.get_tensor(uuid)
+            # an empty tensor is marked ready without being registered
+            if tensor.nbytes:
+                ret_value = self.transfer_engine.unregister_memory(tensor.data_ptr())
+                if ret_value != 0:
+                    # Logged, not raised: a raise would abort the rest of a
+                    # request's teardown (from REMOVE_REQUEST, in the worker's
+                    # main loop). The engine may still hold the region, so the
+                    # tensor is kept for the life of the process: freed, its
+                    # address goes back to the allocator, and a later request's
+                    # tensor there is refused as an overlap (-7).
+                    self._unreleasable_buffers.append(tensor)
+                    logger.error(
+                        "Mooncake memory unregistration failed for uuid %s: %s; "
+                        "keeping its %d bytes allocated so the address is not "
+                        "reused while it may still be registered",
+                        uuid, ret_value, tensor.nbytes,
+                    )
         self.tensor_store.remove_tensor(uuid)
 
     def start_read_tensors(
@@ -1452,6 +2236,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         graph_walk: str | None=None
     ) -> list[Future]:
         futures = []
+        stats = self.transfer_stats
         for graph_edge in graph_edges:
             if len(graph_edge.tensor_info) == 0:
                 continue
@@ -1462,6 +2247,17 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             )
 
             read_info = []
+            transfer_uuids = []
+            # Created before the reads and pointed at by each of them, so the
+            # async reader can stamp ``rx_time`` on it when the read completes
+            # (the reader runs on another thread; the object identity is
+            # stable, only ``.future`` is filled in after submit).
+            fp = FutureAndPointers(
+                future=None, graph_edges=[graph_edge], request_id=request_id,
+                transfer_uuids=transfer_uuids,
+            )
+            # why the engine refused to pin a buffer of this edge, if it did
+            refused: str | None = None
             for info in graph_edge.tensor_info:
                 if info.source_entity == self.my_entity_id:
                     self._slice_existing_tensor(
@@ -1471,8 +2267,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     )
                     self.tensor_store.increment_ref(info.uuid, 1)
                     continue
-                if self.tensor_store.check_uuid_presence(info.uuid):
-                    self.tensor_store.increment_ref(info.uuid, 1)
+                if self._take_cached_read(request_id, info):
                     continue
                 buffer = torch.empty(
                     info.dims, dtype=info.dtype, device=self.device
@@ -1480,15 +2275,40 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 self.tensor_store.put_tensor(
                     request_id=request_id, uuid=info.uuid, tensor=buffer, info=info,
                 )
-                self.tensor_store.set_metadata(info.uuid, mem_registered=True
-                )
                 # +1 for transit (released by get_ready_tensors)
                 # +1 for graph-node usage (released by _cleanup_consumed_inputs)
                 self.tensor_store.increment_ref(info.uuid, 2
                 )
+                if stats is not None:
+                    fp.count_read(info)
+                # Nothing to read, and Mooncake rejects a 0-byte region: the
+                # empty buffer is the whole tensor. With no reads, the edge
+                # gets no future and is ready once earlier reads are.
+                if info.nbytes == 0:
+                    continue
 
-                if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
-                    self.transfer_engine.register_memory(buffer.data_ptr(), info.nbytes)
+                # the edge's buffers go with the read, so teardown waits for it
+                transfer_uuids.append(info.uuid)
+                if refused is not None:
+                    continue  # the read will not run: nothing more to pin
+
+                # Marked only once registered: teardown unregisters what is
+                # marked.
+                ret_value = (
+                    self.transfer_engine.register_memory(
+                        buffer.data_ptr(), info.nbytes,
+                    )
+                    if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP)
+                    else 0
+                )
+                if ret_value != 0:
+                    refused = (
+                        "Mooncake refused to register the read buffer for "
+                        f"request {self.rid_to_str(request_id)}, uuid "
+                        f"{info.uuid}: {ret_value}"
+                    )
+                    continue
+                self.tensor_store.set_metadata(info.uuid, mem_registered=True)
 
                 read_info.append(TransferReadInfo(
                     source_session_id=info.source_session_id,
@@ -1497,17 +2317,17 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     nbytes=info.nbytes,
                 ))
                 logger.debug("Started transfer read for uuid %s", info.uuid)
-            # Create the FutureAndPointers before submit and point each read at
-            # it, so the async reader can stamp ``rx_time`` on it when the read
-            # completes (the reader runs on another thread; the object identity
-            # is stable, only ``.future`` is filled in after submit).
-            fp = FutureAndPointers(
-                future=None, graph_edges=[graph_edge], request_id=request_id
-            )
-            if self.enable_prof:
+            if self.enable_prof or fp.read_src is not None:
                 for ri in read_info:
                     ri.fp = fp
-            fut = self._async_reader.submit(read_info)
+            if refused is not None:
+                # Reading into an unpinned buffer fails or lands nowhere, so the
+                # request fails here, as on a failed read: get_ready_tensors
+                # drops the edge and take_failed_reads names the request.
+                fut = Future()
+                fut.set_exception(MemoryRegistrationError(refused))
+            else:
+                fut = self._async_reader.submit(read_info)
             fp.future = fut
             if fut is not None:
                 futures.append(fut)
@@ -1556,17 +2376,49 @@ def _default_shm_dir() -> str:
     return "/tmp/mstar_shm"
 
 
+DEPLOYMENT_TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN"
+#: The token the last API server in this environment minted.
+_MINTED_TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN_MINTED"
+
+
+def ensure_deployment_token() -> str:
+    """Mint this launch's token unless a launcher set one. Called by the API
+    server, which every other process of the deployment descends from
+    (``spawn`` children inherit the environment).
+
+    A token an API server minted is never kept by the next launch that finds
+    it, a server built again in this process or started by one that holds
+    it: on the same endpoint that launch would write the names a stopping
+    worker of the old one may still unlink."""
+    token = os.environ.get(DEPLOYMENT_TOKEN_ENV)
+    if not token or token == os.environ.get(_MINTED_TOKEN_ENV):
+        token = secrets.token_hex(8)
+        os.environ[DEPLOYMENT_TOKEN_ENV] = os.environ[_MINTED_TOKEN_ENV] = token
+    else:
+        # Kept as is: processes a launcher starts separately must all derive
+        # the same names, so mixing in a nonce here would split them apart.
+        logger.warning(
+            "%s=%s was set by the launcher and is kept. It must be new for every "
+            "launch: a fixed value (a systemd Environment= line, a pod template "
+            "shared by replicas or restarts) lets a stopping worker of the "
+            "previous launch unlink this launch's SHM tensor files. Unset it to "
+            "have the API server mint one.", DEPLOYMENT_TOKEN_ENV, token)
+    return token
+
+
 def _deployment_namespace(communicator) -> str:
     """A token every process of ONE deployment derives identically, and two
-    deployments on the same host never share.
+    deployments that share a tmpfs never share.
 
     Tensor uuids are per-entity counters, so ``worker_0``'s uuid 5 exists in
     every deployment at once; a file named by entity and uuid alone is written
     and unlinked by every server on the host. The conductor's endpoint
-    disambiguates them because it is unique per concurrent deployment: over
-    TCP a second deployment on the same port fails to bind, and over IPC --
-    where libzmq would happily unlink and replace the socket file -- the
-    conductor's ``_lock_deployment`` refuses to start.
+    separates deployments on one host: over TCP a second deployment on the
+    same port fails to bind, and over IPC -- where libzmq would happily
+    unlink and replace the socket file -- the conductor's ``_lock_deployment``
+    refuses to start. Containers that share ``/dev/shm`` but not the network
+    namespace or ``/tmp`` can both run the same endpoint, so the launch token
+    (``ensure_deployment_token``) is mixed in when set.
     """
     if getattr(communicator, "protocol", None) not in (
         CommProtocol.IPC, CommProtocol.TCP
@@ -1576,7 +2428,88 @@ def _deployment_namespace(communicator) -> str:
     if endpoint.startswith("ipc://"):
         # realpath: "/tmp/mstar_x/" and "/tmp/mstar_x" are one deployment.
         endpoint = "ipc://" + os.path.realpath(endpoint.removeprefix("ipc://"))
-    return hashlib.sha1(endpoint.encode()).hexdigest()[:12]
+    token = os.environ.get(DEPLOYMENT_TOKEN_ENV)
+    key = f"{token}\0{endpoint}" if token else endpoint
+    return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+_NAMESPACE_LOCK_RE = re.compile(r"mstar_([0-9a-f]{12})\.lock")
+
+#: Lock path -> fd, held (never closed) for the life of the process.
+_held_namespace_locks: dict[str, int] = {}
+
+
+def _hold_namespace_lock(shm_dir: str, namespace: str) -> None:
+    """Hold a shared ``flock`` on ``mstar_<namespace>.lock`` before this
+    process writes any file under the namespace, so a namespace whose lock
+    nobody holds belongs to a deployment that is gone."""
+    path = os.path.join(shm_dir, f"mstar_{namespace}.lock")
+    if path in _held_namespace_locks:
+        return
+    while True:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        # Waits only while a sweeper deletes the namespace; it unlinks the
+        # lock file before letting go, so recheck that we hold the named one.
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        try:
+            named = os.lstat(path)
+        except FileNotFoundError:
+            named = None
+        held = os.fstat(fd)
+        if named is not None and (held.st_dev, held.st_ino) == (
+            named.st_dev, named.st_ino
+        ):
+            _held_namespace_locks[path] = fd
+            return
+        os.close(fd)
+
+
+def _sweep_dead_namespaces(shm_dir: str, own_namespace: str) -> None:
+    """Delete every ``mstar_<ns>_*`` file in ``shm_dir`` of each of this
+    uid's namespaces whose lock there this process can take exclusively,
+    then the lock file. A per-launch namespace never collides with a dead
+    run's files, so nothing else reclaims them."""
+    try:
+        names = os.listdir(shm_dir)
+    except OSError:
+        return
+    uid = os.getuid()
+    for name in names:
+        m = _NAMESPACE_LOCK_RE.fullmatch(name)
+        if m is None or m[1] == own_namespace:
+            continue
+        path = os.path.join(shm_dir, name)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            held = os.fstat(fd)
+            if held.st_uid != uid:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue   # a process of that deployment is alive
+            named = os.lstat(path)
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                continue
+            prefix = f"mstar_{m[1]}_"
+            swept = 0
+            for stale in os.listdir(shm_dir):
+                if stale.startswith(prefix):
+                    try:
+                        os.unlink(os.path.join(shm_dir, stale))
+                        swept += 1
+                    except OSError:
+                        pass
+            os.unlink(path)
+            logger.info("SHM: swept %d file(s) of dead deployment namespace "
+                        "%s", swept, m[1])
+        except OSError as e:
+            logger.debug("SHM: cannot sweep %s: %s", name, e)
+        finally:
+            os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -1585,6 +2518,10 @@ def _deployment_namespace(communicator) -> str:
 
 class SharedMemoryCommunicationManager(TensorCommunicationManager):
     """Tensor transport via file I/O to a tmpfs directory (``/dev/shm``)."""
+
+    #: Directories besides ``shm_dir`` that hold this transport's
+    #: ``mstar_<namespace>_*`` files; each gets its own namespace lock.
+    _namespace_file_dirs: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -1622,6 +2559,18 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         # uuid → file path for sender-side cleanup
         self._shm_files: dict[int, str] = {}
         self._shm_namespace = _deployment_namespace(communicator)
+        # The launch token is in the namespace, so a later launch on the same
+        # endpoint (uuid counters back at 1) never writes these names.
+        self.names_unique_per_launch = bool(
+            self._shm_namespace and os.environ.get(DEPLOYMENT_TOKEN_ENV))
+        if self._shm_namespace:
+            # A lock guards only the files in its own directory.
+            dirs = [d for d in dict.fromkeys(
+                (self.shm_dir, *self._namespace_file_dirs)) if os.path.isdir(d)]
+            for d in dirs:
+                _hold_namespace_lock(d, self._shm_namespace)
+            for d in dirs:
+                _sweep_dead_namespaces(d, self._shm_namespace)
 
         # Dedicated copy streams: D2H/H2D run here so they don't serialize
         # behind the next GPU step queued on the default stream.
@@ -1657,12 +2606,13 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         PermissionError; creating it is what makes the uuid a claim.
 
         Residue we DO own is a different case and is reclaimed rather than
-        raised on: a deployment that died leaves files under its namespace,
-        and the namespace is derived from the conductor endpoint, so a restart
-        on the same ports collides with every one of them (uuid counters
-        restart at 1 too). Concurrent same-namespace deployments cannot reach
-        here -- over TCP the ports differ, and over IPC the conductor's
-        deployment lock refuses the second one at startup.
+        raised on: without a launch token the namespace is derived from the
+        conductor endpoint alone, so a restart on the same ports collides with
+        every file the dead run left (uuid counters restart at 1 too).
+        Concurrent same-namespace deployments cannot reach here -- the launch
+        token separates deployments that share a tmpfs across containers, and
+        on one host the ports differ over TCP and the conductor's deployment
+        lock refuses a second one over IPC.
         """
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         try:
@@ -1780,6 +2730,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         # consumer's in-flight default-stream work. We make default wait
         # for the H2D stream at the end so downstream kernels see the data.
         h2d_did_work = False
+        stats = self.transfer_stats
         ctx = (
             torch.cuda.stream(self._h2d_stream)
             if self._h2d_stream is not None
@@ -1794,6 +2745,9 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     len(graph_edge.tensor_info), graph_edge.name, graph_edge.next_node,
                 )
                 rx_t0 = time.perf_counter()
+                fp = FutureAndPointers(
+                    future=None, graph_edges=[graph_edge], request_id=request_id,
+                )
                 for info in graph_edge.tensor_info:
                     if info.source_entity == self.my_entity_id:
                         self._slice_existing_tensor(
@@ -1803,16 +2757,16 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                         )
                         self.tensor_store.increment_ref(info.uuid, 1)
                         continue
-                    if self.tensor_store.check_uuid_presence(info.uuid):
-                        self.tensor_store.increment_ref(info.uuid, 1)
+                    producer_uuid = info.uuid
+                    if self._take_cached_read(request_id, info):
                         continue
                     if info.shm_segment is not None:
                         raise RuntimeError(
-                            f"tensor {info.uuid} from {info.source_entity} "
+                            f"tensor {producer_uuid} from {info.source_entity} "
                             "was staged in an SHM arena but this consumer "
                             "runs the file transport — MSTAR_SHM_ARENA must "
                             "match across the deployment")
-                    path = self._shm_path(info.source_entity, info.uuid)
+                    path = self._shm_path(info.source_entity, producer_uuid)
                     with open(path, "rb") as f:
                         f.seek(info.offset)
                         data = f.read(info.nbytes)
@@ -1823,14 +2777,11 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     # +1 for transit (released by get_ready_tensors)
                     # +1 for graph-node usage (released by _cleanup_consumed_inputs)
                     self.tensor_store.increment_ref(info.uuid, 2)
+                    if stats is not None:
+                        fp.count_read(info)
                     logger.debug("SHM: read tensor %s from %s", info.uuid, path)
-                self.pending.append(
-                    FutureAndPointers(
-                        future=None, graph_edges=[graph_edge],
-                        request_id=request_id,
-                        rx_time=time.perf_counter() - rx_t0,
-                    )
-                )
+                fp.rx_time = time.perf_counter() - rx_t0
+                self.pending.append(fp)
         if h2d_did_work and self._h2d_stream is not None:
             torch.cuda.default_stream(self.device).wait_stream(self._h2d_stream)
         return []
@@ -1849,6 +2800,29 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
             except FileNotFoundError:
                 pass
         self.tensor_store.remove_tensor(uuid)
+
+    def unlink_owned_files(self) -> None:
+        """Unlink every tensor file this manager wrote that is still waiting
+        for its TENSOR_RECEIVED or REMOVE_REQUEST, for a process that is
+        stopping. A second call finds nothing left."""
+        files = self._shm_files
+        # The orphan watchdog's thread can run this at the same time, so each
+        # path is taken by one caller, and put back for the retry if a stop
+        # cuts its unlink.
+        while True:
+            try:
+                uuid, path = files.popitem()
+            except KeyError:
+                break
+            try:
+                os.unlink(path)
+            except OSError:
+                # Already gone (FileNotFoundError) or not removable: either
+                # way, keep going so the rest are still reclaimed.
+                pass
+            except BaseException:
+                files[uuid] = path
+                raise
 
 
 # ---------------------------------------------------------------------------

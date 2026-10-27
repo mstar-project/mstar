@@ -19,7 +19,9 @@ time out.
 from __future__ import annotations
 
 import logging
+import re
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -29,11 +31,14 @@ import torch
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Resource
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.position.manager import RopeManager
-from mstar.model.base import PrefixStream
+from mstar.graph.base import GraphEdge, GraphNode, Sequential
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import KVLabel, PrefixKeys
+from mstar.validation.resources import _unservable_walks
 
 KV = "kv"
 ROPE = "rope"
@@ -84,15 +89,20 @@ class _Model:
     def preprocess_fingerprint(self):
         return self._name
 
-    def prefix_key_streams(self):
+    def kv_labels(self):
         return {}
 
 
 class _Declaring(_Model):
     """Keys ``main`` on the KV resource from its text walk."""
 
-    def prefix_key_streams(self):
-        return {KV: {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}}
+    def kv_labels(self):
+        return {KV: {"main": KVLabel(growth=(("decode", "decode_loop"),), keys=PrefixKeys(
+            "text_inputs", ("prefill_text",), growth=True,
+        ))}}
+
+    def get_graph_walk_graphs(self):
+        return {"prefill_text": GraphNode(name="LLM", input_names=["text_inputs"], outputs=[])}
 
 
 def _checkpoint(root, config: bytes) -> str:
@@ -308,10 +318,13 @@ def test_an_uncached_node_says_nothing_at_load(caplog, overrides, model):
 # ── the keys the request brought ────────────────────────────────────────
 
 
+_LAYOUT = {"main": StreamLayout(spans=(PrefixSpan(32, 32, "prefill_text"),), keyed_spans=1)}
+
+
 def test_ingest_puts_the_requests_keys_on_the_stream():
     kv = _kv()
 
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}, kv_layout=_LAYOUT))
 
     assert kv._streams["r0"]["main"].chain.keys == [b"k0", b"k1"], (
         "the chain the request brought never reached its stream"
@@ -320,7 +333,7 @@ def test_ingest_puts_the_requests_keys_on_the_stream():
 
 def test_a_label_the_request_did_not_key_carries_none():
     kv = _kv()
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0"]}))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0"]}, kv_layout=_LAYOUT))
 
     stream = kv._ensure_label("r0", "cfg_text")
 
@@ -331,7 +344,7 @@ def test_a_request_can_opt_out_of_the_cache():
     kv = _kv()
 
     kv.ingest_request("r0", KVReqConfig(
-        prefix_keys={"main": [b"k0"]}, prefix_cache=False,
+        prefix_keys={"main": [b"k0"]}, kv_layout=_LAYOUT, prefix_cache=False,
     ))
 
     assert kv._streams["r0"]["main"].chain is None, (
@@ -400,4 +413,73 @@ def test_a_resource_with_nothing_to_open_leaves_the_cache_beside_it_open():
 
     assert kv._index is not None, (
         "a resource with nothing to open kept the cache beside it shut"
+    )
+
+
+# A walk the cache serves whole runs no forward and completes with no outputs,
+# so a node that reads them would read nothing, and nothing would say why. Only
+# a stream that names layout walks has such walks. A stream with one span always
+# runs at least its last token, which is why Orpheus is not checked even though
+# its prefill streams to its codec.
+
+
+def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_runs_llm=True):
+    """A model whose stream is also written by an image walk. ``text_feeds`` and
+    ``image_feeds`` name what its LLM feeds in each walk."""
+    def node(name, feeds):
+        return GraphNode(name=name, input_names=["inputs"], outputs=[GraphEdge(next_node=feeds, name="out")])
+
+    graphs = {
+        "prefill": node("LLM", text_feeds),
+        "prefill_image": Sequential([node("vit", "LLM"), node("LLM", image_feeds)])
+        if image_walk_runs_llm else node("vit", EMIT_TO_CLIENT),
+    }
+    walks = ("prefill", "prefill_image")
+    label = KVLabel(keys=PrefixKeys("text_inputs", walks))
+    return SimpleNamespace(
+        kv_labels=lambda: {KV: {"main": label}}, get_graph_walk_graphs=lambda: graphs,
+        checkpoint_path=lambda: None, preprocess_fingerprint=lambda: "laid out",
+    )
+
+
+# the node the resource serves, the model, and what the refusal names
+_REFUSED = {
+    "a layout walk feeds a node": ("LLM", _laid_out(image_feeds="talker"), r"'prefill_image', where LLM"),
+    "its own walk feeds a node": ("LLM", _laid_out(text_feeds="talker"), r"'prefill', where LLM"),
+    "no keyed node in a layout walk": ("LLM", _laid_out(image_walk_runs_llm=False), r"'prefill_image', where none"),
+    "no keyed node in its own walk": ("Talker", _laid_out(), r"'prefill', where none"),
+}
+
+
+@pytest.mark.parametrize(("node", "model", "message"), _REFUSED.values(), ids=_REFUSED.keys())
+def test_a_walk_the_cache_cannot_serve_whole_is_refused_at_startup(node, model, message):
+    spec = KVSpec(
+        resource_key=KV, nodes={node},
+        config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
+    )
+
+    problems = list(_unservable_walks([spec], model))
+
+    assert problems and re.search(message, problems[0]), problems
+
+
+def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(monkeypatch):
+    engine = Engine.__new__(Engine)
+    engine._resources = {}
+    engine._device = torch.device("cuda")
+    engine._open_prefix_caches({KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=_kv().config)}, _laid_out())
+    # "vae" is an encoder that no layout walk runs, like an edit's.
+    engine._submodules = {
+        name: SimpleNamespace(submodule=SimpleNamespace(forward=None, forward_batched=None))
+        for name in ("vit", "LLM", "vae")
+    }
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch, "compile", lambda fn, dynamic, **kwargs: dynamic)
+
+    engine._compile_submodules()
+
+    compiled = {name: mgmt.forward for name, mgmt in engine._submodules.items()}
+    assert compiled == {"vit": True, "LLM": None, "vae": None}, (
+        "an image encoder left to recompile caches KV it no longer computes for the same "
+        "file, or a node the cache never keys from lost the compile main gives it"
     )

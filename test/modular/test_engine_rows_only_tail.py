@@ -21,13 +21,16 @@ class _Plain(NodeSubmodule):
 
 
 class _WithTail(_Plain):
-    def batch_postprocess(self, outputs, request_infos, inputs):
-        self.seen = (outputs, request_infos, inputs)
+    def batch_postprocess(self, outputs, request_infos, inputs, piecewise_runners=None):
+        self.seen = (outputs, request_infos, inputs, piecewise_runners)
+
+
+RUNNERS = {"region": object()}
 
 
 def _engine(sub):
     eng = Engine.__new__(Engine)
-    eng._submodules = {"llm": SimpleNamespace(submodule=sub)}
+    eng._submodules = {"llm": SimpleNamespace(submodule=sub, piecewise_runners=RUNNERS)}
     eng._loopback_steps = {}
     eng.per_request_tails = []
     eng.postprocess_batch = lambda batch, outputs: eng.per_request_tails.append(batch)
@@ -36,7 +39,7 @@ def _engine(sub):
 
 def _batch(rows_only):
     return SimpleNamespace(
-        node_name="llm", admit_error=None, rows_only=rows_only,
+        node_name="llm", admit_error=None, rows_only=rows_only, cached_rids=set(),
         per_request_info_wrapped={1: object()}, inputs=[object()],
     )
 
@@ -51,7 +54,8 @@ def test_rows_only_runs_the_batch_tail_only_when_overridden(sub_cls):
     assert eng.exec_and_postprocess(batch) is out
     assert eng.per_request_tails == []
     if sub_cls is _WithTail:
-        assert sub.seen == (out, batch.per_request_info_wrapped, batch.inputs)
+        # the node's captured regions come along, as the forward gets them
+        assert sub.seen == (out, batch.per_request_info_wrapped, batch.inputs, RUNNERS)
     eng.exec_and_postprocess(_batch(rows_only=False))
     assert len(eng.per_request_tails) == 1
 

@@ -1,0 +1,282 @@
+"""``PlatformDispatch``, and the platform's inductor overrides at the engine's
+compile sites. ``current_platform`` is pointed at a chosen ``Platform``, so no
+accelerator is needed.
+"""
+
+import functools
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch._inductor.config as inductor_config
+
+from mstar import platforms
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+from mstar.engine.engine import Engine
+from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform
+from mstar.platforms.compile import with_inductor_overrides
+from mstar.platforms.dispatch import PlatformDispatch
+
+
+@pytest.fixture
+def on_platform(monkeypatch):
+    """Make ``current_platform`` resolve to the given instance."""
+
+    def use(platform: Platform) -> Platform:
+        monkeypatch.setattr(platforms, "resolve_platform", lambda: platform)
+        return platform
+
+    return use
+
+
+class _Counting:
+    """A factory that counts how often it ran; its implementation returns ``tag``."""
+
+    def __init__(self, tag: str):
+        self.tag = tag
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return lambda *args, **kwargs: (self.tag, args, kwargs)
+
+
+def _dispatch(**factories) -> PlatformDispatch:
+    return PlatformDispatch("mstar::example", **factories)
+
+
+# --- PlatformDispatch -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "platform", [CudaPlatform(), RocmPlatform(), XpuPlatform(), CpuPlatform()], ids=repr,
+)
+def test_each_platform_gets_its_own_implementation(on_platform, platform):
+    on_platform(platform)
+    factories = {name: _Counting(name) for name in ("cuda", "rocm", "xpu", "cpu")}
+    dispatch = _dispatch(**factories)
+    assert dispatch(1, key=2) == (platform.name, (1,), {"key": 2})
+    assert {name: f.calls for name, f in factories.items()} == {
+        name: int(name == platform.name) for name in factories
+    }
+
+
+def test_default_serves_a_platform_without_its_own(on_platform):
+    on_platform(RocmPlatform())
+    cuda, default = _Counting("cuda"), _Counting("default")
+    assert _dispatch(cuda=cuda, default=default)()[0] == "default"
+    assert cuda.calls == 0
+
+
+def test_the_factory_runs_once(on_platform):
+    on_platform(CudaPlatform())
+    cuda = _Counting("cuda")
+    dispatch = _dispatch(cuda=cuda)
+    for _ in range(3):
+        dispatch()
+    assert cuda.calls == 1
+
+
+def test_concurrent_first_calls_resolve_once(on_platform):
+    on_platform(CudaPlatform())
+    calls = 0
+
+    def slow_factory():
+        nonlocal calls
+        calls += 1
+        time.sleep(0.05)
+        return lambda: "cuda"
+
+    dispatch = _dispatch(cuda=slow_factory)
+    start = threading.Barrier(8)
+    results = []
+
+    def call():
+        start.wait()
+        results.append(dispatch())
+
+    threads = [threading.Thread(target=call) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert results == ["cuda"] * 8
+    assert calls == 1
+
+
+def test_a_platform_with_no_implementation_is_named(on_platform):
+    on_platform(RocmPlatform())
+    dispatch = PlatformDispatch("mstar::rms_norm", cuda=_Counting("cuda"))
+    with pytest.raises(NotImplementedError) as excinfo:
+        dispatch()
+    assert str(excinfo.value) == "mstar::rms_norm has no implementation for platform rocm"
+
+
+def test_constructing_resolves_nothing(monkeypatch):
+    def no_device():
+        raise AssertionError("resolved the platform")
+
+    monkeypatch.setattr(platforms, "resolve_platform", no_device)
+    cuda = _Counting("cuda")
+    dispatch = _dispatch(cuda=cuda)
+    assert cuda.calls == 0
+    with pytest.raises(AssertionError, match="resolved the platform"):
+        dispatch()
+
+
+def test_reset_resolves_again(on_platform):
+    on_platform(CudaPlatform())
+    cuda, rocm = _Counting("cuda"), _Counting("rocm")
+    dispatch = _dispatch(cuda=cuda, rocm=rocm)
+    assert dispatch()[0] == "cuda"
+    on_platform(RocmPlatform())
+    assert dispatch()[0] == "cuda", "the implementation is cached until reset"
+    dispatch.reset()
+    assert dispatch()[0] == "rocm"
+    assert (cuda.calls, rocm.calls) == (1, 1)
+
+
+# --- with_inductor_overrides ------------------------------------------------
+
+
+class _SmallGemmsOnAten(RocmPlatform):
+    """Overrides inductor for small token counts only, and records each query."""
+
+    def __init__(self):
+        self.queries: list[int | None] = []
+
+    def inductor_overrides(self, num_tokens=None):
+        self.queries.append(num_tokens)
+        if num_tokens is not None and num_tokens <= 32:
+            return {"max_autotune_gemm_backends": "ATEN"}
+        return {}
+
+
+def _read_gemm_backends(*args, **kwargs):
+    return inductor_config.max_autotune_gemm_backends, args, kwargs
+
+
+@pytest.mark.parametrize("platform", [CudaPlatform(), RocmPlatform()], ids=repr)
+def test_no_overrides_returns_the_callable_itself(on_platform, platform):
+    on_platform(platform)
+    assert with_inductor_overrides(_read_gemm_backends, 16) is _read_gemm_backends
+    assert with_inductor_overrides(_read_gemm_backends) is _read_gemm_backends
+
+
+def test_overrides_hold_inside_the_call_only(on_platform):
+    platform = on_platform(_SmallGemmsOnAten())
+    before = inductor_config.max_autotune_gemm_backends
+    assert before != "ATEN"
+
+    wrapped = with_inductor_overrides(_read_gemm_backends, 16)
+    assert wrapped is not _read_gemm_backends
+    assert wrapped(1, key=2) == ("ATEN", (1,), {"key": 2})
+    assert inductor_config.max_autotune_gemm_backends == before
+    assert with_inductor_overrides(_read_gemm_backends, 64) is _read_gemm_backends
+    assert platform.queries == [16, 64]
+
+
+def test_overrides_are_undone_when_the_call_raises(on_platform):
+    on_platform(_SmallGemmsOnAten())
+    before = inductor_config.max_autotune_gemm_backends
+
+    def fails():
+        assert inductor_config.max_autotune_gemm_backends == "ATEN"
+        raise RuntimeError("compile failed")
+
+    with pytest.raises(RuntimeError, match="compile failed"):
+        with_inductor_overrides(fails, 8)()
+    assert inductor_config.max_autotune_gemm_backends == before
+
+
+# --- the engine's compile sites ---------------------------------------------
+
+
+class _EverythingOnAten(_SmallGemmsOnAten):
+    def inductor_overrides(self, num_tokens=None):
+        self.queries.append(num_tokens)
+        return {"max_autotune_gemm_backends": "ATEN"}
+
+
+class _Submodule:
+    def forward(self, *args, **kwargs):
+        return _read_gemm_backends(*args, **kwargs)
+
+    def forward_batched(self, *args, **kwargs):
+        return _read_gemm_backends(*args, **kwargs)
+
+
+@pytest.fixture
+def fake_compile(monkeypatch):
+    """Swap ``torch.compile`` for one that returns a new eager callable, so a
+    call sees the inductor config it ran under. Gives the list of compiled fns."""
+    compiled = []
+
+    def compile_(fn, **kwargs):
+        compiled.append(fn)
+        return functools.partial(fn)
+
+    monkeypatch.setattr(torch, "compile", compile_)
+    return compiled
+
+
+class _GraphRunner:
+    _forward_for = AcceleratorGraphRunner._forward_for
+
+    def __init__(self):
+        self._submodule = _Submodule()
+        self._compiled_forwards = {}
+
+
+def _bucket(num_tokens: int):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            compile=True, compile_mode=None, capture_forward_method="forward_batched",
+        ),
+        config_idx=0,
+        num_tokens=num_tokens,
+    )
+
+
+def test_a_capture_without_overrides_gets_the_compiled_forward(on_platform, fake_compile):
+    on_platform(CudaPlatform())
+    runner = _GraphRunner()
+    first = runner._forward_for(_bucket(64))
+    assert first is runner._compiled_forwards[0]
+    assert runner._forward_for(_bucket(8)) is first
+    assert len(fake_compile) == 1
+
+
+def test_each_capture_runs_under_its_buckets_overrides(on_platform, fake_compile):
+    platform = on_platform(_SmallGemmsOnAten())
+    runner = _GraphRunner()
+    large = runner._forward_for(_bucket(64))
+    small = runner._forward_for(_bucket(16))
+    assert large is runner._compiled_forwards[0]
+    assert small()[0] == "ATEN"
+    assert platform.queries == [64, 16]
+    assert len(fake_compile) == 1, "buckets share one compiled forward"
+
+
+@pytest.mark.parametrize("overrides", [False, True])
+def test_compiled_submodule_forwards_take_overrides_for_any_token_count(
+    monkeypatch, on_platform, fake_compile, overrides,
+):
+    platform = on_platform(_EverythingOnAten() if overrides else CudaPlatform())
+    engine = Engine(graph_runtime=None, device_capability=SimpleNamespace(is_available=True))
+    engine._submodules = {
+        "node": SimpleNamespace(submodule=_Submodule(), forward=None, forward_batched=None),
+    }
+    engine._item_encoders = set()
+    engine._compile_submodules()
+    mgmt = engine._submodules["node"]
+    expected = "ATEN" if overrides else inductor_config.max_autotune_gemm_backends
+    assert mgmt.forward()[0] == expected
+    assert mgmt.forward_batched()[0] == expected
+    assert len(fake_compile) == 2
+    if overrides:
+        assert platform.queries == [None, None]
+    else:
+        assert isinstance(mgmt.forward, functools.partial)

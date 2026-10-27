@@ -85,8 +85,8 @@ def test_knob_reaches_both_models():
     from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
     from mstar.model.z_image.z_image_model import ZImageModel
 
-    klein = Flux2KleinModel(model_path_hf="x", compile=True, compile_exact_ops=True, cuda_graph=False)
-    z = ZImageModel(model_path_hf="x", compile=True, compile_exact_ops=True, cuda_graph=False)
+    klein = Flux2KleinModel(model_path_hf="x", compile=True, compile_exact_ops=True, accelerator_graph=False)
+    z = ZImageModel(model_path_hf="x", compile=True, compile_exact_ops=True, accelerator_graph=False)
     assert klein.compile_exact_ops is True and z.compile_exact_ops is True
     assert Flux2KleinModel(model_path_hf="x", compile_exact_ops=["norms"]).compile_exact_ops == ["norms"]
     assert Flux2KleinModel(model_path_hf="x").compile_exact_ops is False

@@ -586,6 +586,7 @@ def test_bagel_spans_come_from_one_tokenization(bagel):
 
 def test_qwen_schedule_walks_the_plan():
     """Qwen3-Omni prefills each attachment where it was written."""
+    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     model = Qwen3OmniModel.__new__(Qwen3OmniModel)
@@ -610,6 +611,7 @@ def test_qwen_schedule_walks_the_plan():
 
 def test_qwen_placeholder_ids_come_from_the_tokenizer():
     """Not from thinker_config, which disagrees with it on the checkpoint."""
+    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     vocab = {
@@ -629,6 +631,7 @@ def test_qwen_placeholder_ids_come_from_the_tokenizer():
 
 def test_a_modality_the_tokenizer_cannot_place_is_left_out():
     """A missing placeholder drops that modality rather than scanning for 0."""
+    pytest.importorskip("flashinfer")  # imported by Qwen3OmniModel's submodules
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
     vocab = {"<|image_pad|>": 5, "<|vision_start|>": 6, "<|vision_end|>": 7}
@@ -637,3 +640,103 @@ def test_a_modality_the_tokenizer_cannot_place_is_left_out():
         convert_tokens_to_ids=lambda t: vocab.get(t, 0), unk_token_id=0
     )
     assert set(Qwen3OmniModel._placeholder_specs(model)) == {"image"}
+
+
+# ── the layout Bagel keys an understanding prompt's KV by ───────────────
+# The layout has to match the walks exactly: the order the prefill schedule
+# runs them in, and each image's own file over the slots its ViT walk writes.
+# An image keyed by another image's file would be served that image's KV.
+
+PATCH_SIZE, MAX_PATCHES_PER_SIDE = 14, 70
+# Two images of different sizes, so a span sized or keyed by the wrong image fails the test.
+SIZES = [(480, 640), (1200, 1600)]
+
+
+def _laid_out(bagel, modalities: list[str], output_modalities=("text",), tensors=True, **kwargs):
+    """Return what Bagel's `process_prompt` gives for the text and images in ``modalities``, with the images."""
+    bagel.config.vit_config = SimpleNamespace(patch_size=PATCH_SIZE)
+    bagel.config.vit_max_num_patch_per_side = MAX_PATCHES_PER_SIDE
+    bagel.config.latent_downsample, bagel.config.max_latent_size = 16, 64
+    bagel.config.cfg_text_scale, bagel.config.cfg_img_scale, bagel.config.cfg_interval = 4.0, 1.0, [0.4, 1.0]
+    bagel.config.cfg_renorm_type, bagel.config.cfg_renorm_min = "global", 0.0
+    texts = iter(["what is", "in this picture", "and in this one"])
+    parts, images = [], []
+    for modality in modalities:
+        if modality == "text":
+            parts.append(PromptPart(modality="text", text=next(texts)))
+        else:
+            parts.append(PromptPart(modality="image", index=len(images)))
+            images.append(torch.rand(3, *SIZES[len(images)]))
+    output = bagel.process_prompt(
+        "\n".join(part.text for part in parts if part.text), modalities, list(output_modalities),
+        tensors={"image_inputs": images} if tensors else None, prompt_parts=parts, **kwargs,
+    )
+    return output, images
+
+
+def _vit_slots(image: torch.Tensor, image_preprocess: str) -> int:
+    """How many slots the ViT walk writes for ``image``: its patches and the two sentinels."""
+    from mstar.model.bagel.submodules import IMAGE_SENTINELS, ViTEncoderSubmodule
+
+    vit = ViTEncoderSubmodule(None, None, None, PATCH_SIZE, MAX_PATCHES_PER_SIDE)
+    return vit.prepare_inputs(
+        "prefill_vit", SimpleNamespace(step_metadata={"image_preprocess": image_preprocess}),
+        {"image_inputs": [image]},
+    ).kwargs["max_seqlen"] + IMAGE_SENTINELS
+
+
+_LAID_OUT = {
+    "one image": (["text", "image", "text"], "default"),
+    "two images": (["text", "image", "text", "image", "text"], "default"),
+    "image first": (["image", "text", "image"], "default"),
+    "vllm's square": (["text", "image", "text"], "vllm"),
+}
+
+
+@pytest.mark.parametrize(("modalities", "image_preprocess"), _LAID_OUT.values(), ids=_LAID_OUT.keys())
+def test_bagel_lays_each_image_out_in_schedule_order_by_its_own_file_over_its_vits_slots(
+    bagel, modalities, image_preprocess,
+):
+    output, images = _laid_out(bagel, modalities, image_preprocess=image_preprocess)
+    layout = output.metadata["kv_layout"]["kv"]["main"].spans
+    schedule = bagel._build_prefill_schedule(
+        input_modalities=modalities, is_understanding=True,
+        input_signals={"text_inputs": output.new_input_tensors["text_inputs"], "image_inputs": images},
+    )
+
+    spans = [span for span in layout if span.kind == "digest"]
+    assert [span.walk for span in layout] == [walk for walk, _ in schedule], (
+        "the layout names its writes in another order than the walks make them"
+    )
+    assert [span.source for span in spans] == [("image", index) for index in range(len(images))], (
+        "an image is keyed by another's file, so its pages are served for a "
+        "prompt that shows a different picture"
+    )
+    assert [span.length for span in spans] == [_vit_slots(image, image_preprocess) for image in images], (
+        "an image is sized by other slots than its ViT walk writes, so the walks after it lose their reuse"
+    )
+
+
+def test_bagel_keys_an_understood_image_and_otherwise_only_a_leading_text_span(bagel):
+    interleaved = ["text", "image", "text"]
+    cases = {
+        "understood with its image": (interleaved, ("text",)),
+        "text only": (["text"], ("text",)),
+        "generation": (interleaved, ("image",)),
+        "an edit led by its image": (["image", "text"], ("image",)),
+        # Text comes first, so the prompt is understood, but it also outputs an image, so its input is resized first.
+        "understood and edited": (interleaved, ("text", "image")),
+    }
+
+    keyed = {
+        name: _laid_out(bagel, *case)[0].metadata["kv_layout"]["kv"]["main"].keyed_spans
+        for name, case in cases.items()
+    }
+
+    assert keyed == {
+        "understood with its image": None, "text only": None, "generation": 1,
+        "an edit led by its image": 0, "understood and edited": 1,
+    }, "a prompt whose images are resized before their walks see them is keyed past its first text span"
+    assert isinstance(_laid_out(bagel, interleaved, tensors=False)[0], dict), (
+        "a prompt was laid out without the images that size it"
+    )

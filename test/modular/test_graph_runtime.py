@@ -167,6 +167,7 @@ def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
         graph_walk=walk,
         partition_worker_graph_ids=[wg_id],
         worker_graph_to_workers=ParallelList([wg_id], [[worker_id]]),
+        loop_caps={},
     )
     mgr.add_request(rid, fwd_info)
     return mgr, runtime, rid
@@ -428,9 +429,9 @@ def test_pending_loop_stops_are_recorded_and_live_one_iteration():
     )
     assert stopped_rids == [rid]
     assert runtime.has_pending_loop_stop(rid, walk, "ar_loop")
-    assert runtime.pending_loop_stop_rids(walk, "ar_loop") == {rid}
+    assert runtime.pending_loop_stop_rids([walk], "ar_loop") == {rid}
     # A different walk must not match.
-    assert runtime.pending_loop_stop_rids("other_walk", "ar_loop") == set()
+    assert runtime.pending_loop_stop_rids(["other_walk"], "ar_loop") == set()
 
     runtime.clear_pending_loop_stops()
     assert not runtime.has_pending_loop_stop(rid, walk, "ar_loop")
@@ -445,7 +446,7 @@ def test_stop_for_a_loop_not_in_the_walk_is_dropped():
         loop_names=ParallelList([rid], [["not_a_real_loop"]]),
     )
     assert stopped_rids == []
-    assert runtime.pending_loop_stop_rids(walk, "not_a_real_loop") == set()
+    assert runtime.pending_loop_stop_rids([walk], "not_a_real_loop") == set()
 
 
 def test_peer_loop_stop_compares_enclosing_loop_indices():
@@ -523,6 +524,7 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         request_id="rid_b", partition="default", graph_walk="decode",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker0"]]),
+        loop_caps={},
     )
     mgr.add_request(rid_b, _fwd_info("decode"))
     for rid in (rid_a, rid_b):
@@ -759,6 +761,10 @@ def test_an_unread_loop_back_is_not_routed():
     assert [e.name for e in routing.persist] == ["new_token"]
 
 
+def _spec_targets(runtime, node, walk, rid):
+    return runtime.speculate_node(node, [walk], [rid])
+
+
 # --- speculate_node -----------------------------------------------------------
 
 def test_speculate_node_finds_the_downstream_target():
@@ -770,7 +776,7 @@ def test_speculate_node_finds_the_downstream_target():
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
 
-    out = runtime.speculate_node("prefill", "decode", rid)
+    out = _spec_targets(runtime, "prefill", "decode", rid)
     assert [o.node_name for o in out] == ["ar_decode"]
     assert out[0].graph_walk == "decode"
 
@@ -784,7 +790,20 @@ def test_speculate_node_skips_a_target_that_opted_out_of_async():
     wgio = runtime._queues[0].per_request_queues[rid]
     wgio.nodes["ar_decode"].enable_async_scheduling = False
 
-    assert runtime.speculate_node("prefill", "decode", rid) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
+
+
+def test_speculate_node_skips_a_walk_whose_source_opted_out_of_async():
+    """Checked per walk, so a mixed batch can still speculate its other walks."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+    wgio = runtime._queues[0].per_request_queues[rid]
+    wgio.nodes["prefill"].enable_async_scheduling = False
+
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
 
 def test_speculate_node_refuses_a_parallel_target_without_tp_async():
@@ -802,7 +821,7 @@ def test_speculate_node_refuses_a_parallel_target_without_tp_async():
         parallel_leader_nodes={"ar_decode"},
         tp_async_nodes=set(),  # feature off
     )
-    assert runtime.speculate_node("prefill", "decode", rid) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
     # Even with TP async on, a TRANSITION into the parallel node is refused:
     # only a same-node loop-back qualifies.
@@ -811,7 +830,20 @@ def test_speculate_node_refuses_a_parallel_target_without_tp_async():
         parallel_leader_nodes={"ar_decode"},
         tp_async_nodes={"ar_decode"},
     )
-    assert runtime.speculate_node("prefill", "decode", rid) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
+
+
+def test_speculate_node_returns_every_walks_targets():
+    """A walk whose sample rid has no target adds nothing; each target names
+    its walk, and the caller picks."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+
+    out = runtime.speculate_node("prefill", ["decode", "decode"], [rid + 999, rid])
+    assert [(o.node_name, o.graph_walk) for o in out] == [("ar_decode", "decode")]
 
 
 def test_speculate_node_returns_nothing_for_an_unknown_rid():
@@ -819,7 +851,7 @@ def test_speculate_node_returns_nothing_for_an_unknown_rid():
         _make_ar_walk_graph(), 0, "decode",
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
-    assert runtime.speculate_node("prefill", "decode", rid + 999) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid + 999) == []
 
 
 # --- prep_spec_rids -----------------------------------------------------------
@@ -981,6 +1013,7 @@ def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset()):
         request_id="r", partition="default", graph_walk="w",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+        loop_caps={},
     )
     tm.register_request(rid, runtime.get_sharding_config(rid))
     return tm, runtime, rid

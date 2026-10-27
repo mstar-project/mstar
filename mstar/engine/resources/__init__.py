@@ -22,6 +22,7 @@ from mstar.engine.resources.attn.config import (
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
+    RaggedAttnBackend,
     RaggedBlockCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
@@ -48,6 +49,7 @@ from mstar.engine.resources.position.config import (
 )
 from mstar.engine.resources.runner import StepRunner, topo_sort
 from mstar.engine.resources.sampler.config import (
+    LoopbackState,
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
@@ -103,6 +105,7 @@ __all__ = [
     "PublishedInfo",
     "RaggedAttentionConfig",
     "RaggedAttentionSpec",
+    "RaggedAttnBackend",
     "RaggedBlockCausalAttentionSpec",
     "RaggedCrossAttentionSpec",
     "RaggedCrossAttentionStep",
@@ -112,6 +115,7 @@ __all__ = [
     "RingKVConfig",
     "RingKVLayerConfig",
     "RingKVStep",
+    "LoopbackState",
     "SamplerSpec",
     "SamplerStep",
     "SamplingReqConfig",

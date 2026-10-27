@@ -7,10 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_nemotron_duplex_codec import tiny_codec
+from test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep
+from mstar.engine.resources.recurrent import RecurrentStep
 from mstar.model.nemotron_duplex.components.eartts_talker import _rand_rows, maskgit_schedule
 from mstar.model.nemotron_duplex.config import (
+    CODEC_STATE,
     TALKER_ATTN,
     TALKER_CFG_LABEL,
     TALKER_KV,
@@ -18,7 +22,6 @@ from mstar.model.nemotron_duplex.config import (
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
-from test.modular.test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
 P = 37   # speaker warm-up positions
 
@@ -31,7 +34,7 @@ def fwd(handle: str) -> SimpleNamespace:
 def make_sub() -> EarTTSTalkerSubmodule:
     cfg = NemotronDuplexConfig()
     cfg.eartts = TINY
-    return EarTTSTalkerSubmodule(make_talker(), cfg, subword_to_char=S2C, char_pad_idx=CHAR_PAD)
+    return EarTTSTalkerSubmodule(make_talker(), cfg, codec=tiny_codec(), subword_to_char=S2C, char_pad_idx=CHAR_PAD)
 
 
 def test_maskgit_schedule_matches_the_reference_formula():
@@ -88,13 +91,46 @@ def test_pre_drawn_noise_reproduces_generator_sampling():
 
 
 def test_empty_chunk_runs_a_pad_frame():
-    """A very short clip ends the token stream on an empty chunk. The talker runs
-    a PAD frame rather than raising or skipping: either drops the rid from its
-    stream-ended loop, and the worker's stop then fails the whole batch."""
+    """The token stream ends on an empty chunk when its last token was taken
+    before its end arrived. The talker runs a PAD frame rather than raising or
+    skipping: either drops the rid from its stream-ended loop, and the worker's
+    stop then fails the whole batch."""
     sub = make_sub()
     for inputs in ({"new_token": []}, {}):
         out = sub.prepare_inputs("talker_decode", fwd("a"), inputs, is_final_stream_chunk=True)
         assert out.input_ids.tolist() == [sub.config.text_pad_id] and out.kwargs["first"] is True
+
+
+@pytest.mark.parametrize("first", [False, True])
+@pytest.mark.parametrize("final,token", [(True, False), (True, True), (False, False)])
+def test_each_step_emits_its_frame_and_the_last_the_calls_right_edge(final, token, first):
+    """A step emits its frame's final samples, a call's first frame less the
+    overlap-add's trimmed left edge. The PAD frame of the empty final chunk
+    only ends the loop (one audio frame per text token, as offline): it emits
+    the call's right edge as it stood before that frame, nothing for a call
+    with no frame. A final chunk carrying a token emits its frame and the edge
+    after it."""
+    sub = make_sub()
+    edge = sub.codec.stream_edge
+    if not first:
+        sub.request_state("a").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
+    inputs = {"new_token": [torch.tensor([5])] if token else []}
+    ni = sub.prepare_inputs("talker_decode", fwd("a"), inputs, is_final_stream_chunk=final)
+    frame = torch.arange(100, dtype=torch.int16).view(1, -1)
+    end = torch.arange(-1, -2 * edge - 1, -1, dtype=torch.int16).view(1, -1)        # before | after
+    out = {"codec_tokens": [torch.arange(TINY.num_quantizers)], "audio_chunk": [frame], "audio_end": [end]}
+    sub.postprocess("a", None, out, inputs=ni)
+    if final and not token:
+        assert set(out) == ({"audio_chunk"} if not first else set())
+        if not first:
+            assert torch.equal(out["audio_chunk"][0], end[..., :edge])
+        return
+    want = frame[..., edge:] if first else frame
+    if final:
+        want = torch.cat([want, end[..., edge:]], dim=-1)
+    assert torch.equal(out["audio_chunk"][0], want)
+    if not (first or final):
+        assert out["audio_chunk"][0] is frame                  # the engine's row view, untouched
 
 
 def test_step_declares_both_streams_in_one_combined_plan():
@@ -106,7 +142,11 @@ def test_step_declares_both_streams_in_one_combined_plan():
     assert first.input_seq_len == P + 1 and first.kwargs["first"] is True
     assert later.input_seq_len == 1 and later.kwargs["first"] is False
     step = sub.declare_step("talker_decode", ["a", "b"], [first, later])
-    assert set(step.keys()) == {TALKER_KV, TALKER_ATTN, TALKER_POS}
+    assert set(step.keys()) == {TALKER_KV, TALKER_ATTN, TALKER_POS, CODEC_STATE}
+    # one decoded frame per session, in its own codec stream slot
+    codec = step.get(CODEC_STATE)
+    assert isinstance(codec, RecurrentStep)
+    assert [(s.request_id, s.label, s.span) for s in codec.segments] == [("a", "main", 1), ("b", "main", 1)]
     kv = step.get(TALKER_KV)
     assert isinstance(kv, KVStep) and kv.combined_labels == {("main", "uncond"): TALKER_CFG_LABEL}
     assert isinstance(step.get(TALKER_ATTN), AttentionStep) and step.get(TALKER_ATTN).causal
@@ -141,7 +181,7 @@ def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
 
 def test_decode_capture_config_commits_two_labels_per_row():
     sub = make_sub()
-    cfgs = sub.get_cuda_graph_configs(torch.device("cpu"))
+    cfgs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert len(cfgs) == 1 and cfgs[0].capture_graph_walk == "talker_decode"
     assert cfgs[0].total_tokens_multiplier == 2 and cfgs[0].compile is False
     assert cfgs[0].single_request_inputs.input_seq_len == 1
@@ -215,5 +255,5 @@ def test_warmup_steps_run_eager_and_steady_state_steps_hit_the_decode_capture():
     assert sub.declare_step("talker_decode", ["a", "b"], [first, later]).cg_key_info is None
     assert sub.cg_key_info("talker_decode", {"b": infos["b"]}) == sub.DECODE_KEY
     assert sub.declare_step("talker_decode", ["b"], [later]).cg_key_info == sub.DECODE_KEY
-    (cfg,) = sub.get_cuda_graph_configs(torch.device("cpu"))
+    (cfg,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert cfg.additional_key_info == sub.DECODE_KEY

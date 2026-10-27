@@ -26,10 +26,32 @@ class HostRows(NamedTuple):
     request_ids: tuple
     buffers: dict[str, torch.Tensor]
 
+    def first_values(self, name: str, request_ids: Sequence[str]):
+        """``(rid, value)`` for each of ``request_ids`` that has a row, where
+        ``value`` is the first element of its row of buffer ``name``, off one
+        ``tolist``; None when the step staged no such buffer. A request with
+        no row is skipped, as the per-request stop path skips a request with
+        no output."""
+        buffer = self.buffers.get(name)
+        if not torch.is_tensor(buffer) or buffer.dim() == 0:
+            return None
+        values = buffer.reshape(buffer.shape[0], -1)[:, 0].tolist()
+        rows = self.request_ids
+        if len(rows) >= len(request_ids) and all(
+            a == b for a, b in zip(request_ids, rows, strict=False)
+        ):
+            # the common case: the batch in forward order, no row map needed
+            return zip(request_ids, values, strict=False)
+        row_of = {rid: i for i, rid in enumerate(rows)}
+        return (
+            (rid, values[i]) for rid in request_ids
+            if (i := row_of.get(rid)) is not None and i < len(values)
+        )
+
 
 if TYPE_CHECKING:
-    from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
-    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+    from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
+    from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
@@ -92,6 +114,9 @@ class BatchedModelOutput:
     # No per-rid entries were built: every output signal of the step stays on
     # the device (see ``ExecutingBatch.rows_only``). Readers use the rows.
     rows_only: bool = False
+    # A mixed step's rows whose own walk keeps every output signal on the
+    # device (see ``ExecutingBatch.loopback_rids``)
+    loopback_rids: frozenset = frozenset()
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
@@ -213,6 +238,9 @@ class NodeInputs:
     # capture bucket and to size padding, and a step declares its spans from
     # it. 0 for a submodule whose inputs aren't sequence-shaped.
     input_seq_len: int = 0
+
+    # The request's real walk, stamped by the engine; None on capture templates
+    graph_walk: str | None = None
 
     def clone(self):
         """Copy with tensors cloned, so a capture template can be reused.
@@ -435,7 +463,7 @@ class ModelInputsFromEngine:
     # by the engine, spread in at execute time (like ``cache_manager`` /
     # ``sampler``). Empty when the submodule opts into no piecewise graphs or
     # capture failed. See ``NodeSubmodule.get_piecewise_cuda_graph_configs``.
-    piecewise_runners: dict[str, "PiecewiseCudaGraphRunner"] = field(default_factory=dict)
+    piecewise_runners: dict[str, "PiecewiseAcceleratorGraphRunner"] = field(default_factory=dict)
 
     # The batch's per-request states, injected by the engine (None on paths
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
@@ -457,6 +485,13 @@ class ModelInputsFromEngine:
     # dim) reads it here. The forward method itself is chosen by the config's
     # ``capture_forward_method``, so most submodules never need this.
     captured: bool = False
+
+    # Every row is a dummy request (CUDA-graph capture or warmup), not real traffic.
+    synthetic: bool = False
+
+    # Real requests' token count; they lead the batch, later rows are replay padding.
+    # None: no padding.
+    real_seq_len: int | None = None
 
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
@@ -494,6 +529,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # params to the autocast dtype nor wraps its forward (or capture) in
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
+
+    # Float32 math for this node's forward, where the process default (TF32
+    # matmuls and cuDNN, see ``mstar.engine.apply_torch_config``) is too coarse:
+    # "highest" runs fp32 matmuls in full fp32, and ``cudnn_allow_tf32 = False``
+    # does the same for cuDNN convolutions and RNNs. None keeps the default. The
+    # engine applies them around the forward, its compile and its capture (see
+    # ``mstar.engine.fp32_precision``); don't flip the process-wide flags here.
+    # Read once, when the engine loads the submodule.
+    float32_matmul_precision: str | None = None
+    cudnn_allow_tf32: bool | None = None
 
     # Set True on a submodule whose decode walk may read its last sampled
     # tokens back off the sampler's slot masters (``device_loopback_signals``).
@@ -578,7 +623,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return state
 
     def get_device(self):
-        return next(self.parameters()).device
+        # Cached rather than read off ``parameters()``, which walks the module
+        # tree; ``_apply`` (to / cuda / to_empty) drops it, so a moved module
+        # reports its new device.
+        device = self.__dict__.get("_cached_device")
+        if device is None:
+            device = self.__dict__["_cached_device"] = next(self.parameters()).device
+        return device
+
+    def _apply(self, fn, recurse=True):
+        self.__dict__.pop("_cached_device", None)
+        return super()._apply(fn, recurse)
 
     @abstractmethod
     def prepare_inputs(
@@ -774,6 +829,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def max_rows_in_combined(self, graph_walk: str) -> int | None:
+        """How many rows of this real walk a step mixing it with another walk
+        of its combined walk may hold; None is uncapped. For a backend whose
+        mixed step runs the walk's rows on a path sized to a few of them."""
+        del graph_walk
+        return None
+
     def get_autocast_dtype(self) -> torch.dtype | None:
         """Per-submodule autocast dtype override for the engine's forward
         wrap. The engine consults this on each ``execute_batch`` and uses
@@ -788,12 +850,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return None
 
     # Note: do not import CudaGraphConfig; it causes a circular import situation
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1
+    ) -> list[AcceleratorGraphConfig]:
         return []
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Return the piecewise CUDA graph configs this submodule opts into.
 
         ``autocast_dtype`` is the engine's autocast dtype — passed so a config's
@@ -825,9 +889,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return {}
 
-    def can_use_cuda_graphs(
-        self, batch: ExecutingBatch,
-        model_inputs: list[NodeInputs]
+    def can_use_accelerator_graphs(
+        self,
+        batch: ExecutingBatch,
+        model_inputs: list[NodeInputs],
     ) -> bool:
         """Return True if this submodule supports CUDA graphs for ``batch``.
 
@@ -849,12 +914,18 @@ class NodeSubmodule(torch.nn.Module, ABC):
         Subclasses can override to reject on batch shape / metadata (e.g.
         codec submodules that need homogeneous frame counts).
         """
-        if not hasattr(self, "_cached_cuda_graph_walks"):
+        if not hasattr(self, "_cached_accelerator_graph_walks"):
+            device = next(
+                (tensor.device for tensor in self.parameters()),
+                torch.device("cpu"),
+            )
             walks: set[str] = set()
-            for cfg in self.get_cuda_graph_configs(device=torch.device("cpu"), tp_world_size=1):
+            for cfg in self.get_accelerator_graph_configs(
+                device=device, tp_world_size=1
+            ):
                 walks.update(cfg.replay_graph_walks)
-            self._cached_cuda_graph_walks = walks
-        return batch.graph_walk in self._cached_cuda_graph_walks
+            self._cached_accelerator_graph_walks = walks
+        return batch.graph_walk in self._cached_accelerator_graph_walks
 
     def postprocess(
         self, request_id: str,
@@ -895,10 +966,20 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self, outputs: BatchedModelOutput,
         request_infos: dict[int, CurrentForwardPassInfo],
         inputs: list[NodeInputs],
+        piecewise_runners: Mapping[str, PiecewiseAcceleratorGraphRunner] | None = None,
     ) -> None:
-        """``postprocess`` for a rows-only step, which has no per-request
-        outputs: works on the rows of ``outputs`` in place. Optional; only
-        called when overridden."""
+        """Once per step, for work that batches across the step's requests
+        (e.g. watermarking the audio chunks ``postprocess`` trimmed). Works on
+        ``outputs`` in place: its rows on a rows-only step, which has no
+        per-request outputs, and otherwise the per-request outputs after
+        every request's ``postprocess``, for the requests whose
+        ``postprocess`` succeeded (``request_infos``' keys, in the order of
+        ``inputs``); a raise then fails every one of them. Optional; only
+        called when overridden.
+
+        ``piecewise_runners`` are this node's captured regions
+        (``get_piecewise_accelerator_graph_configs``), as ``engine_inputs`` hands
+        them to the forward, so this work can replay a capture too."""
 
     def check_stop(
         self, request_id: str,
@@ -927,12 +1008,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self, request_ids: list[str],
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
+        step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
         """``check_stop`` for the whole batch at once, off the host rows.
 
         Optional. Returns rid -> loops to stop (rids with none left out), and
         must agree with ``check_stop`` for every rid. None, or a raise, falls
-        back to the per-request path.
+        back to the per-request path. ``step_walk`` is the walk every row ran,
+        or None when the step mixes walks (each row's is on its info).
         """
         return None
 
@@ -1007,5 +1090,3 @@ class ARNodeSubmodule(NodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
         pass
-
-
