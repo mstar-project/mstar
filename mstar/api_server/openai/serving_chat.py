@@ -10,12 +10,12 @@ reply into ``content``, ``reasoning_content`` and ``tool_calls``.
 from __future__ import annotations
 
 import base64
-import codecs
 
 from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.utils.utf8_stream import Utf8Stream
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
@@ -145,7 +145,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate, parser=No
     role = {"role": "assistant"}
     failed = False
     # a byte-level BPE token's bytes can end inside a character: hold them
-    text = codecs.getincrementaldecoder("utf-8")("replace")
+    text = Utf8Stream()
     usage = _Usage()
     try:
         # One yield per batch of text chunks: the tokens a request had waiting
@@ -157,7 +157,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate, parser=No
             for c in batch:
                 if c.modality == "text":
                     usage.add(c)
-                    content = text.decode(c.data)
+                    content = text.feed(c.data)
                     if not content:
                         continue
                     deltas = [{"content": content}] if parser is None else parser.feed(content)
@@ -195,7 +195,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate, parser=No
         failed = True
         yield error(str(exc.detail), exc.status_code)
     if not failed:
-        tail = text.decode(b"", final=True)
+        tail = text.flush()
         if parser is None:
             yield chunk({**role, "content": tail} if tail else role, finish=usage.finish_reason(None))
         else:
