@@ -115,6 +115,9 @@ def test_failed_settle_after_success_returns_nothing():
     worker = SimpleNamespace(
         _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
         _graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
+        engine_manager=SimpleNamespace(
+            get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
+        ),
     )
     spec = _speculation(["keep"])
     spec.spec_id = 5

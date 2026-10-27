@@ -512,6 +512,11 @@ class SendInput(NamedTuple):
     profiling: ParallelList[int, Profiling] | None = None
     # Only metadata produced by this worker since its last completion.
     resource_publish_info: ParallelList[int, dict[str, PublishedInfo]] | None = None
+    # Rids that failed after routing (their outputs could not be registered
+    # for send): nothing of theirs leaves -- no peer edges, client emits,
+    # persist signals or WORKER_GRAPHS_DONE. The worker has already failed
+    # them, so the conductor tears them down.
+    failed_rids: frozenset[int] = frozenset()
 
 
 class GraphRuntime(ABC):
@@ -542,10 +547,12 @@ class GraphRuntime(ABC):
         partition: str,
         graph_walk: str,
         partition_worker_graph_ids: list[int],
-        worker_graph_to_workers: ParallelList[int, list[str]]
+        worker_graph_to_workers: ParallelList[int, list[str]],
+        loop_caps: Mapping[str, int],
     ) -> int:
         """
-        Returns the integer handle for this request.
+        Returns the integer handle for this request. Each loop named in
+        ``loop_caps`` runs at most that many iterations for it.
         """
         pass
 

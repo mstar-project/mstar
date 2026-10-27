@@ -242,7 +242,7 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
     out = model.process_prompt(
         None, ["audio"], ["audio", "text"],
         tensors={"audio_inputs": [torch.zeros(16000)]},
-    )
+    ).new_input_tensors
     assert "audio_in" in out                     # an uploaded clip is the stream's first chunk
     assert int(out["prev_text"][0].item()) == model.config.text_bos_id
     assert int(out["prev_func"][0].item()) == model.config.text_pad_id
@@ -253,7 +253,7 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
     out_p = model.process_prompt(
         "You are NVIDIA Voice Chat.", ["audio", "text"], ["audio", "text"],
         tensors={"audio_inputs": [torch.zeros(16000)]},
-    )
+    ).new_input_tensors
     assert int(out_p["prev_text"][0].item()) == model.config.text_pad_id
     assert out_p["text_inputs"][0].tolist() == [5, 6, 7] and "has_prompt" in out_p
 
@@ -265,11 +265,13 @@ def test_duplex_process_prompt_leaves_the_session_cap_to_audio_in():
     uploaded sample to, refuses them."""
     model = _make_model()
     sr = model.config.stt.sample_rate
-    out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(320)]})
+    out = model.process_prompt(
+        None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(320)]},
+    ).new_input_tensors
     assert out["audio_in"][0].numel() == 320
     half = int(model.max_session_s * sr / 2) + 1
     out = model.process_prompt(None, ["audio"], ["audio", "text"],
-                               tensors={"audio_inputs": [torch.zeros(half), torch.zeros(half)]})
+                               tensors={"audio_inputs": [torch.zeros(half), torch.zeros(half)]}).new_input_tensors
     limits = client_stream_limits(model.get_partition_topology(), None)["audio_in"]
     assert sum(limits.item_size(w) for w in out["audio_in"]) > limits.max_items
 
@@ -282,7 +284,7 @@ def test_duplex_process_prompt_rejects_bad_requests():
     ok = {"audio_inputs": [torch.zeros(16000)]}
     model._tokenizer = lambda prompt, return_tensors: SimpleNamespace(input_ids=torch.tensor([[5, 6, 7]]))
     for tensors in (None, {}, {"audio_inputs": []}):
-        out = model.process_prompt("hi", ["text"], ["audio", "text"], tensors=tensors)
+        out = model.process_prompt("hi", ["text"], ["audio", "text"], tensors=tensors).new_input_tensors
         assert "audio_in" not in out and out["text_inputs"][0].tolist() == [5, 6, 7]
     for bad in (float("nan"), float("inf"), -float("inf")):
         wav = torch.zeros(16000)
@@ -301,10 +303,12 @@ def test_duplex_process_prompt_scales_down_over_full_scale_audio():
     peak is brought back to 1.0. Audio within full scale is left untouched."""
     model = _make_model()
     wav = torch.sin(torch.arange(16000) / 10.0)
-    out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [wav * 1e6]})
+    out = model.process_prompt(
+        None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [wav * 1e6]},
+    ).new_input_tensors
     assert torch.allclose(out["audio_in"][0], wav, atol=1e-6)
     quiet = wav * 0.5
-    out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [quiet]})
+    out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [quiet]}).new_input_tensors
     assert torch.equal(out["audio_in"][0], quiet)
 
 
@@ -314,7 +318,7 @@ def test_duplex_process_prompt_scales_a_multi_file_upload_as_one():
     model = _make_model()
     wav = torch.sin(torch.arange(16000) / 10.0)
     out = model.process_prompt(None, ["audio"], ["audio", "text"],
-                               tensors={"audio_inputs": [wav * 4.0, wav * 0.5]})["audio_in"]
+                               tensors={"audio_inputs": [wav * 4.0, wav * 0.5]}).new_input_tensors["audio_in"]
     assert torch.allclose(torch.cat(out), torch.cat([wav, wav / 8.0]), atol=1e-6)
 
 
@@ -373,7 +377,9 @@ def test_duplex_an_upload_or_append_is_one_stream_item():
     model = _make_model()
     long = torch.rand(20 * model.config.stt.sample_rate + 777) - 0.5
     for items in (
-        model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [long]})["audio_in"],
+        model.process_prompt(
+            None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [long]},
+        ).new_input_tensors["audio_in"],
         model.process_stream_chunk(_append({"audio_inputs": [long]}, {"audio_inputs": [{}]}))["audio_in"],
     ):
         assert len(items) == 1 and torch.equal(items[0], long)

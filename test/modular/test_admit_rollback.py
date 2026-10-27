@@ -20,8 +20,11 @@ import torch
 from mstar.engine.engine import Engine, ExecutingBatch, SubmoduleManagement
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
-from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
+from mstar.engine.resources.kv.manager import KVManager, PageArena
+from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
     RecurrentStateConfig,
@@ -60,28 +63,24 @@ class _StubTransfer:
         pass
 
 
-class _HostPoolStub:
+class _HostPoolStub(CPUPagePool):
     """Stands in for the pinned host pool (pinning needs a GPU). Every copy
     succeeds, so ``offload`` is gated only by the manager's own claim."""
 
     def __init__(self):
-        self.offloaded: dict = {}
+        self.arena = PageArena(kv_cache=None, allocator=PageAllocator(64))
+        self.index = PrefixIndex(self.arena)
+        self.offloaded = {}
+        self._refused_logged_at = None
+        self._refused_unlogged = 0
+        self.dropped = 0
+        self._dropped_logged_at = None
 
-    def is_offloaded(self, rid):
-        return rid in self.offloaded
-
-    def offload_stream(self, rid, label, **kwargs):
-        self.offloaded.setdefault(rid, {})[label] = kwargs
-        return True
+    def copy_out(self, gpu_kv_cache, copies):
+        pass
 
     def sync(self):
         pass
-
-    def discard(self, rid, label):
-        self.offloaded.get(rid, {}).pop(label, None)
-
-    def remove_request(self, rid):
-        self.offloaded.pop(rid, None)
 
 
 @pytest.fixture(autouse=True)
@@ -153,8 +152,14 @@ def _whisper():
     for mgr in (cross, selfkv):
         mgr.ingest_request("a", None)
     assert _drive(runner, _whisper_step(2 * PAGE, PAGE), _ctx("a")).ok
-    # a decode step needing more self-attention pages than exist
-    outcome = _drive(runner, _whisper_step(0, 5 * PAGE), _ctx("a"))
+    # "b" holds the other two self-attention pages, so a's next page fits the
+    # pool but not what is free: a retryable refusal, not a terminal one
+    selfkv.ingest_request("b", None)
+    b_step, b_ctx = _kv_step("b", 2 * PAGE), _ctx("b")
+    assert selfkv.admit(b_step, b_ctx).ok
+    selfkv.plan(b_step, b_ctx)
+    selfkv.commit(b_step, b_ctx)
+    outcome = _drive(runner, _whisper_step(0, PAGE), _ctx("a"))
     assert not outcome.ok and isinstance(outcome.reason, AllocationFailed)
     assert outcome.failed_resource == "kv_cache"
     return cross, selfkv

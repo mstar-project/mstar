@@ -418,6 +418,23 @@ class HiggsAudio(Model):
         }
 
 
+class _FastConformerAsr(Model):
+    """NVIDIA's FastConformer speech recognizers: audio in, a transcript out, greedy."""
+
+    def get_supported_modalities(self):
+        return {RequestType.A2T}
+
+
+class Canary(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/canary-1b-v2"
+
+
+class CanaryQwen(_FastConformerAsr):
+    def get_hf_url(self):
+        return "nvidia/canary-qwen-2.5b"
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
@@ -431,6 +448,8 @@ class ModelType(Enum):
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
+    CANARY = "canary"
+    CANARY_QWEN = "canary_qwen"
     QWEN3_5 = "qwen3.5"
     QWEN3_8 = "qwen3.8"
 
@@ -459,6 +478,10 @@ class ModelType(Enum):
             return WhisperLarge(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
+        if self == ModelType.CANARY:
+            return Canary(**kwargs)
+        if self == ModelType.CANARY_QWEN:
+            return CanaryQwen(**kwargs)
         if self == ModelType.QWEN3_5:
             return Qwen3_5_Dense(**kwargs)
         if self == ModelType.QWEN3_8:

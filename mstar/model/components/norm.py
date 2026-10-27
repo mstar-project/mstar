@@ -1,4 +1,4 @@
-"""RMSNorm and AdaRMSNorm.
+"""RMSNorm, AdaRMSNorm and a bias-free LayerNorm.
 
 ``RMSNorm`` supports both the standard Llama-style normalization
 (``normed * weight``) and Gemma's variant (``normed * (1 + weight)``)
@@ -10,6 +10,9 @@ that matches Hugging Face Gemma exactly.
 condition vector). Used by pi05's action expert flow-matching path; the
 output is consumed by ``GatedDecoderLayer`` rather than a plain residual
 add.
+
+``BiasFreeLayerNorm`` is Cohere's LayerNorm (Command A+), with a fused
+residual add + norm kernel for CUDA.
 """
 from __future__ import annotations
 
@@ -167,3 +170,32 @@ class AdaRMSNorm(nn.Module):
         gate = modulation[:, 2 * H:]
 
         return adarms_norm_fused(x_flat, scale, shift, gate, self.variance_epsilon)
+
+
+class BiasFreeLayerNorm(nn.Module):
+    """LayerNorm with FP32 statistics, a learned scale and no bias."""
+
+    def __init__(self, hidden_size: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        centered = x - x.mean(dim=-1, keepdim=True)
+        variance = centered.square().mean(dim=-1, keepdim=True)
+        normalized = centered * torch.rsqrt(variance + self.eps)
+        return (self.weight.float() * normalized).to(input_dtype)
+
+    def add_forward(
+        self, residual: torch.Tensor, delta: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(h, self(h))`` for ``h = residual + delta`` in the input dtype, or
+        ``h = residual`` when ``delta`` is None; one Triton kernel on CUDA."""
+        if not residual.is_cuda:
+            h = residual if delta is None else residual + delta
+            return h, self(h)
+        from mstar.utils.add_layernorm import add_layernorm
+
+        return add_layernorm(residual, delta, self.weight, self.eps)
