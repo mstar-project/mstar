@@ -946,7 +946,7 @@ def _stream_engine():
 def _chunk(num_items):
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
-    return StreamChunkInfo(start_offset=0, context_items=0, num_items=num_items, is_final=False)
+    return StreamChunkInfo(start_offset=0, context_items=0, num_items=num_items, is_final=False, chunk_index=0)
 
 
 def test_capture_group_hands_the_stream_chunk_to_cg_key_info():

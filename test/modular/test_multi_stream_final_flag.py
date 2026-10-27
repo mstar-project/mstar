@@ -72,7 +72,7 @@ def _final_edge(name):
             next_node=TOPOLOGY[name][0], name=name, is_streaming=True,
             _final_stream_chunk=True,
         ),
-        StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=True),
+        StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=True, chunk_index=0),
     )
 
 

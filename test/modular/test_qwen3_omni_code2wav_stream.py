@@ -253,7 +253,7 @@ def test_a_stream_of_only_codec_eos_ends_with_an_empty_chunk(monkeypatch):
     steps, forwards = _stream_batched(submodule, {"r": streamed_frames})
 
     ((info, audio, decoded),) = steps["r"]
-    assert info == StreamChunkInfo(0, 0, 0, True)
+    assert info == StreamChunkInfo(0, 0, 0, True, 0)
     assert forwards == decoder.calls == 0
     assert not decoded and audio.numel() == 0
 

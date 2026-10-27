@@ -354,7 +354,7 @@ def test_a_stream_of_only_im_end_ends_with_an_empty_chunk(config, decoder, monke
     steps, decodes = run_streams(submodule, {"r": stream_codes(0)})
 
     ((info, audio),) = steps["r"]
-    assert info == StreamChunkInfo(0, 0, 0, True)
+    assert info == StreamChunkInfo(0, 0, 0, True, 0)
     assert audio.numel() == 0 and decodes == 0
 
 
@@ -379,7 +379,7 @@ def test_codec_preprocess_stages_window_geometry_as_the_per_column_copies_did(co
             SimpleNamespace(request_id=str(i), rid_handle=i),
             {"codec_tokens": [stream_codes(frames, eos=False)]},
             input_metadata=InputMetadata(
-                stream_chunks={"codec_tokens": StreamChunkInfo(start, context, frames, is_final=False)}
+                stream_chunks={"codec_tokens": StreamChunkInfo(start, context, frames, is_final=False, chunk_index=0)}
             ),
         )
         for i, (start, context, frames) in enumerate(windows)

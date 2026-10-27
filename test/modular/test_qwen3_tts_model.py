@@ -1485,7 +1485,9 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
     fwd_info = SimpleNamespace(request_id="request", rid_handle="request")
 
     def prepare(codes, context):
-        chunk = StreamChunkInfo(start_offset=0, context_items=context, num_items=codes.shape[0], is_final=False)
+        chunk = StreamChunkInfo(
+            start_offset=0, context_items=context, num_items=codes.shape[0], is_final=False, chunk_index=0,
+        )
         return submodule.prepare_inputs(
             "codec_chunk", fwd_info, {"codec_tokens": [codes]},
             input_metadata=InputMetadata(stream_chunks={"codec_tokens": chunk}),
@@ -1723,7 +1725,7 @@ def test_qwen3_tts_codec_conv_stack_decodes_only_the_new_frames_tail():
     prepared = [
         submodule.prepare_inputs(
             "codec_chunk", SimpleNamespace(request_id=rid, rid_handle=rid), {"codec_tokens": [codes[rid]]},
-            input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(0, context, frames, False)}),
+            input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(0, context, frames, False, 0)}),
         )
         for rid, (context, frames) in windows.items()
     ]
@@ -1870,7 +1872,7 @@ def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape()
         SimpleNamespace(request_id="request", rid_handle="request"),
         {"codec_tokens": [codes]},
         input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
-            start_offset=1, context_items=1, num_items=3, is_final=True,
+            start_offset=1, context_items=1, num_items=3, is_final=True, chunk_index=0,
         )}),
     )
 
@@ -1883,7 +1885,7 @@ def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape()
     assert prepared.kwargs == {"frames": 3, "context": 1, "conv_start": 0, "is_final": True}
     assert submodule.request_state("request")["codec_bucket"] == 4
     assert submodule.cg_key_info("codec_chunk", {"request": None}, {
-        "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True)}),
+        "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True, 0)}),
     }) == 4
 
     # A single frame lands in the first ramp bucket; too many frames is an error.
@@ -2007,7 +2009,7 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
     # the ramp's new frames per window: 1, 3, then 3 a window
     assert declined == (final_samples == 0) == (num_frames in (0, 1, 4, 7))
     if num_frames == 0:
-        assert windows == [(StreamChunkInfo(0, 0, 0, True), 0)]
+        assert windows == [(StreamChunkInfo(0, 0, 0, True, 0), 0)]
 
 
 def test_qwen3_tts_codec_batches_and_declares_accelerator_graphs():
@@ -2050,7 +2052,7 @@ def test_qwen3_tts_codec_batches_and_declares_accelerator_graphs():
     # stream chunk info when present (before prepare_inputs), else off the state.
     def chunks(num_items):
         return InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
-            start_offset=0, context_items=0, num_items=num_items, is_final=False,
+            start_offset=0, context_items=0, num_items=num_items, is_final=False, chunk_index=0,
         )})
 
     infos = {"a": None, "b": None}
