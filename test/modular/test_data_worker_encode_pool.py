@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState, encode_workers
+from mstar.model.components.diffusion.image_io import png_workers
 from mstar.streaming.topology import PartitionTopology
 
 
@@ -127,9 +128,12 @@ def _pass_until(wt, n: int, timeout_s: float = 5.0) -> list:
     return chunks
 
 
-@pytest.mark.parametrize(("cpus", "workers"), [(1, 1), (8, 1), (16, 2), (40, 4), (256, 4)])
+@pytest.mark.parametrize(
+    ("cpus", "workers"), [(1, 1), (4, 1), (7, 1), (8, 1), (15, 1), (16, 2), (24, 3), (32, 4), (40, 4), (256, 4)],
+)
 def test_the_pool_times_a_pngs_own_threads_fits_the_cpus(cpus, workers):
     assert encode_workers(cpus) == workers
+    assert encode_workers(cpus) * png_workers(cpus) <= cpus
 
 
 def test_an_image_is_encoded_off_the_thread_and_released_when_done(worker):

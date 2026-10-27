@@ -86,7 +86,7 @@ POOLED_OUTPUT_MODALITIES = frozenset({"image"})
 
 def encode_workers(cpus: int | None = None) -> int:
     """Outputs encoded at once. A PNG deflates on up to 8 threads of its own
-    (``image_io.PNG_WORKERS``), so the pool times that stays within the CPUs
+    (``image_io.png_workers``), so the pool times that stays within the CPUs
     the process may use."""
     if cpus is None:
         cpus = usable_cpus()
