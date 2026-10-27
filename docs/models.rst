@@ -700,10 +700,15 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   without egress.
 - Inputs are user-only 16 kHz mono audio plus an optional system prompt (the
   request's text, primed before the first frame exactly as the reference
-  does): one clip uploaded with the request, or a live call over
+  does): one clip uploaded with the request, a live call over
   ``/generate/ws``, ``append`` messages until ``end_input`` (see
   :doc:`clients`; a one-shot request over the socket carries ``end_input:
-  true`` on its opening message, or it waits for appends). Output is clocked by
+  true`` on its opening message, or it waits for appends), or an OpenAI
+  Realtime conversation over ``/v1/realtime``, which takes PCM16 at one of
+  the eight rates :doc:`clients` lists (8 to 48 kHz) or G.711, resamples it
+  to 16 kHz, appends it in 80 ms frames, and sends each agent reply as one
+  response (BOS / EOS on the agent text channel mark the reply,
+  ``metadata.turn`` on ``/generate``). The voice is ``Aria``. Output is clocked by
   the input, one agent frame per 80 ms of user audio, so a live client keeps
   streaming (silence included) for as long as it wants the agent to talk. The
   model answers in the frames *after* the user stops, so append a few seconds
@@ -717,13 +722,13 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   sees them (raise ``max_session_s``, not the stream's limit, for longer calls). A
   call that ends with no more than 16 ms of audio, which the encoder cannot
   featurize, fails with a 500 (the worker reports it without a client status).
-  Appends must be 16 kHz audio (they are neither
+  ``/generate/ws`` appends must be 16 kHz audio (they are neither
   resampled nor rescaled one by one, which would put a seam at every append).
   Send appends of 80 ms: the encoder takes at most one frame of a call's audio
   per step, so shorter appends need several steps per frame and fall behind
   once a step takes longer than an append, and a longer append takes a step for
   each frame of the call's grid it touches (from 640 samples in, a
-  2560-sample append takes three).
+  2560-sample append takes three). ``/v1/realtime`` does both for the client.
 - Encoder numerics, measured on CPU at the checkpoint's dimensions with random
   weights: the server encodes every call, uploads included, in 80 ms steps,
   which put the frames within about 2e-6 of the offline encoder's (the whole

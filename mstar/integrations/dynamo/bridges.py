@@ -50,6 +50,7 @@ from mstar.api_server.openai.protocol import (
     VideoGenerationRequest,
 )
 from mstar.api_server.openai.serving_images import image_count
+from mstar.api_server.openai.serving_realtime import content_event, decode_base64, response_object, server_event
 from mstar.utils.utf8_stream import Utf8Stream
 
 if TYPE_CHECKING:
@@ -505,26 +506,6 @@ async def _stream_chunks(server: APIServer, rid: str, context):
 # realtime
 # ----------------------------------------------------------------------
 
-def _event_id() -> str:
-    return f"event_{uuid.uuid4().hex}"
-
-
-def _decode_pcm16_b64(audio_b64) -> bytes | None:
-    """Base64 PCM16 append payload -> raw bytes; None when malformed.
-
-    The length may be odd: a sample split across two appends is joined in
-    the session's byte buffer, and a commit takes whole samples only.
-    """
-    if not isinstance(audio_b64, str):
-        return None
-    try:
-        # whitespace is allowed (base64.encodebytes wraps lines), as on the API
-        # server; translate stays linear where split() would build a list
-        return base64.b64decode(audio_b64.encode("ascii").translate(None, b" \t\n\r\v\f"), validate=True)
-    except Exception:  # noqa: BLE001 — refuse the malformed chunk, keep the session
-        return None
-
-
 def _drain(queue: asyncio.Queue) -> None:
     while not queue.empty():
         try:
@@ -580,61 +561,15 @@ class RealtimeBridge:
 
     @staticmethod
     def _session_updated(session) -> dict:
-        return {"type": "session.updated", "event_id": _event_id(), "session": session}
+        return server_event("session.updated", session=session)
 
     @staticmethod
     def _committed(turn: _RealtimeTurn) -> dict:
-        return {
-            "type": "input_audio_buffer.committed",
-            "event_id": _event_id(),
-            "previous_item_id": None,
-            "item_id": turn.item_id,
-        }
+        return server_event("input_audio_buffer.committed", previous_item_id=None, item_id=turn.item_id)
 
     @staticmethod
     def _error(message: str, *, etype: str = "server_error", code: str | None = None) -> dict:
-        return {
-            "type": "error",
-            "event_id": _event_id(),
-            "error": {"type": etype, "code": code, "message": message},
-        }
-
-    @staticmethod
-    def _response(turn: _RealtimeTurn, status: str, modalities: list[str],
-                  status_details: dict | None = None) -> dict:
-        response: dict = {
-            "id": turn.response_id,
-            "object": "realtime.response",
-            "max_output_tokens": "inf",
-            "output": [],
-            "output_modalities": modalities,
-            "status": status,
-        }
-        if status_details is not None:
-            response["status_details"] = status_details
-        return response
-
-    def _response_created(self, turn: _RealtimeTurn, modalities: list[str]) -> dict:
-        return {"type": "response.created", "event_id": _event_id(),
-                "response": self._response(turn, "in_progress", modalities)}
-
-    def _response_done(self, turn: _RealtimeTurn, modalities: list[str],
-                       status: str = "completed",
-                       status_details: dict | None = None) -> dict:
-        return {"type": "response.done", "event_id": _event_id(),
-                "response": self._response(turn, status, modalities, status_details)}
-
-    @staticmethod
-    def _content_event(etype: str, turn: _RealtimeTurn, **fields) -> dict:
-        return {
-            "type": etype,
-            "event_id": _event_id(),
-            "response_id": turn.response_id,
-            "item_id": turn.item_id,
-            "output_index": 0,
-            "content_index": 0,
-            **fields,
-        }
+        return server_event("error", error={"type": etype, "code": code, "message": message})
 
     # -- utterance -> engine -------------------------------------------
 
@@ -691,7 +626,8 @@ class RealtimeBridge:
         want_audio = "audio" in args.output_modalities
         modalities = ["audio"] if want_audio else ["text"]
         try:
-            await events.put(self._response_created(turn, modalities))
+            await events.put(server_event("response.created", response=response_object(
+                turn.response_id, "in_progress", modalities)))
             rid = _submit(self.server, args, prefix="rt")
             sent_audio = False
             stopped = False
@@ -711,11 +647,11 @@ class RealtimeBridge:
                         if not delta:
                             continue
                         text_parts.append(delta)
-                        await events.put(self._content_event(etype, turn, delta=delta))
+                        await events.put(content_event(etype, turn.response_id, turn.item_id, delta=delta))
                     elif chunk.modality == "audio":
                         sent_audio = True
-                        await events.put(self._content_event(
-                            "response.output_audio.delta", turn,
+                        await events.put(content_event(
+                            "response.output_audio.delta", turn.response_id, turn.item_id,
                             delta=base64.b64encode(chunk.data).decode("ascii")))
                     elif chunk.modality == "error":
                         raise RuntimeError(chunk.data.decode("utf-8", "replace"))
@@ -727,24 +663,25 @@ class RealtimeBridge:
                 return
             if tail := text.flush():
                 text_parts.append(tail)
-                await events.put(self._content_event(etype, turn, delta=tail))
+                await events.put(content_event(etype, turn.response_id, turn.item_id, delta=tail))
             if sent_audio:
-                await events.put(self._content_event("response.output_audio.done", turn))
+                await events.put(content_event("response.output_audio.done", turn.response_id, turn.item_id))
             if not want_audio:
-                await events.put(self._content_event(
-                    "response.output_text.done", turn, text="".join(text_parts)))
-            await events.put(self._response_done(turn, modalities))
+                await events.put(content_event("response.output_text.done", turn.response_id, turn.item_id,
+                                               text="".join(text_parts)))
+            await events.put(server_event("response.done", response=response_object(
+                turn.response_id, "completed", modalities)))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — engine failures travel in-band
             logger.exception("realtime turn %s failed", turn.response_id)
             await events.put(self._error(str(exc), code="generation_error"))
-            await events.put(self._response_done(
-                turn, modalities, status="failed",
+            await events.put(server_event("response.done", response=response_object(
+                turn.response_id, "failed", modalities,
                 status_details={
                     "type": "failed",
                     "error": {"code": "generation_error", "type": "server_error"},
-                }))
+                })))
         finally:
             await events.put(None)
 
@@ -815,14 +752,15 @@ class RealtimeBridge:
                                                             "input": {**audio_in, "turn_detection": None}}}
                         out_stream.put_nowait(self._session_updated(session))
                     elif etype == "input_audio_buffer.append":
-                        raw = _decode_pcm16_b64(event.get("audio", ""))
-                        if raw is None:
+                        try:
+                            # the length may be odd: a sample split across two appends is
+                            # joined in pcm, and a commit takes whole samples only
+                            pcm.extend(decode_base64(event.get("audio", "")))
+                        except Exception:  # noqa: BLE001 — refuse the malformed chunk, keep the session
                             out_stream.put_nowait(self._error(
                                 "audio is not base64",
                                 etype="invalid_request_error",
                                 code="invalid_audio"))
-                        else:
-                            pcm.extend(raw)
                     elif etype == "input_audio_buffer.commit":
                         # whole samples only: an odd trailing byte waits for
                         # the rest of its sample in the next append

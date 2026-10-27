@@ -658,13 +658,15 @@ def g711_encode(pcm: np.ndarray, law: str) -> bytes:
     return (code ^ mask).astype(np.uint8).tobytes()
 
 
+def to_pcm16(audio) -> np.ndarray:
+    """Float waveform -> little-endian int16 samples. The inverse of reading
+    PCM16 as ``int16 / 32768``, so 16-bit audio comes back sample for sample."""
+    return np.clip(np.rint(np.asarray(audio, dtype=np.float64) * 32768.0), -32768, 32767).astype("<i2")
+
+
 def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
-    """Float waveform -> 16-bit PCM WAV file at ``path``. The inverse of
-    reading PCM16 as ``int16 / 32768``, so 16-bit audio comes back sample for
-    sample."""
-    scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
-    pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
-    Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
+    """Float waveform -> 16-bit PCM WAV file at ``path`` (see :func:`to_pcm16`)."""
+    Path(path).write_bytes(pcm16_to_wav_bytes(to_pcm16(audio).tobytes(), sample_rate))
     return path
 
 
