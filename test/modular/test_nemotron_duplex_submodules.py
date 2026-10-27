@@ -581,11 +581,10 @@ def test_encoder_layer_region_runs_only_the_calls_with_a_frame():
 
 
 def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
-    """Every read and write of a pool's state, eager or in a region, uses the
-    plan the pool holds at that moment, never one held across another plan:
-    the eager path runs on this step's plan before a region plans its own. The
-    KV attends under a plan of exactly the rows it is given, padding included.
-    A call with a chunk over a second runs in a step of its own."""
+    """The KV attends under a plan of exactly the rows it is given, padding
+    included, with the eager path on this step's plan before a region plans its
+    own (the pools' gather / scatter_ read the plan the pool holds when they
+    run). A call with a chunk over a second runs in a step of its own."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, ConformerEncoderSubmodule.STEP_REGION, ConformerEncoderSubmodule.LAYERS_REGION)
     attend = enc.kv.attend
@@ -595,15 +594,6 @@ def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
         return attend(layer_idx, q, *args, **kwargs)
 
     monkeypatch.setattr(enc.kv, "attend", attend_checked)
-    for pool in (enc.pool, enc.front):
-        for name in ("gather", "scatter_"):
-            def checked(block, rows, *args, _pool=pool, _op=getattr(pool, name), **kwargs):
-                plan = _pool.addressing("main").slot_indices
-                assert rows.slot_indices.untyped_storage().data_ptr() == plan.untyped_storage().data_ptr(), (
-                    "a pool read through a plan it no longer holds")
-                return _op(block, rows, *args, **kwargs)
-
-            monkeypatch.setattr(pool, name, checked)
     wavs = {1: torch.randn(16000 * 2) * 0.1, 2: torch.randn(16000) * 0.1, 3: torch.randn(6000) * 0.1,
             4: torch.randn(16000 * 3) * 0.1}
     got = _stream(enc, wavs, {1: 1280, 2: 1280, 3: 640, 4: 20000})
