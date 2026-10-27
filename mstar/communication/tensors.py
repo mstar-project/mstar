@@ -1521,7 +1521,10 @@ class TensorCommunicationManager(ABC):
             if shard_dim:
                 self._flag_side_state([new_uuid])
 
-    def _take_cached_read(self, request_id: Rid, info: TensorPointerInfo) -> bool:
+    def _take_cached_read(
+        self, request_id: Rid, info: TensorPointerInfo,
+        staged: dict[int, TensorPointerInfo] | None = None, again: list[int] | None = None,
+    ) -> bool:
         """Whether an earlier edge already read the bytes ``info`` names, in
         which case this edge's ref on them is taken here.
 
@@ -1532,22 +1535,38 @@ class TensorCommunicationManager(ABC):
         producer's uuid (``_collect_and_send_acks``). A slice is matched by its
         dims as well as its bytes: rows of zero bytes (a ``[4, 0]`` tensor) give
         every slice offset 0 and nbytes 0.
+
+        ``staged``: reads earlier in the caller's batch, by uuid, not yet in
+        the store. They count as read; the ref on one is appended to ``again``
+        for the caller to take after its put.
         """
         store = self.tensor_store
-        if not store.check_uuid_presence(info.uuid):
+
+        def held(uuid: int) -> TensorPointerInfo | None:
+            if staged and uuid in staged:
+                return staged[uuid]
+            return store.get_info(uuid) if store.check_uuid_presence(uuid) else None
+
+        def take(uuid: int) -> None:
+            if staged and uuid in staged:
+                again.append(uuid)
+            else:
+                store.increment_ref(uuid, 1)
+
+        stored = held(info.uuid)
+        if stored is None:
             return False
-        stored = store.get_info(info.uuid)
         dims = tuple(info.dims)
         if (stored.offset == info.offset and stored.nbytes == info.nbytes
                 and tuple(stored.dims) == dims):
-            store.increment_ref(info.uuid, 1)
+            take(info.uuid)
             return True
         key = (info.uuid, info.offset, info.nbytes, dims)
         slices = self.slice_uuids.setdefault(request_id, {})
         local = slices.get(key)
-        if local is not None and store.check_uuid_presence(local):
+        if local is not None and held(local) is not None:
             info.uuid = local
-            store.increment_ref(local, 1)
+            take(local)
             return True
         local = self._uuid_minter.mint()
         slices[key] = local
@@ -1646,18 +1665,25 @@ class TensorCommunicationManager(ABC):
             stats.record(src, dst, row[0], row[1], seconds * row[col] / total)
 
     @staticmethod
-    def _poll_read(ep: FutureAndPointers) -> tuple[bool, BaseException | None]:
+    def _poll_read(
+        ep: FutureAndPointers,
+        settled: dict[int, tuple[bool, BaseException | None]] | None = None,
+    ) -> tuple[bool, BaseException | None]:
         """``(done, error)`` for a read. A read that finished cleanly drops its
         future, so later polls of it (it can wait behind an earlier read of
-        its request) query nothing."""
-        if ep.future is None:
+        its request) query nothing. ``settled`` caches the answer per future
+        for one pass, since a batch of reads shares one."""
+        fut = ep.future
+        if fut is None:
             return True, None
-        if not ep.future.done():
-            return False, None
-        error = _read_error(ep.future)
-        if error is None:
+        state = settled.get(id(fut)) if settled is not None else None
+        if state is None:
+            state = (True, _read_error(fut)) if fut.done() else (False, None)
+            if settled is not None:
+                settled[id(fut)] = state
+        if state == (True, None):
             ep.future = None
-        return True, error
+        return state
 
     def _drop_failed_read(self, ep: FutureAndPointers, error: BaseException | None) -> None:
         """Retire a finished read that will not be delivered.
@@ -1795,8 +1821,10 @@ class TensorCommunicationManager(ABC):
         # that is done waits for the ones started before it: a streamed token
         # must not reach the client ahead of the one before it
         waiting: set[Rid] = set()
+        # a batch of reads shares one future: ask it once
+        settled: dict[int, tuple[bool, BaseException | None]] = {}
         for ep in self.pending:
-            done, error = self._poll_read(ep)
+            done, error = self._poll_read(ep, settled)
             if error is not None or (done and ep.request_id in self._failed_read_errors):
                 self._drop_failed_read(ep, error)
                 continue
@@ -1819,6 +1847,9 @@ class TensorCommunicationManager(ABC):
 
         self._collect_and_send_acks(e for edges in ready.values() for e in edges)
         final_ready: dict[Rid, list[GraphEdge]] = {}
+        # the transit references, dropped in one call (a buffered shard edge
+        # drops the ones before it first, as it may release them)
+        transit: list[int] = []
         for req_id, edges in ready.items():
             seen_uuids = self.read_finished.setdefault(req_id, set())
             rx_infos = self.req_rx_info.setdefault(req_id, {})
@@ -1871,21 +1902,22 @@ class TensorCommunicationManager(ABC):
                             shards={},
                         )
 
-                tensors: list[torch.Tensor] = []
                 for info in edge.tensor_info:
                     if info.uuid not in seen_uuids:
                         # a first read holds a transit ref; a reused one does not
-                        self.tensor_store.dereference(info.uuid, 1)
+                        transit.append(info.uuid)
                         seen_uuids.add(info.uuid)
                     if shard_dim:
                         self.uuid_to_shard_dim[info.uuid] = shard_dim
                     else:
                         self.uuid_to_shard_dim.pop(info.uuid, None)
-                    tensors.append(self.get_tensor(info.uuid))
                 if shard_dim:
                     self._flag_side_state([info.uuid for info in edge.tensor_info])
 
                 if buf_key in self.buffered_shards.get(req_id, {}):
+                    self.tensor_store.dereference_batch_uniform(transit, 1)
+                    transit = []
+                    tensors = [self.get_tensor(info.uuid) for info in edge.tensor_info]
                     buf = self.buffered_shards[req_id][buf_key]
                     buf.shards.setdefault(
                         edge.tensor_info[0].source_tp_rank, []
@@ -1927,6 +1959,8 @@ class TensorCommunicationManager(ABC):
                     # else: still waiting on more shards; don't emit yet
                 else:
                     final_ready.setdefault(req_id, []).append(edge)
+        if transit:
+            self.tensor_store.dereference_batch_uniform(transit, 1)
         return final_ready
 
     def register_request(

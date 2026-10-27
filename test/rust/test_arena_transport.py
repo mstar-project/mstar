@@ -1292,3 +1292,41 @@ def test_several_requests_read_in_one_call_as_in_one_call_each(tmp_path):
     assert [(fp.request_id, [e.name for e in fp.graph_edges]) for fp in together.pending] == [
         (fp.request_id, [e.name for e in fp.graph_edges]) for fp in apart.pending
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gathered read is for a device consumer")
+def test_a_frames_small_items_are_read_as_one_gathered_copy(tmp_path):
+    """Small items of one shape and dtype (a step's streamed tokens) arrive as
+    slices of one device copy, with the values of the item-by-item read. An
+    item of another shape is read on its own, and a uuid read twice in the call
+    is stored once with both references."""
+    prod = _manager("w0", tmp_path)
+    sent = {}
+    for i, rid in enumerate(("r1", "r2", "r3")):
+        infos = prod.store_and_return_tensor_info(rid, {"tok": [torch.tensor([7 + i])]})
+        prod.register_for_send(rid, infos["tok"])
+        sent[rid] = infos["tok"]
+    odd = prod.store_and_return_tensor_info("r4", {"x": [torch.arange(3, dtype=torch.float32)]})["x"]
+    prod.register_for_send("r4", odd)
+    edges = [(rid, [GraphEdge(next_node="B", name="tok", tensor_info=il, is_streaming=True)])
+             for rid, il in sent.items()]
+    edges.append(("r4", [GraphEdge(next_node="B", name="x", tensor_info=odd, is_streaming=True)]))
+    edges.append(("r1", [GraphEdge(next_node="B", name="tok", tensor_info=sent["r1"], is_streaming=True)]))
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    cons = ArenaShmCommunicationManager(
+        my_entity_id="w1", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    cons.start_read_tensors_multi(edges)
+    torch.cuda.synchronize()
+    toks = [cons.tensor_store.get_tensor(il[0].uuid) for il in sent.values()]
+    assert [t.item() for t in toks] == [7, 8, 9]
+    assert len({t.untyped_storage().data_ptr() for t in toks}) == 1, "one copy for the frame's tokens"
+    x = cons.tensor_store.get_tensor(odd[0].uuid)
+    assert torch.equal(x.cpu(), torch.arange(3, dtype=torch.float32))
+    assert x.untyped_storage().data_ptr() != toks[0].untyped_storage().data_ptr()
+    # transit + usage for the first read, + one for the second
+    r1 = sent["r1"][0].uuid
+    assert r1 not in cons.tensor_store.dereference_batch_uniform([r1], 2)[0]
+    assert r1 in cons.tensor_store.dereference_batch_uniform([r1], 1)[0]
