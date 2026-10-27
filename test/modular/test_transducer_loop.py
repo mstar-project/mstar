@@ -278,6 +278,8 @@ class Harness:
             ctx = StepContext(request_ids=list(rids), graph_walk=DECODE_WALK, slot=0, capture=False)
             out = self._drive(DECODE_WALK, inputs, infos, ctx)
         tokens = out.row_outputs["tokens"][:len(rids)].cpu()
+        # one tensor: the engine clones it once, and the client's copy is the stop check's host copy
+        assert out.check_stop_buffers["tokens"] is out.row_outputs["tokens"]
         host = HostRows(request_ids=tuple(rids), buffers={"active": out.check_stop_buffers["active"].cpu()})
         stops = self.node.check_stop_batched(rids, infos, host, step_walk=DECODE_WALK)
         assert all(loops == {DECODE_LOOP} for loops in stops.values())

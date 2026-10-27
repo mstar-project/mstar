@@ -264,7 +264,9 @@ class TransducerSubmodule(NodeSubmodule):
         # node a speculation target; no input reads it.
         return BatchedModelOutput(
             row_outputs={"tokens": tokens, "clock": active},
-            check_stop_buffers={"active": active},
+            # the tokens too: the stop check doesn't read them, but the
+            # client's copy then comes from their host rows, not a copy per request
+            check_stop_buffers={"active": active, "tokens": tokens},
         )
 
     def forward(
