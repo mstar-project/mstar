@@ -246,7 +246,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        below).
    * - ``max_concurrent_requests``
      - *(optional)* How many requests run at once. Requests past the cap wait in the
-       conductor's queue.
+       conductor's queue, except a live call (open client input), which is refused with
+       a 503.
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
@@ -258,8 +259,35 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
        shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
        ``false``.
+   * - ``max_call_input_mb``
+     - *(optional, default 512)* For a model that takes live client input: how many MiB
+       of files (and append text) one call may send over its whole life, its opening
+       message's included.
+       A live call's opening message past it is refused, and an append that would pass
+       it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
+       decoded input is larger than its files, and how much of it waits in buffers
+       depends on how fast the model consumes it.
+   * - ``client_streams``
+     - *(optional)* For a model that takes live client input: per client stream (by
+       its edge name, e.g. ``audio_in``), overrides of the limits the model declares on
+       it (``ClientStreamLimits``, see :doc:`adding_models`). ``max_items``: what the
+       stream may carry over a call's life, in the model's units (items, or the frames
+       or samples a model counts per item); a call past it ends with a 400. A deployment
+       may set a bound the model leaves open (``null`` is none) or lower one it
+       declares, which is the most the model can take, but not raise or lift it: a
+       model sizes its buffers from its own settings (for ``nemotron_duplex``, raise
+       ``max_session_s`` instead). An unknown stream, key or value fails loading. Unlike
+       ``max_call_input_mb`` it counts what the model was handed, not bytes uploaded.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``ws_per_message_deflate``
+     - *(optional, default true)* Whether the server offers per-message deflate on its
+       WebSocket routes (``/generate/ws``, ``/v1/realtime``); it applies to every route.
+       Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
+       55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
+       costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
+       ``/generate/ws``, whose configs turn it off. Turn it off where the server's
+       event loop, not the network, is the bottleneck.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation

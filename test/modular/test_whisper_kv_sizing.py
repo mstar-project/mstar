@@ -93,6 +93,7 @@ def _conductor(max_concurrent_requests: int | None) -> Conductor:
     c = object.__new__(Conductor)
     c.requests = {}
     c.waiting_queue = []
+    c._client_streams = {}
     c.max_concurrent_requests = max_concurrent_requests
     c._early_abort_requests = set()
     c.enable_nvtx = False
@@ -123,7 +124,7 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
     batch_size = WhisperDecoderSubmodule.MAX_PREFILL_BATCH_SIZE
     for i in range(arrivals):
         conductor._ingest_request(SimpleNamespace(
-            request_id=f"r{i}", model_kwargs={}, client_request_id=None))
+            request_id=f"r{i}", model_kwargs={}, client_request_id=None, client_input=None))
 
     running: list[str] = []
     refused = peak = finished = 0
