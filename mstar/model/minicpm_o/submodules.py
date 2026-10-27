@@ -61,6 +61,7 @@ from mstar.model.minicpm_o.components.token2wav_flow import MEL_BINS as MEL_BINS
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
+    DECODE_LOOP,
     LLM_ATTN,
     LLM_KV,
     LLM_POS,
@@ -95,7 +96,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DECODE = "decode"
-DECODE_LOOP = "decode_loop"
 
 # encoder output name -> the prompt positions it fills
 _MM_FILLS = {"vision_embeds": "image_positions", "audio_embeds": "audio_positions"}

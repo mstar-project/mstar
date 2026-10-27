@@ -33,6 +33,9 @@ T2W_VOICE = "t2w_voice"
 # token2wav attention caches, one resource per ``token2wav.CACHE_FAMILIES`` entry
 T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
 
+# the LLM's decode loop, which the KV layout and loop caps name
+DECODE_LOOP = "decode_loop"
+
 # ragged span labels
 PATCHES = "patches"
 QUERIES = "queries"

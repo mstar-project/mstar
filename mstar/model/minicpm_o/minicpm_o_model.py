@@ -57,7 +57,15 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, ProcessPromptOutput
+from mstar.model.base import (
+    MAX_OUTPUT_TOKENS,
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+)
 from mstar.model.minicpm_o import weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.token2wav import (
@@ -73,6 +81,7 @@ from mstar.model.minicpm_o.components.tts import MiniCPMTTS, TTSConfig
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
+    DECODE_LOOP,
     LLM_ATTN,
     LLM_KV,
     LLM_POS,
@@ -433,7 +442,7 @@ class MiniCPMOModel(Model):
             outputs=[GraphEdge(next_node=LLM, name="audio_embeds")],
         )
         decode = Loop(
-            name="decode_loop",
+            name=DECODE_LOOP,
             section=GraphNode(
                 name=LLM,
                 input_names=["text_inputs"],
@@ -575,7 +584,7 @@ class MiniCPMOModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList | ProcessPromptOutput:
+    ) -> ProcessPromptOutput:
         unsupported = set(output_modalities) - {TEXT, "audio"}
         if unsupported:
             raise ValueError(f"MiniCPM-o outputs text and audio; got {sorted(unsupported)}")
@@ -658,6 +667,7 @@ class MiniCPMOModel(Model):
                 result["audio_features"] = [torch.cat(pieces, dim=-1).to(torch.bfloat16)]
                 result["audio_feature_lens"] = [lens]
                 result["audio_positions"] = [positions]
+        metadata: dict = {}
         if speech:
             # The TTS reads the whole reply and then speaks it, all within its
             # positions; a longer reply would run past them, so speech caps the text.
@@ -666,8 +676,31 @@ class MiniCPMOModel(Model):
             if requested is not None and int(requested) > limit:
                 raise ValueError(f"a spoken reply holds at most {limit} text tokens; got max_output_tokens={requested}")
             if requested is None:
-                return ProcessPromptOutput(result, {"max_output_tokens": min(MAX_OUTPUT_TOKENS, limit)})
-        return result
+                metadata["max_output_tokens"] = min(MAX_OUTPUT_TOKENS, limit)
+        # the LLM's prefill writes every prompt row, placeholders included, then a row per decode step
+        rows = int(input_ids.numel())
+        llm = LabelLayout(
+            spans=(Span("rows", self._prefill_walk(result), rows, rows, "text_inputs"),),
+            growth=((DECODE_LOOP, 1),),
+        )
+        # A spoken reply's TTS prefills its condition in one step: the reply, at most a token
+        # per LLM decode step, then two more. That is a bound, laid out as two rows plus a row
+        # per LLM step; then a row per code.
+        tts = LabelLayout(
+            spans=(Span("rows", TTS_PREFILL, 2, 2, "tts_hidden"),),
+            growth=((DECODE_LOOP, 1), (TTS_DECODE_LOOP, 1)),
+        ) if speech else LabelLayout()
+        metadata["kv_layout"] = {LLM_KV: {"main": llm}, TTS_KV: {"main": tts}}
+        return ProcessPromptOutput(result, metadata)
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {
+            LLM_KV: {"main": KVLabel(growth=(("decode", DECODE_LOOP),))},
+            TTS_KV: {"main": KVLabel(growth=((TTS_DECODE, TTS_DECODE_LOOP),))},
+        }
 
     @property
     def speech_max_text_tokens(self) -> int:

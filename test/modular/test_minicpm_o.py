@@ -100,7 +100,7 @@ def test_image_placeholders_line_up_with_slices(model, max_slice_nums):
         tensors={"image_inputs": [an_image()]},
         prompt_parts=[PromptPart("image"), PromptPart("text", "Describe it.")],
         max_slice_nums=max_slice_nums,
-    )
+    ).new_input_tensors
     ids = out["text_inputs"][0]
     positions = out["image_positions"][0]
     tgt = out["image_tgt_sizes"][0]
@@ -118,7 +118,7 @@ def test_audio_placeholders_line_up_with_pooled_tokens(model):
         None, ["text", "audio"], ["text"],
         tensors={"audio_inputs": [a_clip()]},
         prompt_parts=[PromptPart("text", "Transcribe."), PromptPart("audio")],
-    )
+    ).new_input_tensors
     lens = out["audio_feature_lens"][0].tolist()
     assert out["audio_positions"][0].numel() == sum(model.config.audio.pooled_tokens(n) for n in lens)
     # audio anywhere turns upstream's speech template on: the prompt ends on <|tts_bos|>
@@ -138,7 +138,7 @@ def test_audio_placeholders_line_up_for_any_clips(model, seconds):
         None, ["text"] + ["audio"] * len(clips), ["text"],
         tensors={"audio_inputs": clips},
         prompt_parts=[PromptPart("text", "Transcribe.")] + [PromptPart("audio")] * len(clips),
-    )
+    ).new_input_tensors
     audio = model.config.audio
     if "audio_feature_lens" not in out:  # nothing long enough to encode
         assert seconds == (0.06,)
@@ -182,13 +182,39 @@ def test_spoken_reply_text_fits_the_tts(model):
     limit = model.speech_max_text_tokens
     assert limit + 2 + 2047 == model.tts_config.max_position_embeddings
     out = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts)
-    assert out.metadata == {"max_output_tokens": min(2048, limit)}
-    assert isinstance(model.process_prompt(
-        None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit), dict)
+    assert out.metadata["max_output_tokens"] == min(2048, limit)
+    assert "max_output_tokens" not in model.process_prompt(
+        None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit).metadata
     with pytest.raises(ValueError, match="spoken reply"):
         model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=parts, max_output_tokens=limit + 1)
     # text replies are not capped
-    assert isinstance(model.process_prompt(None, ["text"], ["text"], prompt_parts=parts, max_output_tokens=8192), dict)
+    assert "max_output_tokens" not in model.process_prompt(
+        None, ["text"], ["text"], prompt_parts=parts, max_output_tokens=8192).metadata
+def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
+    """The LLM's layout: one span over every prompt row (placeholders included),
+    written by the prefill walk the request takes, then a row per decode step."""
+    from mstar.model.base import LabelLayout
+    from mstar.model.minicpm_o.config import DECODE_LOOP, LLM_KV, TTS_KV
+    from mstar.model.multimodal import PromptPart
+
+    out = model.process_prompt(
+        None, ["image", "text"], ["text"],
+        tensors={"image_inputs": [an_image()]},
+        prompt_parts=[PromptPart("image"), PromptPart("text", "Describe it.")],
+    )
+    (span,) = out.metadata["kv_layout"][LLM_KV]["main"].spans
+    rows = out.new_input_tensors["text_inputs"][0].numel()
+    assert (span.walk, span.length, span.advance) == ("prefill_image", rows, rows)
+    assert out.metadata["kv_layout"][LLM_KV]["main"].growth == ((DECODE_LOOP, 1),)
+    assert model.get_loop_caps(max_output_tokens=7) == {DECODE_LOOP: 7}
+    assert set(model.kv_labels()) == {LLM_KV, TTS_KV}
+    # a text reply opens the TTS's pool with nothing in it; a spoken one prefills its
+    # condition (two rows and a row per LLM step) and then writes a row per code
+    assert out.metadata["kv_layout"][TTS_KV]["main"] == LabelLayout()
+    spoken = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=[PromptPart("text", "Hi.")])
+    tts = spoken.metadata["kv_layout"][TTS_KV]["main"]
+    assert [(s.walk, s.length) for s in tts.spans] == [("tts_prefill", 2)]
+    assert tts.growth == ((DECODE_LOOP, 1), ("tts_decode_loop", 1))
 
 
 @needs_ckpt
