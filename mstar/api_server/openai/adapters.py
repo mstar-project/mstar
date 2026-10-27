@@ -729,7 +729,7 @@ class FishS2ProAdapter(OpenAIAdapter):
     data URL, bare base64, or, when the server allows remote fetch, an http(s)
     URL; paths on the server are refused) with its transcript in ``ref_text``. Without
     one the model picks a voice. ``voice`` and ``speed`` are not S2-Pro
-    controls and are dropped; inline ``[tag]`` prosody control is part of
+    controls and are reported as ignored; inline ``[tag]`` prosody control is part of
     the input text. ``temperature`` / ``top_p`` / ``seed`` are the standard
     fields; ``top_k``, ``repetition_penalty``, ``do_sample`` and
     ``max_new_tokens`` pass through ``extra_body``. Long inputs are
@@ -743,6 +743,10 @@ class FishS2ProAdapter(OpenAIAdapter):
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        # neither is an S2-Pro control; a sent one is forwarded so it is logged as ignored
+        if getattr(req, "voice", None) is not None:
+            mk.setdefault("voice", req.voice)
+        _forward_sent_speed(req, mk)
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
             path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")

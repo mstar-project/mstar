@@ -37,7 +37,7 @@ _INT_RULES = {
     "top_k": (">= 0 (0 is off)", lambda v: v >= 0),
     "max_output_tokens": (">= 1", lambda v: v >= 1),
 }
-_BOOL_KNOBS = ("ignore_eos", "penalize_prompt")
+_BOOL_KNOBS = ("ignore_eos", "penalize_prompt", "do_sample")
 
 # other names for max_output_tokens, in precedence order after it
 MAX_OUTPUT_TOKENS_ALIASES = ("max_new_tokens", "max_completion_tokens", "max_tokens")

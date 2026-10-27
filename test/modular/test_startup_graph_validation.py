@@ -802,7 +802,7 @@ def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
 
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
-    return _bare(WhisperModel, config=WhisperModelConfig())
+    return _bare(WhisperModel, config=WhisperModelConfig(), sampling_defaults={})
 
 
 def _default(name, model_kwargs, tmp_path, monkeypatch):

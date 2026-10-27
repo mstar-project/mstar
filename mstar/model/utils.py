@@ -395,6 +395,7 @@ _KNOBS = {
 
 def load_generation_defaults(
     checkpoint_dir: str | Path | None, prefix: str = "", stage: str = "",
+    switch_only: bool = False,
 ) -> dict:
     """The sampling defaults ``checkpoint_dir/generation_config.json`` declares.
 
@@ -402,6 +403,8 @@ def load_generation_defaults(
     ``prefix`` selects one stage's keys in a multi-stage file (``"talker_"`` reads
     ``talker_temperature``) and ``stage`` prefixes the returned names
     (``"code_predictor_"``). ``do_sample: false`` is greedy: temperature 0.
+    ``switch_only`` reads ``do_sample`` alone, for a file that is the backbone's
+    chat preset rather than the model's own recipe.
     Returns ``{}`` when there is no file, so the caller's own defaults apply.
     """
     if checkpoint_dir is None:
@@ -415,7 +418,7 @@ def load_generation_defaults(
         logger.warning("Unreadable %s; using the model's own defaults", path)
         return {}
     out = {}
-    for hf_key, knob in _KNOBS.items():
+    for hf_key, knob in ({} if switch_only else _KNOBS).items():
         value = config.get(prefix + hf_key)
         if value is not None:
             out[stage + knob] = value

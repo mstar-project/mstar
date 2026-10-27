@@ -84,6 +84,9 @@ from mstar.streaming.topology import Connection, PartitionTopology, StreamingGra
 
 logger = logging.getLogger(__name__)
 
+# model_kwargs forwarded to the nano sampler; an unset one takes the config's value
+SAMPLING_KEYS = ("temperature", "top_p", "repetition_penalty", "ignore_eos")
+
 
 def _sample_text_token(
     logits: torch.Tensor,          # (B, vocab)
@@ -518,7 +521,7 @@ class NemotronDuplexModel(Model):
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args
         model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
+        keys = SAMPLING_KEYS
         return {
             NANO_SAMPLER: SamplingReqConfig(
                 **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
@@ -653,6 +656,10 @@ class NemotronDuplexModel(Model):
     # -------------------------------------------------------------------
     # Prompt processing
     # -------------------------------------------------------------------
+
+    def request_kwargs(self) -> frozenset[str]:
+        # max_output_tokens is not read: the audio fixes the length
+        return frozenset(SAMPLING_KEYS)
 
     def process_prompt(
         self,

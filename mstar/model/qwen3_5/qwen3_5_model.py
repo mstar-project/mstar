@@ -82,7 +82,7 @@ from mstar.model.qwen3_5.video import (
     sample_video,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import drop_stop_tokens
+from mstar.model.utils import drop_stop_tokens, load_generation_defaults
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,18 @@ logger = logging.getLogger(__name__)
 # a mixed step's prompt rows (as many as `max_rows_in_combined` lets in) take
 # the prefill kernels, its decode rows the decode ones
 _MIXED_SPLIT = CombinedSplit(LLM_MIXED, prefill_walks=("prefill_text",))
+
+# model_kwargs forwarded to the engine sampler when the request sets them
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "min_p",
+    "repetition_penalty", "penalize_prompt", "ignore_eos",
+)
+
+
+def sampling_defaults(checkpoint_dir) -> dict:
+    """The knobs the checkpoint's generation_config.json sets; the engine's defaults fill the rest."""
+    checkpoint = load_generation_defaults(checkpoint_dir)
+    return {k: v for k, v in checkpoint.items() if k in SAMPLING_KEYS}
 
 
 def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
@@ -115,6 +127,7 @@ def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
             "vocab.json",
             "tokenizer.json",
             "merges.txt",
+            "generation_config.json",
         ],
     )
 
@@ -176,6 +189,7 @@ class Qwen3_5DenseModel(Model):
 
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
         self.vision_config = Qwen3_5VisionConfig.from_hf_or_none(self.local_dir)
@@ -265,6 +279,8 @@ class Qwen3_5DenseModel(Model):
                 resource_key=SAMPLER, nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
+                # off unless the checkpoint defaults it on; a request min_p > 0 is refused
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
             *self._vision_resources(),
         ]
@@ -472,6 +488,10 @@ class Qwen3_5DenseModel(Model):
         video's temporal group count goes back as ``video_groups`` metadata:
         the schedule needs it to lay out the plan, and only tokenizing knows it.
         """
+        enable_thinking = kwargs.get("enable_thinking", True)
+        if not isinstance(enable_thinking, bool):
+            raise ValueError(f"enable_thinking must be a boolean; got {enable_thinking!r}")
+
         if prompt is None:
             # An image-only message renders with an empty text span. With no
             # attachments either, fail here, where it reaches the client as a
@@ -519,7 +539,7 @@ class Qwen3_5DenseModel(Model):
                 messages_from_parts(parts),
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=kwargs.get("enable_thinking", True),
+                enable_thinking=enable_thinking,
             )
         except TemplateError as exc:
             # a chat the template refuses (a system message after the first turn,
@@ -811,12 +831,14 @@ class Qwen3_5DenseModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos"]
-        return {
-            SAMPLER: SamplingReqConfig(
-                **{k: model_kwargs[k] for k in keys if k in model_kwargs}
-            )
+        sampling = {
+            **self.sampling_defaults,
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
         }
+        return {SAMPLER: SamplingReqConfig(**sampling)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"enable_thinking", "max_output_tokens", *SAMPLING_KEYS})
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

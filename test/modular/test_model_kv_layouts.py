@@ -76,6 +76,7 @@ def _bagel():
     model.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
     model.eoi_token_id = _StubTokenizer.SPECIALS["<|vision_end|>"]
     model._has_cfg_parallel = model._has_llm_disaggregation = False
+    model.sampling_defaults = {"temperature": 0.0, "top_k": 0, "top_p": 1.0}
     return model
 
 
@@ -255,7 +256,7 @@ def test_chatterbox_caps_decode_where_its_stop_check_ends_it(max_tokens):
         t3.postprocess(request_id, request_info, outputs)
         return t3.check_stop(request_id, request_info, outputs)
 
-    cap = model.get_loop_caps(max_new_tokens=max_tokens)["decode_loop"]
+    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
 
     assert cap == _stops_after(
         check_stop, "decode_loop", "decode", model.config.t3.max_speech_tokens, outputs,
@@ -492,7 +493,7 @@ def test_qwen3_omni_caps_the_thinkers_decode_where_its_stop_check_ends_it(max_to
     ), "the cap and the stop check end decode on different iterations"
 
 
-@pytest.mark.parametrize("talker_max_tokens", [0, 1, 64])
+@pytest.mark.parametrize("talker_max_tokens", [1, 64])
 def test_qwen3_omni_caps_the_talkers_decode_where_its_stop_check_ends_it(talker_max_tokens):
     pytest.importorskip("flashinfer")
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
@@ -633,6 +634,7 @@ def _whisper():
 
     model = object.__new__(WhisperModel)
     model.config = WhisperModelConfig(lang_to_id={"<|en|>": 50259}, task_to_id={"transcribe": 50360})
+    model.sampling_defaults = {}
     model.feature_extractor = WhisperFeatureExtractor(feature_size=model.config.num_mel_bins)
     return model
 

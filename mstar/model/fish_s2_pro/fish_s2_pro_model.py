@@ -514,6 +514,12 @@ class FishS2ProModel(Model):
             ),
         }
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({
+            "ref_text", "temperature", "top_k", "top_p", "repetition_penalty", "ignore_eos", "do_sample",
+            "max_output_tokens",
+        })
+
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
         requested = model_kwargs.get(
             "max_output_tokens",

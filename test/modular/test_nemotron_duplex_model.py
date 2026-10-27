@@ -298,3 +298,18 @@ def test_duplex_no_prompt_seeds_initial_decode_inputs():
     fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], sig)
     assert fpa.full_metadata.graph_walk == "decode"
     assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func", "text_inputs"}
+
+
+def test_request_kwargs_are_the_sampling_knobs_it_reads():
+    from mstar.model.nemotron_duplex.config import NANO_SAMPLER
+
+    model = _make_model()
+    declared = model.request_kwargs()
+    base = model.get_request_resource_configs({}, {})[NANO_SAMPLER]
+    sent = {"temperature": 0.0, "top_p": 0.5, "repetition_penalty": 1.3, "ignore_eos": True}
+    assert declared == set(sent)
+    for key, value in sent.items():
+        assert getattr(base, key) != value
+        assert getattr(model.get_request_resource_configs({}, {key: value})[NANO_SAMPLER], key) == value
+    # the audio fixes the length, so a client cap is not read
+    assert "max_output_tokens" not in declared
