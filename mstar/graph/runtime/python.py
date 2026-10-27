@@ -1485,6 +1485,8 @@ class PythonGraphRuntime(GraphRuntime):
         sent_rids: list[int] = []
 
         for rid, routing in completion.routing.items():
+            if rid in input.failed_rids:
+                continue
             fwd_info = fwd_infos.get(rid)
             info = self._request_info.get(rid)
 
