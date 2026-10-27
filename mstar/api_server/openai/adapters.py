@@ -1140,9 +1140,12 @@ class TextChatAdapter(OpenAIAdapter):
     applies its own chat template; sampling fields reach it as model_kwargs."""
 
     supports_chat = True
+    # a subclass whose output parser splits tool calls out of the reply serves them
+    serves_tool_calls = False
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_tool_calls(req)
+        if not self.serves_tool_calls:
+            _refuse_tool_calls(req)
         text, _, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
         # an image or audio part was decoded to disk and then dropped: the model
         # answered as if it had seen it
@@ -1198,6 +1201,8 @@ class GlmChatAdapter(TextChatAdapter):
     ``chat_template_kwargs``; other template keys are dropped, as vLLM drops the
     ones a template does not read.
     """
+
+    serves_tool_calls = True
 
     def __init__(self, *, always_thinks: bool):
         self.always_thinks = always_thinks
