@@ -3187,11 +3187,6 @@ window.runMermaid = runMermaid;</script>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">capture_batch_sizes</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gen_capture_batch_sizes</span><span class="p">)</span>
         <span class="n">dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">proj_in</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">dtype</span>
-        <span class="c1"># The 2D (TP x SP) captured denoise graph hits a CUDA illegal access at</span>
-        <span class="c1"># 480p+ in the combined Ulysses all-gather + TP all-reduce path (pure-TP and</span>
-        <span class="c1"># pure-SP capture cleanly; only the combination at this scale). For 2D,</span>
-        <span class="c1"># capture only the smallest tier; 480p+ runs eager (correct, just no graph).</span>
-        <span class="n">two_d</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">world_size</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">comm_group</span><span class="o">.</span><span class="n">world_size</span> <span class="o">&gt;</span> <span class="mi">1</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_capture_layout</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">,</span> <span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">configs</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="c1"># The capture is bit-faithful at every resolution (the rotary uses a</span>
@@ -3201,8 +3196,6 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W).</span>
         <span class="n">max_area</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
             <span class="s2">"COSMOS3_GRAPH_MAX_LATENT_AREA"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">graph_max_latent_area</span><span class="p">))</span>
-        <span class="k">if</span> <span class="n">two_d</span><span class="p">:</span>
-            <span class="n">max_area</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">max_area</span><span class="p">,</span> <span class="mi">1000</span><span class="p">)</span>  <span class="c1"># 256p latent 240 captures; 480p 1560 does not</span>
         <span class="c1"># Video tiers (height, width, frames): a plain clip length and/or the</span>
         <span class="c1"># windowed rollout's window; one graph per latent shape serves t2v,</span>
         <span class="c1"># i2v and chained windows (see ``_capture_key``).</span>
@@ -3392,15 +3385,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">layout</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_layout</span><span class="p">[</span><span class="nb">tuple</span><span class="p">(</span><span class="n">latents</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">:])]</span>
         <span class="n">rids</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">request_ids</span>
         <span class="k">if</span> <span class="n">latents</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="c1"># Captured into the denoise CUDA graph. Under SP the Ulysses</span>
-            <span class="c1"># exchange must be all-gather (all-to-all is grouped p2p send/recv —</span>
-            <span class="c1"># not graph-replayable); the flag holds across warmup/capture/replay</span>
-            <span class="c1"># so those kernels compile during eager warmup. No-op without SP.</span>
+            <span class="c1"># Captured into the denoise CUDA graph.</span>
             <span class="n">cond_v</span><span class="p">,</span> <span class="n">uncond_v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="o">.</span><span class="n">denoise_step_batched_cfg</span><span class="p">(</span>
                 <span class="n">latents</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">vision_timesteps</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">position_ids_cond</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">position_ids_uncond</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
                 <span class="n">layout</span><span class="p">[</span><span class="s2">"vision_token_shapes"</span><span class="p">],</span> <span class="n">layout</span><span class="p">[</span><span class="s2">"vision_noisy_frame_indexes"</span><span class="p">],</span>
                 <span class="n">layout</span><span class="p">[</span><span class="s2">"mse_gen_indexes"</span><span class="p">],</span> <span class="n">CFG_BATCHED_LABEL</span><span class="p">,</span> <span class="n">attn</span><span class="p">,</span>
-                <span class="n">prefer_all_gather</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">noisy_token_mask</span><span class="o">=</span><span class="n">noisy_token_mask</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
+                <span class="n">noisy_token_mask</span><span class="o">=</span><span class="n">noisy_token_mask</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span>
             <span class="p">)</span>
             <span class="k">return</span> <span class="p">{</span><span class="n">rids</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span> <span class="p">{</span><span class="s2">"cond_v"</span><span class="p">:</span> <span class="p">[</span><span class="n">cond_v</span><span class="p">],</span> <span class="s2">"uncond_v"</span><span class="p">:</span> <span class="p">[</span><span class="n">uncond_v</span><span class="p">]}}</span>
         <span class="n">reqs</span> <span class="o">=</span> <span class="p">[</span>
