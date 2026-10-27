@@ -23,6 +23,15 @@ model_kwargs:
   num_inference_steps_action: 4
   guidance_scale_action: 3.0
   flow_shift_action: 5.0
+  # The cosmos-framework cookbook serves it with guidance only on timesteps in
+  # [960, 1001], which is the first of the four steps.
+  guidance_interval_action: [960, 1001]
+  # Policy requests default to the checkpoint's checkpoint.json (32 predicted
+  # rows, 15 fps, droid_lerobot) and to the 736x544 bucket the 640x540 camera
+  # composite pads into. The checkpoint keeps the gripper as 1 - gripper, so
+  # robot_state takes the robot's gripper and the reply gives it back.
+  policy_size: [736, 544]
+  policy_flip_dims: [7]
 node_groups:
   # No reasoner: the policy checkpoint ships no vision encoder, so the chat
   # walks are not built and the DiT runs alone.
@@ -30,11 +39,11 @@ node_groups:
     ranks: [0]
   - node_names: ["vae_encoder", "vae_decoder"]
     ranks: [0]
-# The first policy request of a fresh server compiles the action denoise step
-# (about 9 s); this warms it at startup with the model card's example frame as
-# the observation.
+# The first policy request of a fresh server compiles the action denoise step,
+# guided and conditional-only (about 9 s); this warms both at startup with the
+# model card's example frame as the observation and the policy defaults above.
 warmup_requests:
   - text: warmup
     files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
     output_modalities: [action]
-    model_kwargs: {action_mode: policy, domain_name: droid_lerobot, raw_action_dim: 10}
+    model_kwargs: {action_mode: policy, robot_state: [0, 0, 0, 0, 0, 0, 0, 0]}

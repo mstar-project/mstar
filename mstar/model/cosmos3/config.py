@@ -23,6 +23,7 @@ Values load from a local HF checkpoint directory laid out the diffusers way::
                                         distilled checkpoints' FlowMatchEuler SDE sampler)
     <ckpt>/model_index.json          -> pipeline flags (native flow schedule)
     <ckpt>/modular_model_index.json  -> distilled sampler (is_distilled, distilled_sigmas)
+    <ckpt>/checkpoint.json           -> policy-request defaults (chunk, fps, domain), policy fine-tunes
     <ckpt>/config.json               -> reasoner (vision tower + projector), Edge only
     <ckpt>/preprocessor_config.json, video_preprocessor_config.json -> reasoner media processors
 
@@ -425,6 +426,23 @@ class Cosmos3Config:
     num_inference_steps_action: int = 30
     guidance_scale_action: float = 1.0
     flow_shift_action: float = 5.0
+    # Timestep interval [lo, hi] outside which an action request's denoise
+    # step runs the conditional branch alone, when the request sends none
+    # (the Edge DROID cookbook serves [960, 1001]). None guides every step.
+    guidance_interval_action: tuple[float, float] | None = None
+    # Policy-request defaults. The first three come from the checkpoint's
+    # checkpoint.json ``policy`` block (Edge DROID: 32 rows, 15 fps,
+    # droid_lerobot), or from the yaml for a checkpoint that ships none.
+    # ``policy_size`` is (width, height); unset, a policy request runs 832x480.
+    policy_action_chunk_size: int | None = None
+    policy_conditioning_fps: float | None = None
+    policy_domain_name: str | None = None
+    policy_size: tuple[int, int] | None = None
+    # Action dims the checkpoint stores as 1 - x (DROID's gripper). A policy
+    # request's robot_state is flipped there before it conditions the chunk,
+    # and the reply's predicted rows are flipped back, so clients send and get
+    # the robot's own values.
+    policy_flip_dims: tuple[int, ...] = ()
     # Default output size (width, height) for image and video requests that
     # send no ``size``: Nano/Super serve 1024^2 images and the same square for
     # video unless the deployment says otherwise; Edge is 480p-native (the
@@ -549,6 +567,17 @@ class Cosmos3Config:
                 "0 decodes each window's new latents in one call."
             )
 
+    def check_action_defaults(self) -> None:
+        """Reject action defaults a request would misread: an interval that is
+        not [lo, hi], or a flip dim outside the action width."""
+        gi = self.guidance_interval_action
+        if gi is not None and len(gi) != 2:
+            raise ValueError(f"Cosmos3 guidance_interval_action must be [lo, hi], got {gi!r}.")
+        if any(not 0 <= d < self.max_action_dim for d in self.policy_flip_dims):
+            raise ValueError(
+                f"Cosmos3 policy_flip_dims must be in [0, {self.max_action_dim}), got {self.policy_flip_dims!r}."
+            )
+
     @property
     def nemotron_norm(self) -> bool:
         """Whether every RMSNorm uses the Nemotron ordering (fp32 weight
@@ -605,6 +634,14 @@ class Cosmos3Config:
             with open(index_path) as f:
                 index = json.load(f)
             cfg.use_native_flow_schedule = bool(index.get("use_native_flow_schedule", False))
+
+        policy_path = root / "checkpoint.json"
+        if policy_path.exists():
+            with open(policy_path) as f:
+                policy = json.load(f).get("policy") or {}
+            for name, cast in (("action_chunk_size", int), ("conditioning_fps", float), ("domain_name", str)):
+                if policy.get(name) is not None:
+                    setattr(cfg, f"policy_{name}", cast(policy[name]))
 
         if cfg.backbone_type == EDGE_BACKBONE_TYPE:
             defaults = cls()
