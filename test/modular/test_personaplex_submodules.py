@@ -981,9 +981,13 @@ TINY_MIMI = dict(hidden_size=32, num_hidden_layers=2, num_attention_heads=2, num
                  sliding_window=250, use_cache=False, upsample_groups=32)
 
 
-def _tiny_codec(seed=0, layers=TINY_MIMI["num_hidden_layers"]):
+def _tiny_codec(seed=0, layers=TINY_MIMI["num_hidden_layers"], dtype=torch.float32):
     """A random tiny Mimi whose codebook entries are distinct, so different codes decode differently
-    (a fresh MimiModel's codebooks are all zeros, which would make every code stream sound the same)."""
+    (a fresh MimiModel's codebooks are all zeros, which would make every code stream sound the same).
+
+    Float64 isolates cross-shape alignment checks from fp32 convolution-kernel rounding.
+    The default and the NVIDIA fixture comparisons remain fp32.
+    """
     from mstar.model.personaplex.components.mimi import MimiCodec, build_hf_mimi
 
     with _without_triton_stub():
@@ -996,7 +1000,7 @@ def _tiny_codec(seed=0, layers=TINY_MIMI["num_hidden_layers"]):
             for layer in rvq.layers:
                 layer.codebook.embed_sum.copy_(torch.randn_like(layer.codebook.embed_sum))
                 layer.codebook._embed = None
-    return MimiCodec(model)
+    return MimiCodec(model.to(dtype=dtype))
 
 
 def _agent_frames(n, seed=1, card=64):
@@ -1047,8 +1051,8 @@ def test_stream_codes_keep_frame_and_codebook_order():
 @torch.no_grad()
 @pytest.mark.parametrize("frames", [28, 37, 53, 300])
 def test_streamed_decode_within_one_window_matches_the_whole_decode(frames):
-    """Exact (to fp32 rounding) while the track fits the decoder's context: full, partial and empty last chunks."""
-    codec = _tiny_codec()
+    """While the track fits the context: full, partial and empty last chunks align with a whole decode."""
+    codec = _tiny_codec(dtype=torch.float64)
     agent = _agent_frames(frames)
     num_samples = frames * cfg.FRAME_SIZE - 700
     streamed = _stream_decode(MimiDecoderSubmodule(codec), agent, num_samples)
@@ -1068,7 +1072,7 @@ def test_tiny_codec_decodes_different_codes_differently():
 def test_streamed_decode_past_the_window_differs_only_slightly_and_needs_its_context():
     """With the checkpoint's 8 stacked windowed layers the decoder reaches past any finite context, so a
     long reply differs slightly from a whole-track decode (the Qwen3-TTS trade-off), less with more context."""
-    codec = _tiny_codec(layers=8)
+    codec = _tiny_codec(layers=8, dtype=torch.float64)
     frames = 700
     agent = _agent_frames(frames)
     num_samples = frames * cfg.FRAME_SIZE
@@ -1090,7 +1094,7 @@ def test_streamed_decode_past_the_window_differs_only_slightly_and_needs_its_con
 @pytest.mark.parametrize("frames,short", [(12, 700), (13, 700), (12, 6 * 1920 + 5)])
 def test_every_emission_respects_the_sample_budget(frames, short):
     """No chunk, final or not, emits past the input's length; frames short of a block wait for the final chunk."""
-    codec = _tiny_codec()
+    codec = _tiny_codec(dtype=torch.float64)
     agent = _agent_frames(frames)
     num_samples = frames * cfg.FRAME_SIZE - short
     decoder = MimiDecoderSubmodule(codec)
@@ -1162,7 +1166,7 @@ def test_streamed_audio_does_not_depend_on_how_the_stream_groups_frames(sizes):
 
 @torch.no_grad()
 def test_decode_last_reruns_seanet_only_over_its_receptive_field():
-    codec = _tiny_codec()
+    codec = _tiny_codec(dtype=torch.float64)
     codes = torch.cat(_agent_frames(60), dim=-1)
     whole = codec.decode(codes)
     for frames in (1, 4, 25):
@@ -1176,7 +1180,7 @@ def test_decode_last_reruns_seanet_only_over_its_receptive_field():
 
 @torch.no_grad()
 def test_decoder_state_is_per_request_and_released():
-    codec = _tiny_codec()
+    codec = _tiny_codec(dtype=torch.float64)
     decoder = MimiDecoderSubmodule(codec)
     a, b = _agent_frames(10, seed=2), _agent_frames(10, seed=3)
     num_samples = 10 * cfg.FRAME_SIZE
@@ -1223,7 +1227,7 @@ def test_batched_rows_at_different_stream_offsets_each_get_their_own_audio():
 @torch.no_grad()
 def test_requests_sharing_one_batched_decode_each_get_their_own_audio():
     """Two requests at the same stream offset are decoded as rows of one batch; each must get its own row."""
-    codec = _tiny_codec()
+    codec = _tiny_codec(dtype=torch.float64)
     decoder, solo = MimiDecoderSubmodule(codec), MimiDecoderSubmodule(codec)
     frames = {"a": _agent_frames(12, seed=6), "b": _agent_frames(12, seed=7)}
     num_samples = 12 * cfg.FRAME_SIZE
@@ -1245,7 +1249,7 @@ def test_requests_sharing_one_batched_decode_each_get_their_own_audio():
 @torch.no_grad()
 def test_preparing_the_next_chunk_first_changes_nothing():
     """prepare_inputs reads no request state, so N+1's preparation before N's forward is harmless."""
-    codec = _tiny_codec()
+    codec = _tiny_codec(dtype=torch.float64)
     agent = _agent_frames(12)
     num_samples = 12 * cfg.FRAME_SIZE
     decoder = MimiDecoderSubmodule(codec)
