@@ -65,8 +65,8 @@ def _worker():
     w.tensor_manager = SimpleNamespace(
         start_read_tensors=start_read_tensors,
         start_read_tensors_multi=start_read_tensors_multi,
-        ack_unread_tensors=lambda wire_rid, edges: w.acked.append(
-            (wire_rid, [i.uuid for e in edges for i in e.tensor_info]),
+        ack_unread_tensors=lambda edges: w.acked.append(
+            [i.uuid for e in edges for i in e.tensor_info],
         ),
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
@@ -93,7 +93,7 @@ def test_a_frame_does_what_its_rows_as_input_signals_did():
     assert _state(batched) == _state(one_by_one)
     reads, acked, registered, parked = _state(batched)
     assert reads == [(1, EDGE, [1, 2]), (2, EDGE, [6])]
-    assert acked == [("removed", [4])]
+    assert acked == [[4]]
     assert registered == {1: [1, 2], 2: [6], 3: []}
     assert list(parked) == ["later"]
 
