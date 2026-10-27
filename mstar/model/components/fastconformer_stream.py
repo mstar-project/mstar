@@ -68,6 +68,12 @@ class StreamState:
         self.position = StreamPosition(source_len=0, written=value)
 
 
+def samples_per_frame(config: FastConformerConfig, hop_length: int) -> int:
+    """Audio samples per encoder frame: the step the node takes from its input
+    stream, which that edge's ``GridChunkPolicy`` cuts it on."""
+    return hop_length * config.subsampling_factor
+
+
 def front_state_blocks(config: FastConformerConfig, hop_length: int) -> dict[str, RecurrentBlockConfig]:
     """A stream's front-end state, all a later step reads: its newest
     preemphasized samples (``sig``; every sample until its first mel frame,
@@ -75,7 +81,7 @@ def front_state_blocks(config: FastConformerConfig, hop_length: int) -> dict[str
     subsampling window of the next encoder frame) and its last raw sample, for
     the preemphasis. Right-aligned: the newest sample / frame is last."""
     return {
-        "sig": RecurrentBlockConfig(shape=(hop_length * config.subsampling_factor,), dtype=torch.float32),
+        "sig": RecurrentBlockConfig(shape=(samples_per_frame(config, hop_length),), dtype=torch.float32),
         "mel": RecurrentBlockConfig(shape=(2 * config.subsampling_factor, config.num_mel_bins), dtype=torch.float32),
         "last": RecurrentBlockConfig(shape=(1,), dtype=torch.float32),
     }
@@ -108,19 +114,17 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     ``output_edge``; the end of input emits the last ones. A frame per item
     lets a consumer's ``FixedChunkPolicy(1)`` pace a frame-synchronous loop.
 
-    Live streams' chunks run in one batched pass, except that a step holding a
-    chunk of more than a second (an upload, a large append) is not batched
-    (``can_batch``): the engine then runs each stream of it on its own. The
+    Declare ``GridChunkPolicy(samples_per_frame(...), max_steps=K)`` on the
+    input edge, so chunks arrive on the stream's frame grid, an upload in pieces
+    of up to ``K`` frames: one eager pass each, not a step per frame. The
     encoder is bound to the bounded KV and the conv pool; ``front_key`` names
     the pool of each stream's audio and mel tails.
 
-    A stream one frame of audio further on the frame grid (every live step of
-    a client appending 80 ms) runs whole as a CUDA graph (``STEP_REGION``). The
-    others take the front end eagerly, then the blocks as a graph
-    (``LAYERS_REGION``) when each got at most one frame (a live step, the
-    stream's end), else eagerly (a one-shot upload, a large append). In a step
-    whose other streams take the eager blocks, or when the whole-step region
-    has no graph for its streams, those streams run eagerly too.
+    A stream two frames in that gets one frame of audio on the frame grid
+    (every live step of a client appending 80 ms) runs whole as a CUDA graph
+    (``STEP_REGION``), whatever the step's other streams got. Those take the
+    front end eagerly, then the blocks as a graph (``LAYERS_REGION``) when each
+    got at most one frame, else eagerly in one pass padded to the longest.
     """
 
     # The captured regions are not compiled (compile=False); the eager front end
@@ -130,9 +134,6 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     STEP_REGION = "conformer_step"
     LAYERS_REGION = "conformer_layers"
     STATE_KEY = "encoder_stream"         # a stream's StreamState
-    # Longest chunk batched with other streams': a pass pads every stream to its
-    # longest chunk. One second is a judgement, not a measured crossover.
-    BATCHED_CHUNK_S = 1.0
 
     def __init__(
         self,
@@ -147,7 +148,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     ):
         super().__init__()
         c = encoder.config
-        frame_samples = log_mel.hop_length * c.subsampling_factor
+        frame_samples = samples_per_frame(c, log_mel.hop_length)
         unsupported = {
             name: value for name, value, ok in (
                 ("causal", c.causal, c.causal), ("lookahead", c.lookahead, c.lookahead == 0),
@@ -250,7 +251,6 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                 "position": at.position,
                 "n": self.new_frames(at, samples, final),
             },
-            input_seq_len=0 if wav is None else wav.numel(),   # samples, for can_batch
         )
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
@@ -262,12 +262,9 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         }
 
     def can_batch(self, batch, model_inputs) -> bool:
-        # A pass pads every stream to its longest chunk, so a chunk of more than
-        # BATCHED_CHUNK_S keeps its step from being batched, and the engine runs
-        # each stream's step on its own (declare, admit, plan, forward, commit).
-        # Such chunks are uploads and large appends, so it is a rare step.
-        longest = int(self.BATCHED_CHUNK_S * self.log_mel.sampling_rate)
-        return len(model_inputs) == 1 or all(inp.input_seq_len <= longest for inp in model_inputs)
+        # a chunk is at most the input edge policy's max_steps frames, and the
+        # steady streams beside a longer one keep their graph
+        return True
 
     def max_batch_size(self, graph_walk: str) -> int:
         # The engine caps a batch at its whole-forward graphs only; past the
@@ -304,22 +301,21 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None,
                      **kwargs) -> SubmoduleStep | None:
         del graph_walk, slot_lease, kwargs
-        # A live step where every stream is one frame on replays STEP_REGION
-        # over the whole batch, at the bucket its lease names, and the region's
-        # own step owns every resource. Each such stream already holds its slots,
-        # from a first step declared below, so that step's admit reserves nothing.
-        if self.STEP_REGION in (piecewise_leases or {}) and all(inp.kwargs["steady"] for inp in inputs):
+        # With STEP_REGION leased, the region replays the streams one frame on
+        # (steady), and its own step owns their resources: each already holds its
+        # slots, from a first step declared below, so its admit reserves nothing,
+        # and the lease's bucket has a graph for any part of the batch. A step
+        # where every stream is steady declares nothing.
+        leased = self.STEP_REGION in (piecewise_leases or {})
+        rows = [i for i, inp in enumerate(inputs) if not (leased and inp.kwargs["steady"])]
+        if not rows:
             return None
-        # Otherwise this step reserves and plans every stream's slots and new
-        # frames, and the eager path reads that plan. A region the forward still
-        # replays for some streams re-plans their rows into its own buffers, after
-        # the eager path has read this plan. It can't own those rows instead: its
-        # lease names the whole batch's bucket, not the sub-batch's, which may
-        # have no graph, and its admit can't refuse a stream that has no slot yet.
-        spans = [inp.kwargs["n"] for inp in inputs]
-        positions = {rid: inp.kwargs["position"] for rid, inp in zip(request_ids, inputs, strict=True)}
-        return self._declare(request_ids, (self.front_key, self.encoder.conv_key),
-                             self._kv_step(request_ids, spans, positions))
+        # The rest reserve and plan their slots and new frames here, and the
+        # eager path reads that plan, so it never addresses a steady stream's rows.
+        ids = [request_ids[i] for i in rows]
+        positions = {request_ids[i]: inputs[i].kwargs["position"] for i in rows}
+        return self._declare(ids, (self.front_key, self.encoder.conv_key),
+                             self._kv_step(ids, [inputs[i].kwargs["n"] for i in rows], positions))
 
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
@@ -491,57 +487,44 @@ class FastConformerStreamSubmodule(NodeSubmodule):
 
         # streams one frame of audio further on the frame grid: the whole step as one graph, run last
         step_runner, layers_runner = runners.get(self.STEP_REGION), runners.get(self.LAYERS_REGION)
-
-        def layers_graph(rows) -> bool:
-            """Whether the blocks region takes these streams' new frames: at most one each."""
-            new = [i for i in rows if n[i]]
-            return (bool(new) and max(n[i] for i in new) == 1 and layers_runner is not None
-                    and layers_runner.can_run(len(new)))
-
         if engine_inputs.step is None:
             # declare_step left every resource to the region, which its lease says can replay the batch
             assert all(steady), "an encoder step declared nothing but is not all steady"
-            steady = list(range(len(rids)))
+            declared = set()
         else:
-            # This step's KV plan writes every stream's new frames, so the region (which
-            # writes its streams' under its own plan) may serve the steady streams only when
-            # that plan goes unused: the other streams' frames, if any, all go through the
-            # blocks region. Otherwise, or with no graph for them, they run eagerly too.
-            rest = [i for i, s in enumerate(steady) if not s]
-            steady = [i for i, s in enumerate(steady) if s]
-            if steady and not (step_runner is not None and step_runner.can_run(len(steady))
-                               and (not any(n[i] for i in rest) or layers_graph(rest))):
-                steady = []
-        steady_chunks = [chunks[i] for i in steady]
-        eager_n = list(n)
-        for i in steady:
-            chunks[i], eager_n[i] = None, 0     # the eager pass leaves these streams as they are
+            # the streams the declaration left out are the region's (declare_step's
+            # rule); the lease covers that sub-batch (PiecewiseAcceleratorGraphRunner.lease_slot)
+            declared = {seg.request_id for seg in engine_inputs.step.get(self.encoder.kv_key).segments}
+        region = [i for i, rid in enumerate(rids) if rid not in declared]
+        eager = [i for i, rid in enumerate(rids) if rid in declared]
 
-        # The rest: the same math eagerly, reading this step's plans where it
-        # uses them, before any region plans its own; its blocks as a graph when
-        # no stream got more than a frame. A chunk of more than a second comes in
-        # a step of its own (see can_batch).
+        # The rest: the same math eagerly, over only these streams, under this
+        # step's plans, before the region plans its own; their blocks as a graph
+        # when none got more than a frame.
         x = None
-        if len(steady) < len(rids):
-            x = self._front(states, chunks, final, eager_n)
+        if eager:
+            x = self._front([states[i] for i in eager], [chunks[i] for i in eager],
+                            [final[i] for i in eager], [n[i] for i in eager])
         if x is not None:
-            new = [i for i, k in enumerate(eager_n) if k]
-            if layers_graph(new):
+            new = [row for row, i in enumerate(eager) if n[i]]
+            if (max(n[eager[row]] for row in new) == 1 and layers_runner is not None
+                    and layers_runner.can_run(len(new))):
                 # only the streams with a frame: the region plans its own rows
-                y = layers_runner.run(static_inputs={"x": torch.stack([x[i] for i in new]),
+                y = layers_runner.run(static_inputs={"x": torch.stack([x[row] for row in new]),
                                                      "n": torch.ones(len(new), dtype=torch.long, device=device)},
-                                      request_ids=[rids[i] for i in new])["y"]
+                                      request_ids=[rids[eager[row]] for row in new])["y"]
                 y = dict(zip(new, y, strict=True))
             else:
-                y = self._blocks(x, to_device_nonblocking(torch.tensor(eager_n), device))
-            for i in new:
-                states[i].frames += eager_n[i]
-                frames[i] = y[i][: eager_n[i]]
+                y = self._blocks(x, to_device_nonblocking(torch.tensor([n[i] for i in eager]), device))
+            for row in new:
+                i = eager[row]
+                states[i].frames += n[i]
+                frames[i] = y[row][: n[i]]
 
-        if steady:
-            y = step_runner.run(static_inputs={"chunk": torch.stack(steady_chunks)},
-                                request_ids=[rids[i] for i in steady])["y"]
-            for row, i in enumerate(steady):
+        if region:
+            y = step_runner.run(static_inputs={"chunk": torch.stack([chunks[i] for i in region])},
+                                request_ids=[rids[i] for i in region])["y"]
+            for row, i in enumerate(region):
                 st = states[i]
                 st.samples += self.frame_samples
                 st.mels += self.encoder.config.subsampling_factor

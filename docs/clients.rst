@@ -192,12 +192,11 @@ is at ``max_concurrent_requests`` ends at once with ``status`` 503, rather than 
 slot and start that far behind its input; a one-shot request waits in the queue. Other
 models ignore ``end_input``, and an append to them is rejected.
 Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``.
-The append size that serves best is the model's: Nemotron VoiceChat runs a live step as one
-CUDA graph only for an append of exactly 80 ms (1280 samples at 16 kHz) onto a call whose
-audio so far is a whole number of 80 ms frames. Keep the opening clip and every append a
-multiple of 1280 samples: one that is not (a one-second opening clip, 16000 samples) keeps
-the call off the graph for the rest of its life. Other sizes are served the same, more
-slowly (see :doc:`models`).
+The append size that serves best is the model's: Nemotron VoiceChat steps its encoder by
+80 ms frames (1280 samples at 16 kHz) counted from the call's start, and runs a step of one
+new frame as one CUDA graph, so 80 ms appends serve best. Other sizes are served too: audio
+short of a frame waits for the rest of it, and an append of several frames is an eager step
+(see :doc:`models`).
 
 .. code-block:: python
 

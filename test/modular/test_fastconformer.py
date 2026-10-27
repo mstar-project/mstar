@@ -466,16 +466,7 @@ class _Encoder:
         return self.node.declare_step("encode", rids, inputs, piecewise_leases=ctx.piecewise_leases)
 
     def step(self, rids, inputs) -> BatchedModelOutput:
-        """One engine step over ``rids``: batched when the node can batch them,
-        else each stream's own step, as the engine's per-request path runs it."""
-        if len(rids) > 1 and not self.node.can_batch(None, inputs):
-            out = BatchedModelOutput(per_rid_outputs={})
-            for rid, inp in zip(rids, inputs, strict=True):
-                out.per_rid_outputs.update(self._step([rid], [inp]).per_rid_outputs)
-            return out
-        return self._step(rids, inputs)
-
-    def _step(self, rids, inputs) -> BatchedModelOutput:
+        """One engine step over ``rids``, batched."""
         for rid in rids:
             for resource in self.resources.values():
                 resource.ingest_request(rid)
@@ -619,7 +610,7 @@ def test_encoder_paths_read_the_plan_current_when_they_use_it(monkeypatch):
     """The KV attends under a plan of exactly the rows it is given, padding
     included, with the eager path on this step's plan before a region plans its
     own (the pools' gather / scatter_ read the plan the pool holds when they
-    run). A call with a chunk over a second runs in a step of its own."""
+    run)."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP, LAYERS)
     attend = enc.kv.attend
@@ -664,10 +655,12 @@ def test_encoder_an_all_steady_step_leaves_its_resources_to_its_region():
         out = enc.step([1, 2], [enc.prepare(h, wavs[h][at:at + 1280]) for h in (1, 2)]).per_rid_outputs
         assert all(len(out[h]["audio_frame"]) == 1 for h in (1, 2))
     assert enc.regions[STEP].calls == 4
+    # call 2 is steady, call 1 not: the step declares call 1 alone and leaves call 2 to the region
     mixed = [enc.prepare(1, torch.randn(640) * 0.1), enc.prepare(2, torch.randn(1280) * 0.1)]
     step = enc.declare([1, 2], mixed)
     assert set(step.keys()) == {FRONT, CONV, KV}
-    assert _kv_spans(step) == [mixed[0].kwargs["n"], 1]
+    assert [seg.request_id for seg in step.get(KV).segments] == [1]
+    assert _kv_spans(step) == [mixed[0].kwargs["n"]]
 
 
 def test_encoder_a_step_mixes_a_steady_call_with_eager_chunks_past_the_window():
@@ -695,12 +688,11 @@ def test_encoder_a_step_mixes_a_steady_call_with_eager_chunks_past_the_window():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wav), atol=1e-5), h
 
 
-def test_encoder_a_steady_call_joins_the_eager_layers_of_its_step():
+def test_encoder_a_steady_call_keeps_its_region_beside_eager_layers():
     """A call one frame on whose window has wrapped, in a step where another
-    call's chunk makes several frames: this step's KV plan, which the eager
-    blocks run on, writes both calls' frames, so the steady call can't also
-    take the whole-step region (whose write of its frame would follow one from
-    padding into the ring entry the region reads)."""
+    call's chunk makes several frames (an upload's piece): the steady call still
+    replays the whole-step region, and the eager blocks run over the other call
+    alone, under a plan that holds only its rows. Both get their offline frames."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP, LAYERS)
     window = enc.node.encoder.config.left_context
@@ -709,8 +701,11 @@ def test_encoder_a_steady_call_joins_the_eager_layers_of_its_step():
     got = {1: [], 2: []}
     for pos in range(0, at, 1280):
         got[1] += enc.encode(1, wavs[1][pos:pos + 1280])
+    widths, front = [], enc.node._front
+    enc.node._front = lambda sts, *args: widths.append(len(sts)) or front(sts, *args)
+    calls = enc.regions[STEP].calls
     out = _encode_batch(enc, [(1, wavs[1][at:at + 1280], False), (2, wavs[2], False)])
-    assert len(out[2]) > 1
+    assert len(out[2]) > 1 and enc.regions[STEP].calls == calls + 1 and widths == [1]
     for h in (1, 2):
         got[h] += out[h]
     got[1] += enc.encode(1, wavs[1][at + 1280:], final=True)
@@ -719,10 +714,11 @@ def test_encoder_a_steady_call_joins_the_eager_layers_of_its_step():
         assert torch.allclose(torch.stack(got[h]), enc.offline(wavs[h]), atol=1e-5), h
 
 
-def test_encoder_runs_a_steady_call_eagerly_when_its_region_has_no_graph():
-    """The whole-step region leases the batch's bucket, but replays only the
-    steady calls: when the runner dropped the capture for that sub-batch (here
-    one call's), they take the eager path, which this step's plans cover."""
+def test_encoder_a_steady_call_pads_up_when_its_regions_bucket_was_dropped():
+    """The whole-step region leases the batch's bucket and replays only the
+    steady calls: when the capture for that sub-batch's bucket was dropped
+    (here one call's), it replays the next captured one, with a padding row,
+    so a lease covers every part of its batch."""
     enc = _Encoder()
     enc.regions = _encoder_regions(enc, STEP, LAYERS)
     step_region = enc.regions[STEP]
@@ -732,8 +728,10 @@ def test_encoder_runs_a_steady_call_eagerly_when_its_region_has_no_graph():
     for at in (0, 1280, 2560):
         for h, frames in _encode_batch(enc, [(h, wavs[h][at:at + 1280], False) for h in (1, 2)]).items():
             got[h] += frames
+    calls = step_region.calls
     # call 1 is one frame on (steady), call 2 appends half a frame
     out = _encode_batch(enc, [(1, wavs[1][3840:5120], False), (2, wavs[2][3840:4480], False)])
+    assert step_region.calls == calls + 1
     for h in (1, 2):
         got[h] += out[h]
     for h, end in ((1, 5120), (2, 4480)):
@@ -761,42 +759,6 @@ def test_encoder_a_calls_last_frames_do_not_depend_on_its_batch(b_len, a_chunk, 
     want = enc.offline(b)
     assert len(got_b) == want.shape[0]
     assert torch.allclose(torch.stack(got_b), want, atol=1e-5)
-
-
-def test_encoder_keeps_a_chunk_over_a_second_out_of_a_batch():
-    """A pass pads every call to its longest chunk, so a step holding an upload
-    or a large append is not batched: can_batch refuses it, by the chunk length
-    prepare_inputs reports, and the engine runs each call's step on its own.
-    Calls with a second or less share one pass. The frames are the offline
-    ones either way."""
-    enc = _Encoder()
-    fronts, front = [], enc.node._front
-
-    def spy_front(sts, chunks, final, *rest):
-        fronts.append(sorted(c.numel() for c in chunks if c is not None))
-        return front(sts, chunks, final, *rest)
-
-    enc.node._front = spy_front
-    wav = {1: torch.randn(16000 * 5) * 0.1, 2: torch.randn(1280) * 0.1, 3: torch.randn(16001) * 0.1,
-           4: torch.randn(16000) * 0.1}
-    prepared = {h: enc.prepare(h, w, final=True) for h, w in wav.items()}
-    assert {h: inp.input_seq_len for h, inp in prepared.items()} == {h: w.numel() for h, w in wav.items()}
-    assert not enc.node.can_batch(None, list(prepared.values()))
-    assert not enc.node.can_batch(None, [prepared[2], prepared[3]])
-    assert enc.node.can_batch(None, [prepared[2], prepared[4]])
-    assert enc.node.can_batch(None, [prepared[1]])                       # alone, it is its own step
-
-    out = _encode_batch(enc, [(h, w, True) for h, w in wav.items()])
-    assert sorted(fronts) == [[1280], [16000], [16001], [16000 * 5]]    # every call on its own
-    for h, w in wav.items():
-        assert torch.allclose(torch.stack(out[h]), enc.offline(w), atol=1e-5)
-
-    fronts.clear()
-    short = {5: torch.randn(1280) * 0.1, 6: torch.randn(16000) * 0.1}
-    out = _encode_batch(enc, [(h, w, True) for h, w in short.items()])
-    assert fronts == [[1280, 16000]]                                      # one pass
-    for h, w in short.items():
-        assert torch.allclose(torch.stack(out[h]), enc.offline(w), atol=1e-5)
 
 
 def test_encoder_takes_no_batch_wider_than_its_graphs():

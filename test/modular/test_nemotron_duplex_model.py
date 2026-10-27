@@ -454,6 +454,34 @@ def test_duplex_stream_connection_policies():
     assert set(conns) == {"audio_in", "audio_frame", "new_token"}
 
 
+def test_duplex_audio_in_steps_the_encoder_fronts_frame():
+    """audio_in's policy cuts on the frame the encoder's front pool holds: a
+    larger step pads batched steps and a smaller one keeps every call off the
+    graph."""
+    model = _make_model()
+    (client,) = model.get_partition_topology().client_connections()
+    frame = {s.resource_key: s for s in model.get_node_resources()}[ENCODER_FRONT].config.blocks["sig"].shape[0]
+    policy = client.chunk_policy_factory()
+    assert policy.split(torch.zeros(frame - 1)) == []
+    assert [len(p) for p in policy.split(torch.zeros(1))] == [frame]
+
+
+@pytest.mark.parametrize("upload_piece_s", [None, 0.4])
+def test_duplex_audio_in_takes_an_upload_in_pieces_and_a_live_frame_whole(upload_piece_s):
+    """An upload reaches the encoder in pieces of up to ``upload_piece_s`` (a
+    model kwarg), one eager pass each, not a step per frame; a live append of
+    one frame passes whole, a steady step."""
+    model = NemotronDuplexModel("unused", upload_piece_s=upload_piece_s)
+    (client,) = model.get_partition_topology().client_connections()
+    policy = client.chunk_policy_factory()
+    piece, upload = int(model.upload_piece_s * model.config.stt.sample_rate), model.max_session_samples
+    pieces = policy.split(torch.zeros(upload))
+    assert max(len(p) for p in pieces) <= piece
+    assert len(pieces) == -(-upload // piece)
+    frame = 1280
+    assert [len(p) for p in policy.split(torch.zeros(frame))] == [frame]
+
+
 def test_duplex_process_prompt_seeds_frame0_feedback():
     """The frame-0 decode step lists prev_text / prev_func as inputs but has no
     prior sampled token; process_prompt must seed them (BOS / PAD) or the decode

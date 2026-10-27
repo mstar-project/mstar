@@ -77,7 +77,12 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.components.audio_features import NemoLogMel
-from mstar.model.components.fastconformer_stream import encoder_kv_config, encoder_state_blocks, front_state_blocks
+from mstar.model.components.fastconformer_stream import (
+    encoder_kv_config,
+    encoder_state_blocks,
+    front_state_blocks,
+    samples_per_frame,
+)
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
 from mstar.model.nemotron_duplex.config import (
@@ -99,7 +104,7 @@ from mstar.model.nemotron_duplex.config import (
     session_too_long,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.chunk_policy import FixedChunkPolicy, GridChunkPolicy
 from mstar.streaming.topology import (
     CLIENT,
     ClientStreamLimits,
@@ -368,7 +373,8 @@ class NemotronDuplexModel(Model):
     """NVIDIA NemotronLabs VoiceChat-11B (duplex S2S)."""
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None,
-                 max_session_s: float | None = None, max_prompt_tokens: int | None = None, **kwargs):
+                 max_session_s: float | None = None, max_prompt_tokens: int | None = None,
+                 upload_piece_s: float | None = None, **kwargs):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.config = NemotronDuplexConfig()
@@ -376,6 +382,8 @@ class NemotronDuplexModel(Model):
             self.max_session_s = max_session_s
         if max_prompt_tokens:
             self.max_prompt_tokens = max_prompt_tokens
+        if upload_piece_s:
+            self.upload_piece_s = upload_piece_s
         self._tokenizer = None  # lazy — not needed in dummy mode
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
@@ -439,6 +447,12 @@ class NemotronDuplexModel(Model):
     # + 1 final PAD frame fit 16 pages a stream; 32 sessions x 2 streams x 16 =
     # 1024 pages (+ the sink) = 28 GiB.
     max_session_s = 160.0
+    # Longest piece of the user's audio the encoder takes in a step
+    # (``model_kwargs: {upload_piece_s: ...}``), in whole encoder frames, at
+    # least one: an upload's pieces are one eager encoder pass each, which the
+    # live calls of the same step wait for. Longer drains an upload in fewer
+    # steps; shorter keeps those steps short.
+    upload_piece_s = 2.0
     # Most channels an upload may have; the model takes 16 kHz mono speech.
     max_upload_channels = 2
     # Longest system prompt (``model_kwargs: {max_prompt_tokens: ...}``). The
@@ -743,11 +757,18 @@ class NemotronDuplexModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
+        stt = self.config.stt
+        frame = samples_per_frame(stt.encoder, stt.hop_length)
+        steps = max(1, int(self.upload_piece_s * stt.sample_rate) // frame)
         return PartitionTopology(partitions=["Encoder", "LLM", "Talker"], connections=[
-            # the user's audio, one item per uploaded file or append, at most a
-            # session's samples: past them the talker KV and the decode loops run out
+            # the user's audio, at most a session's samples: past them the talker KV
+            # and the decode loops run out. The buffer cuts it on the encoder's frame
+            # grid, into pieces of up to upload_piece_s: an 80 ms live append is one
+            # frame, a steady step batched with the other calls', and an upload a
+            # few long eager passes. The front pool holds the same frame, so a
+            # checkpoint that frames otherwise is refused with the resources.
             Connection(from_partition=CLIENT, to_partition="Encoder", edge_name=AUDIO_IN,
-                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                       chunk_policy_factory=lambda: GridChunkPolicy(frame, max_steps=steps),
                        limits=ClientStreamLimits(max_items=self.max_session_samples,
                                                  item_size=torch.numel, unit="samples")),
             # one audio frame per nano decode step. continue_after_done=False:

@@ -47,6 +47,10 @@ model_kwargs:
   # Longer system prompts get a 400; the prompt prefills in one step that
   # stalls every live session (~2.75 ms/token). TODO(prefill): drop once chunked.
   max_prompt_tokens: 512
+  # The longest piece of an upload or a long append the encoder takes in one
+  # eager pass (whole 80 ms frames): longer drains an upload in fewer steps,
+  # shorter keeps short the steps that live calls beside it wait through.
+  upload_piece_s: 2.0
 
 node_groups:
   - node_names:
