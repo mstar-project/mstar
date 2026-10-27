@@ -36,14 +36,21 @@ def _pending(request_walks: dict[int, str]):
 
 def test_a_combined_batch_down_to_one_walk_routes_under_that_walks_signals():
     # the decode row left the batch (failed in prepare_inputs, say)
-    req = _worker()._get_postprocess_request(_pending({2: "prefill_text"}), None, engine=None)
+    req = _worker()._get_postprocess_request(_pending({2: "prefill_text"}), None, None, False, None, None)
     assert (req.graph_walk, req.walks) == ("prefill_text", None)
     assert req.output_signals == SIGNALS["prefill_text"]
 
 
 def test_a_combined_batch_of_several_walks_routes_under_their_union():
     req = _worker()._get_postprocess_request(
-        _pending({1: "decode", 2: "prefill_text"}), None, engine=None,
+        _pending({1: "decode", 2: "prefill_text"}), None, None, False, None, None,
     )
     assert req.walks == ["decode", "prefill_text"] and req.rid_walk_idx == [0, 1]
     assert req.output_signals == ["text_inputs", "new_token"]
+
+
+def test_the_models_stops_ride_the_request_when_the_runtime_does_not_check():
+    req = _worker()._get_postprocess_request(
+        _pending({2: "prefill_text"}), None, None, False, None, {2: {"decode_loop"}},
+    )
+    assert not req.runtime_stops and req.stops == {2: {"decode_loop"}}

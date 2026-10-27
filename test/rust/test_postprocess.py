@@ -89,15 +89,16 @@ def _collect(box):
     return out
 
 
-def _start(rt, n):
+def _start(rt, n, limits=True):
     rids = []
     for i in range(n):
         rid = rt.add_request(
             request_id=f"r{i}", partition=PART, graph_walk=WALK,
             partition_worker_graph_ids=[0],
             worker_graph_to_workers=ParallelList([0], [[ME]]), loop_caps={})
-        # a limit no step reaches: EOS and the loop's cap end the rows
-        rt.register_stop_limits(rid, SimpleNamespace(max_tokens=1 << 20, resource_configs={}))
+        if limits:
+            # a limit no step reaches: EOS and the loop's cap end the rows
+            rt.register_stop_limits(rid, SimpleNamespace(max_tokens=1 << 20, resource_configs={}))
         rids.append(rid)
     block = ColumnarEdgeSpecs.empty()
     for rid in rids:
@@ -160,13 +161,15 @@ def test_native_matches_reference(tmp_path, mode, dtype, reverse_rows):
         row_rids = list(reversed(active)) if reverse_rows else list(active)
         rows = torch.tensor([[values[r]] for r in row_rids], dtype=dtype)
         column = rows.reshape(rows.shape[0], -1)[:, 0]
+        # the model's stops, checked before the runtime when it does not check
+        model_stops = {r: {LOOP} for r, v in values.items() if v == EOS}
         request = PostprocessRequest(
             partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
             wg_ids=ParallelList(list(active), [0] * len(active)),
+            stops=model_stops if mode == "model_stops" else None,
             runtime_stops=mode != "model_stops", tokens=column, row_rids=row_rids,
             inline=None if mode == "stored" else InlineColumn(SIG, column),
         )
-        model_stops = {r: {LOOP} for r, v in values.items() if v == EOS}
         traces = {k: _drive(rt, request, values, model_stops) for k, rt in rts.items()}
         assert traces["native"] == traces["reference"], step
         needs |= {t[0] for t in traces["native"]}
@@ -177,9 +180,7 @@ def test_native_matches_reference(tmp_path, mode, dtype, reverse_rows):
         )
         active = [r for r in active if r not in stopped]
     expected = {PostprocessNeed.DONE, PostprocessNeed.SEND}
-    expected |= {"model_stops": {PostprocessNeed.STOPS}, "stored": {PostprocessNeed.STORE}}.get(
-        mode, set(),
-    )
+    expected |= {"stored": {PostprocessNeed.STORE}}.get(mode, set())
     assert needs == expected
     for peer in ("api_server", "conductor"):
         got = {k: _collect(boxes[k][peer]) for k in boxes}
@@ -190,20 +191,21 @@ def test_native_matches_reference(tmp_path, mode, dtype, reverse_rows):
 
 
 def test_dropped_rows_are_not_routed(tmp_path):
-    """A row ``check_stop`` failed (STOPS' ``dropped``) leaves the step: it
-    is neither stopped nor routed, in either implementation."""
+    """When the runtime's own check cannot decide (here: no limits), a row
+    ``check_stop`` then fails (STOPS' ``dropped``) leaves the step: it is
+    neither stopped nor routed, in either implementation."""
     traces = {}
     for k, cls in (("native", rust_runtime.RustGraphRuntime), ("reference", _Reference)):
         d = tmp_path / k
         d.mkdir()
         rt = _runtime(cls, str(d))
-        rids = _start(rt, 3)
+        rids = _start(rt, 3, limits=False)
         assert rt.pop_rids(NODE, WALK, rids) is not None
         column = torch.tensor([1, 2, 3], dtype=torch.int64)
         request = PostprocessRequest(
             partition=PART, node_name=NODE, graph_walk=WALK, output_signals=[SIG],
-            wg_ids=ParallelList(list(rids), [0] * 3), row_rids=rids,
-            inline=InlineColumn(SIG, column),
+            wg_ids=ParallelList(list(rids), [0] * 3), runtime_stops=True, tokens=column,
+            row_rids=rids, inline=InlineColumn(SIG, column),
         )
         traces[k] = _drive(
             rt, request, dict(zip(rids, [1, 2, 3], strict=True)),
