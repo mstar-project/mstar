@@ -101,13 +101,20 @@ def ulysses_attention(
     head_dim=2``). The head counts must be divisible by ``sp`` (Ulysses shards
     heads). When the group is trivial this is a passthrough — byte-identical to
     the non-SP path."""
-    if sp_group.world_size == 1:
+    world_size = sp_group.world_size
+    if world_size == 1:
         return run_attention(q=q, k=k, v=v)
-    # scatter heads, gather sequence: [seq/P, H, D] -> [seq, H/P, D]
-    to_heads = dict(scatter_dim=head_dim, gather_dim=seq_dim, gather_sizes=seq_sizes)
-    q = sp_group.all_to_all(q, **to_heads)
-    k = sp_group.all_to_all(k, **to_heads)
-    v = sp_group.all_to_all(v, **to_heads)
+    seq_dim %= q.dim()
+    head_dim %= q.dim()
+    # scatter heads, gather sequence: [seq/P, H, D] -> [seq, H/P, D], for q, k and v in one
+    # exchange (the exchanges are latency-bound at small sizes): each rank's share of the
+    # three tensors' heads side by side, so scattering the heads sends rank r all of its share
+    counts = [t.size(head_dim) // world_size for t in (q, k, v)]
+    qkv = torch.cat([t.unflatten(head_dim, (world_size, -1)) for t in (q, k, v)], dim=head_dim + 1)
+    qkv = sp_group.all_to_all(
+        qkv.flatten(head_dim, head_dim + 1), scatter_dim=head_dim, gather_dim=seq_dim, gather_sizes=seq_sizes,
+    )
+    q, k, v = qkv.split(counts, dim=head_dim)
     out = run_attention(q=q, k=k, v=v)
     # scatter sequence, gather heads: [seq, H/P, D] -> [seq/P, H, D]
     return sp_group.all_to_all(out, scatter_dim=seq_dim, gather_dim=head_dim, scatter_sizes=seq_sizes)

@@ -2,7 +2,8 @@
 
 ``CommGroup.all_to_all`` against the layout it promises, on even and uneven
 splits, and ``ulysses_attention`` over sharded tokens against one rank attending
-the whole sequence, for the ``[S, H, D]`` and ``[B, S, H, D]`` layouts.
+the whole sequence (with fewer key/value heads than query heads too), for the
+``[S, H, D]`` and ``[B, S, H, D]`` layouts.
 """
 
 from __future__ import annotations
@@ -44,8 +45,8 @@ def _layout(batched: bool) -> tuple[int, int]:
     return (1, 2) if batched else (0, 1)
 
 
-def _full(total: int, batched: bool, seed: int = 0) -> torch.Tensor:
-    shape = (2, total, HEADS, 4) if batched else (total, HEADS, 4)
+def _full(total: int, batched: bool, seed: int = 0, heads: int = HEADS) -> torch.Tensor:
+    shape = (2, total, heads, 4) if batched else (total, heads, 4)
     return torch.randn(shape, generator=torch.Generator().manual_seed(seed))
 
 
@@ -76,16 +77,16 @@ def _sdpa(batched):
     def attend(q, k, v):
         if not batched:
             q, k, v = (t.unsqueeze(0) for t in (q, k, v))
-        out = F.scaled_dot_product_attention(*(t.transpose(1, 2) for t in (q, k, v))).transpose(1, 2)
+        out = F.scaled_dot_product_attention(*(t.transpose(1, 2) for t in (q, k, v)), enable_gqa=True).transpose(1, 2)
         return out if batched else out.squeeze(0)
     return attend
 
 
-def _attention(rank, world, total, batched):
+def _attention(rank, world, total, batched, kv_heads):
     group = _group(rank, world)
     seq_dim, _ = _layout(batched)
     sizes = sp_seq_split(total, world)
-    q, k, v = (_full(total, batched, seed) for seed in range(3))
+    q, k, v = (_full(total, batched, seed, heads) for seed, heads in enumerate((HEADS, kv_heads, kv_heads)))
     want = _sdpa(batched)(q, k, v)
     start = sum(sizes[:rank])
     q, k, v = (t.narrow(seq_dim, start, sizes[rank]) for t in (q, k, v))
@@ -94,6 +95,7 @@ def _attention(rank, world, total, batched):
 
 
 @pytest.mark.parametrize("batched", [False, True], ids=["SHD", "BSHD"])
-@pytest.mark.parametrize("world,total", [(2, 6), (3, 11)], ids=["2-even", "3-uneven"])
-def test_ulysses_attention_matches_one_rank(tmp_path, world, total, batched):
-    _run(_attention, world, tmp_path / "store", total, batched)
+@pytest.mark.parametrize("world,total,kv_heads", [(2, 6, HEADS), (3, 11, HEADS), (2, 7, 2), (3, 9, 3)],
+                         ids=["2-even", "3-uneven", "2-gqa", "3-gqa"])
+def test_ulysses_attention_matches_one_rank(tmp_path, world, total, kv_heads, batched):
+    _run(_attention, world, tmp_path / "store", total, batched, kv_heads)
