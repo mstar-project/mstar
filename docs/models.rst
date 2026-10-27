@@ -32,7 +32,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_droid``
      - ``nvidia/Cosmos3-Nano-Policy-DROID``
      - Cosmos3 action-policy fine-tune for the DROID platform (``domain_name``
-       ``droid_lerobot``, 10-dim raw actions); no sound pathway. The config
+       ``droid_lerobot``, 8-dim raw actions); no sound pathway. The config
        serves the released policy sampling defaults (4 steps, guidance 3.0).
    * - ``cosmos3_edge``
      - ``nvidia/Cosmos3-Edge``
@@ -987,15 +987,29 @@ so an image or clip produced alongside other requests differs from its solo
 result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
 request at a time when outputs must be bitwise repeatable.
 
-The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
-``domain_name``) predicts a chunk of robot actions from the current observation:
-``output_modalities=action`` with ``model_kwargs``
-``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10,
-"action_chunk_size": 32}``; the reply's ``action`` payload is float32
-``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the
-embodiment's actions. For a control loop use ``/generate/ws`` (one connection,
-pipelined observations): ``examples/cosmos3_action_ws_client.py`` runs it and
-reports chunks/s, actions/s and latency percentiles.
+The action policy (``cosmos3_droid``, ``cosmos3_edge_droid``, or ``cosmos3_edge`` with
+an action ``domain_name``) predicts a chunk of robot actions from the current
+observation: ``output_modalities=action`` with ``model_kwargs``
+``{"action_mode": "policy", "robot_state": joints + [gripper]}``; the reply's
+``action`` payload is float32 ``[action_chunk_size, action_dim_padded]`` and the first
+``raw_action_dim`` columns are the embodiment's actions. ``robot_state`` is the robot's
+current state, ``raw_action_dim`` finite values (the width defaults to it; anything
+else is a 400). It conditions the chunk as one more action token, clean at video frame
+0 in front of the predicted rows, so ``num_frames`` is ``action_chunk_size + 1``, and
+the reply leaves it out. NVIDIA's RoboLab server runs the released DROID policies this
+way, and their two configs serve its defaults: 32 predicted rows at 15 fps for
+``droid_lerobot`` in the 736x544 bucket (the ``policy_*`` keys, of which Edge's
+``checkpoint.json`` carries the first three), and for Edge the cookbook's guidance
+interval (``guidance_interval_action: [960, 1001]``). The checkpoints keep the gripper as
+``1 - gripper``, so those configs flip it in ``robot_state`` and back in the reply
+(``policy_flip_dims``), and a client sends the 7 joint positions and gripper position as
+DROID records them. The observation is the wrist frame above the two exterior frames,
+reflection-padded to 736x544, and the prompt is the task with view, duration and
+resolution text (a JSON caption for Edge). A deployment without policy
+defaults needs ``domain_name`` and, without a ``robot_state``, ``raw_action_dim`` in the
+request. For a control loop use ``/generate/ws`` (one connection, pipelined
+observations): ``examples/cosmos3_action_ws_client.py`` builds that request, runs the
+loop and reports chunks/s, actions/s and latency percentiles.
 
 Cosmos3 streaming rollout (windowed video)
 ------------------------------------------
