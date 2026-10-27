@@ -171,7 +171,13 @@ pub(super) struct Pass {
 
 #[derive(Default)]
 pub(super) struct SchedState {
+    /// each key's caps, lowered by `limits`
     keys: FxHashMap<Key, KeyCaps>,
+    /// each key's caps as configured, before `limits`
+    base_caps: FxHashMap<Key, Vec<(Sym, Option<u32>)>>,
+    /// (node, walk) -> the most rows a step may take after refused admits
+    /// (`MicroScheduler.batch_limits` and `batch_ceilings`, the smaller)
+    limits: FxHashMap<(Sym, Sym), u32>,
     /// the configured batch builder's Rust backend
     builder: Option<Box<dyn BatchBuilder>>,
     leaders: FxHashSet<Sym>,
@@ -257,12 +263,37 @@ impl GraphRuntime {
             };
             cfgs.insert(key, cfg);
         }
+        self.sched.base_caps = cfgs.iter().map(|(k, c)| (*k, c.caps.clone())).collect();
         self.sched.keys = cfgs;
+        self.sched_apply_limits(None);
         self.sched.leaders = leaders.iter().map(|n| self.interner.intern(n)).collect();
         self.sched.mixing = mixing.iter()
             .map(|(n, w)| (self.interner.intern(n), self.interner.intern(w)))
             .collect();
         Ok(())
+    }
+
+    /// Lower `(node, walk)`'s cap to `limit` in every key that lists the walk,
+    /// or lift it with None, as `SchedKeys.walk_caps` does on the Python side.
+    pub(super) fn sched_set_limit_impl(&mut self, node: &str, walk: &str, limit: Option<u32>) {
+        let at = (self.interner.intern(node), self.interner.intern(walk));
+        match limit {
+            Some(limit) => self.sched.limits.insert(at, limit),
+            None => self.sched.limits.remove(&at),
+        };
+        self.sched_apply_limits(Some(at.0));
+    }
+
+    /// Recompute the caps of `node`'s keys (every key's with None) from their
+    /// configured caps and the limits.
+    fn sched_apply_limits(&mut self, node: Option<Sym>) {
+        let SchedState { keys, base_caps, limits, .. } = &mut self.sched;
+        for (key, cfg) in keys.iter_mut().filter(|(k, _)| node.is_none_or(|n| k.0 == n)) {
+            let Some(base) = base_caps.get(key) else { continue };
+            cfg.caps = base.iter()
+                .map(|&(walk, cap)| (walk, min_cap([cap, limits.get(&(key.0, walk)).copied()])))
+                .collect();
+        }
     }
 
     fn sched_builder(&self) -> PyResult<&dyn BatchBuilder> {

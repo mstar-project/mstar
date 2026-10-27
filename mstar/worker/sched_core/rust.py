@@ -68,6 +68,9 @@ class RustSchedCore(SchedCore):
     ) -> list[int]:
         return self._rt.sched_live_backlog(*key, list(waiting), list(failed))
 
+    def set_limit(self, node_name: str, graph_walk: str, limit: int | None) -> None:
+        self._rt.sched_set_limit(node_name, graph_walk, limit)
+
     def state(self):
         """``(backlog, rr)`` for tests: backlog as ``[(node, label, rids,
         walks)]`` in order, rr as ``{(node, label): batch number}`` plus the

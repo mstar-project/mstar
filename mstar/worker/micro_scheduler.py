@@ -376,6 +376,7 @@ class MicroScheduler:
         key = (node_name, graph_walk)
         limit = max(rows, 1)
         self.batch_limits[key] = min(limit, self.batch_limits.get(key, limit))
+        self._sync_limit(key)
 
     def could_refill(self, node_name: str, graph_walk: str, batch_rids: set[int]) -> bool:
         """Whether rows of ``(node_name, graph_walk)``'s scheduling key other
@@ -388,13 +389,17 @@ class MicroScheduler:
         come back only once their pages fit. Refusal path only.
         """
         key = self._key(node_name, graph_walk)
-        if self._live_backlog(key) - batch_rids:
+        now = time.monotonic()
+        waiting = self.pending_removes.keys() | {
+            rid for rid, until in self.held_until.items() if until > now
+        }
+        if set(self.core.live_backlog(key, waiting, self.failed_rids)) - batch_rids:
             return True
         exclude = self.failed_rids.union(self.pending_removes, self.held_until, batch_rids)
         engine = self.engine_manager.get_engine(node_name)
         return any(
             not engine.is_offloaded(spec.node_name, rid)
-            for spec in self._ready_specs(exclude, key, None)
+            for spec in self.runtime.get_ready_nodes(exclude, target=key)
             if spec.node_name == node_name
             for rid in spec.rids
         )
@@ -419,6 +424,7 @@ class MicroScheduler:
         if cap <= self.batch_ceilings.get(key, cap):
             self.batch_ceilings[key] = cap
             self.ceiling_resources[key] = resource
+            self._sync_limit(key)
 
     def lift_batch_caps(self, resources: Collection[str]) -> None:
         """A teardown handed pages of ``resources`` back: lift the `cap_batch`
@@ -431,6 +437,7 @@ class MicroScheduler:
         for key, resource in list(self.ceiling_resources.items()):
             if resource is None or resource in resources:
                 del self.batch_ceilings[key], self.ceiling_resources[key]
+                self._sync_limit(key)
 
     def clear_batch_limit(
         self, node_name: str, graph_walk: str, rows: int, walks: Iterable[str] = (),
@@ -455,9 +462,10 @@ class MicroScheduler:
             ceiling = self.batch_ceilings.get(key)
             if ceiling is not None and rows < min(ceiling, limit or ceiling):
                 del self.batch_ceilings[key], self.ceiling_resources[key]
+            self._sync_limit(key)
         for walk in walks:
-            if walk != graph_walk:
-                self.batch_limits.pop((node_name, walk), None)
+            if walk != graph_walk and self.batch_limits.pop((node_name, walk), None) is not None:
+                self._sync_limit((node_name, walk))
 
     def tp_rids(self, message: ScheduleTPNode) -> list[int]:
         """``ScheduleTPNode`` crosses the wire, so its rids are strings; these
@@ -851,13 +859,29 @@ class MicroScheduler:
         if self._core is None:
             rust = self.batch_builder.rust is not None and _is_rust_runtime(self.runtime)
             self._core = self._rust_core() if rust else self._python_core()
+            for (node, walk), limit in self.keys.limits.items():
+                self._core.set_limit(node, walk, limit)
         return self._core
+
+    def _sync_limit(self, key: tuple[str, str]) -> None:
+        """``key``'s batch limit for the core: the smaller of its `limit_batch`
+        limit and its `cap_batch` ceiling, or none."""
+        limits = [v for v in (self.batch_limits.get(key), self.batch_ceilings.get(key)) if v is not None]
+        limit = min(limits) if limits else None
+        if limit == self.keys.limits.get(key):
+            return
+        if limit is None:
+            del self.keys.limits[key]
+        else:
+            self.keys.limits[key] = limit
+        if self._core is not None:
+            self._core.set_limit(*key, limit)
 
     def _rust_core(self) -> RustSchedCore:
         keys = {self._key(node, walk) for node, walk in self.runtime.local_node_walks()}
         return RustSchedCore(self.runtime, [
             (node, label, self.keys.walks_of_key.get((node, label), []),
-             self.keys.walk_caps((node, label)), self.keys.walk_row_caps((node, label)))
+             self.keys.engine_walk_caps((node, label)), self.keys.walk_row_caps((node, label)))
             for node, label in sorted(keys)
         ], self.parallel_leader_nodes or (), self.keys.mixing_chains, self.batch_builder.rust)
 

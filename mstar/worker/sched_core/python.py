@@ -625,6 +625,9 @@ class PythonSchedCore(SchedCore):
                 )
         self.backlog = {k: v for k, v in self.backlog.items() if len(v) > 0}
 
+    def set_limit(self, node_name: str, graph_walk: str, limit: int | None) -> None:
+        pass  # reads them off ``SchedKeys``
+
     def live_backlog(
         self, key: tuple[str, str], waiting: Iterable[int], failed: Iterable[int],
     ) -> list[int]:

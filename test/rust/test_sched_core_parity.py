@@ -378,8 +378,20 @@ def test_both_cores_schedule_the_same(config, seed, leaders, variant, monkeypatc
             rid = rng.choice(live)
             idle.discard(rid)
             both(f"cancel {rid}", lambda w, rid=rid: w.remove(rid))
-        elif op < 0.93:
+        elif op < 0.91:
             clock.t += 0.03
+        elif op < 0.95:
+            # a refused admit's limit or cap, or a step / teardown that lifts one
+            key = (LLM, rng.choice([DEC, PRE, MIXED])) if rng.random() < 0.8 else (ENC, ENCODE)
+            kind, rows = rng.random(), rng.randint(0, 5)
+            if kind < 0.35:
+                both(f"limit {key} {rows}", lambda w, k=key, n=rows: w.sched.limit_batch(*k, n))
+            elif kind < 0.6:
+                both(f"cap {key} {rows}", lambda w, k=key, n=rows: w.sched.cap_batch(*k, n, "kv"))
+            elif kind < 0.85:
+                both(f"admitted {key} {rows}", lambda w, k=key, n=rows: w.sched.clear_batch_limit(*k, n))
+            else:
+                both("lift caps", lambda w: w.sched.lift_batch_caps({"kv"}))
         else:
             both("peek", lambda w: w.sched.has_ready_excluding(w.rs, (LLM, DEC)))
             both("room", lambda w: (

@@ -2008,6 +2008,13 @@ impl GraphRuntime {
         self.sched_backlog_has_schedulable_impl(exclude_key, exclude_walk, waiting, failed)
     }
 
+    /// A `(node, walk)` batch limit from refused admits (`MicroScheduler
+    /// .batch_limits` / `batch_ceilings`); None lifts it.
+    #[pyo3(signature = (node, walk, limit=None))]
+    fn sched_set_limit(&mut self, node: &str, walk: &str, limit: Option<u32>) {
+        self.sched_set_limit_impl(node, walk, limit)
+    }
+
     /// `key`'s backlogged rows that are not waiting or failed, in order.
     fn sched_live_backlog(
         &self, node: &str, label: &str, waiting: Vec<u32>, failed: Vec<u32>,

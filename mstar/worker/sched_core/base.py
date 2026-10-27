@@ -107,6 +107,9 @@ class SchedKeys:
         self._max_bs: dict[tuple[str, str], int | None] = {}
         self._walk_caps_of_key: dict[tuple[str, str], dict[str, int | None]] = {}
         self._row_caps_of_key: dict[tuple[str, str], dict[str, int]] = {}
+        # (node, walk) -> the most rows a step may take after refused admits,
+        # kept by ``MicroScheduler`` (the smaller of its limit and ceiling)
+        self.limits: dict[tuple[str, str], int] = {}
 
     def _parse_speculation_mixes_walks(
         self, setting: Mapping[str, Any],
@@ -161,12 +164,21 @@ class SchedKeys:
 
     def walk_caps(self, key: tuple[str, str]) -> dict[str, int | None]:
         """``BatchBuildRequest.walk_caps`` for ``key``: its walk's cap, or a
-        combined key's walks' caps and its own under its label."""
+        combined key's walks' caps and its own under its label, each lowered
+        by any limit from a refused admit. The engine's caps are cached; the
+        limits come and go, so they are applied on every call."""
+        caps = self.engine_walk_caps(key)
+        if not self.limits:
+            return caps
+        return {walk: self._limited(key[0], walk, cap) for walk, cap in caps.items()}
+
+    def engine_walk_caps(self, key: tuple[str, str]) -> dict[str, int | None]:
+        """``walk_caps`` before any limit: the engine's, asked once."""
         caps = self._walk_caps_of_key.get(key)
         if caps is None:
             walks = self.walks_of_key.get(key, ())
-            caps = {walk: self.max_batch_size(key[0], walk) for walk in walks}
-            caps[key[1]] = self.max_batch_size(*key)
+            caps = {walk: self._engine_cap(key[0], walk) for walk in walks}
+            caps[key[1]] = self._engine_cap(*key)
             self._walk_caps_of_key[key] = caps
         return caps
 
@@ -185,6 +197,11 @@ class SchedKeys:
         return caps
 
     def max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
+        """The engine's cap for this (node, walk), if it has one, lowered by
+        any limit from a refused admit."""
+        return self._limited(node_name, graph_walk, self._engine_cap(node_name, graph_walk))
+
+    def _engine_cap(self, node_name: str, graph_walk: str) -> int | None:
         """The engine's cap for this (node, walk), if it has one. A combined
         walk's cap is the model's to declare, via its captures or max_batch_size.
         Fixed once the graphs are captured, so asked once."""
@@ -194,6 +211,12 @@ class SchedKeys:
                 node_name, graph_walk
             )
         return self._max_bs[key]
+
+    def _limited(self, node_name: str, graph_walk: str, cap: int | None) -> int | None:
+        limit = self.limits.get((node_name, graph_walk))
+        if limit is None:
+            return cap
+        return limit if cap is None else min(cap, limit)
 
     def walk_set_cap(self, key: tuple[str, str], walks: set[str]) -> int | None:
         """The cap of a mixed ``key`` step holding ``walks``, as the batch
@@ -260,3 +283,8 @@ class SchedCore(ABC):
         self, key: tuple[str, str], waiting: Iterable[int], failed: Iterable[int],
     ) -> list[int]:
         """``key``'s backlogged rows that are not failed or waiting, in order."""
+
+    @abstractmethod
+    def set_limit(self, node_name: str, graph_walk: str, limit: int | None) -> None:
+        """``SchedKeys.limits`` changed for ``(node_name, graph_walk)``: a core
+        with its own copy of the caps lowers it (None lifts it)."""
