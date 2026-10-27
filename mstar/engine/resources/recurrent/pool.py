@@ -76,12 +76,14 @@ class RecurrentStatePool(Resource):
         config = spec.config
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
-        for block in config.blocks.values():
-            if block.dtype is None:
-                block.dtype = info.kv_dtype if info.kv_dtype is not None else torch.get_default_dtype()
-        return cls(device=info.device, config=config, name=spec.resource_key)
+        # resolved here, not written back: the config is the model's, shared by its specs
+        return cls(device=info.device, config=config, name=spec.resource_key, kv_dtype=info.kv_dtype)
 
-    def __init__(self, device: torch.device, config: RecurrentStateConfig, name: str = "recurrent_state"):
+    def __init__(
+        self, device: torch.device, config: RecurrentStateConfig, name: str = "recurrent_state",
+        kv_dtype: torch.dtype | None = None,
+    ):
+        """``kv_dtype`` (the engine's) stands in for a block's ``dtype=None``."""
         self._device = device
         self.config = config
         # the resource key, for errors
@@ -93,7 +95,7 @@ class RecurrentStatePool(Resource):
         self._blocks: dict[str, torch.Tensor] = {
             name: torch.zeros(
                 (config.num_layers, config.max_slots, *block.shape),
-                dtype=block.dtype,
+                dtype=block.dtype or kv_dtype or torch.get_default_dtype(),
                 device=device,
             )
             for name, block in config.blocks.items()
