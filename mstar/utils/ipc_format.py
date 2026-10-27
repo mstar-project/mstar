@@ -70,8 +70,10 @@ class RemoveRequest(MessageBody):
 
 @dataclass
 class DrainRequest(MessageBody):
-    # Phase-1 teardown: stop reading this request and confirm no reads remain.
-    # Hard cleanup (RemoveRequest) follows once every reader has ACKed via READS_DONE.
+    # Phase-1 teardown: stop scheduling this request, and ACK READS_DONE once no
+    # read of it is in flight, starting none after (the data worker also stops
+    # reading its results). Hard cleanup (RemoveRequest) follows once every
+    # reader has ACKed.
     request_id: str
     source: int = MessageSource.CONDUCTOR
 

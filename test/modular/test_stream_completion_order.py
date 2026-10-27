@@ -263,7 +263,7 @@ def _consumer(policy):
     w = Worker.__new__(Worker)
     buf = StreamBuffer(1, EDGE, "LLM", policy)
     w.worker_id = CONSUMER
-    w._draining_rids = set()
+    w._reads_done_sent = set()
     w.enable_nvtx = False
     w._rid = lambda rid: 1
     w.request_state = SimpleNamespace(per_request_info={
