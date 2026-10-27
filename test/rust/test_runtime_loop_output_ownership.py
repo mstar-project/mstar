@@ -15,6 +15,13 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  
 from mstar.utils.containers import ParallelList  # noqa: E402
 
 
+def _reported(store, uuids):
+    """What a cleanup dereference that frees ``uuids`` returns: a store that
+    frees in place reports only what needs the transport's teardown, which
+    none of these synthetic tensors do."""
+    return [] if store.frees_in_place else uuids
+
+
 def _caps(section):
     """What the conductor sends when a request names no caps: every loop at its max_iters."""
     return {name: loop.max_iters for name, loop in section.get_loops().items()}
@@ -69,7 +76,7 @@ def test_finished_loop_ownership(backend, accumulated, nested, readers, persist)
                 assert freed == []
                 assert all(book.get_info(u) is not None and not book.can_gc(u) for u in expected)
             else:
-                assert sorted(freed) == expected
+                assert sorted(freed) == _reported(store, expected)
                 assert all(book.get_info(u) is None for u in expected)
     runtime.remove_request(rid)
 
@@ -105,7 +112,7 @@ def test_child_accumulation_survives_parent_finish(backend, readers):
             assert all(book.get_info(u) is not None for u in expected)
             for reader in range(readers):
                 freed, _ = store.dereference_batch_uniform(expected, cleanup=True)
-                assert sorted(freed) == (expected if reader + 1 == readers else [])
+                assert sorted(freed) == (_reported(store, expected) if reader + 1 == readers else [])
     assert all(book.get_info(u) is None for u in range(200, 204))
     runtime.remove_request(rid)
 
@@ -155,7 +162,7 @@ def test_loop_finished_by_node_without_outputs_settles_older_holds(backend, accu
             assert book.can_gc(uuid), "persistence must not conceal a leftover cache hold"
     else:
         freed, _ = store.dereference_batch_uniform(expected, cleanup=True)
-        assert sorted(freed) == expected
+        assert sorted(freed) == _reported(store, expected)
         assert all(book.get_info(u) is None for u in expected)
     runtime.remove_request(rid)
 

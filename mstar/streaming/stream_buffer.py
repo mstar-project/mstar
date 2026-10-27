@@ -211,6 +211,7 @@ class StreamBuffer:
         if run < buf_len and not self.policy.is_ready(run):
             # The next items run under another walk: flush this walk's run
             items = self._buffer[:run]
+            released = items
             self._buffer = self._buffer[run:]
             self._consumed += run
             stride = run
