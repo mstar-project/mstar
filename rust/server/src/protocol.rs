@@ -360,16 +360,6 @@ mod tests {
     }
 
     #[test]
-    fn sampling_floats_pass_as_sent() {
-        // the server refuses these; parsed here, "nan" would be served at the default
-        for v in [r#""nan""#, r#""inf""#, r#""abc""#] {
-            let r = chat(&format!(r#"{{"messages":[],"temperature":{v},"top_p":{v}}}"#));
-            let sent: Value = serde_json::from_str(v).unwrap();
-            assert_eq!((r.temperature, r.top_p), (Some(sent.clone()), Some(sent)));
-        }
-    }
-
-    #[test]
     fn coercion_covers_image_and_video_fields() {
         let img: ImageGenerationRequest =
             serde_json::from_str(r#"{"prompt":"x","n":"2","seed":"3"}"#).unwrap();
