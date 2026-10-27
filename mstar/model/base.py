@@ -873,6 +873,19 @@ class Model(ABC):
         """
         return 24000
 
+    # ``(start_id, end_id)``: the text tokens with which a model that decides
+    # when to speak (full duplex) opens and closes each of its turns. The data
+    # worker marks the text chunks they arrive in with ``metadata["turn"]``,
+    # their marks (``"start"`` / ``"end"``) in token order, whatever
+    # ``postprocess`` makes of them, and every text and audio chunk with
+    # ``metadata["step"]``, the iteration of the loop that emitted it. None:
+    # the model's output has no turns, and /v1/realtime refuses its
+    # conversations (/generate/ws still serves it). A model whose ids come from
+    # its config overrides this with a property. ``step`` pairs text with audio
+    # only when both come from per-frame loops; a model emitting audio in
+    # multi-frame chunks would stamp a frame position instead.
+    turn_tokens: tuple[int, int] | None = None
+
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for
         audio. Mono default (the speech models); stereo models override."""
