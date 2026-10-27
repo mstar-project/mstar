@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
+import torch
+
 
 class ChunkPolicy(ABC):
     """Determines when a StreamBuffer has enough items for the consumer node."""
@@ -21,6 +23,23 @@ class ChunkPolicy(ABC):
         """
         if context_items:
             raise NotImplementedError(f"{type(self).__name__} has no leading context")
+
+    def split(self, item) -> list:
+        """The buffer items one arriving item becomes, in order; ``[item]``
+        keeps it as sent.
+
+        Called once per item as it enters the buffer, in the order the producer
+        sent them. Only a policy that releases one item per chunk may split, so
+        that a chunk is one piece. A split must depend only on the items' order
+        and content, never on when they arrived, so every rank consuming the
+        stream cuts it alike.
+        """
+        return [item]
+
+    def flush(self) -> list:
+        """What the policy still holds, for the end of the buffer, once the
+        producer is done and every item it sent has arrived. Called once."""
+        return []
 
     @abstractmethod
     def is_ready(self, buffer_len: int) -> bool:
@@ -161,6 +180,41 @@ class FixedChunkPolicy(ChunkPolicy):
 
     def continue_after_producer_done(self) -> bool:
         return self._continue_after_done
+
+
+class GridChunkPolicy(FixedChunkPolicy):
+    """One-item chunks of a stream of rows (dim 0, such as audio samples), cut
+    on the grid of ``step_rows`` rows counted from the stream's start, for a
+    consumer that steps that many rows at a time (one encoder frame, say).
+
+    An arriving item, after the part of a step held from the items before it,
+    enters the buffer as its whole steps, in pieces of at most ``max_steps``
+    steps, so every piece starts and ends on the grid whatever the producer's
+    item sizes. The rest waits for the next item, so an item that completes no
+    step adds nothing; the stream's last piece is what is held when it ends.
+    ``continue_after_done`` behaves as in :class:`FixedChunkPolicy`.
+    """
+
+    def __init__(self, step_rows: int, max_steps: int = 1, continue_after_done: bool = False):
+        for name, value in (("step_rows", step_rows), ("max_steps", max_steps)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer, not {value!r}")
+        super().__init__(chunk_size=1, continue_after_done=continue_after_done)
+        self._step_rows = step_rows
+        self._max_rows = step_rows * max_steps
+        self._held: torch.Tensor | None = None
+
+    def split(self, item: torch.Tensor) -> list:
+        if self._held is not None:
+            item = torch.cat([self._held, item])
+        whole = item.shape[0] // self._step_rows * self._step_rows
+        # a copy, so a short tail doesn't keep a long item alive
+        self._held = item[whole:].clone() if whole < item.shape[0] else None
+        return list(item[:whole].split(self._max_rows)) if whole else []
+
+    def flush(self) -> list:
+        held, self._held = self._held, None
+        return [] if held is None else [held]
 
 
 class RampChunkPolicy(ChunkPolicy):

@@ -2268,6 +2268,19 @@ streams (audio and video, say): each has its own buffer and its own end.
   session cap of its own. Declare the most the consumer can take: a deployment may
   lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise
   it.
+- A consumer that steps a fixed number of rows (dim 0) at a time from the stream's
+  start, such as one encoder frame of audio, declares
+  ``chunk_policy_factory=lambda: GridChunkPolicy(N, max_steps=K)``
+  (``mstar.streaming.chunk_policy``). Its buffer then cuts the stream on the grid of
+  ``N`` rows whatever sizes the client sends: each chunk is one piece of 1 to ``K``
+  whole steps, starting and ending on the grid, and the part of a step an item leaves
+  over waits for the next item, so an append shorter than a step adds nothing until the
+  rest of its step arrives, and the stream's last chunk is what is left when it ends.
+  ``K > 1`` lets a consumer that can take several steps of buffered rows in one pass
+  (an encoder over an upload) take an upload in pieces of ``K`` steps rather than a
+  step at a time. Take ``N`` from the consuming component, from the same call that sizes its
+  state, so that the two agree; ``K`` may come from the model's config, as a model
+  kwarg. The cut is the consumer's, so ``max_items`` still counts what the client sent.
 - A stream ends when the client ends it: ``end_input: true`` ends all of the call's
   streams, a list of names only those. The consumer gets ``producer_done`` for that edge
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.

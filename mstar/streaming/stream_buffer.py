@@ -53,6 +53,13 @@ class StreamBuffer:
 
     For sliding-window policies the buffer keeps old items so that
     pop_chunk can return the full window while only advancing by stride.
+
+    An arriving item enters the buffer as the items its policy splits it into
+    (``ChunkPolicy.split``), and the policy's ``flush`` ends the buffer. The
+    producer's counts (items registered, written, expected by the done signal)
+    are of arriving items; everything after the split (``_consumed``, offsets,
+    chunk sizes, the consumed count reported to the conductor) counts the
+    buffer's items.
     """
     request_id: int
     edge_name: str
@@ -76,6 +83,8 @@ class StreamBuffer:
     # flush). Guards the empty-buffer final flush below so it fires exactly
     # once and ``has_chunk_ready`` doesn't spin returning True forever.
     _final_chunk_emitted: bool = False
+    # the policy holds items for the buffer's end (``ChunkPolicy.flush``)
+    _flush_pending: bool = False
 
     _num_tensors_registered = 0
     _num_buffer_writes = 0
@@ -84,6 +93,12 @@ class StreamBuffer:
     # from the producer, so the signal can arrive first. (A client stream's end
     # follows its items on the data worker's own FIFO.)
     _num_items_expected = 0
+
+    def __post_init__(self):
+        # Most policies keep items as sent: skip the calls for them.
+        policy = type(self.policy)
+        self._splits = policy.split is not ChunkPolicy.split
+        self._flush_pending = policy.flush is not ChunkPolicy.flush
 
     def prime_context(self, context_items: int) -> None:
         """The first ``context_items`` items the producer sends are context only
@@ -106,9 +121,15 @@ class StreamBuffer:
             if tensor_id not in self._id_to_tensor:
                 return
             self._tensor_ids_in_order.popleft()
-            self._buffer.append(self._id_to_tensor[tensor_id])
+            item = self._id_to_tensor.pop(tensor_id)
+            if self._splits:
+                self._buffer.extend(self.policy.split(item))
+            else:
+                self._buffer.append(item)
             self._num_buffer_writes += 1
-            del self._id_to_tensor[tensor_id]
+        if self._flush_pending and self._producer_done_and_all_read():
+            self._flush_pending = False
+            self._buffer.extend(self.policy.flush())
 
     def signal_done(self, num_items: int = 0) -> None:
         """Producer signals no more items will arrive after the ``num_items``

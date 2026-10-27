@@ -15,6 +15,7 @@ import torch
 
 from mstar.streaming.chunk_policy import (
     FixedChunkPolicy,
+    GridChunkPolicy,
     LeftContextChunkPolicy,
     RampChunkPolicy,
     SlidingWindowChunkPolicy,
@@ -170,3 +171,71 @@ def test_ramp_policy_long_stream_stays_at_cap():
         policy.register_chunk(policy.next_chunk_size(0))
     assert policy.next_chunk_size(10) == 10
     assert policy.is_ready(10) and not policy.is_ready(9)
+
+
+def _pieces(policy, sizes, drain_before_done):
+    """Feed one stream of counting rows through a StreamBuffer as items of
+    ``sizes`` rows; return each popped chunk's rows and ``is_final``, checking
+    that the chunks carry the stream's rows in order."""
+    sb = StreamBuffer(request_id="r", edge_name="audio_in", from_partition="client", policy=policy)
+    stream = torch.arange(sum(sizes))
+    popped, rows = [], []
+
+    def poll():
+        while sb.has_chunk_ready():
+            chunk = sb.pop_chunk()
+            data = chunk.data["data"]
+            popped.append((0 if data is None else len(data), chunk.is_final))
+            if data is None:
+                return  # the end, or a continue_after_done stream's first empty chunk
+            rows.append(data)
+
+    at = 0
+    for i, n in enumerate(sizes):
+        sb.pre_read_register(f"t{i}")
+        sb.put(f"t{i}", stream[at:at + n].clone())
+        at += n
+        if drain_before_done:
+            poll()
+    sb.signal_done(len(sizes))
+    poll()
+    assert torch.equal(torch.cat(rows) if rows else stream, stream)
+    return popped
+
+
+@pytest.mark.parametrize("drain_before_done", [True, False])
+@pytest.mark.parametrize("policy, sizes, pieces", [
+    # a step's remainder joins the next item: 0..8 | 8..16 | 16..20 | 20..40
+    (lambda: GridChunkPolicy(4), [10, 7, 4, 19], [4] * 10),
+    # whole steps in pieces of at most two steps
+    (lambda: GridChunkPolicy(4, max_steps=2), [10, 7, 4, 19], [8, 8, 4, 8, 8, 4]),
+    # items that complete no step add nothing until one does
+    (lambda: GridChunkPolicy(4, max_steps=3), [2, 1, 6, 3], [8, 4]),
+    (lambda: GridChunkPolicy(4), [], []),
+    # a policy that doesn't split keeps the items as sent
+    (lambda: FixedChunkPolicy(chunk_size=1), [10, 7, 4, 19], [10, 7, 4, 19]),
+])
+def test_a_grid_policy_cuts_a_stream_on_its_grid_whatever_its_items(policy, sizes, pieces, drain_before_done):
+    """The pieces depend only on the items, not on when the consumer pops them."""
+    popped = _pieces(policy(), sizes, drain_before_done)
+    assert [n for n, _final in popped if n] == pieces
+    assert [final for _n, final in popped].count(True) == 1 and popped[-1][1]
+
+
+@pytest.mark.parametrize("drain_before_done", [True, False])
+@pytest.mark.parametrize("continue_after_done, ending", [
+    (False, [(1, True)]),
+    (True, [(1, False), (0, False)]),
+])
+def test_a_grid_policy_ends_its_stream_with_the_part_step_it_holds(continue_after_done, ending, drain_before_done):
+    policy = GridChunkPolicy(4, max_steps=2, continue_after_done=continue_after_done)
+    assert _pieces(policy, [10, 3], drain_before_done) == [(8, False), (4, False), *ending]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"step_rows": 0}, {"step_rows": -4}, {"step_rows": True}, {"step_rows": 2.5},
+    {"step_rows": 4, "max_steps": 0}, {"step_rows": 4, "max_steps": 1.5},
+])
+def test_a_grid_policy_refuses_a_step_that_is_not_a_positive_integer(kwargs):
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        GridChunkPolicy(**kwargs)
