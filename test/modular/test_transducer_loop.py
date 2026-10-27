@@ -374,9 +374,9 @@ def test_loop_matches_the_reference_and_the_frozen_decoder(scenario, durations, 
         assert [len(tokens) for tokens in expected] == [head.config.max_symbols_per_step * n for n in lengths]
 
 
-def test_loop_caps_and_stop_check_agree():
-    """The loop cap is where the stop check's guard would end the loop: past
-    the most steps a clip can take, so active ends it first."""
+def test_the_loop_cap_covers_the_most_steps_a_clip_takes():
+    """The runtime ends a request's loop at its cap: past the most steps a clip
+    can take, so active ends it first; the stop check reads only active."""
     head, clips = _never_blank([])
     cfg = head.config
     for n in (1, 5, 17, 30):
@@ -388,11 +388,8 @@ def test_loop_caps_and_stop_check_agree():
     assert model.get_loop_caps() == {}
     node = TransducerSubmodule(head, compile_step=False, frame_buckets=BUCKETS)
     info = _info(0, DECODE_WALK, 30, iterations=cfg.decode_iterations(30) - 1)
-    assert node.check_stop(0, info, {"clock": [torch.tensor([True])]}) == {DECODE_LOOP}
-    info = _info(0, DECODE_WALK, 30, iterations=cfg.decode_iterations(30) - 2)
     assert node.check_stop(0, info, {"clock": [torch.tensor([True])]}) == set()
     assert node.check_stop(0, info, {"clock": [torch.tensor([False])]}) == {DECODE_LOOP}
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures CUDA graphs")
 @pytest.mark.parametrize("durations", [[0, 1, 2, 3, 4], []], ids=["tdt", "rnnt"])

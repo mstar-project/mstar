@@ -268,14 +268,6 @@ class TransducerSubmodule(NodeSubmodule):
 
     # -- stopping -------------------------------------------------------------------
 
-    def _stops(self, active: bool, info: CurrentForwardPassInfo) -> bool:
-        if not active:
-            return True
-        # the loop cap, which never binds (`decode_iterations`)
-        num_frames = info.step_metadata.get(NUM_FRAMES)
-        done = info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
-        return num_frames is not None and done >= self.head.config.decode_iterations(num_frames)
-
     def check_stop(
         self,
         request_id: str,
@@ -285,7 +277,8 @@ class TransducerSubmodule(NodeSubmodule):
         if "clock" not in outputs:
             return set()
         # the clock carries the row's active flag
-        return {DECODE_LOOP} if self._stops(bool(outputs["clock"][0].reshape(-1)[0]), request_info) else set()
+        # the loop cap is the runtime's (`get_loop_caps`)
+        return set() if bool(outputs["clock"][0].reshape(-1)[0]) else {DECODE_LOOP}
 
     def check_stop_batched(
         self,
@@ -302,6 +295,6 @@ class TransducerSubmodule(NodeSubmodule):
         stops: dict[str, set[str]] = {}
         for rid in request_ids:
             i = row_of.get(rid)
-            if i is not None and self._stops(values[i], request_infos[rid]):
+            if i is not None and not values[i]:
                 stops[rid] = {DECODE_LOOP}
         return stops
