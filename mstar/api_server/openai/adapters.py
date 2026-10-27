@@ -171,14 +171,6 @@ def _passthrough(req) -> dict:
     return dict(extra)
 
 
-def _forward_sent_speed(req, mk: dict) -> None:
-    """A client-sent ``speed`` into ``model_kwargs`` for a model with no speed
-    control, so the server logs it as ignored. ``SpeechRequest.speed`` defaults
-    to 1.0, so an unsent one stays out; it would warn on every request."""
-    if "speed" in getattr(req, "model_fields_set", ()):
-        mk.setdefault("speed", req.speed)
-
-
 def _refuse_tool_calls(req) -> None:
     """Refuse a chat that asks the model to call a tool.
 
@@ -311,6 +303,16 @@ class OpenAIAdapter:
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("audio/speech is not supported by this model")
+
+    def speech_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        """``speech_to_request`` plus a client-sent ``speed``; the model's request_kwargs reads or logs it.
+
+        Only a sent one: ``SpeechRequest.speed`` defaults to 1.0, which would warn on every request.
+        """
+        args = self.speech_to_request(req, upload_dir)
+        if "speed" in req.model_fields_set:
+            args.model_kwargs.setdefault("speed", req.speed)
+        return args
 
     def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("image generation is not supported by this model")
@@ -460,7 +462,6 @@ class Qwen3OmniAdapter(OpenAIAdapter):
             mk["voice"] = req.voice
         # Talker (speech) sampling; max_tokens is not an OpenAI speech field.
         _apply_sampling(req, mk, temperature_key="talker_temperature", top_p_key="talker_top_p", max_tokens_key=None)
-        _forward_sent_speed(req, mk)
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
@@ -513,7 +514,6 @@ class OrpheusAdapter(OpenAIAdapter):
         if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
-        _forward_sent_speed(req, mk)
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
@@ -531,8 +531,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
     alias for ``instruct`` so an OpenAI client that only knows the standard
     field can still reach voice design.
 
-    ``speed`` is a real OmniVoice knob (it scales the estimated duration), so
-    unlike the other speech adapters it is forwarded rather than dropped. The
+    ``speed`` is a real OmniVoice knob (it scales the estimated duration). The
     decoding knobs -- ``num_step``, ``guidance_scale``, ``t_shift``,
     ``language``, ``duration``, the two temperatures -- arrive through
     ``extra_body`` and stay per-request all the way to the unmask loop.
@@ -552,8 +551,6 @@ class OmniVoiceAdapter(OpenAIAdapter):
         if getattr(req, "voice", None) is not None and mk.get("instruct") is None:
             mk["instruct"] = req.voice
         mk.pop("voice", None)
-        if getattr(req, "speed", None) is not None:
-            mk.setdefault("speed", req.speed)
         if getattr(req, "seed", None) is not None:
             mk.setdefault("seed", req.seed)
 
@@ -606,7 +603,6 @@ class Qwen3TTSAdapter(OpenAIAdapter):
         if instructions:
             mk.setdefault("instruct", instructions)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
-        _forward_sent_speed(req, mk)
         # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL (when
         # the server allows it) or bare base64. It becomes the
         # request's audio input for one request; ``ref_text`` and
@@ -635,7 +631,7 @@ class KokoroAdapter(OpenAIAdapter):
 
     ``voice`` is a bundled voice or a blend (``af_bella+af_sky``,
     ``af_bella(2)+af_sky(1)``) and ``speed`` scales the predicted durations;
-    both are real model knobs and are forwarded. Kokoro does not sample, so
+    both are real model knobs. Kokoro does not sample, so
     ``temperature`` / ``top_p`` are ignored. ``lang_code`` (a G2P language
     override; the default follows the voice's prefix) and ``phonemes`` (skip
     G2P) arrive through ``extra_body``.
@@ -647,8 +643,6 @@ class KokoroAdapter(OpenAIAdapter):
         mk = _passthrough(req)
         if getattr(req, "voice", None) is not None:
             mk.setdefault("voice", req.voice)
-        if getattr(req, "speed", None) is not None:
-            mk.setdefault("speed", req.speed)
         if getattr(req, "seed", None) is not None:
             mk.setdefault("seed", req.seed)
         return SubmitArgs(
@@ -705,7 +699,6 @@ class ChatterboxAdapter(OpenAIAdapter):
         if getattr(req, "voice", None) is not None:
             mk.setdefault("voice", req.voice)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
-        _forward_sent_speed(req, mk)
         file_paths = None
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
@@ -746,7 +739,6 @@ class FishS2ProAdapter(OpenAIAdapter):
         # neither is an S2-Pro control; a sent one is forwarded so it is logged as ignored
         if getattr(req, "voice", None) is not None:
             mk.setdefault("voice", req.voice)
-        _forward_sent_speed(req, mk)
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
             path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")

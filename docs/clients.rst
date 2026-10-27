@@ -185,7 +185,14 @@ streaming request gets that status instead of a ``200`` followed by an in-band e
      -
    * - ``num_inference_steps``
      - integer ``>= 1``
-     - Denoising steps of an image or video model. Above the model's limit is a 400.
+     - Denoising steps of an image or video model. Past the denoise loop's ``max_iters``
+       is a 400.
+   * - ``num_step``
+     - integer ``>= 1``
+     - OmniVoice's unmask steps. Past the unmask loop's ``max_iters`` is a 400.
+   * - ``rollout_horizon``
+     - integer ``>= 0``
+     - V-JEPA2's rollout length. Past the rollout loop's ``max_iters`` is a 400.
    * - ``height``, ``width``, ``num_frames``
      - integer ``>= 1``
      - Output size of an image or video model, which may refuse sizes its VAE cannot tile.
@@ -195,6 +202,10 @@ streaming request gets that status instead of a ``200`` followed by an in-band e
    * - ``guidance_scale``
      - number
      - Classifier-free guidance strength.
+   * - ``speed``
+     - number ``> 0``
+     - Speech rate, for a model that reads it (Kokoro, OmniVoice); any other model logs it
+       as ignored. Only a sent ``speed`` is forwarded, not the OpenAI default of 1.0.
 
 A string that spells a number is read as that number, since some JSON clients send
 numbers as strings: ``"0.7"`` or ``" 0.7 "`` for a real-valued knob, ``"5"`` or ``"5.0"``
@@ -408,7 +419,7 @@ Per-model notes:
   Whisper also reads ``task`` (``transcribe``, the default, or ``translate`` into
   English). Its ``max_output_tokens`` is at most 444, the 448-position table less the
   forced prompt; more is a 400. Higgs-Audio's default is 1024. A key the model does not
-  read is logged as ignored, once per key per server.
+  read is logged as ignored on each request that sends it.
 - **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
   its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
   clip of up to 20 s is one request; a longer upload is cut into windows of about equal

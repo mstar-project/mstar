@@ -675,10 +675,14 @@ async fn audio_speech(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let args = match adapter.speech_to_request(&req) {
+    let mut args = match adapter.speech_to_request(&req) {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
+    // only a sent speed, as Python's speech_request; an adapter-set one wins
+    if let Some(speed) = &req.speed {
+        args.model_kwargs.entry("speed").or_insert_with(|| speed.clone());
+    }
     let request_id = rid("speech");
     let fmt = req.response_format.to_ascii_lowercase();
     // Only wav / pcm are produced natively; unlike Python (soundfile encodes

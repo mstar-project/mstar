@@ -229,10 +229,11 @@ def test_registry():
 
 @pytest.mark.parametrize("adapter", [
     adapters.OrpheusAdapter(), adapters.Qwen3OmniAdapter(), adapters.Qwen3TTSAdapter(),
-    adapters.ChatterboxAdapter(),
+    adapters.ChatterboxAdapter(), adapters.KokoroAdapter(), adapters.OmniVoiceAdapter(), adapters.FishS2ProAdapter(),
 ])
-def test_speech_without_a_speed_control_forwards_only_a_sent_speed(adapter, tmp_path):
-    """A sent ``speed`` reaches model_kwargs, so the server logs it as ignored; the 1.0 default does not."""
-    sent = adapter.speech_to_request(SpeechRequest(input="hi", speed=1.2), tmp_path)
+def test_every_speech_adapter_forwards_only_a_sent_speed(adapter, tmp_path):
+    """A sent ``speed`` reaches model_kwargs, for the model to read or log as ignored; the 1.0 default does not."""
+    sent = adapter.speech_request(SpeechRequest(input="hi", voice="v", speed=1.2), tmp_path)
     assert sent.model_kwargs["speed"] == 1.2
-    assert "speed" not in adapter.speech_to_request(SpeechRequest(input="hi"), tmp_path).model_kwargs
+    unsent = adapter.speech_request(SpeechRequest(input="hi", voice="v"), tmp_path)
+    assert "speed" not in unsent.model_kwargs

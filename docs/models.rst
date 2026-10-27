@@ -540,7 +540,7 @@ Fish Audio S2-Pro notes
   control is part of the text. Clone a voice with ``ref_audio`` (data URL,
   base64, or an http(s) URL when the server allows remote fetch) and its transcript in
   ``ref_text``; with the SDK, ``client.tts(text, reference_audio="ref.wav",
-  ref_text="...")``. ``voice`` and ``speed`` are ignored.
+  ref_text="...")``. ``voice`` and ``speed`` are logged as ignored.
 - Sampling defaults follow the reference (temperature 0.8, top-p 0.8, top-k 30);
   ``do_sample: false`` is greedy. The order differs: M\*'s sampler applies the
   temperature first and takes top-k and top-p over the tempered probabilities,
@@ -997,8 +997,8 @@ Generation knobs (per request, via ``model_kwargs`` or the request body):
        frames = ``(num_frames - 1) // 4 + 1``.
    * - ``num_inference_steps``
      - 50
-     - An integer in 1-100 (``max_denoise_steps``, the denoise loop's ceiling); a 400
-       outside it.
+     - An integer in 1-100; the upper bound is the denoise loop's ``max_iters``
+       (``max_denoise_steps``). A 400 outside it.
    * - ``guidance_scale``
      - 5.0
      - Classifier-free guidance; run as a single batched forward.

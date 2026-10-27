@@ -57,21 +57,6 @@ mod flex {
         }
     }
 
-    pub fn opt_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
-        match Option::<Value>::deserialize(d)? {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::Number(n)) => {
-                n.as_f64().map(Some).ok_or_else(|| Error::custom("invalid number"))
-            }
-            Some(Value::String(s)) => s
-                .trim()
-                .parse::<f64>()
-                .map(Some)
-                .map_err(|_| Error::custom(format!("expected a number, got {s:?}"))),
-            Some(other) => Err(Error::custom(format!("expected a number, got {other}"))),
-        }
-    }
-
     pub fn opt_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
         match Option::<Value>::deserialize(d)? {
             None | Some(Value::Null) => Ok(None),
@@ -164,11 +149,9 @@ pub struct SpeechRequest {
     pub voice: Option<String>,
     #[serde(default = "default_wav")]
     pub response_format: String,
-    /// Accepted for OpenAI compatibility (kept out of `extra`); playback-rate
-    /// adjustment is not applied, as in mstar.
-    #[allow(dead_code)]
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub speed: Option<f64>,
+    /// Forwarded as sent when present; the model's request_kwargs reads or logs it.
+    #[serde(default)]
+    pub speed: Option<Value>,
     /// `bool | None` in Python (default False); accept an explicit `null`
     /// instead of hard-erroring. Absent / null / false all mean non-streaming.
     #[serde(default, deserialize_with = "flex::opt_bool")]

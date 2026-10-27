@@ -915,6 +915,21 @@ def test_streaming_speech_wav_and_pcm():
         assert (code, ctype, raw) == (200, "audio/pcm", pcm)
 
 
+def test_speech_forwards_only_a_sent_speed_as_python_does():
+    """A sent speed reaches the model, read or logged as ignored there; an unsent one does not."""
+    stub = _AudioStub()
+    with _model_stack("orpheus", stub) as (port, _up):
+        for extra in ({"speed": "1.5"}, {}):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/audio/speech",
+                data=json.dumps({"model": "orpheus", "input": "hi", "voice": "tara", **extra}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                assert r.status == 200
+    sent, unsent = (sub["mk"] for sub in stub.submitted)
+    assert sent["speed"] == "1.5" and "speed" not in unsent
+
+
 def test_streaming_speech_aborts_the_body_on_a_late_error():
     """A cleanly ended stream would pass for a complete answer, so the read
     must fail: a truncated body, or a dropped connection when the error lands

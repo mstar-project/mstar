@@ -294,8 +294,9 @@ contract:
 - Declare every ``model_kwargs`` key you read in ``request_kwargs()``; any other key a
   client sends is logged as ignored by the server. ``test_model_contracts.py`` fails for a
   registered model that does not override it.
-- Bound a request's length through ``get_loop_caps``: the conductor refuses a cap past the
-  loop's ``max_iters`` instead of cutting the request short, so do not clamp it yourself.
+- Bound a request's length, or a denoise loop's step count, through ``get_loop_caps``: the
+  conductor refuses a cap past the loop's ``max_iters`` instead of cutting the request short,
+  so do not clamp it, or check it against a typed-in limit, yourself.
 - Draw any model-local randomness from the request's seed (``random_seed`` on the
   forward-pass info), never the global RNG.
 

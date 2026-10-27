@@ -731,7 +731,7 @@ def test_request_kwargs_are_the_keys_it_reads():
 
 def test_speech_adapter_forwards_a_sent_voice_and_speed_so_they_are_logged_as_ignored(tmp_path):
     adapter = adapters.FishS2ProAdapter()
-    sent = adapter.speech_to_request(SpeechRequest(input="hi", voice="alloy", speed=1.2), tmp_path).model_kwargs
+    sent = adapter.speech_request(SpeechRequest(input="hi", voice="alloy", speed=1.2), tmp_path).model_kwargs
     assert (sent["voice"], sent["speed"]) == ("alloy", 1.2)
-    unsent = adapter.speech_to_request(SpeechRequest(input="hi"), tmp_path).model_kwargs
+    unsent = adapter.speech_request(SpeechRequest(input="hi"), tmp_path).model_kwargs
     assert "voice" not in unsent and "speed" not in unsent

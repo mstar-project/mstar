@@ -323,7 +323,7 @@ class RequestBridge:
         # refuse a codec we cannot produce before the request costs GPU time
         fmt = media_io.check_audio_format(body["response_format"], sample_rate=sample_rate)
         req = SpeechRequest.model_validate(body)
-        args = self.adapter.speech_to_request(req, self.server.upload_dir)
+        args = self.adapter.speech_request(req, self.server.upload_dir)
 
         rid = self._submit(args, prefix="speech")
         pcm = bytearray()
