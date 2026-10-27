@@ -4,6 +4,7 @@ prefill and a batch of decodes, with two requests interleaved.
 """
 from __future__ import annotations
 
+import logging
 import sys
 import types
 
@@ -182,7 +183,7 @@ class TestEngineCpu:
         assert pool.num_free_slots == pool.config.usable_slots
         assert not kv._streams
 
-    def test_check_stop_and_context_cap(self):
+    def test_check_stop_and_context_cap(self, caplog):
         engine, sub, cfg = _build_engine(seed=1)
         _add(engine, "r")
         prompt = torch.tensor([1, 2, 3], dtype=torch.long)
@@ -211,8 +212,13 @@ class TestEngineCpu:
             },
             step_context=StepContext(request_ids=tuple(rids), graph_walk="prefill", slot=0, capture=False),
         )
-        engine.prepare_inputs(b)
-        assert "long" in b.failed_requests and "index_topk" in str(b.failed_requests["long"])
+        with caplog.at_level(logging.ERROR, logger="mstar.engine.engine"):
+            engine.prepare_inputs(b)
+        # a 500 past the conductor's own refusal: the client sees an error id, the log the reason
+        error = b.failed_requests["long"]
+        assert error.startswith("internal error (error id ")
+        error_id = error.removeprefix("internal error (error id ").removesuffix(")")
+        assert any(error_id in r.getMessage() and "index_topk" in r.getMessage() for r in caplog.records)
         assert list(b.request_ids) == ["short"]
         outputs = engine.exec_and_postprocess(b)
         assert set(outputs.per_rid_outputs) == {"short"}
