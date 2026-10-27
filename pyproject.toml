@@ -70,7 +70,7 @@ mstar-serve = "mstar.api_server.entrypoint:main"
 # docs/installation.rst, same as flash-attn.
 omnivoice = []
 command_a_plus = [
-    "flashinfer-python>=0.6.18",
+    "flashinfer-python==0.7.2",
     "huggingface-hub>=1.5",
     "mooncake-transfer-engine>=0.3.13.post1",
     "ninja",
@@ -138,7 +138,7 @@ dynamo = [
 
 bagel = [
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow>=12.3.0",
@@ -175,7 +175,7 @@ cosmos3 = [
     # build; on a mismatch the engine logs a warning and falls back to the
     # paged flashinfer backend. See docs/models.rst.
     "fa3-fwd",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow>=12.3.0",
@@ -190,7 +190,7 @@ qwen3_omni = [
     # prebuilt wheels aren't on PyPI, so a plain install compiles from source
     # (and fails on CUDA 13). Install it separately; see docs/installation.rst.
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow>=12.3.0",
@@ -216,7 +216,7 @@ qwen3_omni = [
 # into one downgrades huggingface-hub under them. See docs/installation.rst.
 qwen3_tts = [
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -225,7 +225,7 @@ qwen3_tts = [
 ]
 
 fish_s2_pro = [
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -250,7 +250,7 @@ kokoro = [
 # resemble-perth 1.0.1 (the latest) imports pkg_resources, which setuptools 82
 # removed; without it the package hides its watermarker.
 chatterbox = [
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "librosa",
     "mooncake-transfer-engine>=0.3.13.post1",
@@ -270,7 +270,7 @@ chatterbox_multilingual = [
 
 orpheus = [
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -278,7 +278,7 @@ orpheus = [
 ]
 
 pi05 = [
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -344,7 +344,7 @@ flux2_klein = [
     # FLUX.2 [klein] 4B/9B: diffusers is the parity oracle in the tests only; serving
     # runs the native ports. transformers provides the Qwen3 tokenizer (chat template).
     "diffusers>=0.39",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "Pillow>=12.3.0",
     "safetensors",
@@ -353,7 +353,7 @@ flux2_klein = [
 ]
 
 vjepa2_ac = [
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -363,7 +363,7 @@ vjepa2_ac = [
 # ASR models: Whisper-large-v3, Higgs Audio
 asr = [
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
@@ -389,7 +389,7 @@ all = [
     "diffusers>=0.39",
     "fa3-fwd",
     "einops",
-    "flashinfer-python>=0.6.14",
+    "flashinfer-python==0.7.2",
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "Pillow>=12.3.0",
