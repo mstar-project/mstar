@@ -873,15 +873,15 @@ class Engine:
                 self._keyed_walks.setdefault(node, set()).update(
                     walk for label in by_label.values() for walk in label.keys.walks
                 )
-        # a cache another engine holds is taken as open when its config says so
+        # a cache another engine holds is taken as open by the same rule as one this engine holds
         opened_keys = {
             key for key in declared
-            if key not in self._resources and specs_by_key[key].config.prefix_cache
+            if key not in self._resources and specs_by_key[key].config.prefix_cache_opens(checkpoint)
         }
         for key, resource in self._resources.items():
-            if checkpoint is None and declared.get(key):
+            if declared.get(key):
                 config = specs_by_key[key].config
-                if config.prefix_cache and not config.prefix_cache_salt:
+                if config.prefix_cache and not config.prefix_cache_opens(checkpoint):
                     logger.info(
                         "KV %s: prefix cache off: %s names no checkpoint, so "
                         "builds that differ only in their weights cannot be "

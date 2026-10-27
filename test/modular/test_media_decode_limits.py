@@ -163,6 +163,7 @@ def test_refused_image_reaches_the_client_as_a_400(tmp_path, no_decode):
     wt.request_output_state = {}
     wt.device = "cpu"
     wt._keyed_labels = {}
+    wt._keys_shut = False
     wt._live_requests = {}
     wt.model = types.SimpleNamespace(
         load_image=lambda p, device: Model.load_image(None, p, device), max_input_files=dict,
@@ -515,6 +516,7 @@ def _preprocess_thread(model):
     wt.request_output_state = {}
     wt.device = "cpu"
     wt._keyed_labels = {}
+    wt._keys_shut = False
     wt._live_requests = {}
     wt.model = model
     return wt

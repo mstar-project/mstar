@@ -403,6 +403,7 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker.enable_prof = False
     worker.timing_requested = threading.Event()
     worker._keyed_labels = {}
+    worker._keys_shut = False
     worker._live_requests = {}
     worker._client_edges = frozenset()
     worker.communicator = SimpleNamespace(send=lambda *args: None)

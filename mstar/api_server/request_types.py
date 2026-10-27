@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -7,6 +8,9 @@ from mstar.model.multimodal import PromptPart
 from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+
+if TYPE_CHECKING:
+    from mstar.model.base import GrowingClip
 
 
 @dataclass
@@ -133,6 +137,8 @@ class PreprocessInput:
     client_request_id: str | None = None
     # the client streams the opening ends; the others stay open for appends
     ends: frozenset[str] = frozenset()
+    # the item a realtime re-decode sends again, longer: set by the server, never by a client
+    clip: "GrowingClip | None" = None
 
 
 @dataclass

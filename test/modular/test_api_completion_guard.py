@@ -72,6 +72,7 @@ def test_preprocess_failure_emits_error_chunk():
     wt._draining_rids = set()
     wt._reads_done_sent = set()
     wt._live_requests = {}
+    wt._keys_shut = False
 
     wt.in_queue.put(PreprocessInput(
         request_id="r1", text="x", file_paths=None,

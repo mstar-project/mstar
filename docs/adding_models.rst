@@ -319,12 +319,17 @@ only on another deployment, as an unguided BAGEL generation does for a CFG-paral
 A layout has five fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A
-  :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids from the tensor
-  ``source`` names, ``"digest"`` for KV made from an uploaded file (``source`` is
-  ``(modality, index)``), and ``"rows"`` for KV made from anything else, such as another
-  node's outputs. ``length`` is the slots the write fills, ``advance`` how far it moves
-  the position counter. A span's ``scratch`` is the most one non-committing step writes
-  before the span commits into those slots, as a window's denoise steps do.
+  :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids (the next entry
+  of the tensor ``source`` names, or the :class:`mstar.model.base.TensorRange` it names),
+  ``"digest"`` for KV made from an uploaded file (``source`` is ``(modality, index)``)
+  or from part of the request's :class:`mstar.model.base.GrowingClip`, the audio a run of
+  requests sends again, longer, which ``process_prompt`` gets as its one ``audio_inputs``
+  entry with no file (``source`` is a ``TensorRange`` of the tensor it is in),
+  and ``"rows"`` for KV made from anything else, such as another node's outputs. A digest
+  span's ``params`` are whatever else decides its KV. ``length`` is the slots the write
+  fills, ``advance`` how far it moves the position counter. One step may write several
+  spans in a row, keyed parts first. A span's ``scratch`` is the most one non-committing
+  step writes before the span commits into those slots, as a window's denoise steps do.
 - ``growth``: ``(loop, slots)`` pairs, ``slots`` per iteration of ``loop``.
 - ``scratch``: the most KV slots one non-committing step writes past the committed length.
 - ``retention``: the ``RetentionPolicy`` the label's committing steps declare.
@@ -403,7 +408,12 @@ overrides** in :doc:`serving`.
      request that re-sends the reply matches it too.
 
    The keys cover the label's first ``keyed_spans`` spans. An ids span is keyed by its
-   token ids, a digest span by its file.
+   token ids, a digest span by its file's hash, or by its clip's nonce and range, and its
+   ``params``. A request
+   that sent ``prefix_cache=False``, or one whose keyed caches each have ``prefix_cache``
+   off or neither a model checkpoint nor a ``prefix_cache_salt``, reaches
+   ``process_prompt`` with ``prefix_cache=False``, so work done only to key it can be
+   skipped.
 
    BAGEL keys its text and ViT walks and the decode that follows them:
 

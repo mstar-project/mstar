@@ -108,6 +108,11 @@ class PagedKVConfig(KVConfig):
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
 
+    def prefix_cache_opens(self, checkpoint: str | None) -> bool:
+        """Whether the prefix index opens for a model whose weights sit at ``checkpoint``: two
+        builds that differ only in their weights are told apart by the checkpoint or a salt."""
+        return self.prefix_cache and (checkpoint is not None or bool(self.prefix_cache_salt))
+
     @property
     def latent_dim(self) -> int:
         """Per-token cache width under MLA."""

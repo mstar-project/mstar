@@ -46,6 +46,7 @@ from mstar.api_server.request_types import (
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
+from mstar.model.base import GrowingClip
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -603,6 +604,7 @@ class APIServer:
         request_id: str | None = None,
         end_input: bool | Collection[str] = True,
         file_streams: dict[str, list[str | None]] | None = None,
+        clip: GrowingClip | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -628,6 +630,9 @@ class APIServer:
         in :meth:`stream_input`: one the model lacks is refused with a 400.
         ``process_prompt`` routes the opening's files, so a name is only
         checked.
+
+        ``clip`` is the server's own: the item a realtime re-decode sends again,
+        longer (`GrowingClip`). No HTTP route takes one from a client.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
@@ -696,6 +701,7 @@ class APIServer:
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
             ends=ending,
+            clip=clip,
         ))
 
         logger.info(

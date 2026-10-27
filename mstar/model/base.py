@@ -1,10 +1,12 @@
 import itertools
+import secrets
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
-from typing import TYPE_CHECKING, NamedTuple, Type
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Type
 
+import numpy as np
 import torch
 import yaml
 
@@ -68,15 +70,58 @@ class ClientChunk(NamedTuple):
     request_kwargs: dict
 
 
+class TensorRange(NamedTuple):
+    """Elements ``[start, end)`` of entry ``entry`` of a tensor the request is prefilled
+    with, flattened: a span's source when part of an input decides the span's KV, such
+    as the ids before an audio clip or one encoder window of a `GrowingClip`."""
+    tensor: str
+    entry: int
+    start: int
+    end: int
+
+
+@dataclass(slots=True)
+class GrowingClip:
+    """One audio item that a run of requests sends again, longer each time (a realtime
+    transcription item): ``chunks``, which only ever grow by `append`, so whatever part
+    of it one request held, every later request holds too.
+
+    The samples are mono float32 at ``SAMPLE_RATE``. The clip is its request's one audio
+    input: the data worker hands the model `audio` as ``audio_inputs``, with no file
+    between them, and charges it no media budget, so the clip's producer caps its length.
+    It keys a digest span's `TensorRange` by ``nonce`` and the range, not by hashing the
+    samples on every request. The server makes one per item, never a client, and starts a
+    new clip for a new item. ``memo`` is the model's: what it computes once from a part of
+    the clip.
+    """
+    SAMPLE_RATE: ClassVar[int] = 16_000
+    nonce: bytes = field(default_factory=lambda: secrets.token_bytes(16))
+    chunks: tuple = field(default=(), init=False)
+    samples: int = field(default=0, init=False)
+    memo: dict[str, object] = field(default_factory=dict)
+
+    def append(self, chunk) -> None:
+        # the data worker reads ``chunks``, which one rebinding replaces whole, and
+        # ``samples`` only for its profile
+        self.chunks += (chunk,)
+        self.samples += int(chunk.size)
+
+    def audio(self) -> torch.Tensor:
+        """Every sample so far, as one tensor."""
+        chunks = self.chunks
+        return torch.from_numpy(np.concatenate(chunks, dtype=np.float32)) if chunks else torch.zeros(0)
+
+
 class Span(NamedTuple):
     """One write to a KV stream. A layout lists them in the order the walks write.
 
     ``length`` is how many KV slots the write fills, and ``advance`` is how far
     it moves the position counter, which is the length for text. ``source`` is
-    the tensor whose next entry an ids span keys, or the file of a digest span
-    as ``(modality, index)``. ``params`` are the preprocessing arguments that
-    change the tensors made from the file. A ``rows`` span writes KV made from
-    anything else, such as another node's outputs, and is never keyed.
+    the tensor whose next entry an ids span keys, or a `TensorRange` of its ids,
+    or what a digest span is keyed by: a file as ``(modality, index)``, or a
+    `TensorRange` of the request's `GrowingClip`. ``params`` are the
+    arguments, beyond that, that change the span's KV. A ``rows`` span
+    writes KV made from anything else, such as another node's outputs, and is never keyed.
     ``scratch`` is the most a non-committing step writes before the span
     commits into those slots, as a denoised window does.
     """
@@ -84,7 +129,7 @@ class Span(NamedTuple):
     walk: str
     length: int
     advance: int
-    source: str | tuple[str, int]
+    source: str | tuple[str, int] | TensorRange
     params: tuple = ()
     scratch: int = 0
 

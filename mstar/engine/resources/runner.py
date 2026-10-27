@@ -119,7 +119,7 @@ class StepRunner:
     ) -> CachedPrefix | None:
         """The longest prefix of this walk every resource on ``node_name`` can serve.
 
-        The smallest answer wins, because a step is one span: a resource that
+        The smallest answer wins, because a step is one cut: a resource that
         holds less than another has to be caught up by the tokens that run.
         A resource with no opinion is not an answer of zero.
         """

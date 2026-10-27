@@ -62,6 +62,9 @@ class _Model(Model):
     def __init__(self, layout=LAYOUT, max_seq_len=4096):
         self._layout, self._max_seq_len = layout, max_seq_len
 
+    def checkpoint_path(self):
+        return "/weights"
+
     def get_node_resources(self):
         return [KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=self._max_seq_len, max_num_pages=64, page_size=PS,

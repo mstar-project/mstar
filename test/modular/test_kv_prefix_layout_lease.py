@@ -62,20 +62,25 @@ def _walks(parts: list) -> list[tuple[str, int]]:
 
 def _config(parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WALK, decode: int = 0) -> KVReqConfig:
     """What the preprocess worker sends for ``parts``, keyed by its own code."""
-    layouts = {"kv": {"main": LabelLayout(spans=tuple(
+    layout = LabelLayout(spans=tuple(
         Span("ids", text_walk, slots, slots, "text_inputs") if isinstance(part, list)
         # The span's source holds the digest itself, which the stand-in `_digest` returns.
         else Span("digest", image_walk, slots, 1, part[1] if isinstance(part, tuple) else DIGEST)
         for part, (_, slots) in zip(parts, _walks(parts), strict=True)
-    ), growth=(("decode_loop", 1),))}}
-    walks = (text_walk, image_walk)
+    ), growth=(("decode_loop", 1),))
+    texts = [torch.tensor(part) for part in parts if isinstance(part, list)]
+    return _sent(layout, texts, (text_walk, image_walk), decode)
+
+
+def _sent(layout: LabelLayout, texts: list[torch.Tensor], walks: tuple[str, ...], decode: int = 0) -> KVReqConfig:
+    layouts = {"kv": {"main": layout}}
     worker = SimpleNamespace(
         _keyed_labels={"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", walks, growth=True))}},
         _prefix_page_sizes={"kv": PAGE_SIZE}, model=None,
-        _digest=lambda span, file_paths, file_states: span.source,
+        _digest=lambda span, tensors, file_paths, file_states, clip=None: span.source,
         _page_layout=lambda *args: PreprocessWorkerThread._page_layout(None, *args),
     )
-    tensors = {"text_inputs": [torch.tensor(part) for part in parts if isinstance(part, list)]}
+    tensors = {"text_inputs": texts}
     rows = {key: {label: layout.row() for label, layout in by_label.items()} for key, by_label in layouts.items()}
     sent = PreprocessWorkerThread._prefix_keys(worker, tensors, layouts, rows, None, {})
     config = KVReqConfig()
@@ -282,3 +287,58 @@ def test_a_prompt_prefilled_beside_a_decode_is_matched_by_its_repeat():
     assert node.walk(TEXT_WALK, len(prompt)) == 2 * PAGE_SIZE, (
         "a prompt prefilled in a step of a combined walk filed no pages, so its repeat recomputed it"
     )
+
+
+# One prefill step can write several keyed parts: the ids before an audio clip, then one item
+# per complete encoder window, each a slot a position, then rows nothing keys. A streaming
+# re-decode of the same clip, longer, is that step again with more windows.
+HEAD = list(range(1, 21))
+WINDOW = 26
+
+
+def _one_step(windows: list[bytes], rows: int, window: int = WINDOW) -> tuple[KVReqConfig, int]:
+    spans = (
+        Span("ids", TEXT_WALK, len(HEAD), len(HEAD), "text_inputs"),
+        *(Span("digest", TEXT_WALK, window, window, digest) for digest in windows),
+        Span("rows", TEXT_WALK, rows, rows, "text_inputs"),
+    )
+    return _sent(LabelLayout(spans=spans), [torch.tensor(HEAD)], (TEXT_WALK,)), len(HEAD) + window * len(windows) + rows
+
+
+_A, _B, _C, _LOUDER_B = (bytes([n]) * 32 for n in (1, 2, 3, 4))
+
+
+@pytest.mark.parametrize(("windows", "window", "rows", "held"), [
+    # the windows both requests share end at slot 72, inside page 4, whose cached end serves it
+    ([_A, _B, _C], WINDOW, 5, 20 + 2 * WINDOW),
+    # B differs from page 2 on, so the hit stops at page 2, inside A, and A's rest runs
+    ([_A, _LOUDER_B, _C], WINDOW, 5, 2 * PAGE_SIZE),
+    # the same windows: every keyed slot is served, since the rows after them still run
+    ([_A, _B], WINDOW, 5, 20 + 2 * WINDOW),
+    # rows reaching past page 4: its cached end is still served only up to the keyed end
+    ([_A, _B], WINDOW, 20, 20 + 2 * WINDOW),
+    # B and C end on the same page: C's end was never cached, B's is
+    ([_A, _B, _C], 3, 5, 20 + 2 * 3),
+], ids=["a longer clip", "a window keyed apart", "the same windows", "rows past the end's page",
+        "two ends on one page"])
+def test_one_step_of_several_keyed_parts_is_served_what_it_shares_and_placed_past_it(windows, window, rows, held):
+    node = _TextNode()
+    node.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((TEXT_WALK,))})
+    seed, length = _one_step([_A, _B], 7, window)
+    node.runner.ingest_request("seed", {"kv": seed})
+    node.step("seed", length)
+    queried, hit = node.kv.prefix_tokens.get(NODE, (0, 0))
+    config, length = _one_step(windows, rows, window)
+    node.runner.ingest_request(RID, {"kv": config})
+
+    inputs = ARNodeInputs(input_seq_len=length)
+    prefix = node.runner.resolve_cached_prefix(RID, NODE, TEXT_WALK, inputs)
+    node.runner.apply_cached_prefix(RID, NODE, TEXT_WALK, inputs, prefix)
+    positions = node.step(RID, length - prefix.tokens)
+
+    assert (prefix.tokens, positions) == (held, list(range(held, length))), (
+        "a step writing several keyed parts was refused its hit, served slots past its keyed end, "
+        "or the slots after a hit that ends inside an item were placed at the item's start"
+    )
+    after = node.kv.prefix_tokens[NODE]
+    assert after[1] - hit <= after[0] - queried, "the cache counted more hit tokens than it was queried for"

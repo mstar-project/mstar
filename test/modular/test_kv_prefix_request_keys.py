@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import numpy as np
 import pytest
 import torch
 
@@ -26,6 +27,7 @@ from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.model.base import (
+    GrowingClip,
     KVLabel,
     LabelLayout,
     PrefixKeys,
@@ -72,8 +74,9 @@ class _Model:
 
     def __init__(
         self, declares: bool = True, metadata: dict | None = None,
-        decode_walk: str | None = None, lays_out: bool = True,
+        decode_walk: str | None = None, lays_out: bool = True, checkpoint: str | None = "/weights",
     ):
+        self._checkpoint = checkpoint
         self._declares = declares
         self._metadata = metadata
         self._decode_walk = decode_walk
@@ -81,6 +84,9 @@ class _Model:
 
     def get_partition_topology(self):
         return PartitionTopology(partitions=["default"])
+
+    def checkpoint_path(self):
+        return self._checkpoint
 
     def kv_labels(self):
         if not self._declares:
@@ -147,12 +153,12 @@ def _handed_over(model_kwargs: dict, key: str = "kv") -> KVReqConfig:
     return cfg
 
 
-def _run(worker: PreprocessWorkerThread, model_kwargs: dict | None = None) -> dict:
+def _run(worker: PreprocessWorkerThread, model_kwargs: dict | None = None, clip: GrowingClip | None = None) -> dict:
     """Preprocess one request and return the kwargs the conductor was sent."""
     worker._process_input(PreprocessInput(
         request_id="r0", text="hello", file_paths=None,
         input_modalities=["text"], output_modalities=["text"],
-        model_kwargs=model_kwargs or {},
+        model_kwargs=model_kwargs or {}, clip=clip,
     ))
     return worker.communicator.sent[-1].body.model_kwargs
 
@@ -186,6 +192,53 @@ def test_an_undeclared_model_sends_no_keys():
     worker = _worker(_Model(declares=False), _deployment())
 
     assert "prefix_keys" not in _run(worker), "an undeclared model was keyed"
+
+
+@pytest.mark.parametrize(("salt", "keyed"), [("", False), ("build-7", True)], ids=["shut", "salted"])
+def test_a_model_naming_no_checkpoint_is_keyed_only_where_a_salt_opens_its_cache(salt, keyed):
+    deployment = _deployment()
+    deployment["resources"]["kv"]["prefix_cache_salt"] = salt
+    worker = _worker(_Model(checkpoint=None), deployment)
+
+    assert ("prefix_keys" in _run(worker)) == keyed, (
+        "the worker keyed a request the engine's cache would not open for, or skipped one it would"
+    )
+
+
+def test_a_model_whose_cache_stays_shut_is_told_its_request_is_uncached():
+    model = _Model(checkpoint=None)
+    seen = {}
+    model.process_prompt = lambda *args, **kwargs: seen.update(kwargs) or _Model.process_prompt(model, *args, **kwargs)
+
+    _run(_worker(model, _deployment()))
+
+    assert seen.get("prefix_cache") is False, (
+        "a model was left to build what keys a request when no cache here opens for them"
+    )
+
+
+@pytest.mark.parametrize("server_clip", [True, False], ids=["the server's", "none"])
+def test_a_model_is_handed_the_servers_clip_and_never_a_clients(server_clip):
+    model = _Model()
+    seen = {}
+    model.process_prompt = lambda *args, **kwargs: seen.update(kwargs) or _Model.process_prompt(model, *args, **kwargs)
+    clip = GrowingClip() if server_clip else None
+    if clip is not None:
+        clip.append(np.linspace(-1, 1, 1600, dtype=np.float32))
+        clip.append(np.zeros(160, dtype=np.float32))
+
+    sent = _run(_worker(model, _deployment()), {"growing_clip": "a client's"}, clip=clip)
+
+    assert seen.get("growing_clip") is clip, (
+        "a model was not handed its request's clip, or was handed one a client named"
+    )
+    assert "growing_clip" not in sent, "a clip was sent on to the conductor"
+    if clip is not None:
+        # with no file between them: the clip's samples are the request's audio
+        (audio,) = seen["tensors"]["audio_inputs"]
+        assert torch.equal(audio, torch.from_numpy(np.concatenate(clip.chunks))), (
+            "the model was not handed the clip's own samples as its audio input"
+        )
 
 
 def test_a_worker_without_a_deployment_config_keys_no_stream():

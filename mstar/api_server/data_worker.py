@@ -44,7 +44,16 @@ from mstar.communication.tensors import (
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import ClientChunk, Model, PrefixKeys, ProcessPromptOutput, Span, keyed_labels
+from mstar.model.base import (
+    ClientChunk,
+    GrowingClip,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    TensorRange,
+    keyed_labels,
+)
 from mstar.model.media_limits import (
     RequestMediaBudget,
     charge_decoded_audio,
@@ -181,14 +190,28 @@ def _preprocess_loop(**kwargs):
 
 
 def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
-    """Page size per KV resource whose prefix cache is on, after this deployment's YAML has been applied."""
+    """Page size per KV resource whose prefix cache opens, after this deployment's YAML has been applied."""
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, model_config)
+    checkpoint = model.checkpoint_path()
     return {
         spec.resource_key: spec.config.page_size
         for spec in specs
-        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.prefix_cache
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+        and spec.config.prefix_cache_opens(checkpoint)
     }
+
+
+def _tensor_range(tensors: dict, source: TensorRange) -> torch.Tensor:
+    """The flattened elements a span's `TensorRange` names, or ValueError when the request has none there."""
+    name, entry, start, end = source
+    entries = tensors.get(name, ())
+    if not 0 <= entry < len(entries):
+        raise ValueError(f"a span names {name} entry {entry}, but the request has {len(entries)}")
+    values = entries[entry].reshape(-1)
+    if not 0 <= start < end <= values.numel():
+        raise ValueError(f"a span names {name}[{start}:{end}] of {values.numel()} elements")
+    return values[start:end]
 
 
 class PreprocessWorker:
@@ -574,6 +597,9 @@ class PreprocessWorkerThread:
         self._keyed_labels = {
             key: by_label for key, by_label in declared.items() if key in self._prefix_page_sizes
         }
+        # a model that declares keys no cache here opens is told each request is uncached,
+        # so it builds nothing to key it by
+        self._keys_shut = bool(declared) and not self._keyed_labels
         # tensors under these names are client stream items, not prompt signals
         self._client_edges = frozenset(
             conn.edge_name for conn in model.get_partition_topology().client_connections()
@@ -712,8 +738,13 @@ class PreprocessWorkerThread:
             # is hashed, its KV would be keyed by bytes we never decoded.
             for modality, paths in input.file_paths.items():
                 file_states[modality] = [_file_state(path) for path in paths]
+        if input.clip is not None and (input.file_paths or {}).get("audio"):
+            raise ValueError("a request takes its audio from its clip or from files, not both")
         tensors, input_metadata = self._load_media(input.file_paths)
-
+        if input.clip is not None:
+            # the server's own samples, already decoded and capped by the session
+            tensors["audio_inputs"] = [input.clip.audio()]
+            input_metadata["audio_inputs"] = [{"sample_rate": GrowingClip.SAMPLE_RATE, "num_channels": 1}]
 
         # Then, tokenize the prompt and let the model augment/transform the
         # tensors dict (e.g., Qwen3-Omni needs to compute pixel_values,
@@ -725,9 +756,14 @@ class PreprocessWorkerThread:
         # another request's pages and be served that request's KV. Likewise
         # only process_prompt sets the model's INTERNAL_KWARGS.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", *internal):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "growing_clip", *internal):
             model_kwargs.pop(name, None)
+        if self._keys_shut:
+            model_kwargs["prefix_cache"] = False
         if self.model is not None:
+            # the server's clip, never a client's, and kept out of model_kwargs:
+            # those reach the conductor
+            clip = {"growing_clip": input.clip} if input.clip is not None else {}
             prompt_tensors = self.model.process_prompt(
                 input.text,
                 input.input_modalities,
@@ -736,6 +772,7 @@ class PreprocessWorkerThread:
                 input_metadata=input_metadata,
                 prompt_parts=input.prompt_parts,
                 **model_kwargs,
+                **clip,
             )
             if isinstance(prompt_tensors, ProcessPromptOutput):
                 model_kwargs.update(prompt_tensors.metadata)
@@ -753,7 +790,7 @@ class PreprocessWorkerThread:
             # actually be prefilled with
             if model_kwargs.get("prefix_cache") is not False:
                 model_kwargs.update(self._prefix_keys(
-                    tensors, layouts, rows, input.file_paths, file_states,
+                    tensors, layouts, rows, input.file_paths, file_states, input.clip,
                 ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
@@ -1060,7 +1097,7 @@ class PreprocessWorkerThread:
 
     def _prefix_keys(
         self, tensors: dict, layouts: dict, rows: dict, file_paths: dict | None,
-        file_states: dict[str, list[tuple[int, int, int]]],
+        file_states: dict[str, list[tuple[int, int, int]]], clip: GrowingClip | None = None,
     ) -> dict:
         """Key each page of every label's keyed spans, by resource and label.
 
@@ -1082,7 +1119,7 @@ class PreprocessWorkerThread:
                     continue
                 try:
                     digests = [
-                        self._digest(span, file_paths, file_states)
+                        self._digest(span, tensors, file_paths, file_states, clip)
                         if span.kind == "digest" else None
                         for span in keyed
                     ]
@@ -1137,11 +1174,14 @@ class PreprocessWorkerThread:
                 )
             touched = range(at // page_size, -(-(at + span.length) // page_size))
             if span.kind == "ids":
-                entry = entries.get(span.source, 0)
-                entries[span.source] = entry + 1
-                if entry >= len(tensors.get(span.source, ())):
-                    raise ValueError(f"ids span {entry} of {span.source!r} has no entry to key")
-                ids = tensors[span.source][entry].flatten().tolist()
+                if isinstance(span.source, TensorRange):
+                    ids = _tensor_range(tensors, span.source).tolist()
+                else:
+                    entry = entries.get(span.source, 0)
+                    entries[span.source] = entry + 1
+                    if entry >= len(tensors.get(span.source, ())):
+                        raise ValueError(f"ids span {entry} of {span.source!r} has no entry to key")
+                    ids = tensors[span.source][entry].flatten().tolist()
                 if not len(ids) == span.length == span.advance:
                     raise ValueError(
                         f"an ids span of length {span.length} and advance "
@@ -1158,19 +1198,34 @@ class PreprocessWorkerThread:
         return pages, page_items(zip((span.length for span in layout), digests, strict=True), page_size)
 
     def _digest(
-        self, span: Span, file_paths: dict | None,
-        file_states: dict[str, list[tuple[int, int, int]]],
+        self, span: Span, tensors: dict, file_paths: dict | None,
+        file_states: dict[str, list[tuple[int, int, int]]], clip: GrowingClip | None = None,
     ) -> bytes:
-        """Hash the whole file a digest span names, with everything else that decides its KV.
+        """Hash the whole file a digest span names, or key the range of the request's
+        growing clip it names, with everything else that decides its KV.
 
         The digest is never cut short or turned into an id. Either would let two
-        images share a key, and one request would be served another's KV.
+        images share a key, and one request would be served another's KV. A clip's
+        range is keyed by the clip's nonce, which only the server holds: its samples
+        never change, so hashing them again on every request of the clip would only
+        cost time.
         """
         if type(span.params) is not tuple or not all(
             type(param) in (type(None), bool, int, float, str, bytes)
             for param in span.params
         ):
             raise ValueError(f"digest params {span.params!r} are not a tuple of plain values, whose repr is exact")
+        # Use repr, not str. True and "True" can preprocess differently
+        params = [repr(param) for param in span.params]
+        if isinstance(span.source, TensorRange):
+            if clip is None:
+                raise ValueError("a digest span names a tensor range, but the request has no growing clip")
+            # checked as the ids spans are; the dtype decides the stored values too
+            values = _tensor_range(tensors, span.source)
+            return fingerprint(
+                b"clip", clip.nonce, *span.source, values.dtype, self.model.preprocess_fingerprint(),
+                span.advance, *params,
+            )
         modality, index = span.source
         paths = (file_paths or {}).get(modality, ())
         if not 0 <= index < len(paths):
@@ -1178,11 +1233,7 @@ class PreprocessWorkerThread:
         raw = _sha256(paths[index])
         if _file_state(paths[index]) != file_states[modality][index]:
             raise _FileChangedError(paths[index])
-        return fingerprint(
-            raw, modality, self.model.preprocess_fingerprint(), span.advance,
-            # Use repr, not str. True and "True" can preprocess differently
-            *(repr(param) for param in span.params),
-        )
+        return fingerprint(raw, modality, self.model.preprocess_fingerprint(), span.advance, *params)
 
     @staticmethod
     def _summarize_inputs(input: PreprocessInput) -> list[InputInfo]:
@@ -1191,7 +1242,8 @@ class PreprocessWorkerThread:
         Reports the bytes the client actually sent — uploaded file sizes on
         disk and the UTF-8 length of the prompt — rather than the much larger
         decoded tensors (e.g. a compressed JPEG vs. its raw RGB tensor), so the
-        numbers line up with what a user thinks of as "input size".
+        numbers line up with what a user thinks of as "input size". A server-held
+        `GrowingClip` has no upload, so it counts as the PCM16 a WAV of it would carry.
         """
         infos = []
         if input.text:
@@ -1212,6 +1264,9 @@ class PreprocessWorkerThread:
                 count=len(paths),
                 total_bytes=total_bytes,
             ))
+        if input.clip is not None:
+            # the PCM16 a WAV of it would carry
+            infos.append(InputInfo(modality="audio", count=1, total_bytes=2 * input.clip.samples))
         return infos
 
     def _fail_request(
