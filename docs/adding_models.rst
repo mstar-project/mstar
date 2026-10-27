@@ -444,10 +444,11 @@ request's inputs on the keyed walk and cuts a prefix only from inputs that
 ``split_inputs`` can slice. A request whose inputs carry ``kwargs`` or
 ``resource_step_info`` is never probed; BAGEL's guided requests carry ``requires_cfg``
 there. The default ``split_inputs`` slices only the sequence, so a request whose inputs
-carry ``tensor_inputs`` is probed only when the submodule overrides it to cut those
-tensors. For a label keyed over several walks, where a keyed node streams into a
-partition other than its own, a request that runs that partition is not cached either,
-since a hit would skip the rows the node streams for the tokens the cache holds. BAGEL
+carry ``tensor_inputs`` is probed only when the submodule sets ``cuts_tensor_inputs``
+and overrides ``split_inputs`` to cut those tensors. For a label keyed over several
+walks, where a keyed node streams into a partition other than its own, a request that
+runs that partition is not cached either, since a hit would skip the rows the node
+streams for the tokens the cache holds. BAGEL
 keys an understanding prompt's text and images, and a generation's first span when it
 is text: an edit's images are resized before their walks see them, and a file's digest
 doesn't cover the resize. A label under a sliding window files pages only up to its

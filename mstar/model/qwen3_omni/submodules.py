@@ -335,6 +335,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
     produces ``logits`` for text token sampling.
     """
 
+    cuts_tensor_inputs = True
+
     # Default MRoPE section for head_dim=128: [24, 20, 20]
     MROPE_SECTION = [24, 20, 20]
 

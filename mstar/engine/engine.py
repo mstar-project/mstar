@@ -49,7 +49,6 @@ from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
-    ARNodeSubmodule,
     BatchedModelOutput,
     HostRows,
     InputMetadata,
@@ -1190,7 +1189,7 @@ class Engine:
         )
         submodule = self._submodules[batch.node_name].submodule
         if inputs.kwargs or inputs.resource_step_info or (
-            inputs.tensor_inputs and type(submodule).split_inputs is ARNodeSubmodule.split_inputs
+            inputs.tensor_inputs and not getattr(submodule, "cuts_tensor_inputs", False)
         ):
             self._runner.apply_cached_prefix(rid, batch.node_name, walk, inputs, None)
             return inputs

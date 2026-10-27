@@ -978,6 +978,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 
 class ARNodeSubmodule(NodeSubmodule):
+    # Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.
+    # The engine probes the prefix cache for a walk that carries them only then.
+    cuts_tensor_inputs: bool = False
+
     def split_inputs(
         self,
         graph_walk: str,
