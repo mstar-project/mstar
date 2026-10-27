@@ -90,7 +90,7 @@ def test_capture_rows_take_no_master_rows(ingraph, monkeypatch):
     monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1" if ingraph else "0")
     monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", "8")
     max_bs, vocab = 8, 32
-    res = SamplerResource(vocab_size=vocab, enable_repetion_penalty=True, device=CPU)
+    res = SamplerResource(vocab_size=vocab, enable_repetition_penalty=True, device=CPU)
     res._keep_last_token = ingraph
     res.build_accelerator_graph_buffers([SimpleNamespace(slot=s) for s in (0, 1)], max_bs, 1)
     bufs = res._cg_buffers

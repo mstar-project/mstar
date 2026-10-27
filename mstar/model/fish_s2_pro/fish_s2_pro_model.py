@@ -180,7 +180,7 @@ class FishS2ProModel(Model):
                 resource_key=AR_SAMPLER,
                 nodes={"AR"},
                 vocab_size=self.config.semantic_head_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
             ),
         ]
 

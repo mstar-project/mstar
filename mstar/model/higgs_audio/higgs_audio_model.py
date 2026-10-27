@@ -163,7 +163,7 @@ class HiggsAudioModel(Model):
                 # ASR transcription: the reference decodes greedily and
                 # exposes no penalty knob, so no seen-token buffers; without
                 # the capability a request penalty or min_p is refused.
-                enable_repetion_penalty=self.sampling_defaults.get("repetition_penalty", 1) != 1,
+                enable_repetition_penalty=self.sampling_defaults.get("repetition_penalty", 1) != 1,
                 enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]

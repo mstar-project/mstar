@@ -94,7 +94,7 @@ def test_graph_buffers_carry_min_p_only_when_enabled():
 
 
 def test_resource_refuses_min_p_without_the_capability():
-    plain = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=CPU)
+    plain = SamplerResource(vocab_size=None, enable_repetition_penalty=False, device=CPU)
     with pytest.raises(ValueError, match="enable_min_p=False"):
         plain.ingest_request("r", SamplingReqConfig(min_p=0.05, repetition_penalty=1.2))
     assert "r" not in plain._sampler._sampling_config
@@ -105,7 +105,7 @@ def test_resource_refuses_min_p_without_the_capability():
     assert plain._sampler._sampling_config["ok"].min_p == 0.0
 
     capable = SamplerResource(
-        vocab_size=None, enable_repetion_penalty=False, device=CPU, enable_min_p=True,
+        vocab_size=None, enable_repetition_penalty=False, device=CPU, enable_min_p=True,
     )
     capable.ingest_request("r", SamplingReqConfig(min_p=0.05))
     assert capable._sampler._sampling_config["r"].min_p == 0.05
@@ -116,7 +116,7 @@ def test_resource_refuses_min_p_out_of_range(bad):
     # checked before the capability, so a plain node rejects NaN rather than admitting it
     for enable in (False, True):
         res = SamplerResource(
-            vocab_size=None, enable_repetion_penalty=True, device=CPU, enable_min_p=enable,
+            vocab_size=None, enable_repetition_penalty=True, device=CPU, enable_min_p=enable,
         )
         with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
             res.ingest_request("r", SamplingReqConfig(min_p=bad, repetition_penalty=1.2))
@@ -126,7 +126,7 @@ def test_resource_refuses_min_p_out_of_range(bad):
 
 def test_resource_accepts_min_p_bounds():
     res = SamplerResource(
-        vocab_size=None, enable_repetion_penalty=False, device=CPU, enable_min_p=True,
+        vocab_size=None, enable_repetition_penalty=False, device=CPU, enable_min_p=True,
     )
     res.ingest_request("zero", SamplingReqConfig(min_p=0.0))
     res.ingest_request("one", SamplingReqConfig(min_p=1.0))

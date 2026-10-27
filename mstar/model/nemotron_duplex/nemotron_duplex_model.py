@@ -485,7 +485,7 @@ class NemotronDuplexModel(Model):
             SamplerSpec(
                 resource_key=NANO_SAMPLER, nodes={"nano_llm"},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
             ),
             KVSpec(
                 resource_key=TALKER_KV, nodes={"eartts_talker"},

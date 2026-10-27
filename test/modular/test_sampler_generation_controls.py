@@ -153,7 +153,7 @@ def _logits(bs: int, step: int, device) -> torch.Tensor:
 
 def _resource(**kwargs) -> SamplerResource:
     return SamplerResource(
-        vocab_size=None, enable_repetion_penalty=True, device=CPU, **kwargs,
+        vocab_size=None, enable_repetition_penalty=True, device=CPU, **kwargs,
     )
 
 
@@ -331,7 +331,7 @@ class _ProbsSpy:
 
 def _capable(device) -> SamplerResource:
     return SamplerResource(
-        vocab_size=None, enable_repetion_penalty=True, device=device,
+        vocab_size=None, enable_repetition_penalty=True, device=device,
         max_repetition_window=WINDOW, min_tokens_stop_ids=(EOS,),
         enable_top_p_first=True,
     )
@@ -621,7 +621,7 @@ def test_a_windowed_penalty_needs_no_seen_token_mask():
     from mstar.engine.resources.sampler.config import SamplingReqConfig
 
     spec = SamplerSpec(resource_key="s", nodes={"n"}, vocab_size=VOCAB,
-                       enable_repetion_penalty=False, max_repetition_window=16)
+                       enable_repetition_penalty=False, max_repetition_window=16)
     SamplingReqConfig(repetition_penalty=1.05, repetition_window=16).validate(spec)
     with pytest.raises(ValueError, match="repetition_penalty"):
         SamplingReqConfig(repetition_penalty=1.05).validate(spec)
