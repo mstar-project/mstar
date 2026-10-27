@@ -618,9 +618,9 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
   no sink), and its pages in ``nano_kv`` and
   ``talker_kv`` (``max_num_pages``; both sized from ``max_session_s``, and the
-  nano's from ``max_prompt_tokens`` too). The shipped configs set
-  ``max_concurrent_requests: 32`` to match; to serve more, raise the cap and
-  all six with it. The server
+  nano's from ``max_prompt_tokens`` too). The shipped configs set a
+  conservative ``max_concurrent_requests: 16`` (below); raising it to 32 needs
+  no other change, and to serve more, raise the cap and all six with it. The server
   refuses to start with a cap one of them cannot hold, since a session past
   any of them would wait on admit, and its frames with it, until another ends.
   The nano, the talker and the encoder each run at most 32 sessions
@@ -646,7 +646,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   106-frame demo clip, three repeats): 24-25 ms per 80 ms tick with one
   session, 61-64 ms with 32 concurrent sessions, 76-85 ms with 40, 87-92 ms
   with 48 and 95-97 ms with 64 (2026-10-08). 32 is the most that keep up with
-  real time, hence the shipped cap; every session received all its frames.
+  real time, hence the pools' size; every session received all its frames.
   Those are one-shot replays (the whole clip uploaded, so the server runs as
   fast as it can). Live calls paced in real time over ``/generate/ws``
   (``test/nemotron_duplex/live_ws_request.py``, 80 ms appends, 2026-10-17, one
@@ -659,8 +659,8 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   user stopping to agent audio playable without gaps). With the codec in the
   talker's step, on one H200: 16 live calls keep real time whether they start
   together or 2 s apart; 32 all finish but sit at the edge of real time (one run
-  kept up with 32 started together, another did not), so the shipped cap of 32
-  is an admission limit for live calls, not a real-time promise. Served audio is checked for intelligibility by
+  kept up with 32 started together, another did not; later runs kept up at 32),
+  so the shipped cap is a conservative 16. Served audio is checked for intelligibility by
   transcribing it (``test/nemotron_duplex/asr_check.py``, Whisper
   large-v3-turbo): MaskGIT sampling is knife-edge, so attention-backend
   numerics change the waveform but not the words.

@@ -16,7 +16,9 @@ max_seq_len: 12288  # config: voicechat streaming_max_len / vllm_max_model_len
 # raise the cap, raise their max_slots (cap + 1 for the recurrent pools, for the
 # sink; cap for encoder_kv) and the KV pools' max_num_pages with it.
 # The server refuses to start with a cap one of them cannot hold.
-# 16 keeps every live call in real time on one H200; at 32 the calls fall behind.
+# 16 is conservative: 32 live calls kept real time on recent H200 runs, but not
+# on every run, while 16 always has. The pools are sized for 32, so raising the
+# cap to 32 needs no other change.
 max_concurrent_requests: 16
 
 # No per-message deflate on the WebSocket routes: compressing 32 live calls'
