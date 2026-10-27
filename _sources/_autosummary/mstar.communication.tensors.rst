@@ -53,6 +53,7 @@ mstar.communication.tensors
    .. autosummary::
    
       AsyncReadError
+      MemoryRegistrationError
    
    
 
