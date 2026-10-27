@@ -1127,3 +1127,52 @@ def test_a_streamed_row_unlike_the_frame_goes_as_input_signals(tmp_path):
     (frame,) = mesh.run(rid, uuids=[1, 2])[PEER]
     assert frame.message_type == WorkerMessageType.INPUT_SIGNALS
     assert [i.uuid for i in frame.body.inputs[0].tensor_info] == [1, 2]
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_only_a_non_streamed_edge_to_a_peer_asks_for_request_info(tmp_path, streaming):
+    """A loop pass that sends a peer only streamed items needs no forward-pass
+    info: the receiver reads it only alongside a non-streamed edge."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    peer = ZmqCommunicator(PEER, str(tmp_path))
+    node = _node("ar_decode", ["token"], [("token", "ar_decode", False)])
+    node["outputs"].append({"name": "out", "dest": "remote", "persist": False,
+                            "new_token": False, "streaming": streaming, "modality": ""})
+    wg = {
+        "wg_id": WG_ID, "graph_walks": [WALK], "nodes": [node],
+        "loops": [{
+            "name": "ar_loop", "max_iters": 8, "parent": None,
+            "member_nodes": ["ar_decode"],
+            "outputs": [{"name": "token", "dest": "", "persist": False,
+                         "new_token": False, "streaming": False, "modality": ""}],
+            "accumulated": [], "loop_back": [("token", "ar_decode")],
+            "external_inputs": [("token", "ar_decode")],
+        }],
+    }
+    rt = GraphRuntime(
+        worker_graphs=[wg],
+        remote_worker_graphs=[{"wg_id": 1, "graph_walks": [WALK],
+                               "nodes": ["remote"], "dyn_loops": []}],
+        sharding={"groups": [], "shard_dim": [],
+                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
+                         [ME, PEER], [1, 1], [], [])
+    rt.ingest_inputs_batch(_one_signal(rid, "token", "ar_decode"))
+    rt.pop_rids("ar_decode", WALK, [rid])
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+    signals = rt.get_output_signals("ar_decode", WALK)
+    out = rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": WALK, "walks": None, "rid_walk_idx": None,
+        "node_name": "ar_decode", "output_signals": signals, "rids": [rid], "wg_ids": [WG_ID],
+        "tensors": [1], "num_tensors": [1 if s == "out" else 0 for s in signals],
+    })
+    assert (rid in out.rids_needing_request_info) is not streaming
+    _send(rt, out.completion_id)
+    (frame,) = _collect(peer)
+    assert frame.message_type == (
+        WorkerMessageType.STREAM_ITEMS if streaming else WorkerMessageType.INPUT_SIGNALS
+    )
