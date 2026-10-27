@@ -2,9 +2,13 @@
 
 Checks M*'s PersonaPlex against NVIDIA's reference implementation and measures
 it as served. M* serves PersonaPlex as an offline replay: a prerecorded user
-clip in, an agent track of the same length out. Concurrent requests share LM
-steps (`model_kwargs.max_batch_size`). Nothing in this directory exercises
-live duplex input or streamed audio.
+clip in, an agent track of the same length out, streamed back in chunks while
+the model runs. Concurrent requests share LM and decoder steps
+(`model_kwargs.max_batch_size`). Streamed output is exercised three ways: the
+served stages (lifecycle, soak, warm, batch) receive it through HTTP, which
+joins the chunks; the parity stages and `timing.py` feed the decoder node chunk
+by chunk (`decode.py`); and `sessions.py` timestamps chunks as they arrive.
+Nothing here exercises live duplex input (audio fed into a running request).
 
 NVIDIA's numbers come from running its reference model code
 (`NVIDIA/personaplex` at `3428dfd95309a7f3c84fd93259ded0f810d1ff91`) in the
@@ -99,9 +103,14 @@ against a running server on a clip of user speech followed by silence
 (`test/personaplex/duplex_clip.py` makes one). It reports per session:
 time to first audio; response onset on the audio timeline (signed, with
 speech already running at the user's speech end reported separately); and
-playback underruns with a fixed buffer. It exits 1 if any session fails or
-returns the wrong length of audio. A discarded warm-up wave runs first. It measures streamed delivery;
-`benchmark.runner` remains the throughput harness.
+playback underruns: playback starts `--buffer` (0.32 s) after the first chunk
+and runs in real time, and a chunk arriving after its playback time stalls it.
+Speech is 20 ms windows at or above `--voice-threshold` RMS for at least
+`--min-voiced` seconds; both are recorded in the output. It exits 1 if any
+session fails or returns the wrong length of audio. A discarded warm-up wave
+runs first. The whole clip is uploaded at once, so zero underruns show the
+server keeps ahead of playback, not that it takes live input. It measures
+streamed delivery; `benchmark.runner` remains the throughput harness.
 
 ## Limits
 

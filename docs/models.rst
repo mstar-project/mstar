@@ -1255,13 +1255,15 @@ implementation on GH200 and H100 GPUs:
   on both graph runtimes; a 20-minute mixed-load soak on the Rust runtime kept
   GPU memory flat.
 - The LM's generate step runs from CUDA graphs captured at batch sizes up to
-  ``max_batch_size`` (conditioning frames run eagerly). On one H100, over HTTP,
-  one 17.7 s request finished in 0.29x real time (5.1 s) and four concurrent
-  ones in 0.40x each (median), about 8.7 seconds of audio per second in total;
-  32 concurrent requests reached about 24. In one container with the graphs
-  on and off, one request took 4.7 to 5.0 s against 11.7 s: the eager step is
-  bound by CPU overhead (``benchmark/worker_phases``), so its speed also varies
-  between hosts.
+  ``max_batch_size`` (conditioning frames run eagerly). On one H100 over HTTP
+  (``benchmark.runner``, closed loop, a 17.7 s clip, ``max_batch_size`` 32),
+  M* delivered 3.8 to 4.1 seconds of audio per second at one request, 11.4 to
+  12.1 at four and 30 to 32 at 32, against 1.2 to 1.3, 4.0 to 4.5 and 19 to 21
+  with the graphs and the depformer cut both off, in one container. The eager
+  step is bound by CPU overhead (``benchmark/worker_phases``), so its speed
+  also varies between hosts. Streaming the audio costs 0 to 8% of that
+  throughput (more at higher concurrency); 16 streamed sessions play back
+  without underruns.
 - Audio quality has not been formally assessed. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge; no listening study

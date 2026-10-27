@@ -306,8 +306,10 @@ def report(root):
     lines += [
         "",
         "Deferred: injected worker errors, supported NVIDIA runtime, accepted near-limit",
-        "requests, broad quality claims, live ingress and streamed audio. The parity stages",
-        "drive the LM node directly (eager); served stages replay its captured generate step.",
+        "requests, broad quality claims and live ingress. The parity stages drive the LM node",
+        "directly (eager) and the decoder chunk by chunk; served stages replay its captured",
+        "generate step and receive the streamed audio joined over HTTP; streamed delivery",
+        "timing is measured separately by benchmark.personaplex.sessions.",
         "A completed comparison does not approve numerical divergence or establish quality.",
     ]
     (root / "REPORT.rst").write_text("\n".join(lines) + "\n")

@@ -258,6 +258,19 @@ def test_ownership_gate_allows_frames_in_flight_until_the_last_decoder_step():
         verify_ownership_observations(leaked, completed=1)
 
 
+def test_ownership_gate_needs_decoder_evidence_for_every_completed_request():
+    """Two completions, but decoder observations (several chunks) for only one request's lifetime."""
+    rows = [
+        _ownership("after_decoder_inputs_consumed", 0, 10, [(1, 8, 16)]),
+        _ownership("after_decoder_inputs_consumed", 0, 11, [(1, 8, 16)]),
+        _ownership("before_hard_cleanup", 0, 12),
+        _ownership("before_hard_cleanup", 1, 13, [(1, 8, 1)]),
+    ]
+    with pytest.raises(AssertionError, match="Missing decoder observations: 1 request lifetimes for 2"):
+        verify_ownership_observations(rows, completed=2)
+    verify_ownership_observations(rows, completed=1)
+
+
 def test_ownership_gate_recognises_unnamed_agent_frames_by_shape():
     rows = [_ownership("after_decoder_inputs_consumed", 0, 10, [(1, 8, 16), (1, 8, 1)]),
             _ownership("before_hard_cleanup", 0, 11)]
@@ -498,6 +511,20 @@ def test_sessions_onset_is_found_within_chunks_and_respects_overlap():
     blip = np.zeros(rate, dtype=np.float32)
     blip[: int(0.05 * rate)] = 0.5  # shorter than the minimum voiced duration
     assert speech_segments(blip, rate) == []
+
+
+def test_sessions_detector_finds_speech_in_tracks_with_little_or_no_silence():
+    """A mostly voiced reply has no quiet percentile to calibrate on; the threshold must not need one."""
+    from benchmark.personaplex.sessions import speech_segments
+
+    rate = 24000
+    constant = np.full(rate, 0.3, dtype=np.float32)
+    assert speech_segments(constant, rate) == [(0.0, 1.0)]
+    mostly = np.full(rate * 2, 0.3, dtype=np.float32)
+    mostly[: int(0.2 * rate)] = 0.002  # 10% idle at PersonaPlex's measured idle level
+    segments = speech_segments(mostly, rate)
+    assert len(segments) == 1 and abs(segments[0][0] - 0.2) < 0.021
+    assert speech_segments(np.full(rate, 0.008, dtype=np.float32), rate) == []  # idle noise stays silent
 
 
 def test_sessions_cell_is_invalid_and_exits_nonzero_when_a_session_fails(tmp_path, monkeypatch):

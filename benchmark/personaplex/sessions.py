@@ -9,8 +9,10 @@ reports per session, from timestamped chunk arrivals (monotonic clock):
   segment beginning at or after ``speech_end - window``, as signed seconds
   from the user's speech end (negative = the agent began first). An agent
   segment already running at speech end is reported separately, not folded
-  into a near-zero onset. Segments come from 20 ms RMS windows within the
-  chunks, a threshold and a minimum voiced duration;
+  into a near-zero onset. Segments are runs of 20 ms windows whose RMS is at
+  least ``--voice-threshold`` (default 0.02, -34 dBFS; PersonaPlex replies idle
+  at or below about 0.009 and speak at 0.05-0.2), lasting at least
+  ``--min-voiced`` seconds. Both are recorded with the results;
 * delivery against playback: playback starts ``buffer`` after the first chunk
   and runs in real time; a chunk that arrives after its playback time pauses
   playback until it does (an underrun), and later deadlines shift by the stall;
@@ -41,20 +43,23 @@ import numpy as np
 SAMPLE_RATE = 24000
 
 
-def speech_segments(pcm: np.ndarray, rate: int = SAMPLE_RATE, window_s: float = 0.02,
-                    threshold: float | None = None, min_voiced_s: float = 0.1) -> list[tuple[float, float]]:
-    """Voiced spans (seconds) of a float PCM track, from RMS over ``window_s`` windows.
+VOICE_THRESHOLD = 0.02  # window RMS, full scale 1.0
+MIN_VOICED_S = 0.1
 
-    ``threshold`` defaults to four times the 20th percentile of the window RMS
-    (the track's idle level), floored at 0.01 of full scale.
+
+def speech_segments(pcm: np.ndarray, rate: int = SAMPLE_RATE, window_s: float = 0.02,
+                    threshold: float = VOICE_THRESHOLD,
+                    min_voiced_s: float = MIN_VOICED_S) -> list[tuple[float, float]]:
+    """Voiced spans (seconds) of a float PCM track: runs of ``window_s`` windows with RMS >= ``threshold``.
+
+    A fixed threshold, not one derived from the track: a reply that is mostly speech has no quiet
+    percentile to calibrate on.
     """
     hop = int(rate * window_s)
     count = len(pcm) // hop
     if count == 0:
         return []
     rms = np.sqrt((pcm[: count * hop].reshape(count, hop).astype(np.float64) ** 2).mean(axis=1))
-    if threshold is None:
-        threshold = max(0.01, 4 * float(np.percentile(rms, 20)))
     voiced = rms >= threshold
     segments, start = [], None
     for i, on in enumerate([*voiced, False]):
@@ -114,7 +119,7 @@ def run_session(url: str, audio: str, voice: str, timeout: float, out: dict) -> 
 
 
 def run_cell(url: str, audio: str, sessions: int, speech_end: float, voice: str, buffer_s: float,
-             timeout: float) -> dict:
+             timeout: float, voice_threshold: float = VOICE_THRESHOLD, min_voiced_s: float = MIN_VOICED_S) -> dict:
     with wave.open(audio) as w:
         input_samples, rate = w.getnframes(), w.getframerate()
     if rate != SAMPLE_RATE:
@@ -136,13 +141,15 @@ def run_cell(url: str, audio: str, sessions: int, speech_end: float, voice: str,
             "time_to_first_audio_s": r["arrivals"][0][0] if r["arrivals"] else None,
             "rtf": r["wall_s"] / (input_samples / SAMPLE_RATE),
             **playback(r["arrivals"], buffer_s=buffer_s),
-            **response_onset(speech_segments(r["pcm"]), speech_end),
+            **response_onset(speech_segments(r["pcm"], threshold=voice_threshold, min_voiced_s=min_voiced_s),
+                             speech_end),
             "arrivals": r["arrivals"],
         })
     return {"sessions": sessions, "valid": all(row["complete"] for row in rows),
             "completed": sum(row["complete"] for row in rows), "wall_s": wall,
             "audio_seconds_throughput": sum(row["samples"] for row in rows) / SAMPLE_RATE / wall,
-            "buffer_s": buffer_s, "speech_end_s": speech_end, "rows": rows}
+            "buffer_s": buffer_s, "speech_end_s": speech_end, "voice_threshold": voice_threshold,
+            "min_voiced_s": min_voiced_s, "rows": rows}
 
 
 def main() -> int:
@@ -155,13 +162,17 @@ def main() -> int:
     parser.add_argument("--buffer", type=float, default=0.32, help="playback buffer after the first chunk, seconds")
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--warmup", type=int, default=1, help="waves of N sessions run and discarded before each cell")
+    parser.add_argument("--voice-threshold", type=float, default=VOICE_THRESHOLD,
+                        help="speech window RMS, full scale 1")
+    parser.add_argument("--min-voiced", type=float, default=MIN_VOICED_S, help="shortest speech segment, seconds")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     cells = []
     for n in args.sessions:
+        detector = {"voice_threshold": args.voice_threshold, "min_voiced_s": args.min_voiced}
         for _ in range(args.warmup):
-            run_cell(args.url, args.audio, n, args.speech_end, args.voice, args.buffer, args.timeout)
-        cell = run_cell(args.url, args.audio, n, args.speech_end, args.voice, args.buffer, args.timeout)
+            run_cell(args.url, args.audio, n, args.speech_end, args.voice, args.buffer, args.timeout, **detector)
+        cell = run_cell(args.url, args.audio, n, args.speech_end, args.voice, args.buffer, args.timeout, **detector)
         cells.append(cell)
         print(json.dumps({k: v for k, v in cell.items() if k != "rows"}), flush=True)
     args.output.write_text(json.dumps({"audio": args.audio, "cells": cells}, indent=2) + "\n")

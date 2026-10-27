@@ -57,23 +57,28 @@ def verify_ownership_observations(rows, completed):
     a handle's observations are grouped by the hard cleanups between them.
     """
     decoders = [r for r in rows if r["event"] == "after_decoder_inputs_consumed"]
-    assert len(decoders) >= completed, f"Missing decoder observations: {len(decoders)} for {completed} completions"
+    assert decoders or not completed, f"Missing decoder observations: 0 for {completed} completions"
     entities = {r.get("entity") for r in decoders}
     timelines = {}
     for r in rows:
         if r["event"] in ("after_decoder_inputs_consumed", "before_hard_cleanup") and r.get("entity") in entities:
             timelines.setdefault((r.get("entity"), r["rid"]), []).append(r)
-    held = []
+    held, lifetimes = [], 0  # lifetimes: request lifetimes (cleanups) with decoder evidence
     for (entity, rid), events in timelines.items():
         last = None
         for event in sorted(events, key=lambda e: (e["time"], e["event"] == "before_hard_cleanup")):
             if event["event"] == "after_decoder_inputs_consumed":
                 last = event
                 continue
-            if last is not None and any(holds_agent_frame(t) for t in last["tensors"]):
-                held.append(rid)
+            if last is not None:
+                lifetimes += 1
+                if any(holds_agent_frame(t) for t in last["tensors"]):
+                    held.append(rid)
             last = None
         assert last is None, f"Decoder observation for handle {rid} on {entity} has no later hard cleanup"
+    # Every completed request needs its own decoder evidence; one request's many chunks must not count twice.
+    assert lifetimes >= completed, (
+        f"Missing decoder observations: {lifetimes} request lifetimes for {completed} completions")
     assert not held, f"Decoder observations still hold agent frames for handles {held}"
 
 
