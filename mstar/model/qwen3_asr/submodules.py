@@ -22,7 +22,6 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
-    BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
@@ -32,6 +31,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.aut_encoder import AuTEncoder
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
+from mstar.model.components.token_step import TokenStepNode
 from mstar.model.qwen3_asr.config import (
     ATTN,
     AUT_ATTN,
@@ -47,7 +47,6 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -199,7 +198,7 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
 # ===================================================================
 
 
-class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
+class Qwen3ASRLLMSubmodule(TokenStepNode, ARNodeSubmodule):
     """Dense Qwen3 decoder.
 
     Dispatches on graph_walk:
@@ -212,9 +211,13 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
     on batch size with bare ids embedded inside the graph.
     """
 
+    DECODE_WALK = DECODE_WALK
+    DECODE_LOOP = DECODE_LOOP
+    SAMPLER = SAMPLER
+    # prefill's batch is capped by its captures (and uncapped eager)
+    MAX_PREFILL_BATCH_SIZE = None
     PREFILL_TOKEN_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     # Prefill and decode are graph replays. The compiled path only served the
     # uncaptured shapes and recompiled per request id (see the encoder).
     disable_torch_compile = True
@@ -226,6 +229,7 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         super().__init__()
         self.model = llm
         self.config = config
+        self.stop_token_ids = config.stop_token_ids
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -233,14 +237,7 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
         hidden = self.config.text.hidden_size
         dtype = self.model.embed_tokens.weight.dtype
         return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk=DECODE_WALK,
-                single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
-                    input_seq_len=1,
-                ),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            ),
+            *super().get_accelerator_graph_configs(device, tp_world_size),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 make_node_input=lambda n: ARNodeInputs(
@@ -381,9 +378,6 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
     ) -> NameToTensorList:
         return {"new_token": [self._forward(graph_walk, engine_inputs, input_ids, input_embeds)]}
 
-    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        return True
-
     def forward_batched(
         self,
         graph_walk: str,
@@ -402,65 +396,6 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
             check_stop_buffers={"new_token": new_tokens},
         )
 
-    def postprocess(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs,
-    ):
-        if "new_token" in outputs:
-            outputs["text_inputs"] = outputs["new_token"]
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        tokens = outputs.get("text_inputs") or outputs.get("new_token")
-        if request_info.graph_walk != DECODE_WALK or not tokens:
-            return set()
-        token = tokens[0].item()
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        decoded = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
-        if (not ignore_eos and token in self.config.stop_token_ids) or decoded >= request_info.max_tokens:
-            return {DECODE_LOOP}
-        return set()
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-        step_walk: str | None = None,
-    ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``."""
-        if step_walk is not None and step_walk != DECODE_WALK:
-            return {}  # as check_stop: only a decode row's token is checked
-        tokens = host_rows.buffers.get("new_token")
-        if not torch.is_tensor(tokens) or tokens.dim() == 0:
-            return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        rows = host_rows.request_ids
-        if len(rows) >= len(request_ids) and all(
-            a == b for a, b in zip(request_ids, rows, strict=False)
-        ):
-            pairs = zip(request_ids, values, strict=False)
-        else:
-            row_of = {rid: i for i, rid in enumerate(rows)}
-            pairs = (
-                (rid, values[i]) for rid in request_ids
-                if (i := row_of.get(rid)) is not None and i < len(values)
-            )  # no row, no output: the per-request path skips it too
-        stop_ids = self.config.stop_token_ids
-        stops: dict[str, set[str]] = {}
-        for rid, token in pairs:
-            info = request_infos[rid]
-            if info.graph_walk != DECODE_WALK:
-                continue
-            if (
-                token in stop_ids and not info.resource_configs[SAMPLER].ignore_eos
-            ) or info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1 >= info.max_tokens:
-                stops[rid] = {DECODE_LOOP}
-        return stops
+    def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
+        # only a decode step's token ends the loop: prefill runs outside it
+        return request_info.graph_walk == DECODE_WALK and super()._stops(token, request_info)

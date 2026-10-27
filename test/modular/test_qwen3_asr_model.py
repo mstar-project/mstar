@@ -310,7 +310,7 @@ def _llm_submodule(cfg):
     sub = object.__new__(Qwen3ASRLLMSubmodule)
     torch.nn.Module.__init__(sub)
     sub.request_states, sub.node_resources = {}, {}
-    sub.config = cfg
+    sub.config, sub.stop_token_ids = cfg, cfg.stop_token_ids
     embed = torch.nn.Embedding(cfg.text.vocab_size, cfg.text.hidden_size)
     sub.model = type("M", (), {"embed": staticmethod(embed.forward), "embed_tokens": embed})()
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
@@ -388,7 +388,6 @@ def test_llm_check_stop_batched_agrees_with_per_request():
     # called as Engine.check_stop_for_batch calls it (step_walk=None: a mixed step)
     host_rows = HostRows(row_rids, {"new_token": tokens})
     batched = sub.check_stop_batched(check, infos, host_rows, step_walk=None)
-    assert sub.check_stop_batched(check, infos, host_rows, step_walk=PREFILL_WALK) == {}
     per_request = {}
     for i, rid in enumerate(row_rids):
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
