@@ -6,10 +6,11 @@ check_stop, per step.
 Requests of 1, 5, 17 and 30 frames join and leave at different iterations, in
 both frame buckets (small ones here), in eager steps and in steps padded to a
 capture bucket as a replay is. A stopped request rides along in one more
-iteration, as the async worker's speculated step does, and is dropped. Each
-request's tokens must equal the one-request reference loop's and those of
-#796's in-forward decoder (a frozen copy below). On CUDA a captured graph,
-replayed through the engine's runner, must emit what the eager steps do.
+iteration, and emits nothing. Each request's tokens must equal the one-request
+reference loop's and those of #796's in-forward decoder (a frozen copy below),
+which project the whole clip first where the loop projects the frames each
+step reads. On CUDA a captured graph, replayed through the engine's runner,
+must emit what the eager steps do.
 """
 from __future__ import annotations
 
@@ -30,10 +31,10 @@ from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
-    DECODE_WALK,
     NUM_FRAMES,
-    PREFILL_WALK,
+    PROMPT_ID,
     TRANSDUCER_STATE,
+    WALK,
     ParakeetModelConfig,
 )
 from mstar.model.parakeet.parakeet_model import ParakeetModel
@@ -181,10 +182,11 @@ SCENARIOS = {"random": _random, "never_blank": _never_blank, "blank_runs": _blan
 
 # -- the node, its pool and a step runner ------------------------------------------
 
-def _info(rid: int, walk: str, num_frames: int, iterations: int = 0) -> CurrentForwardPassInfo:
+def _info(rid: int, num_frames: int, iterations: int = 0, prompt_id: int | None = None) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
-        request_id=f"r{rid}", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=2048, rid_handle=rid,
-        step_metadata={NUM_FRAMES: num_frames}, dynamic_loop_iter_counts={DECODE_LOOP: iterations},
+        request_id=f"r{rid}", graph_walk=WALK, fwd_index=0, random_seed=0, max_tokens=2048, rid_handle=rid,
+        step_metadata={NUM_FRAMES: num_frames, PROMPT_ID: prompt_id},
+        dynamic_loop_iter_counts={DECODE_LOOP: iterations},
     )
 
 
@@ -209,7 +211,9 @@ class Harness:
             cfg.additional_key_info: cfg for cfg in self.node.get_accelerator_graph_configs(self.device)
         }
         self.precision = node_fp32_precision("transducer", self.node)
-        self.frames: dict[int, torch.Tensor] = {}
+        # each request's encoder output, which the loop re-injects every iteration
+        self.states: dict[int, torch.Tensor] = {}
+        self.prompts: dict[int, int | None] = {}
         self.iterations: dict[int, int] = {}
         # the replay slot the next step leases, rotated as the engine does
         self.slot = 0
@@ -233,28 +237,17 @@ class Harness:
         self.runner.commit(step)
         return BatchedModelOutput.coerce(out)
 
-    def join(self, rids: list[int], clips: list[torch.Tensor]) -> None:
-        """Open the requests and run their prefill step, as one batch."""
-        for rid in rids:
+    def join(self, rids: list[int], clips: list[torch.Tensor], prompts: list[int | None]) -> None:
+        """Open the requests, each with its encoder output."""
+        for rid, clip, prompt in zip(rids, clips, prompts, strict=True):
             self.runner.ingest_request(rid)
-        infos = {rid: _info(rid, PREFILL_WALK, clip.shape[0]) for rid, clip in zip(rids, clips, strict=True)}
-        inputs = [
-            self.node.prepare_inputs(PREFILL_WALK, infos[rid], {"encoder_states": [clip.to(self.device)]})
-            for rid, clip in zip(rids, clips, strict=True)
-        ]
-        ctx = StepContext(request_ids=list(rids), graph_walk=PREFILL_WALK, slot=0, capture=False)
-        out = self._drive(PREFILL_WALK, inputs, infos, ctx)
-        for rid in rids:
-            assert self.node.check_stop(rid, infos[rid], out.per_rid_outputs[rid]) == set()
-            frames = self.frames[rid] = out.per_rid_outputs[rid]["frames"][0]
-            assert frames.is_contiguous() and frames.shape == (infos[rid].step_metadata[NUM_FRAMES], 16)
-            self.iterations[rid] = 0
+            self.states[rid], self.prompts[rid], self.iterations[rid] = clip.to(self.device), prompt, 0
 
     def _decode_inputs(self, rids):
         infos = {
-            rid: _info(rid, DECODE_WALK, self.frames[rid].shape[0], self.iterations[rid]) for rid in rids
+            rid: _info(rid, self.states[rid].shape[0], self.iterations[rid], self.prompts[rid]) for rid in rids
         }
-        inputs = [self.node.prepare_inputs(DECODE_WALK, infos[rid], {"frames": [self.frames[rid]]}) for rid in rids]
+        inputs = [self.node.prepare_inputs(WALK, infos[rid], {"encoder_states": [self.states[rid]]}) for rid in rids]
         return infos, inputs
 
     def iterate(self, rids: list[int], padded_to: int | None = None, runner=None) -> tuple[dict, set]:
@@ -263,25 +256,25 @@ class Harness:
         directly), or replayed by ``runner``. -> each request's tokens, and the
         requests check_stop ends."""
         infos, inputs = self._decode_inputs(rids)
-        bucket = self.node.cg_key_info(DECODE_WALK, infos)
+        bucket = self.node.cg_key_info(WALK, infos)
         assert bucket == inputs[0].resource_step_info
         if runner is not None:
             out = self._replay(runner, rids, infos, inputs, bucket)
         elif padded_to is not None:
-            lease = SlotLease(slot=0, bucket=BucketKey(DECODE_WALK, padded_to, padded_to, bucket))
+            lease = SlotLease(slot=0, bucket=BucketKey(WALK, padded_to, padded_to, bucket))
             padding = [dummy_rid_handle(f"__cg_transducer_{bucket}_slot0_{i}__") for i in range(len(rids), padded_to)]
             inputs = [*inputs, *self.configs[bucket].get_node_inputs(len(padding), 0)]
-            ctx = StepContext(request_ids=list(rids), graph_walk=DECODE_WALK, slot=0, capture=False, slot_lease=lease)
+            ctx = StepContext(request_ids=list(rids), graph_walk=WALK, slot=0, capture=False, slot_lease=lease)
             ctx.set_padded_rids([*rids, *padding])
-            out = self._drive(DECODE_WALK, inputs, infos, ctx)
+            out = self._drive(WALK, inputs, infos, ctx)
         else:
-            ctx = StepContext(request_ids=list(rids), graph_walk=DECODE_WALK, slot=0, capture=False)
-            out = self._drive(DECODE_WALK, inputs, infos, ctx)
+            ctx = StepContext(request_ids=list(rids), graph_walk=WALK, slot=0, capture=False)
+            out = self._drive(WALK, inputs, infos, ctx)
         tokens = out.row_outputs["tokens"][:len(rids)].cpu()
         # one tensor: the engine clones it once, and the client's copy is the stop check's host copy
         assert out.check_stop_buffers["tokens"] is out.row_outputs["tokens"]
         host = HostRows(request_ids=tuple(rids), buffers={"active": out.check_stop_buffers["active"].cpu()})
-        stops = self.node.check_stop_batched(rids, infos, host, step_walk=DECODE_WALK)
+        stops = self.node.check_stop_batched(rids, infos, host, step_walk=WALK)
         assert all(loops == {DECODE_LOOP} for loops in stops.values())
         for rid in rids:
             self.iterations[rid] += 1
@@ -290,16 +283,16 @@ class Harness:
     def _replay(self, cg, rids, infos, inputs, bucket):
         """The engine's ``_exec_single`` under a lease: pad, declare, admit, plan,
         preprocess, stage and replay, commit, release."""
-        lease = cg.lease_slot(DECODE_WALK, bs=len(rids), slot=self.slot, num_tokens=len(rids), cg_key_info=bucket)
+        lease = cg.lease_slot(WALK, bs=len(rids), slot=self.slot, num_tokens=len(rids), cg_key_info=bucket)
         self.slot += 1
         assert lease is not None, f"no capture for {len(rids)} rows of bucket {bucket}"
         padded = cg.pad_inputs(lease, inputs)
-        ctx = StepContext(request_ids=list(rids), graph_walk=DECODE_WALK, slot=lease.slot, capture=False,
+        ctx = StepContext(request_ids=list(rids), graph_walk=WALK, slot=lease.slot, capture=False,
                           slot_lease=lease)
         ctx.set_padded_rids(cg.step_ids(lease, list(rids)))
         try:
             return self._drive(
-                DECODE_WALK, padded, cg.step_metadata(lease, list(rids), infos), ctx,
+                WALK, padded, cg.step_metadata(lease, list(rids), infos), ctx,
                 forward=lambda preprocessed: cg.run_forward(lease, preprocessed),
             )
         finally:
@@ -308,14 +301,15 @@ class Harness:
     def leave(self, rid: int) -> None:
         self.runner.remove_request(rid)
         self.node.cleanup_request(rid)
-        del self.frames[rid], self.iterations[rid]
+        del self.states[rid], self.prompts[rid], self.iterations[rid]
 
 
-def _run(harness: Harness, clips, mode, runner=None, arrivals=ARRIVALS) -> dict[int, list[int]]:
-    """Every request of ``arrivals`` through prefill and its decode loop. A
-    request joins when a slot is free (the conductor's queue), each
-    iteration runs one step per frame bucket, and a request check_stop ends
-    runs one more iteration whose tokens are dropped."""
+def _run(harness: Harness, clips, mode, runner=None, arrivals=ARRIVALS, prompts=None) -> dict[int, list[int]]:
+    """Every request of ``arrivals`` through its decode loop. A request joins
+    when a slot is free (the conductor's queue), each iteration runs one step
+    per frame bucket, and a request check_stop ends runs one more iteration
+    whose tokens are dropped."""
+    prompts = prompts or [None] * len(arrivals)
     out: dict[int, list[int]] = {}
     waiting = list(range(len(arrivals)))
     live: list[int] = []
@@ -327,14 +321,14 @@ def _run(harness: Harness, clips, mode, runner=None, arrivals=ARRIVALS) -> dict[
                 waiting.remove(rid)
                 joining.append(rid)
         if joining:
-            harness.join(joining, [clips[rid] for rid in joining])
+            harness.join(joining, [clips[rid] for rid in joining], [prompts[rid] for rid in joining])
             live += joining
             out.update({rid: [] for rid in joining})
         if not live and not waiting:
             break
         groups: dict[int | None, list[int]] = {}
         for rid in live:
-            groups.setdefault(harness.node._bucket(harness.frames[rid].shape[0]), []).append(rid)
+            groups.setdefault(harness.node._bucket(harness.states[rid].shape[0]), []).append(rid)
         newly_stopped = set()
         for group, (bucket, rids) in enumerate(sorted(groups.items())):
             padded_to = None
@@ -343,7 +337,7 @@ def _run(harness: Harness, clips, mode, runner=None, arrivals=ARRIVALS) -> dict[
             tokens, stops = harness.iterate(rids, padded_to=padded_to, runner=runner)
             for rid in rids:
                 if rid in stopped:
-                    # the speculated iteration after the stop: dropped, and it emits nothing
+                    # an iteration after the stop: dropped, and it emits nothing
                     assert all(token == -1 for token in tokens[rid])
                 else:
                     out[rid] += [token for token in tokens[rid] if token >= 0]
@@ -377,6 +371,44 @@ def test_loop_matches_the_reference_and_the_frozen_decoder(scenario, durations, 
         assert [len(tokens) for tokens in expected] == [head.config.max_symbols_per_step * n for n in lengths]
 
 
+def test_each_request_decodes_under_its_own_prompt():
+    """Nemotron's language prompt reaches every step from the step metadata:
+    requests with different prompts in one batch each get the reference's
+    tokens for theirs."""
+    head = _head([], num_prompts=4, seed=3)
+    _, clips = _random([])
+    prompts = [rid % 4 for rid in range(len(clips))]
+    with torch.no_grad():
+        got = _run(Harness(head), clips, "mixed", prompts=prompts)
+        expected = [_reference(head, clip, prompt) for clip, prompt in zip(clips, prompts, strict=True)]
+        unprompted = [_reference(head, clip, 0) for clip in clips]
+    assert [got[rid] for rid in range(len(clips))] == expected
+    assert expected != unprompted, "the prompt changed nothing; the test would be vacuous"
+
+
+def test_a_step_run_row_by_row_feeds_the_stop_check():
+    """``forward``, which the engine runs for a step it doesn't batch, hands
+    the per-request stop check the active flag beside the tokens."""
+    head, clips = _never_blank([])
+    harness = Harness(head)
+    # one frame: max_symbols tokens, then the cursor moves past it
+    harness.join([0], [clips[1]], [None])
+    infos, inputs = harness._decode_inputs([0])
+    step = harness.node.declare_step(WALK, [0], inputs, per_request_info=infos)
+    step.set_ctx(StepContext(request_ids=[0], graph_walk=WALK, slot=0, capture=False))
+    assert harness.runner.admit(step).ok
+    harness.runner.plan(step)
+    engine_inputs = ModelInputsFromEngine(
+        request_ids=[0], per_request_info=infos, resources=harness.resources, captured=False, step=step,
+    )
+    with torch.no_grad(), fp32_precision_scope(harness.precision):
+        out = harness.node.forward(WALK, engine_inputs, **harness.node.preprocess(WALK, engine_inputs, inputs))
+    harness.runner.commit(step)
+    assert out.keys() == {"tokens", "active"}
+    assert [token for token in out["tokens"][0][0].tolist() if token >= 0] == _reference(head, clips[1])
+    assert harness.node.check_stop(0, infos[0], out) == {DECODE_LOOP}
+
+
 def test_loop_caps_and_stop_check_agree():
     """The loop cap is where the stop check's guard would end the loop: past
     the most steps a clip can take, so active ends it first."""
@@ -390,11 +422,11 @@ def test_loop_caps_and_stop_check_agree():
     assert model.get_loop_caps(**{NUM_FRAMES: 30}) == {DECODE_LOOP: cfg.decode_iterations(30)}
     assert model.get_loop_caps() == {}
     node = TransducerSubmodule(head, compile_step=False, frame_buckets=BUCKETS)
-    info = _info(0, DECODE_WALK, 30, iterations=cfg.decode_iterations(30) - 1)
-    assert node.check_stop(0, info, {"clock": [torch.tensor([True])]}) == {DECODE_LOOP}
-    info = _info(0, DECODE_WALK, 30, iterations=cfg.decode_iterations(30) - 2)
-    assert node.check_stop(0, info, {"clock": [torch.tensor([True])]}) == set()
-    assert node.check_stop(0, info, {"clock": [torch.tensor([False])]}) == {DECODE_LOOP}
+    info = _info(0, 30, iterations=cfg.decode_iterations(30) - 1)
+    assert node.check_stop(0, info, {"active": [torch.tensor([True])]}) == {DECODE_LOOP}
+    info = _info(0, 30, iterations=cfg.decode_iterations(30) - 2)
+    assert node.check_stop(0, info, {"active": [torch.tensor([True])]}) == set()
+    assert node.check_stop(0, info, {"active": [torch.tensor([False])]}) == {DECODE_LOOP}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures CUDA graphs")

@@ -65,12 +65,11 @@ def _reference(head: TransducerHead, states: torch.Tensor, prompt_id=None) -> li
 def _greedy(head: TransducerHead, states, lengths, prompt_ids=None) -> list[list[int]]:
     """Each request's tokens from ``advance`` alone: the batch's state, from
     the start state, stepped a chunk at a time until no row is active."""
-    frames = head.project_frames(states, prompt_ids)
-    rows = frames.shape[0]
+    rows = states.shape[0]
     state = {name: start.expand(rows, *start.shape).clone() for name, start in head.initial_state().items()}
     chunks = []
-    for _ in range(head.config.decode_iterations(frames.shape[1])):
-        tokens, active = head.advance(frames, lengths, state)
+    for _ in range(head.config.decode_iterations(states.shape[1])):
+        tokens, active = head.advance(states, lengths, state, prompt_ids=prompt_ids)
         chunks.append(tokens)
         if not active.any():
             break

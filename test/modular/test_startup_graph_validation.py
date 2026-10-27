@@ -828,7 +828,7 @@ def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.components.transducer import TransducerConfig
     from mstar.model.parakeet.config import ParakeetModelConfig
     from mstar.model.parakeet.parakeet_model import ParakeetModel
-    # Nemotron ASR's language prompt is one more input to the transducer
+    # Nemotron ASR conditions the transducer on a language prompt
     transducer = TransducerConfig(num_prompts=128 if name == "nemotron_asr" else 0)
     return _bare(ParakeetModel, config=ParakeetModelConfig(name, FastConformerConfig(), transducer))
 

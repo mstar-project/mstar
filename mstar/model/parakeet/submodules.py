@@ -1,12 +1,11 @@
 """The transducer node: greedy RNN-T / TDT decoding as a loop in the graph. The
 encoder node is the shared ``FastConformerEncoderSubmodule``.
 
-``prefill`` projects a batch's encoder output once (with Nemotron's language
-prompt) into each request's ``frames``, which the decode loop re-injects every
-iteration. A ``decode`` iteration reads its rows' state from the recurrent
-pool, runs ``CHUNK`` greedy steps, writes the state back and emits the
-iteration's tokens; the stop check ends a request's loop once its cursor has
-passed its last frame.
+The decode loop re-injects each request's encoder output every iteration. An
+iteration reads its rows' state from the recurrent pool, runs ``CHUNK`` greedy
+steps, each projecting the frames under the cursors (with Nemotron's language
+prompt), writes the state back and emits the iteration's tokens; the stop
+check ends a request's loop once its cursor has passed its last frame.
 """
 from __future__ import annotations
 
@@ -14,7 +13,6 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
-from torch.nn.utils.rnn import pad_sequence
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -24,7 +22,7 @@ from mstar.engine.fp32_precision import fp32_precision_scope, node_fp32_precisio
 from mstar.engine.resources import Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.recurrent import RecurrentAddressing, RecurrentStatePool, RecurrentStep
 from mstar.model.components.transducer import CHUNK, TransducerHead
-from mstar.model.parakeet.config import DECODE_LOOP, DECODE_WALK, NUM_FRAMES, TRANSDUCER_STATE
+from mstar.model.parakeet.config import DECODE_LOOP, NUM_FRAMES, PROMPT_ID, TRANSDUCER_STATE, WALK
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     HostRows,
@@ -48,12 +46,13 @@ def _batch_sizes(bucket: int) -> list[int]:
 
 
 class TransducerSubmodule(NodeSubmodule):
-    """Projects the frames at prefill; each decode iteration then replays, per
-    frame bucket, the pool's gather, ``CHUNK`` compiled greedy steps and the
-    scatter.
+    """Each decode iteration replays, per frame bucket, the pool's gather,
+    ``CHUNK`` compiled greedy steps and the scatter.
 
     The head is small (a 640-wide LSTM and joint) and its argmax decides every
-    token, so it runs in fp32 outside the engine's autocast and TF32.
+    token, so it runs in fp32 outside the engine's autocast and TF32. The
+    encoder output stays in the encoder's dtype until a step projects the
+    frames it reads.
     """
 
     MAX_BATCH_SIZE = max(CAPTURE_BATCH_SIZES)
@@ -63,10 +62,15 @@ class TransducerSubmodule(NodeSubmodule):
     # TF32 flips argmax near-ties
     float32_matmul_precision = "highest"
 
-    def __init__(self, head: TransducerHead, compile_step: bool = True, frame_buckets=FRAME_BUCKETS):
+    def __init__(
+        self, head: TransducerHead, compile_step: bool = True, frame_buckets=FRAME_BUCKETS,
+        encoder_dtype: torch.dtype = torch.float32,
+    ):
         super().__init__()
         self.head = head
         self.frame_buckets = tuple(frame_buckets)
+        # the encoder output's dtype, which the captures' frames buffers take
+        self.encoder_dtype = encoder_dtype
         # where a fresh slot starts, and every padding row; in full fp32, as
         # the engine runs the forward
         with fp32_precision_scope(node_fp32_precision(type(self).__name__, self)):
@@ -95,23 +99,18 @@ class TransducerSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        if graph_walk == DECODE_WALK:
-            # the prefill's output, already on this device
-            frames = inputs["frames"][0]
-            counted = fwd_info.step_metadata.get(NUM_FRAMES)
-            if counted is not None and frames.shape[0] != counted:
-                raise ValueError(
-                    f"the encoder heard {frames.shape[0]} frames of this clip, process_prompt counted {counted}"
-                )
-            return NodeInputs(
-                tensor_inputs={"frames": frames}, input_seq_len=1, resource_step_info=self._bucket(frames.shape[0]),
+        states = inputs["encoder_states"][0]
+        counted = fwd_info.step_metadata.get(NUM_FRAMES)
+        if counted is not None and states.shape[0] != counted:
+            raise ValueError(
+                f"the encoder heard {states.shape[0]} frames of this clip, process_prompt counted {counted}"
             )
-        states = inputs["encoder_states"][0].to(device=self.get_device())
-        tensor_inputs = {"encoder_states": states}
-        if self.head.prompt_projector is not None:
-            # moved to the device with the batch's, in preprocess
-            tensor_inputs["prompt_ids"] = inputs["prompt_ids"][0].reshape(1)
-        return NodeInputs(tensor_inputs=tensor_inputs, input_seq_len=states.shape[0])
+        # the prompt is known on the host, so it rides the step metadata
+        kwargs = {PROMPT_ID: fwd_info.step_metadata[PROMPT_ID]} if self.head.prompt_projector is not None else {}
+        return NodeInputs(
+            tensor_inputs={"encoder_states": states}, kwargs=kwargs, input_seq_len=1,
+            resource_step_info=self._bucket(states.shape[0]),
+        )
 
     def _padding(self, rows: int, like: torch.Tensor) -> torch.Tensor:
         if self._pad is None or self._pad.shape[0] < rows:
@@ -124,25 +123,21 @@ class TransducerSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        if graph_walk == DECODE_WALK:
-            frames = [inp.tensor_inputs["frames"] for inp in inputs]
-            lengths = [f.shape[0] for f in frames]
-            # a replay reads its capture's shape; eager pads to the longest row
-            width = inputs[0].resource_step_info if engine_inputs.captured else max(1, *lengths)
-            pad = self._padding(width, frames[0])
-            parts = []
-            for f, n in zip(frames, lengths, strict=True):
-                parts += (f, pad[:width - n])
-            return {
-                "frames": torch.cat(parts).view(len(frames), width, -1),
-                "lengths": to_device_nonblocking(torch.tensor(lengths), frames[0].device),
-            }
-        # fp32 for the head, in one cast for the batch
-        states = pad_sequence([inp.tensor_inputs["encoder_states"] for inp in inputs], batch_first=True).float()
-        out = {"encoder_states": states, "num_frames": [inp.input_seq_len for inp in inputs]}
+        states = [inp.tensor_inputs["encoder_states"] for inp in inputs]
+        lengths = [s.shape[0] for s in states]
+        # a replay reads its capture's shape; eager pads to the longest row
+        width = inputs[0].resource_step_info if engine_inputs.captured else max(1, *lengths)
+        pad = self._padding(width, states[0])
+        parts = []
+        for s, n in zip(states, lengths, strict=True):
+            parts += (s, pad[:width - n])
+        device = states[0].device
+        out = {
+            "encoder_states": torch.cat(parts).view(len(states), width, -1),
+            "lengths": to_device_nonblocking(torch.tensor(lengths), device),
+        }
         if self.head.prompt_projector is not None:
-            prompt_ids = torch.cat([inp.tensor_inputs["prompt_ids"] for inp in inputs])
-            out["prompt_ids"] = to_device_nonblocking(prompt_ids, states.device)
+            out["prompt_ids"] = to_device_nonblocking(torch.tensor([inp.kwargs[PROMPT_ID] for inp in inputs]), device)
         return out
 
     # -- resources and captures --------------------------------------------------
@@ -156,9 +151,6 @@ class TransducerSubmodule(NodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
-        if graph_walk != DECODE_WALK:
-            # nothing to read or write yet: a request takes its slot at its first iteration
-            return SubmoduleStep(steps={})
         buckets = {inp.resource_step_info for inp in inputs}
         return SubmoduleStep(
             segments=[Segment(rid, "main", 1) for rid in request_ids],
@@ -173,14 +165,13 @@ class TransducerSubmodule(NodeSubmodule):
         per_request_input_metadata=None,
         **kwargs: Any,
     ) -> int | None:
-        if graph_walk != DECODE_WALK:
-            return None
         buckets = {self._bucket(info.step_metadata.get(NUM_FRAMES)) for info in per_request_info.values()}
         return buckets.pop() if len(buckets) == 1 else None
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
         # the buckets can't share a replay, and an eager batch pads to its longest clip
-        return graph_walk == DECODE_WALK
+        del graph_walk
+        return True
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -188,12 +179,14 @@ class TransducerSubmodule(NodeSubmodule):
         """One decode capture per frame bucket. The template row carries no
         frames, so a replay's padding rows copy none; preprocess pads every
         row to the bucket."""
-        hidden = self.head.config.hidden_size
+        hidden = self.head.config.encoder_hidden_size
+        kwargs = {PROMPT_ID: 0} if self.head.prompt_projector is not None else {}
         return [
             BatchedAcceleratorGraphConfig(
-                capture_graph_walk=DECODE_WALK,
+                capture_graph_walk=WALK,
                 single_request_inputs=NodeInputs(
-                    tensor_inputs={"frames": torch.zeros(0, hidden, device=device)},
+                    tensor_inputs={"encoder_states": torch.zeros(0, hidden, dtype=self.encoder_dtype, device=device)},
+                    kwargs=kwargs,
                     input_seq_len=1,
                     resource_step_info=bucket,
                 ),
@@ -228,42 +221,25 @@ class TransducerSubmodule(NodeSubmodule):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         **kwargs,
-    ) -> BatchedModelOutput | dict[str, NameToTensorList]:
-        if graph_walk != DECODE_WALK:
-            return self._project(engine_inputs, **kwargs)
+    ) -> BatchedModelOutput:
         return self._decode(engine_inputs, **kwargs)
 
-    def _project(
-        self,
-        engine_inputs: ModelInputsFromEngine,
-        encoder_states: torch.Tensor,
-        num_frames: list[int],
-        prompt_ids: torch.Tensor | None = None,
-    ) -> dict[str, NameToTensorList]:
-        frames = self.head.project_frames(encoder_states, prompt_ids)
-        # each request's own copy: a view would keep the padded batch alive
-        # until the request's last iteration
-        return {
-            rid: {"frames": [frames[i, :n].clone()]}
-            for i, (rid, n) in enumerate(zip(engine_inputs.request_ids, num_frames, strict=True))
-        }
-
     def _decode(
-        self, engine_inputs: ModelInputsFromEngine, frames: torch.Tensor, lengths: torch.Tensor,
+        self, engine_inputs: ModelInputsFromEngine, encoder_states: torch.Tensor, lengths: torch.Tensor,
+        prompt_ids: torch.Tensor | None = None,
     ) -> BatchedModelOutput:
         pool: RecurrentStatePool = engine_inputs.resources[TRANSDUCER_STATE]
         rows = pool.addressing("main")
-        assert frames.shape[0] == rows.num_rows, (
-            f"{frames.shape[0]} rows of frames for a step that addresses {rows.num_rows}"
+        assert encoder_states.shape[0] == rows.num_rows, (
+            f"{encoder_states.shape[0]} rows of frames for a step that addresses {rows.num_rows}"
         )
         state = self._read_state(pool, rows)
-        tokens, active = self.head.advance(frames, lengths, state, CHUNK, self._step)
+        tokens, active = self.head.advance(encoder_states, lengths, state, CHUNK, self._step, prompt_ids)
         for name, value in state.items():
             pool.scatter_(name, rows, value)
-        # tokens are -1 where a step emitted none. The clock only makes the
-        # node a speculation target; no input reads it.
+        # tokens are -1 where a step emitted none
         return BatchedModelOutput(
-            row_outputs={"tokens": tokens, "clock": active},
+            row_outputs={"tokens": tokens},
             # the tokens too: the stop check doesn't read them, but the
             # client's copy then comes from their host rows, not a copy per request
             check_stop_buffers={"active": active, "tokens": tokens},
@@ -275,10 +251,9 @@ class TransducerSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         **kwargs,
     ) -> NameToTensorList:
-        out = BatchedModelOutput.coerce(self.forward_batched(graph_walk, engine_inputs, **kwargs))
-        if out.row_outputs:
-            return {name: [rows[:1]] for name, rows in out.row_outputs.items()}
-        return out.per_rid_outputs[engine_inputs.request_ids[0]]
+        out = self.forward_batched(graph_walk, engine_inputs, **kwargs)
+        # the active flag for the per-request stop check, beside the tokens
+        return {name: [rows[:1]] for name, rows in {**out.row_outputs, **out.check_stop_buffers}.items()}
 
     # -- stopping -------------------------------------------------------------------
 
@@ -296,10 +271,9 @@ class TransducerSubmodule(NodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "clock" not in outputs:
+        if "active" not in outputs:
             return set()
-        # the clock carries the row's active flag
-        return {DECODE_LOOP} if self._stops(bool(outputs["clock"][0].reshape(-1)[0]), request_info) else set()
+        return {DECODE_LOOP} if self._stops(bool(outputs["active"][0].reshape(-1)[0]), request_info) else set()
 
     def check_stop_batched(
         self,

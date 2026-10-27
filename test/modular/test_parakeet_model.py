@@ -10,14 +10,14 @@ import torch
 from mstar.api_server.openai.adapters import TransducerAdapter
 from mstar.api_server.openai.protocol import TranscriptionRequest
 from mstar.engine.resources.recurrent import RecurrentStateSpec
-from mstar.graph.base import GraphNode, Loop, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
-    DECODE_WALK,
     NUM_FRAMES,
-    PREFILL_WALK,
+    PROMPT_ID,
     TRANSDUCER_STATE,
+    WALK,
     ParakeetModelConfig,
 )
 from mstar.model.parakeet.parakeet_model import ParakeetModel
@@ -100,13 +100,12 @@ def test_graph_and_process_prompt(tmp_path, nemotron):
     out = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(8000)]},
                                language="de")
     tensors = out.new_input_tensors
-    assert tensors["audio"][0].shape == (8000,)
-    # the encoder frames of 50 mel frames, as the encoder node will count them
-    assert out.metadata == {NUM_FRAMES: model.config.encoder.output_lengths(8000 // 160)}
-    assert NUM_FRAMES in model.INTERNAL_KWARGS
-    assert ("prompt_ids" in tensors) == nemotron
-    if nemotron:
-        assert tensors["prompt_ids"][0].tolist() == [2]
+    assert tensors.keys() == {"audio"} and tensors["audio"][0].shape == (8000,)
+    # the encoder frames of 50 mel frames, as the encoder node will count them, and
+    # Nemotron's prompt, both host values for the decode steps
+    frames = model.config.encoder.output_lengths(8000 // 160)
+    assert out.metadata == ({NUM_FRAMES: frames, PROMPT_ID: 2} if nemotron else {NUM_FRAMES: frames})
+    assert set(model.INTERNAL_KWARGS) == {NUM_FRAMES, PROMPT_ID}
     with pytest.raises(ValueError):
         model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(611 * 16_000)]})
     # Parakeet-TDT refuses a language it can't detect, Nemotron one its prompt
@@ -155,49 +154,41 @@ def _pointer(uuid: int) -> TensorPointerInfo:
 
 
 @pytest.mark.parametrize("nemotron", [False, True])
-def test_prefill_then_a_decode_loop(tmp_path, nemotron):
-    """prefill persists the projected frames; decode is a loop over the
-    transducer that the Loop re-injects them into, with a self loop-back
-    clock that makes the node a speculation target; then the request is done."""
+def test_one_walk_the_encoder_then_a_decode_loop(tmp_path, nemotron):
+    """One walk: the encoder, then a loop over the transducer that re-injects
+    the encoder output every iteration. No loop-back edge, so the worker
+    speculates a request's first iteration but no next one; then the request
+    is done."""
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
     walks = model.get_graph_walk_graphs()
-    assert walks.keys() == {PREFILL_WALK, DECODE_WALK}
-    transducer = walks[PREFILL_WALK].get_nodes()["transducer"]
-    assert transducer.input_names == ({"encoder_states", "prompt_ids"} if nemotron else {"encoder_states"})
-    [frames] = transducer.outputs
-    assert (frames.name, frames.next_node, frames.persist) == ("frames", EMPTY_DESTINATION, True)
-
-    loop = walks[DECODE_WALK]
+    assert walks.keys() == {WALK}
+    walk = walks[WALK]
+    assert isinstance(walk, Sequential)
+    encoder, loop = walk.sections
+    assert encoder.name == "audio_encoder"
+    assert [(e.name, e.next_node) for e in encoder.outputs] == [("encoder_states", "transducer")]
     assert isinstance(loop, Loop) and loop.name == DECODE_LOOP and loop.outputs == []
     node = loop.section
     assert isinstance(node, GraphNode) and node.name == "transducer" and node.enable_async_scheduling
-    assert node.input_names == {"frames", "clock"}
-    assert {(e.name, e.next_node) for e in node.outputs} == {("clock", "transducer"), ("tokens", EMIT_TO_CLIENT)}
-    # the frames come from outside the loop, so it saves and re-injects them; the clock loops back
-    assert loop._external_inputs == {("frames", "transducer")}
-    assert loop._loop_back_inputs == {("clock", "transducer")}
+    assert node.input_names == {"encoder_states"}
+    assert [(e.name, e.next_node) for e in node.outputs] == [("tokens", EMIT_TO_CLIENT)]
+    # the encoder output comes from outside the loop, so it saves and re-injects it
+    assert loop._external_inputs == {("encoder_states", "transducer")}
+    assert loop._loop_back_inputs == set()
     # a ceiling only: the clip's own cap, and its stop check, end the loop first
     assert loop.max_iters == model.config.transducer.decode_iterations(
         model.config.encoder.output_lengths(610 * 16_000 // 160))
     assert model.get_loop_caps(**{NUM_FRAMES: 7}) == {DECODE_LOOP: model.config.transducer.decode_iterations(7)}
 
-    audio, prompt = _pointer(1), _pointer(2)
-    first = model.get_initial_forward_pass_args(
-        "default", ["audio"], ["text"], {"audio": [audio], "prompt_ids": [prompt]}, model_kwargs={NUM_FRAMES: 7},
-    )
-    assert first.full_metadata.graph_walk == PREFILL_WALK and first.full_metadata.is_prefill
-    assert [e.next_node for e in first.inputs] == ["audio_encoder"] + (["transducer"] if nemotron else [])
-    persisted = _pointer(3)
-    decode = model.get_partition_forward_pass_args("default", first.full_metadata, {"frames": [persisted]})
-    assert decode.full_metadata.graph_walk == DECODE_WALK and not decode.full_metadata.is_prefill
-    assert not decode.request_done
-    edges = {e.name: e for e in decode.inputs}
-    assert edges.keys() == {"frames", "clock"} and all(e.next_node == "transducer" for e in decode.inputs)
-    assert edges["frames"].tensor_info == [persisted] and edges["clock"].tensor_info == []
-    # the conductor lets go of the frames; the loop holds its own reference
-    assert decode.unpersist_tensors == [persisted]
-    assert decode.step_metadata == {NUM_FRAMES: 7}
-    done = model.get_partition_forward_pass_args("default", decode.full_metadata, {})
+    audio = _pointer(1)
+    kwargs = {NUM_FRAMES: 7, PROMPT_ID: 3} if nemotron else {NUM_FRAMES: 7}
+    first = model.get_initial_forward_pass_args("default", ["audio"], ["text"], {"audio": [audio]}, model_kwargs=kwargs)
+    assert first.full_metadata.graph_walk == WALK
+    [edge] = first.inputs
+    assert (edge.name, edge.next_node, edge.tensor_info) == ("audio", "audio_encoder", [audio])
+    assert first.unpersist_tensors == [audio]
+    assert first.step_metadata == {NUM_FRAMES: 7, PROMPT_ID: 3 if nemotron else None}
+    done = model.get_partition_forward_pass_args("default", first.full_metadata, {})
     assert done.request_done and done.inputs == []
 
 
