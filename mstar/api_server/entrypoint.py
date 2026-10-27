@@ -254,9 +254,10 @@ class PendingRequest:
     output_modalities: list[str]
     profile: RequestProfile
     event: threading.Event = field(default_factory=threading.Event)
+    # Unread outputs; a streaming consumer takes ownership of each drained list.
     chunks: list[ResultChunk] = field(default_factory=list)
     output_chunk_counts: dict[str, int] = field(default_factory=dict)
-    consumed_chunks: int = 0
+    output_totals: dict[str, OutputInfo] = field(default_factory=dict)
     error: Any | None = None
     error_status: int = 500
     # Set by the streaming handler on its event loop; the message thread wakes
@@ -921,6 +922,13 @@ class APIServer:
                                 rid, req.request_id,
                             ).encode("utf-8")
                         req.chunks.append(result_chunk)
+                        if self.log_stats:
+                            info = req.output_totals.get(result_chunk.modality)
+                            if info is None:
+                                info = OutputInfo(modality=result_chunk.modality, count=0, total_bytes=0)
+                                req.output_totals[result_chunk.modality] = info
+                            info.count += 1
+                            info.total_bytes += len(result_chunk.data)
                         to_wake[id(req)] = req
 
                         if result_chunk.modality == "error":
@@ -1035,10 +1043,8 @@ class APIServer:
                 with self.request_lock:
                     req = self.pending_requests.get(key)
                     if req:
-                        avail = len(req.chunks)
-                        consumed = req.consumed_chunks
-                        new_chunks = req.chunks[consumed:avail]
-                        req.consumed_chunks = avail
+                        new_chunks = req.chunks
+                        req.chunks = []
                         done = req.event.is_set()
                     else:
                         done = True
@@ -1059,7 +1065,8 @@ class APIServer:
                         req = self.pending_requests.get(key)
                         if req:
                             if not errored:
-                                remaining = req.chunks[req.consumed_chunks:]
+                                remaining = req.chunks
+                            req.chunks = []
                             finished_req = self.pending_requests.pop(key, None)
                             self._retire(key)
                     # Profiling (incl. the optional file write) runs outside the
@@ -1244,7 +1251,7 @@ class APIServer:
         self.metrics.record(req, outcome)
 
     def _finalize_profile(self, req: PendingRequest) -> None:
-        """Stamp the finish time, aggregate output sizes, and emit the report.
+        """Stamp the finish time, attach output totals, and emit the report.
 
         Called once per request from whichever completion path pops it
         (streaming or non-streaming), after the request has been removed from
@@ -1256,16 +1263,8 @@ class APIServer:
 
         req.profile.timing.finish_time = time.perf_counter()
 
-        # Aggregate the collected chunks into per-modality output info.
-        by_modality: dict[str, OutputInfo] = {}
-        for chunk in req.chunks:
-            info = by_modality.get(chunk.modality)
-            if info is None:
-                info = OutputInfo(modality=chunk.modality, count=0, total_bytes=0)
-                by_modality[chunk.modality] = info
-            info.count += 1
-            info.total_bytes += len(chunk.data)
-        req.profile.outputs = list(by_modality.values())
+        # Accepted-output totals survive streaming drains without retaining payloads.
+        req.profile.outputs = list(req.output_totals.values())
 
         try:
             pretty_print_profile(req.profile, self.log_stats_file)
@@ -2102,6 +2101,11 @@ def main(argv: list[str] | None = None):
         log_stats_file=args.log_stats_file,
         enable_nvtx=args.enable_nvtx,
     )
+
+    from mstar.api_server.openai.adapters import get_adapter
+    if getattr(get_adapter(model_name), "supports_realtime_transcription", False):
+        from mstar.api_server.openai import realtime_vad
+        realtime_vad.report_availability()   # warns now if server_vad or semantic_vad cannot run
 
     # Spawn conductor in a separate process
     ctx = mp.get_context("spawn")

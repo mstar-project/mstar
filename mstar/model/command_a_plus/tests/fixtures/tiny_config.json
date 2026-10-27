@@ -1,7 +1,23 @@
 {
   "model_type": "cohere2_vision",
   "tie_word_embeddings": true,
-  "vision_config": {"model_type": "siglip_vision_model"},
+  "alignment_activation_fn": "swiglu",
+  "alignment_intermediate_size": 32,
+  "downsample_factor": 2,
+  "image_token_id": 120,
+  "vision_feature_layer": -1,
+  "vision_feature_select_strategy": "full",
+  "vision_config": {
+    "model_type": "siglip_vision_model",
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 16,
+    "intermediate_size": 24,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "image_size": 32,
+    "patch_size": 8,
+    "layer_norm_eps": 0.000001
+  },
   "text_config": {
     "model_type": "cohere2_moe",
     "hidden_size": 32,

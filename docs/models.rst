@@ -24,8 +24,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        HiFT vocoder, PerTh watermark. 24 kHz. Multilingual covers 23 languages.
    * - ``command_a_plus`` *(Experimental)*
      - ``CohereLabs/command-a-plus-05-2026-bf16``
-     - Command A+ text chat: a 218B-parameter MoE (25B active) with sliding-window
-       attention. Tested on 4x GB200 at TP4; see the notes below.
+     - Command A+ text and image chat: a 218B-parameter MoE (25B active) with
+       sliding-window attention. Tested on 4x GB200 at TP4; see the notes below.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -299,12 +299,18 @@ client sends.
 Command A+ (``command_a_plus``)
 -------------------------------
 
-Text chat on Command A+: 32 MoE layers (128 routed experts, top-8, plus an
-always-on shared expert), with three sliding-window (4096) layers for every
-global one. Only the text backbone is loaded. Served on ``POST /generate``
-(there is no OpenAI adapter yet)::
+Text and image chat on Command A+: 32 MoE layers (128 routed experts, top-8,
+plus an always-on shared expert), with three sliding-window (4096) layers for
+every global one. Served on ``POST /generate`` (there is no OpenAI adapter
+yet)::
 
     mstar serve command_a_plus --gpus 0,1,2,3
+    curl -s http://localhost:8000/generate -F 'text=What is in this image?' -F 'files=@cat.jpg'
+
+Images are tiled like transformers' ``Cohere2VisionProcessor`` (up to 12
+512x512 tiles plus a thumbnail, 256 tokens each) and encoded on the first LLM
+rank. In ``messages``, an image is a ``{"type": "image"}`` item; the uploaded
+files fill them in order.
 
 Install the ``command_a_plus`` extra, and point ``CUDA_HOME`` at a toolkit
 matching PyTorch's CUDA version so the fused-MoE alignment op can JIT-build.
@@ -328,9 +334,9 @@ On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs,
 Triton kernels, and one all-reduce per layer (``tp_allreduce: flashinfer`` at TP4).
 On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
 64 (``benchmark/command_a_plus/bench_http.py``); ``validate_checkpoint.py``
-there checks parity against Hugging Face. Not supported yet: image input, FP8
-weights, prefill CUDA graphs, and reclaiming KV pages outside the sliding
-window.
+there checks parity against Hugging Face, with ``--images`` for image prompts.
+Not supported yet: FP8 weights, prefill CUDA graphs, and reclaiming KV pages
+outside the sliding window.
 
 Kokoro notes
 ------------
@@ -650,9 +656,10 @@ Chatterbox notes
 - Requests: ``/v1/audio/speech`` with ``input``, ``voice`` (``default`` = the
   voice shipped in the checkpoint, or a preset name resolved under the
   deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
-  ``ref_audio`` (data URL of a reference clip, 5-30 s, cloning; an http(s)
-  URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the
-  server are refused), ``exaggeration`` (0-2, emotion intensity, default 0.5),
+  ``ref_audio`` (data URL or bare base64 of a reference clip, 5-30 s,
+  cloning; an http(s) URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``;
+  paths on the server, clips over 60 s and clips below 8 kHz are refused),
+  ``exaggeration`` (0-2, emotion intensity, default 0.5),
   ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
   ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
   whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;
@@ -775,6 +782,16 @@ Cosmos3 environment requirements
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
+
+Cosmos3 image-to-video conditioning
+-----------------------------------
+
+An image-to-video request's conditioning image is scaled to cover the output
+size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
+NVIDIA's cosmos-framework and diffusers 0.40 and later. Setting
+``conditioning_resize: stretch`` under the config YAML's ``model_kwargs``
+resizes it to the output size instead (antialiased bilinear, aspect ratio not
+kept), as diffusers 0.39 did. Action requests ignore the setting.
 
 Cosmos3-Edge reasoner and action loop
 -------------------------------------

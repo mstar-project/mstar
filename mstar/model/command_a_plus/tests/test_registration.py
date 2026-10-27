@@ -24,8 +24,11 @@ class RegistrationTests(unittest.TestCase):
         (Path(directory) / "config.json").write_text(FIXTURE.read_text())
         model = CommandAPlusModel(MODEL_ID, checkpoint_dir=directory)
         graphs = model.get_worker_graphs(_resolve_config("command_a_plus", None))
-        self.assertEqual(len(graphs), 2)
-        self.assertTrue(all(g.tp_size == 4 and g.sp_size == 1 for g in graphs))
+        # prefill, decode, and prefill_image's encoder and LLM halves
+        self.assertEqual(len(graphs), 4)
+        for graph in graphs:
+            tp = 4 if "LLM" in graph.section.get_nodes() else 1
+            self.assertEqual((graph.tp_size, graph.sp_size), (tp, 1))
         # Fail before the parameter constructor allocates any storage.
         with patch("mstar.model.command_a_plus.components.language_model.CommandAPlusForCausalLM") as constructor:
             with self.assertRaisesRegex(FileNotFoundError, "obtain the checkpoint explicitly"):

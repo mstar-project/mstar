@@ -309,7 +309,7 @@ def test_command_a_plus_caps_decode_where_its_stop_check_ends_it(max_tokens):
     from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
     from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
 
-    llm = CommandAPlusLLMSubmodule(None, SimpleNamespace(eos_token_id=0))
+    llm = CommandAPlusLLMSubmodule(None, SimpleNamespace(eos_token_id=0), image_token_id=1)
 
     cap = CommandAPlusModel.get_loop_caps(object.__new__(CommandAPlusModel), max_output_tokens=max_tokens)
 

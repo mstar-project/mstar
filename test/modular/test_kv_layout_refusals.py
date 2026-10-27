@@ -12,7 +12,22 @@ from test_kv_layout_intake import LAYOUT, _conduct, _Model, _preprocess
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.graph.base import GraphNode, Loop
 from mstar.model.base import KVLabel, LabelLayout
-from mstar.worker.engine_manager import _refuse_undeclared_pools, _refuse_unknown_walks
+from mstar.validation.resources import _undeclared_pools, _unknown_prefix_walks
+
+
+def _raise_first(problems):
+    """The checks report every problem; these tests look at one."""
+    for problem in problems:
+        raise ValueError(problem)
+
+
+def _refuse_undeclared_pools(specs, model):
+    _raise_first(_undeclared_pools(specs, model))
+
+
+def _refuse_unknown_walks(model):
+    _raise_first(_unknown_prefix_walks(model))
+
 
 LLM = GraphNode(name="llm", input_names=["text_inputs"], outputs=[])
 
