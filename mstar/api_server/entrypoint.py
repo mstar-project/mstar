@@ -1221,18 +1221,18 @@ class APIServer:
                 req.sink, req.sink_tag = sink, tag
 
     def _relay_chunks(self, sink: ChunkSink, reqs) -> None:
-        """On ``sink``'s loop: hand it the chunks its requests have not yet
-        consumed, up to an error chunk, which stays for the handler."""
+        """On ``sink``'s loop: drain its requests' chunks into it, up to an
+        error chunk, which stays for the handler with what follows it."""
         tags: list = []
         chunks: list[ResultChunk] = []
         with self.request_lock:
             for req in reqs:
-                pending, i, end = req.chunks, req.consumed_chunks, len(req.chunks)
-                while i < end and pending[i].modality != "error":
-                    tags.append(req.sink_tag)
-                    chunks.append(pending[i])
-                    i += 1
-                req.consumed_chunks = i
+                pending = req.chunks
+                n = next((i for i, c in enumerate(pending) if c.modality == "error"), len(pending))
+                if n:
+                    tags += [req.sink_tag] * n
+                    chunks += pending[:n]
+                    req.chunks = pending[n:]
         if chunks:
             sink.relay(tags, chunks)
 

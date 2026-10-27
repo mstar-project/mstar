@@ -101,10 +101,10 @@ def test_a_pass_hands_the_sink_every_request_s_chunks_in_one_call(monkeypatch):
         _one_pass(server, monkeypatch)
         await asyncio.sleep(0)
         assert sink.calls == [([1, 1, 2], [b"a1", b"a2", b"b1"])]
-        assert a.consumed_chunks == 2 and b.consumed_chunks == 1
+        assert a.chunks == [] and b.chunks == []
         # a sink request's handler is not woken per chunk; anyone else's is
         assert not a.wake.is_set() and c.wake.is_set()
-        assert c.consumed_chunks == 0
+        assert [ch.data for ch in c.chunks] == [b"c1"]
 
     asyncio.run(run())
 
@@ -170,7 +170,7 @@ def test_chunks_the_handler_already_took_are_not_relayed_again(monkeypatch):
         assert [c.data for c in got] == [b"a1"]
         await asyncio.sleep(0)
         assert sink.calls == []
-        assert req.consumed_chunks == 1
+        assert req.chunks == []
         await batches.aclose()
 
     asyncio.run(run())
