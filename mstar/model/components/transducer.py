@@ -20,8 +20,11 @@ from torch import nn
 
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
 
-# greedy steps per decode iteration: one graph replay each
-CHUNK = 16
+# greedy steps per decode iteration, one graph replay each. An iteration
+# costs every row the engine's and the worker's per-step work, which at 16
+# outweighed the idle steps of 64; at 64 a LibriSpeech clip takes 1.2
+# iterations on average.
+CHUNK = 64
 # frames an RNN-T step scores at once: wider windows cost more joint work, over
 # a 13k vocabulary, than the blank steps they save. TDT scores one: its
 # durations already skip most blank frames.
@@ -72,10 +75,11 @@ class TransducerConfig:
             "symbols": RecurrentBlockConfig((), torch.int64),
         }
 
-    def decode_iterations(self, num_frames: int) -> int:
-        """The most decode iterations a clip of ``num_frames`` can take: a frame
-        takes at most ``max_symbols_per_step`` steps, so this never binds."""
-        return max(1, math.ceil(self.max_symbols_per_step * num_frames / CHUNK))
+    def decode_iterations(self, num_frames: int, chunk: int = CHUNK) -> int:
+        """The most decode iterations of ``chunk`` steps a clip of ``num_frames``
+        can take: a frame takes at most ``max_symbols_per_step`` steps, so this
+        never binds."""
+        return max(1, math.ceil(self.max_symbols_per_step * num_frames / chunk))
 
 
 class LSTMWeights(nn.Module):
@@ -151,8 +155,12 @@ class TransducerHead(nn.Module):
         self.window = 1 if config.durations else RNNT_WINDOW
 
     def project_frames(self, encoder_states: torch.Tensor, prompt_ids: torch.Tensor | None) -> torch.Tensor:
+        """``(B, T, encoder hidden)`` encoder output -> the joint's ``(B, T, hidden)``
+        frames, with each row's prompt (``(B,)`` ids) mixed in first."""
         if self.prompt_projector is not None:
-            one_hot = F.one_hot(prompt_ids, self.config.num_prompts).to(encoder_states.dtype)
+            # one_hot, written out: it checks the ids on the host
+            prompts = torch.arange(self.config.num_prompts, device=prompt_ids.device)
+            one_hot = (prompt_ids[:, None] == prompts).to(encoder_states.dtype)
             one_hot = one_hot[:, None, :].expand(-1, encoder_states.shape[1], -1)
             encoder_states = self.prompt_projector(torch.cat([encoder_states, one_hot], dim=-1))
         return self.encoder_projector(encoder_states)
@@ -174,13 +182,17 @@ class TransducerHead(nn.Module):
         with no host reads: each active row emits one token or moves past a
         window of blanks -> the step's tokens (-1 where a row emitted none)."""
         cfg = self.config
-        frames, cursor, symbols, active, lengths = s["frames"], s["cursor"], s["symbols"], s["active"], s["lengths"]
-        rows, t, hidden = frames.shape
+        states, cursor, symbols, active, lengths = (
+            s["encoder_states"], s["cursor"], s["symbols"], s["active"], s["lengths"]
+        )
+        rows, t, hidden = states.shape
         width = self.window
-        offsets = torch.arange(width, device=frames.device)
+        offsets = torch.arange(width, device=states.device)
         at = cursor[:, None] + offsets
         valid = at < lengths[:, None]
-        window = frames.gather(1, at.clamp(max=t - 1)[:, :, None].expand(-1, -1, hidden))
+        # only the frames under the cursors are projected, in fp32
+        window = states.gather(1, at.clamp(max=t - 1)[:, :, None].expand(-1, -1, hidden))
+        window = self.project_frames(window.float(), s.get("prompt_ids"))
         logits = self.joint.head(F.relu(window + s["dec_out"][:, None]))
         tokens = logits[..., :cfg.vocab_size].argmax(dim=-1)
         blank = tokens == cfg.blank_token_id
@@ -193,7 +205,7 @@ class TransducerHead(nn.Module):
         # the window keep whatever reaches them
         reach = max(cfg.durations, default=1) or 1
         nxt = torch.where(blank & valid, offsets + skips.clamp(min=1), offsets)
-        nxt = torch.cat([nxt, torch.arange(width, width + reach, device=frames.device).expand(rows, -1)], dim=1)
+        nxt = torch.cat([nxt, torch.arange(width, width + reach, device=states.device).expand(rows, -1)], dim=1)
         # pointer doubling: each round doubles the blanks a chain has followed
         for _ in range(math.ceil(math.log2(width))):
             nxt = nxt.gather(1, nxt)
@@ -220,14 +232,17 @@ class TransducerHead(nn.Module):
         return torch.where(emit, token, -1)
 
     def advance(
-        self, frames: torch.Tensor, lengths: torch.Tensor, state: dict[str, torch.Tensor],
-        chunk: int = CHUNK, step=None,
+        self, encoder_states: torch.Tensor, lengths: torch.Tensor, state: dict[str, torch.Tensor],
+        chunk: int = CHUNK, step=None, prompt_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``chunk`` greedy steps (``step``, by default :meth:`step`) over
-        ``(B, T, hidden)`` projected frames and per-row frame counts, updating
-        ``state`` (``state_blocks``' names, batch-first) in place -> the steps'
+        """``chunk`` greedy steps (``step``, by default :meth:`step`) over the
+        ``(B, T, encoder hidden)`` encoder output, per-row frame counts and,
+        with a prompt projector, ``(B,)`` prompt ids, updating ``state``
+        (``state_blocks``' names, batch-first) in place -> the steps'
         ``(B, chunk)`` tokens and which rows are still decoding."""
         step = step or self.step
-        s = {**state, "frames": frames, "lengths": lengths, "active": state["cursor"] < lengths}
+        s = {**state, "encoder_states": encoder_states, "lengths": lengths, "active": state["cursor"] < lengths}
+        if prompt_ids is not None:
+            s["prompt_ids"] = prompt_ids
         tokens = torch.stack([step(s) for _ in range(chunk)], dim=1)
         return tokens, s["active"]

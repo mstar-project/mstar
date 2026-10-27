@@ -15,11 +15,12 @@ from mstar.model.utils import GRANARY_LANGUAGES, base_language
 
 SUPPORTED_MODEL_TYPES = ("parakeet_tdt", "parakeet_rnnt", "nemotron3_5_asr")
 
-PREFILL_WALK, DECODE_WALK, DECODE_LOOP = "prefill", "decode", "decode_loop"
+WALK, DECODE_LOOP = "transcribe", "decode_loop"
 # each request's decoding state between iterations of the decode loop
 TRANSDUCER_STATE = "transducer_state"
-# model_kwargs and step_metadata key: the clip's encoder frames, from process_prompt
-NUM_FRAMES = "num_frames"
+# model_kwargs and step_metadata keys, from process_prompt: the clip's encoder
+# frames, and Nemotron's language prompt
+NUM_FRAMES, PROMPT_ID = "num_frames", "prompt_id"
 
 
 def check_detected_language(language: str | None) -> None:

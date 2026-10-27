@@ -79,12 +79,11 @@ def _greedy(head, states: torch.Tensor, prompt: torch.Tensor | None, step=None) 
     from mstar.model.components.transducer import CHUNK
 
     with fp32_precision_scope(Fp32Precision("highest", None)):
-        frames = head.project_frames(states, prompt)
-        lengths = torch.tensor([frames.shape[1]], device=frames.device)
+        lengths = torch.tensor([states.shape[1]], device=states.device)
         state = {name: start[None].clone() for name, start in head.initial_state().items()}
         tokens = []
-        for _ in range(head.config.decode_iterations(frames.shape[1])):
-            chunk, active = head.advance(frames, lengths, state, CHUNK, step)
+        for _ in range(head.config.decode_iterations(states.shape[1])):
+            chunk, active = head.advance(states, lengths, state, CHUNK, step, prompt)
             tokens += [token for token in chunk[0].tolist() if token >= 0]
             if not active.item():
                 break
