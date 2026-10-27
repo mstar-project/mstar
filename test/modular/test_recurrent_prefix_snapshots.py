@@ -35,7 +35,7 @@ from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
-from mstar.worker.engine_manager import _refuse_unskippable_resources
+from mstar.validation.resources import _unskippable_resources
 
 NODE, WALK, PAGE = "llm", "prefill", 4
 
@@ -338,7 +338,9 @@ def test_a_node_whose_pool_keeps_no_snapshots_opens_no_cache(monkeypatch, caplog
 
 def test_a_keyed_node_loads_with_a_recurrent_pool_and_the_resource_over_it():
     specs = _specs(prefix_slots=0)
-    _refuse_unskippable_resources(list(specs.values()), _Keyed())
+    assert not list(_unskippable_resources(list(specs.values()), _Keyed())), (
+        "a recurrent pool and the resource over it were refused, though the pool restores from snapshots"
+    )
 
 
 @pytest.mark.parametrize("depends_on", [set(), {"kv"}])
@@ -352,8 +354,8 @@ def test_a_keyed_node_still_refuses_a_resource_that_cant_skip_a_prefix(depends_o
             return depends_on
 
     specs = [*_specs(prefix_slots=2).values(), _Unskippable(resource_key="other", nodes={"LLM"})]
-    with pytest.raises(ValueError, match="'other' cannot serve a request"):
-        _refuse_unskippable_resources(specs, _Keyed())
+    problems = list(_unskippable_resources(specs, _Keyed()))
+    assert problems and "'other' cannot serve a request" in problems[0], problems
 
 
 def _prefill(pool: RecurrentStatePool, rid: str, tokens: list[int], hit: int | None) -> RecurrentStep:

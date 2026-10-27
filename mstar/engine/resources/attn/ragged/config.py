@@ -27,6 +27,8 @@ class RaggedAttnBackend(Enum):
     # the platform's default, decided when the resource is built
     AUTO = "auto"
     FLASHINFER = "flashinfer"
+    # FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE
+    DENSE = "dense"
 
 
 @dataclass(frozen=True)
