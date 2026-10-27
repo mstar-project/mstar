@@ -296,7 +296,7 @@ def test_prompt_past_the_cap_is_refused_up_front():
     model = Glm5NextModel("x", config_variant="reduced", tokenizer_mode="byte")
     limit = model.config.index_topk
     out = model.process_prompt("a" * (limit - 2), ["text"], ["text"])
-    assert out["text_inputs"][0].numel() == limit - 2
+    assert out.new_input_tensors["text_inputs"][0].numel() == limit - 2
     # a ValueError in preprocessing is the client's 400
     with pytest.raises(ValueError, match="at most"):
         model.process_prompt("a" * (limit - 1), ["text"], ["text"])

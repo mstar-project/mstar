@@ -71,6 +71,22 @@ Communication
        extension; raises if missing). ``AUTO``: the arena when the
        extension imports, files otherwise. Must match across the
        deployment — arena locations ride in the tensor descriptors.
+   * - ``MSTAR_DEPLOYMENT_TOKEN``
+     - random per launch
+     - Mixed into the namespace of the SHM tensor files and arena segments,
+       so no two launches share names: not a restart on the same socket
+       prefix, and not two deployments that share ``/dev/shm`` from different
+       containers (``--ipc=host``, hostIPC) with the same socket prefix and
+       ports. The API server mints a new one at every launch unless a
+       launcher set it (one an API server minted is replaced, also when
+       inherited), and the conductor and workers inherit it. Set it only
+       when a launcher starts a deployment's processes separately: the same
+       value in all of them, and a new value per launch (a dead run's files
+       are swept only once no process holds its namespace, and a stopping
+       worker unlinks its own files even after its conductor is gone, which
+       a reused value would let it do to the next launch's files).
+       The API server logs a warning whenever it keeps a value the launcher
+       set.
    * - ``MSTAR_KV_SHM_DIR``
      - ``/dev/shm`` (or ``/tmp`` if unavailable)
      - Base directory for host-staged KV snapshots when remote KV transfer
@@ -207,12 +223,6 @@ model, so they are named for it.
        checkpoint the registry names. For serving a fine-tune of the same
        architecture off a mounted volume, where the registry entry would
        otherwise pull the public weights from the Hub.
-   * - ``MSTAR_GLM52_GRAPH_COMPILE``
-     - ``1``
-     - GLM-5.2: capture the ``torch.compile``'d forward into the CUDA graphs.
-       ``0`` captures the eager forward and runs the uncaptured steps
-       uncompiled, an escape hatch for an Inductor failure that would
-       otherwise fail every capture and serve eager.
    * - ``MSTAR_GLM52_MTP_PAIR_POSTNORM``
      - ``1``
      - GLM-5.2 MTP: pair drafts against the trunk's post-norm hidden state,
@@ -274,6 +284,14 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
        with a file whose inputs or outputs differ (the package's other
        exports), ``server_vad`` sessions are refused. Never downloaded.
+   * - ``MSTAR_SMART_TURN_PATH``
+     - unset
+     - Pipecat Smart Turn v3 ONNX file for ``/v1/realtime`` ``semantic_vad``,
+       read by ``realtime_vad.smart_turn_weights``. Unset, the
+       ``pipecat-ai/smart-turn-v3`` ``smart-turn-v3.2-cpu.onnx`` file in the
+       local Hugging Face cache is used if present; with neither, or with a
+       file whose inputs or outputs differ, ``semantic_vad`` sessions are
+       refused. Never downloaded.
 
 Serving (Rust frontend)
 -----------------------
@@ -480,7 +498,7 @@ Worker scheduling
        spends 78 ms of wall time on 36 ms of kernels. The default now reaches
        8192; narrow it to save graph memory and capture time, or extend it.
    * - ``MSTAR_KV_CHAIN_LAZY_STEPS``
-     - ``1``
+     - config's ``knobs: kv_chain_lazy_steps``, else ``1``
      - How many decode steps of sampled ids the KV manager holds back before
        it extends the requests' prefix chains (the per-page keys the prefix
        cache is indexed by), one extend per request per batch of steps instead
@@ -492,7 +510,7 @@ Worker scheduling
        measured as noise at c64/c128 on 0.8B (the extension is a small part
        of the stop check's tail).
    * - ``MSTAR_KV_PINNED_INDPTRS``
-     - ``0``
+     - config's ``knobs: kv_pinned_indptrs``, else ``0``
      - The KV plan writes FlashInfer's index arrays (qo_indptr, kv_indptr,
        kv_indices, last_page_len) into a ring of page-locked host buffers and
        the decode wrapper copies the indices straight into its captured
@@ -501,8 +519,18 @@ Worker scheduling
        one and FlashInfer makes the indices copy blocking. No measurable gain
        at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
        event per plan, which a buffer set waits on before it is rewritten.
+   * - ``MSTAR_GC_GEN0_THRESHOLD``
+     - config's ``knobs: gc_gen0_threshold``, else ``0``
+     - The generation-0 garbage-collection threshold a worker sets after
+       warmup (``0`` keeps CPython's 700). A decode step at 128 rows keeps
+       more than 700 young container objects alive at its peak, so at 700 a
+       collection runs almost every step and escalates to a full one (about
+       10 ms) every few hundred steps; the time lands in whichever span is
+       allocating. ``50000`` removed them on Qwen3.5 0.8B at c=128 (an 8%
+       shorter decode step), at the cost of holding at most that many young
+       objects between collections. Read by ``knobs.gc_gen0_threshold``.
    * - ``MSTAR_KV_PLAN_CACHE``
-     - ``0``
+     - config's ``knobs: kv_plan_cache``, else ``0``
      - The KV manager plans a captured decode step off the previous step's
        plan when the batch is the same rows in the same order and nothing
        but that step's commit touched the streams: every length is one
@@ -514,7 +542,7 @@ Worker scheduling
        until measured. ``0`` plans every step from the streams. ``2`` runs
        both and logs a difference, for checking a run.
    * - ``MSTAR_DEVICE_LOOPBACK``
-     - ``1``
+     - config's ``knobs: device_loopback``, else ``1``
      - Whether a decode node may keep its loop-back token on the device:
        the sampler writes each request's last token to a slot-addressed
        master and the next step reads its input ids from it, so the worker
@@ -527,19 +555,20 @@ Worker scheduling
        synchronous host-to-device copy per step. ``0`` keeps every node on
        the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
-     - ``0``
+     - config's ``knobs: ingraph_decode_rope``, else ``0``
      - A captured decode step builds its rotary tables inside the graph from
        the position resource's planned positions instead of staging them.
        Experiment knob, measured and gated on its own.
    * - ``MSTAR_SAMPLER_INGRAPH_SCATTER``
-     - ``0``
+     - config's ``knobs: sampler_ingraph_scatter``, else ``0``
      - The captured sampler gathers its RNG offsets from the slot masters
        and scatters the advanced offsets and the sampled tokens back inside
        the graph, so a replayed decode step issues none of those launches on
        the gpu thread afterwards (each one is a GIL release the main thread's
        postprocess wins). Padding rows then address a trash master row and
-       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` concurrent
-       requests (default 4096, a hard cap with this on). Only with the device
+       the masters are allocated once for ``MSTAR_SAMPLER_SLOTS`` (config's
+       ``knobs: sampler_slots``) concurrent requests (default 4096, a hard
+       cap with this on). Only with the device
        loop-back on. An experiment knob; measure before turning it on.
    * - ``MSTAR_RUST_SEND_TIMING``
      - unset
@@ -558,9 +587,9 @@ Worker scheduling
    * - ``MSTAR_KV_DEBUG_ASSERTS``
      - ``0``
      - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
-       ``remove_request``, check the KV page bookkeeping (free list, owner
-       counts, seals) against the streams holding the pages. Walks every
-       live stream; tests and debugging only.
+       ``remove_request``, check the KV page bookkeeping against the streams
+       holding the pages, and each commit against its request's layout. Logs a
+       label left under its footprint at removal. Tests and debugging only.
 
 Compilation
 -----------
@@ -576,3 +605,10 @@ Compilation
      - ``84``
      - Dynamo's recompile limit, clamped to [8, 256]. Raise it if the logs
        show ``hit config.recompile_limit``.
+   * - ``MSTAR_COMPILE_LEVEL``
+     - ``1``
+     - How much a captured forward's compile tunes; ``mstar serve -O`` sets it
+       (read by :func:`mstar.engine.accelerator_graph_runner.compile_level`).
+       ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
+       ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
+       own ``compile_mode`` keeps it.

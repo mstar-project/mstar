@@ -167,6 +167,17 @@ def test_text_chat_maps_text_and_sampling(tmp_path):
     assert [p.modality for p in sa.prompt_parts] == ["text"]
 
 
+def test_text_chat_keeps_each_turn(tmp_path):
+    req = ChatCompletionRequest(model="llm", messages=[
+        {"role": "system", "content": "Be brief."}, {"role": "user", "content": "Name a color."},
+        {"role": "assistant", "content": "Blue."}, {"role": "user", "content": "Another."},
+    ])
+    sa = adapters.TextChatAdapter().chat_to_request(req, tmp_path)
+    assert [(p.role, p.text) for p in sa.prompt_parts] == [
+        ("system", "Be brief."), ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another."),
+    ]
+
+
 def test_glm52_serves_text_chat():
     assert isinstance(adapters.get_adapter("glm52"), adapters.TextChatAdapter)
 
@@ -186,6 +197,7 @@ def test_extra_body_passthrough(tmp_path):
 
 _CHAT_ADAPTERS = [
     adapters.BagelAdapter, adapters.Qwen3OmniAdapter, adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter,
+    adapters.TextChatAdapter,
 ]
 _FUNCTION = {"name": "get_weather"}
 _NAMED = {"type": "function", "function": _FUNCTION}

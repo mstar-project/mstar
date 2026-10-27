@@ -71,7 +71,7 @@ def _ctx(needs_selection: bool) -> DSAContext:
 def test_cleanup_request_drops_per_request_state():
     """Retirement leaves NO per-request growth: the engine's request removal
     calls cleanup_request on every managed submodule, which must drop the
-    prefix-hit mark, the MTP counters, the token budget and the prefill's stop."""
+    prefix-hit mark, the MTP counters, the MTP token budget and the prefill's stop."""
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}

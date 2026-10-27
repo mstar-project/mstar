@@ -656,6 +656,9 @@ def _laid_out(bagel, modalities: list[str], output_modalities=("text",), tensors
     """Return what Bagel's `process_prompt` gives for the text and images in ``modalities``, with the images."""
     bagel.config.vit_config = SimpleNamespace(patch_size=PATCH_SIZE)
     bagel.config.vit_max_num_patch_per_side = MAX_PATCHES_PER_SIDE
+    bagel.config.latent_downsample, bagel.config.max_latent_size = 16, 64
+    bagel.config.cfg_text_scale, bagel.config.cfg_img_scale, bagel.config.cfg_interval = 4.0, 1.0, [0.4, 1.0]
+    bagel.config.cfg_renorm_type, bagel.config.cfg_renorm_min = "global", 0.0
     texts = iter(["what is", "in this picture", "and in this one"])
     parts, images = [], []
     for modality in modalities:
@@ -695,7 +698,7 @@ def test_bagel_lays_each_image_out_in_schedule_order_by_its_own_file_over_its_vi
     bagel, modalities, image_preprocess,
 ):
     output, images = _laid_out(bagel, modalities, image_preprocess=image_preprocess)
-    layout = output.metadata["prefix_layout"]["kv"]["main"]
+    layout = output.metadata["kv_layout"]["kv"]["main"].spans
     schedule = bagel._build_prefill_schedule(
         input_modalities=modalities, is_understanding=True,
         input_signals={"text_inputs": output.new_input_tensors["text_inputs"], "image_inputs": images},
@@ -714,21 +717,26 @@ def test_bagel_lays_each_image_out_in_schedule_order_by_its_own_file_over_its_vi
     )
 
 
-def test_bagel_lays_out_only_the_understood_prompts_it_has_images_for(bagel):
+def test_bagel_keys_an_understood_image_and_otherwise_only_a_leading_text_span(bagel):
     interleaved = ["text", "image", "text"]
     cases = {
-        "understood with its image": (interleaved, ("text",), True),
-        "text only": (["text"], ("text",), True),
-        "generation": (interleaved, ("image",), True),
-        "understood without tensors": (interleaved, ("text",), False),
+        "understood with its image": (interleaved, ("text",)),
+        "text only": (["text"], ("text",)),
+        "generation": (interleaved, ("image",)),
+        "an edit led by its image": (["image", "text"], ("image",)),
         # Text comes first, so the prompt is understood, but it also outputs an image, so its input is resized first.
-        "understood and edited": (interleaved, ("text", "image"), True),
+        "understood and edited": (interleaved, ("text", "image")),
     }
 
-    # A prompt with no layout comes back as a plain dict of its tensors.
-    laid_out = {name: not isinstance(_laid_out(bagel, *case)[0], dict) for name, case in cases.items()}
+    keyed = {
+        name: _laid_out(bagel, *case)[0].metadata["kv_layout"]["kv"]["main"].keyed_spans
+        for name, case in cases.items()
+    }
 
-    assert laid_out == {name: name == "understood with its image" for name in cases}, (
-        "a layout went to a prompt with no understood image or none of its "
-        "tensors, or was missing from the one that has both"
+    assert keyed == {
+        "understood with its image": None, "text only": None, "generation": 1,
+        "an edit led by its image": 0, "understood and edited": 1,
+    }, "a prompt whose images are resized before their walks see them is keyed past its first text span"
+    assert isinstance(_laid_out(bagel, interleaved, tensors=False)[0], dict), (
+        "a prompt was laid out without the images that size it"
     )

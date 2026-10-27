@@ -1095,6 +1095,30 @@ def test_a_submission_the_server_refuses_leaves_no_upload_behind(
     assert _left_after_cleanup(stub.upload_dir) == []
 
 
+_ATTACHMENTS = _CHAT["messages"][0]["content"][:2]
+
+
+@pytest.mark.parametrize("model,body,message", [
+    ("bagel", {"messages": [{"role": "user", "content": [
+        *_ATTACHMENTS, {"type": "image_url", "image_url": {"url": "data:image/png;base64,%%%"}},
+    ]}]}, "Only base64 data is allowed"),
+    ("qwen3_omni", {"messages": [{"role": "user", "content": _ATTACHMENTS}, {"role": "tool", "content": "42"}]},
+     "a message's role must be system, developer, user or assistant, not 'tool'"),
+    ("cosmos3_edge", {"messages": [{"role": "user", "content": _ATTACHMENTS}], "chat_template_kwargs": True},
+     "argument of type 'bool' is not iterable"),
+], ids=["bad-attachment", "bad-role", "bad-template-kwargs"])
+def test_a_chat_refused_after_its_attachments_leaves_no_upload_behind(client_and_stub, model, body, message):
+    """A chat refused once some attachments are saved is never submitted, so
+    nothing else would delete them."""
+    client, stub = client_and_stub
+    stub.model_name = model
+
+    r = client.post("/v1/chat/completions", json=body)
+
+    assert r.status_code == 400 and r.json()["error"]["message"].startswith(message), r.text
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
 def test_a_chunked_speech_stream_keeps_its_clip_until_the_last_chunk_is_submitted(client_and_stub, no_cleanup_delay):
     """Every sentence chunk reads the reference clip, and a stream submits the
     later ones while it plays: the clip stays until the stream ends."""

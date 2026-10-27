@@ -44,6 +44,8 @@ from mstar.model.glm52.config import (
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
 )
@@ -98,10 +100,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._index_stager = PinnedStager(torch.long)
         # paged DSA: rows' requests and lengths, page tables
         self._int_stager = PinnedStager(torch.int32)
-        # Per request, in its request_state: "token_budget", max_tokens capped at the
-        # context limit (prompt-aware, set by the prefill's preprocess, read by check_stop for
-        # every k); "ended_at_prefill", the prefill sampled a stop token: the prefill walk has no
-        # loop to stop, so the first decode step stops decode_loop and emits nothing.
+        # Per request, in its request_state: "token_budget", under MTP, max_tokens capped at
+        # the context limit less two verify blocks (prompt-aware, set by the prefill's
+        # preprocess, read by check_stop); "ended_at_prefill", the prefill sampled a stop token:
+        # the prefill walk has no loop to stop, so the first decode step stops decode_loop and
+        # emits nothing.
         # Which trunk stream the MTP plane pairs drafts against (see
         # _mtp_pair_rows): the post-final-norm one by default.
         self._mtp_pair_postnorm = (
@@ -300,20 +303,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return blocked
 
     def _compile_flags(self) -> dict[str, Any]:
-        # MSTAR_GLM52_GRAPH_COMPILE=0 captures the eager forward (escape hatch
-        # for an Inductor toolchain crash); "default" is torch.compile's own
-        # mode (cuBLAS GEMMs, no autotuning), the fastest here.
-        return {
-            "compile": os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
-            "compile_mode": "default",
-        }
+        # "default" is torch.compile's own mode (cuBLAS GEMMs, no autotuning), the fastest here
+        return {"compile": self.config.graph_compile, "compile_mode": "default"}
 
     @property
     def disable_torch_compile(self) -> bool:
-        # the escape hatch covers the uncaptured steps too, which the engine compiles; under
+        # graph_compile covers the uncaptured steps too, which the engine compiles; under
         # dsa_long_context those run eager, and the frame would key on each prompt's length
         return (getattr(self, "_mtp_uncompiled", False) or self.config.dsa_long_context
-                or os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") != "1")
+                or not self.config.graph_compile)
 
     def to(self, *args, **kwargs):
         """Honor device moves; refuse post-load dtype casts (per-param dtypes
@@ -468,9 +466,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return self.config.max_seq_len if self.config.dsa_long_context else self.config.index_topk
 
     def _clamp_token_budget(self, engine_inputs: ModelInputsFromEngine, rid: str, room: int) -> None:
-        """Cap the request's max_tokens at what fits before the context
-        limit, so decode stops there (check_stop, the MTP verify truncation)
-        instead of tripping preprocess's guard mid-batch. ``room`` is the
+        """Under MTP, cap the request's max_tokens at what fits before the
+        context limit, so decode stops there (check_stop, the verify
+        truncation) instead of tripping preprocess's guard mid-batch. The
+        conductor holds prompt plus max_tokens to the window at one row per
+        decode step; a verify step writes a whole block. ``room`` is the
         prompt-aware count, known only once the prefill rows are declared."""
         info = (getattr(engine_inputs, "per_request_info", None) or {}).get(rid)
         asked = getattr(info, "max_tokens", None)
@@ -503,8 +503,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             self._prefix_hits.difference_update(request_ids)  # its step has been leased
         # Dense MLA equals the reference DSA computation only while every
         # context fits the top-k window; refuse beyond it unless the DSA
-        # engine path is on, where the cap is the serving window. The
-        # positions themselves are the position resource's (``_positions``).
+        # engine path is on, where the cap is the serving window. The KV pool
+        # is sized to this limit, so the conductor holds every request inside
+        # it and this only fires on a bug. The positions themselves are the
+        # position resource's (``_positions``).
         limit = self._context_limit()
         for rid, sl in zip(request_ids, seq_lens, strict=True):
             start = pos.position(rid, _MAIN)  # where the step's first token lands
@@ -518,12 +520,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                         "DSA computation. Long context needs dsa_long_context=True."
                     )
                 )
-            if graph_walk == "prefill":
-                # a prompt of P rows emits at most limit - P tokens, one row short of
-                # the limit: the next step may already be running when the stop lands.
-                # Under MTP every step writes a whole block, that one included.
-                room = limit - (start + sl) - (2 * self.mtp_block if self.mtp_k else 0)
-                self._clamp_token_budget(engine_inputs, rid, room)
+            if graph_walk == "prefill" and self.mtp_k:
+                # every verify step writes a whole block, and the next may already be
+                # running when the stop lands
+                self._clamp_token_budget(engine_inputs, rid, limit - (start + sl) - 2 * self.mtp_block)
         # Every per-step index in one pinned H2D (a pageable torch.tensor(..., device=cuda)
         # drains the stream before the step even starts): on prefill each request's last row
         # (for an eager prefill, when no plan buffer carries qo_indptr); under MTP the seed
@@ -716,14 +716,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     @torch.compiler.disable
     def _sample(
         self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = list(engine_inputs.request_ids)
+    ) -> BatchedModelOutput:
         new_tokens = engine_inputs.resources[SAMPLER_RESOURCE].sample(
-            request_ids, logits=logits)
-        return {
-            rid: {"new_token": [new_tokens[i : i + 1]]}
-            for i, rid in enumerate(request_ids)
-        }
+            list(engine_inputs.request_ids), logits=logits)
+        # Row i is request i: one clone and one D2H copy per step, not one per request
+        return BatchedModelOutput(
+            row_outputs={"new_token": new_tokens},
+            check_stop_buffers={"new_token": new_tokens},
+        )
 
     # ── MTP: one captured graph per step ──
     #
@@ -1042,26 +1042,53 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
+        tokens = outputs["new_token"][0].reshape(-1).tolist() if "new_token" in outputs else None
+        return self._stops(request_id, request_info, tokens)
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for every request off one ``tolist`` of the step's tokens."""
+        tokens = host_rows.buffers.get("new_token")
+        if self.mtp_k > 0 or not torch.is_tensor(tokens) or tokens.dim() == 0:
+            # an MTP verify step emits several tokens a row, which check_stop counts
+            return None
+        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        stops: dict[str, set[str]] = {}
+        for rid in request_ids:
+            i = row_of.get(rid)
+            if i is None or i >= len(values):
+                continue  # no row, no output: the per-request path skips it too
+            loops = self._stops(rid, request_infos[rid], [values[i]])
+            if loops:
+                stops[rid] = loops
+        return stops
+
+    def _stops(
+        self, request_id: str, request_info: CurrentForwardPassInfo, tokens: list[int] | None,
+    ) -> set[str]:
+        """The loops the step's new ``tokens`` stop; None when the step emitted none."""
         state = self.request_state(request_id)
         if state.get("ended_at_prefill"):
             return {"decode_loop"}
-        if "new_token" not in outputs:
+        if tokens is None:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
-        # the prompt-aware cap from the prefill's preprocess, else the request's own
+        # under MTP the prompt-aware cap from the prefill's preprocess, else the request's own
         budget = state.get("token_budget", request_info.max_tokens)
+        # in-step truncation (MTP) leaves a stop id only as the LAST element
+        is_eos = tokens[-1] in self.config.eos_token_ids
         if self.mtp_k > 0:
-            # multi-token emission: in-step truncation guarantees a stop id
-            # can only be the LAST element; totals live in the per-request
-            # counter (loop iters no longer count tokens)
-            tokens = outputs["new_token"][0]
-            last = int(tokens[-1])
-            is_eos = last in self.config.eos_token_ids
-            generated = self._mtp_checked.get(request_id, 0) + tokens.numel()
+            # multi-token emission: totals live in the per-request counter (loop iters no
+            # longer count tokens)
+            generated = self._mtp_checked.get(request_id, 0) + len(tokens)
             self._mtp_checked[request_id] = generated
         else:
-            token = outputs["new_token"][0].item()
-            is_eos = token in self.config.eos_token_ids
             # max_tokens counts the token the prefill emits, so the total is
             # 1 + (iters + 1) decode tokens
             generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2

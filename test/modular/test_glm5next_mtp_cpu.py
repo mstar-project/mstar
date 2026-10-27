@@ -390,7 +390,7 @@ def test_prompts_leave_two_blocks_of_index_topk():
     model = Glm5NextModel("x", config_variant="reduced", tokenizer_mode="byte",
                           mtp_num_draft_tokens=3)
     limit = model.config.index_topk - 2 * 4
-    assert model.process_prompt("a" * limit, ["text"], ["text"])["text_inputs"][0].numel() == limit
+    assert model.process_prompt("a" * limit, ["text"], ["text"]).new_input_tensors["text_inputs"][0].numel() == limit
     with pytest.raises(ValueError, match="at most"):
         model.process_prompt("a" * (limit + 1), ["text"], ["text"])
 

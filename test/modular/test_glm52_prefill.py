@@ -179,10 +179,10 @@ def test_compiled_forward_does_not_recompile_per_request(monkeypatch):
     try:
         # the second call recompiles once as the RoPE cache fills
         for rid in ("a", "b"):
-            assert set(prefill(rid)) == {rid}
+            assert prefill(rid).row_outputs["new_token"].shape == (1,)
         frames = counter.frame_count
         for rid in ("c", "d"):
-            assert set(prefill(rid)) == {rid}
+            assert prefill(rid).row_outputs["new_token"].shape == (1,)
         assert counter.frame_count == frames
     finally:
         torch._dynamo.reset()
@@ -268,7 +268,7 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
     from types import SimpleNamespace
 
     from mstar.engine.resources import StepContext
-    from mstar.model.glm52._testing import build_cpu_resources
+    from mstar.model.glm52._testing import build_cpu_resources, per_request_outputs
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
     from mstar.model.glm52.config import SAMPLER_RESOURCE
     from mstar.model.submodule_base import ModelInputsFromEngine
@@ -309,7 +309,8 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
                                    resources=resources, step=step)
         rows_seen.clear()
         with torch.no_grad():
-            out = sub.forward_batched("prefill", ei, **sub.preprocess("prefill", ei, inputs))
+            out = per_request_outputs(
+                sub.forward_batched("prefill", ei, **sub.preprocess("prefill", ei, inputs)), rids)
         return [out[rid]["new_token"][0] for rid in rids], list(rows_seen)
 
     full_tokens, full_rows = prefill(False, ["a", "b"])
