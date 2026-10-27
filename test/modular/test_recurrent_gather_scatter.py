@@ -244,6 +244,23 @@ def test_a_pool_without_a_sink_refuses_gather_and_scatter():
         pool.scatter_("h", rows_of(2, 0.0))
 
 
+def test_a_block_in_the_engine_dtype_takes_each_engines_own():
+    """A ``dtype=None`` block is resolved by the pool, not written back into
+    the model's config, which its other specs and engines share."""
+    config = RecurrentStateConfig(
+        num_layers=1, blocks={"h": RecurrentBlockConfig(shape=SHAPE, dtype=None)}, max_slots=MAX_SLOTS,
+    )
+    pools = [
+        RecurrentStatePool.build(
+            RecurrentStateSpec("state", {"node"}, config),
+            EngineResourceInfo(device=torch.device("cpu"), kv_dtype=kv_dtype),
+        )
+        for kv_dtype in (torch.bfloat16, torch.float16)
+    ]
+    assert [pool.block("h", 0).dtype for pool in pools] == [torch.bfloat16, torch.float16]
+    assert config.blocks["h"].dtype is None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
 def test_a_captured_graph_addresses_the_rows_each_replay_plans():
     """Capture once over a bucket's addressing, then replay for batches of

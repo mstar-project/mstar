@@ -59,6 +59,7 @@ from mstar.model.submodule_base import (
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
+from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
@@ -161,7 +162,7 @@ class SubmoduleManagement:
         # TODO: submodule-wide, so a capture touching neither kind still pays
         # double the buffers. Each runner could size its own count from the
         # resources its captures touch, as PiecewiseCudaGraphRunner does.
-        preplan_enabled = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
+        preplan_enabled = knobs.pre_plan_enabled()
         self._forced_double_buffer = any(
             res.force_double_buffer for res in self.resources.values()
         )
@@ -177,7 +178,8 @@ class SubmoduleManagement:
             # MSTAR_NUM_SLOTS=1 is the knob for turning double-buffering off,
             # but neither hazard has a single-buffered form: one slot puts the
             # next step's staging on top of a DMA that may not have retired.
-            # Turn pre-planning off (MSTAR_PRE_PLAN_SPEC=0) to drop to a slot.
+            # Turn pre-planning off (`knobs: {pre_plan: false}`, or
+            # MSTAR_PRE_PLAN_SPEC=0) to drop to a single slot.
             logger.warning(
                 "MSTAR_NUM_SLOTS=%d, but a resource on this node needs "
                 "double-buffering; using 2 slots.", self._num_slots,

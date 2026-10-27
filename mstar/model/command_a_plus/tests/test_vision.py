@@ -41,6 +41,13 @@ class VisionEncoderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Missing"):
             tiny_encoder().load_weights(list(weights.items())[1:])
 
+    def test_patch_embedding_matches_the_conv(self):
+        torch.manual_seed(0)
+        embeddings = tiny_encoder().embeddings
+        pixels = torch.rand(2, 3, 32, 32)
+        conv = embeddings.patch_embedding(pixels).flatten(2).transpose(1, 2)
+        torch.testing.assert_close(embeddings(pixels), conv + embeddings.position_embedding.weight)
+
 
 @unittest.skipUnless(os.environ.get("MSTAR_TEST_HF") == "1", "set MSTAR_TEST_HF=1")
 class HuggingFaceVisionParityTests(unittest.TestCase):
