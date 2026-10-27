@@ -7,7 +7,6 @@ layer, so capacity is a slot count and a fork is a fixed-size copy.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from math import prod
 from typing import TYPE_CHECKING
 
 import torch
@@ -25,7 +24,7 @@ class RecurrentBlockConfig:
 
     ``shape`` is opaque to the pool. ``shard_dims`` names the axes divided
     across ranks. A ``dtype`` of None is the engine's compute dtype (what its
-    KV caches store), settled when the pool is built.
+    KV caches store), resolved by the pool, which never writes it back.
     """
 
     shape: tuple[int, ...]
@@ -43,14 +42,6 @@ class RecurrentBlockConfig:
         for dim in self.shard_dims:
             shape[dim] = divide(self._unsharded_shape[dim], num_shards)
         self.shape = tuple(shape)
-
-    @property
-    def numel(self) -> int:
-        return prod(self.shape)
-
-    @property
-    def nbytes(self) -> int:
-        return self.numel * torch.empty((), dtype=self.dtype).element_size()
 
 
 class RecurrentGeometry(ABC):
@@ -276,15 +267,6 @@ class RecurrentStateConfig:
         resource can both shard the shared config."""
         for block in self.blocks.values():
             block.shard(num_shards)
-
-    @property
-    def slot_bytes(self) -> int:
-        return self.num_layers * sum(b.nbytes for b in self.blocks.values())
-
-    @property
-    def total_bytes(self) -> int:
-        return self.slot_bytes * self.max_slots
-
 
 @dataclass
 class RecurrentStateSpec(NodeResourceSpec):

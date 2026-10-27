@@ -46,6 +46,7 @@ from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexMode
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import client_stream_limits
+from mstar.validation.client_streams import check_client_streams
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "nemotron_duplex.yaml"
 
@@ -517,8 +518,8 @@ def test_duplex_audio_in_caps_a_call_at_the_session_in_samples():
     lowered = client_stream_limits(model.get_partition_topology(),
                                    {"client_streams": {"audio_in": {"max_items": 16000}}})["audio_in"]
     assert lowered.max_items == 16000
-    with pytest.raises(ValueError, match="may lower"):
-        client_stream_limits(model.get_partition_topology(), {"client_streams": {"audio_in": {"max_items": None}}})
+    (problem,) = check_client_streams(model, {"client_streams": {"audio_in": {"max_items": None}}})
+    assert "may lower" in problem
 
 
 def test_duplex_appended_audio_becomes_stream_items_in_order():
