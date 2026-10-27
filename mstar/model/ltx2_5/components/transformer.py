@@ -20,6 +20,7 @@ not ported yet.
 
 from __future__ import annotations
 
+import functools
 from typing import NamedTuple
 
 import torch
@@ -106,7 +107,7 @@ class LTX2Attends(NamedTuple):
     video_text: Attend
     audio_text: Attend
     audio_to_video: Attend      # q: video, kv: audio
-    video_to_audio: Attend      # q: audio, kv: video
+    video_to_audio: Attend      # q: audio, kv: video; also takes return_lse (see SeqParallel)
 
 
 class TemporalEmbeddings(NamedTuple):
@@ -215,9 +216,11 @@ class LTX2Block(nn.Module):
         )
         q_in = norm_a * (1 + a_v2a_scale) + a_v2a_shift
         kv_in = norm_x * (1 + v_v2a_scale) + v_v2a_shift
+        v2a = attends.video_to_audio
+        if sp is not None:
+            v2a = functools.partial(sp.attend_shards, run=v2a)
         a = a + v2a_gate * self.video_to_audio_attn(
-            q_in, attends.video_to_audio if sp is None else sp.attend_shards, context=kv_in,
-            q_rope=rope.cross_audio, k_rope=rope.cross_video,
+            q_in, v2a, context=kv_in, q_rope=rope.cross_audio, k_rope=rope.cross_video,
         )
 
         # 4. feed-forward

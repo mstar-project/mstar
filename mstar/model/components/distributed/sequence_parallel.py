@@ -112,29 +112,28 @@ def ulysses_attention(
 
 
 @torch.compiler.disable
-def attention_over_sharded_keys(sp_group: CommGroup, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def attention_over_sharded_keys(
+    sp_group: CommGroup,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    run_attention: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+) -> torch.Tensor:
     """A query replicated on every rank attending keys sharded along the sequence:
     ``q`` ``[B, Lq, H, D]``, ``k``/``v`` ``[B, Lk/P, H, D]`` (this rank's tokens), returns
     ``[B, Lq, H, D]``. Each rank attends its own shard and the partial attentions merge
     exactly by their log-sum-exps, which moves query-sized results rather than the keys.
-    Unmasked, at ``D ** -0.5``."""
-    out, lse = attention_with_lse(q, k, v)
+
+    ``run_attention(q, k, v, return_lse=True)`` returns ``(out, lse)`` with ``lse``
+    ``[B, Lq, H]`` in natural log (``joint_attention`` over a ragged resource, or
+    ``sdpa_attention``)."""
     if sp_group.world_size == 1:
-        return out
-    outs = sp_group.all_gather(out.unsqueeze(0), dim=0)
-    lses = sp_group.all_gather(lse.unsqueeze(0), dim=0)
-    weights = torch.softmax(lses, dim=0).transpose(2, 3).unsqueeze(-1)
+        return run_attention(q, k, v)
+    out, lse = run_attention(q, k, v, return_lse=True)
+    outs = sp_group.all_gather(out.unsqueeze(0).contiguous(), dim=0)
+    lses = sp_group.all_gather(lse.unsqueeze(0).float().contiguous(), dim=0)
+    weights = torch.softmax(lses, dim=0).unsqueeze(-1)
     return (outs.float() * weights).sum(dim=0).to(q.dtype)
-
-
-def attention_with_lse(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Unmasked ``[B, L, H, D]`` attention at ``D ** -0.5``, and its log-sum-exp in the
-    kernel's ``[B, H, L]`` (fp32); both contiguous, as a collective needs them."""
-    q, k, v = (t.transpose(1, 2) for t in (q, k, v))
-    flash = (torch.ops.aten._scaled_dot_product_flash_attention if q.is_cuda
-             else torch.ops.aten._scaled_dot_product_flash_attention_for_cpu)
-    out, lse = flash(q, k, v)[:2]
-    return out.transpose(1, 2).contiguous(), lse.float().contiguous()
 
 
 def sp_head_slice(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:

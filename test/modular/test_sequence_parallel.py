@@ -18,6 +18,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.diffusion.attention import sdpa_attention
 from mstar.model.components.distributed.sequence_parallel import (
     attention_over_sharded_keys,
     sp_seq_split,
@@ -133,7 +134,9 @@ def _sharded_keys(rank, world, total):
     k, v = (_full(total, batched=True, seed=seed) for seed in (1, 2))
     want = _sdpa(batched=True)(q, k, v)
     start = sum(sizes[:rank])
-    out = attention_over_sharded_keys(group, q, k.narrow(1, start, sizes[rank]), v.narrow(1, start, sizes[rank]))
+    out = attention_over_sharded_keys(
+        group, q, k.narrow(1, start, sizes[rank]), v.narrow(1, start, sizes[rank]), sdpa_attention,
+    )
     torch.testing.assert_close(out, want)
 
 

@@ -371,14 +371,12 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         for rid, inp in zip(request_ids, inputs, strict=True):
             shape: LTXShape = inp.resource_step_info
             video.append(Segment(request_id=rid, label=VIDEO_SPAN, span=shape.video_tokens))
-            # the cross-attentions attend from this rank's share of the video tokens
+            # the cross-attentions attend from (and the audio queries over) this rank's share
+            # of the video tokens; LTX2Block merges the shards' audio-over-video attentions
             shard = sp_seq_split(shape.video_tokens, sp.world_size)[sp.rank]
             video_shard.append(Segment(request_id=rid, label=VIDEO_SPAN, span=shard))
             audio.append(Segment(request_id=rid, label=AUDIO_SPAN, span=shape.audio_frames))
             text.append(Segment(request_id=rid, label=TEXT_SPAN, span=shape.text_len))
-        # sharded, the audio queries attend each rank's video shard outside the resource
-        # (LTX2Block merges the shards' partial attentions)
-        audio_pairs = AUDIO_XATTN_PAIRS if sp.world_size == 1 else AUDIO_XATTN_PAIRS[:2]
         return SubmoduleStep(
             steps={
                 VIDEO_ATTN: AttentionStep(segments=tuple(video), causal=False),
@@ -387,7 +385,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
                     segments=tuple(video_shard + text), pairs=VIDEO_XATTN_PAIRS,
                 ),
                 AUDIO_XATTN: RaggedCrossAttentionStep(
-                    segments=tuple(video_shard + audio + text), pairs=audio_pairs,
+                    segments=tuple(video_shard + audio + text), pairs=AUDIO_XATTN_PAIRS,
                 ),
             },
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),

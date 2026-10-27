@@ -52,8 +52,8 @@ class SeqParallel(NamedTuple):
     Only an attention whose queries and keys are both the sharded stream needs the
     exchange: it attends every token over this rank's head-group (``attend``). A
     query shard attending a replicated stream needs nothing, and a replicated query
-    attending the sharded keys merges the ranks' partial attentions
-    (``attend_shards``)."""
+    attending the sharded keys merges the ranks' partial attentions by their
+    log-sum-exps (``attend_shards``; ``run`` must take ``return_lse``)."""
 
     group: CommGroup
     sizes: list[int]
@@ -61,8 +61,8 @@ class SeqParallel(NamedTuple):
     def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
         return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
 
-    def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        return attention_over_sharded_keys(self.group, q, k, v)
+    def attend_shards(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, run: Attend) -> torch.Tensor:
+        return attention_over_sharded_keys(self.group, q, k, v, run)
 
 
 def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:

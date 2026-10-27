@@ -389,8 +389,8 @@ def test_declare_step_spans_and_pairs():
 @pytest.mark.parametrize("rank, shard", [(0, 13), (1, 12)])
 def test_declare_step_under_sequence_parallelism(rank, shard):
     """The video self-attention spans every video token; the cross-attentions attend
-    from this rank's share of them, and the audio queries over the video leave the
-    resource."""
+    from this rank's share of them, and the audio queries attend that share too (the
+    block merges the ranks' partial attentions)."""
     cfg = LTX25Config()
     shape = LTXShape(frames=1, height=5, width=5, audio_frames=5, fps=24.0, text_len=16)
     sub = LTXDenoiseSubmodule(nn_stub(), cfg, loop_name=DENOISE_LOOP, use_ragged_attention=True,
@@ -399,7 +399,7 @@ def test_declare_step_under_sequence_parallelism(rank, shard):
     assert [s.span for s in step.steps[VIDEO_ATTN].segments] == [25]
     for key in (VIDEO_XATTN, AUDIO_XATTN):
         assert {s.label: s.span for s in step.steps[key].segments}["video"] == shard
-    assert set(step.steps[AUDIO_XATTN].pairs) == {("audio", "text"), ("video", "audio")}
+    assert set(step.steps[AUDIO_XATTN].pairs) == {("audio", "text"), ("video", "audio"), ("audio", "video")}
 
 
 def test_distilled_schedule_matches_the_scheduler_recipe():
