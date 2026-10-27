@@ -1218,8 +1218,6 @@ class TransducerAdapter(_UntimedTranscriptionAdapter):
     # full attention over the clip; longer uploads run as independent windows
     max_audio_seconds = 600.0
     long_form = "parallel"
-    # greedy only: a retry at a higher temperature decodes the same text
-    compression_ratio_threshold = None
 
     def __init__(self, detects_language: bool = False):
         self.detects_language = detects_language
