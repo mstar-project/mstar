@@ -366,6 +366,8 @@ asr = [
     "huggingface-hub",
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
+    # decodes WAV / FLAC / OGG / MP3 uploads without FFmpeg (torchcodec takes the rest)
+    "soundfile",
     # torchcodec doesn't declare its torch requirement and loads only next to the torch
     # it was built for, so the extra pins the pair the Dockerfiles ship (torch 2.10 with 0.10)
     "torch>=2.10.0,<2.11",

@@ -805,12 +805,32 @@ def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(WhisperModel, config=WhisperModelConfig())
 
 
+def _canary(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.canary.canary_model import CanaryModel
+    from mstar.model.canary.config import CanaryModelConfig
+    from mstar.model.components.fastconformer import FastConformerConfig
+    config = CanaryModelConfig(encoder=FastConformerConfig())
+    return _bare(CanaryModel, config=config)
+
+
+def _canary_qwen(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
+    from mstar.model.canary_qwen.config import CanaryQwenModelConfig
+    from mstar.model.components.fastconformer import FastConformerConfig
+    from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    return _bare(CanaryQwenModel, config=CanaryQwenModelConfig(
+        encoder=FastConformerConfig(), llm=Qwen3LMConfig(), llm_repo="Qwen/Qwen3-1.7B",
+    ))
+
+
 def _default(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs)
 
 
 _FACTORIES = {
     "BagelModel": _bagel,
+    "CanaryModel": _canary,
+    "CanaryQwenModel": _canary_qwen,
     "ChatterboxModel": _chatterbox,
     "CommandAPlusModel": _command_a_plus,
     "Cosmos3Model": _cosmos3,
