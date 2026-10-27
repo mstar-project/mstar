@@ -5,10 +5,7 @@ groups, conv kernel 4 -> conv_dim 12288."""
 import pytest
 import torch
 
-from mstar.engine.resources.recurrent import (
-    DeltaNetGeometry,
-    Mamba2Geometry,
-)
+from mstar.engine.resources.recurrent import DeltaNetGeometry, Mamba2Geometry
 
 NEMOTRON_H = Mamba2Geometry(num_heads=128, head_dim=80, state_size=128, n_groups=8, conv_kernel_size=4)
 

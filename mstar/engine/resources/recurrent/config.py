@@ -273,6 +273,7 @@ class RecurrentStateConfig:
         for block in self.blocks.values():
             block.shard(num_shards)
 
+
 @dataclass
 class RecurrentStateSpec(NodeResourceSpec):
     config: RecurrentStateConfig
