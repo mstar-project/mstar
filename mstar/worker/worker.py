@@ -1165,19 +1165,34 @@ class Worker:
 
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
-        # Handle producer_done signal: mark all StreamBuffers for this request as done
-        if body.producer_done:
-            if req_info:
-                for edge_name, sbuf in req_info.stream_buffers.items():
-                    if sbuf.from_partition in body.producer_done:
-                        # If we have multiple consumer partitions colocated, we need to signal
-                        # the right one
-                        sbuf.signal_done(body.producer_done_items.get(edge_name, 0))
+        # Handle producer_done signal: end the producer's streams it counts.
+        # The conductor (its only sender) counts every edge it ends, with 0
+        # items too, so a producer partition's end names each of its edges into
+        # this consumer, and a client's names only the streams the client ended.
+        if body.producer_done and req_info:
+            counts = body.producer_done_items
+            for edge_name, sbuf in req_info.stream_buffers.items():
+                if sbuf.from_partition in body.producer_done and edge_name in counts:
+                    sbuf.signal_done(counts[edge_name])
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
         non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
-        streaming_with_tensors = [edge for edge in body.inputs if edge.is_streaming and edge.tensor_info]
+        buffers = req_info.stream_buffers if req_info else {}
+        streaming_with_tensors = []
+        unbuffered = []
+        for edge in body.inputs:
+            if edge.is_streaming and edge.tensor_info:
+                (streaming_with_tensors if edge.name in buffers else unbuffered).append(edge)
+        if unbuffered:
+            # Nothing here will consume it: ack it unread so the producer frees
+            # it. Expected when the request's ingest failed on this worker.
+            if request_id not in self.scheduler.failed_rids:
+                logger.warning(
+                    "Worker %s: no stream buffer for %s of request %s; dropping it",
+                    self.worker_id, [edge.name for edge in unbuffered], body.request_id,
+                )
+            self.tensor_manager.ack_unread_tensors(body.request_id, unbuffered)
 
         # Only update fwd_info when there are non-streaming edges (i.e., this is
         # a conductor-triggered forward pass, not just streaming data from another
@@ -2711,6 +2726,7 @@ class Worker:
         per_request_inputs: dict[int, NameToTensorList],
         consumed_streaming_edges: dict[int, list[StreamingEdge]],
         continuing: list[int],
+        fresh_final_edges: dict[int, set[str]],
         *,
         is_same_node: bool,
         spec_id: int = 0,
@@ -2718,7 +2734,11 @@ class Worker:
         request_walks: dict[int, str] | None = None,
     ) -> Speculation:
         """Package prepared rids (batch order) into the ``Speculation`` the main
-        loop runs. Leader and follower differ only in how they pick the rids."""
+        loop runs. Leader and follower differ only in how they pick the rids.
+
+        ``fresh_final_edges`` is ``final_edges`` (see ``_make_executing_batch``)
+        for the rids that did not come from batch N: their final chunks were
+        ingested before this step, not polled by it."""
         spec_node = spec_target.node_name
         request_ids = list(request_to_worker_graph)
         per_request_input_metadata = {
@@ -2757,7 +2777,7 @@ class Worker:
                 rid: {se.edge.name for se in edges if se.chunk.is_final}
                 for rid, edges in consumed_streaming_edges.items()
                 if any(se.chunk.is_final for se in edges)
-            },
+            } | fresh_final_edges,
             per_request_input_metadata=input_meta,
             request_walks=request_walks,
         )
@@ -2969,6 +2989,7 @@ class Worker:
             return None
         # fresh rows of another walk (a mixing chain): rid -> walk
         other_walks: dict[int, str] = {}
+        fresh_final_edges: dict[int, set[str]] = {}
 
         # Merge in fresh rids whose spec-target node is ready right now
         # Speculation only consumes work compatible with the spec target. In
@@ -2990,10 +3011,10 @@ class Worker:
                 f"Speculation asked for {spec_node_name!r} but the "
                 f"scheduler returned {fresh_batch.node_name!r}"
             )
-            fresh_inputs = fresh_batch.input_edges.to_input_tensors(
+            fresh_inputs, fresh_final, _ = fresh_batch.input_edges.to_input_tensors(
                 self.tensor_manager.get_tensor,
                 fresh_batch.request_to_worker_graph,
-            ).by_rid
+            )
             for rid in fresh_batch.request_to_worker_graph:
                 if rid in continuing:
                     # Shouldn't happen — continuing rids are held by the
@@ -3012,6 +3033,8 @@ class Worker:
                 new_request_to_worker_graph[rid] = (
                     fresh_batch.request_to_worker_graph[rid]
                 )
+                if rid in fresh_final:
+                    fresh_final_edges[rid] = fresh_final[rid]
                 walk = fresh_batch.walk_of(rid)
                 if walk != graph_walk:
                     other_walks[rid] = walk
@@ -3021,7 +3044,7 @@ class Worker:
         speculation = self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
-            consumed_streaming_edges, continuing,
+            consumed_streaming_edges, continuing, fresh_final_edges,
             is_same_node=speculating_same_node, spec_id=prep.spec_id,
             # a per-row map only when the step mixes walks
             request_walks={
@@ -3237,9 +3260,9 @@ class Worker:
         prep_inputs = prep.input_edges.to_input_tensors(
             get_tensor, prep.ready_rids,
         ).by_rid
-        fresh_inputs = fresh_edges.to_input_tensors(
+        fresh_inputs, fresh_final_edges, _ = fresh_edges.to_input_tensors(
             get_tensor, list(fresh_wg),
-        ).by_rid
+        )
         prep_wg = dict(zip(prep.ready_rids, prep.wg_ids, strict=True))
 
         new_request_to_worker_graph: dict[int, int] = {}
@@ -3279,7 +3302,7 @@ class Worker:
         speculation = self._assemble_speculation(
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
-            consumed_streaming_edges, in_n,
+            consumed_streaming_edges, in_n, fresh_final_edges,
             is_same_node=True, spec_id=prep.spec_id, tp_seq=head.spec_seq,
             request_walks=request_walks,
         )
@@ -4656,9 +4679,9 @@ class Worker:
         # on prev_advance_event (signaled right after advance_seq_lens(N) on
         # the GPU thread, ~tens of µs into replay)
         #
-        # Default ON. Set MSTAR_PRE_PLAN_SPEC=0 to fall back to the
-        # double-buffer-without-pre-plan baseline.
-        pre_plan_spec = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
+        # Default ON; `knobs: {pre_plan: false}` or MSTAR_PRE_PLAN_SPEC=0
+        # falls back to the double-buffer-without-pre-plan baseline.
+        pre_plan_spec = knobs.pre_plan_enabled()
         launch_wait_s = self._launch_wait_s
         plan_executor = None
         if pre_plan_spec:
