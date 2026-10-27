@@ -2,7 +2,8 @@
 
 CPU-safe unit tests cover the sound segment packing (mrope band, indexes,
 position ids), the duration -> latent-frame math, the request-level validation
-and walk selection, a tiny AVAE decoder shape check, and the decoder-subset
+and walk selection, the video noise a sound request shares with the same-seed
+video request, a tiny AVAE decoder shape check, and the decoder-subset
 checkpoint load. GPU tests (gated on ``COSMOS3_NANO_DIR`` + CUDA) check the
 engine cache-once [video | sound] loop against the fused reference pipeline —
 bit-tight with the sdpa handle, PSNR-level with FlashInfer — and smoke the
@@ -22,7 +23,7 @@ import torch.nn.functional as F  # noqa: F401 — keeps parity harness imports u
 
 from mstar.model.cosmos3.components.packing import build_static_inputs
 from mstar.model.cosmos3.config import Cosmos3Config
-from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
+from mstar.model.cosmos3.constants import VIDEO_GEN_WALK, VIDEO_SOUND_GEN_WALK
 from mstar.model.cosmos3.submodules import LATENT_DTYPE, sound_frames
 from mstar.model.cosmos3.tests.test_engine_cache import (
     _engine_resources,
@@ -118,6 +119,45 @@ def test_sound_request_validation() -> None:
         raise AssertionError("expected ValueError with sound serving disabled")
     except ValueError:
         pass
+
+
+def test_sound_request_draws_the_video_request_noise() -> None:
+    """A sound request's video band starts from the same noise tensor as the
+    same-seed video request: both draw it first from the request's generator,
+    in the loop-state dtype."""
+    from types import SimpleNamespace
+
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+    from mstar.model.submodule_base import CurrentForwardPassInfo
+
+    dit = Cosmos3DiTSubmodule(
+        transformer=None, config=Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config,
+    )
+    # The served transformer's projection dtype, which the loop state must not follow.
+    dit.transformer = SimpleNamespace(proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.bfloat16)))
+    dit.get_device = lambda: torch.device("cpu")
+    # Only the step count matters for the first iteration.
+    dit._new_scheduler = lambda steps, device, **kwargs: SimpleNamespace(
+        timesteps=torch.linspace(999.0, 0.0, steps), step_index=None,
+    )
+    md = {"height": 32, "width": 32, "num_frames": 9, "fps": 24.0,
+          "guidance_scale": 6.0, "num_inference_steps": 4}
+
+    def first_step(rid, walk, metadata):
+        fwd = CurrentForwardPassInfo(
+            request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
+            random_seed=11, max_tokens=0, step_metadata=metadata,
+        )
+        dit.prepare_inputs("prefill", fwd, {"text_inputs": [torch.tensor([5, 6, 7]), torch.tensor([5, 6])]})
+        fwd.graph_walk = walk
+        return dit.prepare_inputs(walk, fwd, {}).tensor_inputs
+
+    video = first_step("video", VIDEO_GEN_WALK, md)
+    sound = first_step("sound", VIDEO_SOUND_GEN_WALK, {**md, "generate_sound": True})
+    assert video["latents"].dtype == sound["latents"].dtype == LATENT_DTYPE
+    assert torch.equal(video["latents"], sound["latents"])
+    assert sound["sound_latents"].dtype == LATENT_DTYPE
 
 
 def test_sound_forward_smoke_cpu() -> None:
