@@ -28,6 +28,8 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -43,6 +45,7 @@ from mstar.model.whisper.config import (
     SAMPLER,
     WhisperModelConfig,
 )
+from mstar.utils.knobs import device_loopback_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -166,16 +169,18 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
 
     Both cache streams belong to the step: ``main`` grows by the token
     count, ``context`` grows by the encoder output at prefill and is
-    declared zero-span (read-only) thereafter. Only decode is captured —
-    prefill runs once per request and is dominated by the 1500-token
-    cross-K/V projection, which has nothing to gain from a graph.
+    declared zero-span (read-only) thereafter. Only decode is captured:
+    prefill is launch-bound too, but the context it writes (1500 tokens a
+    row) is larger than the KV capture buffers, which are sized by the
+    step's input tokens.
     """
 
-    # Every prefill is the same shape (a 4-token forced prompt over a
-    # max_source_positions encoder window), so decode is the only walk whose
-    # capture buys anything. Up to the requests the decoder caches hold
+    # Up to the requests the decoder caches hold
     # (`WhisperModel.MAX_CONCURRENT_REQUESTS`), so they all decode in one step.
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+
+    # the decode walk reads its input token off the sampler's slot masters
+    reads_device_loopback = True
 
     def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig):
         super().__init__()
@@ -220,8 +225,12 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs,
     ) -> ARNodeInputs:
+        if graph_walk == "decode" and has_loopback and self._device_loopback():
+            # one token, read off the sampler's slot master in `preprocess`
+            return ARNodeInputs(input_seq_len=1)
         device = self.get_device()
         token_ids = inputs["text_inputs"][0].to(device).reshape(-1)
 
@@ -234,6 +243,34 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             input_ids=token_ids,
             tensor_inputs=tensor_inputs,
         )
+
+    def uniform_row_inputs(
+        self, graph_walk: str, has_loopback: bool = False,
+    ) -> ARNodeInputs | None:
+        # the loop-back decode row above, built once for the step's rows
+        if graph_walk == "decode" and has_loopback and self._device_loopback():
+            return ARNodeInputs(input_seq_len=1)
+        return None
+
+    def _device_loopback(self) -> bool:
+        return (
+            device_loopback_enabled()
+            and self.node_resources[SAMPLER].has_slot_masters
+        )
+
+    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        if graph_walk == "decode" and self._device_loopback():
+            return frozenset({"text_inputs"})
+        return frozenset()
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        # decode's client edge carries the token the stop check already has on
+        # the host; prefill's is persisted for the decode walk
+        return {"text_inputs": "new_token"} if graph_walk == "decode" else {}
+
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        # a decode row spans one token and no context, as the template does
+        return graph_walk == "decode"
 
     @staticmethod
     def _context_span(inp: ARNodeInputs) -> int:
@@ -291,6 +328,19 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        if graph_walk == "decode" and any(inp.input_ids is None for inp in inputs):
+            # Each row's last sampled token, read on the device by slot. Real
+            # rows whose last step did not loop back here brought theirs.
+            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+            ids = sampler.loopback_tokens(engine_inputs.request_ids)
+            real = len(inputs) if engine_inputs.real_seq_len is None else engine_inputs.real_seq_len
+            routed = [i for i in range(real) if inputs[i].input_ids is not None]
+            if routed:
+                ids.index_copy_(
+                    0, torch.tensor(routed, device=ids.device),
+                    torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
+                )
+            return {"input_ids": ids}
         preprocessed: dict[str, torch.Tensor | Any] = {
             "input_ids": torch.cat([inp.input_ids for inp in inputs]),
         }
@@ -377,17 +427,19 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         encoder_states: torch.Tensor | None = None,
         **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         new_tokens = self._forward(
             graph_walk=graph_walk,
             engine_inputs=engine_inputs,
             input_ids=input_ids,
             encoder_states=encoder_states,
         )
-        return {
-            rid: {"new_token": [new_tokens[i:i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        # Row i is request i: one clone and one host copy per step instead of
+        # one per request.
+        return BatchedModelOutput(
+            row_outputs={"new_token": new_tokens},
+            check_stop_buffers={"new_token": new_tokens},
+        )
 
     def postprocess(
         self,
@@ -411,9 +463,38 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return set()
         token = outputs["new_token"][0].item()
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
+        return {"decode_loop"} if self._stops(token, request_info) else set()
+
+    def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
+        # the token test first: EOS is rare, the config read behind it is not free
+        if token == self.config.eos_token_id and not request_info.resource_configs[SAMPLER].ignore_eos:
+            return True
         decoded_tokens = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-        if (not ignore_eos and token == self.config.eos_token_id) or \
-                decoded_tokens >= request_info.max_tokens:
-            return {"decode_loop"}
-        return set()
+        return decoded_tokens >= request_info.max_tokens
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+        step_walk: str | None = None,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for every request off one ``tolist``."""
+        tokens = host_rows.buffers.get("new_token")
+        if not torch.is_tensor(tokens) or tokens.dim() == 0:
+            return None
+        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
+        rows = host_rows.request_ids
+        if tuple(rows[:len(request_ids)]) == tuple(request_ids):
+            pairs = zip(request_ids, values, strict=False)
+        else:
+            row_of = {rid: i for i, rid in enumerate(rows)}
+            # no row, no output: the per-request path skips it too
+            pairs = (
+                (rid, values[i]) for rid in request_ids
+                if (i := row_of.get(rid)) is not None and i < len(values)
+            )
+        return {
+            rid: {"decode_loop"} for rid, token in pairs
+            if self._stops(token, request_infos[rid])
+        }

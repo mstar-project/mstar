@@ -282,10 +282,12 @@ class WhisperModel(Model):
             section=GraphNode(
                 name="decoder",
                 input_names=["text_inputs"],
+                # one signal for both edges, so a step whose token stays on the
+                # device routes no tensor and emits the token inline
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
-                        name="new_token",
+                        name="text_inputs",
                         output_modality="text",
                     ),
                     GraphEdge(
