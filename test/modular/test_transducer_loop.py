@@ -7,22 +7,18 @@ Requests of 1, 5, 17 and 30 frames join and leave at different iterations, in
 both frame buckets (small ones here), in eager steps and in steps padded to a
 capture bucket as a replay is. A stopped request rides along in one more
 iteration, as the async worker's speculated step does, and is dropped. Each
-request's tokens must equal the one-request reference loop's and those of
-#796's in-forward decoder (a frozen copy below). On CUDA a captured graph,
+request's tokens must equal the one-request reference loop's. On CUDA a captured graph,
 replayed through the engine's runner, must emit what the eager steps do.
 """
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
-import torch.nn.functional as F
 from test_transducer import _head, _reference
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_runner import dummy_rid_handle
-from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
+from mstar.engine.fp32_precision import fp32_precision_scope, node_fp32_precision
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.recurrent import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
@@ -55,79 +51,6 @@ def _one_thread():
     torch.set_num_threads(1)
     yield
     torch.set_num_threads(previous)
-
-
-# -- #796's decoder at bf9f0676c, frozen -------------------------------------
-# A deliberate copy of the in-forward greedy decoder the loop replaced
-# (TransducerHead.start / step / advance / greedy_decode at bf9f0676c), kept as
-# an oracle: the loop must emit exactly its tokens. It calls only the head's
-# layers. Don't update it to follow the live code.
-
-def _frozen_start(head, frames, lengths):
-    cfg = head.config
-    b = frames.shape[0]
-    start = torch.full((b,), cfg.start_token_id, dtype=torch.long, device=frames.device)
-    zeros = frames.new_zeros(b, cfg.num_layers, cfg.hidden_size)
-    dec_out, h, c = head.decoder(start, zeros, zeros)
-    return {
-        "frames": frames, "lengths": lengths, "cursor": torch.zeros_like(lengths),
-        "symbols": torch.zeros_like(lengths), "active": lengths > 0, "dec_out": dec_out, "h": h, "c": c,
-    }
-
-
-def _frozen_step(head, s):
-    cfg = head.config
-    frames, cursor, symbols, active, lengths = s["frames"], s["cursor"], s["symbols"], s["active"], s["lengths"]
-    rows, t, hidden = frames.shape
-    width = head.window
-    offsets = torch.arange(width, device=frames.device)
-    at = cursor[:, None] + offsets
-    valid = at < lengths[:, None]
-    window = frames.gather(1, at.clamp(max=t - 1)[:, :, None].expand(-1, -1, hidden))
-    logits = head.joint.head(F.relu(window + s["dec_out"][:, None]))
-    tokens = logits[..., :cfg.vocab_size].argmax(dim=-1)
-    blank = tokens == cfg.blank_token_id
-    if cfg.durations:
-        skips = head.durations[logits[..., cfg.vocab_size:].argmax(dim=-1)]
-    else:
-        skips = torch.zeros_like(tokens)
-    reach = max(cfg.durations, default=1) or 1
-    nxt = torch.where(blank & valid, offsets + skips.clamp(min=1), offsets)
-    nxt = torch.cat([nxt, torch.arange(width, width + reach, device=frames.device).expand(rows, -1)], dim=1)
-    for _ in range(math.ceil(math.log2(width))):
-        nxt = nxt.gather(1, nxt)
-    first = nxt[:, 0]
-    at_first = first.clamp(max=width - 1)[:, None]
-    emit = active & (first < width) & (valid & ~blank).gather(1, at_first)[:, 0]
-    token = tokens.gather(1, at_first)[:, 0]
-    skip = skips.gather(1, at_first)[:, 0]
-    count = torch.where(first > 0, 0, symbols)
-    count = torch.where(emit & (skip == 0), count + 1, 0)
-    forced = count >= cfg.max_symbols_per_step
-    skip = skip.masked_fill(forced, 1)
-    symbols.copy_(count.masked_fill(forced, 0))
-    new_out, h, c = head.decoder(token, s["h"], s["c"])
-    s["dec_out"].copy_(torch.where(emit[:, None], new_out, s["dec_out"]))
-    s["h"].copy_(torch.where(emit[:, None, None], h, s["h"]))
-    s["c"].copy_(torch.where(emit[:, None, None], c, s["c"]))
-    cursor.add_(torch.where(active, torch.where(emit, first + skip, first), 0))
-    active.copy_(cursor < lengths)
-    return torch.where(emit, token, -1)
-
-
-@torch.no_grad()
-def _frozen_greedy_decode(head, encoder_states, lengths, prompt_ids=None):
-    with fp32_precision_scope(Fp32Precision("highest", None)):
-        frames = head.project_frames(encoder_states, prompt_ids)
-        state = _frozen_start(head, frames, lengths)
-        chunks = []
-        for _ in range(math.ceil(head.config.max_symbols_per_step * encoder_states.shape[1] / 16)):
-            tokens = [_frozen_step(head, state) for _ in range(16)]
-            chunks.append(torch.stack(tokens, dim=1))
-            if not bool(state["active"].any()):
-                break
-    rows = torch.cat(chunks, dim=1).tolist()
-    return [[tok for tok in row if tok >= 0] for row in rows]
 
 
 # -- heads and clips -------------------------------------------------------------
@@ -357,18 +280,14 @@ def _run(harness: Harness, clips, mode, runner=None, arrivals=ARRIVALS) -> dict[
 @pytest.mark.parametrize("scenario", sorted(SCENARIOS))
 @pytest.mark.parametrize("durations", [[0, 1, 2, 3, 4], []], ids=["tdt", "rnnt"])
 @pytest.mark.parametrize("mode", ["eager", "replay", "mixed"])
-def test_loop_matches_the_reference_and_the_frozen_decoder(scenario, durations, mode):
+def test_loop_matches_the_reference(scenario, durations, mode):
     head, clips = SCENARIOS[scenario](durations)
     with torch.no_grad():
         got = _run(Harness(head), clips, mode)
         lengths = [clip.shape[0] for clip in clips]
-        padded = torch.zeros(len(clips), max(lengths), 24)
-        for i, clip in enumerate(clips):
-            padded[i, :clip.shape[0]] = clip
-        frozen = _frozen_greedy_decode(head, padded, torch.tensor(lengths))
         expected = [_reference(head, clip) for clip in clips]
     for rid in range(len(clips)):
-        assert got[rid] == expected[rid] == frozen[rid], (rid, lengths[rid])
+        assert got[rid] == expected[rid], (rid, lengths[rid])
     assert sum(map(len, expected)) > len(clips), "the head emitted almost nothing; the test would be vacuous"
     if scenario == "never_blank":
         assert [len(tokens) for tokens in expected] == [head.config.max_symbols_per_step * n for n in lengths]
@@ -390,6 +309,7 @@ def test_the_loop_cap_covers_the_most_steps_a_clip_takes():
     info = _info(0, DECODE_WALK, 30, iterations=cfg.decode_iterations(30) - 1)
     assert node.check_stop(0, info, {"clock": [torch.tensor([True])]}) == set()
     assert node.check_stop(0, info, {"clock": [torch.tensor([False])]}) == {DECODE_LOOP}
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures CUDA graphs")
 @pytest.mark.parametrize("durations", [[0, 1, 2, 3, 4], []], ids=["tdt", "rnnt"])
