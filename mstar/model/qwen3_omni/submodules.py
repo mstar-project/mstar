@@ -296,8 +296,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
         encoder_output = self.vision_encoder(
             pixel_values,
             grid_thw=grid_thw,
-            # an image is one segment of all its patches, and no video frame's segment is longer
-            max_seqlen=pixel_values.shape[0],
+            # each video frame is its own segment, and a call encodes one item, so this is one frame's patches
+            max_seqlen=pixel_values.shape[0] // (kwargs["cu_seqlens"].shape[0] - 1),
             **kwargs,
         )
 
