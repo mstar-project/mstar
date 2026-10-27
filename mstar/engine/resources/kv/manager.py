@@ -2359,6 +2359,7 @@ class KVManager(AttentionResource):
                     indptrs.cpu_indptrs, self._static_plan_state(lease.slot, label),
                     lease.bucket.num_tokens,
                 )
+                self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
                     self._preplan_states[label] = plan_state
                 else:
