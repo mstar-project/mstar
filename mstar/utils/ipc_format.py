@@ -8,6 +8,7 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.streaming.topology import ClientStream
 
 
 class Status(Enum):
@@ -41,6 +42,7 @@ class WorkerMessageType(Enum):
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
     ENABLE_METRICS = "enable_metrics"
+    CLIENT_STREAM_ROUTE = "client_stream_route"
 
 
 @dataclass
@@ -82,7 +84,8 @@ class DrainRequest(MessageBody):
 class InputSignals(MessageBody):
     request_id: str
     inputs: list[GraphEdge]
-    request_info: CurrentForwardPassInfo
+    # None for a signal with no non-streaming input, which reads none
+    request_info: CurrentForwardPassInfo | None
     partition_name: str = "default"
     # Producer partition names. Declared, not a bare ``set``: a bare one is
     # untyped on the wire, so an empty set a Rust sender writes came back a
@@ -104,6 +107,20 @@ class TensorReceived(MessageBody):
 class UnpersistTensors(MessageBody):
     request_id: str
     uuid_to_ref_count: dict[int, int]
+
+
+@dataclass
+class ClientStreamRoute(MessageBody):
+    """The conductor telling the API server's data worker, the producer of a
+    request's client streams, which ranks consume each one: once at dispatch,
+    and again with an empty list for a stream whose consuming partition has
+    ended, which then takes no more items."""
+    request_id: str
+    # client stream edge -> the consuming node's ranks for this request
+    workers: dict[str, list[str]]
+    # client stream edge -> its consumer, which addresses the sends
+    consumers: dict[str, ClientStream]
+
 
 @dataclass
 class StopLoops(MessageBody):
@@ -229,17 +246,6 @@ class ConductorMessageType(Enum):
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
     ENABLE_METRICS = "enable_metrics"
-    CLIENT_STREAM_INPUT = "client_stream_input"
-
-
-@dataclass
-class ClientStreamInput(MessageBody):
-    """The next chunk of a running request's client streams (see
-    ``mstar.streaming.topology.CLIENT``): stored tensors by edge name, and
-    the streams that end after it. An ended stream takes no more chunks."""
-    request_id: str
-    signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
-    ended: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -253,10 +259,9 @@ class NewRequestConductor(MessageBody):
     # The client's request_id. ``request_id`` is the API server's key for this
     # one submission, never reused; the seed still derives from the client's.
     client_request_id: str | None = None
-    # For a model with client streams, the opening's own client input: its
-    # first chunk and the streams it ends, forwarded once the request is
-    # admitted. A stream it leaves open makes it a live call.
-    client_input: ClientStreamInput | None = None
+    # A client stream the opening leaves open: a live call, which is refused
+    # rather than queued at max_concurrent_requests.
+    input_open: bool = False
 
 
 @dataclass

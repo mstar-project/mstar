@@ -211,6 +211,7 @@ class _EndsLLM:
 def _conductor(passes=1):
     c = object.__new__(Conductor)
     c.model = _EndsLLM(passes)
+    c._client_streams = {}
     c.enable_prof = False
     c.communicator = _Capture()
     c._all_worker_graph_ids_to_graph_walks = {0: {"decode"}, 1: {"snac_chunk"}}
