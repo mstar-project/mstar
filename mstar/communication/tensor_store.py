@@ -835,15 +835,7 @@ class RustTensorStore(TensorStore):
 
     def __init__(self, bookkeeping: TensorBookkeeping | None = None):
         del bookkeeping  # resolved by __new__
-        rust = self.bookkeeping._rust
-        self._rust = rust
-        # The per-uuid calls go straight to the extension, skipping the
-        # Python frame of the methods below (which document them).
-        self.get_tensor = rust.get_tensor
-        self.get_tensors = rust.get_tensors
-        self.get_cpu_tensor = rust.get_cpu_tensor
-        self.check_uuid_presence = rust.has_tensor
-        self.remove_tensor = rust.remove_tensor
+        self._rust = self.bookkeeping._rust
 
     def get_tensor(self, uuid: int) -> torch.Tensor:
         """KeyError when not held, as the dict lookup it replaces."""
