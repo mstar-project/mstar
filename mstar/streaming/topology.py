@@ -43,10 +43,6 @@ class ClientStreamLimits(NamedTuple):
     unit: str = "items"
 
 
-# The limits a deployment may override, per client stream.
-_YAML_LIMITS = ("max_items",)
-
-
 @dataclass
 class Connection:
     """Defines a streaming connection between two partitions, or from the
@@ -87,33 +83,11 @@ def client_stream_limits(
     topology: PartitionTopology, model_config: Mapping | None,
 ) -> dict[str, ClientStreamLimits]:
     """Each client stream's limits: the model's declaration, with the serving
-    config's ``client_streams: {<edge name>: {max_items}}`` applied. A
-    deployment may set a bound the model leaves open, or lower one it
-    declares, but not raise or lift it: the model sized its consumer for
-    that much (nemotron_duplex's session buffers and KV pools for
-    ``max_session_s``). An unknown stream, key or value is an error: it
-    would otherwise be a silently ineffective setting."""
-    declared = {conn.edge_name: conn.limits or ClientStreamLimits() for conn in topology.client_connections()}
+    config's ``client_streams: {<edge name>: {max_items}}`` applied, as
+    ``validate_deployment`` accepted it (see
+    ``mstar.validation.client_streams``)."""
     overrides = (model_config or {}).get("client_streams") or {}
-    if not isinstance(overrides, Mapping):
-        raise ValueError("client_streams must map client stream names to their limits")
-    unknown = sorted(overrides.keys() - declared.keys())
-    if unknown:
-        raise ValueError(
-            f"serving config limits unknown client stream(s) {unknown}; this model takes {sorted(declared)}"
-        )
-    limits = {}
-    for name, base in declared.items():
-        block = overrides.get(name) or {}
-        if not isinstance(block, Mapping) or set(block) - set(_YAML_LIMITS):
-            raise ValueError(f"client_streams.{name} takes {list(_YAML_LIMITS)}; got {block!r}")
-        limits[name] = base._replace(**block)
-        bound = limits[name].max_items
-        if bound is not None and (isinstance(bound, bool) or not isinstance(bound, int) or bound < 1):
-            raise ValueError(f"client_streams.{name}.max_items must be a positive integer or null, not {bound!r}")
-        if base.max_items is not None and (bound is None or bound > base.max_items):
-            raise ValueError(
-                f"client_streams.{name}.max_items may lower the model's bound of {base.max_items}, "
-                f"not raise or lift it ({bound!r})"
-            )
-    return limits
+    return {
+        conn.edge_name: (conn.limits or ClientStreamLimits())._replace(**(overrides.get(conn.edge_name) or {}))
+        for conn in topology.client_connections()
+    }

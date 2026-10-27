@@ -945,40 +945,22 @@ class Conductor:
 
     @staticmethod
     def _find_client_streams(model: Model) -> dict[str, ClientStream]:
-        """Where each client stream's chunks go, checking at startup what
-        would otherwise fail every live call."""
+        """Where each client stream's chunks go: to the one node that consumes
+        it, in the partition it flows into, as validate_deployment checked."""
         connections = model.get_partition_topology().client_connections()
         if not connections:
             return {}
-        if type(model).process_stream_chunk is Model.process_stream_chunk:
-            raise ValueError(
-                f"{type(model).__name__} declares client streams but does not "
-                "implement process_stream_chunk"
-            )
         walks = model.get_graph_walk_graphs()
         partitions = {p.name: p for p in model.get_partitions()}
         streams: dict[str, ClientStream] = {}
         for conn in connections:
-            name, partition = conn.edge_name, partitions.get(conn.to_partition)
-            if name in streams:
-                raise ValueError(f"client stream {name!r} is declared twice; one consumer per stream")
-            if partition is None:
-                raise ValueError(f"client stream {name!r} flows into {conn.to_partition!r}, which is not a partition")
-            # Unique over every walk, as the worker resolves a streamed edge's
-            # consumer (Worker._build_consumer_node_cache), so both agree.
-            consumers = {
+            name, partition = conn.edge_name, partitions[conn.to_partition]
+            (consumer,) = {
                 node.name for walk in walks.values() for node in walk.get_nodes().values()
                 if name in node.input_names
             }
-            in_partition = sorted(
-                walk for walk in partition.graph_walks if consumers & walks[walk].get_nodes().keys()
-            )
-            if len(consumers) != 1 or not in_partition:
-                raise ValueError(
-                    f"client stream {name!r} needs exactly one consuming node, in "
-                    f"partition {partition.name!r}; found {sorted(consumers) or 'none'}"
-                )
-            streams[name] = ClientStream(consumers.pop(), in_partition[-1], partition.name)
+            walk = max(walk for walk in partition.graph_walks if consumer in walks[walk].get_nodes())
+            streams[name] = ClientStream(consumer, walk, partition.name)
         return streams
 
     def _split_inputs_to_workers(

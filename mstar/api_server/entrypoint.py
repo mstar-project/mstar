@@ -6,7 +6,6 @@ import collections
 import itertools
 import json
 import logging
-import math
 import multiprocessing as mp
 import os
 import re
@@ -17,6 +16,7 @@ import time
 import uuid
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Optional
 
@@ -356,10 +356,7 @@ def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
 
 def _call_input_limit(model_config: dict | None) -> int:
     """The config's ``max_call_input_mb``, in bytes."""
-    mb = (model_config or {}).get("max_call_input_mb", 512)
-    if isinstance(mb, bool) or not isinstance(mb, (int, float)) or not 0 < mb < math.inf:
-        raise ValueError(f"max_call_input_mb must be a positive number of MiB, not {mb!r}")
-    return int(mb * (1 << 20))
+    return int((model_config or {}).get("max_call_input_mb", 512) * (1 << 20))
 
 
 def _file_bytes(file_paths: dict[str, list[str]] | None) -> int:
@@ -419,10 +416,7 @@ class APIServer:
             conn.edge_name for conn in model.get_partition_topology().client_connections()
         ) if model is not None else frozenset()
         self.takes_stream_input = bool(self.client_streams)
-        # The most file bytes one live call may send over its life. A cap on a
-        # call's input, not on memory: decoded input is larger than its files,
-        # and how much waits in buffers depends on how fast the model reads.
-        self.max_call_input_bytes = _call_input_limit(model_config)
+        self._model_config = model_config
 
         # Before any tensor manager; the conductor and workers inherit it.
         ensure_deployment_token()
@@ -486,6 +480,15 @@ class APIServer:
         self.fatal_error: str | None = None
         self.on_fatal: Callable[[], None] | None = None
         self._liveness_interval_s = 0.5
+
+    @cached_property
+    def max_call_input_bytes(self) -> int:
+        """The most file bytes one live call may send over its life. A cap on
+        a call's input, not on memory: decoded input is larger than its
+        files, and how much waits in buffers depends on how fast the model
+        reads. Read on first use, after the conductor's validate_deployment
+        has accepted it, so a bad value is reported with the rest."""
+        return _call_input_limit(self._model_config)
 
     def finalize_setup(self) -> None:
         """Block until the conductor signals that every worker has finished

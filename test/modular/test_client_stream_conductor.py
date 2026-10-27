@@ -53,6 +53,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     SetupDone,
     WorkerGraphsDone,
 )
+from mstar.validation.client_streams import check_client_streams  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 PREPROCESS = "api_server_preprocess_worker"
@@ -409,8 +410,13 @@ def test_a_client_stream_has_one_consumer(tmp_path, monkeypatch):
         def get_partitions(self):
             return [PartitionDefinition(name="Ear", graph_walks={"listen", "listen2"}, initial_walk="listen")]
 
-    with pytest.raises(ValueError, match="exactly one consuming node"):
-        Conductor._find_client_streams(_TwoEars())
+    assert _refused(_TwoEars(), "exactly one consuming node")
+
+
+def _refused(model, text, config=None) -> bool:
+    """The deployment is refused at startup, for ``text`` alone."""
+    (problem,) = check_client_streams(model, config or {})
+    return text in problem
 
 
 def _client_connection(edge_name, to_partition="Ear"):
@@ -422,8 +428,7 @@ def test_client_streams_without_process_stream_chunk_fail_at_startup():
     class _NoHook(_DuplexToy):
         process_stream_chunk = Model.process_stream_chunk
 
-    with pytest.raises(ValueError, match="process_stream_chunk"):
-        Conductor._find_client_streams(_NoHook())
+    assert _refused(_NoHook(), "process_stream_chunk")
 
 
 def test_a_client_stream_into_no_partition_fails_at_startup():
@@ -431,8 +436,7 @@ def test_a_client_stream_into_no_partition_fails_at_startup():
         def get_partition_topology(self):
             return PartitionTopology(partitions=["Ear"], connections=[_client_connection("audio_in", "Mouth")])
 
-    with pytest.raises(ValueError, match="'Mouth', which is not a partition"):
-        Conductor._find_client_streams(_Nowhere())
+    assert _refused(_Nowhere(), "'Mouth', which is not a partition")
 
 
 class _AudioAndVideo(_DuplexToy):
@@ -494,8 +498,7 @@ def test_a_client_streams_consumer_must_be_its_partitions_and_the_only_one():
                     "speak": GraphNode(name="mouth", input_names=["audio_in"], outputs=[])}
 
     for model in (_ElsewhereToo(), _OnlyElsewhere()):
-        with pytest.raises(ValueError, match="exactly one consuming node"):
-            Conductor._find_client_streams(model)
+        assert _refused(model, "exactly one consuming node")
 
 
 def test_a_model_without_client_streams_is_not_inspected():
@@ -506,7 +509,7 @@ def test_a_model_without_client_streams_is_not_inspected():
         def get_graph_walk_graphs(self):
             raise AssertionError("walked the graphs of a model with no client stream")
 
-    assert Conductor._find_client_streams(_Plain()) == {}
+    assert Conductor._find_client_streams(_Plain()) == {} and check_client_streams(_Plain(), {}) == []
 
 
 @pytest.mark.parametrize("failed_here", [True, False])
@@ -595,22 +598,21 @@ def test_client_stream_limits_take_deployment_overrides():
 @pytest.mark.parametrize("max_items", [11, None])
 def test_a_deployment_cannot_raise_or_lift_a_declared_bound(max_items):
     """A declared bound is what the model's consumer was sized for."""
-    topology = _Bounded(ClientStreamLimits(max_items=10)).get_partition_topology()
-    with pytest.raises(ValueError, match="may lower the model's bound of 10"):
-        client_stream_limits(topology, {"client_streams": {"audio_in": {"max_items": max_items}}})
+    assert _refused(_Bounded(ClientStreamLimits(max_items=10)), "may lower the model's bound of 10",
+                    {"client_streams": {"audio_in": {"max_items": max_items}}})
 
 
-@pytest.mark.parametrize("block, match", [
-    ({"video_in": {"max_items": 1}}, "unknown client stream"),
-    ({"audio_in": {"max_itmes": 1}}, "takes"),
-    ({"audio_in": {"max_items": 0}}, "positive integer"),
-    ({"audio_in": {"max_items": True}}, "positive integer"),
-    ({"audio_in": 5}, "takes"),
+@pytest.mark.parametrize("config, match", [
+    ({"client_streams": {"video_in": {"max_items": 1}}}, "unknown client stream"),
+    ({"client_streams": {"audio_in": {"max_itmes": 1}}}, "takes"),
+    ({"client_streams": {"audio_in": {"max_items": 0}}}, "positive integer"),
+    ({"client_streams": {"audio_in": {"max_items": True}}}, "positive integer"),
+    ({"client_streams": {"audio_in": 5}}, "takes"),
+    ({"client_streams": ["audio_in"]}, "must map client stream names"),
+    *(({"max_call_input_mb": mb}, "max_call_input_mb") for mb in ("1e3", 0, -4, True, float("nan"), float("inf"))),
 ])
-def test_a_bad_client_streams_block_fails_loading(block, match):
-    topology = _Bounded(ClientStreamLimits()).get_partition_topology()
-    with pytest.raises(ValueError, match=match):
-        client_stream_limits(topology, {"client_streams": block})
+def test_bad_client_stream_settings_fail_startup(config, match):
+    assert _refused(_Bounded(ClientStreamLimits()), match, config)
 
 
 def test_only_a_client_stream_takes_limits():
