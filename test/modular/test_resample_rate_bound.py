@@ -45,17 +45,21 @@ def _wave_soundfile() -> types.ModuleType:
                 samplerate=w.getframerate(), frames=w.getnframes(), channels=w.getnchannels(),
             )
 
+    def _frames(w, frames, always_2d):
+        channels = w.getnchannels()
+        raw = w.readframes(w.getnframes() if frames < 0 else frames)
+        data = (np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0).reshape(-1, channels)
+        return data if always_2d or channels > 1 else data[:, 0]
+
     def read(path, dtype="float32", always_2d=False):
         with wave.open(str(path), "rb") as w:
-            channels, rate = w.getnchannels(), w.getframerate()
-            raw = w.readframes(w.getnframes())
-        data = (np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0).reshape(-1, channels)
-        return (data if always_2d or channels > 1 else data[:, 0]), rate
+            return _frames(w, -1, always_2d), w.getframerate()
 
     class SoundFile:
         def __init__(self, path):
             self._w = wave.open(str(path), "rb")
-            self.samplerate = self._w.getframerate()
+            self.samplerate, self.channels = self._w.getframerate(), self._w.getnchannels()
+            self.frames = self._w.getnframes()
 
         def __enter__(self):
             return self
@@ -64,10 +68,7 @@ def _wave_soundfile() -> types.ModuleType:
             self._w.close()
 
         def read(self, frames=-1, dtype="float32", always_2d=False):
-            channels = self._w.getnchannels()
-            raw = self._w.readframes(self._w.getnframes() if frames < 0 else frames)
-            data = (np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0).reshape(-1, channels)
-            return data if always_2d or channels > 1 else data[:, 0]
+            return _frames(self._w, frames, always_2d)
 
     def write(path, data, samplerate):
         pcm = np.round(np.clip(np.asarray(data, dtype=np.float32), -1, 1) * 32767).astype("<i2")
