@@ -17,6 +17,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeVisionEncoder,
 )
 
+from mstar import platforms
 from mstar.engine.engine import Engine
 from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
@@ -27,6 +28,7 @@ from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel, image_span
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
+from mstar.platforms import CudaPlatform
 
 RID = "r0"
 NODE = "Thinker"
@@ -332,6 +334,8 @@ def test_the_audio_encoder_embeds_a_clip_from_its_prepared_inputs_as_it_would_al
 
 
 def test_the_audio_encoder_compiles_with_the_default_while_its_output_is_cached(monkeypatch):
+    # the compiled path; AMD GPUs run the encoders eager (test_qwen3_omni_encoder_compile.py)
+    monkeypatch.setattr(platforms, "resolve_platform", CudaPlatform)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch, "compile", lambda fn, dynamic, **kwargs: dynamic)
     engine = Engine.__new__(Engine)
