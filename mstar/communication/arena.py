@@ -878,13 +878,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         )
                         self.tensor_store.increment_ref(info.uuid, 1)
                         continue
-                    if self.tensor_store.check_uuid_presence(info.uuid):
-                        self.tensor_store.increment_ref(info.uuid, 1)
+                    producer_uuid = info.uuid
+                    if self._take_cached_read(request_id, info):
                         continue
                     if info.shm_segment is None:
                         # Spilled at the producer (arena saturated): read the
                         # per-uuid file, the old protocol's path.
-                        path = self._shm_path(info.source_entity, info.uuid)
+                        path = self._shm_path(info.source_entity, producer_uuid)
                         with open(path, "rb") as f:
                             f.seek(info.offset)
                             data = f.read(info.nbytes)
@@ -979,6 +979,15 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         return t.clone()  # CPU consumer: own the bytes past reclaim
 
     # -- reclaim ----------------------------------------------------------
+
+    def unlink_owned_files(self) -> None:
+        """The spill files, then this arena's own segments, for a process that
+        is stopping: its exit-time finalizer never runs when a hung teardown
+        ends in SIGKILL or the watchdog's hard exit. Peers keep the mappings
+        they have; the finalizer still runs at a normal exit and finds them
+        gone, and unlinks any segment grown after this call."""
+        super().unlink_owned_files()
+        _unlink_paths(list(self._own_segment_paths))
 
     def close(self) -> None:
         """Stop the wake watcher and unregister every pinned segment (the

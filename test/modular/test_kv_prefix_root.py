@@ -19,6 +19,7 @@ time out.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from types import SimpleNamespace
 
@@ -39,7 +40,7 @@ from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, PrefixKeys
 from mstar.streaming.topology import StreamingGraphEdge
-from mstar.worker.engine_manager import _refuse_unservable_walks
+from mstar.validation.resources import _unservable_walks
 
 KV = "kv"
 ROPE = "rope"
@@ -455,14 +456,15 @@ _REFUSED = {
 
 
 @pytest.mark.parametrize(("node", "model", "message"), _REFUSED.values(), ids=_REFUSED.keys())
-def test_a_walk_the_cache_cannot_serve_whole_is_refused_at_load(node, model, message):
+def test_a_walk_the_cache_cannot_serve_whole_is_refused_at_startup(node, model, message):
     spec = KVSpec(
         resource_key=KV, nodes={node},
         config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
     )
 
-    with pytest.raises(ValueError, match=message):
-        _refuse_unservable_walks([spec], model)
+    problems = list(_unservable_walks([spec], model))
+
+    assert problems and re.search(message, problems[0]), problems
 
 
 def test_a_keyed_node_that_streams_into_another_partition_loads():
@@ -476,7 +478,10 @@ def test_a_keyed_node_that_streams_into_another_partition_loads():
         config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
     )
 
-    _refuse_unservable_walks([spec], model)
+    assert not list(_unservable_walks([spec], model)), (
+        "a keyed node that streams into another partition was refused, though a walk the cache "
+        "serves whole leaves its own partition nothing to read"
+    )
 
 
 def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(monkeypatch):

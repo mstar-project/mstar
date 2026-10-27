@@ -37,12 +37,15 @@ class _RecordingWrapper:
     """Stands in for FlashInferPrefillWrapper; records how it was built."""
 
     built: list[dict] = []
+    kind = "prefill"
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        type(self).built.append(kwargs)
+        self.plans = 0
+        type(self).built.append({**kwargs, "kind": self.kind})
 
     def plan(self, **kwargs):
+        self.plans += 1
         # a real CUDA-graph wrapper raises here when the row count exceeds the
         # batch_size it was built with
         rows = kwargs["qo_indptr"].shape[0] - 1
@@ -53,10 +56,17 @@ class _RecordingWrapper:
             )
 
 
+class _RecordingDecodeWrapper(_RecordingWrapper):
+    """Stands in for FlashInferDecodeWrapper (rows of one query token)."""
+
+    kind = "decode"
+
+
 @pytest.fixture(autouse=True)
 def _stub_wrapper(monkeypatch):
     _RecordingWrapper.built = []
     monkeypatch.setattr(cross_mod, "FlashInferPrefillWrapper", _RecordingWrapper)
+    monkeypatch.setattr(cross_mod, "FlashInferDecodeWrapper", _RecordingDecodeWrapper)
     # WorkspacePool allocates this many MB per (label, slot)
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
 
@@ -165,3 +175,75 @@ def test_the_eager_wrapper_is_unsized():
 
     (built,) = _RecordingWrapper.built
     assert "batch_size" not in built
+
+
+def test_one_token_rows_plan_the_decode_kernel_and_longer_rows_the_prefill_kernel():
+    """A decoder's cross attention queries one token per request every step;
+    a prompt prefill queries several."""
+    rids = ("r0", "r1")
+    for to_compute, kind in ((1, "decode"), (3, "prefill")):
+        _RecordingWrapper.built = []
+        query = {"main": _plan_output([
+            SequenceView(request_id=rid, label="main", page_idxs=[9], length=4,
+                         to_compute=to_compute)
+            for rid in rids
+        ])}
+        _manager().plan(AttentionStep(causal=False), _ctx(rids, query))
+        (built,) = _RecordingWrapper.built
+        assert built["kind"] == kind
+
+
+def _query(spans):
+    return {"main": _plan_output([
+        SequenceView(request_id=f"r{i}", label="main", page_idxs=[9], length=4, to_compute=n)
+        for i, n in enumerate(spans)
+    ])}
+
+
+@pytest.mark.parametrize("spans,kind", [
+    ([1, 1], "decode"),
+    # as many tokens as rows, but not one a row: the prefill kernel
+    ([2, 0], "prefill"),
+    ([3, 2], "prefill"),
+])
+def test_the_kernel_follows_every_rows_span(spans, kind):
+    for leased in (True, False):
+        _RecordingWrapper.built = []
+        ctx = _ctx(("r0", "r1"), _query(spans))
+        if not leased:
+            ctx.slot_lease = None
+        _manager().plan(AttentionStep(causal=False), ctx)
+        (built,) = _RecordingWrapper.built
+        assert built["kind"] == kind
+
+
+def test_force_prefill_takes_the_prefill_kernel():
+    ctx = _ctx(("r0", "r1"), _query([1, 1]))
+    ctx.force_prefill = True
+    _manager().plan(AttentionStep(causal=False), ctx)
+    (built,) = _RecordingWrapper.built
+    assert built["kind"] == "prefill"
+
+
+def test_an_unchanged_step_is_not_planned_again():
+    manager = _manager()
+    ctx = _ctx(("r0", "r1"), _query([1, 1]))
+    manager.plan(AttentionStep(causal=False), ctx)
+    wrapper = manager._current_plan_states["main"]
+    # the same context plan object over the same rows: nothing rebuilt
+    manager.plan(AttentionStep(causal=False), ctx)
+    # a new context plan over the same pages: FlashInfer's plan skipped
+    manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([1, 1])))
+    assert manager._current_plan_states["main"] is wrapper and wrapper.plans == 1
+    # other pages plan again
+    moved = _ctx(("r0", "r1"), _query([1, 1]))
+    moved.plan_results[CTX_KV][CONTEXT].views[1].page_idxs[0] = 7
+    manager.plan(AttentionStep(causal=False), moved)
+    assert wrapper.plans == 2
+
+
+def test_a_captured_key_keeps_its_kind():
+    manager = _manager()
+    manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([1, 1])))
+    with pytest.raises(AssertionError, match="captured as decode"):
+        manager.plan(AttentionStep(causal=False), _ctx(("r0", "r1"), _query([2, 0])))
