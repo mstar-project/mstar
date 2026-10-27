@@ -36,6 +36,7 @@ class BoundedPlan(NamedTuple):
     rows: tuple[tuple[int, RowLayout, int], ...]
     # host facts ``attend`` checks its arguments against
     max_retained: int = 0
+    max_span: int = 0
     reads_source: bool = False
     reads_row_source: bool = False
 
@@ -138,8 +139,11 @@ class BoundedKVManager(Resource):
             raise ValueError("a row of this step reads its source prefix, and attend was given no source")
         if plan.reads_row_source and row_source is None:
             raise ValueError("a row of this step reads its row_source entry, and attend was given no row_source")
+        t = q.shape[2]
+        if plan.max_span > t:
+            raise ValueError(f"a row of this step writes {plan.max_span} tokens; attend was given {t}")
         if rel_bias is not None:
-            t, window = q.shape[2], self.config.query_window
+            window = self.config.query_window
             need = plan.max_retained + 2 * t - 1 if window is None else window + 1
             if rel_bias.shape[-1] < need:
                 raise ValueError(f"rel_bias holds {rel_bias.shape[-1]} distances; this step needs {need}")
@@ -269,7 +273,9 @@ class BoundedKVManager(Resource):
         c = self.config
         values: list[int] = []
         rows = []
-        max_retained, reads_source, reads_row_source = 0, False, False
+        # a capture's rows are padding, but its replays may retain up to the config's max
+        max_retained = c.max_retained if ctx.capture else 0
+        max_span, reads_source, reads_row_source = 0, False, False
         for seg in step.segments or ():
             req = None if ctx.capture or ctx.is_padding_row(seg.request_id) else self._requests.get(seg.request_id)
             if req is None:
@@ -282,6 +288,7 @@ class BoundedKVManager(Resource):
                 rows.append((req.slot, layout, pos.source))
                 reads = layout.reads
                 max_retained = max(max_retained, sum(count for _, count in reads))
+                max_span = max(max_span, seg.span)
                 if reads[0][1] or reads[2][1]:      # the source's ranges (READ_FROM_SOURCE)
                     if pos.source < 0:
                         reads_row_source = True
@@ -290,7 +297,7 @@ class BoundedKVManager(Resource):
             values += flatten_row(*rows[-1])
         table = self._table(ctx, len(rows))
         self._stager.copy_(table, values, pad_value=0)
-        self._current = BoundedPlan(table, tuple(rows), max_retained, reads_source, reads_row_source)
+        self._current = BoundedPlan(table, tuple(rows), max_retained, max_span, reads_source, reads_row_source)
         return self._current
 
     def commit(self, step: BoundedKVStep, ctx: StepContext) -> None:

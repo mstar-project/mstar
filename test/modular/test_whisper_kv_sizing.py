@@ -121,7 +121,7 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
     specs = _kv_specs(model)
     cross = _manager(specs[CROSS_KV_CACHE].config, CROSS_KV_CACHE)
     self_kv = _manager(specs[KV_CACHE].config, KV_CACHE)
-    batch_size = WhisperDecoderSubmodule.MAX_BATCH_SIZE
+    batch_size = WhisperDecoderSubmodule.MAX_PREFILL_BATCH_SIZE
     for i in range(arrivals):
         conductor._ingest_request(SimpleNamespace(
             request_id=f"r{i}", model_kwargs={}, client_request_id=None))
@@ -240,7 +240,7 @@ def test_old_context_cache_refused_a_full_prefill_batch_even_empty():
     model = _make_model()
     config = dataclasses.replace(_kv_specs(model)[CROSS_KV_CACHE].config, max_num_pages=192)
     cross = _manager(config, CROSS_KV_CACHE)
-    batch = [f"r{i}" for i in range(WhisperDecoderSubmodule.MAX_BATCH_SIZE)]
+    batch = [f"r{i}" for i in range(WhisperDecoderSubmodule.MAX_PREFILL_BATCH_SIZE)]
     for rid in batch:
         cross.ingest_request(rid)
     span = model.config.max_source_positions

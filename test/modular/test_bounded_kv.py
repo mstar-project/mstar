@@ -454,6 +454,15 @@ def test_attend_refuses_misuse():
             mgr.attend(0, q, k, v, **kwargs)
     with pytest.raises(ValueError):
         mgr.attend(0, q.double(), k, v, source, row_source=row_source)
+    # a row writes at most the step's T tokens
+    mgr.plan(BoundedKVStep(segments=(Segment(1, "main", t + 1),), positions={1: StreamPosition(10, 0, 0)}),
+             StepContext(request_ids=(1,), graph_walk="w", slot=0, capture=False))
+    with pytest.raises(ValueError):
+        mgr.attend(0, q[:1], k[:1], v[:1], source)
+    # a capture's rows are padding, but its replays read up to 12 retained (4 sink + 8 window)
+    mgr.plan(step, StepContext(request_ids=(1, 2), graph_walk="w", slot=0, capture=True))
+    with pytest.raises(ValueError):
+        mgr.attend(0, q, k, v, source, rel_bias=band, row_source=row_source)
 
 
 def test_kernel_refuses_a_head_dim_it_cannot_tile():
@@ -535,3 +544,13 @@ def test_dtype_none_is_the_engines_kv_dtype():
     assert config.dtype is None
     # the engine sizes graph tables through main's hook name
     assert BoundedKVManager.build_accelerator_graph_buffers is not Resource.build_accelerator_graph_buffers
+
+
+def test_max_slots_override_is_checked():
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec
+
+    config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1, max_source_len=0,
+                             retention=SinkWindow(0, 8))
+    spec = BoundedKVSpec(resource_key="kv", nodes={"node"}, config=config)
+    with pytest.raises(ValueError):
+        spec.apply_yaml_overrides(max_slots=0)

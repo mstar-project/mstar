@@ -9,6 +9,7 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import re
 import signal
 import sys
 import threading
@@ -44,6 +45,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.tensors import ensure_deployment_token
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -57,6 +59,7 @@ from mstar.observability.metrics import (
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
@@ -75,6 +78,20 @@ NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
 # rather than shared with ``mstar.client.media`` so the SDK keeps its stdlib-only
 # import contract; ``test_binary_framing.py`` asserts the two stay equal.
 BINARY_STREAM_MEDIA_TYPE = "application/vnd.mstar.frames"
+
+# A request's id rides in every control message about it, so a client-pinned
+# one is kept short. The Rust frontend (rust/server/src/main.rs) mirrors this.
+MAX_REQUEST_ID_LEN = 128
+_REQUEST_ID_RE = re.compile(rf"[A-Za-z0-9._:-]{{0,{MAX_REQUEST_ID_LEN}}}")
+REQUEST_ID_ERROR = f"request_id must be at most {MAX_REQUEST_ID_LEN} characters from [A-Za-z0-9._:-]"
+
+
+def check_request_id(request_id: str | None) -> None:
+    """Raise ``ValueError`` unless ``request_id`` is None or fits :data:`_REQUEST_ID_RE`."""
+    if request_id is not None and (
+        not isinstance(request_id, str) or _REQUEST_ID_RE.fullmatch(request_id) is None
+    ):
+        raise ValueError(REQUEST_ID_ERROR)
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -208,6 +225,10 @@ def _shutdown_conductor_process(
 #: The Rust frontend waits the same (``DUPLICATE_ID_GRACE`` in serving.rs).
 DUPLICATE_ID_GRACE_S = 0.5
 
+#: How often a non-streaming handler (``collect_results``) asks whether its
+#: client left while it waits for the request to finish.
+DISCONNECT_CHECK_S = 0.1
+
 
 def _client_text(text: str, key: str, request_id: str | None) -> str:
     """``text`` with the submission key ``key`` (``<request_id>#<n>``) shown
@@ -225,14 +246,6 @@ def _until_error(chunks: list[ResultChunk]) -> tuple[list[ResultChunk], bool]:
     return list(chunks), False
 
 
-def _is_utf8(text: str) -> bool:
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
-
-
 def request_id_in_use(request_id: str) -> str:
     """The 409 detail for a ``request_id`` that still has a request in flight."""
     return (
@@ -248,12 +261,10 @@ class PendingRequest:
     output_modalities: list[str]
     profile: RequestProfile
     event: threading.Event = field(default_factory=threading.Event)
-    # A streaming handler takes the chunks as it delivers them (a live call
-    # can stream for hours); a non-streaming request keeps all of them.
+    # Unread outputs; a streaming consumer takes ownership of each drained list.
     chunks: list[ResultChunk] = field(default_factory=list)
     output_chunk_counts: dict[str, int] = field(default_factory=dict)
-    # per modality, the chunks a streaming handler has taken (--log-stats)
-    delivered: dict[str, OutputInfo] = field(default_factory=dict)
+    output_totals: dict[str, OutputInfo] = field(default_factory=dict)
     error: Any | None = None
     error_status: int = 500
     # The client streams the client may still append to, and when it last
@@ -268,6 +279,9 @@ class PendingRequest:
     # sleeps between chunks instead of polling every millisecond per request.
     wake: Any | None = None
     loop: Any | None = None
+    # Set by collect_results, which reads no chunk before the request ends:
+    # the wake then waits for the finish instead of firing on every chunk.
+    wake_on_finish: bool = False
     # The client's request_id. The engine knows the request by its key, so
     # the message thread restamps each chunk with this before the client sees it.
     request_id: str | None = None
@@ -277,7 +291,7 @@ class PendingRequest:
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
         loop, wake = self.loop, self.wake
-        if loop is None or wake is None:
+        if loop is None or wake is None or (self.wake_on_finish and not self.event.is_set()):
             return
         try:
             loop.call_soon_threadsafe(wake.set)
@@ -298,7 +312,7 @@ def notify_many(reqs) -> None:
     by_loop: dict[int, tuple[Any, list]] = {}
     for req in reqs:
         loop, wake = req.loop, req.wake
-        if loop is None or wake is None:
+        if loop is None or wake is None or (req.wake_on_finish and not req.event.is_set()):
             continue
         entry = by_loop.get(id(loop))
         if entry is None:
@@ -338,15 +352,6 @@ def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
         "metadata": chunk.metadata,
     }, separators=(",", ":"))
     return header.encode("utf-8") + b"\n", chunk.data
-
-
-def _count_outputs(by_modality: dict[str, OutputInfo], chunks: list[ResultChunk]) -> None:
-    for chunk in chunks:
-        info = by_modality.get(chunk.modality)
-        if info is None:
-            info = by_modality[chunk.modality] = OutputInfo(chunk.modality, count=0, total_bytes=0)
-        info.count += 1
-        info.total_bytes += len(chunk.data)
 
 
 def _call_input_limit(model_config: dict | None) -> int:
@@ -419,6 +424,8 @@ class APIServer:
         # and how much waits in buffers depends on how fast the model reads.
         self.max_call_input_bytes = _call_input_limit(model_config)
 
+        # Before any tensor manager; the conductor and workers inherit it.
+        ensure_deployment_token()
         self.preprocess_worker = PreprocessWorker(
             model=model,
             model_config=model_config,
@@ -620,9 +627,7 @@ class APIServer:
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
-        elif not _is_utf8(request_id):
-            # e.g. a lone surrogate from a JSON escape: no message could name it
-            raise HTTPException(status_code=400, detail="request_id is not valid UTF-8 text")
+        check_request_id(request_id)
 
         for m in input_modalities + output_modalities:
             if m not in SUPPORTED_MODALITIES:
@@ -1094,6 +1099,13 @@ class APIServer:
                                 rid, req.request_id,
                             ).encode("utf-8")
                         req.chunks.append(result_chunk)
+                        if self.log_stats:
+                            info = req.output_totals.get(result_chunk.modality)
+                            if info is None:
+                                info = OutputInfo(modality=result_chunk.modality, count=0, total_bytes=0)
+                                req.output_totals[result_chunk.modality] = info
+                            info.count += 1
+                            info.total_bytes += len(result_chunk.data)
                         to_wake[id(req)] = req
 
                         if result_chunk.modality == "error":
@@ -1217,8 +1229,6 @@ class APIServer:
 
                 if new_chunks:
                     new_chunks, errored = _until_error(new_chunks)
-                    if self.log_stats:
-                        _count_outputs(req.delivered, new_chunks)
                     if self.enable_nvtx:
                         for _ in new_chunks:
                             profiler.mark("apiserver.chunk_available")
@@ -1234,6 +1244,7 @@ class APIServer:
                         if req:
                             if not errored:
                                 remaining = req.chunks
+                            req.chunks = []
                             finished_req = self.pending_requests.pop(key, None)
                             self._retire(key)
                     # Profiling (incl. the optional file write) runs outside the
@@ -1356,19 +1367,41 @@ class APIServer:
         return its chunks. Disconnecting or timing out releases engine state."""
         start = time.time()
         key = self.submission_key(request_id)
+        # Woken by the message thread (PendingRequest.notify) when the request
+        # finishes, not on each chunk (wake_on_finish). Polling every 5 ms per
+        # request (lock, cancel scope, timer) held the event loop at high
+        # concurrency; the timeout is checked on each pass and a disconnect
+        # every DISCONNECT_CHECK_S.
+        wake = asyncio.Event()
+        with self.request_lock:
+            req = self.pending_requests.get(key)
+            if req is not None:
+                req.loop = asyncio.get_running_loop()
+                req.wake = wake
+                req.wake_on_finish = True
+        checked = start
         while True:
+            # Cleared before the read: a notification that lands after this
+            # point stays set and the wait below returns at once.
+            wake.clear()
             with self.request_lock:
                 req = self.pending_requests.get(key)
                 done = req.event.is_set() if req else True
             if done:
                 break
-            if time.time() - start > self.timeout_seconds:
+            now = time.time()
+            if now - start > self.timeout_seconds:
                 self.abort_submission(key, outcome="timeout")
                 raise HTTPException(status_code=500, detail="Request timed out")
-            if raw_request is not None and await raw_request.is_disconnected():
-                self.abort_submission(key)
-                return []
-            await asyncio.sleep(0.005)
+            if raw_request is not None and now - checked >= DISCONNECT_CHECK_S:
+                checked = now
+                if await raw_request.is_disconnected():
+                    self.abort_submission(key)
+                    return []
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=DISCONNECT_CHECK_S)
+            except asyncio.TimeoutError:
+                pass
 
         with self.request_lock:
             req = self.pending_requests.pop(key, None)
@@ -1396,7 +1429,7 @@ class APIServer:
         self.metrics.record(req, outcome)
 
     def _finalize_profile(self, req: PendingRequest) -> None:
-        """Stamp the finish time, aggregate output sizes, and emit the report.
+        """Stamp the finish time, attach output totals, and emit the report.
 
         Called once per request from whichever completion path pops it
         (streaming or non-streaming), after the request has been removed from
@@ -1408,11 +1441,8 @@ class APIServer:
 
         req.profile.timing.finish_time = time.perf_counter()
 
-        # Per-modality output info: what a streaming handler delivered, and
-        # the chunks still held (all of a non-streaming request's).
-        by_modality = req.delivered
-        _count_outputs(by_modality, req.chunks)
-        req.profile.outputs = list(by_modality.values())
+        # Accepted-output totals survive streaming drains without retaining payloads.
+        req.profile.outputs = list(req.output_totals.values())
 
         try:
             pretty_print_profile(req.profile, self.log_stats_file)
@@ -1977,16 +2007,20 @@ async def generate_ws(websocket: WebSocket):
             if call is not None and not call.done():
                 call.set_result(None)
             release_turn()
-            payload = {"request_id": request_id, "error": str(exc)}
             if isinstance(exc, HTTPException):
-                payload.update(error=exc.detail, status=exc.status_code)
-            if isinstance(exc, HTTPException) and exc.status_code < 500:
-                logger.info(
-                    "generate/ws request %s refused (%d): %s",
-                    request_id, exc.status_code, exc.detail,
-                )
+                payload = {"request_id": request_id, "error": exc.detail, "status": exc.status_code}
+                if exc.status_code < 500:
+                    logger.info(
+                        "generate/ws request %s refused (%d): %s",
+                        request_id, exc.status_code, exc.detail,
+                    )
+                else:
+                    logger.exception("generate/ws request failed")
             else:
-                logger.exception("generate/ws request failed")
+                text, _ = client_error_text(
+                    exc, f"generate/ws request {request_id} failed", log=logger, type_name=False,
+                )
+                payload = {"request_id": request_id, "error": text}
             try:
                 await send(payload, binary)
             except Exception:  # noqa: BLE001
@@ -2082,9 +2116,17 @@ async def generate_ws(websocket: WebSocket):
                 continue
             # a null field is an absent one, to routing and validation alike
             message = {k: v for k, v in message.items() if v is not None}
+            if message.get("request_id") == "":
+                # An empty form field reaches /generate as None; same here.
+                del message["request_id"]
             request_id = message.get("request_id")
             if request_id is not None and not isinstance(request_id, str):
                 reply({"request_id": None, "error": "request_id must be a string"}, binary)
+                continue
+            try:
+                check_request_id(request_id)
+            except ValueError as exc:
+                reply({"request_id": request_id, "error": str(exc)}, binary)
                 continue
             if _ws_is_append(message):
                 if request_id not in live:
@@ -2162,6 +2204,10 @@ async def generate(
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
+    try:
+        check_request_id(request_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
 
     # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
     # HTML checkbox) instead of its declared default, for Optional[bool] too.
@@ -2287,7 +2333,10 @@ async def generate(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        text, _ = client_error_text(
+            e, f"generate request {request_id} failed", log=logger, type_name=False,
+        )
+        raise HTTPException(status_code=500, detail=text) from e
     finally:
         # Deferred cleanup of uploaded files
         if file_paths:
@@ -2474,6 +2523,11 @@ def main(argv: list[str] | None = None):
         log_stats_file=args.log_stats_file,
         enable_nvtx=args.enable_nvtx,
     )
+
+    from mstar.api_server.openai.adapters import get_adapter
+    if getattr(get_adapter(model_name), "supports_realtime_transcription", False):
+        from mstar.api_server.openai import realtime_vad
+        realtime_vad.report_availability()   # warns now if server_vad or semantic_vad cannot run
 
     # Spawn conductor in a separate process
     ctx = mp.get_context("spawn")

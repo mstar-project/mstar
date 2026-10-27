@@ -39,9 +39,13 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
     ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
     Model,
     ProcessPromptOutput,
+    Span,
     TensorAndMetadata,
+    prompt_spans,
 )
 from mstar.model.multimodal import (
     TEXT,
@@ -55,6 +59,7 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
+from mstar.model.qwen3_5.components.rope import vision_position_advance
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -77,7 +82,7 @@ from mstar.model.qwen3_5.video import (
     sample_video,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import drop_stop_tokens
+from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -159,6 +164,8 @@ class Qwen3_5DenseModel(Model):
     # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
+
+    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -549,8 +556,34 @@ class Qwen3_5DenseModel(Model):
             result["video_grid_thw"] = [video.grid for video in videos]
             # the decoded frames are spent; don't hold them for the request's life
             result["video_inputs"] = []
+        walk = "prefill_vision" if images or videos else "prefill_text"
+        merge = self.vision_config.spatial_merge_size
+        owners = group_owners(groups)
+
+        def media(step: PromptPart) -> tuple[Span]:
+            # A span is the merged tokens and two sentinels, and each temporal group of a video
+            # is placed like a one-frame image.
+            video = step.modality == VIDEO
+            grid = result["video_grid_thw"][owners[step.index]] if video else result["image_grid_thw"][step.index]
+            grid = grid[0] if grid.dim() == 2 else grid
+            t, h, w = (int(v) for v in grid.tolist())
+            grid = torch.tensor((1 if video else t, h, w))
+            rows = int(grid.prod()) // merge**2 + 2
+            source = (VIDEO, owners[step.index]) if video else ("image", step.index)
+            return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
+
+        plan = prefill_plan(expand_video_parts(parts, groups))
+        layout = LabelLayout(spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),))
         # always set, so a `video_groups` the client sent never reaches the schedule
-        return ProcessPromptOutput(result, {"video_groups": groups})
+        return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {"decode_loop": self.get_max_output_tokens(**model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {KV_CACHE: {"main": KVLabel(
+            growth=(("decode", "decode_loop"),),
+        )}}
 
 
     def postprocess(
@@ -561,8 +594,9 @@ class Qwen3_5DenseModel(Model):
         ) -> bytes:
             if modality == "text":
                 ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
-                detok = self.tokenizer.decode(ids)
-                return detok.encode("utf-8")
+                if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
+                    self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
+                return self._text_detokenizer.to_bytes(ids)
             raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
 
     # ------------------------------------------------------------------

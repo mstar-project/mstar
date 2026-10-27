@@ -50,6 +50,7 @@ class NewRequest(MessageBody):
     worker_graph_to_workers: dict[int, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
+    loop_caps: dict[str, int]
 
 
 class MessageSource(IntEnum):
@@ -193,6 +194,12 @@ class ScheduleTPNode(MessageBody):
     # means every rid runs graph_walk
     walks: list[str] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
+    # rank 0's prefix-cache leases, by wire request id and then resource
+    prefix_hits: dict[str, dict[str, list[int]]] = field(default_factory=dict)
+    page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # A row of the step takes an input a follower reads from elsewhere: every
+    # rank agrees on whose read failed before preparing the step
+    read_check: bool = False
 
 
 @dataclass

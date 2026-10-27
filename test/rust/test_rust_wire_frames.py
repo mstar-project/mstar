@@ -96,6 +96,7 @@ class _Mesh:
             # request's are the same list.
             "r1", "default", WALK, list(wgs), list(wgs), list(workers),
             [1] * len(wgs),
+            [], [],
         )
 
     def run(self, rid, uuids, **send_kwargs):
@@ -144,6 +145,7 @@ def _send(rt, completion_id, **aos):
         stream_tokens_consumed=[dict(c) for c in con],
         prof_rids=prof_rids, profiling=prof,
         publish_rids=publish_rids, publications=publications,
+        skip_rids=aos.get("skip_rids", []),
     )
 
 
@@ -231,6 +233,20 @@ def test_an_emitted_signal_reaches_the_api_server(tmp_path):
     # The WGD names one entry per emitted chunk, for the conductor to count.
     wgd = got["conductor"][0].body
     assert wgd.output_signal_names == ["out"]
+
+
+def test_a_skipped_rid_sends_nothing(tmp_path):
+    """A rid that failed after routing: no peer, client or conductor frame."""
+    mesh = _Mesh(
+        tmp_path, outs=[("out", "remote", False), ("txt", "emit_to_client", True)],
+        remote=[{"wg_id": 1, "graph_walks": [WALK],
+                 "nodes": ["remote"], "dyn_loops": []}],
+    )
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    got = mesh.run(rid, uuids=[1], skip_rids=[rid])
+
+    assert got == {"conductor": [], "api_server": [], PEER: []}
 
 
 def test_a_remote_destination_gets_input_signals(tmp_path):
@@ -468,7 +484,7 @@ def _loop_mesh(tmp_path):
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
-                         [ME, PEER], [1, 1])
+                         [ME, PEER], [1, 1], [], [])
     return rt, rid, inboxes
 
 
@@ -517,7 +533,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2], [], [])
     info = TensorPointerInfo(
         dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
         stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
@@ -562,7 +578,7 @@ def _persist_mesh(tmp_path, tp_rank):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2], [], [])
     info = TensorPointerInfo(
         dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
         stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
@@ -662,7 +678,7 @@ def _fanout_mesh(tmp_path, shard_dim=None, dims=(4, 3), nbytes=24, stride=None):
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
-                         [ME, PEER, P2], [1, 2])
+                         [ME, PEER, P2], [1, 2], [], [])
     # By default 4 rows of 6 bytes.
     book.put_tensor(1, _info(
         1, dims=list(dims), nbytes=nbytes,
@@ -796,7 +812,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0,
     srcs = [ME, PEER][:src_tp]
     dests = [PEER, P2][:dest_tp]
     rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
-                         srcs + dests, [src_tp, dest_tp])
+                         srcs + dests, [src_tp, dest_tp], [], [])
     book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
     book.increment_ref(1, 1)
     rt.ingest_inputs_batch(_one_signal(rid, "prompt", "src"))
@@ -893,7 +909,7 @@ def _looping_emit_mesh(tmp_path):
                   "tp_enabled_nodes": [], "sp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME], [1])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME], [1], [], [])
     return rt, book, rid, inboxes
 
 
@@ -997,6 +1013,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
     keep = mesh.admit()
     doomed = mesh.rt.add_request(
         "doomed", "default", WALK, [WG_ID], [WG_ID], [ME], [1],
+        [], [],
     )
     _put(mesh, 1)
     _put(mesh, 2)
@@ -1014,6 +1031,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
     mesh.rt.remove_request(doomed)
     reused = mesh.rt.add_request(
         "fresh", "default", WALK, [WG_ID], [WG_ID], [ME], [1],
+        [], [],
     )
     assert reused == doomed, "the handle must be recycled for this to bite"
 
@@ -1052,7 +1070,7 @@ def test_one_route_reports_each_row_in_its_own_walks_graph(tmp_path):
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
     rids = [
-        rt.add_request(name, "default", walk, [0, 1], [0, 1], [ME, ME], [1, 1])
+        rt.add_request(name, "default", walk, [0, 1], [0, 1], [ME, ME], [1, 1], [], [])
         for name, walk in (("r_prefill", "prefill"), ("r_decode", "decode"))
     ]
     for rid in rids:

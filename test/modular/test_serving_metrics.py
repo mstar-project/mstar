@@ -687,6 +687,9 @@ class _StubTensorManager:
     def get_ready_tensors(self):
         return {}
 
+    def take_failed_reads(self):
+        return []
+
     def has_inflight_reads(self, request_id):
         return False
 

@@ -10,6 +10,8 @@ uv.lock
 *.prof
 *.json
 !examples/observability/grafana/dashboards/*.json
+!mstar/utils/fused_moe/configs/*.json
+!mstar/model/command_a_plus/tests/fixtures/tiny_config.json
 profiler/
 traces/
 
