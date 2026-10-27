@@ -28,7 +28,7 @@ from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerS
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.audio_features import LogMelSpectrogram
-from mstar.model.components.encoder_decoder import EncoderDecoderNode
+from mstar.model.components.token_step import TokenStepNode
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -225,8 +225,8 @@ class WhisperEncoderSubmodule(NodeSubmodule):
 _DECODE_LOOPBACK_WRITES = frozenset({TS_RULES})
 
 
-class WhisperDecoderSubmodule(EncoderDecoderNode, ARNodeSubmodule):
-    """Autoregressive Whisper decoder on the shared encoder-decoder node.
+class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
+    """Autoregressive Whisper decoder.
 
     Dispatches on graph_walk:
       - prefill: embed the forced decoder prompt
@@ -248,20 +248,16 @@ class WhisperDecoderSubmodule(EncoderDecoderNode, ARNodeSubmodule):
 
     Both cache streams belong to the step: ``main`` grows by the token
     count, ``context`` grows by the encoder output at the walk that writes it
-    and is declared zero-span (read-only) thereafter. The context span, the
-    token feedback and the base stop condition are the shared node's; the step
-    declaration, the context write (in ``preprocess``, so the prefill graph is
-    sized by the prompt) and the device loop-back are Whisper's.
+    and is declared zero-span (read-only) thereafter.
+
+    Not an ``EncoderDecoderNode`` like Canary's decoder: that node writes the
+    context inside the prefill forward and captures only decode, while this
+    one writes it eagerly in ``preprocess`` so the prefill walk can replay a
+    graph sized by the prompt alone. The token feedback, batch caps and
+    base stop condition are ``TokenStepNode``'s.
     """
 
-    KV_CACHE = KV_CACHE
-    ATTN = ATTN
-    POS = POS
     SAMPLER = SAMPLER
-    CROSS_KV_CACHE = CROSS_KV_CACHE
-    CROSS_ATTN = CROSS_ATTN
-    CONTEXT_LABEL = CONTEXT_LABEL
-    PREFILL_WALK = PREFILL_WALK
     DECODE_WALK = DECODE_WALK
     DECODE_LOOP = DECODE_LOOP
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
@@ -482,6 +478,13 @@ class WhisperDecoderSubmodule(EncoderDecoderNode, ARNodeSubmodule):
         heads = [(int(layer), int(head)) for layer, head in self.config.alignment_heads]
         weights = self.decoder.cross_attention_weights(input_ids, encoder_states, heads)
         return alignment.alignment_output(weights, input_ids, audio_frames)
+
+    @staticmethod
+    def _context_span(inp: ARNodeInputs) -> int:
+        """How far this step grows the request's context stream: the encoder
+        output on the walk that writes it, zero after."""
+        encoder_states = inp.tensor_inputs.get("encoder_states")
+        return 0 if encoder_states is None else encoder_states.shape[0]
 
     def declare_step(
         self,
@@ -748,17 +751,6 @@ class WhisperDecoderSubmodule(EncoderDecoderNode, ARNodeSubmodule):
         if next_rules is not None:
             rows["ts_rules"] = next_rules
         return BatchedModelOutput(row_outputs=rows, check_stop_buffers={"new_token": new_tokens})
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        tokens = outputs.get("text_inputs") or outputs.get("new_token")
-        if not tokens:
-            return set()
-        return {DECODE_LOOP} if self._stops(tokens[0].item(), request_info) else set()
 
     def _stops(self, token: int, request_info: CurrentForwardPassInfo) -> bool:
         """The shared stop condition (EOS or the token cap) on a decode step's

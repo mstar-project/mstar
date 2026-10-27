@@ -1,4 +1,4 @@
-"""Whisper's decoder node on the shared encoder-decoder base: HF generate's
+"""Whisper's decoder node on the shared TokenStepNode: HF generate's
 token suppression, applied to the logits the sampler gets; the batched stop
 check, which only a decode step's token answers; and the walk and loop names
 of Whisper's graph."""
@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from mstar.model.submodule_base import HostRows
-from mstar.model.whisper.config import WhisperModelConfig
+from mstar.model.whisper.config import PREFILL_WALK, WhisperModelConfig
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule
 
 
@@ -65,7 +65,7 @@ def test_names_match_whispers_graph():
     model.config = WhisperModelConfig()
     walks = model.get_graph_walk_graphs()
     node = _node()
-    assert {node.PREFILL_WALK, node.DECODE_WALK} <= set(walks)
+    assert {PREFILL_WALK, node.DECODE_WALK} <= set(walks)
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP
 
 
