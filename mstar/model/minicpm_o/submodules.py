@@ -32,6 +32,7 @@ from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.vision import MiniCPMOVision, slice_layout
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
+    DECODE_LOOP,
     LLM_ATTN,
     LLM_KV,
     LLM_POS,
@@ -55,7 +56,6 @@ from mstar.model.submodule_base import (
 logger = logging.getLogger(__name__)
 
 DECODE = "decode"
-DECODE_LOOP = "decode_loop"
 
 # encoder output name -> the prompt positions it fills
 _MM_FILLS = {"vision_embeds": "image_positions", "audio_embeds": "audio_positions"}

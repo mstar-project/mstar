@@ -22,6 +22,9 @@ VISION_ATTN = "vision_attn"
 RESAMPLER_ATTN = "resampler_attn"
 AUDIO_ATTN = "audio_attn"
 
+# the LLM's decode loop, which the KV layout and loop caps name
+DECODE_LOOP = "decode_loop"
+
 # ragged span labels
 PATCHES = "patches"
 QUERIES = "queries"

@@ -47,9 +47,10 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
+    DECODE_LOOP,
     LLM_ATTN,
     LLM_KV,
     LLM_POS,
@@ -242,7 +243,7 @@ class MiniCPMOModel(Model):
             outputs=[GraphEdge(next_node=LLM, name="audio_embeds")],
         )
         decode = Loop(
-            name="decode_loop",
+            name=DECODE_LOOP,
             section=GraphNode(
                 name=LLM,
                 input_names=["text_inputs"],
@@ -315,7 +316,7 @@ class MiniCPMOModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         unsupported = set(output_modalities) - {TEXT}
         if unsupported:
             raise ValueError(f"MiniCPM-o here has no {', '.join(sorted(unsupported))} output yet")
@@ -387,7 +388,19 @@ class MiniCPMOModel(Model):
                 result["audio_features"] = [torch.cat(pieces, dim=-1).to(torch.bfloat16)]
                 result["audio_feature_lens"] = [lens]
                 result["audio_positions"] = [positions]
-        return result
+        # the prefill writes every prompt row, placeholders included, then a row per decode step
+        rows = int(input_ids.numel())
+        layout = LabelLayout(
+            spans=(Span("rows", self._prefill_walk(result), rows, rows, "text_inputs"),),
+            growth=((DECODE_LOOP, 1),),
+        )
+        return ProcessPromptOutput(result, {"kv_layout": {LLM_KV: {"main": layout}}})
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {LLM_KV: {"main": KVLabel(growth=(("decode", DECODE_LOOP),))}}
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == TEXT:
