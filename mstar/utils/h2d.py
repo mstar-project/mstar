@@ -144,3 +144,13 @@ class PinnedStager:
             ev.record(torch.accelerator.current_stream(dst.device))
             if mirror is not None:
                 mirror.record(key, values)
+
+
+def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """``tensor`` on ``device`` without the host waiting: a CPU source goes
+    through pinned memory, so the copy queues behind the work already on the
+    stream instead of draining it first (a pageable copy blocks until then)."""
+    device = torch.device(device)
+    if device.type != "cuda" or tensor.device.type != "cpu":
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)
