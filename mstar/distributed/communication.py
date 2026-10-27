@@ -570,13 +570,10 @@ class GlobalParallelConfig:
         node_to_instance_groups: dict[str, set[tuple[int, ...]]] = {}
         for wg in worker_graphs.values():
             shape = (wg._tp_comm_size, wg.sp_size)
-            instance_groups = wg._instance_ranks or [
-                [rank] for rank in wg.ranks
-            ]
             for node in wg.section.get_nodes():
                 node_to_parallel_shapes.setdefault(node, set()).add(shape)
                 node_to_instance_groups.setdefault(node, set()).update(
-                    tuple(group) for group in instance_groups
+                    wg.replica_instances
                 )
         frozen_parallel_shapes = {
             node: frozenset(shapes)

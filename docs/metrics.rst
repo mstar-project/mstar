@@ -232,6 +232,14 @@ From the conductor's status message, sent every second while metrics are on.
    conductor dispatched and has not heard back from. The conductor sees whole passes,
    so a node running a request's decode loop counts it once for the loop.
 
+``mstar_routing_predicted_saving_total{model_name, resource}``
+   Counter, up to a second old. Per resource that predicts for the data-parallel replica
+   pick (see "Data-parallel routing" in :doc:`serving`), the saving it predicted on the
+   replica each request was sent to, in request-equivalents. For a KV cache, each request
+   adds the share of its prompt predicted cached there, so its rate over the request rate
+   is a mean of per-request shares, not the token ratio the workers' prefix-cache counters
+   give.
+
 ``mstar_conductor_status_age_seconds{model_name}``
    Gauge, seconds, computed at scrape time. Time since the API server received the
    conductor's last status message, or since metrics were enabled if none arrived yet.

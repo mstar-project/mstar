@@ -44,6 +44,13 @@ COMPONENT_IN_FLIGHT = Family(
     "dispatched and whose completion it has not received yet.",
     ("component",),
 )
+ROUTING_PREDICTED_SAVING = Family(
+    "mstar_routing_predicted_saving_total", COUNTER,
+    "Per resource mirror, the saving it predicted on the data-parallel replica "
+    "each request was sent to, in request-equivalents: for a KV cache, the "
+    "share of the request's prompt predicted cached there.",
+    ("resource",),
+)
 REQUEST_QUEUE_SECONDS = Family(
     "mstar_request_queue_seconds", HISTOGRAM,
     "Successful requests: the conductor taking the request in to admitting it "
@@ -152,5 +159,5 @@ WORKER_FAMILIES: dict[str, Family] = {
 #: Families the conductor's status message carries, exported from the latest
 #: message.
 STATUS_FAMILIES: dict[str, Family] = {
-    f.name: f for f in (CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT)
+    f.name: f for f in (CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT, ROUTING_PREDICTED_SAVING)
 } | WORKER_FAMILIES

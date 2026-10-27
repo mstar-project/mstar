@@ -1,6 +1,7 @@
 """Resource checks: the model's declarations and the deployment's ``resources:``
 overrides, as every worker's engine would build them."""
 
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -38,6 +39,7 @@ def check_resources(
     problems += _unknown_prefix_walks(model)
     problems += _undeclared_pools(specs, model)
     problems += _unservable_walks(specs, model)
+    problems += _routing_weights(specs, config)
     return problems
 
 
@@ -71,6 +73,22 @@ def _apply_overrides(
             by_key[key].apply_yaml_overrides(**kwargs)
         except (TypeError, ValueError) as e:
             yield f"resources.{key}: {e}"
+
+
+def _routing_weights(specs: Sequence[NodeResourceSpec], config: Mapping[str, Any]) -> Iterator[str]:
+    """``routing_weights``: ``load`` and resource keys, each a finite number >= 0,
+    since every replica's cost is a sum of weighted terms."""
+    weights = config.get("routing_weights") or {}
+    keys = sorted(spec.resource_key for spec in specs)
+    unknown = sorted(set(weights) - set(keys) - {"load"}, key=str)
+    if unknown:
+        yield f"routing_weights names {unknown}; it takes `load` and this model's resources {keys}"
+    for name, weight in weights.items():
+        if (
+            isinstance(weight, bool) or not isinstance(weight, (int, float))
+            or not math.isfinite(weight) or weight < 0
+        ):
+            yield f"routing_weights.{name} must be a finite number >= 0; got {weight!r}"
 
 
 def _uncacheable_positions(

@@ -1744,6 +1744,26 @@ example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
    with a message describing the migration. Move the block under ``resources:``, keyed by
    the resource name.
 
+Routing across data-parallel replicas
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a node group has several replicas, the conductor sends each new request to the
+replica where it is cheapest (see "Data-parallel routing" in :doc:`serving`). A resource
+whose state makes a request cheaper on one replica than another takes part through its
+spec, so models declare nothing for it: ``NodeResourceSpec.routing_mirror(ctx)`` returns a
+``RoutingMirror`` or ``None``, the default, where the ``RoutingContext`` ``ctx`` gives the
+group's replica count, the ranks per replica and whether the model names its checkpoint.
+The mirror is conductor-side bookkeeping with three methods. ``score(config)`` gives the
+request's cost on each replica, in request-equivalents (1 weighs as one more live
+request), from the request's ``ResourceReqConfig`` for the resource, which the conductor
+builds and validates before the pick. ``add_request(config, replica)`` records the
+placement once the request is dispatched and returns a handle, and
+``remove_request(handle)`` releases it when the request leaves. The module that defines it
+must stay free of kernels, since the conductor builds it. ``KVSpec`` with a
+``PagedKVConfig`` is the one implementation: it predicts each replica's prefix cache from
+the prompt's page keys, and only where ``PagedKVConfig.prefix_cache_opens`` says the
+workers open the cache.
+
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~
 

@@ -7,7 +7,7 @@ the abort/fail path (drain all workers + preprocess worker, then Remove).
 """
 
 import types
-from collections import Counter, deque
+from collections import deque
 
 import pytest
 import torch
@@ -36,7 +36,6 @@ def _request_data(workers=("w0",), persist_signals=None, ref_cnts=None):
         # Post-resource-pool refactor: requests carry per-resource configs
         # rather than a sampling_config. The barrier never reads them.
         resource_configs={},
-        dp_replicas={0: 0},
     )
 
 
@@ -59,7 +58,6 @@ def _conductor(requests, drain_ttl_s=120.0):
         send=lambda entity_id, msg: c.sent.append((entity_id, msg))
     )
     c.requests = {}
-    c._replica_load = Counter()
     for rid, request_data in requests.items():
         c._register_request(rid, request_data)
     c.draining = {}
@@ -121,8 +119,6 @@ def test_abort_drains_all_participants_then_removes():
     assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
     assert "r1" not in c.requests and "r1" not in c.draining
     assert c.admits == 1
-    # the DP replica pick no longer counts it
-    assert not any(c._replica_load.values())
 
 
 def test_abort_of_unknown_request_sends_nothing():
@@ -305,7 +301,6 @@ def test_bad_value_registered_but_not_dispatched_is_a_400():
     c._do_ingest_request = bad_config
     c._ingest_request(_new_request("r1"))
     assert "r1" not in c.requests and c.draining == {}
-    assert not any(c._replica_load.values())
     assert _remove_targets(c, "r1") == {PREPROCESS}
     [failure] = _failures(c, "r1")
     assert failure.status == 400 and "top_p" in failure.error_message

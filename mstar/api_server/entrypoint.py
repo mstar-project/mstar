@@ -1641,9 +1641,10 @@ def _run_warmup_requests(server: APIServer, specs: list, copies: int = 1) -> Non
     Each spec runs as ``copies`` x its ``concurrency`` concurrent requests,
     once per value when ``concurrency`` is a list: ``copies`` warms every
     replica of a data-parallel deployment, since the conductor sends
-    concurrent requests to different replicas (the least-loaded one each), and
-    ``concurrency`` lets them batch, for a step that compiles per batch size;
-    both are best effort, as the scheduler decides what shares a step.
+    concurrent requests to different replicas (the least-loaded one each, at
+    the default ``routing_weights``), and ``concurrency`` lets them batch, for
+    a step that compiles per batch size; both are best effort, as the
+    scheduler decides what shares a step.
     """
     if not isinstance(specs, list):
         logger.warning("warmup_requests must be a list; ignoring %r", type(specs).__name__)

@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -408,6 +408,19 @@ class KVSpec(NodeResourceSpec):
         """Forwarded to the config: which keys are legal is a property of the
         storage strategy, so the config answers for them."""
         self.config.apply_yaml_overrides(**kwargs)
+
+    def routing_mirror(self, ctx: RoutingContext):
+        if not isinstance(self.config, PagedKVConfig) or not self.config.prefix_cache_opens(
+            ctx.instance_size, ctx.checkpoint_named,
+        ):
+            return None
+        from mstar.engine.resources.kv.routing import KVRoutingMirror
+
+        return KVRoutingMirror(
+            ctx.num_replicas,
+            # without SINK_PAGE, which the pool never hands out
+            capacity=self.config.max_num_pages - 1, page_size=self.config.page_size,
+        )
 
 
 @dataclass(frozen=True)

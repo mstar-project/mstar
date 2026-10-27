@@ -423,8 +423,11 @@ def test_resource_over_local_nodes_in_different_parallel_groups_is_refused(tmp_p
     ([_Spec("kv", {"llm"}, deps={"kv"})], {}, r"resource 'kv' depends on itself"),
     ([_Spec("a", {"llm"}, deps={"b"}), _Spec("b", {"llm"}, deps={"a"})], {},
      r"dependency cycle among resources \['a', 'b'\]"),
+    # NaN would make every replica's cost NaN, and every DP ingest fail
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"kv": float("nan")}},
+     r"routing_weights.kv must be a finite number >= 0; got nan"),
 ], ids=["top_level_kv_cache", "unknown_resource", "bad_override", "duplicate_key", "missing_dependency",
-        "self_dependency", "cycle"])
+        "self_dependency", "cycle", "routing_weight_not_finite"])
 def test_resource_problem_is_refused_in_the_conductor(specs, extra, pattern, tmp_path, monkeypatch):
     """EngineManager.build and Engine.load_model raised these on every worker."""
     with pytest.raises(DeploymentError, match=pattern):

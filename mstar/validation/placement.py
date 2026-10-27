@@ -184,11 +184,9 @@ def _input_limits(walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]
 
 def _on_same_workers(wgs: list[WorkerGraph]) -> bool:
     """Whether every request runs all of these worker graphs on the same
-    workers: the conductor picks one replica per node_group, so they share a
-    node_group, or each is a single instance on the same ranks."""
-    if len({wg._group_id for wg in wgs}) == 1:
-        return True
-    return all(len(wg.ranks) == wg.tp_size and wg.ranks == wgs[0].ranks for wg in wgs)
+    workers: the conductor picks one replica for every node_group on the same
+    lockstep instances (``ReplicaRouter``), so they share those instances."""
+    return len({wg.replica_instances for wg in wgs}) == 1
 
 
 def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGraph]]) -> Iterator[str]:
@@ -228,8 +226,8 @@ def _stream_driven_walks(model: Model, walk_to_wgs: Mapping[str, list[WorkerGrap
                 f"{[sorted(wg.section.get_nodes()) for wg in wgs]} on ranks "
                 f"{[wg.ranks for wg in wgs]}. Across worker graphs a stream-driven walk "
                 "is served only with every consumer gated on a non-streamed input that "
-                "arrives once per pass and every worker graph on the same workers (one "
-                "node_group, or one instance on the same ranks); otherwise run it as "
+                "arrives once per pass and every worker graph on the same workers (node_groups "
+                "on the same ranks, instance for instance); otherwise run it as "
                 "one worker graph, or move the work after the consumer into a "
                 "downstream partition fed by a StreamingGraphEdge."
             )

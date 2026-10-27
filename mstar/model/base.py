@@ -206,8 +206,9 @@ class WorkerGraph:
     # for data parallelism). ``_tp_ranks`` are the mesh rows (tensor-parallel
     # comm groups: sharded heads/weights, all-reduce); ``_sp_ranks`` are the
     # columns (sequence-parallel comm groups: Ulysses all-to-all);
-    # ``_instance_ranks`` are the whole instances (the conductor's lockstep
-    # routing unit — every rank of an instance runs a request together). With
+    # ``_instance_ranks`` are the whole instances (every rank of an instance runs
+    # a request together; empty without TP/SP, so the data-parallel replicas the
+    # conductor routes to are ``replica_instances``). With
     # sp_size==1 this reduces to the old ``ranks`` chunked by ``tp_size``
     # (trivial SP groups; instance == TP row). ``tp_size`` is rewritten in
     # __post_init__ to the instance size (tp*sp) so the conductor — which models
@@ -253,6 +254,11 @@ class WorkerGraph:
             self._tp_comm_size = tp
             # Conductor routes to the lockstep unit (the whole instance).
             self.tp_size = inst
+
+    @property
+    def replica_instances(self) -> tuple[tuple[int, ...], ...]:
+        """The data-parallel replicas: each lockstep instance's ranks, or one rank each."""
+        return tuple(map(tuple, self._instance_ranks)) or tuple((rank,) for rank in self.ranks)
 
 
 def _combine_sections_sequential_or_parallel(

@@ -8,6 +8,9 @@ entry however often it is read, and an entry that surfaces under an older stamp
 is pushed back under the page's own.
 
 Every caller holds the manager's lock, so none of this takes one of its own.
+The conductor's routing mirror predicts this order per replica
+(``_ReplicaPages`` in ``kv/routing.py``), so a change to eviction here belongs
+there too.
 """
 
 import heapq

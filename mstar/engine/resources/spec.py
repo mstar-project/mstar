@@ -11,7 +11,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -37,6 +37,38 @@ class CombinedSplit:
         return min(total, bucket_rows)
 
 
+class RoutingContext(NamedTuple):
+    """The node group a routing mirror is built for, and what it needs of the model."""
+    num_replicas: int
+    # ranks per replica: its lockstep instance
+    instance_size: int
+    # whether the model names its checkpoint, which a prefix cache roots in
+    checkpoint_named: bool
+
+
+class RoutingMirror(Protocol):
+    """A conductor-side prediction of one resource's state on each data-parallel
+    replica of a node group, for choosing a new request's replica. It holds
+    bookkeeping only, never the resource's data, and a wrong prediction makes a
+    request slower, never wrong.
+
+    ``config`` is the request's config for the resource, as the conductor
+    opens it with: built and validated before the pick.
+    """
+
+    def score(self, config: "ResourceReqConfig") -> list[float]:
+        """The request's cost on each replica, lower being cheaper. A score is
+        in request-equivalents, the unit of the forward mirror's live-request
+        count, so a cost of 1 weighs as one more request on the replica."""
+
+    def add_request(self, config: "ResourceReqConfig", replica: int) -> Any:
+        """Record the request as placed on ``replica``; the handle comes back
+        to ``remove_request``."""
+
+    def remove_request(self, handle: Any) -> None:
+        """Release what ``add_request`` recorded, once the request is gone."""
+
+
 @dataclass
 class NodeResourceSpec(ABC):
     resource_key: str
@@ -60,6 +92,11 @@ class NodeResourceSpec(ABC):
         The builder, not necessarily the class built: an attention spec names
         `AttentionManager`, whose `build` picks a backend subclass.
         """
+
+    def routing_mirror(self, ctx: RoutingContext) -> RoutingMirror | None:
+        """A mirror of this resource for the node group ``ctx`` describes; None
+        (the default) leaves the resource out of the replica pick."""
+        return None
 
     def apply_yaml_overrides(self, **kwargs):
         """Patch declared parameters from this resource's YAML block.

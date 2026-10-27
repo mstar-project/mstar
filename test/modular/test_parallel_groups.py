@@ -22,6 +22,7 @@ from mstar.distributed.communication import (
     GlobalParallelConfig,
     WorkerParallelGroups,
 )
+from mstar.model.base import WorkerGraph
 
 
 def _groups() -> WorkerParallelGroups:
@@ -148,15 +149,9 @@ def test_global_instance_groups_determine_remote_transfer_need():
 
 def test_global_config_exposes_remote_replica_shapes_to_every_worker():
     def worker_graph(node, ranks, tp_size):
-        return SimpleNamespace(
+        return WorkerGraph(
             section=SimpleNamespace(get_nodes=lambda: {node: None}),
-            ranks=ranks,
-            tp_size=tp_size,
-            sp_size=1,
-            _tp_comm_size=tp_size,
-            _tp_ranks=[ranks] if tp_size > 1 else [],
-            _sp_ranks=[],
-            _instance_ranks=[ranks] if tp_size > 1 else [],
+            graph_walks=set(), ranks=ranks, tp_size=tp_size,
         )
 
     config = GlobalParallelConfig(

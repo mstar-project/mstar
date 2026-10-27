@@ -2041,12 +2041,70 @@
       ]
     },
     {
+      "id": 46,
+      "type": "timeseries",
+      "title": "Predicted routing saving",
+      "description": "Per resource, the saving the data-parallel replica pick predicted on the replica each request went to, in request-equivalents per second (for a KV cache, the predicted share of each prompt cached there). Empty unless a node group has replicas and a resource mirror.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 108,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (resource) (rate(mstar_routing_predicted_saving_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{resource}}",
+          "range": true
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Engine workers",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 108,
+        "y": 116,
         "w": 24,
         "h": 1
       },
@@ -2063,7 +2121,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 109,
+        "y": 117,
         "w": 12,
         "h": 8
       },
@@ -2151,7 +2209,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 109,
+        "y": 117,
         "w": 12,
         "h": 8
       },
@@ -2219,7 +2277,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 117,
+        "y": 125,
         "w": 12,
         "h": 8
       },
@@ -2277,7 +2335,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 117,
+        "y": 125,
         "w": 12,
         "h": 8
       },
@@ -2358,7 +2416,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 125,
+        "y": 133,
         "w": 12,
         "h": 8
       },
@@ -2453,7 +2511,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 125,
+        "y": 133,
         "w": 12,
         "h": 8
       },
@@ -2507,7 +2565,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 133,
+        "y": 141,
         "w": 24,
         "h": 1
       },
@@ -2524,7 +2582,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 134,
+        "y": 142,
         "w": 12,
         "h": 8
       },
@@ -2582,7 +2640,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 134,
+        "y": 142,
         "w": 12,
         "h": 8
       },
@@ -2650,7 +2708,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 142,
+        "y": 150,
         "w": 12,
         "h": 8
       },
@@ -2722,7 +2780,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 142,
+        "y": 150,
         "w": 12,
         "h": 8
       },
@@ -2790,7 +2848,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 150,
+        "y": 158,
         "w": 24,
         "h": 1
       },
@@ -2808,7 +2866,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 151,
+        "y": 159,
         "w": 12,
         "h": 8
       },
@@ -2987,7 +3045,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 151,
+        "y": 159,
         "w": 12,
         "h": 8
       },
@@ -3043,7 +3101,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 159,
+        "y": 167,
         "w": 24,
         "h": 8
       },
