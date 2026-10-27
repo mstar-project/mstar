@@ -1886,17 +1886,6 @@ def test_qwen3_tts_codec_takes_every_item_as_a_frame_and_pads_to_capture_shape()
         "request": InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(1, 1, 3, True)}),
     }) == 4
 
-    # A stream whose only frame was a withheld EOS ends with an empty chunk: no audio.
-    empty = submodule.prepare_inputs(
-        "codec_chunk", SimpleNamespace(request_id="empty", rid_handle="empty"), {},
-        input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(0, 0, 0, True)}),
-    )
-    assert empty.tensor_inputs["codec_tokens"].shape == (4, 1)
-    assert empty.kwargs["frames"] == empty.kwargs["context"] == 0
-    outputs = {"audio_chunk": [torch.arange(4)]}
-    submodule.postprocess("empty", None, outputs, inputs=empty)
-    assert outputs["audio_chunk"][0].numel() == 0
-
     # A single frame lands in the first ramp bucket; too many frames is an error.
     one = submodule.prepare_inputs(
         "codec_chunk", SimpleNamespace(request_id="one", rid_handle="one"), {"codec_tokens": [codes[:1]]},
@@ -1954,11 +1943,12 @@ def test_qwen3_tts_streaming_policy_ramps_and_flushes_only_new_tail_audio():
 
 
 @pytest.mark.parametrize("num_frames", [0, 1, 2, 3, 4, 5, 6, 7, 8])
-def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_frames):
+def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_frames, monkeypatch):
     """The Talker's stop check withholds its EOS frame, so the codec's windows
     hold only frames and each frame's audio comes out once. Off a window
-    boundary the final chunk carries the last frames; a stream whose first
-    frame was EOS ends with an empty chunk that emits nothing."""
+    boundary the final chunk carries the last frames; on one (or when the
+    stream's first frame was EOS) it carries no new frame, and the codec
+    declines it before building any tensor."""
     config = _tiny_model_config()
     talker = TalkerSubmodule.__new__(TalkerSubmodule)
     talker.talker_config = config.talker
@@ -1983,9 +1973,13 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
     stream.signal_done(num_frames)
 
     codec = CodecSubmodule(_FakeCodecDecoder(4), config)
+    if num_frames == 0:
+        def no_device():
+            raise AssertionError("the codec built a device tensor")
+        monkeypatch.setattr(codec, "get_device", no_device)
     fwd = SimpleNamespace(request_id="r", rid_handle="r")
     engine_inputs = ModelInputsFromEngine(request_ids=["r"], per_request_info={})
-    windows = []
+    windows, declined = [], False
     while stream.has_chunk_ready():
         chunk = stream.pop_chunk()
         data = chunk.data["data"]
@@ -1994,6 +1988,11 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
         item = codec.prepare_inputs(
             "codec_chunk", fwd, inputs, input_metadata=InputMetadata(stream_chunks={"codec_tokens": chunk.info}),
         )
+        if item is None:   # declined: no forward, and the stream still ends
+            assert chunk.is_final and chunk.num_items == chunk.context_items
+            windows.append((chunk.info, 0))
+            declined = True
+            continue
         assert item.kwargs["frames"] == chunk.num_items
         assert (item.tensor_inputs["codec_tokens"][0, :chunk.num_items] != eos).all()
         packed = codec.preprocess("codec_chunk", engine_inputs, [item])
@@ -2006,8 +2005,7 @@ def test_qwen3_tts_codec_stream_carries_no_eos_and_ends_on_the_last_frames(num_f
     assert sum(samples for _, samples in windows) == num_frames * codec.total_upsample
     assert final_samples == (final.num_items - final.context_items) * codec.total_upsample
     # the ramp's new frames per window: 1, 3, then 3 a window
-    if num_frames not in (0, 1, 4, 7):
-        assert final_samples > 0
+    assert declined == (final_samples == 0) == (num_frames in (0, 1, 4, 7))
     if num_frames == 0:
         assert windows == [(StreamChunkInfo(0, 0, 0, True), 0)]
 

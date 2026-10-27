@@ -577,7 +577,7 @@ def _ar_decoder(monkeypatch):
 def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
     """The AR decoder's context-re-decode + trim reproduces the whole-clip
     decode of the same latent stream, chunk counts drive completion, and the
-    stream's empty terminal flush is skipped."""
+    stream's empty terminal flush is declined."""
     sub = _ar_decoder(monkeypatch)
     # Latent stream of 12 units, value = absolute unit index; windows of 8
     # units with 1-unit overlap: [0..8) then [7..12).
@@ -585,9 +585,9 @@ def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
     md = {"num_windows": 2, "overlap_latent_units": 1, "num_frames": 45}
     engine_inputs = SimpleNamespace(request_ids=["r"], per_request_info={"r": SimpleNamespace(step_metadata=md)})
 
-    flush = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, None, {"window_latents": []})
-    assert flush.tensor_inputs["latents"].numel() == 0
-    assert sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, flush.tensor_inputs["latents"]) == {}
+    assert sub.prepare_inputs(
+        C.VIDEO_DECODE_AR_WALK, None, {"window_latents": []}, is_final_stream_chunk=True,
+    ) is None
     first = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, None, {"window_latents": [stream[:, :, 0:8]]})
     assert sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, first.tensor_inputs["latents"]) == {}
     out = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, stream[:, :, 7:12])
@@ -617,8 +617,6 @@ def test_windowed_decoder_streams_chunks(monkeypatch) -> None:
     expected = sub._decode_pixels(stream)
     assert torch.equal(torch.cat([c0, c1], dim=2), expected[:, :, :43])
     assert sub.request_state("r")["ar_pixels"] == []
-    # The stream's empty terminal flush stays a no-op.
-    assert sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, torch.empty(0)) == {}
 
 
 def test_windowed_stream_video_gen_params() -> None:

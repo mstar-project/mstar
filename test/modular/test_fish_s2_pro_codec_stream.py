@@ -155,7 +155,7 @@ def run_streams(submodule: CodecSubmodule, frames: dict[str, torch.Tensor]):
     """Stream each request's frames, as the AR samples them, through its own
     buffer; every step batches the requests that have a chunk ready, as the
     scheduler batches the codec. Returns, per request, ``(chunk_info, audio)``
-    per step and the decode count."""
+    per step (a declined chunk emits no audio) and the decode count."""
     cfg = submodule.codec
     buffers = {}
     for rid, request_frames in frames.items():
@@ -176,25 +176,38 @@ def run_streams(submodule: CodecSubmodule, frames: dict[str, torch.Tensor]):
     while rids := [rid for rid, buffer in buffers.items() if buffer.has_chunk_ready()]:
         chunks = {rid: buffers[rid].pop_chunk() for rid in rids}
         meta = {rid: InputMetadata(stream_chunks={"codec_tokens": chunk.info}) for rid, chunk in chunks.items()}
-        engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={})
         # an empty chunk reaches the node as an edge with no tensors
-        items = [
-            submodule.prepare_inputs(
+        prepared = {
+            rid: submodule.prepare_inputs(
                 "codec_chunk", infos[rid],
                 {"codec_tokens": [] if chunks[rid].data["data"] is None else [chunks[rid].data["data"]]},
                 input_metadata=meta[rid],
             )
             for rid in rids
-        ]
+        }
+        # as the engine does: a declined chunk runs no forward
+        for rid in rids:
+            if prepared[rid] is None:
+                assert chunks[rid].is_final
+                steps[rid].append((chunks[rid].info, torch.empty(0, dtype=torch.int16)))
+        run = [rid for rid in rids if prepared[rid] is not None]
+        if not run:
+            continue
+        items = [prepared[rid] for rid in run]
+        engine_inputs = ModelInputsFromEngine(request_ids=run, per_request_info={})
         assert submodule.can_batch(None, items)
         packed = submodule.preprocess("codec_chunk", engine_inputs, items)
-        decodes += packed["codec_tokens"].shape[-1] > 0
+        decodes += 1
         with torch.no_grad():
             outputs = submodule.forward_batched("codec_chunk", engine_inputs, **packed)
-        for rid, item in zip(rids, items, strict=True):
+        for rid, item in zip(run, items, strict=True):
             submodule.postprocess(rid, infos[rid], outputs[rid], inputs=item)
             steps[rid].append((chunks[rid].info, outputs[rid]["audio_chunk"][0]))
     return steps, decodes
+
+
+def _no_device():
+    raise AssertionError("the codec built a device tensor")
 
 
 def streamed(steps) -> torch.Tensor:
@@ -303,8 +316,8 @@ def test_streams_batched_at_different_offsets_each_stitch_into_their_own_decode(
 
 
 def test_context_only_terminal_flush_decodes_nothing(config, decoder):
-    """A stream whose last window holds only context emits nothing and, alone
-    in its batch, runs no decode."""
+    """A stream whose last window holds only context declines it: it emits
+    nothing and runs no decode."""
     submodule = CodecSubmodule(decoder, config)
     # ramp 2 + 3, then chunks of 5: 15 frames end exactly on a window
     steps, decodes = run_streams(submodule, {"r": stream_codes(15)})
@@ -332,10 +345,12 @@ def test_the_ar_withholds_im_end_and_the_final_window_keeps_the_last_frames(conf
     assert_same_audio(streamed(steps["r"]), whole_decode(decoder, codes))
 
 
-def test_a_stream_of_only_im_end_ends_with_an_empty_chunk(config, decoder):
-    """The AR's first frame was <|im_end|>: the stream gets no item, and its
-    final chunk reaches the codec with no tensor, decodes nothing and emits no audio."""
+def test_a_stream_of_only_im_end_ends_with_an_empty_chunk(config, decoder, monkeypatch):
+    """The AR's first frame was <|im_end|>: the stream gets no item, and the
+    codec declines its final chunk, which reaches it with no tensor, before
+    building any: it decodes nothing and emits no audio."""
     submodule = CodecSubmodule(decoder, config)
+    monkeypatch.setattr(submodule, "get_device", _no_device)
     steps, decodes = run_streams(submodule, {"r": stream_codes(0)})
 
     ((info, audio),) = steps["r"]

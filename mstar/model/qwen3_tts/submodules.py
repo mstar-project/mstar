@@ -1061,7 +1061,7 @@ class CodecSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
-    ) -> ARNodeInputs:
+    ) -> ARNodeInputs | None:
         """Pad one stream window to its capture bucket.
 
         Input arrives as ``[frames, code_groups]``. The official decoder wants
@@ -1072,13 +1072,13 @@ class CodecSubmodule(ARNodeSubmodule):
         """
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
+        if chunk is not None and chunk.is_final and chunk.num_items <= chunk.context_items:
+            # a terminal flush with no new frame (a stream that ends on a window
+            # boundary, or whose first frame was EOS): nothing to decode, and
+            # declined it still ends the stream
+            return None
         state = self.request_state(fwd_info.rid_handle)
-        received = inputs.get("codec_tokens")
-        if received:
-            codes = received[0].to(device=self.get_device(), dtype=torch.long)
-        else:
-            # a stream whose first frame was EOS ends with an empty chunk
-            codes = torch.zeros(0, self.config.num_code_groups, dtype=torch.long, device=self.get_device())
+        codes = inputs["codec_tokens"][0].to(device=self.get_device(), dtype=torch.long)
         if codes.ndim == 1:
             codes = codes.view(-1, self.config.num_code_groups)
         if codes.ndim != 2:
@@ -1090,7 +1090,7 @@ class CodecSubmodule(ARNodeSubmodule):
         context = chunk.context_items if chunk is not None else 0
         # First window frame the conv stack decodes: the new frames' conv context.
         conv_start = context - min(context, self.conv_context) if self.split_decode else 0
-        bucket = self._bucket(max(frames, 1))
+        bucket = self._bucket(frames)
         if frames < bucket:
             codes = torch.nn.functional.pad(codes, (0, 0, 0, bucket - frames))
         logger.debug(
@@ -1300,7 +1300,7 @@ class CodecSubmodule(ARNodeSubmodule):
         for request_id in per_request_info:
             chunk = self._codec_chunk(per_request_input_metadata.get(request_id))
             if chunk is not None:
-                buckets.add(self._bucket(max(chunk.num_items, 1)))
+                buckets.add(self._bucket(chunk.num_items))
             else:
                 buckets.add(self.request_state(request_id).get("codec_bucket"))
         buckets.discard(None)
