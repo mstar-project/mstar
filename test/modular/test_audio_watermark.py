@@ -477,7 +477,7 @@ def test_pcm16_round_trip_matches_offline_within_one_step():
     assert (marked.int() - expected.int()).abs().max() <= 1
 
 
-def test_watermark_runs_fp32_matmuls_and_tf32_cudnn_and_restores_the_flags(monkeypatch):
+def test_watermark_runs_fp32_matmuls_and_tf32_cudnn_and_restores_the_flags(monkeypatch, torch_flag):
     """cuDNN on H100 picks a far slower conv with TF32 off; matmuls, which the
     engine turns to TF32, stay fp32."""
     wmk = _watermarker()
@@ -490,7 +490,7 @@ def test_watermark_runs_fp32_matmuls_and_tf32_cudnn_and_restores_the_flags(monke
         return forward(x)
 
     monkeypatch.setattr(first_conv, "forward", conv)
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
+    torch_flag(torch.backends.cuda.matmul, "allow_tf32", True)
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     wmk.apply([torch.zeros(320)], [WatermarkStream()])
     assert seen == [(False, True)]
