@@ -61,7 +61,7 @@ use protocol::{
     VideoGenerationRequest,
 };
 use serving::{
-    collect, now, result_stream, rid, try_result_stream, AppState, Out, DUPLICATE_ID_GRACE,
+    collect, now, result_stream, rid, try_result_stream, AppState, Out, OutStream, DUPLICATE_ID_GRACE,
 };
 
 #[tokio::main]
@@ -505,7 +505,11 @@ async fn chat_completions(
     let request_id = rid("chatcmpl");
 
     if req.stream.unwrap_or(false) {
-        return chat_sse(st, args, request_id).into_response();
+        let base = match open_stream(result_stream(&st, &args, &request_id, true)).await {
+            Ok(base) => base,
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
+        };
+        return chat_sse(st, base, request_id).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(build_chat_response(
@@ -516,17 +520,25 @@ async fn chat_completions(
     }
 }
 
+/// `base` once its first item is in, replayed; a refusal is `Err` before any 200 is sent.
+/// A client that leaves meanwhile drops this future, and the stream's guard aborts.
+async fn open_stream(mut base: OutStream) -> Result<OutStream, (u16, String)> {
+    match base.next().await {
+        Some(Out::Error { status, message }) => Err((status, message)),
+        first => Ok(Box::pin(futures::stream::iter(first).chain(base))),
+    }
+}
+
 /// SSE `chat.completion.chunk`s: per-chunk deltas, finish, `[DONE]`. The role
 /// rides on the first delta (the finish one when there is none), as in
 /// `serving_chat.py`: clients time the first token from the first chunk.
 fn chat_sse(
     st: AppState,
-    args: SubmitArgs,
+    base: OutStream,
     request_id: String,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     let created = now();
     let model = st.model_name.clone();
-    let base = result_stream(&st, &args, &request_id, true);
 
     // Set if a terminal error is emitted mid-stream, so the tail below does NOT
     // append a clean `finish_reason:"stop"` + `[DONE]` — a failed request must
@@ -686,19 +698,14 @@ async fn audio_speech(
     }
 
     if req.stream.unwrap_or(false) {
-        // Look at the first item before committing to a 200, as the Python
-        // frontend does: a refused request (bad voice, bad knob) gets its status.
-        let mut base = result_stream(&st, &args, &request_id, true);
-        let first = match base.next().await {
-            Some(Out::Error { status, message }) => {
-                return error(status, &message, error_type(status))
-            }
-            first => first,
+        let base = match open_stream(result_stream(&st, &args, &request_id, true)).await {
+            Ok(base) => base,
+            Err((status, message)) => return error(status, &message, error_type(status)),
         };
         // Open-ended WAV (a streaming header, then PCM16 frames), or bare PCM.
         // A later error aborts the body: the status is already sent, and a
         // cleanly ended stream would pass for a complete answer.
-        let audio = futures::stream::iter(first).chain(base).filter_map(|item| async move {
+        let audio = base.filter_map(|item| async move {
             match item {
                 Out::Chunk(c) if c.modality == "audio" && !c.data.is_empty() => {
                     Some(Ok(Bytes::from(c.data)))
@@ -763,7 +770,7 @@ async fn images_generations(
     let futs = (0..n).map(|i| {
         let mut args = base.clone();
         if let (Some(s), true) = (seed, i > 0) {
-            args.model_kwargs.insert("seed".to_string(), Value::from(s + i));
+            args.model_kwargs.insert("seed".to_string(), Value::from(s.wrapping_add(i)));
         }
         let st = st.clone();
         async move {
@@ -1217,18 +1224,15 @@ async fn generate_finish(
         bridge.wait_for_request_id(&request_id, DUPLICATE_ID_GRACE).await;
     }
     if streaming {
-        let mut base = match try_result_stream(&st, &args, &request_id, true) {
+        let base = match try_result_stream(&st, &args, &request_id, true) {
             Ok(base) => base,
             Err((status, message)) => return detail_error(status, &message),
         };
-        // Wait for the first item, as the Python frontend's open_result_stream
-        // does: a refused request gets its real status, not a 200. A client
-        // that leaves meanwhile drops this future, and the stream's guard aborts.
-        let first = match base.next().await {
-            Some(Out::Error { status, message }) => return detail_error(status, &message),
-            first => first,
+        let base = match open_stream(base).await {
+            Ok(base) => base,
+            Err((status, message)) => return detail_error(status, &message),
         };
-        let body = futures::stream::iter(first).chain(base).map(|item| {
+        let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
                 // after the 200 is committed the status travels in-band
@@ -1495,8 +1499,9 @@ mod tests {
                 output_modalities: outputs.iter().map(|m| m.to_string()).collect(),
                 ..SubmitArgs::default()
             };
-            let (status, _, data) =
-                body(chat_sse(state(None), args, "r".into()).into_response()).await;
+            let st = state(None);
+            let base = result_stream(&st, &args, "r", true);
+            let (status, _, data) = body(chat_sse(st, base, "r".into()).into_response()).await;
             assert_eq!(status, StatusCode::OK);
             let text = String::from_utf8(data).unwrap();
             let events: Vec<&str> = text

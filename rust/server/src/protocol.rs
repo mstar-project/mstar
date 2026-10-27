@@ -117,10 +117,11 @@ pub struct ChatCompletionRequest {
     #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
     #[serde(default)]
     pub model: Option<String>,
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub temperature: Option<f64>,
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub top_p: Option<f64>,
+    /// Passed on as sent; the server's normalize_generation_kwargs holds the rules.
+    #[serde(default)]
+    pub temperature: Option<Value>,
+    #[serde(default)]
+    pub top_p: Option<Value>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub max_tokens: Option<i64>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -172,10 +173,11 @@ pub struct SpeechRequest {
     /// instead of hard-erroring. Absent / null / false all mean non-streaming.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     pub stream: Option<bool>,
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub temperature: Option<f64>,
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub top_p: Option<f64>,
+    /// Passed on as sent; the server's normalize_generation_kwargs holds the rules.
+    #[serde(default)]
+    pub temperature: Option<Value>,
+    #[serde(default)]
+    pub top_p: Option<Value>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub seed: Option<i64>,
 
@@ -283,6 +285,7 @@ impl ModelList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn chat(body: &str) -> ChatCompletionRequest {
         serde_json::from_str(body).unwrap()
@@ -298,8 +301,8 @@ mod tests {
                 "max_tokens":"16","n":"2","seed":"7"}"#,
         );
         assert_eq!(r.stream, Some(true));
-        assert_eq!(r.temperature, Some(0.5));
-        assert_eq!(r.top_p, Some(0.9));
+        assert_eq!(r.temperature, Some(json!("0.5")));
+        assert_eq!(r.top_p, Some(json!("0.9")));
         assert_eq!(r.max_tokens, Some(16));
         assert_eq!(r.n, Some(2));
         assert_eq!(r.seed, Some(7));
@@ -314,7 +317,7 @@ mod tests {
                 "seed":null}"#,
         );
         assert_eq!(r.stream, Some(true));
-        assert_eq!(r.temperature, Some(0.5));
+        assert_eq!(r.temperature, Some(json!(0.5)));
         assert_eq!(r.max_tokens, Some(16));
         assert_eq!(r.seed, None); // explicit null
         let r = chat(r#"{"messages":[]}"#);
@@ -324,10 +327,6 @@ mod tests {
 
     #[test]
     fn rejects_genuinely_invalid_scalars() {
-        assert!(serde_json::from_str::<ChatCompletionRequest>(
-            r#"{"messages":[],"temperature":"abc"}"#
-        )
-        .is_err());
         // A non-integral value for an int field is still an error.
         assert!(serde_json::from_str::<ChatCompletionRequest>(
             r#"{"messages":[],"max_tokens":"1.5"}"#
@@ -358,6 +357,16 @@ mod tests {
         assert_eq!(max_tokens("-9223372036854775808.0").unwrap(), Some(i64::MIN));
         let seed = r#"{"messages":[],"seed":1e20}"#;
         assert!(serde_json::from_str::<ChatCompletionRequest>(seed).is_err());
+    }
+
+    #[test]
+    fn sampling_floats_pass_as_sent() {
+        // the server refuses these; parsed here, "nan" would be served at the default
+        for v in [r#""nan""#, r#""inf""#, r#""abc""#] {
+            let r = chat(&format!(r#"{{"messages":[],"temperature":{v},"top_p":{v}}}"#));
+            let sent: Value = serde_json::from_str(v).unwrap();
+            assert_eq!((r.temperature, r.top_p), (Some(sent.clone()), Some(sent)));
+        }
     }
 
     #[test]
