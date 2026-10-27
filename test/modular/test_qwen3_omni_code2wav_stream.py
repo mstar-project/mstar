@@ -17,11 +17,13 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+import yaml
 
 from mstar.model.qwen3_omni.components import code2wav as code2wav_module
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
@@ -395,6 +397,7 @@ RAMPS = [
     pytest.param((5, 10), 25, 25, id="5-10-25"),
     pytest.param((1, 2, 4, 8, 16), 25, 25, id="doubling-ramp"),
     pytest.param((4,), 25, 25, id="4-then-25"),
+    pytest.param((8, 10, 13, 16, 20), 25, 25, id="early-audio-8-10-13-16-20"),
     # a ramp chunk wider than the steady chunk widens the padded window
     pytest.param((30, 10), 25, 25, id="30-10-25"),
     pytest.param((4, 10), 25, 50, id="4-10-25-context-50"),
@@ -529,6 +532,41 @@ def test_yaml_model_kwargs_set_the_streaming_knobs():
     assert (cfg.codec_chunk_schedule, cfg.codec_chunk_frames, cfg.codec_left_context_frames) == ((), 25, 50)
     assert kwargs == {"codec_chunk_frames": None, "other": 1}
     assert cfg.codec_max_window == 75
+
+
+EARLY_AUDIO_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "qwen3omni_colocated_early_audio.yaml"
+
+
+def test_the_early_audio_config_ramps_in_small_steps_inside_the_default_capture():
+    """The AMD deployment's knobs: first audio after 8 frames, no chunk over
+    1.3x the one before, and every window still padded to the default's 50
+    frames, so the vocoder needs no new capture."""
+    from mstar.model.qwen3_omni.qwen3_omni_model import apply_code2wav_serving_overrides
+
+    kwargs = dict(yaml.safe_load(EARLY_AUDIO_CONFIG.read_text())["model_kwargs"])
+    cfg = Code2WavConfig()
+    apply_code2wav_serving_overrides(cfg, kwargs)
+
+    sizes = (*cfg.codec_chunk_schedule, cfg.codec_chunk_frames)
+    assert sizes == (8, 10, 13, 16, 20, 25) and not kwargs
+    assert max(b / a for a, b in zip(sizes, sizes[1:], strict=False)) <= 1.3
+    assert cfg.codec_max_window == Code2WavConfig().codec_max_window == 50
+    assert _windows(_scheduled_policy(cfg), 120) == [
+        (0, 8), (8, 18), (18, 31), (25, 41), (25, 45), (25, 50), (25, 50), (25, 28),
+    ]
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+@pytest.mark.parametrize("boundary", [8, 18, 31, 47, 67, 92])
+def test_the_early_audio_ramp_streams_the_full_decode_around_each_boundary(boundary, offset):
+    decoder = _LookaheadDecoder()
+    submodule = Code2WavSubmodule(decoder, _config((8, 10, 13, 16, 20)))
+    codes = _codes(boundary + offset)
+
+    steps = _stream(submodule, codes, _scheduled_policy)
+    full = _to_pcm(decoder(codes.t()[None], torch.arange(boundary + offset)[None]))[0, 0]
+
+    assert torch.equal(torch.cat([audio for _, audio, _ in steps]), full)
 
 
 def test_one_context_frame_covers_the_lookahead_samples():

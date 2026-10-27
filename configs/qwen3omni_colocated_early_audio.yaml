@@ -1,0 +1,23 @@
+# qwen3omni_colocated.yaml with first audio after 8 codec frames and a longer
+# ramp to 25-frame chunks. Each chunk is at most 1.3x the one before, so it
+# arrives before the previous one has played as long as the Talker gives a
+# request about 16 frames/s (1.3x real time). The default's 13 -> 25 step
+# needs about 24. The recommended deployment on AMD GPUs; see the Qwen3-Omni
+# notes in docs/models.rst.
+model: "qwen3_omni"
+max_seq_len: 32768
+model_kwargs:
+  codec_chunk_schedule: [8, 10, 13, 16, 20]
+# The KV pools default to 2,048 pages. The Thinker's is 24 GiB at 12 MiB a page,
+# and every node's weights on one 80 GB GPU leave about 12 GiB.
+resources:
+  thinker_kv:
+    max_num_pages: 256
+  talker_kv:
+    max_num_pages: 256
+node_groups:
+  - node_names: [audio_encoder, vision_encoder, Code2Wav]
+    ranks: [0]
+
+  - node_names: [Thinker, Talker]
+    ranks: [0]
