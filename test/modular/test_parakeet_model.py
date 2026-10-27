@@ -215,3 +215,6 @@ def test_startup_refuses_more_requests_than_slots(tmp_path):
         model.validate_config_yaml({"max_concurrent_requests": 129}, "a.yaml")
     with pytest.raises(ValueError, match="positive int"):
         model.validate_config_yaml({"max_concurrent_requests": 0}, "a.yaml")
+    # slot 0 is the sink, so one slot leaves none to admit into, with or without a cap
+    with pytest.raises(ValueError, match="max_slots must be an int >= 2"):
+        model.validate_config_yaml({"resources": {TRANSDUCER_STATE: {"max_slots": 1}}}, "a.yaml")
