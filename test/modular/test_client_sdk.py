@@ -151,6 +151,25 @@ def test_stereo_audio_keeps_its_channels():
         assert (w.getnchannels(), w.getframerate(), w.getnframes()) == (2, 48000, 3)
 
 
+def test_generate_leaves_the_output_to_the_server():
+    """Unnamed, the server picks the model's default (audio for TTS)."""
+    c = MStarClient("http://x")
+    resp = mock.MagicMock()
+    resp.json.return_value = {"request_id": "r", "outputs": {}}
+    with mock.patch.object(c._session, "post", return_value=resp) as post:
+        c.generate(text="hi")
+        assert "output_modalities" not in post.call_args.kwargs["data"]
+        c.generate(text="hi", output_modalities=("audio",))
+        assert post.call_args.kwargs["data"]["output_modalities"] == "audio"
+        # a comma string or a generator names the same outputs
+        c.generate(text="hi", output_modalities="text, audio")
+        assert post.call_args.kwargs["data"]["output_modalities"] == "text,audio"
+        c.generate(text="hi", output_modalities=(m for m in ["image"]))
+        assert post.call_args.kwargs["data"]["output_modalities"] == "image"
+    with pytest.raises(ValueError, match="requires stream=True"):
+        c.generate(text="hi", output_modalities="video_frame")
+
+
 def test_build_files_accepts_one_filename_bytes_pair():
     """A bare ``(filename, bytes)`` pair is one upload, not two items (the SDK docstring's contract)."""
     from mstar.client.client import MStarClient

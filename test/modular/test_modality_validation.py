@@ -4,13 +4,14 @@ Each model declares the modalities it takes and produces, and
 ``APIServer.submit_request`` refuses any other with ``UnsupportedModalityError``,
 which every front end answers with a 400. The tables below hold the shapes the
 front ends send each model (they must pass) and shapes it cannot serve (they
-must not).
+must not). A request that names no output gets the model's default.
 """
 
 import asyncio
 import base64
 import io
 import json
+import time
 import wave
 from importlib import import_module
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from mstar.api_server import entrypoint
 from mstar.api_server.entrypoint import SUPPORTED_MODALITIES, UnsupportedModalityError
+from mstar.api_server.request_types import ResultChunk
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.model.base import Model
 from mstar.model.registry import MODEL_REGISTRY
@@ -395,6 +397,116 @@ def test_cosmos3_produces_text_only_where_the_reasoner_is_served(tmp_path):
     assert "text" in cls.SUPPORTED_OUTPUT_MODALITIES
 
 
+# ── the default output ──────────────────────────────────────────────────────
+
+# One registry key per class: what a request that names no output gets.
+# Cosmos3 depends on the checkpoint (test_cosmos3_defaults_to_chat_only_with_the_reasoner).
+DEFAULTS = {
+    "bagel": ("text",),
+    "canary": ("text",),
+    "canary_qwen": ("text",),
+    "chatterbox": ("audio",),
+    "command_a_plus": ("text",),
+    "fish_s2_pro": ("audio",),
+    "flux2_klein": ("image",),
+    "higgs_audio": ("text",),
+    "kokoro": ("audio",),
+    "lingbot_world_1_3b": ("video_frame",),
+    "ltx2_5": ("video", "audio"),
+    "nemotron_duplex": ("text", "audio"),
+    "omnilingual_asr_ctc_300m": ("text",),
+    "omnivoice": ("audio",),
+    "orpheus": ("audio",),
+    "pi05": ("action",),
+    "qwen3_5_0.8b": ("text",),
+    "qwen3_asr": ("text",),
+    "qwen3_omni": ("text",),
+    "qwen3_tts": ("audio",),
+    "vjepa2": ("video",),
+    "vjepa2_ac": ("video",),
+    "wan22": ("video",),
+    "waypoint": ("video_frame",),
+    "whisper_large": ("text",),
+    "z_image_turbo": ("image",),
+}
+
+
+@pytest.mark.parametrize("name,default", sorted(DEFAULTS.items()))
+def test_the_default_output_per_class(name, default):
+    assert _declared(name).default_output_modalities() == default
+
+
+def test_the_defaults_table_covers_every_class():
+    classes = {MODEL_REGISTRY[name] for name in [*DEFAULTS, "cosmos3"]}
+    assert classes == set(MODEL_REGISTRY.values())
+
+
+@pytest.mark.parametrize("name", sorted(MODEL_REGISTRY))
+def test_every_registered_model_has_a_default_it_produces(name):
+    """A model with several outputs and no text must name its default, or a
+    request that names none is a 400."""
+    model = _declared(name)
+    default = model.default_output_modalities()
+    assert default, f"{name} has no default output"
+    assert len(set(default)) == len(default)
+    assert model.unsupported_modalities([], list(default)) == []
+
+
+def test_cosmos3_defaults_to_chat_only_with_the_reasoner(tmp_path):
+    # Edge's reasoner answered a request naming no output on main (as text);
+    # elsewhere that request was refused, and now gets an image
+    cls = _model_cls("cosmos3")
+    from test_cosmos3_edge_model import _fake_edge_dir
+
+    edge = str(_fake_edge_dir(tmp_path))
+    assert cls(model_path_hf=edge, skip_weight_loading=True).default_output_modalities() == ("text",)
+    for model in (
+        cls(model_path_hf=edge, skip_weight_loading=True, enable_reasoner=False),
+        cls(model_path_hf="unused", skip_weight_loading=True),  # Nano: no reasoner
+    ):
+        assert model.default_output_modalities() == ("image",)
+        assert model.unsupported_modalities([], ["image"]) == []
+
+
+def test_submit_request_fills_in_the_models_default():
+    calls = []
+    server = make_test_api_server(
+        model=_declared("orpheus"), model_name="orpheus",
+        preprocess_worker=SimpleNamespace(new_request=calls.append),
+    )
+    rid = server.submit_request(text="hi", input_modalities=["text"], output_modalities=[])
+    (sent,) = calls
+    assert sent.output_modalities == ["audio"]
+    assert server.pending_requests[server.submission_key(rid)].output_modalities == ["audio"]
+    # with no model to ask, text, as before
+    calls.clear()
+    server = make_test_api_server(preprocess_worker=SimpleNamespace(new_request=calls.append))
+    server.submit_request(text="hi", input_modalities=["text"], output_modalities=[])
+    assert calls[0].output_modalities == ["text"]
+
+
+def test_a_model_without_a_default_refuses_a_request_naming_no_output():
+    model = _declared("ltx2_5")
+    model.DEFAULT_OUTPUT_MODALITIES = None  # two outputs, neither of them text
+    server = _server(model, "ltx2_5")
+    with pytest.raises(UnsupportedModalityError) as e:
+        server.submit_request(text="a dog on a beach", input_modalities=["text"], output_modalities=[])
+    assert e.value.status_code == 400
+    assert e.value.detail == "ltx2_5 has no default output; name one of audio, video in output_modalities"
+    assert server.pending_requests == {}
+
+
+def test_a_default_goes_through_the_same_checks():
+    # Waypoint's raw frames are streaming-only, named or not
+    server = _server(_declared("waypoint"), "waypoint")
+    with pytest.raises(UnsupportedModalityError, match="video_frame requires streaming=True"):
+        server.submit_request(
+            file_paths={"image": ["/uploads/seed.png"]}, input_modalities=["image"],
+            output_modalities=[], streaming=False,
+        )
+    assert server.pending_requests == {}
+
+
 # ── front ends ──────────────────────────────────────────────────────────────
 
 
@@ -552,3 +664,118 @@ def test_rust_bridge_relays_a_refusal_in_band_with_its_status():
     )
     assert reply["data"].decode().startswith("bagel does not support 'audio' input")
     assert bridge._keys == {}
+
+
+# Models that don't read output_modalities, so main served a request naming none
+# (as text); each is served with its default here, not refused for text.
+SERVED_UNNAMED = [
+    # (registry name, the upload it takes or None, its inputs, its default)
+    ("orpheus", None, ["text"], ["audio"]),
+    ("pi05", ("frame.png", b"\x89PNG"), ["image", "text"], ["action"]),
+    ("vjepa2", ("clip.mp4", b"\x00\x00\x00\x18ftyp"), ["video", "text"], ["video"]),
+    ("vjepa2_ac", ("clip.mp4", b"\x00\x00\x00\x18ftyp"), ["video", "text"], ["video"]),
+]
+
+
+class _AnsweringDataWorker:
+    """Stands in for the data worker and the engine: finishes each request with
+    one chunk per output it asks for."""
+
+    def __init__(self):
+        self.server = None
+        self.received = []
+
+    def new_request(self, sent):
+        self.received.append(sent)
+        with self.server.request_lock:
+            req = self.server.pending_requests[sent.request_id]
+            req.chunks += [
+                ResultChunk(request_id=sent.client_request_id, modality=m, data=b"x", metadata={})
+                for m in sent.output_modalities
+            ]
+            req.event.set()
+        req.notify()
+
+
+def _answering(monkeypatch, tmp_path, name):
+    worker = _AnsweringDataWorker()
+    server = make_test_api_server(
+        model=_declared(name), model_name=name, upload_dir=tmp_path, preprocess_worker=worker,
+    )
+    worker.server = server
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    return server, worker
+
+
+@pytest.mark.parametrize("streaming", [True, False], ids=["stream", "aggregate"])
+@pytest.mark.parametrize("name,upload,in_mods,default", SERVED_UNNAMED)
+def test_generate_serves_a_request_naming_no_output(monkeypatch, tmp_path, name, upload, in_mods, default, streaming):
+    _, worker = _answering(monkeypatch, tmp_path, name)
+    response = TestClient(entrypoint.app).post(
+        "/generate", data={"text": "hi", "streaming": str(streaming).lower()},
+        files={"files": upload} if upload else None,
+    )
+    assert response.status_code == 200, response.text
+    (sent,) = worker.received
+    assert (sent.input_modalities, sent.output_modalities) == (in_mods, default)
+    if streaming:
+        assert [json.loads(line)["modality"] for line in response.text.splitlines()] == default
+    else:
+        assert list(response.json()["outputs"]) == default
+
+
+@pytest.mark.parametrize("name,upload,in_mods,default", SERVED_UNNAMED)
+def test_generate_ws_serves_a_request_naming_no_output(monkeypatch, tmp_path, name, upload, in_mods, default):
+    _, worker = _answering(monkeypatch, tmp_path, name)
+    message = {"request_id": "r1", "text": "hi"}
+    if upload:
+        message["files"] = [{"name": upload[0], "data": base64.b64encode(upload[1]).decode()}]
+    replies = []
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps(message))
+        while not (replies and (replies[-1].get("finish") or "error" in replies[-1])):
+            replies.append(json.loads(ws.receive_text()))
+    assert "error" not in replies[-1], replies[-1]
+    assert [r["modality"] for r in replies[:-1]] == default
+    (sent,) = worker.received
+    assert (sent.input_modalities, sent.output_modalities) == (in_mods, default)
+
+
+def test_a_live_call_naming_no_output_opens_with_the_models_default(monkeypatch, tmp_path):
+    # NemotronDuplex refuses text alone in process_prompt, which such a call asked for
+    server = _live_server(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"request_id": "call"}))
+        for _ in range(500):
+            if server.preprocess_worker.items:
+                break
+            time.sleep(0.01)
+    (opening,) = server.preprocess_worker.items
+    assert (opening.input_modalities, opening.output_modalities) == ([], ["text", "audio"])
+    assert opening.ends == frozenset()  # still taking input
+
+
+@pytest.mark.parametrize("name,upload,in_mods,default", SERVED_UNNAMED)
+def test_rust_bridge_serves_a_request_naming_no_output(monkeypatch, tmp_path, name, upload, in_mods, default):
+    # mstar-server's /generate sends an empty list when the form names no output
+    server, worker = _answering(monkeypatch, tmp_path, name)
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.server, bridge._keys, sent = server, {}, []
+    bridge._send = sent.append
+    file_paths = {in_mods[0]: [f"/uploads/{upload[0]}"]} if upload else {}
+
+    async def submit():
+        bridge._submit({
+            "t": "submit", "rid": "r1", "sub": 1, "text": "hi", "file_paths": file_paths,
+            "input_modalities": in_mods, "output_modalities": [],
+        })
+        for _ in range(200):
+            if sent and sent[-1]["t"] in ("done", "err"):
+                return
+            await asyncio.sleep(0.01)
+
+    asyncio.run(submit())
+    assert [m["t"] for m in sent] == ["chunk"] * len(default) + ["done"], sent
+    assert [m["modality"] for m in sent[:-1]] == default
+    assert worker.received[0].output_modalities == default

@@ -374,6 +374,8 @@ class NemotronDuplexModel(Model):
     # text alongside when asked
     SUPPORTED_INPUT_MODALITIES = frozenset({"audio", "text"})
     SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio", "text"})
+    # the graph emits both on every request; text alone is refused in process_prompt
+    DEFAULT_OUTPUT_MODALITIES = ("text", "audio")
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None,
                  max_session_s: float | None = None, max_prompt_tokens: int | None = None, **kwargs):

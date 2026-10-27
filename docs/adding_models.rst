@@ -203,7 +203,10 @@ checkpoints declares their union and narrows
 the instance in ``__init__``: Qwen3-TTS takes ``audio`` only on Base, Qwen3.5 takes
 attachments only with a vision tower, and Cosmos3 produces ``text`` only where the
 reasoner is served. ``test/modular/test_modality_validation.py`` fails for a
-registered model that leaves either set at the default.
+registered model that leaves either set at the default. A request that names no
+output gets ``DEFAULT_OUTPUT_MODALITIES``; left unset, that is the model's only
+output, else ``text``. A model with several outputs and no text output sets it
+(LTX-2.5 video and audio, V-JEPA 2-AC video); without one, such a request is a 400.
 
 .. note::
 
@@ -2339,7 +2342,7 @@ Checklist
          [ ] get_partition_forward_pass_args
          [ ] postprocess
          [ ] get_submodule
-         [ ] SUPPORTED_INPUT_MODALITIES / SUPPORTED_OUTPUT_MODALITIES
+         [ ] SUPPORTED_INPUT_MODALITIES / SUPPORTED_OUTPUT_MODALITIES (+ DEFAULT_OUTPUT_MODALITIES)
          [ ] (optional) get_request_resource_configs
          [ ] kv_labels, kv_layout from process_prompt (+ get_loop_caps) — with a paged KV pool
          [ ] (optional) keys on a KVLabel + checkpoint_path — cross-request prefix reuse

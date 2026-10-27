@@ -1158,6 +1158,8 @@ class VJepa2ACModel(VJepa2Model):
 
     # the MPC walk adds the best candidate's index and every candidate's cost
     SUPPORTED_OUTPUT_MODALITIES = frozenset({"video", "scalar", "tensor"})
+    # every walk emits video; mpc=True (a kwarg) picks the one that adds the others
+    DEFAULT_OUTPUT_MODALITIES = ("video",)
 
     def __init__(
         self,

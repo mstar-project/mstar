@@ -501,6 +501,33 @@ def test_generate_refuses_video_frame_with_a_400_before_submitting(stack, fields
     assert stub.submitted == []
 
 
+@pytest.mark.parametrize("urlencoded", [True, False], ids=["urlencoded", "multipart"])
+def test_generate_leaves_an_unnamed_output_to_the_backend(stack, urlencoded):
+    # submit_request fills in the model's default, as on the Python /generate
+    port, stub, _bridge, _proc = stack
+    status, _ = _generate(port, urlencoded, fields={"text": "hi", "streaming": "false"})
+    assert status == 200
+    assert stub.submitted[-1]["out"] == []
+
+
+def test_mock_generate_without_a_named_output_answers_in_text():
+    # no bridge, so no model to pick a default: the mock falls back to text
+    import base64
+    import subprocess
+
+    port = _free_port()
+    proc = subprocess.Popen([BINARY, "qwen3_omni", str(port)])
+    try:
+        assert _wait_healthy(port)
+        status, body = _generate(port, urlencoded=True, fields={"text": "hi", "streaming": "false"})
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+    assert status == 200
+    (chunk,) = json.loads(body)["outputs"]["text"]
+    assert base64.b64decode(chunk["data"]) == b"[mock] hi"
+
+
 def test_generate_accepts_both_content_types(stack):
     """The FastAPI /generate accepts multipart AND urlencoded form bodies
     (the latter is what `requests.post(data=...)` sends with no files); the

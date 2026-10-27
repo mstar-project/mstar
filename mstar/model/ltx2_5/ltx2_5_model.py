@@ -94,6 +94,8 @@ class LTX25Model(Model):
     # text-to-video, with or without its audio track
     SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
     SUPPORTED_OUTPUT_MODALITIES = frozenset({"video", "audio"})
+    # the joint walk, as _generate_walk_for picks with no outputs named
+    DEFAULT_OUTPUT_MODALITIES = ("video", "audio")
 
     def __init__(
         self,

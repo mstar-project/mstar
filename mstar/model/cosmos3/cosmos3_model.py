@@ -207,6 +207,8 @@ class Cosmos3Model(Model):
         self.config: Cosmos3Config = self._load_config()
         if not self._reasoner_enabled():
             self.SUPPORTED_OUTPUT_MODALITIES = self.SUPPORTED_OUTPUT_MODALITIES - {"text"}
+            # nothing answers in text, so a request naming no output gets an image
+            self.DEFAULT_OUTPUT_MODALITIES = ("image",)
         self.tokenizer = self._load_tokenizer()
         if self._windowed_serving_enabled() and not self.config.is_distilled:
             logger.warning(

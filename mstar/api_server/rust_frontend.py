@@ -166,7 +166,8 @@ class RustFrontendBridge:
                 text=msg.get("text"),
                 file_paths=msg.get("file_paths") or None,
                 input_modalities=list(msg.get("input_modalities") or []),
-                output_modalities=list(msg.get("output_modalities") or ["text"]),
+                # none named: submit_request picks the model's default
+                output_modalities=list(msg.get("output_modalities") or []),
                 model_kwargs=dict(msg.get("model_kwargs") or {}),
                 prompt_parts=[PromptPart(**p) for p in parts] if parts else None,
                 streaming=bool(msg.get("streaming", True)),

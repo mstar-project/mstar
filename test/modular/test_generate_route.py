@@ -8,16 +8,18 @@ from mstar.api_server.entrypoint import NDJSON_STREAM_MEDIA_TYPE
 
 
 class _RecordingServer:
-    """Stand-in for ``APIServer`` that records the ``streaming`` it was given."""
+    """Stand-in for ``APIServer`` that records the ``streaming`` and outputs it was given."""
 
     def __init__(self):
         self.streaming = None
+        self.output_modalities = None
 
     async def wait_for_request_id(self, request_id):
         pass
 
     def submit_request(self, **kwargs):
         self.streaming = kwargs["streaming"]
+        self.output_modalities = kwargs["output_modalities"]
         return "r"
 
     def async_stream_results(self, request_id, binary=False):
@@ -58,6 +60,15 @@ def test_generate_aggregates_when_streaming_is_false(monkeypatch, multipart):
     assert response.status_code == 200
     assert server.streaming is False
     assert response.json() == {"request_id": "r", "outputs": {}}
+
+
+@pytest.mark.parametrize("multipart", [False, True], ids=["urlencoded", "multipart"])
+def test_generate_leaves_an_unnamed_output_to_submit_request(monkeypatch, multipart):
+    # submit_request fills in the model's default (not a hard-coded "text")
+    server, response = _post_text(monkeypatch, multipart)
+    assert response.status_code == 200 and server.output_modalities == []
+    server, _ = _post_text(monkeypatch, multipart, output_modalities="audio, text")
+    assert server.output_modalities == ["audio", "text"]
 
 
 def test_generate_accepts_streaming_only_output_without_streaming_field(monkeypatch):

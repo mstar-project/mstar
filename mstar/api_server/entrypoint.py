@@ -641,11 +641,22 @@ class APIServer:
 
         A modality the loaded model does not take or produce, declared or
         uploaded, raises :class:`UnsupportedModalityError` before anything is
-        registered.
+        registered. A request that names no output gets the model's
+        :meth:`~mstar.model.base.Model.default_output_modalities`.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
         check_request_id(request_id)
+
+        if not output_modalities:
+            output_modalities = (
+                list(self.model.default_output_modalities()) if self.model is not None else ["text"]
+            )
+            if not output_modalities:
+                raise UnsupportedModalityError(
+                    f"{self.model_name} has no default output; name one of "
+                    f"{', '.join(sorted(self.model.SUPPORTED_OUTPUT_MODALITIES))} in output_modalities"
+                )
 
         # Uploads count too: the data worker loads every file_paths key
         arrived = list(dict.fromkeys([*input_modalities, *(file_paths or {})]))
@@ -1586,7 +1597,8 @@ class WarmupRequest:
 
     text: str | None = None
     files: list[WarmupMedia] = field(default_factory=list)
-    output_modalities: list[str] = field(default_factory=lambda: ["text"])
+    # empty: the model's default, as on /generate
+    output_modalities: list[str] = field(default_factory=list)
     model_kwargs: dict | None = None
 
     @classmethod
@@ -1604,7 +1616,7 @@ class WarmupRequest:
             raise ValueError(f"repeat must be a positive integer, got {repeat!r}")
         if repeat > 1 and not text:
             raise ValueError("repeat needs text")
-        out_mods = spec.get("output_modalities") or ["text"]
+        out_mods = spec.get("output_modalities") or []
         if isinstance(out_mods, str):
             out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
         files = spec.get("files") or []
@@ -1676,7 +1688,7 @@ def _run_warmup_requests(server: APIServer, specs: list) -> None:
             continue
         logger.info(
             "warmup request %d/%d (%s) done in %.1f s",
-            index + 1, len(specs), ",".join(request.output_modalities),
+            index + 1, len(specs), ",".join(request.output_modalities) or "default",
             time.perf_counter() - t0,
         )
 
@@ -1979,7 +1991,8 @@ async def generate_ws(websocket: WebSocket):
                 after.add_done_callback(lambda _: _pass_turn(turn))
 
         try:
-            out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
+            # none named: submit_request picks the model's default
+            out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or []
             text = message.get("text")
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")
@@ -2223,7 +2236,7 @@ async def generate(
     text: Optional[str] = Form(None),
     files: Optional[list[UploadFile]] = File(None),
     input_modalities: Optional[str] = Form(None),
-    output_modalities: str = Form("text"),
+    output_modalities: Optional[str] = Form(None),
     streaming: bool = Form(True),
     model_kwargs: Optional[str] = Form(None),
     request_id: Optional[str] = Form(None),
@@ -2236,8 +2249,8 @@ async def generate(
             each file is inferred from its extension.
         input_modalities: Comma-separated list of input modalities.  When
             omitted, modalities are auto-detected from the provided data.
-        output_modalities: Comma-separated list of desired output modalities
-            (default ``"text"``).
+        output_modalities: Comma-separated list of desired output modalities.
+            When omitted, the model's default (e.g. ``"audio"`` for a TTS model).
         streaming: If ``True``, return an NDJSON stream of result chunks.
         model_kwargs: Optional JSON string of model-specific parameters.
         request_id: Optional client-supplied request id. When omitted, the
@@ -2259,7 +2272,7 @@ async def generate(
     if "streaming" not in await request.form():
         streaming = True
 
-    out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
+    out_mods = [m.strip() for m in (output_modalities or "").split(",") if m.strip()]
     streaming_only = STREAMING_ONLY_MODALITIES.intersection(out_mods)
     if streaming_only and not streaming:
         names = ", ".join(sorted(streaming_only))

@@ -475,3 +475,14 @@ def test_an_append_is_not_held_up_by_another_message_waiting_its_turn(monkeypatc
     assert not any(r.get("error") for r in replies)
     assert log.index(("append", "early")) < log.index(("submit", "upload"))
     assert [e for e in log if e[1] == "late"] == [("submit", "late"), ("append", "late"), ("append", "late")]
+
+
+def test_a_message_naming_no_output_leaves_it_to_submit_request(monkeypatch, tmp_path):
+    # as on /generate: submit_request fills in the model's default
+    fake = _FakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "a drone over a coast", "request_id": "r1"}))
+        _recv_until_finish(ws, binary=False)
+    (sub,) = fake.submitted
+    assert sub["output_modalities"] == []

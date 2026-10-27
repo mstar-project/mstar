@@ -458,6 +458,20 @@ class Model(ABC):
     # so a model must narrow both (test_modality_validation.py checks)
     SUPPORTED_INPUT_MODALITIES: frozenset[str] = MODALITIES
     SUPPORTED_OUTPUT_MODALITIES: frozenset[str] = MODALITIES
+    # What a request that names no output gets. None: the model's only output,
+    # else text; a model with several outputs and no text output sets it
+    DEFAULT_OUTPUT_MODALITIES: tuple[str, ...] | None = None
+
+    def default_output_modalities(self) -> tuple[str, ...]:
+        """The outputs of a request that names none; empty when the model has
+        no default, and intake then refuses the request."""
+        if self.DEFAULT_OUTPUT_MODALITIES is not None:
+            return self.DEFAULT_OUTPUT_MODALITIES
+        if len(self.SUPPORTED_OUTPUT_MODALITIES) == 1:
+            return tuple(self.SUPPORTED_OUTPUT_MODALITIES)
+        if "text" in self.SUPPORTED_OUTPUT_MODALITIES:
+            return ("text",)
+        return ()
 
     def unsupported_modalities(
         self, input_modalities: list[str], output_modalities: list[str],
