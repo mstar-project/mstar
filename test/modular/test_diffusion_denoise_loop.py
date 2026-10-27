@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+import threading
 
 import pytest
 import torch
@@ -518,8 +519,6 @@ class PrefetchingToy(ToyDenoise):
         self.drawn_on: list[str] = []
 
     def seed_latents(self, fwd_info, bucket_key, generator):
-        import threading
-
         self.drawn_on.append(threading.current_thread().name)
         # a permuted view, as klein's packing returns
         return torch.randn(4, bucket_key[0], generator=generator).t()
@@ -529,7 +528,7 @@ def _added(sub, rid, **info):
     """``on_request_added`` as the engine calls it at ingest, with the first walk's info."""
     ingest = dataclasses.replace(_info(rid, 0, **info), graph_walk="encode_text")
     sub.on_request_added(_handle(rid), ingest)
-    return sub.request_state(_handle(rid))["seed_draw"][1]
+    return sub.request_state(_handle(rid))["seed_draw"].future
 
 
 def test_prefetched_seeds_are_drawn_off_the_calling_thread_and_match_an_inline_draw():
@@ -566,6 +565,54 @@ def test_removing_the_request_drops_its_draw():
     _added(sub, "p5").result()
     sub.cleanup_request(_handle("p5"))
     assert _handle("p5") not in sub.request_states
+
+
+class HeldPoolToy(PrefetchingToy):
+    """Draws for a "hold*" request wait for ``release``. Two of them take both of the
+    seed pool's threads, so a draw submitted after them stays queued."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.release = threading.Event()
+        self.drawn_for: list[str] = []
+
+    def seed_latents(self, fwd_info, bucket_key, generator):
+        if fwd_info.request_id.startswith("hold"):
+            assert self.release.wait(timeout=60)
+        self.drawn_for.append(fwd_info.request_id)
+        return super().seed_latents(fwd_info, bucket_key, generator)
+
+    def finish(self, holds):
+        self.release.set()
+        for hold in holds:
+            hold.result()
+        self._seed_pool.shutdown(wait=True)  # every queued draw has run or been skipped
+
+
+def test_removing_a_request_cancels_its_queued_draw():
+    sub = HeldPoolToy()
+    holds = [_added(sub, f"hold{i}") for i in range(2)]
+    try:
+        queued = _added(sub, "q0")
+        sub.cleanup_request(_handle("q0"))
+        assert queued.cancelled()
+    finally:
+        sub.finish(holds)
+    assert sorted(sub.drawn_for) == ["hold0", "hold1"], "the removed request's draw ran"
+
+
+def test_a_queued_draw_for_another_bucket_key_is_cancelled():
+    sub = HeldPoolToy()
+    holds = [_added(sub, f"hold{i}") for i in range(2)]
+    try:
+        queued = _added(sub, "q1", tokens=8)
+        got = sub.prepare_inputs(WALK, _info("q1", 0, tokens=16), _inputs())
+        assert queued.cancelled()
+    finally:
+        sub.finish(holds)
+    assert got.tensor_inputs[LATENTS].shape == (16, 4)
+    # drawn once, inline, for the key it runs at
+    assert sorted(sub.drawn_for) == ["hold0", "hold1", "q1"] and sub.drawn_on.count("MainThread") == 1
 
 
 def test_an_initial_loop_back_of_its_own_is_not_handed_the_draw():

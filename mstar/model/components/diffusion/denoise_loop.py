@@ -49,7 +49,7 @@ import copy
 import logging
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, NamedTuple
 
 import torch
@@ -79,6 +79,13 @@ class StepScalar(NamedTuple):
     # viewed as [B, 1, 1] to broadcast over [B, L, C]; a plain [B] otherwise
     broadcast: bool = True
     capture_fill: float = 1.0  # placeholder value for a graph capture's dummy rows
+
+
+class SeedDraw(NamedTuple):
+    """A request's seeds being drawn ahead under ``PREFETCH_SEEDS``."""
+
+    bucket_key: Hashable
+    future: Future
 
 
 class DenoiseLoopSubmodule(NodeSubmodule):
@@ -208,7 +215,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         if self._seed_pool is None:
             # a CPU randn is single-threaded and releases the GIL
             self._seed_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mstar-seed")
-        state.add("seed_draw", (bucket_key, self._seed_pool.submit(self._draw_seeds, info, bucket_key)))
+        state.add("seed_draw", SeedDraw(bucket_key, self._seed_pool.submit(self._draw_seeds, info, bucket_key)))
 
     def _draw_seeds(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable) -> dict[str, torch.Tensor]:
         """:meth:`seed_loop_back` as iteration 0 would draw it, made contiguous here so
@@ -221,13 +228,24 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """The ingest-time draw, once. None when there is none or it was drawn for
         another bucket key (a later stage's geometry), which then draws inline."""
         state = self.request_state(request_id)
-        entry = state.get("seed_draw")
-        if entry is None:
+        draw = state.get("seed_draw")
+        if draw is None:
             return None
         state.remove("seed_draw")
-        drawn_key, future = entry
+        if draw.bucket_key != bucket_key:
+            # not needed any more; still queued, it would delay the draws behind it
+            draw.future.cancel()
+            return None
         # usually done long before; waiting releases the GIL and syncs no device
-        return future.result() if drawn_key == bucket_key else None
+        return draw.future.result()
+
+    def cleanup_request(self, request_id: str) -> None:
+        state = self.request_states.get(request_id)
+        draw = state.get("seed_draw") if state is not None else None
+        if draw is not None:
+            # not needed any more; still queued, it would delay the draws behind it
+            draw.future.cancel()
+        super().cleanup_request(request_id)
 
     def request_inputs(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, bucket_key: Hashable,
