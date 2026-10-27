@@ -219,6 +219,7 @@ class _ChunkServer:
 
     enable_nvtx = False
     async_stream_results = entrypoint.APIServer.async_stream_results
+    open_result_stream = entrypoint.APIServer.open_result_stream
     _stream_ndjson = entrypoint.APIServer._stream_ndjson
     _stream_binary = entrypoint.APIServer._stream_binary
     _chunk_to_ndjson = entrypoint.APIServer._chunk_to_ndjson

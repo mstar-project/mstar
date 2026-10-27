@@ -27,7 +27,8 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
     for i in range(n):
         model_kwargs = dict(args.model_kwargs)
         if seed is not None and i > 0:
-            model_kwargs["seed"] = int(seed) + i
+            # the conductor's seed is an int64: wrap as speech chunks do, never overflow
+            model_kwargs["seed"] = (int(seed) + i) % 2**63
         request_id = rid("img")
         # Listed before submitting: submit_request registers the request
         # before handing it on, so a failed submit still holds an entry.

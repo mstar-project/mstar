@@ -49,6 +49,25 @@ _MODALITY_OF = {"images": "image", "audio": "audio", "video": "video"}
 MediaItem = "str | bytes | Path | tuple[str, bytes]"
 
 
+def _raise_for_status(resp) -> None:
+    """``raise_for_status`` with the server's message in the error: ``detail``
+    from ``/generate``, ``error.message`` from the OpenAI routes."""
+    if resp.ok:
+        return
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    message = None
+    if isinstance(body, dict):
+        message = body.get("detail")
+        if message is None and isinstance(body.get("error"), dict):
+            message = body["error"].get("message")
+    if message is None:
+        resp.raise_for_status()
+    raise requests.HTTPError(f"{resp.status_code} {resp.reason}: {message}", response=resp)
+
+
 def _load_nvtx():
     """Return CUDA NVTX hooks or ``None``, importing torch only on demand.
 
@@ -134,6 +153,12 @@ class MStarClient:
         Returns a :class:`GenerateResult` when ``stream=False``, or an iterator
         of :class:`StreamEvent` when ``stream=True``. Raw ``video_frame`` output
         is streaming-only and yields :class:`VideoFrameChunk` objects.
+
+        A request the server refuses (a bad knob, an unsupported parameter)
+        raises ``requests.HTTPError`` carrying the status and the server's
+        message, streaming or not; a streaming request raises it when the
+        iterator is first advanced. A failure after the stream has opened
+        raises ``RuntimeError`` from the iterator.
         """
         if "video_frame" in output_modalities and not stream:
             raise ValueError(
@@ -160,7 +185,7 @@ class MStarClient:
             return self._stream(url, data, files, output_modalities=output_modalities)
         resp = self._session.post(url, data=data, files=files or None, timeout=self.timeout,
                                   auth=self._auth)
-        resp.raise_for_status()
+        _raise_for_status(resp)
         return self._parse_result(resp.json())
 
     def stream(self, **kwargs) -> Iterator[StreamEvent]:
@@ -361,7 +386,7 @@ class MStarClient:
             headers=self._stream_headers(output_modalities),
             auth=self._auth,
         ) as resp:
-            resp.raise_for_status()
+            _raise_for_status(resp)
             # Branch on what the server actually sent, not on what was asked
             # for: that is what makes the negotiation safe against servers that
             # ignore ``Accept`` entirely.
