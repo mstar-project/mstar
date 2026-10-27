@@ -388,6 +388,11 @@ Qwen3-Omni notes
   default) at the same text throughput, with image throughput 3% lower in its
   one pair of runs. Spoken questions at c=32 keep one GPU too busy for either
   ramp (0.90 of chunks in time, 0.87 with the default).
+- On AMD GPUs the audio and vision encoders run eager. Compiled, they
+  recompiled for most new clip lengths and for each new image grid in a
+  three-grid sweep (dynamo guards the chunk lengths and the image grid the HF
+  code reads with ``.tolist()``), up to 9 s a request on an MI300X. Eager
+  costs about 13 ms an image and 8 ms a clip.
 
 Qwen3-TTS notes
 ---------------

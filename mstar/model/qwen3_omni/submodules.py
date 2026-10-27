@@ -62,6 +62,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,12 @@ class AudioEncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.audio_encoder = audio_encoder
         self.config = config
+        # Eager on AMD GPUs. Compiled, the HF encoder splits the clip by
+        # chunk_lengths.tolist(), so dynamo guards on those values and
+        # recompiles for most new clip lengths, 0.2-6 s each on an MI300X.
+        # Eager costs about 8 ms a clip there.
+        if current_platform.is_rocm():
+            self.disable_torch_compile = True
         # Older transformers take return_dict; newer ones dropped it.
         self._encoder_takes_return_dict = _accepts_kwarg(audio_encoder.forward, "return_dict")
 
@@ -193,6 +200,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.config = config
+        # Eager on AMD GPUs, like AudioEncoderSubmodule: compiled, each new
+        # image grid seen recompiled it (grid_thw.tolist() values are guarded),
+        # up to 9 s on an MI300X. Eager costs about 13 ms an image there.
+        if current_platform.is_rocm():
+            self.disable_torch_compile = True
 
     def prepare_inputs(
         self,
