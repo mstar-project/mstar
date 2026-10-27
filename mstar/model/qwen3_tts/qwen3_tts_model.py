@@ -390,6 +390,11 @@ class Qwen3TTSModel(Model):
     prompt processing, configuration, and output encoding.
     """
 
+    # TTS: text in, audio out. Base also takes the clip it clones; __init__
+    # drops audio for the other checkpoints
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "audio"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio"})
+
     def __init__(
         self,
         model_path_hf: str,
@@ -414,6 +419,8 @@ class Qwen3TTSModel(Model):
         # Rejects unknown ``tts_model_type`` values; every supported variant
         # is handled below through the config's capability properties.
         self.config = Qwen3TTSModelConfig.from_pretrained(self.local_dir)
+        if not self.config.supports_reference_audio:
+            self.SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.local_dir,

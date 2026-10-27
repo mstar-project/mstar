@@ -273,6 +273,10 @@ class BagelModel(Model):
     through interleaved text and image inputs.
     """
 
+    # ViT/VAE encoders in, decode or image_gen out; no audio, video or action
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text", "image"})
+
     _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(

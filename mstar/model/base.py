@@ -425,6 +425,13 @@ class ForwardPassArgs:
     stream_lead_items: dict[str, int] = field(default_factory=dict)
 
 
+# Every modality a request can name; each model narrows it per direction.
+# video_frame (raw RGB24 frames) is output-only and streaming-only
+MODALITIES: frozenset[str] = frozenset(
+    {"text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor"}
+)
+
+
 class Model(ABC):
     # Inputs consumed by process_prompt (tokenized or placed on tensor edges).
     # Retain them locally for postprocessing, but do not send the original
@@ -445,6 +452,21 @@ class Model(ABC):
     # default of one per core; ``preprocess_torch_threads`` in the model's
     # config.yaml overrides either. See ``entrypoint._set_preprocess_threads``.
     PREPROCESS_TORCH_THREADS: int | None = None
+
+    # The modalities intake accepts for this model, per direction; anything
+    # else is a 400 before the data worker runs. The base is every modality,
+    # so a model must narrow both (test_modality_validation.py checks)
+    SUPPORTED_INPUT_MODALITIES: frozenset[str] = MODALITIES
+    SUPPORTED_OUTPUT_MODALITIES: frozenset[str] = MODALITIES
+
+    def unsupported_modalities(
+        self, input_modalities: list[str], output_modalities: list[str],
+    ) -> list[tuple[str, str]]:
+        """The ``(modality, "input" | "output")`` pairs this model does not
+        take or produce; empty when it handles them all."""
+        bad = [(m, "input") for m in input_modalities if m not in self.SUPPORTED_INPUT_MODALITIES]
+        bad += [(m, "output") for m in output_modalities if m not in self.SUPPORTED_OUTPUT_MODALITIES]
+        return bad
 
     def _get_worker_graphs_for_graph_walk(
         self,

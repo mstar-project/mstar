@@ -145,6 +145,11 @@ class WhisperModel(Model):
     # long-form windows carry the transcript so far as <|startofprev|> context.
     LENGTH_KWARGS = ()
 
+    # one clip in, a transcript out; the transcription route's text part is
+    # unused (the decoder prompt comes from the language/task kwargs)
+    SUPPORTED_INPUT_MODALITIES = frozenset({"audio", "text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     # Requests the default decoder caches hold at once, each at full length.
     # A deployment retunes the page counts under ``resources:`` in its YAML.
     MAX_CONCURRENT_REQUESTS = 64

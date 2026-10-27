@@ -189,6 +189,22 @@ You must implement these abstract methods:
 
    See `Step 4 — Implement the submodules`_.
 
+You must also declare the modalities the model takes and produces, as the class
+attributes ``SUPPORTED_INPUT_MODALITIES`` and ``SUPPORTED_OUTPUT_MODALITIES``
+(``frozenset`` subsets of :data:`mstar.model.base.MODALITIES`). The API server
+refuses any other modality with a 400 before the request reaches the data worker,
+and it counts uploaded files (a live call's appended ones too) as well as the
+request's ``input_modalities``. Declare
+what the model's front ends send, not only what it reads: if a front end sends a text
+part the model ignores (the transcription route does for Whisper and Canary),
+``text`` belongs in the input set. Inputs that arrive in ``model_kwargs`` (actions,
+robot state, a camera path) are not modalities. A class that serves several
+checkpoints declares their union and narrows
+the instance in ``__init__``: Qwen3-TTS takes ``audio`` only on Base, Qwen3.5 takes
+attachments only with a vision tower, and Cosmos3 produces ``text`` only where the
+reasoner is served. ``test/modular/test_modality_validation.py`` fails for a
+registered model that leaves either set at the default.
+
 .. note::
 
    ``model_kwargs`` reaches your model from clients through the OpenAI routes'
@@ -2323,6 +2339,7 @@ Checklist
          [ ] get_partition_forward_pass_args
          [ ] postprocess
          [ ] get_submodule
+         [ ] SUPPORTED_INPUT_MODALITIES / SUPPORTED_OUTPUT_MODALITIES
          [ ] (optional) get_request_resource_configs
          [ ] kv_labels, kv_layout from process_prompt (+ get_loop_caps) — with a paged KV pool
          [ ] (optional) keys on a KVLabel + checkpoint_path — cross-request prefix reuse

@@ -370,6 +370,11 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class NemotronDuplexModel(Model):
     """NVIDIA NemotronLabs VoiceChat-11B (duplex S2S)."""
 
+    # user audio plus an optional system prompt in; the agent speaks, with its
+    # text alongside when asked
+    SUPPORTED_INPUT_MODALITIES = frozenset({"audio", "text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio", "text"})
+
     def __init__(self, model_path_hf: str, cache_dir: str | None = None,
                  max_session_s: float | None = None, max_prompt_tokens: int | None = None, **kwargs):
         self.model_path_hf = model_path_hf

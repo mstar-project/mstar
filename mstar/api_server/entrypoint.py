@@ -46,6 +46,7 @@ from mstar.api_server.request_types import (
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
+from mstar.model.base import MODALITIES
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -68,10 +69,20 @@ from mstar.utils.socket_prefix import per_port_socket_prefix
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({
-    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
-})
+SUPPORTED_MODALITIES = MODALITIES
 STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
+
+
+class UnsupportedModalityError(ValueError):
+    """A request names a modality the loaded model does not take or produce.
+    Raised at intake; every front end answers it with a 400."""
+
+    status_code = 400
+
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(detail)
+
 
 NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
 # Opt-in framing for raw binary payloads, requested via ``Accept``. Duplicated
@@ -627,20 +638,27 @@ class APIServer:
         in :meth:`stream_input`: one the model lacks is refused with a 400.
         ``process_prompt`` routes the opening's files, so a name is only
         checked.
+
+        A modality the loaded model does not take or produce, declared or
+        uploaded, raises :class:`UnsupportedModalityError` before anything is
+        registered.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
         check_request_id(request_id)
 
-        for m in input_modalities + output_modalities:
+        # Uploads count too: the data worker loads every file_paths key
+        arrived = list(dict.fromkeys([*input_modalities, *(file_paths or {})]))
+        for m in arrived + output_modalities:
             if m not in SUPPORTED_MODALITIES:
-                raise ValueError(f"Unsupported modality: {m!r}")
-        if "video_frame" in input_modalities:
-            raise ValueError("'video_frame' is an output-only modality")
+                raise UnsupportedModalityError(f"Unsupported modality: {m!r}")
+        if "video_frame" in arrived:
+            raise UnsupportedModalityError("'video_frame' is an output-only modality")
+        self._check_modalities(arrived, output_modalities)
         streaming_only = STREAMING_ONLY_MODALITIES.intersection(output_modalities)
         if streaming_only and not streaming:
             names = ", ".join(sorted(streaming_only))
-            raise ValueError(
+            raise UnsupportedModalityError(
                 f"Output modality {names} requires streaming=True; raw frame "
                 "chunks cannot be returned as an aggregated response."
             )
@@ -772,12 +790,15 @@ class APIServer:
         False, changing nothing, if the request is not taking input (unknown,
         finished, or every stream ended) or the append names a stream that has
         ended; raises ``ValueError`` for input past the call's budget
-        (``max_call_input_mb``) or a stream the model doesn't have.
+        (``max_call_input_mb``), a stream the model doesn't have, or a
+        modality it doesn't take (:class:`UnsupportedModalityError`).
         """
         named = self._check_streams(
             name for names in (file_streams or {}).values() for name in names if name is not None
         )
         ending = None if end_input is True else self._check_streams(end_input or ())
+        # the preprocess thread loads an append's files as it loads an opening's
+        self._check_modalities([*(["text"] if text else []), *(file_paths or {})], [])
         with self.request_lock:
             req = self.pending_requests.get(key)
             if req is None or not req.open_streams or req.event.is_set():
@@ -808,6 +829,20 @@ class APIServer:
                 f"this model takes {sorted(self.client_streams) or 'none'}"
             )
         return names
+
+    def _check_modalities(self, input_modalities: list[str], output_modalities: list[str]) -> None:
+        """Raise :class:`UnsupportedModalityError` for a modality the loaded
+        model does not take or produce."""
+        if self.model is None:
+            return
+        bad = self.model.unsupported_modalities(input_modalities, output_modalities)
+        if bad:
+            names = ", ".join(f"{m!r} {direction}" for m, direction in bad)
+            raise UnsupportedModalityError(
+                f"{self.model_name} does not support {names}; it takes "
+                f"{', '.join(sorted(self.model.SUPPORTED_INPUT_MODALITIES))} and produces "
+                f"{', '.join(sorted(self.model.SUPPORTED_OUTPUT_MODALITIES))}"
+            )
 
     def _check_call_input(self, size: int) -> None:
         if size > self.max_call_input_bytes:
@@ -2010,7 +2045,7 @@ async def generate_ws(websocket: WebSocket):
             if call is not None and not call.done():
                 call.set_result(None)
             release_turn()
-            if isinstance(exc, HTTPException):
+            if isinstance(exc, (HTTPException, UnsupportedModalityError)):
                 payload = {"request_id": request_id, "error": exc.detail, "status": exc.status_code}
                 if exc.status_code < 500:
                     logger.info(
@@ -2342,6 +2377,8 @@ async def generate(
 
     except HTTPException:
         raise
+    except UnsupportedModalityError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
     except Exception as e:
         text, _ = client_error_text(
             e, f"generate request {request_id} failed", log=logger, type_name=False,

@@ -70,6 +70,10 @@ _MP4_MAX_SIDE = 16384
 class Wan22Model(Model):
     """Wan2.2-TI2V-5B video generation model (TI2V-5B variant only)."""
 
+    # T2V and I2V: a prompt with an optional conditioning image, video out
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video"})
+
     ENCODE_TEXT_WALK = "encode_text"
     ENCODE_IMAGE_WALK = "encode_image"
     VIDEO_GEN_WALK = "video_gen"

@@ -165,6 +165,11 @@ class Qwen3_5DenseModel(Model):
     # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
 
+    # chat with image and video attachments, text out; __init__ drops the
+    # attachments on a text-only checkpoint
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image", "video"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
@@ -179,8 +184,10 @@ class Qwen3_5DenseModel(Model):
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
-        # vision_encoder node)
+        # vision_encoder node, and intake refuses attachments)
         self.vision_config = Qwen3_5VisionConfig.from_hf_or_none(self.local_dir)
+        if self.vision_config is None:
+            self.SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.local_dir,

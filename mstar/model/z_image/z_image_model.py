@@ -53,6 +53,10 @@ ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 
 
 class ZImageModel(Model):
+    # text-to-image only: the shared image adapter opens /v1/images/edits, which this refuses
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"image"})
+
     def __init__(
         self,
         model_path_hf: str = Z_IMAGE_TURBO,

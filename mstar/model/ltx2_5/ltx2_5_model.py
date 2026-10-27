@@ -91,6 +91,10 @@ ATTENTION_BACKENDS = ("flashinfer", "sdpa")
 class LTX25Model(Model):
     """LTX-2.5 (22B, distilled) joint audio-video generation."""
 
+    # text-to-video, with or without its audio track
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video", "audio"})
+
     def __init__(
         self,
         model_path_hf: str = LTX25_REPO,

@@ -67,6 +67,10 @@ class CanaryModel(Model):
     """Canary speech recognition / translation: FastConformer encoder +
     autoregressive Transformer decoder."""
 
+    # one clip in, a transcript out; the transcription route's text part is unused
+    SUPPORTED_INPUT_MODALITIES = frozenset({"audio", "text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     # the route's 40 s window, plus slack for containers that decode longer than
     # their header said; still the largest encoder graph and 4 context pages
     MAX_AUDIO_SECONDS = 40.96

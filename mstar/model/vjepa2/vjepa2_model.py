@@ -182,6 +182,12 @@ def _preprocess_video(
 class VJepa2Model(Model):
     """V-JEPA 2 model (encoder + optional predictor)."""
 
+    # a video in, predicted hidden states out (as "video"); actions and states
+    # come in model_kwargs. A text prompt is unused: benchmark/request.py sends
+    # one with the video
+    SUPPORTED_INPUT_MODALITIES = frozenset({"video", "text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video"})
+
     PREPROCESS_ONLY_KWARGS = (
         "actions", "states", "extrinsics", "context_mask", "target_mask", "goal_hidden",
     )
@@ -1149,6 +1155,9 @@ class VJepa2ACModel(VJepa2Model):
         "num_attention_heads": 22,
         "mlp_ratio": 48 / 11,
     }
+
+    # the MPC walk adds the best candidate's index and every candidate's cost
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video", "scalar", "tensor"})
 
     def __init__(
         self,

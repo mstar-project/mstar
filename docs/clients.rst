@@ -180,8 +180,8 @@ an append's record never open a request, and a message that opens a request unde
 call's id gets a 409 while the call goes on. An append carries its text, files and
 ``model_kwargs`` inside the record: beside it they are rejected. A ``null`` field counts as absent, inside
 the record too. Input resets the request timeout. A rejected append (an unknown file type,
-say) ends the call with its error (``status`` 400), and no finish follows, since the input
-it carried is lost. So does an append the server then fails to load or process (a corrupt
+or a modality the model doesn't take) ends the call with its error (``status`` 400), and no
+finish follows, since the input it carried is lost. So does an append the server then fails to load or process (a corrupt
 file, say), with that failure's status, as for a request's own files, and so does input
 past a limit the model or the deployment sets on how much a stream may carry over a call
 (``client_streams`` in :doc:`serving`), with a 400 that names the limit. An append after

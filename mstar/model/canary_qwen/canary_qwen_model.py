@@ -89,6 +89,11 @@ class CanaryQwenModel(Model):
     """Canary-Qwen speech recognition: FastConformer + projection feeding a
     LoRA-adapted Qwen3-1.7B."""
 
+    # one clip in, a transcript out; the transcription route's text part is
+    # unused (the instruction is a kwarg)
+    SUPPORTED_INPUT_MODALITIES = frozenset({"audio", "text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     # trained on clips of up to 40 s, the transcription route's window; the
     # slack covers containers that decode longer than their header said, and
     # stays inside the largest encoder graph (4096 mel frames, 512 audio tokens)

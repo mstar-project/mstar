@@ -113,6 +113,10 @@ LICENSE_NOTICE = (
 class FishS2ProModel(Model):
     """Fish Audio S2-Pro model contract (plain TTS and voice cloning)."""
 
+    # TTS: text plus an optional reference clip in, audio out
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "audio"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio"})
+
     # API tensors the AR prefill consumes; the clone prefill adds ``ref_codes``.
     PREFILL_INPUTS = ("prompt_ids",)
     REF_ENCODER_INPUTS = ("audio_inputs",)

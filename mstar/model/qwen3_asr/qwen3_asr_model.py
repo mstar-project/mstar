@@ -93,6 +93,10 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class Qwen3ASRModel(Model):
     """Qwen3-ASR: AuT encoder + dense Qwen3 decoder."""
 
+    # one clip in, a transcript out; a text part is the system-turn context
+    SUPPORTED_INPUT_MODALITIES = frozenset({"audio", "text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     # Where process_prompt put the audio placeholders, so prefill splices the
     # audio embeddings in by slice instead of finding them on the device.
     INTERNAL_KWARGS = ("audio_slot", "audio_tokens")

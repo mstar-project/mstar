@@ -55,6 +55,10 @@ _DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", 
 
 
 class LingBotWorldModel(Model):
+    # a prompt and a conditioning image in (the camera path is a kwarg), raw frames out
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video_frame"})
+
     def __init__(
         self,
         model_path_hf: str | None = None,

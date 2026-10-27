@@ -166,6 +166,12 @@ def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
+    # A prompt with optional image or video conditioning (actions come in
+    # model_kwargs); an image, a video with its sound band, actions, or text
+    # where the reasoner is served (__init__ drops it elsewhere)
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image", "video"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"image", "video", "audio", "action", "text"})
+
     PREPROCESS_ONLY_KWARGS = ("action",)
 
     PREFILL_WALK = constants.PREFILL_WALK
@@ -199,6 +205,8 @@ class Cosmos3Model(Model):
         # against whichever tokenizer is bound; see ``postprocess``).
         self._detokenizer = None
         self.config: Cosmos3Config = self._load_config()
+        if not self._reasoner_enabled():
+            self.SUPPORTED_OUTPUT_MODALITIES = self.SUPPORTED_OUTPUT_MODALITIES - {"text"}
         self.tokenizer = self._load_tokenizer()
         if self._windowed_serving_enabled() and not self.config.is_distilled:
             logger.warning(

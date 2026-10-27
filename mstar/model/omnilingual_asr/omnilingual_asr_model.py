@@ -72,6 +72,11 @@ class OmnilingualASRModel(Model):
       (320): padded audio per forward; a step over it runs as several forwards.
     """
 
+    # one clip in, a transcript out; a text prompt (the SDK's transcribe sends
+    # one) is unused
+    SUPPORTED_INPUT_MODALITIES = frozenset({"audio", "text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     def __init__(
         self,
         model_path_hf: str | None = None,

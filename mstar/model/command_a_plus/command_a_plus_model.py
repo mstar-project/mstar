@@ -37,6 +37,10 @@ VISION_WEIGHTS = ("model.vision_tower.", "model.multi_modal_projector.")
 
 
 class CommandAPlusModel(Model):
+    # chat with image attachments, text out
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None,
         max_seq_len: int | None = None, checkpoint_dir: str | None = None, **kwargs,

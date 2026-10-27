@@ -157,6 +157,11 @@ def image_span(grid_thw: torch.Tensor, merge_size: int) -> ImageSpan:
 class Qwen3OmniModel(Model):
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
 
+    # any of text, image, audio and video in; the Thinker emits text, and the
+    # Talker and Code2Wav add audio when it is asked for
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image", "audio", "video"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text", "audio"})
+
     LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
 
     _text_detokenizer: TextChunkDetokenizer | None = None
