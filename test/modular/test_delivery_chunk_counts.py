@@ -164,10 +164,7 @@ def api_server() -> PreprocessWorker:
 def deliver(worker: PreprocessWorker, chunk) -> None:
     """One chunk message as the API server's message loop hands it over."""
     if isinstance(chunk, ResultTokens):
-        for i, rid in enumerate(chunk.request_ids):
-            worker.new_result_token(
-                rid, chunk.values[i], chunk.loop_indices[i], chunk.signal, chunk.modality,
-            )
+        worker.new_result_tokens(chunk.request_ids, chunk.values, chunk.signal, chunk.modality)
     else:
         assert isinstance(chunk, ResultTensors)
         worker.new_result_tensors(chunk)

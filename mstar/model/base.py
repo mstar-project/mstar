@@ -800,10 +800,25 @@ class Model(ABC):
         override must not keep state across calls.
 
         Modality to expected encoding type:
-        - text: utf-8
+        - text: utf-8; a chunk may end inside a character, since the API
+          server joins a request's text chunks before decoding them
         - image: png
         """
         return output.cpu().numpy().tobytes()
+
+    def postprocess_inline(
+        self,
+        values: list[int],
+        modality: str,
+        request_kwargs: list[dict | None],
+    ) -> list[bytes]:
+        """``postprocess`` for one step's inline values (one per request) in
+        one call. The default builds a one-element tensor per value; a model
+        whose inline values are token ids can map them directly."""
+        return [
+            self.postprocess(torch.tensor([v], dtype=torch.int64), modality, request_kwargs=kw)
+            for v, kw in zip(values, request_kwargs, strict=True)
+        ]
 
     @abstractmethod
     def get_submodule(

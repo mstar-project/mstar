@@ -159,12 +159,12 @@ def _video_frame_metadata(
         "frame_count": frame_count,
     }
 @dataclass
-class InlineToken:
-    """One request's value out of a RESULT_TOKENS frame, queued behind the
-    tensor results so sequences keep arrival order."""
-    request_id: str
-    value: int
-    loop_indices: NestedLoopIndices | None
+class InlineTokens:
+    """One RESULT_TOKENS frame's values for the requests still known here,
+    queued behind the tensor results so each request's chunks keep arrival
+    order. One item per frame, not per request."""
+    request_ids: list[str]
+    values: list[int]
     modality: str
 
 
@@ -363,30 +363,28 @@ class PreprocessWorker:
         self.result_tensor_input_queue.put(input)
         self._signal()
 
-    def new_result_token(
-        self, request_id: str, value: int,
-        loop_indices: NestedLoopIndices | None, signal: str, modality: str,
-        wake: bool = True,
+    def new_result_tokens(
+        self, request_ids: list[str], values: list[int], signal: str, modality: str,
     ):
-        """A value that rode inline: same accounting as a result tensor, no
-        transport read and nothing to ack. ``wake=False`` queues without
-        ending the thread's idle wait: a frame's caller hands over every
-        request's value first and calls ``wake`` once."""
-        if request_id not in self.received_chunk_counts:
-            logger.debug("Late token for cleaned-up request %s dropped", request_id)
-            return
-        counts = self.received_chunk_counts[request_id]
-        counts[signal] = counts.get(signal, 0) + 1
-        self.per_request_reading_tensors[request_id] += 1
-        self.result_tensor_input_queue.put(
-            InlineToken(request_id, value, loop_indices, modality)
-        )
-        if wake:
+        """A frame's values that rode inline: the same accounting per request
+        as a result tensor, no transport read and nothing to ack. A request
+        already cleaned up is dropped."""
+        counts_by_rid = self.received_chunk_counts
+        reading = self.per_request_reading_tensors
+        kept_ids: list[str] = []
+        kept_values: list[int] = []
+        for rid, value in zip(request_ids, values, strict=True):
+            counts = counts_by_rid.get(rid)
+            if counts is None:
+                logger.debug("Late token for cleaned-up request %s dropped", rid)
+                continue
+            counts[signal] = counts.get(signal, 0) + 1
+            reading[rid] += 1
+            kept_ids.append(rid)
+            kept_values.append(value)
+        if kept_ids:
+            self.result_tensor_input_queue.put(InlineTokens(kept_ids, kept_values, modality))
             self._signal()
-
-    def wake(self):
-        """End the thread's idle wait after a batch of ``wake=False`` puts."""
-        self._signal()
 
     def discard_result_tensors(self, input: ResultTensors):
         """Ack and drop result tensors for an already-removed request.
@@ -1196,35 +1194,48 @@ class PreprocessWorkerThread:
             state.order[tensor_info.uuid] = (state.next_sequence, result.loop_indices)
             state.next_sequence += 1
 
-    def _emit_inline_token(self, item: InlineToken) -> None:
-        """Detokenize a value that arrived inline and queue its chunk."""
-        request_id = item.request_id
-        state = self.request_output_state.setdefault(
-            request_id, RequestOutputState()
-        )
-        sequence = state.next_sequence
-        state.next_sequence += 1
+    def _emit_inline_tokens(self, item: InlineTokens) -> None:
+        """Postprocess a frame's inline values in one model call and queue each
+        request's chunk, in arrival order with its tensor results."""
+        rids, values = item.request_ids, item.values
+        if self._draining_rids:
+            keep = [i for i, rid in enumerate(rids) if rid not in self._draining_rids]
+            rids = [rids[i] for i in keep]
+            values = [values[i] for i in keep]
+        kwargs = self.request_model_kwargs
         try:
-            tensor = torch.tensor([item.value], dtype=torch.int64)
-            postprocessed = self.model.postprocess(
-                tensor, item.modality,
-                request_kwargs=self.request_model_kwargs.get(request_id),
+            datas = self.model.postprocess_inline(
+                values, item.modality, [kwargs.get(rid) for rid in rids],
             )
-            self._queue_completed_output(
-                request_id,
-                sequence,
-                ResultChunk(
-                    request_id=request_id,
-                    modality=item.modality,
-                    data=postprocessed,
-                    metadata={},
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001 — must reach the client
-            self._fail_request(
-                request_id, exc, f"{item.modality} output postprocessing",
-                sequence=sequence,
-            )
+        except Exception:  # noqa: BLE001 — retried row by row below
+            # so a failure fails only the request it belongs to
+            datas = None
+        states = self.request_output_state
+        for i, request_id in enumerate(rids):
+            state = states.get(request_id)
+            if state is None:
+                state = states[request_id] = RequestOutputState()
+            sequence = state.next_sequence
+            state.next_sequence += 1
+            try:
+                if datas is None:
+                    data = self.model.postprocess_inline(
+                        [values[i]], item.modality, [kwargs.get(request_id)],
+                    )[0]
+                else:
+                    data = datas[i]
+                self._queue_completed_output(
+                    request_id,
+                    sequence,
+                    ResultChunk(
+                        request_id=request_id, modality=item.modality, data=data, metadata={},
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — must reach the client
+                self._fail_request(
+                    request_id, exc, f"{item.modality} output postprocessing",
+                    sequence=sequence,
+                )
 
     def _queue_completed_output(
         self,
@@ -1656,11 +1667,10 @@ class PreprocessWorkerThread:
                 while not self.result_tensor_queue.empty():
                     did_work = True
                     result = self.result_tensor_queue.get()
-                    if isinstance(result, InlineToken):
+                    if isinstance(result, InlineTokens):
                         # Nothing to read or ack: postprocess in place, in
                         # arrival order with the tensor results.
-                        if result.request_id not in self._draining_rids:
-                            self._emit_inline_token(result)
+                        self._emit_inline_tokens(result)
                         continue
                     # Draining for teardown: don't start new reads — ack the
                     # tensors back so the producing worker can free its buffers.

@@ -605,10 +605,29 @@ class Qwen3_5DenseModel(Model):
         ) -> bytes:
             if modality == "text":
                 ids = drop_stop_tokens(output, self.config.stop_token_ids, request_kwargs)
-                if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
-                    self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
-                return self._text_detokenizer.to_bytes(ids)
+                return self._detokenizer().to_bytes(ids)
             raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
+
+    def postprocess_inline(
+        self,
+        values: list[int],
+        modality: str,
+        request_kwargs: list[dict | None],
+    ) -> list[bytes]:
+        # `postprocess` per value, without a tensor per value
+        if modality != "text":
+            raise ValueError(f"Unsupported modality for Qwen 3.5: {modality!r}")
+        stop = self.config.stop_token_ids
+        detokenizer = self._detokenizer()
+        return [
+            b"" if v in stop and not (kw or {}).get("ignore_eos") else detokenizer.to_bytes([v])
+            for v, kw in zip(values, request_kwargs, strict=True)
+        ]
+
+    def _detokenizer(self) -> TextChunkDetokenizer:
+        if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
+            self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
+        return self._text_detokenizer
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass args

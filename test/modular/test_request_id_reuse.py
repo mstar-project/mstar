@@ -37,6 +37,7 @@ from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
 from mstar.api_server.entrypoint import request_id_in_use
 from mstar.api_server.request_types import APIServerMessage, RequestFailed, ResultChunk
+from mstar.model.base import Model
 from mstar.streaming.topology import PartitionTopology
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -56,6 +57,9 @@ class _Model:
 
     def process_prompt(self, *args, **kwargs):
         return None
+
+    # the inline path's per-value default, over the stub's postprocess
+    postprocess_inline = Model.postprocess_inline
 
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
@@ -178,7 +182,7 @@ class _Rig:
     def output(self, request_id, value=7):
         """A worker's output for ``request_id``, as the message thread hands it
         over; returns the chunk the data worker emits, or None."""
-        self.data_worker.new_result_token(request_id, value, None, "text_inputs", "text")
+        self.data_worker.new_result_tokens([request_id], [value], "text_inputs", "text")
         try:
             return self.worker.out_queue.get(timeout=2)
         except queue.Empty:
@@ -274,7 +278,7 @@ def test_the_older_request_s_remove_does_not_unlink_the_reuse_s_inputs(rig):
 def _received(rig, key):
     """A worker's chunk for ``key`` as the message thread hands it over; returns
     the chunks the API server reads back from the data worker."""
-    rig.data_worker.new_result_token(key, 7, None, "text_inputs", "text")
+    rig.data_worker.new_result_tokens([key], [7], "text_inputs", "text")
     rig.settle()
     return rig.data_worker.get_result_chunks()
 
