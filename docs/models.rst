@@ -164,6 +164,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Overworld/Waypoint-1.5-1B``
      - Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
        frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.
+       A request carries a seed image and ``model_kwargs.actions`` (1 to ``max_frames``,
+       512 latent frames, controller dicts); it generates one frame per action. A live
+       ``/generate/ws`` call (opened with ``end_input: false``) appends more as
+       ``{"append": {"model_kwargs": {"actions": [...]}}}`` and plays until it ends its
+       input, or for at most ``max_frames`` actions in all.
    * - ``lingbot_world_1_3b``
      - ``robbyant/lingbot-world-v2-1.3b-causal-fast``
      - LingBot-World-V2 1.3B causal-fast: camera-controlled image-to-world video, streamed
