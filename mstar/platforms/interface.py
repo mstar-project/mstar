@@ -83,7 +83,8 @@ class CudaPlatform(Platform):
         return torch.cuda.get_device_capability(device)
 
     def process_env_defaults(self) -> dict[str, str]:
-        return blackwell_ptxas_env()
+        # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
+        return {"NCCL_GRAPH_REGISTER": "0", **blackwell_ptxas_env()}
 
 
 class RocmPlatform(Platform):
