@@ -190,6 +190,9 @@ FROZEN_CPU_CORE = (
 )
 RETIRED = {
     "test/modular/test_cpu_core_list.py": "checked test/cpu-core.txt and was deleted with it",
+    "test/modular/test_diffusion_noise_stager.py": (
+        "NoiseStager was removed for mstar.utils.h2d.to_device_nonblocking (test_h2d_nonblocking.py)"
+    ),
 }
 
 

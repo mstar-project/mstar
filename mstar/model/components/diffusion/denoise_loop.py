@@ -59,20 +59,10 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
-from mstar.model.components.diffusion.noise import NoiseStager
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.utils.device import DeviceCapability
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
-
-
-def _queue_to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """``tensor`` on ``device`` without a host sync. A blocking copy synchronizes the
-    stream, so on the GPU thread it waits out the step still running there; one
-    from pinned memory is only queued behind it."""
-    if tensor.device == device or not DeviceCapability.of(device).is_accelerator:
-        return tensor.to(device)
-    return tensor.pin_memory().to(device, non_blocking=True)
 
 
 class StepScalar(NamedTuple):
@@ -156,9 +146,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self._layouts: dict[Hashable, Any] = {}
         self._uncaptured_layouts: OrderedDict[Hashable, Any] = OrderedDict()
         self.max_uncaptured_layouts = int(max_uncaptured_layouts)
-        # Pinned staging rings for the seeded noise, one per dtype, built on first
-        # use (a stager allocates nothing until it stages something).
-        self._noise_stagers: dict[torch.dtype, NoiseStager] = {}
         # Draws seeds ahead under PREFETCH_SEEDS; built on first use.
         self._seed_pool: ThreadPoolExecutor | None = None
         # One callable per attention label for the life of a binding; see
@@ -183,29 +170,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     ) -> torch.Tensor:
         """Initial noise for one request, ``[L, C]`` on the CPU generator's device."""
         raise NotImplementedError
-
-    def noise_stager(self, dtype: torch.dtype) -> NoiseStager:
-        """This node's pinned staging ring for ``dtype``, built on first use.
-
-        A benign race between the plan and GPU threads can build two and keep one;
-        a stager holds no buffers until it stages something, so that costs nothing.
-        """
-        stager = self._noise_stagers.get(dtype)
-        if stager is None:
-            stager = self._noise_stagers[dtype] = NoiseStager(dtype)
-        return stager
-
-    def stage_seed(self, tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """Seed tensor on ``device``, copied from pinned memory without stalling.
-
-        ``tensor.to(device)`` would copy from pageable host memory, which blocks the
-        calling thread until it retires -- and this runs on the GPU thread, where
-        that stalls the pre-plan and the overlap with the previous step's
-        postprocess. See :mod:`mstar.model.components.diffusion.noise`.
-        """
-        if tensor.device == device:
-            return tensor
-        return self.noise_stager(tensor.dtype).to_device(tensor, device)
 
     def seed_loop_back(
         self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, generator: torch.Generator,
@@ -418,7 +382,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                     f"entries for {schedule.num_steps} steps, but "
                     f"{scalar.source} has {tensor.shape[0]}."
                 )
-            staged.setdefault(scalar.source, _queue_to_device(tensor, device))
+            staged.setdefault(scalar.source, to_device_nonblocking(tensor, device))
         return staged
 
     def _carried_inputs(
@@ -432,7 +396,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         if k == 0:
             generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
             seeds = self.initial_loop_back(fwd_info, inputs, bucket_key, generator)
-            return {name: self.stage_seed(tensor, device) for name, tensor in seeds.items()}
+            return {name: to_device_nonblocking(tensor, device) for name, tensor in seeds.items()}
         missing = [name for name in self.loop_back_names if not inputs.get(name)]
         if missing:
             raise RuntimeError(

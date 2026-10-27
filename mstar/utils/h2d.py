@@ -6,6 +6,9 @@ the graph; H2D copies and event waits do not. So host values go to the device
 in ONE copy from pinned memory (``PinnedStager``), padding written on the host,
 never via a device-side staging tensor. An ``H2DMirror`` skips re-copying
 values a destination already holds, as in a steady decode batch.
+
+``to_device_nonblocking`` is for a host tensor that needs a fresh device copy
+(a request's schedule or seed noise) rather than a fixed destination.
 """
 from __future__ import annotations
 
@@ -139,10 +142,22 @@ class PinnedStager:
 
 
 def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
-    """``tensor`` on ``device`` without the host waiting: a CPU source goes
-    through pinned memory, so the copy queues behind the work already on the
-    stream instead of draining it first (a pageable copy blocks until then)."""
+    """``tensor`` on ``device`` without blocking the host.
+
+    A copy from pageable memory waits for everything already queued on the
+    stream. This one copies ``tensor`` into a pinned buffer from torch's caching
+    host allocator and queues a non-blocking copy from there. The allocator
+    doesn't hand that buffer out again until the stream has run the copy, so
+    nothing here waits and ``tensor`` can change as soon as this returns. Like
+    any async copy, the result is ordered on the current stream.
+    """
     device = torch.device(device)
-    if device.type != "cuda" or tensor.device.type != "cpu":
+    if tensor.device.type != "cpu" or not DeviceCapability.of(device).pin_memory:
         return tensor.to(device)
-    return tensor.pin_memory().to(device, non_blocking=True)
+    src = tensor.contiguous()
+    pinned = torch.empty(src.shape, dtype=src.dtype, pin_memory=True)
+    if src.numel():
+        # One memcpy on the calling thread: copy_ would split it over torch's
+        # intra-op pool, where a descheduled thread holds up the caller.
+        pinned.view(-1).view(torch.uint8).numpy()[:] = src.view(-1).view(torch.uint8).numpy()
+    return pinned.to(device, non_blocking=True)
