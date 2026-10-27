@@ -372,9 +372,8 @@ def test_a_tensor_freed_with_the_gil_released_is_gone_on_return(tmp_path):
     step = rt.begin_postprocess(PostprocessRequest(
         partition="default", node_name="LLM", graph_walk="decode", output_signals=["tok"],
         wg_ids=ParallelList([rid], [0]), row_rids=[rid], inline=InlineColumn("tok", column),
+        stops={},  # checked by the worker: no row stops
     ))
-    assert step.need is PostprocessNeed.STOPS  # no declared policies: check_stop decides
-    step = rt.resume_postprocess(stops={})
     assert step.need is PostprocessNeed.DONE, "nothing left for Python to tear down"
     assert ref() is None
     assert store.stored_counts() == (0, 0)
