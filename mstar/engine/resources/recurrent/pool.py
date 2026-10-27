@@ -16,7 +16,6 @@ import torch
 
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.recurrent.config import (
-    RecurrentBlockConfig,
     RecurrentStateConfig,
     RecurrentStateSpec,
     RecurrentStep,
@@ -96,7 +95,7 @@ class RecurrentStatePool(Resource):
         self._blocks: dict[str, torch.Tensor] = {
             name: torch.zeros(
                 (config.num_layers, config.max_slots, *block.shape),
-                dtype=self.block_dtype(block, kv_dtype),
+                dtype=block.resolved_dtype(kv_dtype),
                 device=device,
             )
             for name, block in config.blocks.items()
@@ -145,12 +144,6 @@ class RecurrentStatePool(Resource):
         )
 
     # Storage access
-
-    @staticmethod
-    def block_dtype(block: RecurrentBlockConfig, kv_dtype: torch.dtype | None) -> torch.dtype:
-        """The dtype the pool stores ``block`` in; a resource planned against
-        the pool reads it here rather than from the shared config."""
-        return block.dtype or kv_dtype or torch.get_default_dtype()
 
     def block(self, name: str, layer_idx: int) -> torch.Tensor:
         """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""
