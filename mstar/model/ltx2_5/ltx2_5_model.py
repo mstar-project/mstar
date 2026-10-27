@@ -126,7 +126,6 @@ class LTX25Model(Model):
         compile_eager_rounding: bool = True,
         accelerator_graph: bool = True,
         capture_shapes: list[list[float]] | None = None,
-        capture_refine_shapes: list[list[float]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 4,
         vae_tile_min_pixels: int = 1280 * 720,
@@ -151,16 +150,11 @@ class LTX25Model(Model):
         self.capture_shapes = [
             (int(h), int(w), int(f), float(fps)) for h, w, f, fps in (capture_shapes or [[544, 960, 121, 24.0]])
         ]
-        # the two-stage recipe's stage 2, by final (height, width, num_frames, fps); its stage 1
-        # replays the single-stage capture of the half size
-        self.capture_refine_shapes = [
-            (int(h), int(w), int(f), float(fps)) for h, w, f, fps in (capture_refine_shapes or [])
-        ]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2])]
         self.max_batch_size = int(max_batch_size)
         self.vae_tile_min_pixels = int(vae_tile_min_pixels)
         # compile the video VAE decode, warmed at load for vae_compile_shapes (by default the
-        # capture and refine shapes); ~55 dB from the eager decode, so off for bit-exact output
+        # capture shapes); ~55 dB from the eager decode, so off for bit-exact output
         self.vae_compile = bool(vae_compile)
         # separate from the DiT's captures: the decoder may sit on a rank with room to warm a
         # shape the DiT's ranks leave uncaptured
@@ -538,16 +532,14 @@ class LTX25Model(Model):
         def shape(h, w, f, fps):
             return shape_from_metadata(self.config, {"height": h, "width": w, "num_frames": f, "fps": fps})
 
-        return [(GENERATE_AV_WALK, shape(*s)) for s in self.capture_shapes] + [
-            (REFINE_AV_WALK, shape(*s)) for s in self.capture_refine_shapes
-        ]
+        return [(GENERATE_AV_WALK, shape(*s)) for s in self.capture_shapes]
 
     def _decode_shapes(self) -> list[LTXShape]:
         """The video shapes the compiled decoder is warmed for: ``vae_compile_shapes``, or by
-        default the single-stage captures and the refine walk's final size."""
+        default the capture shapes."""
         shapes = self.vae_compile_shapes
         if shapes is None:
-            shapes = self.capture_shapes + self.capture_refine_shapes
+            shapes = self.capture_shapes
         return [
             shape_from_metadata(self.config, {"height": h, "width": w, "num_frames": f, "fps": fps})
             for h, w, f, fps in dict.fromkeys(shapes)
@@ -589,10 +581,10 @@ class LTX25Model(Model):
                 compile_transformer=self.compile_transformer, compile_eager_rounding=self.compile_eager_rounding,
                 max_batch_size=self.max_batch_size, capture_buckets=self.capture_buckets(),
                 capture_batch_sizes=self.capture_batch_sizes,
-                # one capture serves every generate walk: the dit's step is the same in each
+                # one capture serves every walk: the dit's step is the same in each, and the
+                # refine walks read their extra inputs only when seeding
                 replay_walks={
-                    GENERATE_AV_WALK: [GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK, STAGE1_WALK],
-                    REFINE_AV_WALK: [REFINE_VIDEO_WALK, REFINE_AUDIO_WALK],
+                    GENERATE_AV_WALK: [GENERATE_VIDEO_WALK, GENERATE_AUDIO_WALK, STAGE1_WALK, *REFINE_WALKS.values()],
                 },
                 sp_group=sp_group,
             )

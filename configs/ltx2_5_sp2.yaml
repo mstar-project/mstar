@@ -11,9 +11,8 @@ model_kwargs:
   max_batch_size: 4
   # the video VAE decode compiled, ~55 dB from the eager decode; false for bit-exact output
   vae_compile: true
+  # the two-stage recipe's 1088x1920 stage 2 runs uncaptured (compiled eager)
   capture_shapes: [[544, 960, 121, 24]]
-  # the two-stage recipe's stage 2 runs uncaptured (compiled eager)
-  capture_refine_shapes: []
   # the decoder warms its own shapes, the two-stage 1088x1920 decode included
   vae_compile_shapes: [[544, 960, 121, 24], [1088, 1920, 121, 24]]
   capture_batch_sizes: [1, 2]

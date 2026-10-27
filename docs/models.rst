@@ -1250,12 +1250,12 @@ two-stage 1088x1920x121, one request    21.6 s            11.0 s            11.3
 two-stage, 2 concurrent                 2.8 videos/min    5.9 videos/min    6.1 videos/min
 ======================================  ================  ================  ================
 
-The DiT is compiled and its denoise step captured per shape (``capture_shapes``,
-``capture_refine_shapes``); other shapes run the compiled eager path, and the first
+The DiT is compiled and its denoise step captured per shape (``capture_shapes``, which
+the two-stage recipe's stages replay too); other shapes run the compiled eager path, and the first
 request of a new shape pays its compile. ``vae_compile`` (on in these configs) compiles the
 video VAE's decoder at load for ``vae_compile_shapes``, by default the same shapes (~55 dB
-from the eager decode; other shapes decode eager). The SP2 config captures no refine shape
-but lists 1088x1920 there, so its two-stage decode runs compiled too.
+from the eager decode; other shapes decode eager). The SP2 config doesn't capture 1088x1920
+but lists it there, so its two-stage decode runs compiled too.
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------

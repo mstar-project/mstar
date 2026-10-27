@@ -472,14 +472,14 @@ def test_toy_dit_forward_shapes_and_row_independence():
 
 
 def test_vae_compile_shapes_are_independent_of_the_dit_captures():
-    """The decoder warms the capture and refine shapes by default, and vae_compile_shapes
-    alone when given (the SP2 config warms the 1088x1920 decode it never captures)."""
+    """The decoder warms the capture shapes by default, and vae_compile_shapes alone when
+    given (the SP2 config warms the 1088x1920 decode it never captures)."""
     def sizes(model):
         return [(s.height, s.width, s.frames) for s in model._decode_shapes()]
 
-    model = _make_model(capture_shapes=[[544, 960, 121, 24]], capture_refine_shapes=[[1088, 1920, 121, 24]])
+    model = _make_model(capture_shapes=[[544, 960, 121, 24], [1088, 1920, 121, 24]])
     assert sizes(model) == [(17, 30, 16), (34, 60, 16)]
-    model = _make_model(capture_shapes=[[544, 960, 121, 24]], capture_refine_shapes=[],
+    model = _make_model(capture_shapes=[[544, 960, 121, 24]],
                         vae_compile_shapes=[[544, 960, 121, 24], [1088, 1920, 121, 24]])
     assert model.capture_buckets() == [(GENERATE_AV_WALK, model._decode_shapes()[0])]
     assert sizes(model) == [(17, 30, 16), (34, 60, 16)]

@@ -9,13 +9,11 @@ max_seq_len: 1024
 model_kwargs:
   attention_backend: flashinfer
   max_batch_size: 4
-  # the video VAE decode compiled for the capture (and refine) shapes, ~55 dB from the eager
-  # decode; false for bit-exact output
+  # the video VAE decode compiled for the capture shapes, ~55 dB from the eager decode;
+  # false for bit-exact output
   vae_compile: true
-  # CUDA graphs for the single-stage default, and for the two-stage recipe's
-  # 1088x1920 stage 2 (its stage 1 replays the 544x960 capture)
-  capture_shapes: [[544, 960, 121, 24]]
-  capture_refine_shapes: [[1088, 1920, 121, 24]]
+  # CUDA graphs for 544x960 and 1088x1920; the two-stage recipe's stages replay them too
+  capture_shapes: [[544, 960, 121, 24], [1088, 1920, 121, 24]]
   capture_batch_sizes: [1, 2]
 
 node_groups:
