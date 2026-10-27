@@ -44,6 +44,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
@@ -723,19 +724,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         }
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
-        pos_ids = self.node_resources[THINKER_POS].pos_ids("main")
-        parts: list[torch.Tensor] = []
-        offset = 0
-        for inp in inputs:
-            if inp.custom_pos_ids is not None:
-                parts.append(inp.custom_pos_ids)
-            else:
-                assert pos_ids is not None, (
-                    "position resource has no plan for this step; `plan` must run before `preprocess`"
-                )
-                parts.append(pos_ids[offset:offset + inp.input_seq_len].float().unsqueeze(0).expand(3, -1))
-            offset += inp.input_seq_len
-        return torch.cat(parts, dim=1)
+        return mrope_position_ids(self.node_resources[THINKER_POS].pos_ids("main"), inputs)
 
     def _deepstack_inputs(
         self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
