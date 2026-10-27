@@ -1,8 +1,9 @@
 """Ulysses sequence parallelism on CPU processes over gloo.
 
 ``CommGroup.all_to_all`` against the layout it promises, on even and uneven
-splits, and ``ulysses_attention`` over sharded tokens against one rank attending
-the whole sequence (with fewer key/value heads than query heads too), for the
+splits, and of several tensors at once against one at a time; and
+``ulysses_attention`` over sharded tokens against one rank attending the whole
+sequence (with fewer key/value heads than query heads too), for the
 ``[S, H, D]`` and ``[B, S, H, D]`` layouts.
 """
 
@@ -99,3 +100,21 @@ def _attention(rank, world, total, batched, kv_heads):
                          ids=["2-even", "3-uneven", "2-gqa", "3-gqa"])
 def test_ulysses_attention_matches_one_rank(tmp_path, world, total, kv_heads, batched):
     _run(_attention, world, tmp_path / "store", total, batched, kv_heads)
+
+
+def _several_at_once(rank, world, total, batched):
+    group = _group(rank, world)
+    seq_dim, head_dim = _layout(batched)
+    sizes = sp_seq_split(total, world)
+    start = sum(sizes[:rank])
+    tensors = [_full(total, batched, seed, heads).narrow(seq_dim, start, sizes[rank])
+               for seed, heads in enumerate((HEADS, world, 2 * world))]
+    together = group.all_to_all(tensors, scatter_dim=head_dim, gather_dim=seq_dim, gather_sizes=sizes)
+    for got, x in zip(together, tensors, strict=True):
+        assert torch.equal(got, group.all_to_all(x, scatter_dim=head_dim, gather_dim=seq_dim, gather_sizes=sizes))
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["SHD", "BSHD"])
+@pytest.mark.parametrize("world,total", [(2, 6), (3, 11)], ids=["2-even", "3-uneven"])
+def test_all_to_all_of_several_tensors_matches_one_at_a_time(tmp_path, world, total, batched):
+    _run(_several_at_once, world, tmp_path / "store", total, batched)

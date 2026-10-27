@@ -1,4 +1,5 @@
 import socket
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -219,12 +220,12 @@ class CommGroup:
 
     def all_to_all(
         self,
-        input_: torch.Tensor,
+        input_: torch.Tensor | Sequence[torch.Tensor],
         scatter_dim: int,
         gather_dim: int,
         scatter_sizes: list[int] | None = None,
         gather_sizes: list[int] | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Redistribute ``input_`` across the group: split it into
         ``world_size`` pieces along ``scatter_dim`` (piece i goes to rank i)
         and concatenate the pieces received from every rank along
@@ -240,33 +241,68 @@ class CommGroup:
         group size); when ``None`` the respective dimension is split evenly
         (and ``scatter_dim`` must then be divisible by ``world_size``).
 
-        One ``all_to_all_single`` over a packed buffer, which replays from a
-        CUDA graph. The collective is hidden from torch.compile, so a compiled
-        caller breaks around this call; tracing it as a functional collective
-        instead gave an illegal memory access in Cosmos3's batched capture.
+        ``input_`` may be several tensors that differ only in the extent of
+        ``scatter_dim``, split evenly (q, k and v with their own head counts):
+        they go in one exchange and come back as a tuple. Each exchange is one
+        ``all_to_all_single`` over a buffer packed in a single copy, which
+        replays from a CUDA graph. The collective is hidden from torch.compile,
+        so a compiled caller breaks around this call; tracing it as a
+        functional collective instead gave an illegal memory access in
+        Cosmos3's batched capture.
         """
+        tensors = (input_,) if isinstance(input_, torch.Tensor) else tuple(input_)
         if self.world_size == 1:
-            return input_
+            return input_ if isinstance(input_, torch.Tensor) else tensors
         world_size = self.world_size
         # positive dims: unflatten below adds a dim, which would shift a negative one
-        scatter_dim %= input_.dim()
-        gather_dim %= input_.dim()
-        even_scatter = scatter_sizes is None or len(set(scatter_sizes)) == 1
-        even_gather = gather_sizes is None or len(set(gather_sizes)) == 1
-        if even_scatter and even_gather:
-            # [.., N, ..] -> [P, .., N/P, ..]: piece r goes to rank r, and the
-            # piece received from rank r has the same shape
-            send = input_.unflatten(scatter_dim, (world_size, -1))
-            send = send.movedim(scatter_dim, 0).contiguous()
+        scatter_dim %= tensors[0].dim()
+        gather_dim %= tensors[0].dim()
+        if scatter_sizes is not None and len(set(scatter_sizes)) > 1:
+            assert len(tensors) == 1, "all_to_all: several tensors need an even scatter"
+            out = self._all_to_all_uneven_scatter(tensors[0], scatter_dim, gather_dim, scatter_sizes, gather_sizes)
+            return out if isinstance(input_, torch.Tensor) else (out,)
+        # per tensor [.., N, ..] -> [P, .., N/P, ..]; rank r's block of the send buffer holds
+        # its piece of each tensor one after another, so each tensor unpacks contiguous
+        blocks = [x.unflatten(scatter_dim, (world_size, -1)).movedim(scatter_dim, 0) for x in tensors]
+        numels = [blk[0].numel() for blk in blocks]
+        send = blocks[0].new_empty(world_size, sum(numels))
+        for blk, piece in zip(blocks, send.split(numels, dim=1), strict=True):
+            piece.view(blk.shape).copy_(blk)
+        if gather_sizes is None or len(set(gather_sizes)) == 1:
+            # the block received from rank r has this rank's own block's layout
             recv = _all_to_all_single(self.device_group, send, torch.empty_like(send))
-            return recv.movedim(0, gather_dim).flatten(gather_dim, gather_dim + 1)
-        if scatter_sizes is None:
-            scatter_sizes = [input_.size(scatter_dim) // world_size] * world_size
+            outs = [
+                piece.view(blk.shape).movedim(0, gather_dim).flatten(gather_dim, gather_dim + 1)
+                for blk, piece in zip(blocks, recv.split(numels, dim=1), strict=True)
+            ]
+        else:
+            # rank r's block: each tensor's piece with the gathered dim at rank r's extent
+            shapes = [
+                [blk.shape[1:gather_dim + 1] + (n,) + blk.shape[gather_dim + 2:] for blk in blocks]
+                for n in gather_sizes
+            ]
+            rank_numels = [[int(torch.Size(shape).numel()) for shape in row] for row in shapes]
+            recv = _all_to_all_single(
+                self.device_group, send.flatten(), send.new_empty(sum(map(sum, rank_numels))),
+                [sum(row) for row in rank_numels], [sum(numels)] * world_size,
+            )
+            per_rank = [
+                [piece.view(shape) for piece, shape in zip(block.split(row), shape_row, strict=True)]
+                for block, row, shape_row in zip(recv.split([sum(row) for row in rank_numels]), rank_numels, shapes,
+                                                 strict=True)
+            ]
+            outs = [torch.cat([pieces[i] for pieces in per_rank], dim=gather_dim) for i in range(len(tensors))]
+        return outs[0] if isinstance(input_, torch.Tensor) else tuple(outs)
+
+    def _all_to_all_uneven_scatter(
+        self, input_: torch.Tensor, scatter_dim: int, gather_dim: int,
+        scatter_sizes: list[int], gather_sizes: list[int] | None,
+    ) -> torch.Tensor:
         chunks = input_.split(scatter_sizes, dim=scatter_dim)
         send = torch.cat([chunk.contiguous().flatten() for chunk in chunks])
         mine = list(chunks[self.rank].shape)
         if gather_sizes is None:
-            gather_sizes = [mine[gather_dim]] * world_size
+            gather_sizes = [mine[gather_dim]] * self.world_size
         shapes = [mine[:gather_dim] + [n] + mine[gather_dim + 1:] for n in gather_sizes]
         numels = [int(torch.Size(shape).numel()) for shape in shapes]
         recv = _all_to_all_single(
