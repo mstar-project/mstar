@@ -41,6 +41,10 @@ _MIB = 2**20
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a throwaway capture needs a GPU")
 
 
+# a node with no float32 setting of its own
+_NO_PRECISION = SimpleNamespace(fp32_precision=None)
+
+
 def _bucket(walk: str, bs: int, tokens: int) -> BucketKey:
     return BucketKey(graph_walk=walk, bs=bs, num_tokens=tokens)
 
@@ -209,7 +213,7 @@ def test_a_plan_that_leaves_a_graph_out_sizes_each_bucket_by_its_own_capture(
     runner = _StubMeasuredRunner(torch.device("cuda", 0), walk)
     runner._num_slots = 1
     engine = SimpleNamespace(
-        _device=torch.device("cuda", 0), _submodules={"Code2Wav": None}, _gpu_memory_fraction=None,
+        _device=torch.device("cuda", 0), _submodules={"Code2Wav": _NO_PRECISION}, _gpu_memory_fraction=None,
     )
 
     plan = Engine._plan_captures(engine, {"Code2Wav": runner}, {"Code2Wav": {}})
@@ -301,7 +305,9 @@ def test_a_sizing_step_that_fails_fails_the_boot(measured):
         raise RuntimeError("CUDA error: unknown error")
 
     runner._warmed = dead_context
-    engine = SimpleNamespace(_device=torch.device("cuda", 0), _submodules={"Thinker": None}, _gpu_memory_fraction=None)
+    engine = SimpleNamespace(
+        _device=torch.device("cuda", 0), _submodules={"Thinker": _NO_PRECISION}, _gpu_memory_fraction=None,
+    )
 
     with pytest.raises(RuntimeError, match="slot=0 eagerly to size its capture, with 51200 MiB free before it: CUDA"):
         Engine._plan_captures(engine, {"Thinker": runner}, {"Thinker": {}})
@@ -362,7 +368,9 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
     runner.prepare_for_capture = lambda: [
         CGSlotSpec(bucket=b, slot=s, config=config) for b in (wide, fits) for s in (0, 1)
     ]
-    engine = SimpleNamespace(_device=torch.device("cuda", 0), _submodules={"LLM": None}, _gpu_memory_fraction=None)
+    engine = SimpleNamespace(
+        _device=torch.device("cuda", 0), _submodules={"LLM": _NO_PRECISION}, _gpu_memory_fraction=None,
+    )
 
     plan = Engine._plan_captures(engine, {"LLM": runner}, {"LLM": {}})
 
@@ -600,7 +608,7 @@ def test_a_capped_worker_reuses_the_copies_only_within_its_cap(monkeypatch, frac
     costs = {bs: CaptureCost(2 * _GIB, _GIB, _GIB, 1, _GIB // 2, talker) for bs in range(8)}
     runner = SimpleNamespace(size_captures=lambda: costs, size_lent_captures=lambda wanted: costs)
     engine = SimpleNamespace(
-        _device=torch.device("cuda", 0), _submodules={"Talker": None}, _gpu_memory_fraction=fraction,
+        _device=torch.device("cuda", 0), _submodules={"Talker": _NO_PRECISION}, _gpu_memory_fraction=fraction,
     )
 
     plan = Engine._plan_captures(engine, {"Talker": runner}, {"Talker": {}})
@@ -836,7 +844,7 @@ def test_the_cap_bounds_the_plan(monkeypatch, fraction, reserved, planned):
     costs = {bs: CaptureCost(peak=2 * _GIB, graph=_GIB, kept=_GIB, slots=1) for bs in range(8)}
     talker = SimpleNamespace(size_captures=lambda: costs, size_lent_captures=lambda wanted: costs)
     engine = SimpleNamespace(
-        _device=torch.device("cuda", 0), _submodules={"Talker": None}, _gpu_memory_fraction=fraction,
+        _device=torch.device("cuda", 0), _submodules={"Talker": _NO_PRECISION}, _gpu_memory_fraction=fraction,
     )
 
     plan = Engine._plan_captures(engine, {"Talker": talker}, {"Talker": {}})

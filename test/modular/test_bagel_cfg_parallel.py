@@ -41,7 +41,7 @@ def test_offload_reset_preserves_remote_content_epoch():
 def _bare_model() -> BagelModel:
     model = BagelModel.__new__(BagelModel)
     model.config = SimpleNamespace(
-        num_timesteps=50,
+        num_timesteps=50, max_position_embeddings=32768,
         temperature=1.0,
         top_k=0,
         top_p=1.0,
@@ -92,7 +92,7 @@ def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     model._has_llm_disaggregation = True
     args = {
         "default": SimpleNamespace(
-            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True})
+            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True, "target_output": "image"})
         )
     }
 
@@ -582,10 +582,12 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
 
     healthy_page = manager._streams["healthy"]["main"].page_indices[0]
 
+    # the refusal reaches clients: an error id, the file error itself only in the log
     assert not broken.ok
-    assert "FileNotFoundError" in broken.reason.message
+    assert "internal error (error id" in broken.reason.message
+    assert "missing.pt" not in broken.reason.message
     assert not broken_again.ok
-    assert "FileNotFoundError" in broken_again.reason.message
+    assert broken_again.reason.message == broken.reason.message
     assert healthy.ok and healthy.ready
     torch.testing.assert_close(
         manager.kv_cache.tensor[:, healthy_page, :, :1],

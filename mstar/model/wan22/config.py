@@ -68,11 +68,22 @@ class Wan22Config:
     # Ceiling on the denoise loop; the per-request step count is clamped to it.
     max_denoise_steps: int = 100
 
+    # Ceiling on a request's height x width x num_frames (about 3.6x the default
+    # 1280x704x81 clip); DiT memory grows with it. A larger request is a 400.
+    max_video_pixels: int = 256 * 2**20
+
     # torch.compile the inner DiT region (patchify -> blocks -> head). The UniPC
     # solver stays eager — its CPU-resident sigma trips Inductor (see
     # Wan22DitSubmodule). Default ON in serving; the reference-equivalence gates
     # build with this False so the eager path stays the bit-exact reference.
     compile_dit: bool = True
+    # "WxHxF" request shapes (width x height x num_frames) the compiled DiT
+    # serves; None is the default shape (1280x704x81). Every other shape runs
+    # the transformer eager. The compile traces one graph per input shape and
+    # requests choose theirs, so an open set would let each new shape cost a
+    # compile on the shared worker. A listed shape compiles at most twice (CFG
+    # on and off).
+    compile_dit_sizes: tuple[str, ...] | None = None
 
     # VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably
     # exceeds the estimated untiled peak for the output size and tiles otherwise;
@@ -136,3 +147,31 @@ class Wan22Config:
             self.vae_scale_factor_spatial * self.patch_size[1],
             self.vae_scale_factor_spatial * self.patch_size[2],
         )
+
+    def compile_dit_grids(self) -> frozenset[tuple[int, int, int]]:
+        """``compile_dit_sizes`` as latent (frames, height, width) grids, the
+        trailing dims of the DiT's input."""
+        sizes = self.compile_dit_sizes
+        if sizes is None:
+            sizes = (f"{self.default_width}x{self.default_height}x{self.default_num_frames}",)
+        if isinstance(sizes, str) or not isinstance(sizes, (list, tuple)):
+            raise ValueError(f"Wan2.2 compile_dit_sizes must be a list of 'WxHxF' shapes, got {sizes!r}.")
+        align_h, align_w = self.spatial_alignment
+        temporal = self.vae_scale_factor_temporal
+        grids = set()
+        for size in sizes:
+            try:
+                width, height, frames = (int(v) for v in str(size).lower().split("x"))
+            except ValueError:
+                raise ValueError(f"Wan2.2 compile_dit_sizes entry must be 'WxHxF', got {size!r}.") from None
+            if min(width, height, frames) <= 0 or width % align_w or height % align_h or (frames - 1) % temporal:
+                raise ValueError(
+                    f"Wan2.2 compile_dit_sizes entry {size!r} must be positive multiples of "
+                    f"{align_w}x{align_h} with {temporal}k+1 frames."
+                )
+            grids.add((
+                (frames - 1) // temporal + 1,
+                height // self.vae_scale_factor_spatial,
+                width // self.vae_scale_factor_spatial,
+            ))
+        return frozenset(grids)

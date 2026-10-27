@@ -33,7 +33,7 @@ from mstar.model.nemotron_duplex.config import ConformerSTTConfig
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
-    from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
 # Pure numerical constants (not architecture dims / not in config.json).
 INF_VAL = 10000.0        # attention mask fill value (NeMo RelPos MHA)
@@ -513,8 +513,8 @@ class ConformerStreamer:
         return (self.has_steady_step and not final and chunk is not None and chunk.numel() == fs
                 and st.samples >= 2 * fs and st.samples % fs == 0)
 
-    def steady_step(self, chunk: torch.Tensor, front: "RecurrentStatePool", front_rows: "RecurrentAddressing",
-                    kv: "BoundedKVManager", pool: "RecurrentStatePool", rows: "RecurrentAddressing") -> torch.Tensor:
+    def steady_step(self, chunk: torch.Tensor, front: "RecurrentStatePool",
+                    kv: "BoundedKVManager", pool: "RecurrentStatePool") -> torch.Tensor:
         """One frame for each call, from ``chunk (B, frame_samples)``: the new
         mel frames, the subsampling window and the layers, all on the device.
         It is captured, so its STFT is a matmul: a graph must not hold a cuFFT
@@ -525,8 +525,8 @@ class ConformerStreamer:
         ``8k - 9 .. 8k - 2`` and encoder frame ``k - 1``, whose subsampling
         window is the 15 mel frames before them plus them (the third output)."""
         c, fs, f = self.c, self.frame_samples, self.c.subsampling_factor
-        last, sig = front.gather("last", front_rows), front.gather("sig", front_rows)
-        mel_tail = front.gather("mel", front_rows)
+        last, sig = front.gather("last"), front.gather("sig")
+        mel_tail = front.gather("mel")
         x = chunk.to(torch.float32)
         y = x - c.preemph * torch.cat([last, x[:, :-1]], dim=1)
         win = torch.cat([sig, y], dim=1)                                    # samples S - fs .. S + fs
@@ -535,13 +535,13 @@ class ConformerStreamer:
         mel_new = self._mel(win[:, fs - hop - pad: 2 * fs - 2 * hop + pad], by_matmul=True)
         window = torch.cat([mel_tail[:, 1:], mel_new], dim=1)               # (B, 23, n_mels)
         new = self._subsample(window)[:, 2:3]
-        front.scatter_("sig", front_rows, y)
-        front.scatter_("last", front_rows, x[:, -1:])
-        front.scatter_("mel", front_rows, torch.cat([mel_tail, mel_new], dim=1)[:, -2 * f:])
-        return self.layers(new, kv, pool, rows, chunk.new_ones(chunk.shape[0], dtype=torch.long))
+        front.scatter_("sig", y)
+        front.scatter_("last", x[:, -1:])
+        front.scatter_("mel", torch.cat([mel_tail, mel_new], dim=1)[:, -2 * f:])
+        return self.layers(new, kv, pool, chunk.new_ones(chunk.shape[0], dtype=torch.long))
 
     def front(self, sts: list[StreamState], chunks: list[torch.Tensor | None], final: list[bool], n: list[int],
-              front: "RecurrentStatePool", front_rows: "RecurrentAddressing") -> EncoderInputs | None:
+              front: "RecurrentStatePool") -> EncoderInputs | None:
         """Append each call's chunk; the ``n`` encoder-input frames it made final
         (``new_frames``, counted before the step), or None when no call has one.
         A call with no chunk and not at its end is left as it is."""
@@ -551,8 +551,8 @@ class ConformerStreamer:
                 if fin or (ch is not None and ch.numel())]
         if not busy:
             return None
-        last, sig = front.gather("last", front_rows), front.gather("sig", front_rows)
-        mel_tail = front.gather("mel", front_rows)
+        last, sig = front.gather("last"), front.gather("sig")
+        mel_tail = front.gather("mel")
         new_sig, new_last, new_mel = list(sig), list(last), list(mel_tail)
         rows, lo_hi, mel_rows = [], [], []
         for i in busy:
@@ -598,9 +598,9 @@ class ConformerStreamer:
             if n[i]:
                 start = max(0, f * st.frames - 2 * f)     # the subsampling window's first mel frame
                 mel_rows.append((i, mels[start - first:], (st.frames - start // f, n[i])))
-        front.scatter_("sig", front_rows, torch.stack(new_sig))
-        front.scatter_("last", front_rows, torch.stack(new_last))
-        front.scatter_("mel", front_rows, torch.stack(new_mel))
+        front.scatter_("sig", torch.stack(new_sig))
+        front.scatter_("last", torch.stack(new_last))
+        front.scatter_("mel", torch.stack(new_mel))
         if not mel_rows:
             return None
         lens = [w.shape[0] for _, w, _ in mel_rows]
@@ -667,10 +667,10 @@ class ConformerStreamer:
         return conv.pointwise_conv2(z).transpose(1, 2), tails
 
     def layers(self, x: torch.Tensor, kv: "BoundedKVManager", pool: "RecurrentStatePool",
-               rows: "RecurrentAddressing", n: torch.Tensor) -> torch.Tensor:
+               n: torch.Tensor) -> torch.Tensor:
         """The layer stack over ``x (B, t, D)`` and the projection. Attention
         runs on ``kv`` under the plan its step declared; the conv tails are read
-        and written in ``pool`` at ``rows``. ``n`` is each call's new frames,
+        and written in ``pool`` at its step's rows. ``n`` is each call's new frames,
         a device ``(B,)`` count (``n <= t``; a call with none keeps its conv
         tails as they were)."""
         b, t, _ = x.shape
@@ -679,12 +679,12 @@ class ConformerStreamer:
         conv_idx = (n.view(b, 1, 1) + torch.arange(keep, device=x.device).view(1, 1, keep)).expand(
             b, self.c.d_model, keep)
         for li, layer in enumerate(self.p.encoder.layers):
-            conv_cache = pool.gather("conv", rows, li)
+            conv_cache = pool.gather("conv", li)
             r = x + layer.FC_FACTOR * layer.feed_forward1(layer.norm_feed_forward1(x))
             r = r + self._attend(layer, li, layer.norm_self_att(r), kv)
             cv, tails = self._conv(layer, layer.norm_conv(r), conv_cache)
             r = r + cv
             r = r + layer.FC_FACTOR * layer.feed_forward2(layer.norm_feed_forward2(r))
             x = layer.norm_out(r)
-            pool.scatter_("conv", rows, tails.gather(2, conv_idx).to(conv_cache.dtype), li)
+            pool.scatter_("conv", tails.gather(2, conv_idx).to(conv_cache.dtype), li)
         return self.p.proj(x)

@@ -633,14 +633,12 @@ class ConformerEncoderSubmodule(NodeSubmodule):
 
     def _step_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         front, pool = call.resources[ENCODER_FRONT], call.resources[ENCODER_STATE]
-        return {"y": self.streamer.steady_step(call.static_inputs["chunk"], front, front.addressing("main"),
-                                               call.resources[ENCODER_KV], pool, pool.addressing("main"))}
+        return {"y": self.streamer.steady_step(call.static_inputs["chunk"], front, call.resources[ENCODER_KV], pool)}
 
     def _layers_region(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         pool = call.resources[ENCODER_STATE]
         s = call.static_inputs
-        return {"y": self.streamer.layers(s["x"], call.resources[ENCODER_KV], pool, pool.addressing("main"),
-                                          s["n"])}
+        return {"y": self.streamer.layers(s["x"], call.resources[ENCODER_KV], pool, s["n"])}
 
     def _stream_state(self, rid) -> StreamState:
         state = self.request_state(rid)
@@ -649,12 +647,6 @@ class ConformerEncoderSubmodule(NodeSubmodule):
             st = StreamState()
             state.add(self.STATE_KEY, st)
         return st
-
-    @staticmethod
-    def _pool(engine_inputs, key) -> tuple:
-        """A pool and the plan this step made for it, read when the eager path uses it."""
-        pool = engine_inputs.resources[key]
-        return pool, pool.addressing("main")
 
     @staticmethod
     def _to_device(chunks: list, device: torch.device) -> list:
@@ -714,7 +706,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         # a step of its own (see can_batch).
         enc = None
         if len(steady) < len(rids):
-            enc = streamer.front(states, chunks, final, eager_n, *self._pool(engine_inputs, ENCODER_FRONT))
+            enc = streamer.front(states, chunks, final, eager_n, engine_inputs.resources[ENCODER_FRONT])
         if enc is not None:
             new = [i for i, k in enumerate(enc.n) if k]
             if layers_graph(new):
@@ -725,7 +717,7 @@ class ConformerEncoderSubmodule(NodeSubmodule):
                 y = dict(zip(new, y, strict=True))
             else:
                 y = self._eager_layers(enc, engine_inputs.resources[ENCODER_KV],
-                                       *self._pool(engine_inputs, ENCODER_STATE), device)
+                                       engine_inputs.resources[ENCODER_STATE], device)
             streamer.advance(states, enc)
             for i in new:
                 frames[i] = y[i][: enc.n[i]]
@@ -748,9 +740,9 @@ class ConformerEncoderSubmodule(NodeSubmodule):
             check_stop_buffers={},
         )
 
-    def _eager_layers(self, enc, kv, pool, rows, device) -> list[torch.Tensor]:
+    def _eager_layers(self, enc, kv, pool, device) -> list[torch.Tensor]:
         """The layer stack eagerly over ``enc``, on this step's plans: each call's new frames."""
-        y = self.streamer.layers(enc.x, kv, pool, rows, device_counts(enc.n, device))
+        y = self.streamer.layers(enc.x, kv, pool, device_counts(enc.n, device))
         return [row[:n] for row, n in zip(y, enc.n, strict=True)]
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
@@ -984,7 +976,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             noise_scale=e.inference_noise_scale, top_p=e.inference_top_p, noise=noise,
         ).squeeze(1)                                                      # [N, Q]
         pool = engine_inputs.resources[CODEC_STATE]
-        audio = codec_step(self.codec, pool, pool.addressing("main"), codes.unsqueeze(1))
+        audio = codec_step(self.codec, pool, codes.unsqueeze(1))
         # One copy out of the graph per name, a row view per request. Nothing
         # for check_stop, the stream's end stops the loop.
         return BatchedModelOutput(row_outputs={
@@ -1025,9 +1017,9 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             outputs["audio_chunk"] = [pcm]
 
 
-def codec_step(codec: AudioCodec, pool, rows, codes: torch.Tensor) -> CodecStreamAudio:
+def codec_step(codec: AudioCodec, pool, codes: torch.Tensor) -> CodecStreamAudio:
     """Decode each row's next code frames ``[B, T, num_quantizers]`` against its
-    stream state in ``pool`` (``CODEC_STATE``, addressed by the step's ``rows``):
+    stream state in ``pool`` (``CODEC_STATE``, at the step's rows):
     gather the state, decode only the new frames, scatter the state back. A
     fresh slot is zeros, the decoder's causal padding, so a call's first frame
     needs nothing else. Fixed-shape, so a graph captures it."""
@@ -1035,14 +1027,14 @@ def codec_step(codec: AudioCodec, pool, rows, codes: torch.Tensor) -> CodecStrea
     stages = len(codec.config.channels)
     with torch.autocast(device_type=codes.device.type, enabled=False):
         state = CodecStreamState(
-            tails=[t for i in range(stages) for t in pool.gather(f"stage{i}", rows).unbind(1)],
-            overlap=pool.gather("overlap", rows),
+            tails=[t for i in range(stages) for t in pool.gather(f"stage{i}").unbind(1)],
+            overlap=pool.gather("overlap"),
         )
         audio, state = codec.decode_stream(codes, state)
         for i in range(stages):
             tails = torch.stack(state.tails[i * blocks:(i + 1) * blocks], dim=1)
-            pool.scatter_(f"stage{i}", rows, tails.to(pool.block(f"stage{i}", 0).dtype))
-        pool.scatter_("overlap", rows, state.overlap)
+            pool.scatter_(f"stage{i}", tails.to(pool.block(f"stage{i}", 0).dtype))
+        pool.scatter_("overlap", state.overlap)
     return audio
 
 

@@ -106,11 +106,6 @@ class BoundedKVConfig:
     def slot_tokens(self) -> int:
         return self.sink_capacity + self.window_capacity
 
-    @property
-    def slot_bytes(self) -> int:
-        per_token = self.rows_per_request * self.num_heads * 2 * self.head_dim
-        return self.num_layers * self.slot_tokens * per_token * torch.empty((), dtype=self.dtype).element_size()
-
 
 @dataclass
 class BoundedKVSpec(NodeResourceSpec):
@@ -124,6 +119,8 @@ class BoundedKVSpec(NodeResourceSpec):
 
     def apply_yaml_overrides(self, max_slots: int | None = None):
         if max_slots is not None:
+            if max_slots < 1:
+                raise ValueError(f"max_slots must be >= 1, got {max_slots}")
             self.config.max_slots = max_slots
 
 

@@ -243,6 +243,14 @@ class ZMQCommunicator(BaseCommunicator):
         return messages
 
 
+def requested_transport() -> str:
+    """``MSTAR_RUST_ZMQ`` as set, upper-cased: ``0``, ``1`` or ``AUTO``."""
+    choice = os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper()
+    if choice not in ("0", "1", "AUTO"):
+        raise ValueError(f"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got {choice!r}")
+    return choice
+
+
 def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCommunicator:
     """Construct the process's communicator, selecting the transport.
 
@@ -263,9 +271,7 @@ def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCo
     ``ZmqCommunicator.try_send`` falls back to pyzmq under ``AUTO`` and
     raises under ``1``. Every other caller keeps such a build.
     """
-    choice = os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper()
-    if choice not in ("0", "1", "AUTO"):
-        raise ValueError(f"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got {choice!r}")
+    choice = requested_transport()
     if choice != "0":
         try:
             import mstar_rust

@@ -13,7 +13,6 @@ CPU-only: nothing here launches a kernel.
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from mstar.engine.resources.base import EngineResourceInfo
@@ -146,68 +145,3 @@ def test_a_real_request_padding_and_release_across_the_rotation():
     assert pool.num_free_slots == 1
     pool.remove_request("r")
     assert pool.num_free_slots == 2
-
-
-def test_gather_scatter_follow_the_step_addressing():
-    """``gather`` / ``scatter_`` address the step's rows: a replay's padding rows
-    read and write the sink and nothing else, and a step planned over a subset
-    of the requests addresses the same slots as the full step."""
-    pool = build_pool(max_slots=6)
-    step = decode_step(["a", "b"])
-    eager = StepContext(request_ids=["a", "b"], graph_walk="decode", slot=0, capture=False)
-    pool.admit(step, eager)
-    rows = pool.plan(step, eager)["main"]
-    value = torch.arange(2 * 96 * 3, dtype=torch.float32).view(2, 96, 3)
-    pool.scatter_("conv", rows, value, layer_idx=1)
-    torch.testing.assert_close(pool.gather("conv", rows, layer_idx=1), value)
-    one = StepContext(request_ids=["b"], graph_walk="decode", slot=0, capture=False)
-    torch.testing.assert_close(pool.gather("conv", pool.plan(decode_step(["b"]), one)["main"], layer_idx=1), value[1:])
-    untouched = pool.block("conv", 0).clone()
-
-    padded = decode_step(["a", "b", "pad0", "pad1"])
-    ctx = padded_ctx(["a", "b"], ["a", "b", "pad0", "pad1"], bs=4)
-    pool.admit(padded, ctx)
-    rows = pool.plan(padded, ctx)["main"]
-    assert rows.num_rows == 4
-    got = pool.gather("conv", rows, layer_idx=1)
-    torch.testing.assert_close(got[:2], value)
-    pool.scatter_("conv", rows, torch.full((4, 96, 3), -1.0), layer_idx=1)
-    conv = pool.block("conv", 1)
-    live = {pool._slots[r]["main"].index for r in ("a", "b")}
-    assert all(bool((conv[i] == -1).all()) for i in live | {SINK_SLOT})
-    assert all(bool((conv[i] == 0).all()) for i in range(6) if i not in live | {SINK_SLOT})
-    torch.testing.assert_close(pool.block("conv", 0), untouched)
-
-
-def test_gather_scatter_refuse_padding_rows_on_a_pool_without_a_sink():
-    """Padding rows of a pool with no sink carry the sentinel, which no slot
-    holds: ``gather`` / ``scatter_`` say so rather than index with it (an
-    IndexError on CPU, a device-side assert on CUDA)."""
-    pool = build_pool(max_slots=4, disable_sink_slot=True)
-    names = [f"__cg_LLM_0_{i}__" for i in range(4)]
-    for rid in ["r", *names]:
-        pool.ingest_request(rid)
-    padded = ["r", *names[1:]]
-    ctx = padded_ctx(["r"], padded, bs=4)
-    assert pool.admit(decode_step(padded), ctx).ok
-    rows = pool.plan(decode_step(padded), ctx)["main"]
-    with pytest.raises(ValueError, match="sink"):
-        pool.gather("conv", rows)
-    with pytest.raises(ValueError, match="sink"):
-        pool.scatter_("conv", rows, torch.zeros(4, 96, 3))
-    eager = StepContext(request_ids=["r"], graph_walk="decode", slot=0, capture=False)
-    real = pool.plan(decode_step(["r"]), eager)["main"]
-    assert pool.gather("conv", real).shape == (1, 96, 3)
-
-
-def test_gather_reads_with_the_planned_indices_as_they_are():
-    """A layer loop gathers several blocks a layer, every step: each read is the
-    index_select alone, with no cast of the int32 plan to int64 first."""
-    pool = build_pool(max_slots=4)
-    ctx = StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False)
-    pool.admit(decode_step(["a"]), ctx)
-    rows = pool.plan(decode_step(["a"]), ctx)["main"]
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU], acc_events=True) as prof:
-        pool.gather("conv", rows)
-    ops = {event.name for event in prof.events()}
-    assert "aten::index_select" in ops and not ops & {"aten::to", "aten::_to_copy"}, ops

@@ -93,3 +93,27 @@ def test_other_containers_still_go_to_torchcodec(tmp_path, video_only_ffmpeg):
     with pytest.raises(RuntimeError, match="Invalid data"):
         Model.load_audio(None, str(path), "cpu")
     assert video_only_ffmpeg.calls == [str(path)]
+
+
+def test_omnivoice_reads_a_wav_reference_without_ffmpeg(tmp_path, video_only_ffmpeg):
+    """The cloning reference, end to end: the API check, then the loader at the codec rate."""
+    sf = pytest.importorskip("soundfile")
+    import base64
+
+    from mstar.api_server.openai import adapters
+    from mstar.api_server.openai.protocol import SpeechRequest
+    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
+
+    clip = tmp_path / "ref.wav"
+    sf.write(clip, _tone(24_000, seconds=1.0), 24_000, subtype="PCM_16")
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    req = SpeechRequest(input="hi", ref_audio=base64.b64encode(clip.read_bytes()).decode(), ref_text="hi")
+    (path,) = adapters.OmniVoiceAdapter().speech_to_request(req, uploads).file_paths["audio"]
+
+    model = types.SimpleNamespace(config=types.SimpleNamespace(sample_rate=24_000))
+    out = OmniVoiceModel.load_audio(model, path, "cpu")
+
+    assert video_only_ffmpeg.calls == []
+    assert out.metadata == {"sample_rate": 24_000, "num_channels": 1}
+    assert out.data.numel() == 24_000
