@@ -127,6 +127,10 @@ def test_missing_max_seq_len_is_refused(tmp_path):
     _refused(_Model(), str(cfg), r"must define `max_seq_len`")
 
 
+def test_mps_that_is_not_a_bool_is_refused(tmp_path):
+    _refused(_Model(), _cfg(tmp_path, mps="yes"), r"mps must be true or false, got 'yes'")
+
+
 def test_missing_node_groups_is_refused(tmp_path):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text("max_seq_len: 64\n")

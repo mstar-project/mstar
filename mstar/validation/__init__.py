@@ -12,7 +12,7 @@ from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
 from mstar.model.base import Model, WorkerGraph
-from mstar.validation.knobs import check_knobs
+from mstar.validation.knobs import check_knobs, check_mps
 from mstar.validation.placement import check_worker_graphs, node_groups_problems
 from mstar.validation.resources import check_resources, resources_shape_problem
 
@@ -66,6 +66,7 @@ def validate_deployment(
     if not isinstance(config, Mapping):
         raise DeploymentError(config_path, [f"the config must be a YAML mapping; got {config!r}"])
     problems = list(check_knobs())
+    problems += check_mps(config)
     if "max_seq_len" not in config:
         problems.append("the config must define `max_seq_len`")
     # model hooks read `resources:` as a mapping; check_resources reports a bad one

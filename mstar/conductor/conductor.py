@@ -39,7 +39,7 @@ from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
-from mstar.platforms import apply_process_env_defaults, current_platform
+from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils import knobs
@@ -494,10 +494,8 @@ class Conductor:
         }
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
-        # of time-slicing.
+        # of time-slicing. validate_deployment checked the value.
         self._mps_requested = self.model_config.get("mps", False)
-        if not isinstance(self._mps_requested, bool):
-            raise ValueError(f"{model_config_file}: mps must be true or false, got {self._mps_requested!r}")
         self._mps: MpsDaemon | None = None
 
         self.default_sharding_config = deployment.sharding_config
@@ -758,8 +756,6 @@ class Conductor:
         ctx = mp.get_context("spawn")
         atexit.register(self.shutdown)
         if self._mps_requested:
-            if not current_platform.is_cuda():
-                raise ValueError(f"mps: true needs an NVIDIA GPU, not {current_platform!r}")
             self._mps = MpsDaemon()
             self._mps.start()
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
