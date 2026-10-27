@@ -89,6 +89,7 @@ _HF_KEY_RENAMES: dict[str, str] = {
     "num_attention_heads": "num_qo_heads",
     "num_key_value_heads": "num_kv_heads",
     "intermediate_size": "pali_intermediate_size",
+    "max_state_dim": "state_dim",
 }
 
 # Pi05Config field names — computed once from the dataclass.

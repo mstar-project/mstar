@@ -274,7 +274,7 @@ def bagel():
 
     class _Bagel(BagelModel):
         def __init__(self):
-            self.config = SimpleNamespace(think_mode=False)
+            self.config = SimpleNamespace(think_mode=False, latent_downsample=16, max_latent_size=64)
             self.tokenizer = _StubTokenizer()
             self.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
             self.eoi_token_id = _StubTokenizer.SPECIALS["<|vision_end|>"]

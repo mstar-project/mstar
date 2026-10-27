@@ -142,9 +142,6 @@ SAMPLING_KEYS = (
 )
 CFG_RENORM_TYPES = ("global", "channel", "text_channel")
 IMAGE_PREPROCESS_MODES = ("default", "vllm")
-# latent grid is at most 64 patches of 16 px per side
-MAX_IMAGE_SIDE = 1024
-IMAGE_SIDE_STRIDE = 16
 
 
 def _is_real(value) -> bool:
@@ -154,54 +151,45 @@ def _is_real(value) -> bool:
     )
 
 
-def check_request_kwargs(model_kwargs: dict | None) -> None:
-    """Raise ``ValueError`` on a BAGEL-specific knob outside its allowed values.
+def _is_side(value, max_side: int, stride: int) -> bool:
+    return (
+        not isinstance(value, bool) and isinstance(value, int)
+        and stride <= value <= max_side and value % stride == 0
+    )
+
+
+# every BAGEL knob a request may set -> (check(value, max_side, stride), what it must be)
+IMAGE_KNOBS = {
+    "cfg_text_scale": (lambda v, *_: _is_real(v), "a finite number (<= 1 disables it)"),
+    "cfg_img_scale": (lambda v, *_: _is_real(v), "a finite number (<= 1 disables it)"),
+    "cfg_interval": (
+        lambda v, *_: isinstance(v, (list, tuple)) and len(v) == 2
+        and all(_is_real(x) for x in v) and 0 <= v[0] <= v[1] <= 1,
+        "[lo, hi] with 0 <= lo <= hi <= 1",
+    ),
+    "cfg_renorm_type": (lambda v, *_: v in CFG_RENORM_TYPES, f"one of {list(CFG_RENORM_TYPES)}"),
+    "cfg_renorm_min": (lambda v, *_: _is_real(v) and 0 <= v <= 1, "a number in [0, 1]"),
+    "think_mode": (lambda v, *_: isinstance(v, bool), "true or false"),
+    "image_preprocess": (
+        lambda v, *_: v in IMAGE_PREPROCESS_MODES, f"one of {list(IMAGE_PREPROCESS_MODES)}",
+    ),
+    "width": (_is_side, "an integer multiple of {stride} in [{stride}, {max_side}]"),
+    "height": (_is_side, "an integer multiple of {stride} in [{stride}, {max_side}]"),
+}
+
+
+def check_request_kwargs(model_kwargs: dict | None, max_side: int, stride: int) -> None:
+    """Raise ``ValueError`` on a BAGEL knob outside its allowed values.
 
     Sampling knobs are checked at the API boundary and by the sampler.
+    ``max_side`` and ``stride`` bound ``width`` / ``height`` (see ``BagelModel.image_sides``).
     """
-    mk = model_kwargs or {}
-    for key in ("cfg_text_scale", "cfg_img_scale"):
-        if key in mk and not _is_real(mk[key]):
-            raise ValueError(f"{key} must be a finite number (<= 1 disables it); got {mk[key]!r}")
-    if "cfg_interval" in mk:
-        interval = mk["cfg_interval"]
-        if not (
-            isinstance(interval, (list, tuple)) and len(interval) == 2
-            and all(_is_real(v) for v in interval)
-            and 0 <= interval[0] <= interval[1] <= 1
-        ):
-            raise ValueError(
-                f"cfg_interval must be [lo, hi] with 0 <= lo <= hi <= 1; got {interval!r}"
-            )
-    if "cfg_renorm_type" in mk and mk["cfg_renorm_type"] not in CFG_RENORM_TYPES:
-        raise ValueError(
-            f"cfg_renorm_type must be one of {list(CFG_RENORM_TYPES)}; "
-            f"got {mk['cfg_renorm_type']!r}"
-        )
-    if "cfg_renorm_min" in mk and not (
-        _is_real(mk["cfg_renorm_min"]) and 0 <= mk["cfg_renorm_min"] <= 1
-    ):
-        raise ValueError(f"cfg_renorm_min must be a number in [0, 1]; got {mk['cfg_renorm_min']!r}")
-    if "think_mode" in mk and not isinstance(mk["think_mode"], bool):
-        raise ValueError(f"think_mode must be true or false; got {mk['think_mode']!r}")
-    if "image_preprocess" in mk and mk["image_preprocess"] not in IMAGE_PREPROCESS_MODES:
-        raise ValueError(
-            f"image_preprocess must be one of {list(IMAGE_PREPROCESS_MODES)}; "
-            f"got {mk['image_preprocess']!r}"
-        )
-    for key in ("width", "height"):
-        if key not in mk:
-            continue
-        value = mk[key]
-        if (
-            isinstance(value, bool) or not isinstance(value, int)
-            or not IMAGE_SIDE_STRIDE <= value <= MAX_IMAGE_SIDE
-            or value % IMAGE_SIDE_STRIDE
-        ):
-            raise ValueError(
-                f"{key} must be an integer multiple of {IMAGE_SIDE_STRIDE} in "
-                f"[{IMAGE_SIDE_STRIDE}, {MAX_IMAGE_SIDE}]; got {value!r}"
-            )
+    for key, value in (model_kwargs or {}).items():
+        if key in IMAGE_KNOBS:
+            ok, rule = IMAGE_KNOBS[key]
+            if not ok(value, max_side, stride):
+                rule = rule.format(max_side=max_side, stride=stride)
+                raise ValueError(f"{key} must be {rule}; got {value!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +708,7 @@ class BagelModel(Model):
 
         Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
         """
-        check_request_kwargs(kwargs)
+        check_request_kwargs(kwargs, *self.image_sides)
         result: NameToTensorList = {}
 
         if prompt is not None:
@@ -795,7 +783,7 @@ class BagelModel(Model):
             and tensors.get("image_inputs")
         ):
             result["image_inputs"] = [
-                self._resize_to_fit(img, max_width, max_height)
+                self._resize_to_fit(img, max_width, max_height, self.image_sides[0])
                 for img in tensors["image_inputs"]
             ]
 
@@ -870,20 +858,27 @@ class BagelModel(Model):
             ),
         }
 
+    @property
+    def image_sides(self) -> tuple[int, int]:
+        """``(max_side, stride)`` of an image in pixels: the latent grid times its downsample."""
+        stride = self.config.latent_downsample
+        return self.config.max_latent_size * stride, stride
+
     @staticmethod
     def _resize_to_fit(
         image: torch.Tensor,
         max_width: int | None,
         max_height: int | None,
+        max_side: int,
     ) -> torch.Tensor:
         """Resize a c x h x w image to the largest size fitting within
         max_width x max_height while preserving aspect ratio.
 
         If only one of max_width / max_height is given, only that dimension
-        constrains the result. Both dimensions are capped at 1024.
+        constrains the result. Both dimensions are capped at ``max_side``.
         """
         _, h, w = image.shape
-        scales = [1024 / w, 1024 / h]
+        scales = [max_side / w, max_side / h]
         if max_width is not None:
             scales.append(max_width / w)
         if max_height is not None:
@@ -960,9 +955,7 @@ class BagelModel(Model):
 
     def request_kwargs(self) -> frozenset[str]:
         return frozenset({
-            *SAMPLING_KEYS, "max_output_tokens", "think_mode", "width", "height",
-            "cfg_text_scale", "cfg_img_scale", "cfg_interval", "cfg_renorm_type",
-            "cfg_renorm_min", "image_preprocess",
+            *SAMPLING_KEYS, "max_output_tokens", *IMAGE_KNOBS,
         })
 
     def checkpoint_path(self) -> str:
@@ -1380,15 +1373,9 @@ class BagelModel(Model):
     def _request_params(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict | None,
     ) -> dict:
-        overridable_keys = [
-            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
-            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
-        ]
-        params = {k: getattr(self.config, k) for k in overridable_keys}
-        params["width"] = 1024
-        params["height"] = 1024
-        params["image_preprocess"] = "default"
-        overridable_keys += ["width", "height", "image_preprocess"]
+        max_side, _ = self.image_sides
+        params = {"width": max_side, "height": max_side, "image_preprocess": "default"}
+        params.update({k: getattr(self.config, k) for k in IMAGE_KNOBS if k not in params})
 
         if "image" in input_modalities and "image" in output_modalities:
             params["cfg_img_scale"] = 2.0
@@ -1396,7 +1383,7 @@ class BagelModel(Model):
             params["cfg_renorm_type"] = "text_channel"
 
         if model_kwargs:
-            for key in overridable_keys:
+            for key in IMAGE_KNOBS:
                 if key in model_kwargs:
                     params[key] = model_kwargs[key]
         return params
@@ -1523,7 +1510,7 @@ class BagelModel(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         target_output = output_modalities[0]  # "text" or "image"
-        check_request_kwargs(model_kwargs)
+        check_request_kwargs(model_kwargs, *self.image_sides)
         params = self._request_params(input_modalities, output_modalities, model_kwargs)
 
         # edit: width/height bound the output via process_prompt's resize of the input

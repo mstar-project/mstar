@@ -719,7 +719,7 @@ def test_request_kwargs_are_the_keys_it_reads():
     model = tiny_model()
     declared = model.request_kwargs()
     base = model.get_request_resource_configs({}, {})[AR_SAMPLER]
-    sent = {"temperature": 0.3, "top_p": 0.5, "top_k": 7, "repetition_penalty": 1.3, "ignore_eos": True}
+    sent = {"temperature": 0.3, "top_p": 0.5, "top_k": 7, "min_p": 0.2, "repetition_penalty": 1.3, "ignore_eos": True}
     for key, value in sent.items():
         assert key in declared
         assert getattr(base, key) != value

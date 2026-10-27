@@ -19,6 +19,38 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
 
+# knob -> (rule text, predicate); the one copy, also applied at the API by normalize_generation_kwargs
+REAL_KNOB_RULES = {
+    "temperature": (">= 0 (0 is greedy)", lambda v: v >= 0),
+    "top_p": ("in (0, 1] (1 is off; greedy is temperature 0)", lambda v: 0 < v <= 1),
+    "min_p": ("in [0, 1] (0 is off)", lambda v: 0 <= v <= 1),
+    "repetition_penalty": ("> 0 (1 is off)", lambda v: v > 0),
+}
+INT_KNOB_RULES = {
+    "top_k": (">= 0 (0 is off)", lambda v: v >= 0),
+}
+BOOL_KNOBS = ("ignore_eos", "penalize_prompt")
+
+
+def check_real_knob(key: str, value, rule: str, ok) -> None:
+    """Raise ``ValueError`` unless ``value`` is a finite number satisfying ``ok``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number {rule}; got {value!r}")
+    if not math.isfinite(value) or not ok(value):
+        raise ValueError(f"{key} must be a finite number {rule}; got {value!r}")
+
+
+def check_int_knob(key: str, value, rule: str, ok) -> None:
+    """Raise ``ValueError`` unless ``value`` is an integer satisfying ``ok``."""
+    if isinstance(value, bool) or not isinstance(value, int) or not ok(value):
+        raise ValueError(f"{key} must be an integer {rule}; got {value!r}")
+
+
+def check_bool_knob(key: str, value) -> None:
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false; got {value!r}")
+
+
 @dataclass
 class SamplerSpec(NodeResourceSpec):
     vocab_size: int | None # must be set for enable_repetition_penalty
@@ -92,18 +124,15 @@ class SamplingReqConfig(ResourceReqConfig):
     def validate(self, spec: "SamplerSpec | None" = None) -> None:
         """Raise ``ValueError`` on a value outside the contract, or one ``spec``'s
         node cannot honour. None means the sampler's default."""
-        _check_real("temperature", self.temperature, lambda v: v >= 0, ">= 0")
-        _check_real("top_p", self.top_p, lambda v: 0 < v <= 1, "in (0, 1]")
-        _check_real("min_p", self.min_p, lambda v: 0 <= v <= 1, "in [0, 1]")
-        _check_real("repetition_penalty", self.repetition_penalty, lambda v: v > 0, "> 0")
-        if self.top_k is not None and (
-            isinstance(self.top_k, bool) or not isinstance(self.top_k, int) or self.top_k < 0
-        ):
-            raise ValueError(f"top_k must be an integer >= 0 (0 disables it); got {self.top_k!r}")
-        for name in ("ignore_eos", "penalize_prompt"):
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, bool):
-                raise ValueError(f"{name} must be a boolean; got {value!r}")
+        for name, (rule, ok) in REAL_KNOB_RULES.items():
+            if (value := getattr(self, name)) is not None:
+                check_real_knob(name, value, rule, ok)
+        for name, (rule, ok) in INT_KNOB_RULES.items():
+            if (value := getattr(self, name)) is not None:
+                check_int_knob(name, value, rule, ok)
+        for name in BOOL_KNOBS:
+            if (value := getattr(self, name)) is not None:
+                check_bool_knob(name, value)
         if spec is None:
             return
         # refused here, not ignored: the node's sampler has no such filter
@@ -125,16 +154,6 @@ def derive_seed(seed: int, stream: str) -> int:
     """
     digest = hashlib.blake2b(f"{seed}:{stream}".encode(), digest_size=8).digest()
     return int.from_bytes(digest, "little") & (2**63 - 1)
-
-
-def _check_real(name: str, value, ok, rule: str) -> None:
-    """Raise ``ValueError`` unless ``value`` is None or a finite number satisfying ``ok``."""
-    if value is None:
-        return
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be a number; got {value!r}")
-    if not math.isfinite(value) or not ok(value):
-        raise ValueError(f"{name} must be a finite number {rule}; got {value!r}")
 
 
 @dataclass(frozen=True)

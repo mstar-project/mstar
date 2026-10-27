@@ -508,6 +508,7 @@ class FishS2ProModel(Model):
                 temperature=temperature,
                 top_k=model_kwargs.get("top_k", generation.top_k),
                 top_p=model_kwargs.get("top_p", generation.top_p),
+                min_p=model_kwargs.get("min_p", 0.0),
                 repetition_penalty=model_kwargs.get("repetition_penalty", generation.repetition_penalty),
                 penalize_prompt=False,
                 ignore_eos=model_kwargs.get("ignore_eos", False),
@@ -516,7 +517,7 @@ class FishS2ProModel(Model):
 
     def request_kwargs(self) -> frozenset[str]:
         return frozenset({
-            "ref_text", "temperature", "top_k", "top_p", "repetition_penalty", "ignore_eos", "do_sample",
+            "ref_text", "temperature", "top_k", "top_p", "min_p", "repetition_penalty", "ignore_eos", "do_sample",
             "max_output_tokens",
         })
 

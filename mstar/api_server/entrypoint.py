@@ -323,6 +323,12 @@ def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
     }) + "\n"
 
 
+async def _disconnected(raw_request: Request) -> None:
+    """Return once the client has gone; the body is already read."""
+    while (await raw_request.receive())["type"] != "http.disconnect":
+        pass
+
+
 async def _empty_stream():
     """The body for a client that left before its first chunk."""
     return
@@ -446,8 +452,6 @@ class APIServer:
         self._id_waiters: set[str] = set()
         self._generation = itertools.count(1)
         self.request_lock = threading.Lock()
-        # unread model_kwargs already warned about; repeats go to debug
-        self.reported_ignored_params: set[str] = set()
         self.running = True
 
         # Set by main() once the conductor is spawned. It gets polled because a
@@ -561,24 +565,14 @@ class APIServer:
     # ----------------------------------------------------------
 
     def _report_ignored_params(self, model_kwargs: dict) -> None:
-        """Log the keys the model does not read; the request is served regardless.
-
-        Each key warns once per server; a client or adapter that always sends
-        it (Whisper's long-form windows) would otherwise warn on every request.
-        """
+        """Log the keys the model does not read; the request is served regardless."""
         model = getattr(self, "model", None)
         declared = model.request_kwargs() if model is not None else None
         if declared is None:
             return
-        ignored = sorted(set(model_kwargs) - declared - SERVER_KWARGS)
-        if not ignored:
-            return
-        new = [k for k in ignored if k not in self.reported_ignored_params]
-        if new:
-            self.reported_ignored_params.update(new)
+        ignored = sorted(set(model_kwargs) - declared - set(model.ENGINE_KWARGS) - set(model.LENGTH_KWARGS))
+        if ignored:
             logger.warning("Ignoring model_kwargs this model does not read: %s", ignored)
-        else:
-            logger.debug("Ignoring model_kwargs this model does not read: %s", ignored)
 
     def submit_request(
         self,
@@ -1155,46 +1149,47 @@ class APIServer:
             return self._stream_binary(chunks)
         return self._stream_ndjson(chunks)
 
-    async def open_result_stream(self, request_id: str, raw_request: Request | None = None):
-        """The request's chunk iterator, after its first chunk has arrived.
+    async def open_result_stream(
+        self, request_id: str, raw_request: Request | None = None, *, batches: bool = False,
+    ):
+        """The request's result iterator, after its first item has arrived.
 
-        A request the engine refuses (a 400 from admission, a failed worker)
-        raises ``HTTPException`` with its status here, before the caller commits
-        a 200. Otherwise the returned iterator yields the first chunk again.
-        A client that disconnects first is aborted, as in ``collect_results``,
-        and gets an empty iterator.
+        A request the engine refuses raises ``HTTPException`` with its status
+        here, before the caller commits a 200; otherwise the iterator replays
+        the first item. ``batches`` selects ``iter_result_chunk_batches``. A
+        client that disconnects first is aborted and gets an empty iterator.
         """
-        chunks = self.iter_result_chunks(request_id)
-        first_read = asyncio.ensure_future(anext(chunks, None))
+        items = (self.iter_result_chunk_batches if batches else self.iter_result_chunks)(request_id)
+        first_read = asyncio.ensure_future(anext(items, None))
+        gone = asyncio.ensure_future(_disconnected(raw_request)) if raw_request is not None else None
         try:
-            while not first_read.done():
-                await asyncio.wait({first_read}, timeout=0.05)
-                if (not first_read.done() and raw_request is not None
-                        and await raw_request.is_disconnected()):
-                    break
+            await asyncio.wait({first_read, gone} - {None}, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            if not first_read.done():
-                # cancelling the read unwinds iter_result_chunks, which aborts the request
-                first_read.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await first_read
+            # a pending receive() would take the disconnect StreamingResponse listens for
+            for task in (gone, first_read):
+                if task is not None and not task.done():
+                    # cancelling the read unwinds the iterator, which aborts the request
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
         if first_read.cancelled():
             return _empty_stream()
         first = first_read.result()
-        if first is not None and first.modality == "error":
+        head = first[0] if batches and first else first
+        if head is not None and head.modality == "error":
             # read to the end, so the finished request is not aborted
-            async for _ in chunks:
+            async for _ in items:
                 pass
             raise HTTPException(
-                status_code=int((first.metadata or {}).get("status", 500)),
-                detail=bytes(first.data).decode("utf-8", "replace"),
+                status_code=int((head.metadata or {}).get("status", 500)),
+                detail=bytes(head.data).decode("utf-8", "replace"),
             )
 
         async def replay():
             if first is not None:
                 yield first
-            async for chunk in chunks:
-                yield chunk
+            async for item in items:
+                yield item
         return replay()
 
     async def _stream_ndjson(self, chunks):
@@ -1576,8 +1571,6 @@ app.add_middleware(
     metrics=lambda: getattr(api_server, "metrics", None),
     routes=lambda: (*app.router.routes, *openai_router.routes),
 )
-# keys the server itself reads for every model
-SERVER_KWARGS = frozenset({"seed", "max_output_tokens", "prefix_cache"})
 
 
 @app.exception_handler(RequestValidationError)

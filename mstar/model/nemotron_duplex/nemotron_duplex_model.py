@@ -524,7 +524,8 @@ class NemotronDuplexModel(Model):
         keys = SAMPLING_KEYS
         return {
             NANO_SAMPLER: SamplingReqConfig(
-                **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
+                **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys},
+                min_p=model_kwargs.get("min_p", 0.0),
             ),
             # every talker session reads both of its streams
             TALKER_KV: KVReqConfig(needed_labels=["main", "uncond"]),
@@ -659,7 +660,7 @@ class NemotronDuplexModel(Model):
 
     def request_kwargs(self) -> frozenset[str]:
         # max_output_tokens is not read: the audio fixes the length
-        return frozenset(SAMPLING_KEYS)
+        return frozenset({*SAMPLING_KEYS, "min_p"})
 
     def process_prompt(
         self,
