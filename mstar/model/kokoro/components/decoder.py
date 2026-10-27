@@ -20,6 +20,34 @@ from mstar.model.kokoro.components.stft import RealSTFT
 from mstar.model.kokoro.config import KokoroModelConfig
 
 GENERATOR_LEAKY_SLOPE = 0.1
+_MASK32 = 0xFFFFFFFF
+
+
+def _mul32(x: torch.Tensor, c: int) -> torch.Tensor:
+    """``x * c mod 2**32`` for int64 ``x`` in [0, 2**32), split so no product overflows."""
+    return (x * (c & 0xFFFF) + (((x * (c >> 16)) & 0xFFFF) << 16)) & _MASK32
+
+
+def _hash32(x: torch.Tensor) -> torch.Tensor:
+    """The ``lowbias32`` integer hash on int64 values in [0, 2**32)."""
+    x = _mul32(x ^ (x >> 16), 0x7FEB352D)
+    x = _mul32(x ^ (x >> 15), 0x846CA68B)
+    return x ^ (x >> 16)
+
+
+def keyed_normal(keys: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Standard normals ``[B, rows, cols]``, a pure function of each row's key and position.
+
+    ``keys`` is int64 ``[B, 2]`` (two 32-bit words). A row's values do not
+    depend on the batch or its padding, and the draw is CUDA-graph safe.
+    """
+    counter = torch.arange(rows * cols, device=keys.device, dtype=torch.int64).view(1, rows, cols)
+    k1, k2 = keys[:, 0, None, None], keys[:, 1, None, None]
+    bits = _hash32(_hash32((counter + k1) & _MASK32) ^ k2)
+    # two 16-bit uniforms in (0, 1) per value, then Box-Muller
+    u1 = ((bits >> 16).float() + 0.5) / 65536
+    u2 = ((bits & 0xFFFF).float() + 0.5) / 65536
+    return torch.sqrt(-2 * torch.log(u1)) * torch.cos((2 * math.pi) * u2)
 
 
 def snake(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
@@ -60,9 +88,12 @@ class SineSource(nn.Module):
 
     ``deterministic`` silences the noise branch; tests use it to compare a
     padded batch against single rows, which draw noise of different shapes.
-    The reference also draws an initial harmonic phase and an unused noise
-    tensor; both are drawn here too so a seeded run consumes the RNG stream
-    exactly as the reference does.
+
+    Serving passes ``noise_keys`` (per row, from the request seed); the noise
+    is then ``keyed_normal`` and the global RNG is untouched. Without keys the
+    noise comes from the global RNG, as in the reference, which also draws an
+    initial harmonic phase and an unused noise tensor; both are drawn then too
+    so a seeded run consumes the RNG stream exactly as the reference does.
     """
 
     def __init__(self, config: KokoroModelConfig):
@@ -79,7 +110,9 @@ class SineSource(nn.Module):
         )
         self.deterministic = False
 
-    def forward(self, f0: torch.Tensor, frame_lengths: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, f0: torch.Tensor, frame_lengths: torch.Tensor, noise_keys: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """``[B, n]`` F0 (Hz) per generator frame -> ``[B, n * upsample]`` excitation."""
         bsz, num_frames = f0.shape
         num_samples = num_frames * self.upsample
@@ -89,7 +122,8 @@ class SineSource(nn.Module):
         # within a frame, and summing over the same layout keeps the GPU scan's
         # rounding identical (the vocoder amplifies one-ulp phase differences).
         cycles = (f0[:, :, None] * self.harmonic_index / self.sample_rate) % 1
-        torch.rand(bsz, self.num_harmonics, device=f0.device)  # reference's initial phase (has no effect)
+        if noise_keys is None:
+            torch.rand(bsz, self.num_harmonics, device=f0.device)  # reference's initial phase (has no effect)
         phase = (torch.cumsum(cycles, dim=1) * (2 * math.pi)).transpose(1, 2)
         # Hold each row's last valid phase through its padding: the linear
         # upsample then computes every valid sample with exactly the operands
@@ -105,11 +139,16 @@ class SineSource(nn.Module):
         f0_samples = f0.repeat_interleave(self.upsample, dim=1)
         voiced = (f0_samples > self.voiced_threshold).to(f0.dtype)[:, :, None]
         noise_amp = voiced * self.noise_std + (1 - voiced) * self.sine_amp / 3
-        noise = noise_amp * torch.randn_like(sines)
+        if noise_keys is None:
+            normal = torch.randn_like(sines)
+        else:
+            normal = keyed_normal(noise_keys, num_samples, self.num_harmonics)
+        noise = noise_amp * normal
         if self.deterministic:
             noise = torch.zeros_like(noise)
         sine_waves = sines * self.sine_amp * voiced + noise
-        torch.randn_like(voiced)  # reference's unused noise branch
+        if noise_keys is None:
+            torch.randn_like(voiced)  # reference's unused noise branch
 
         source = torch.tanh(self.l_linear(sine_waves))[:, :, 0]
         return source.masked_fill(~length_mask(frame_lengths * self.upsample, num_samples), 0.0)
@@ -160,11 +199,16 @@ class Generator(nn.Module):
         self.conv_post = nn.Conv1d(channels, source_channels, 7, 1, padding=3)
 
     def forward(
-        self, x: torch.Tensor, style: torch.Tensor, f0: torch.Tensor, frame_lengths: torch.Tensor
+        self,
+        x: torch.Tensor,
+        style: torch.Tensor,
+        f0: torch.Tensor,
+        frame_lengths: torch.Tensor,
+        noise_keys: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``[B, C, n]`` features and ``[B, n]`` F0 -> ``[B, n * upsample]`` waveform."""
         with torch.autocast(device_type=x.device.type, enabled=False):
-            source = self.m_source(f0.float(), frame_lengths)
+            source = self.m_source(f0.float(), frame_lengths, noise_keys)
             magnitude, phase, _ = self.stft.transform(source, frame_lengths * self.m_source.upsample)
         harmonics = torch.cat([magnitude, phase], dim=1).to(x.dtype)
 
@@ -222,6 +266,7 @@ class Decoder(nn.Module):
         energy_curve: torch.Tensor,
         style: torch.Tensor,
         frame_lengths: torch.Tensor,
+        noise_keys: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``asr [B, hidden, F]``, curves ``[B, 2F]`` -> ``[B, F * samples_per_frame]``."""
         autocast = torch.autocast(
@@ -235,4 +280,4 @@ class Decoder(nn.Module):
             asr_res = mask_channels(self.asr_res(asr), mask)
             for block in self.decode:
                 x, lengths = block(torch.cat([x, asr_res, f0, energy], dim=1), style, lengths)
-            return self.generator(x, style, f0_curve, lengths)
+            return self.generator(x, style, f0_curve, lengths, noise_keys)

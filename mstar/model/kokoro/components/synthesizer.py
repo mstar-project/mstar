@@ -89,11 +89,16 @@ class KokoroTTS(nn.Module):
         asr: torch.Tensor,
         frame_lengths: torch.Tensor,
         style: torch.Tensor,
+        noise_keys: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Frame-aligned features -> waveform ``[B, F * samples_per_frame]``."""
+        """Frame-aligned features -> waveform ``[B, F * samples_per_frame]``.
+
+        ``noise_keys`` (int64 ``[B, 2]``) seeds each row's source noise; None
+        draws it from the global RNG, as the reference does.
+        """
         decoder_style, predictor_style = self._split_style(style)
         f0, energy = self.predictor.f0n(en, predictor_style, frame_lengths)
-        return self.decoder(asr, f0, energy, decoder_style, frame_lengths)
+        return self.decoder(asr, f0, energy, decoder_style, frame_lengths, noise_keys)
 
     def synthesize_frames(
         self,
@@ -102,10 +107,11 @@ class KokoroTTS(nn.Module):
         pred_dur: torch.Tensor,
         style: torch.Tensor,
         num_frames: int,
+        noise_keys: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``align`` then ``decode_frames``: the waveform and each row's frame count."""
         en, asr, frame_lengths = self.align(d, t_en, pred_dur, num_frames)
-        return self.decode_frames(en, asr, frame_lengths, style), frame_lengths
+        return self.decode_frames(en, asr, frame_lengths, style, noise_keys), frame_lengths
 
     def forward(
         self,
@@ -113,9 +119,10 @@ class KokoroTTS(nn.Module):
         lengths: torch.Tensor,
         style: torch.Tensor,
         speed: torch.Tensor,
+        noise_keys: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Eager end-to-end synthesis: (waveform, frame lengths, durations)."""
         d, t_en, pred_dur = self.encode_text(input_ids, lengths, style, speed)
         num_frames = int(pred_dur.sum(dim=1).max().item())
-        audio, frame_lengths = self.synthesize_frames(d, t_en, pred_dur, style, num_frames)
+        audio, frame_lengths = self.synthesize_frames(d, t_en, pred_dur, style, num_frames, noise_keys)
         return audio, frame_lengths, pred_dur

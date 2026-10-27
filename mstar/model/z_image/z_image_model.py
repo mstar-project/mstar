@@ -175,8 +175,8 @@ class ZImageModel(Model):
         return enc["input_ids"][0].to(torch.long)
 
     def _resolve_size(self, model_kwargs: dict) -> tuple[int, int]:
-        height = int(model_kwargs.get("height", self.config.default_height))
-        width = int(model_kwargs.get("width", self.config.default_width))
+        height = model_kwargs.get("height", self.config.default_height)
+        width = model_kwargs.get("width", self.config.default_width)
         align = self.config.spatial_alignment
         for name, value in (("height", height), ("width", width)):
             if value <= 0 or value % align:
@@ -189,10 +189,15 @@ class ZImageModel(Model):
         return height, width
 
     def _resolve_steps(self, model_kwargs: dict) -> int:
-        steps = int(model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps))
-        if steps < 1:
-            raise ValueError(f"num_inference_steps must be >= 1, got {steps}")
-        return min(steps, self.config.max_denoise_steps)
+        return model_kwargs.get("num_inference_steps", self.config.default_num_inference_steps)
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # past the loop's max_iters the conductor refuses the request
+        return {DENOISE_LOOP: self._resolve_steps(model_kwargs)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        # guidance_scale is read only to log that the distilled checkpoint ignores it
+        return frozenset({"height", "width", "num_inference_steps", "guidance_scale"})
 
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
@@ -206,7 +211,7 @@ class ZImageModel(Model):
             raise ValueError("Z-Image-Turbo is text-to-image only; reference images are not supported")
         self._resolve_size(kwargs)
         self._resolve_steps(kwargs)
-        if float(kwargs.get("guidance_scale", 0.0)) > 0.0:
+        if kwargs.get("guidance_scale", 0.0) > 0.0:
             logger.info("guidance_scale is ignored: Z-Image-Turbo is distilled and runs without CFG")
         return {TEXT_INPUTS: [self.tokenize(prompt)]}
 

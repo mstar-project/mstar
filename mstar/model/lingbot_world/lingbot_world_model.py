@@ -179,6 +179,9 @@ class LingBotWorldModel(Model):
         lat_f = (num_frames - 1) // cfg.vae_stride[0] + 1
         return lat_f - lat_f % cfg.chunk_size
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"camera_poses", "intrinsics", "num_frames", "height", "width"})
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,
@@ -213,7 +216,7 @@ class LingBotWorldModel(Model):
         if not (np.isfinite(poses).all() and torch.isfinite(intrinsics).all()):
             raise ValueError("LingBot-World camera_poses and intrinsics must be finite numbers.")
 
-        num_frames = int(kwargs.get("num_frames", len(poses)))
+        num_frames = kwargs.get("num_frames", len(poses))
         lat_f = self.num_latent_frames(num_frames, len(poses))
         if lat_f < cfg.chunk_size or lat_f > cfg.max_chunks * cfg.chunk_size:
             raise ValueError(f"LingBot-World rollout of {lat_f} latent frames is out of range.")
@@ -243,8 +246,8 @@ class LingBotWorldModel(Model):
         image = image.cpu()
         image = image.float().div(255) if image.dtype == torch.uint8 else image.float()
         image = image.sub(0.5).div(0.5)
-        height = int(kwargs.get("height", cfg.default_height))
-        width = int(kwargs.get("width", cfg.default_width))
+        height = kwargs.get("height", cfg.default_height)
+        width = kwargs.get("width", cfg.default_width)
         # the area sizes the resize here and the DiT's tokens and rolling K/V
         if height <= 0 or width <= 0 or height * width > cfg.max_area:
             raise ValueError(

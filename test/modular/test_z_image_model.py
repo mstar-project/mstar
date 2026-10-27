@@ -10,6 +10,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.conductor import Conductor  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, ZImageConfig  # noqa: E402
@@ -85,8 +86,17 @@ def test_process_prompt_and_validation():
         model.process_prompt("x", ["image", "text"], ["image"])
     with pytest.raises(ValueError, match="multiple of 16"):
         model.process_prompt("x", ["text"], ["image"], height=1000)
-    with pytest.raises(ValueError, match="num_inference_steps"):
-        model.process_prompt("x", ["text"], ["image"], num_inference_steps=0)
+
+
+def test_steps_past_the_loop_ceiling_are_refused_not_clamped():
+    model = _make_model()
+    ceiling = model.config.max_denoise_steps
+    assert model.get_loop_caps(num_inference_steps=8) == {DENOISE_LOOP: 8}
+    conductor = Conductor.__new__(Conductor)
+    conductor.model, conductor._loop_max_iters = model, {DENOISE_LOOP: ceiling}
+    assert conductor._loop_caps({"num_inference_steps": ceiling}) == {DENOISE_LOOP: ceiling}
+    with pytest.raises(ValueError, match=f"at most {ceiling}"):
+        conductor._loop_caps({"num_inference_steps": ceiling + 1})
 
 
 def test_schedule_and_caption_bucket_from_token_count():

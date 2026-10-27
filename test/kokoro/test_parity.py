@@ -8,6 +8,8 @@ What is compared, and why the tolerances differ:
 * durations are integers and must match exactly;
 * every deterministic intermediate (phoneme states, F0/energy curves, text
   features, the decoder given identical inputs) matches to fp32 noise;
+* serving draws the source noise from the request seed (``keyed_normal``), not
+  the global RNG; the reference given that same noise is the oracle for it;
 * the waveform is compared with a looser bound. Kokoro's vocoder feeds the
   *phase* of the harmonic source's STFT into convolutions, and the source
   phase is a cumulative sum over the whole utterance, so the output is
@@ -18,6 +20,7 @@ What is compared, and why the tolerances differ:
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -25,7 +28,9 @@ import pytest
 import torch
 
 from mstar.model.kokoro.components import KokoroTTS
+from mstar.model.kokoro.components.decoder import keyed_normal
 from mstar.model.kokoro.config import KokoroModelConfig
+from mstar.model.kokoro.submodules import noise_key
 from mstar.model.kokoro.weight_loader import load_kokoro_weights
 
 HF_REPO = "hexgrad/Kokoro-82M"
@@ -201,3 +206,81 @@ def test_reference_is_chaotic_in_f0(config, reference):
     assert f0_effect > 1e-3  # F0: a rounding-level change is amplified
     assert asr_effect < 10 * INTERMEDIATE_TOL  # everything else is well conditioned
     assert f0_effect > 10 * asr_effect
+
+
+@contextlib.contextmanager
+def _reference_keyed_noise(keys: torch.Tensor):
+    """The reference's source noise drawn as serving draws it.
+
+    Its first ``randn_like`` (SineGen's noise, ``[B, samples, harmonics]``)
+    becomes ``keyed_normal``; the second, SourceModuleHnNSF's unused branch,
+    stays on the RNG.
+    """
+    real = torch.randn_like
+    calls = []
+
+    def keyed(t, *args, **kwargs):
+        calls.append(tuple(t.shape))
+        if len(calls) == 1:
+            return keyed_normal(keys.to(t.device), t.shape[1], t.shape[2]).to(t.dtype)
+        return real(t, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(torch, "randn_like", keyed)
+        yield
+    assert len(calls) == 2, calls
+
+
+def _reference_features(reference, input_ids, ref_s, speed):
+    """The reference's decoder inputs (asr, F0, energy) and durations."""
+    T = input_ids.shape[1]
+    lengths = torch.full((1,), T, dtype=torch.long, device=DEVICE)
+    text_mask = torch.gt(torch.arange(T, device=DEVICE)[None] + 1, lengths[:, None])
+    d_en = reference.bert_encoder(reference.bert(input_ids, attention_mask=(~text_mask).int())).transpose(-1, -2)
+    s = ref_s[:, 128:]
+    d = reference.predictor.text_encoder(d_en, s, lengths, text_mask)
+    x, _ = reference.predictor.lstm(d)
+    dur = torch.round(torch.sigmoid(reference.predictor.duration_proj(x)).sum(-1) / speed).clamp(min=1).long()
+    frames = torch.repeat_interleave(torch.arange(T, device=DEVICE), dur[0])
+    alignment = torch.zeros((T, frames.shape[0]), device=DEVICE)
+    alignment[frames, torch.arange(frames.shape[0], device=DEVICE)] = 1
+    f0, energy = reference.predictor.F0Ntrain(d.transpose(-1, -2) @ alignment[None], s)
+    asr = reference.text_encoder(input_ids, lengths, text_mask) @ alignment[None]
+    return asr, f0, energy, dur
+
+
+@pytest.mark.parametrize(("voice", "phonemes", "speed"), CASES)
+def test_keyed_noise_decoder_matches_reference(config, ours, reference, voice, phonemes, speed):
+    """The served path's noise, given to the reference, gives the reference's audio."""
+    input_ids, ref_s = _inputs(config, voice, phonemes)
+    keys = noise_key(1234, 0)[None].to(DEVICE)
+    other_keys = noise_key(1235, 0)[None].to(DEVICE)
+    with torch.no_grad():
+        asr, f0, energy, dur = _reference_features(reference, input_ids, ref_s, speed)
+        with _reference_keyed_noise(keys):
+            audio_ref = reference.decoder(asr, f0, energy, ref_s[:, :128]).reshape(-1)
+        frame_lengths = dur.sum(1)
+        audio = ours.decoder(asr, f0, energy, ref_s[:, :128], frame_lengths, noise_keys=keys)[0]
+        other = ours.decoder(asr, f0, energy, ref_s[:, :128], frame_lengths, noise_keys=other_keys)[0]
+    assert audio.shape == audio_ref.shape
+    assert _rel(audio, audio_ref) < 10 * INTERMEDIATE_TOL
+    # the bound would catch the wrong noise: another seed lands well outside it
+    assert _rel(other, audio_ref) > 2 * 10 * INTERMEDIATE_TOL
+
+
+@pytest.mark.parametrize(("voice", "phonemes", "speed"), CASES)
+def test_keyed_noise_waveform_within_phase_chaos_band(config, ours, reference, voice, phonemes, speed):
+    """End to end on the served noise path, in the band ``test_waveform_within_phase_chaos_band`` uses."""
+    input_ids, ref_s = _inputs(config, voice, phonemes)
+    keys = noise_key(1234, 0)[None].to(DEVICE)
+    with torch.no_grad():
+        with _reference_keyed_noise(keys):
+            audio_ref, dur_ref = reference.forward_with_tokens(input_ids, ref_s, speed)
+        audio, _, dur = ours(
+            input_ids, torch.tensor([input_ids.shape[1]], device=DEVICE), ref_s,
+            torch.tensor([speed], device=DEVICE), noise_keys=keys,
+        )
+    audio_ref = audio_ref.reshape(-1)
+    assert torch.equal(dur[0], dur_ref.reshape(-1))
+    assert audio.shape == (1, audio_ref.numel())
+    assert _rel(audio[0], audio_ref) < WAVEFORM_TOL

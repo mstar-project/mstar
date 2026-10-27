@@ -313,6 +313,10 @@ class LTX25Model(Model):
             )
         return walk
 
+    def request_kwargs(self) -> frozenset[str]:
+        # num_inference_steps and guidance_scale are read only to warn that the fixed schedule ignores them
+        return frozenset({"height", "width", "num_frames", "fps", "num_inference_steps", "guidance_scale"})
+
     def process_prompt(
         self, prompt: str | None, input_modalities: list[str], output_modalities: list[str],
         tensors: NameToTensorList | None = None, **kwargs,

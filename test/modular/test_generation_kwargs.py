@@ -55,6 +55,14 @@ def test_in_contract_values_pass(kwargs):
     ({"seed": 1e20}, "seed"),
     ({"ignore_eos": "false"}, "ignore_eos"),
     ({"do_sample": "false"}, "do_sample"),
+    ({"num_inference_steps": 0}, "num_inference_steps"),
+    ({"num_inference_steps": 7.9}, "num_inference_steps"),
+    ({"height": True}, "height"),
+    ({"width": "512.5"}, "width"),
+    ({"num_frames": -1}, "num_frames"),
+    ({"fps": 0}, "fps"),
+    ({"video_fps": "-24"}, "video_fps"),
+    ({"guidance_scale": "inf"}, "guidance_scale"),
     ({"talker_top_p": 0}, "talker_top_p"),
     ({"thinker_temperature": -0.1}, "thinker_temperature"),
 ])
@@ -76,6 +84,8 @@ def test_out_of_contract_values_raise(kwargs, name):
     ({"seed": "7"}, {"seed": 7}),
     ({"seed": 42.0}, {"seed": 42}),
     ({"seed": "9007199254740993.0"}, {"seed": 9007199254740993}),
+    ({"num_inference_steps": "8", "height": 1024.0}, {"num_inference_steps": 8, "height": 1024}),
+    ({"fps": "24", "guidance_scale": "-2"}, {"fps": 24.0, "guidance_scale": -2.0}),
 ])
 def test_values_that_denote_the_knobs_type_are_coerced(kwargs, expected):
     out = normalize_generation_kwargs(kwargs)

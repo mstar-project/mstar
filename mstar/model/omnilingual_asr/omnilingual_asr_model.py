@@ -144,6 +144,10 @@ class OmnilingualASRModel(Model):
         waveform = load_waveform(filepath)
         return TensorAndMetadata(data=waveform, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
 
+    def request_kwargs(self) -> frozenset[str]:
+        # argmax CTC: the transcription adapter's language, prompt and temperature are not read
+        return frozenset()
+
     def process_prompt(
         self,
         prompt: str | None,
