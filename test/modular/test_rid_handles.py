@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     MessageSource,
@@ -122,6 +123,9 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     w.sent = []
     w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
     w.removed_in_runtime = []
+    w._removed_rids = RecentSet(16)
+    w._unprocessed_messages = {}
+    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
 
     def _runtime_remove(h):
         # The handle must be freed only after every worker-side map dropped it.
@@ -257,7 +261,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     body = SimpleNamespace(
         request_id="wire-1", request_info=info,
         partition_worker_graph_ids={}, worker_graph_to_workers={},
-        initial_inputs=[],
+        initial_inputs=[], loop_caps={},
     )
     w.request_state.per_request_info = {0: cfg}
 
@@ -302,7 +306,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
         )
         body = SimpleNamespace(
             request_id="wire-1", request_info=info, partition_worker_graph_ids={},
-            worker_graph_to_workers={}, initial_inputs=[],
+            worker_graph_to_workers={}, initial_inputs=[], loop_caps={},
         )
         Worker._add_new_request(w, body)
 

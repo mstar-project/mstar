@@ -44,11 +44,17 @@ def recompile_limit() -> int:
     return limit
 
 
-def apply_torch_config() -> None:
+def apply_dynamo_config() -> None:
     # dynamo config is per-thread since torch 2.12, so every compiling thread calls this
     torch._dynamo.config.recompile_limit = recompile_limit()
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
     torch._dynamo.config.specialize_int = False
+
+
+def apply_torch_config() -> None:
+    apply_dynamo_config()
+    # Process-wide, so set once here and never from a thread initializer: a
+    # thread starting mid-step would overwrite a node's fp32_precision_scope.
     torch.set_float32_matmul_precision('high')
 
 

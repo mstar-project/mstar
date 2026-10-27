@@ -215,6 +215,8 @@ def _pin(ptr: int, nbytes: int) -> bool:
 class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     """Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""
 
+    _namespace_file_dirs = ("/dev/shm",)
+
     # Staging writes the segment and offset onto the descriptor the store
     # holds, which routing may already have copied -- so every outgoing edge
     # has to be refreshed from the store before it is sent. See
@@ -337,12 +339,17 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # and across users (permission-denied at startup). pid + random
         # token makes each instance's names unique; wire-compatibility is
         # free because consumers open whatever segment name the descriptor
-        # carries. The pid embedded in the name also enables the orphan
-        # sweep below.
+        # carries. Under a deployment namespace the segments are named like
+        # its tensor files, so its lock marks them live and the dead-
+        # namespace sweep reclaims them; a pid cannot, since /proc is per
+        # PID namespace and containers can share /dev/shm. Without one, the
+        # pid in the name drives the orphan sweep below.
         import secrets
 
         self._sweep_orphans()
-        base = (f"mstar_arena_{my_entity_id}_{os.getpid()}_"
+        ns = self._shm_namespace
+        base = (f"mstar_{ns}_arena_{my_entity_id}_{secrets.token_hex(4)}"
+                if ns else f"mstar_arena_{my_entity_id}_{os.getpid()}_"
                 f"{secrets.token_hex(4)}")
         self._arena = SegmentedShmArena.create(
             base, segment_mb << 20, max_segments)
@@ -871,13 +878,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         )
                         self.tensor_store.increment_ref(info.uuid, 1)
                         continue
-                    if self.tensor_store.check_uuid_presence(info.uuid):
-                        self.tensor_store.increment_ref(info.uuid, 1)
+                    producer_uuid = info.uuid
+                    if self._take_cached_read(request_id, info):
                         continue
                     if info.shm_segment is None:
                         # Spilled at the producer (arena saturated): read the
                         # per-uuid file, the old protocol's path.
-                        path = self._shm_path(info.source_entity, info.uuid)
+                        path = self._shm_path(info.source_entity, producer_uuid)
                         with open(path, "rb") as f:
                             f.seek(info.offset)
                             data = f.read(info.nbytes)
@@ -972,6 +979,15 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         return t.clone()  # CPU consumer: own the bytes past reclaim
 
     # -- reclaim ----------------------------------------------------------
+
+    def unlink_owned_files(self) -> None:
+        """The spill files, then this arena's own segments, for a process that
+        is stopping: its exit-time finalizer never runs when a hung teardown
+        ends in SIGKILL or the watchdog's hard exit. Peers keep the mappings
+        they have; the finalizer still runs at a normal exit and finds them
+        gone, and unlinks any segment grown after this call."""
+        super().unlink_owned_files()
+        _unlink_paths(list(self._own_segment_paths))
 
     def close(self) -> None:
         """Stop the wake watcher and unregister every pinned segment (the

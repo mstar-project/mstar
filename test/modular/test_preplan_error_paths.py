@@ -56,6 +56,9 @@ def _fake_worker() -> Worker:
     )
     # No stream buffers in the fake, so _return_streaming_edge no-ops.
     w.request_state = SimpleNamespace(per_request_info={})
+    w.engine_manager = SimpleNamespace(
+        get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
+    )
     return w
 
 
@@ -99,7 +102,8 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
     assert spec.plan_future is None
     assert sorted(w.despeculated) == ["a", "b"]
     assert w.pushed_back == ["b"]
-    assert w.failed == [{"a": "Error in worker: RuntimeError: boom"}]
+    assert list(w.failed[0]) == ["a"] and len(w.failed) == 1
+    assert w.failed[0]["a"].startswith("Error in worker: internal error (error id ")
     # The step never ran, so its staged stream chunks are un-ingested and go
     # back to their buffers -- the fresh rid pushed back above would otherwise
     # hold one in a slot the next ingest can overtake.
@@ -128,7 +132,7 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     w.engine_manager = SimpleNamespace(get_engine=lambda name: engine)
     released = []
     node_batch = SimpleNamespace(
-        node_name="dit", launch_started_event=None, preplanned_rids=("a",),
+        node_name="dit", launch_started_event=None, preplanned_rids=("a",), read_check_rids=None,
         request_ids=("a",), release_waiters=lambda: released.append(True),
         per_request_info={"a": SimpleNamespace(request_id="a")},
     )

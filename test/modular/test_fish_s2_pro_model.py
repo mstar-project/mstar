@@ -446,8 +446,8 @@ def test_check_stop_on_im_end_on_the_frame_limit_and_not_with_ignore_eos():
 
     def info(ignore_eos=False):
         return SimpleNamespace(
-            step_metadata={"ar_max_tokens": 3},
-            max_tokens=99,
+            step_metadata={},
+            max_tokens=3,
             resource_configs={AR_SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)},
         )
 
@@ -609,10 +609,12 @@ def test_process_prompt_lays_out_clones_and_validates_requests():
     ids, prefix_len = model.build_prompt("hi", "r", 21)
     assert list(out.new_input_tensors) == ["prompt_ids"]
     assert out.new_input_tensors["prompt_ids"][0].tolist() == ids
-    assert out.metadata == {"prompt_layout": [prefix_len, 21], "ref_clip_key": clip_digest(clip)}
+    assert {key: value for key, value in out.metadata.items() if key != "kv_layout"} == {
+        "prompt_layout": [prefix_len, 21], "ref_clip_key": clip_digest(clip),
+    }
 
     plain = model.process_prompt("hi", ["text"], ["audio"])
-    assert plain.metadata == {"prompt_layout": [0, 0]}
+    assert {key: value for key, value in plain.metadata.items() if key != "kv_layout"} == {"prompt_layout": [0, 0]}
     for prompt, inputs, outputs, tensors, match in [
         ("  ", ["text"], ["audio"], None, "non-empty"),
         ("hi", ["image"], ["audio"], None, "takes text input"),
@@ -623,9 +625,7 @@ def test_process_prompt_lays_out_clones_and_validates_requests():
         with pytest.raises(ValueError, match=match):
             model.process_prompt(prompt, inputs, outputs, tensors)
     with pytest.raises(ValueError, match="max_new_tokens must be in 1..4096"):
-        model.process_prompt("hi", ["text"], ["audio"], max_new_tokens=5000)
-    with pytest.raises(ValueError, match="exceeds the 32,768-token context"):
-        model.process_prompt("x" * 480, ["text"], ["audio"], max_new_tokens=64)
+        model.get_max_output_tokens(max_new_tokens=5000)
 
 
 # ---------------------------------------------------------------------------
@@ -663,7 +663,6 @@ def test_partition_state_machine_routes_clones_through_the_ref_encoder():
     }
     assert clone.step_metadata == {
         "is_prefill": True,
-        "ar_max_tokens": 7,
         "prompt_layout": [5, 21],
         "ref_clip_key": "k",
     }

@@ -4,9 +4,12 @@ from mstar.model.base import Model
 
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
+    "canary": ("mstar.model.canary.canary_model", "CanaryModel"),
+    "canary_qwen": ("mstar.model.canary_qwen.canary_qwen_model", "CanaryQwenModel"),
     "chatterbox": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_multilingual": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_turbo": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
+    "command_a_plus": ("mstar.model.command_a_plus.command_a_plus_model", "CommandAPlusModel"),
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_edge": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
@@ -44,6 +47,12 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
+    # NVIDIA Canary-1B-v2: FastConformer encoder + Transformer decoder, speech
+    # recognition in 25 European languages and translation to/from English.
+    "canary": {"model_path_hf": "nvidia/canary-1b-v2"},
+    # NVIDIA Canary-Qwen-2.5B: Canary's FastConformer encoder feeding a
+    # LoRA-adapted Qwen3-1.7B (NeMo SALM); English speech recognition.
+    "canary_qwen": {"model_path_hf": "nvidia/canary-qwen-2.5b"},
     # Resemble AI Chatterbox: Llama-520M T3 speech-token LM + S3Gen flow
     # matching decoder + HiFT vocoder, zero-shot voice cloning with CFG and
     # exaggeration control. The Turbo checkpoint is a GPT-2-medium T3 with a
@@ -53,6 +62,7 @@ HF_MODELS: dict[str, dict] = {
     "chatterbox": {"model_path_hf": "ResembleAI/chatterbox"},
     "chatterbox_multilingual": {"model_path_hf": "ResembleAI/chatterbox", "variant": "multilingual"},
     "chatterbox_turbo": {"model_path_hf": "ResembleAI/chatterbox-turbo"},
+    "command_a_plus": {"model_path_hf": "CohereLabs/command-a-plus-05-2026-bf16"},
     # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
     # Cosmos3-Nano-Policy-DROID — Nano-sized action-policy fine-tune for the

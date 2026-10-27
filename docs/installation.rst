@@ -58,7 +58,7 @@ console scripts, ``mstar`` and ``mstar-serve``.
 .. important::
 
    **For CUDA installs, always pass** ``--torch-backend=auto``. ``mstar`` floors
-   PyTorch at 2.9 (``torch>=2.9.1`` / ``torchvision>=0.24.1`` / ``torchaudio>=2.9.1``).
+   PyTorch at 2.10 (``torch>=2.10.0`` / ``torchvision>=0.25.0`` / ``torchaudio>=2.10.0``).
    The flag tells
    ``uv`` to detect your driver's CUDA version and fetch the **matching** torch build
    — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
@@ -120,6 +120,14 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - BAGEL runtime for Intel XPU. Pins ``vllm-xpu-kernels==0.1.15.4`` for
        batched token sampling with per-request RNG state on the device.
        Install the matching XPU build of PyTorch.
+   * - ``.[command_a_plus]``
+     - Command A+ runtime: ``flashinfer-python>=0.6.18`` (its one-kernel all-reduce),
+       ``transformers>=5.17`` (the version its Hugging Face parity checks use),
+       ``huggingface-hub``, ``safetensors``, ``mooncake-transfer-engine``, and ``ninja``
+       (speeds up the JIT build of the vendored MoE align kernel). Set ``CUDA_HOME`` to a
+       CUDA toolkit matching PyTorch's so that kernel can build. ``.[all]`` allows older
+       FlashInfer and Transformers for the other models, so add ``.[command_a_plus]``
+       when installing both.
    * - ``.[qwen3_omni]``
      - Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and
        ``ninja`` (speeds up the JIT build of the vendored MoE align kernel).
@@ -148,6 +156,12 @@ Model families and some output formats need extra packages, exposed as pip *extr
        package metadata allows ``m-star`` to be published on PyPI. **Also needs**
        ``flash-attn-4``, which is installed separately —
        see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_.
+   * - ``.[asr]``
+     - Speech recognition models: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``einops``, ``soundfile`` (WAV / FLAC / OGG / MP3 uploads), ``torchcodec``
+       (FFmpeg-backed decoding of the other formats), ``huggingface-hub``,
+       ``mooncake-transfer-engine``, and ``datasets`` / ``jiwer`` for
+       ``benchmark/asr_eval.py``.
    * - ``.[audio]``
      - ``soundfile`` — only needed to return **non-WAV** audio containers (mp3/flac/…)
        from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
@@ -230,7 +244,9 @@ The GPU model families depend on:
 - **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for
   multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory
   (``SHM``) or ``TCP`` transport instead (see :doc:`serving`, which also covers the network
-  it needs).
+  it needs). The extras install Mooncake's CUDA 12 wheel; next to a CUDA 13 torch
+  (``+cu130``) swap in its CUDA 13 build, as the Docker images do (see
+  :ref:`mooncake-cuda13`).
 
 Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
 installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
@@ -290,7 +306,7 @@ build from source (see `No matching wheel — build from source`_ below).
 The wheels live on flash-attn's `GitHub releases
 <https://github.com/Dao-AILab/flash-attention/releases>`_, named by CUDA major, torch
 **minor** version, Python tag, and C++ ABI. ``mstar`` no longer pins torch (floor
-``>=2.9.1``), so the wheel's ``torchX.Y`` tag must match **whatever torch you actually
+``>=2.10.0``), so the wheel's ``torchX.Y`` tag must match **whatever torch you actually
 installed**, and its ``cu1x`` must match that torch's CUDA build — not your system toolkit.
 Check both first:
 
@@ -298,25 +314,20 @@ Check both first:
 
    python -c "import torch; print(torch.__version__, torch.version.cuda)"
    # e.g. 2.12.1+cu130 13.0  ->  torch2.12 / cu13
-   #      2.9.1+cu128  12.8  ->  torch2.9  / cu12
+   #      2.10.0+cu130 13.0  ->  torch2.10 / cu13
 
 Pick the release that has a wheel for your torch minor (each flash-attn release lists which
 ``torchX.Y`` tags it ships), then install it by **direct URL** (don't use ``--find-links`` —
 uv sorts the ``+cu13…`` local version above ``+cu12…`` and will grab cu13 even on a CUDA 12
-box). The examples below are for **torch 2.9**; substitute the ``torch2.9`` segment with your
-own tag. Note the prebuilt wheels **top out at** ``torch2.10`` (``cu13``, in release
-``v2.8.3``) — there is **no** ``torch2.11+`` wheel, so on newer torch (e.g. 2.12) you must
-build from source instead:
+box). The example below is for **torch 2.10**, the floor. The prebuilt wheels **top out at**
+``torch2.10``, and only for ``cu13`` (release ``v2.8.3``): on a cu12 torch, or on torch 2.11+,
+you must build from source instead:
 
 .. code-block:: bash
 
-   # torch built for CUDA 12.x (cu12)
+   # torch 2.10 built for CUDA 13.x (cu13)
    uv pip install \
-     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
-
-   # torch built for CUDA 13.x (cu13)
-   uv pip install \
-     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
 Because it's a binary wheel nothing compiles, so your *system* CUDA version is irrelevant —
 only the torch build matters. Verify with:
@@ -414,19 +425,9 @@ look for ``--torch-backend`` if unsure; ``export UV_TORCH_BACKEND=auto`` is equi
 
 .. note::
 
-   **Mooncake on a CUDA 13 torch.** The extras install ``mooncake-transfer-engine``,
-   Mooncake's default wheel, which is built for CUDA 12 and links ``libcudart.so.12``. An extra
-   can't choose a dependency by CUDA version, so it installs that wheel next to a cu130 torch
-   too. A CUDA 13 torch doesn't bring the CUDA 12 runtime, so ``TCP`` and ``RDMA`` transport
-   fail at startup with ``libcudart.so.12: cannot open shared object file``; ``SHM`` is not
-   affected. Swap in Mooncake's CUDA 13 build, which installs the same ``mooncake`` package:
-
-   .. code-block:: bash
-
-      uv pip uninstall mooncake-transfer-engine
-      uv pip install --reinstall --no-deps mooncake-transfer-engine-cuda13
-
-   Installing an extra again puts the CUDA 12 build back, so repeat the swap afterwards.
+   **Mooncake on a CUDA 13 torch.** The extras install Mooncake's CUDA 12 wheel, which can't
+   load next to a cu130 torch, so ``TCP`` and ``RDMA`` transport fail at startup; ``SHM`` is
+   not affected. Swap in its CUDA 13 build as described in :ref:`mooncake-cuda13`.
 
 **Manual fallback.** If you can't use the flag, install the pinned torch trio from the
 matching CUDA index **first**, then install ``mstar`` (the resolver then treats the
@@ -435,13 +436,18 @@ requirement as already satisfied):
 .. code-block:: bash
 
    # pick the index for your CUDA toolkit: cu128 (CUDA 12.8), cu130 (CUDA 13.x), …
-   uv pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+   uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
        --index-url https://download.pytorch.org/whl/cu128
-   uv pip install -e ".[all]"
+   uv pip install -e ".[all]" "torchcodec==0.10.*"
 
 Check your driver's CUDA version with ``nvidia-smi`` and pick the closest build at
-https://pytorch.org/get-started/locally/. Keep all three packages on the same ``2.9`` /
-``0.24`` line — ``torchvision`` and ``torchaudio`` are versioned in lockstep with ``torch``.
+https://pytorch.org/get-started/locally/. Keep all three packages on the same ``2.10`` /
+``0.25`` line — ``torchvision`` and ``torchaudio`` are versioned in lockstep with ``torch``.
+``torchcodec`` doesn't declare its ``torch`` version, so the resolver otherwise picks the
+newest release (0.17 at the time of writing), which fails to load next to torch 2.10; 0.10
+is the release built against it.
+The ``[asr]`` extra pins that pair itself (``torch`` 2.10 with ``torchcodec`` 0.10, as in the
+Docker images), so installing it puts ``torch`` on 2.10.
 
 Verify the install
 ------------------
@@ -563,6 +569,8 @@ Fix — complete the environment's own cuDNN so it never falls back to the syste
 
 ``--no-deps`` leaves torch in place; pip may print a harmless warning that torch pins
 ``9.20.0.48``. cuDNN is ABI-compatible within the v9 series, so the newer patch runs fine.
+
+.. _mooncake-cuda13:
 
 ``libcudart.so.12: cannot open shared object file``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

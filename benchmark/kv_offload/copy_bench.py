@@ -24,8 +24,10 @@ import time
 import torch
 
 from mstar.engine.resources.kv import cpu_page_pool, page_copier
-from mstar.engine.resources.kv.cache import KVCache
+from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.cpu_page_pool import PageCopies
+from mstar.engine.resources.kv.manager import PageArena
 
 
 def sleep_cycles_per_ms() -> float:
@@ -39,19 +41,19 @@ def sleep_cycles_per_ms() -> float:
 
 def measure(pool, kv, n, direction, queued_cycles):
     gpu = kv.tensor
-    src, dst = list(range(1, n + 1)), list(range(n + 1, 2 * n + 1))
+    src, dst, host = list(range(1, n + 1)), list(range(n + 1, 2 * n + 1)), list(range(n))
 
     def stage():
         if direction == "reload":
-            pool.offload_stream("r", "main", gpu, src, stored_len=0, position=0)
+            pool.copy_out(gpu, PageCopies(gpu=src, cpu=host))
             pool.sync()
         torch.cuda.synchronize()
 
     def run():
         if direction == "offload":
-            pool.offload_stream("r", "main", gpu, src, stored_len=0, position=0)
+            pool.copy_out(gpu, PageCopies(gpu=src, cpu=host))
         else:
-            pool.reload_stream("r", "main", gpu, dst)
+            pool.copy_in(gpu, PageCopies(gpu=dst, cpu=host))
 
     stage()
     torch.cuda._sleep(queued_cycles)
@@ -60,7 +62,6 @@ def measure(pool, kv, n, direction, queued_cycles):
     pool.sync()
     host_ms = (time.perf_counter() - start) * 1e3
     torch.cuda.synchronize()
-    pool.remove_request("r")
 
     stage()
     stream = pool._get_stream()
@@ -70,7 +71,6 @@ def measure(pool, kv, n, direction, queued_cycles):
     run()
     e.record(stream)
     torch.cuda.synchronize()
-    pool.remove_request("r")
     return host_ms, s.elapsed_time(e)
 
 
@@ -96,7 +96,7 @@ def main():
     )
     kv = KVCache(cfg, torch.device("cuda"), getattr(torch, args.dtype))
     kv.tensor.normal_()
-    pool = cpu_page_pool.CPUPagePool(cfg, kv, max(counts))
+    pool = cpu_page_pool.CPUPagePool(cfg, kv, PageArena(kv_cache=None, allocator=PageAllocator(max(counts))))
     page_bytes = kv.tensor[:, 0].numel() * kv.tensor.element_size()
     queued = int(args.queued_ms * sleep_cycles_per_ms())
 
