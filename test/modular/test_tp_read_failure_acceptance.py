@@ -59,6 +59,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.graph.runtime.base import PhasedPostprocess
 from mstar.utils.ipc_format import WorkerMessageType
 
 HERE = Path(__file__).resolve().parent
@@ -375,7 +376,7 @@ def _engine(rank, group, kv, prefix_cache, graph_runtime):
     return engine
 
 
-class _Graph:
+class _Graph(PhasedPostprocess):
     """The graph runtime and request state of one rank, for one node: a row is
     ready once each of its walk's inputs landed, and what the rank routes and
     sends is reported to the parent."""
@@ -697,6 +698,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._stream_partition = {}
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._innermost_loop_by_node = {}
+    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._metrics = None
     for setup in _DESIGN_SETUP:
         if hasattr(w, setup):
