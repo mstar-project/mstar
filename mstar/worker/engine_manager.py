@@ -179,8 +179,9 @@ class EngineManager:
         conductor resolved for it (``Model.get_request_resource_configs``)."""
         self.engine.add_request(request_id, resource_configs)
 
-    def remove_request(self, request_id: str) -> None:
-        self.engine.remove_request(request_id)
+    def remove_request(self, request_id: str) -> set[str]:
+        """Tear the request down; returns the resources it handed pages back to."""
+        return self.engine.remove_request(request_id)
 
     def evictable_nodes(self) -> list[str]:
         """Nodes whose state can be reclaimed. The worker keeps the per-request

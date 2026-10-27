@@ -9,12 +9,12 @@ then maps the resulting modality chunks back to OpenAI shapes: text into
 from __future__ import annotations
 
 import base64
-import codecs
 
 from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
+from mstar.utils.utf8_stream import Utf8Stream
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
@@ -109,7 +109,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
     role = {"role": "assistant"}
     failed = False
     # a byte-level BPE token's bytes can end inside a character: hold them
-    text = codecs.getincrementaldecoder("utf-8")("replace")
+    text = Utf8Stream()
     try:
         # One yield per batch of text chunks: the tokens a request had waiting
         # when its handler ran go out as one body frame (one write), which is
@@ -119,7 +119,7 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
             text_events: list[str] = []
             for c in batch:
                 if c.modality == "text":
-                    content = text.decode(c.data)
+                    content = text.feed(c.data)
                     if content:
                         text_events.append(chunk({**role, "content": content}))
                         role = {}
@@ -154,6 +154,6 @@ async def _stream_events(batches, model_name, request_id, sample_rate):
         failed = True
         yield error(str(exc.detail), exc.status_code)
     if not failed:
-        tail = text.decode(b"", final=True)
+        tail = text.flush()
         yield chunk({**role, "content": tail} if tail else role, finish="stop")
     yield SSE_DONE

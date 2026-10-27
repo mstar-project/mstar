@@ -179,7 +179,8 @@ def _state(pid: int) -> str | None:
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[0]
-    except FileNotFoundError:
+    # a process exiting mid-read can fail the read with ESRCH instead
+    except (FileNotFoundError, ProcessLookupError):
         return None
 
 

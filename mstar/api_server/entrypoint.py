@@ -53,6 +53,7 @@ from mstar.observability.metrics import (
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
@@ -254,9 +255,10 @@ class PendingRequest:
     output_modalities: list[str]
     profile: RequestProfile
     event: threading.Event = field(default_factory=threading.Event)
+    # Unread outputs; a streaming consumer takes ownership of each drained list.
     chunks: list[ResultChunk] = field(default_factory=list)
     output_chunk_counts: dict[str, int] = field(default_factory=dict)
-    consumed_chunks: int = 0
+    output_totals: dict[str, OutputInfo] = field(default_factory=dict)
     error: Any | None = None
     error_status: int = 500
     # Set by the streaming handler on its event loop; the message thread wakes
@@ -921,6 +923,13 @@ class APIServer:
                                 rid, req.request_id,
                             ).encode("utf-8")
                         req.chunks.append(result_chunk)
+                        if self.log_stats:
+                            info = req.output_totals.get(result_chunk.modality)
+                            if info is None:
+                                info = OutputInfo(modality=result_chunk.modality, count=0, total_bytes=0)
+                                req.output_totals[result_chunk.modality] = info
+                            info.count += 1
+                            info.total_bytes += len(result_chunk.data)
                         to_wake[id(req)] = req
 
                         if result_chunk.modality == "error":
@@ -1035,10 +1044,8 @@ class APIServer:
                 with self.request_lock:
                     req = self.pending_requests.get(key)
                     if req:
-                        avail = len(req.chunks)
-                        consumed = req.consumed_chunks
-                        new_chunks = req.chunks[consumed:avail]
-                        req.consumed_chunks = avail
+                        new_chunks = req.chunks
+                        req.chunks = []
                         done = req.event.is_set()
                     else:
                         done = True
@@ -1059,7 +1066,8 @@ class APIServer:
                         req = self.pending_requests.get(key)
                         if req:
                             if not errored:
-                                remaining = req.chunks[req.consumed_chunks:]
+                                remaining = req.chunks
+                            req.chunks = []
                             finished_req = self.pending_requests.pop(key, None)
                             self._retire(key)
                     # Profiling (incl. the optional file write) runs outside the
@@ -1244,7 +1252,7 @@ class APIServer:
         self.metrics.record(req, outcome)
 
     def _finalize_profile(self, req: PendingRequest) -> None:
-        """Stamp the finish time, aggregate output sizes, and emit the report.
+        """Stamp the finish time, attach output totals, and emit the report.
 
         Called once per request from whichever completion path pops it
         (streaming or non-streaming), after the request has been removed from
@@ -1256,16 +1264,8 @@ class APIServer:
 
         req.profile.timing.finish_time = time.perf_counter()
 
-        # Aggregate the collected chunks into per-modality output info.
-        by_modality: dict[str, OutputInfo] = {}
-        for chunk in req.chunks:
-            info = by_modality.get(chunk.modality)
-            if info is None:
-                info = OutputInfo(modality=chunk.modality, count=0, total_bytes=0)
-                by_modality[chunk.modality] = info
-            info.count += 1
-            info.total_bytes += len(chunk.data)
-        req.profile.outputs = list(by_modality.values())
+        # Accepted-output totals survive streaming drains without retaining payloads.
+        req.profile.outputs = list(req.output_totals.values())
 
         try:
             pretty_print_profile(req.profile, self.log_stats_file)
@@ -1710,16 +1710,20 @@ async def generate_ws(websocket: WebSocket):
         except (WebSocketDisconnect, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
-            reply = {"request_id": request_id, "error": str(exc)}
             if isinstance(exc, HTTPException):
-                reply.update(error=exc.detail, status=exc.status_code)
-            if isinstance(exc, HTTPException) and exc.status_code < 500:
-                logger.info(
-                    "generate/ws request %s refused (%d): %s",
-                    request_id, exc.status_code, exc.detail,
-                )
+                reply = {"request_id": request_id, "error": exc.detail, "status": exc.status_code}
+                if exc.status_code < 500:
+                    logger.info(
+                        "generate/ws request %s refused (%d): %s",
+                        request_id, exc.status_code, exc.detail,
+                    )
+                else:
+                    logger.exception("generate/ws request failed")
             else:
-                logger.exception("generate/ws request failed")
+                text, _ = client_error_text(
+                    exc, f"generate/ws request {request_id} failed", log=logger, type_name=False,
+                )
+                reply = {"request_id": request_id, "error": text}
             try:
                 await send(reply, binary)
             except Exception:  # noqa: BLE001
@@ -1925,7 +1929,10 @@ async def generate(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        text, _ = client_error_text(
+            e, f"generate request {request_id} failed", log=logger, type_name=False,
+        )
+        raise HTTPException(status_code=500, detail=text) from e
     finally:
         # Deferred cleanup of uploaded files
         if file_paths:

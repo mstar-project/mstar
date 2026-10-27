@@ -59,6 +59,7 @@ from mstar.model.submodule_base import (
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
@@ -406,8 +407,12 @@ class ExecutingBatch:
         self.outputs_ready.set()
         self.commit_done.set()
 
-    def register_failure(self, rid: int, error: Exception):
-        self.failed_requests[rid] = f"{type(error).__name__}: {error}"
+    def register_failure(self, rid: int, error: Exception, walk: str | None = None):
+        self.failed_requests[rid], _ = client_error_text(
+            error,
+            f"request {rid} failed (node={self.node_name}, walk={walk or self.graph_walk})",
+            log=logger,
+        )
 
     def drop_rids(self, rids: set[int]):
         """Take rids out of the step, leaving the rest of the batch intact."""
@@ -999,11 +1004,7 @@ class Engine:
                     # the submodule reads a mixed step's rows by their own walk
                     req_inputs.graph_walk = row_walk
             except Exception as error:
-                logger.exception(
-                    "prepare_inputs failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, row_walk,
-                )
-                batch.register_failure(rid, error)
+                batch.register_failure(rid, error, walk=row_walk)
                 continue
             if req_inputs is None:
                 batch.skipped_rids.add(rid)
@@ -1752,10 +1753,6 @@ class Engine:
                     inputs=node_inputs,
                 )
             except Exception as error:
-                logger.exception(
-                    "postprocess failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, batch.step_context.graph_walk,
-                )
                 batch.register_failure(rid, error)
         if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
             live = [
@@ -1854,10 +1851,6 @@ class Engine:
                     rid, batch.per_request_info_wrapped[rid], rid_outputs
                 )
             except Exception as error:
-                logger.exception(
-                    "check_stop failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, batch.step_context.graph_walk,
-                )
                 batch.register_failure(rid, error)
                 continue
             if rid_stops:
@@ -2659,11 +2652,20 @@ class Engine:
     ) -> None:
         self._runner.ingest_request(request_id, overrides)
 
-    def remove_request(self, request_id: str) -> None:
+    def remove_request(self, request_id: str) -> set[str]:
+        """Tear the request down on every resource. Returns the resources it
+        held pages of that the teardown hands back, which `reclaimable` counts:
+        a KV cache whose pages reach the free list or are left to the prefix
+        index alone. An offloaded request, or one that never ran, frees none."""
         self._loopback_steps.pop(request_id, None)
+        freed = {
+            key for key, resource in self._resources.items()
+            if resource.reclaimable(request_id)
+        }
         self._runner.remove_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
+        return freed
 
     def shutdown(self):
         for resource in self._resources.values():

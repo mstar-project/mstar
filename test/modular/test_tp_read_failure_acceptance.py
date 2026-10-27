@@ -133,6 +133,9 @@ class Scenario:
     # the follower's read of r1's _FAILING input fails
     fail: bool = True
     prefix_cache: bool = False
+    # rank 1's main loop stalls this long, once, in the first message poll
+    # after its first SCHEDULE_TP, so rank 0 routes that step first
+    follower_stall_s: float = 0.0
     shm_root: str = ""
     store: str = ""
 
@@ -149,12 +152,13 @@ class _Communicator:
     """Messages to and from the parent process, which routes them between the
     ranks and plays the conductor. Every message crosses the wire codec."""
 
-    def __init__(self, worker_id, inbox, outbox, on_message):
+    def __init__(self, worker_id, inbox, outbox, on_message, stall_s=0.0):
         self.worker_id = worker_id
         self.inbox, self.outbox = inbox, outbox
         self.on_message = on_message
         self.stopped = False
         self._held = []
+        self._stall_s, self._scheduled = stall_s, False
 
     def send(self, dest, msg=None):
         from mstar.communication.wire import encode
@@ -173,12 +177,16 @@ class _Communicator:
 
     def get_all_new_messages(self):
         from mstar.communication.wire import decode
+        if self._scheduled and self._stall_s:
+            time.sleep(self._stall_s)
+            self._stall_s = 0.0
         while self._pull(0):
             pass
         if self.stopped:
             raise _Stop
         held, self._held = self._held, []
         messages = [decode(b) for b in held]
+        self._scheduled |= any(m.message_type == WorkerMessageType.SCHEDULE_TP for m in messages)
         self.on_message(messages)
         return messages
 
@@ -752,7 +760,9 @@ def _rank_main(rank, scenario, inbox, outbox):
                     or time.monotonic() - started > TRIGGER_S:
                 reads.fire()
 
-        comm = _Communicator(WORKERS[rank], inbox, outbox, on_message)
+        comm = _Communicator(
+            WORKERS[rank], inbox, outbox, on_message, scenario.follower_stall_s if rank == 1 else 0.0,
+        )
         tm.communicator = comm
         w = _worker(rank, scenario, comm, graph, engine, tm, group)
         try:
@@ -793,8 +803,10 @@ class Run:
     elapsed: float = 0.0
 
     def completed(self, rid):
-        """Rank 0 routed the request's output; it never failed."""
-        return rid in self.routed[0] and rid not in self.failed
+        """Every rank routed the request's output; it never failed. The run
+        stops once each request completed or was torn down, so a follower
+        that routes after rank 0 still gets its outputs recorded."""
+        return all(rid in routed for routed in self.routed.values()) and rid not in self.failed
 
     def torn_down(self, rid):
         return rid in self.failed and self.reads_done.get(rid, set()) >= {0, 1}
@@ -966,6 +978,17 @@ def test_the_failed_rows_pages_never_become_leasable(tmp_path):
             f"rank {rank} would lease the failed row's pages to a new request: "
             f"{run.final[rank]['probe_failed_prefix']}"
         )
+
+
+def test_a_run_waits_for_a_follower_that_routes_after_rank_0(tmp_path):
+    """The harness itself: rank 1 stalls in its poll while its first step runs,
+    so rank 0 has routed both requests before rank 1 has. The run still ends
+    with both requests routed on both ranks, so A4 compares real outputs on
+    every rank, not a follower's missing ones."""
+    run = _run(tmp_path, Scenario(kind="text", fail=False, follower_stall_s=1.5))
+    _healthy_ok(run)
+    for rank in (0, 1):
+        assert set(run.routed[rank]) == {"r0", "r1"}, f"rank {rank}: " + run.summary()
 
 
 @pytest.mark.parametrize("kind", KINDS)
