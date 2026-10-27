@@ -239,6 +239,9 @@ class ParakeetModel(Model):
             check_detected_language(kwargs.get("language"))
         return ProcessPromptOutput(out, {NUM_FRAMES: self._num_frames(samples.shape[0])})
 
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
+
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
