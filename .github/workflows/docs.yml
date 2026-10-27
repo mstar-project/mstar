@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           # CPU-only torch: the API autosummary imports the package, and conf.py
           # deliberately does not mock torch (PEP 604 annotations break under mocks).
-          pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+          pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
             --index-url https://download.pytorch.org/whl/cpu
           # Base install only; GPU-only model extras (flashinfer, transformers, ...)
           # are not needed for the narrative docs. Modules that import them at module

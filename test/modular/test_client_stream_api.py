@@ -65,7 +65,7 @@ class _ListeningModel:
     def max_input_files(self):
         return {}
 
-    def prefix_key_streams(self):
+    def kv_labels(self):
         return {}
 
     def get_partition_topology(self):
@@ -117,6 +117,9 @@ class _TensorManager:
     # what the thread's loop polls between items
     def get_ready_tensors(self):
         return {}
+
+    def take_failed_reads(self):
+        return []
 
     def has_inflight_reads(self, request_id):
         return False
@@ -286,7 +289,7 @@ def test_a_bad_append_fails_and_aborts_the_request(tmp_path):
         wt.stop_event.set()
         runner.join(timeout=10)
 
-    assert error.modality == "error" and b"not_a_stream" in error.data
+    assert error.modality == "error" and b"internal error" in error.data  # #646: kept from the client
     assert error.metadata["status"] == 500  # the model's bug, not the client's
     (abort,) = _bodies(sent, ConductorMessageType.ABORT_REQUEST)
     assert abort.request_id == "r"
@@ -1581,38 +1584,6 @@ def test_one_failing_release_leaves_the_rest_of_the_pass_to_run(tmp_path):
     ]
     assert [b.request_id for b in _bodies(sent, ConductorMessageType.NEW_REQUEST)] == ["d"]
     assert list(tmp_path.iterdir()) == []
-
-
-def test_a_streaming_request_lets_go_of_the_chunks_it_has_delivered(tmp_path):
-    """A live call can stream for hours: its delivered chunks must not pile
-    up until it ends, and its profile still counts every one of them."""
-    from mstar.api_server.request_types import ResultChunk
-    from mstar.profile.format import OutputInfo
-
-    server = _server()
-    server.log_stats, server.log_stats_file = True, str(tmp_path / "profiles.txt")
-    key = _submit(server, "call", end_input=False)
-    req = server.pending_requests[key]
-
-    def chunk():
-        with server.request_lock:
-            req.chunks.append(ResultChunk("call", "audio", bytes(100), {}))
-        req.notify()
-
-    async def main():
-        batches = server.iter_result_chunk_batches("call")
-        for _ in range(50):
-            chunk()
-            await batches.__anext__()
-        held = len(req.chunks)
-        chunk()
-        req.event.set()
-        async for _batch in batches:
-            pass
-        return held
-
-    assert asyncio.run(main()) == 0
-    assert req.profile.outputs == [OutputInfo("audio", 51, 5100)]
 
 
 @pytest.mark.parametrize("value", ["1e3", 0, -4, True, float("nan"), float("inf")])

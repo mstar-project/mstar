@@ -56,7 +56,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.fish_s2_pro.config import (
     ALLOWED_TEXT_SPECIAL_TOKENS,
     AR_ATTN,
@@ -116,6 +116,7 @@ class FishS2ProModel(Model):
     # API tensors the AR prefill consumes; the clone prefill adds ``ref_codes``.
     PREFILL_INPUTS = ("prompt_ids",)
     REF_ENCODER_INPUTS = ("audio_inputs",)
+    LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any) -> None:
         self.model_path_hf = model_path_hf
@@ -377,11 +378,15 @@ class FishS2ProModel(Model):
             ref_frames = self.config.codec.frames_for_samples(num_samples)
         ref_text = str(kwargs.get("ref_text") or "").strip() if clips else None
         ids, prefix_len = self.build_prompt(prompt.strip(), ref_text, ref_frames)
-        if len(ids) + ref_frames + self.get_max_output_tokens(**kwargs) > self.config.slow_ar.max_seq_len:
-            raise ValueError("Fish S2-Pro prompt plus max_new_tokens exceeds the 32,768-token context")
         metadata: dict[str, Any] = {PROMPT_LAYOUT_KEY: [prefix_len, ref_frames]}
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
+        # a clone's walk splices the reference frames into the prompt's rows
+        clone = "audio" in input_modalities
+        rows = len(ids) + ref_frames
+        walk = "ar_prefill_clone" if clone else "ar_prefill"
+        prefill = Span("rows" if clone else "ids", walk, rows, rows, "prompt_ids")
+        metadata["kv_layout"] = {AR_KV: {"main": LabelLayout(spans=(prefill,), growth=(("ar_decode_loop", 1),))}}
         return ProcessPromptOutput({"prompt_ids": [torch.tensor(ids, dtype=torch.long)]}, metadata)
 
     # -----------------------------------------------------------------------
@@ -480,7 +485,7 @@ class FishS2ProModel(Model):
 
     @staticmethod
     def _ar_step_metadata(metadata: CurrentForwardConductorMetadata) -> dict[str, Any]:
-        return {"is_prefill": metadata.is_prefill, "ar_max_tokens": metadata.kwargs["ar_max_tokens"]}
+        return {"is_prefill": metadata.is_prefill}
 
     # -----------------------------------------------------------------------
     # Sampling and output encoding
@@ -520,6 +525,15 @@ class FishS2ProModel(Model):
                 f"Fish S2-Pro max_new_tokens must be in 1..{self.config.codec.max_frames}, got {requested}"
             )
         return requested
+
+    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
+        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
+        return {"ar_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {AR_KV: {"main": KVLabel(
+            growth=(("ar_decode", "ar_decode_loop"),),
+        )}}
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.codec.sample_rate
