@@ -435,7 +435,7 @@ def _closed(t: Transcript) -> Transcript:
     )
 
 
-def _tail(adapter, req, planner: WindowPlanner, window: Window) -> Window | None:
+async def _tail(adapter, req, planner: WindowPlanner, window: Window) -> Window | None:
     """The unfinished tail of a parallel window decoded with timestamps, as a
     window of its own, or None. Near its end Whisper writes the next segment's
     start and ends the window, leaving that speech to the next window, which in
@@ -451,7 +451,7 @@ def _tail(adapter, req, planner: WindowPlanner, window: Window) -> Window | None
     if not MIN_SEEK_SECONDS <= end <= window.duration - MIN_REDECODE_SECONDS:
         return None
     window.transcript = _closed(parsed)
-    return planner.cut(window.offset + end, window.duration - end)
+    return await asyncio.to_thread(planner.cut, window.offset + end, window.duration - end)
 
 
 async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[str], raw_request=None):
@@ -588,7 +588,7 @@ async def create_transcription(
             tails: dict[int, Window] = {}
             collected = 0
             async for window in _parallel(api, adapter, req, windows, inflight, raw_request):
-                tail = await asyncio.to_thread(_tail, adapter, req, planner, window)
+                tail = await _tail(adapter, req, planner, window)
                 if tail is not None:
                     _submit(api, adapter, req, tail, streaming=False, inflight=inflight)
                     tails[collected] = tail
