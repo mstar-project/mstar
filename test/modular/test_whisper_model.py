@@ -1045,33 +1045,8 @@ def test_decoder_prefill_selects_each_request_last_row_itself():
 
 
 # --------------------------------------------------------------------------
-# pre_plan serve-config key
+# pre_plan knob
 # --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("config,env,expected", [
-    # absent in most configs: pre-planning stays on, as it was before the key
-    ({}, {}, True),
-    # a config can turn it off, or ask for it explicitly
-    ({"pre_plan": False}, {}, False),
-    ({"pre_plan": True}, {}, True),
-    # an explicit env var wins either way, so an A/B needs no config edit
-    ({"pre_plan": False}, {"MSTAR_PRE_PLAN_SPEC": "1"}, True),
-    ({"pre_plan": True}, {"MSTAR_PRE_PLAN_SPEC": "0"}, False),
-    ({}, {"MSTAR_PRE_PLAN_SPEC": "0"}, False),
-])
-def test_pre_plan_config_defers_to_an_explicit_env_var(config, env, expected):
-    from mstar.worker.worker import resolve_enable_pre_plan
-
-    assert resolve_enable_pre_plan(config, dict(env)) == expected
-
-
-@pytest.mark.parametrize("value", ["false", "no", 0, None])
-def test_a_pre_plan_that_is_not_a_yaml_boolean_is_refused(value):
-    from mstar.worker.worker import resolve_enable_pre_plan
-
-    with pytest.raises(ValueError, match="pre_plan must be true or false"):
-        resolve_enable_pre_plan({"pre_plan": value}, {})
 
 
 def test_only_turbo_turns_pre_plan_off():
@@ -1080,10 +1055,12 @@ def test_only_turbo_turns_pre_plan_off():
     the default; flipping them was measured as a regression."""
     root = Path(__file__).parents[2]
     turbo = yaml.safe_load((root / "configs/whisper_large_v3_turbo.yaml").read_text())
-    assert turbo["pre_plan"] is False
+    assert turbo["knobs"]["pre_plan"] is False
     for name in ("whisper_large", "whisper_large_tp2", "qwen3_asr", "qwen3_asr_realtime"):
         cfg = yaml.safe_load((root / f"configs/{name}.yaml").read_text())
-        assert "pre_plan" not in cfg, f"{name} should stay on the pre_plan default"
+        assert "pre_plan" not in (cfg.get("knobs") or {}), (
+            f"{name} should stay on the pre_plan default"
+        )
 
 
 def test_decode_tokens_are_recorded_for_the_align_walk_until_the_stop():

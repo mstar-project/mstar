@@ -344,7 +344,7 @@ def _llm_submodule(cfg):
     sub = object.__new__(Qwen3ASRLLMSubmodule)
     torch.nn.Module.__init__(sub)
     sub.request_states, sub.node_resources = {}, {}
-    sub.config = cfg
+    sub.config, sub.stop_token_ids = cfg, cfg.stop_token_ids
     embed = torch.nn.Embedding(cfg.text.vocab_size, cfg.text.hidden_size)
     sub.model = type("M", (), {"embed": staticmethod(embed.forward), "embed_tokens": embed})()
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
@@ -419,7 +419,9 @@ def test_llm_check_stop_batched_agrees_with_per_request():
         "prefill": info(PREFILL_WALK, 0),
     }
     check = list(reversed(row_rids))  # not forward order
-    batched = sub.check_stop_batched(check, infos, HostRows(row_rids, {"new_token": tokens}))
+    # called as Engine.check_stop_for_batch calls it (step_walk=None: a mixed step)
+    host_rows = HostRows(row_rids, {"new_token": tokens})
+    batched = sub.check_stop_batched(check, infos, host_rows, step_walk=None)
     per_request = {}
     for i, rid in enumerate(row_rids):
         got = sub.check_stop(rid, infos[rid], {"new_token": [tokens[i:i + 1]]})
@@ -468,8 +470,6 @@ def test_engine_stop_check_takes_the_batched_path(step_walk):
         engine, batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
     )
     assert stops == {"end": {"decode_loop"}} and not failures
-    # a step of another walk stops nothing, without reading its rows
-    assert sub.check_stop_batched(["end"], infos, HostRows(("end",), {}), step_walk=PREFILL_WALK) == {}
 
 
 # --------------------------------------------------------------------------

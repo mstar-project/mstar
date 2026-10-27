@@ -23,7 +23,7 @@ class TokenStepNode:
     DECODE_LOOP = "decode_loop"
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     SAMPLER: str
-    MAX_PREFILL_BATCH_SIZE: int
+    MAX_PREFILL_BATCH_SIZE: int | None
     stop_token_ids: frozenset[int]
 
     def get_accelerator_graph_configs(
@@ -70,9 +70,11 @@ class TokenStepNode:
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "new_token" not in outputs:
+        # a batched decode step routes its token as text_inputs alone
+        tokens = outputs.get("text_inputs") or outputs.get("new_token")
+        if not tokens:
             return set()
-        return {self.DECODE_LOOP} if self._stops(outputs["new_token"][0].item(), request_info) else set()
+        return {self.DECODE_LOOP} if self._stops(tokens[0].item(), request_info) else set()
 
     def check_stop_batched(
         self,

@@ -126,7 +126,6 @@ def _rank(
     w.is_tp_follower = tp_rank > 0
     w.enable_nvtx, w._phase_period, w._phase_buf = False, 0, {}
     w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
-    w._enable_pre_plan = True  # what Worker.__init__ resolves with MSTAR_PRE_PLAN_SPEC and pre_plan unset
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}

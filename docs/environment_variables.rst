@@ -469,11 +469,12 @@ Worker scheduling
        ``0`` with it: that throttle holds the GPU thread until step N drains,
        which serialises the very overlap this flag buys.
    * - ``MSTAR_PRE_PLAN_SPEC``
-     - ``1``
+     - config's ``knobs: pre_plan``, else ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
-       thread. Unset, the serve config's ``pre_plan:`` decides (default on);
-       set, it overrides it. Read in ``Worker.__init__``.
+       thread, which Whisper turbo's serve config sets: its 4-layer steps
+       are too short to hide the planning in. Read by
+       ``knobs.pre_plan_enabled``.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads

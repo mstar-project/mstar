@@ -4,7 +4,8 @@
 model: "whisper_large_v3_turbo"
 max_seq_len: 448
 max_concurrent_requests: 64
-pre_plan: false
+knobs:
+  pre_plan: false
 rank_devices: {0: 0, 1: 0}
 mps: true
 resources:
