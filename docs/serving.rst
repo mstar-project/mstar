@@ -249,12 +249,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        conductor's queue, except a live call (open client input), which is refused with
        a 503.
    * - ``routing_weights``
-     - *(optional)* The weights of the data-parallel replica pick (see below):
-       ``load`` for the live requests on a replica, and a resource key for that
-       resource's prediction. Each is a finite number >= 0 and defaults to 1.0; any other
-       key fails loading. A resource weight above ``load``'s lets a predicted hit outweigh a
-       live request, so concurrent copies of one prompt, warmup copies included, can share
-       a replica.
+     - *(optional)* The weights of the data-parallel replica pick (see below), one per
+       term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
+       the prompt predicted in its KV prefix cache. Each is a finite number >= 0 and
+       defaults to 1.0; any other key, or ``load: 0`` while another weight is above 0, fails
+       loading. ``prefix: 0`` picks by load alone. A ``prefix`` weight above ``load``'s lets
+       a predicted hit outweigh a live request, so concurrent copies of one prompt can share
+       a replica. At data parallelism, warmup copies run with ``prefix_cache=False``, so
+       they still spread but do not warm the prefill that starts from cached pages; a
+       warmup spec that sets ``prefix_cache`` keeps its own value.
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
@@ -420,20 +423,29 @@ It doesn't replace the cap.
 replica. The conductor picks it per request, at ingest, as the replica with the lowest
 cost: ``routing_weights.load`` times the live requests on the replica (counted per set of
 groups that pick together, for each request with a partition on them that is not done at
-ingest), plus, for each resource that predicts its state on the replicas, its weight times
-that prediction. Ties go at random. Every term is in request-equivalents. A paged KV cache
-whose prefix cache opens predicts minus the share of the request's prompt positions (every
-label's, keyed or not) it already holds. The worker never matches a prompt's last page, so
-a hit weighs less than one live request: at the default weights a request follows its
-prefix to a replica no busier than the others, never to a busier one, and a hot prefix
-spreads once its replica runs one more request. Groups whose replicas sit on the same
-ranks, replica for replica, take one pick together. The prediction is the conductor's own,
-from each request's page keys and its end; workers send nothing for it. It does not see
-decode growth, preemption or a reply's tokens, so it is approximate, and a wrong
-prediction makes a request slower, never wrong. With no cache that opens (one replica,
-``prefix_cache: false``, or replicas above one rank, where the cache stays off:
-``prefix_cache_tp`` on a pool with replicas fails at startup) the pick is the replica with
-the fewest live requests.
+ingest), plus the price of what the conductor predicts about the request there. Ties go
+at random. Every term is in request-equivalents. Groups whose replicas sit on the same
+ranks, replica for replica, take one pick together.
+
+Today the one prediction is the KV prefix cache's, on the replicas that run a walk keying
+the cache (BAGEL's ``LLM``, also with CFG-parallel nodes): ``routing_weights.prefix``
+times minus the share of the request's prompt positions (every label's, keyed or not)
+the replica's caches are predicted to hold, all the caches on the replica together. The
+worker never matches a prompt's last page, so at the default weights a hit weighs less
+than one live request: a request follows its prefix to a replica no busier than the
+others, never to a busier one, and a hot prefix spreads once its replica runs one more
+request.
+
+The prediction runs the worker's own prefix index (``PrefixIndex``) per replica, over a
+count of each replica's pages, and takes a request's steps at dispatch: its lease of the
+matched pages, its own pages, evicting on a shortfall, and the index entries of its whole
+pages. Its end releases its pages; a request that ends before a pass of it comes back
+(aborted while queued, say) also takes back the entries only it made. Workers send
+nothing for it, so it does not see admit timing, decode growth, preemption or a reply's
+tokens, and it is approximate: a wrong prediction makes a request slower, never wrong.
+With no cache that opens (one replica, ``prefix_cache: false``, no walk that keys it, or
+replicas above one rank, where the cache stays off: ``prefix_cache_tp`` on a pool with
+replicas fails at startup) the pick is the replica with the fewest live requests.
 
 **Single GPU.** Everything on rank 0:
 
@@ -746,10 +758,10 @@ second old:
   ``node_names`` of the config's ``node_groups``), running requests with a pass on that
   node that the conductor dispatched and has not heard back from. The conductor sees
   whole passes, so a node running a request's decode loop counts it once for the loop.
-- ``mstar_routing_predicted_saving_total{model_name, resource}``: counter, per resource
-  that predicts for the data-parallel replica pick, the saving it predicted on the
-  replica each request went to, in request-equivalents. For a KV cache, each request adds
-  the share of its prompt predicted cached there.
+- ``mstar_routing_predicted_saving_total{model_name, term}``: counter, per term of the
+  data-parallel replica cost, the saving predicted on the replica each request went to,
+  in request-equivalents. For ``prefix``, each request adds the share of its prompt
+  predicted cached there.
 - ``mstar_conductor_status_age_seconds{model_name}``: seconds since the API server
   received the last status message, or since metrics were enabled before the first one.
   More than a few seconds means the conductor stopped reporting.

@@ -8,9 +8,9 @@ entry however often it is read, and an entry that surfaces under an older stamp
 is pushed back under the page's own.
 
 Every caller holds the manager's lock, so none of this takes one of its own.
-The conductor's routing mirror predicts this order per replica
-(``_ReplicaPages`` in ``kv/routing.py``), so a change to eviction here belongs
-there too.
+It needs of its arena only the page owner counts and ``seal``, ``retain`` and
+``release``, so the conductor's routing mirror runs it over a counting arena
+(``kv/routing.py``).
 """
 
 import heapq
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 class PrefixIndex:
     def __init__(self, arena: "PageArena") -> None:
-        num_pages = arena.allocator.max_num_pages
+        num_pages = len(arena.num_owners)
         self._arena = arena
         self._by_key: dict[bytes, int] = {}
         self._key: list[bytes | None] = [None] * num_pages
@@ -139,6 +139,14 @@ class PrefixIndex:
         for entry in passed_over:
             heapq.heappush(self._leaves, entry)
         return dropped
+
+    def drop(self, pages: Sequence[int]) -> None:
+        """Remove these pages' entries, last first, each only while it is a
+        leaf the index alone holds: what the routing mirror predicted a request
+        would index, taken back once the request ended without running."""
+        for page in reversed(pages):
+            if self._key[page] is not None and not self._children[page] and self._arena.num_owners[page] == 1:
+                self._remove(page)
 
     def _pop_leaf(self) -> tuple[int, int] | None:
         while self._leaves:

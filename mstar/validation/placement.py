@@ -1,9 +1,12 @@
 """Placement checks: walks and partitions, ``node_groups``, the worker graphs
-they divide into, and the parallel groups each worker is handed."""
+they divide into, the parallel groups each worker is handed, and the weights
+that pick a request's replica among them."""
 
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
+from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.spec import NodeResourceSpec
@@ -26,6 +29,33 @@ def node_groups_problems(config: Mapping[str, Any]) -> list[str]:
         problem for i, group in enumerate(node_groups)
         if (problem := _node_group_entry_problem(i, group))
     ]
+
+
+def routing_weights_problems(config: Mapping[str, Any]) -> list[str]:
+    """``routing_weights``, the data-parallel replica pick's: one per term of
+    the cost, each a finite number >= 0, since the cost is a sum of weighted
+    terms, and ``load`` above 0 when another term is, or nothing would spread
+    a hot prefix."""
+    weights = config.get("routing_weights")
+    if weights is None:
+        return []
+    if not isinstance(weights, Mapping):
+        return [f"routing_weights must be a mapping of {list(RoutingWeights._fields)}; got {weights!r}"]
+    problems = []
+    unknown = sorted(set(weights) - set(RoutingWeights._fields), key=str)
+    if unknown:
+        problems.append(f"routing_weights names {unknown}; it takes {list(RoutingWeights._fields)}")
+    for name, weight in weights.items():
+        if (
+            isinstance(weight, bool) or not isinstance(weight, (int, float))
+            or not math.isfinite(weight) or weight < 0
+        ):
+            problems.append(f"routing_weights.{name} must be a finite number >= 0; got {weight!r}")
+    if not problems and not weights.get("load", RoutingWeights._field_defaults["load"]) and any(
+        weights.get(name, default) for name, default in RoutingWeights._field_defaults.items() if name != "load"
+    ):
+        problems.append("routing_weights.load must be above 0 while another weight is")
+    return problems
 
 
 def _is_count(value: Any, least: int) -> bool:

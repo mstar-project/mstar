@@ -1750,19 +1750,40 @@ Routing across data-parallel replicas
 When a node group has several replicas, the conductor sends each new request to the
 replica where it is cheapest (see "Data-parallel routing" in :doc:`serving`). A resource
 whose state makes a request cheaper on one replica than another takes part through its
-spec, so models declare nothing for it: ``NodeResourceSpec.routing_mirror(ctx)`` returns a
-``RoutingMirror`` or ``None``, the default, where the ``RoutingContext`` ``ctx`` gives the
-group's replica count, the ranks per replica and whether the model names its checkpoint.
-The mirror is conductor-side bookkeeping with three methods. ``score(config)`` gives the
-request's cost on each replica, in request-equivalents (1 weighs as one more live
-request), from the request's ``ResourceReqConfig`` for the resource, which the conductor
-builds and validates before the pick. ``add_request(config, replica)`` records the
-placement once the request is dispatched and returns a handle, and
-``remove_request(handle)`` releases it when the request leaves. The module that defines it
-must stay free of kernels, since the conductor builds it. ``KVSpec`` with a
-``PagedKVConfig`` is the one implementation: it predicts each replica's prefix cache from
-the prompt's page keys, and only where ``PagedKVConfig.prefix_cache_opens`` says the
-workers open the cache.
+spec, so models declare nothing for it.
+
+**The hook.** ``NodeResourceSpec.routing_mirror(ctx)`` returns a ``RoutingMirror`` or
+``None``, the default. The router asks once per set of node groups with replicas that
+holds one of the spec's nodes, and ``ctx`` (a ``RoutingContext``) gives the replica count,
+the ranks per replica, the walks of the worker graphs there that hold the spec's nodes,
+and the model's KV declarations: the resource's keyed labels with the walks that key each
+(empty for a resource that is not a KV cache), and whether the model names a checkpoint.
+A mirror is conductor-side bookkeeping that follows the resource's own rules as far as
+the conductor's inputs allow. The module that defines one must stay free of kernels,
+since the conductor builds it.
+
+**The mirror's methods.** Each is given the request's ``ResourceReqConfig`` for the
+resource, which the conductor builds and validates before the pick.
+
+- ``facts(config)`` reports the request's ``RoutingFacts`` on each replica: named counts,
+  such as ``work`` (prompt positions) and ``kv_hit`` (of those, the ones predicted cached).
+  The router adds every mirror's row on a replica field by field, then prices the sum
+  once with ``routing_cost`` in ``mstar/conductor/routing.py``, one term per
+  ``routing_weights`` key, each 0 when its facts are absent.
+- ``add_request(config, replica)`` records the placement once the request is dispatched,
+  and returns a handle.
+- ``remove_request(handle, ran)`` releases it when the request leaves. ``ran`` says
+  whether a pass came back for one of the request's partitions with a walk on the
+  resource's node groups.
+
+**Adding a resource.** A new resource adds its fields to ``RoutingFacts``, its mirror,
+and its term to ``routing_cost`` and ``RoutingWeights``. ``ReplicaRouter`` changes only
+if its fields are not counts that add, or if its mirror reads a model declaration other
+than the KV ones, which then becomes a ``RoutingContext`` field that ``ReplicaRouter``
+fills. ``KVSpec`` with a ``PagedKVConfig`` is the one implementation. Its mirror runs the
+worker's own ``PrefixIndex`` per replica over a count of the pool's pages, takes each
+request's lease, pages and index entries at dispatch, and exists only where a walk keying
+the cache runs and ``PagedKVConfig.prefix_cache_opens`` says the workers open it.
 
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~

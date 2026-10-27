@@ -2044,7 +2044,7 @@
       "id": 46,
       "type": "timeseries",
       "title": "Predicted routing saving",
-      "description": "Per resource, the saving the data-parallel replica pick predicted on the replica each request went to, in request-equivalents per second (for a KV cache, the predicted share of each prompt cached there). Empty unless a node group has replicas and a resource mirror.",
+      "description": "Per term of the replica cost, the saving the data-parallel replica pick predicted on the replica each request went to, in request-equivalents per second (for prefix, the predicted share of each prompt cached there). Empty unless a node group has replicas and a resource mirror.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -2092,8 +2092,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "sum by (resource) (rate(mstar_routing_predicted_saving_total{model_name=~\"$model\"}[1m]))",
-          "legendFormat": "{{resource}}",
+          "expr": "sum by (term) (rate(mstar_routing_predicted_saving_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{term}}",
           "range": true
         }
       ]

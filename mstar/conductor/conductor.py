@@ -602,10 +602,8 @@ class Conductor:
         }
         self._components = sorted({n for nodes in self._wg_nodes.values() for n in nodes})
         self._router = ReplicaRouter(
-            self.worker_graphs.values(), model.get_partitions(),
-            specs=self._resource_specs().values(),
+            model, self.worker_graphs.values(), specs=self._resource_specs().values(),
             weights=self.model_config.get("routing_weights"),
-            checkpoint_named=lambda: model.checkpoint_path() is not None,
         )
         self._requests_gauge = Gauge(catalog.CONDUCTOR_REQUESTS)
         self._in_flight_gauge = Gauge(catalog.COMPONENT_IN_FLIGHT)
@@ -1464,7 +1462,9 @@ class Conductor:
         """The one way a request leaves ``self.requests``, so what the replica pick recorded cannot leak."""
         request_data = self.requests.pop(request_id, None)
         if request_data is not None and request_data.routing is not None:
-            self._router.remove(request_data.routing)
+            self._router.remove(request_data.routing, [
+                name for name, pstate in request_data.partition_states.items() if pstate.fwd_pass_number
+            ])
 
     def _register_draining(
         self, request_id: str, expected_acks: set[str], participants: set[str],

@@ -166,6 +166,8 @@ def test_warmup_reaches_every_data_parallel_replica() -> None:
     fake = _FakeServer()
     entrypoint._run_warmup_requests(fake, [{"text": "a"}, {"text": "b"}], copies=2)
     assert [s["request_id"] for s in fake.submitted] == ["warmup-0.0.0", "warmup-0.0.1", "warmup-1.0.0", "warmup-1.0.1"]
+    # off the prefix cache, so a prefix weight above load's cannot put the copies on one replica
+    assert all(s["model_kwargs"] == {"prefix_cache": False} for s in fake.submitted)
 
 
 def test_concurrency_runs_copies_together_for_batched_shapes() -> None:

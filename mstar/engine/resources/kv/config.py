@@ -410,17 +410,15 @@ class KVSpec(NodeResourceSpec):
         self.config.apply_yaml_overrides(**kwargs)
 
     def routing_mirror(self, ctx: RoutingContext):
-        if not isinstance(self.config, PagedKVConfig) or not self.config.prefix_cache_opens(
+        """A mirror of the prefix cache where it opens and a walk that keys it runs."""
+        labels = [label for label, walks in ctx.keyed.items() if ctx.walks.intersection(walks)]
+        if not labels or not isinstance(self.config, PagedKVConfig) or not self.config.prefix_cache_opens(
             ctx.instance_size, ctx.checkpoint_named,
         ):
             return None
         from mstar.engine.resources.kv.routing import KVRoutingMirror
 
-        return KVRoutingMirror(
-            ctx.num_replicas,
-            # without SINK_PAGE, which the pool never hands out
-            capacity=self.config.max_num_pages - 1, page_size=self.config.page_size,
-        )
+        return KVRoutingMirror(ctx.num_replicas, self.config.max_num_pages, self.config.page_size, labels)
 
 
 @dataclass(frozen=True)

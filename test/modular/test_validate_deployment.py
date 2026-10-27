@@ -424,10 +424,18 @@ def test_resource_over_local_nodes_in_different_parallel_groups_is_refused(tmp_p
     ([_Spec("a", {"llm"}, deps={"b"}), _Spec("b", {"llm"}, deps={"a"})], {},
      r"dependency cycle among resources \['a', 'b'\]"),
     # NaN would make every replica's cost NaN, and every DP ingest fail
-    ([_Spec("kv", {"llm"})], {"routing_weights": {"kv": float("nan")}},
-     r"routing_weights.kv must be a finite number >= 0; got nan"),
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"prefix": float("nan")}},
+     r"routing_weights.prefix must be a finite number >= 0; got nan"),
+    # a weight is per term of the cost, not per resource
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"kv": 2.0}},
+     r"routing_weights names \['kv'\]; it takes \['load', 'prefix'\]"),
+    # named on its own, not as a config the resource checks could not read, empty too
+    ([_Spec("kv", {"llm"})], {"routing_weights": []}, r"routing_weights must be a mapping"),
+    # nothing would spread a hot prefix
+    ([_Spec("kv", {"llm"})], {"routing_weights": {"load": 0}}, r"routing_weights.load must be above 0"),
 ], ids=["top_level_kv_cache", "unknown_resource", "bad_override", "duplicate_key", "missing_dependency",
-        "self_dependency", "cycle", "routing_weight_not_finite"])
+        "self_dependency", "cycle", "routing_weight_not_finite", "routing_weight_per_resource",
+        "routing_weights_not_a_mapping", "routing_load_0"])
 def test_resource_problem_is_refused_in_the_conductor(specs, extra, pattern, tmp_path, monkeypatch):
     """EngineManager.build and Engine.load_model raised these on every worker."""
     with pytest.raises(DeploymentError, match=pattern):

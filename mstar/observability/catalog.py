@@ -46,10 +46,10 @@ COMPONENT_IN_FLIGHT = Family(
 )
 ROUTING_PREDICTED_SAVING = Family(
     "mstar_routing_predicted_saving_total", COUNTER,
-    "Per resource mirror, the saving it predicted on the data-parallel replica "
-    "each request was sent to, in request-equivalents: for a KV cache, the "
-    "share of the request's prompt predicted cached there.",
-    ("resource",),
+    "Per term of the data-parallel replica cost, the saving the mirrors "
+    "predicted on the replica each request was sent to, in request-equivalents: "
+    "for prefix, the share of the request's prompt predicted cached there.",
+    ("term",),
 )
 REQUEST_QUEUE_SECONDS = Family(
     "mstar_request_queue_seconds", HISTOGRAM,
