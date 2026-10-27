@@ -120,8 +120,9 @@ def test_action_static_layout() -> None:
 
 
 def test_gen_position_ids_do_not_depend_on_prompt_length() -> None:
-    """The denoise step is compiled with static shapes and strides, so the
-    generation band's position ids must look the same for every prompt length."""
+    """The denoise step is compiled with dynamic=False, which guards on sizes
+    and strides, so the generation band's position ids must have the same
+    layout for every prompt length."""
     cfg = _cfg()
     latent_shape = (1, cfg.latent_channel, 3, 4, 4)
     builds = {
