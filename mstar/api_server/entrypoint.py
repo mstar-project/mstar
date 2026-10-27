@@ -428,10 +428,11 @@ class APIServer:
         self.model_name = model_name
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
-        self.client_streams = frozenset(
-            conn.edge_name for conn in model.get_partition_topology().client_connections()
-        ) if model is not None else frozenset()
+        connections = model.get_partition_topology().client_connections() if model is not None else []
+        self.client_streams = frozenset(conn.edge_name for conn in connections)
         self.takes_stream_input = bool(self.client_streams)
+        # the streams that declare their audio; a /v1/realtime conversation feeds one
+        self.client_audio = [conn for conn in connections if conn.audio is not None]
         self._model_config = model_config
 
         # Before any tensor manager; the conductor and workers inherit it.

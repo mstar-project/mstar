@@ -191,8 +191,9 @@ not the end of a request, and the call goes on. A live call that opens while the
 is at ``max_concurrent_requests`` ends at once with ``status`` 503, rather than wait for a
 slot and start that far behind its input; a one-shot request waits in the queue. Other
 models ignore ``end_input``, and an append to them is rejected.
-Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``.
-The append size that serves best is the model's: Nemotron VoiceChat runs a live step as one
+Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``
+or ``/v1/realtime``. ``/v1/realtime`` cuts audio into the model's frames for you; over
+``/generate/ws`` the append size that serves best is the model's: Nemotron VoiceChat runs a live step as one
 CUDA graph only for an append of exactly 80 ms (1280 samples at 16 kHz) onto a call whose
 audio so far is a whole number of 80 ms frames. Keep the opening clip and every append a
 multiple of 1280 samples: one that is not (a one-second opening clip, 16000 samples) keeps
@@ -333,13 +334,21 @@ Endpoints and model coverage:
        ``nemotron_asr``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
+   * - ``WS /v1/realtime``
+     - ``nemotron_duplex`` (full-duplex models)
+     - A spoken conversation in OpenAI's GA Realtime events: microphone audio in,
+       each agent reply out as one response (audio and its transcript). The model
+       decides when to speak; see below.
    * - ``WS /v1/realtime?intent=transcription``
      - models whose adapter can continue a hypothesis
-     - Streaming speech-to-text: ``input_audio_buffer.append`` PCM16 chunks in,
+     - Streaming speech-to-text: ``input_audio_buffer.append`` chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
-       finishes the utterance. Input is ``pcm16`` at 16 kHz (the default) or
-       ``{"type": "audio/pcm", "rate": 24000}``, resampled to 16 kHz. Turn
+       finishes the utterance. ``input_audio_format`` is ``"pcm16"`` (24 kHz, as
+       OpenAI reads it; this endpoint read it as 16 kHz before), ``"g711_ulaw"``,
+       ``"g711_alaw"`` or a GA format object such as ``{"type": "audio/pcm", "rate":
+       16000}`` at the rates a conversation takes (below). A session that names no
+       format sends PCM16 at 16 kHz (not OpenAI's 24 kHz). Audio is resampled to 16 kHz. Turn
        detection is null (client commits), ``server_vad`` or ``semantic_vad``; see below.
    * - ``POST /v1/images/generations``
      - ``bagel``
@@ -425,6 +434,38 @@ Per-model notes:
   Nemotron takes a locale (``en-US``), a bare code or ``auto``. Uploads longer than the
   model's clip (40 s for Canary and Canary-Qwen, 10 min for Parakeet and Nemotron) run as
   parallel windows.
+- **Realtime conversation** (``WS /v1/realtime``, a model that declares an audio client
+  stream, such as ``nemotron_duplex``) speaks OpenAI's GA Realtime events, not the beta
+  ones. The whole call is one engine request, opened by the first
+  ``input_audio_buffer.append`` with the session's ``instructions`` as its prompt; the
+  instructions, audio formats and voice are fixed from then on. ``audio.input.format``
+  and ``audio.output.format`` are ``{"type": "audio/pcm", "rate": N}`` (24 kHz when left
+  out; 8, 11.025, 16, 22.05, 32, 44.1 or 48 kHz too, an mstar extension, since OpenAI
+  takes only 24 kHz), ``{"type": "audio/pcmu"}`` or ``{"type": "audio/pcma"}`` (G.711,
+  8 kHz). Input is resampled to the model's rate and sent on in its frames (80 ms for
+  Nemotron); a partial frame waits for the next append, and one append (or one item's
+  parts together) holds at most 300 s. Keep streaming, silence included: the model hears
+  and answers frame by frame, and a client that stops sending stops the agent too. Each reply
+  is one response, ``response.created`` through ``response.done``, with
+  ``response.output_audio.delta`` and ``response.output_audio_transcript.delta`` in
+  between; audio between replies is silence and is not sent. ``turn_detection``
+  ``server_vad`` and ``semantic_vad`` both mean "the model decides", and their knobs are
+  not used; null, or ``create_response`` / ``interrupt_response`` false, are refused.
+  ``input_audio_buffer.commit`` is acknowledged and flushes nothing, ``clear`` drops a
+  partial frame, and ``conversation.item.create`` takes a user message of ``input_audio``
+  parts, all of them or none. ``response.create``, ``response.cancel``,
+  ``output_audio_buffer.clear`` and the item-editing events are answered with an
+  ``unsupported`` error, and the call goes on. Input transcription and tools are not
+  supported, nor are ``max_output_tokens`` and ``audio.output.speed`` other than their
+  defaults. ``voice`` is the model's own (Nemotron: ``Aria``). One response is in
+  progress at a time: a reply that starts while the previous one is still speaking is
+  its own response, sent once that one is done. If the call ends (its length cap, say),
+  the server sends an ``error``, ends a reply still in progress with ``response.done``
+  (``failed``, or ``incomplete`` when the call ended without an error), and closes the
+  socket; events sent after that get no answer. Over ``/generate``, the same models
+  mark the text chunk where a reply starts or ends with ``metadata.turn`` (``["start"]``
+  / ``["end"]``, every turn token's mark in order), and each text and audio chunk with
+  ``metadata.step``, the model step it came from.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``

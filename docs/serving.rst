@@ -214,13 +214,16 @@ environment, and so does a variable that expands to nothing (``--api-key "$UNSET
 
 Clients send the key as their API key: ``MStarClient(base_url, api_key=...)`` (it reads
 ``MSTAR_API_KEY`` when not given one) or ``OpenAI(base_url=..., api_key=...)``; see
-:doc:`clients`. The standalone Nemotron realtime server
-(``python -m mstar.model.nemotron_duplex.realtime_api``) takes the same flag and
-variable.
+:doc:`clients`.
 
 Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
 ``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
 Dynamo's frontend or a gateway in front of it.
+
+The Dynamo worker (``python -m mstar.integrations.dynamo``) does not serve a model that
+takes live client input (``nemotron_duplex``): no Dynamo surface carries a live call's
+appends, so it exits at startup saying so, before any GPU process starts. Serve such a
+model with ``mstar serve`` and call it over ``/v1/realtime`` or ``/generate/ws``.
 
 Config files
 ------------
