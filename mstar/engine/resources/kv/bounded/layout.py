@@ -18,14 +18,18 @@ NUM_READS = 5
 READ_FROM_SOURCE = (True, False, True, False, False)
 # writes: (fresh offset of the range's first entry, slot start, len) triples
 NUM_WRITES = 3
-# slot, source, reads, writes
-ROW_HEAD = 2
+# slot, source, span, reads, writes
+ROW_HEAD = 3
 ROW_INTS = ROW_HEAD + 2 * NUM_READS + 3 * NUM_WRITES
 
 
 class RowLayout(NamedTuple):
     reads: tuple[tuple[int, int], ...]
     writes: tuple[tuple[int, int, int], ...]
+    # what the row writes this step; per step it also attends only those of the
+    # step's keys (a row padded past its span must not see its padding), or all
+    # of them when it writes none
+    span: int = 0
 
 
 def _ring_ranges(first: int, count: int, window: int) -> list[tuple[int, int]]:
@@ -45,7 +49,7 @@ def row_layout(
     entries and gains ``span`` this step. Slot offsets put the sink's written
     part at ``[0, sink_capacity)`` and the ring after it. With ``reverse`` a
     step's tokens join the stream last-first (see ``BoundedKVConfig``)."""
-    sink, window, includes_step = policy
+    sink, window, includes_step = policy.sink, policy.window, policy.window_includes_step
     n = source_len + written
     ring = sink_capacity
 
@@ -71,14 +75,14 @@ def row_layout(
             writes.append((fresh(first), ring + s, c))
             first += c
     writes += [(0, 0, 0)] * (NUM_WRITES - len(writes))
-    return RowLayout(tuple(reads), tuple(writes))
+    return RowLayout(tuple(reads), tuple(writes), span)
 
 
 EMPTY_ROW = RowLayout(((0, 0),) * NUM_READS, ((0, 0, 0),) * NUM_WRITES)
 
 
 def flatten_row(slot: int, layout: RowLayout, source: int = 0) -> list[int]:
-    out = [slot, source]
+    out = [slot, source, layout.span]
     for start, count in layout.reads:
         out += (start, count)
     for offset, start, count in layout.writes:

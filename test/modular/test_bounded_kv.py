@@ -76,7 +76,7 @@ def test_slots_hold_the_sink_of_the_shortest_source(source_len):
     )
     assert config.sink_capacity == 30 and config.max_retained == 50
     source = [("s", i) for i in range(source_len)]
-    sim = SlotSim(source, config.retention(source_len), config.sink_capacity)
+    sim = SlotSim(source, config.retention_for(source_len), config.sink_capacity)
     stream = list(source)
     for step in range(8):
         fresh = [("g", len(stream) - source_len + j) for j in range(7)]
@@ -256,3 +256,301 @@ def test_waypoint_ring_is_sink_window(ring_buckets, dilation):
         assert got == want, (frame, got, want)
         assert sum(c for _, c in layout.reads[:3]) == 0
         written += span
+
+
+# The resource end to end (layout, attention, writes) over a stream of steps,
+# against brute force over each row's whole stream.
+
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
+WINDOW = 70
+
+
+def _manager(window: int, per_query: bool, dtype, device, heads: int = 2, head_dim: int = 128, slots: int = 4):
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
+    from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
+
+    config = BoundedKVConfig(num_layers=1, num_heads=heads, head_dim=head_dim, rows_per_request=1,
+                             max_source_len=0, retention=SinkWindow(0, window), max_slots=slots, dtype=dtype,
+                             query_window=window if per_query else None)
+    return BoundedKVManager(config, torch.device(device))
+
+
+def _step(rids, written, spans):
+    from mstar.engine.resources.kv.bounded.config import BoundedKVStep, StreamPosition
+    from mstar.engine.resources.step import Segment, StepContext
+
+    step = BoundedKVStep(
+        segments=tuple(Segment(r, "main", s) for r, s in zip(rids, spans, strict=True)),
+        positions={r: StreamPosition(0, w) for r, w in zip(rids, written, strict=True)},
+    )
+    return step, StepContext(request_ids=tuple(rids), graph_walk="w", slot=0, capture=False)
+
+
+def _stream_reference(streams, q, k, v, written, spans, window, per_query, bias):
+    """float64: each row's query ``i`` (stream position ``w + i``) over its stream so
+    far ``streams[b] = (keys, values) [H, w, D]`` and the step's own tokens; per
+    query, the keys at distances [0, window], with the band indexed by distance;
+    per step, the last ``window`` stream keys and the step's first ``span`` (all T
+    for a row that writes none)."""
+    n, h, t, d = q.shape
+    out = torch.empty(n, t, h, d, dtype=torch.float64)
+    for b in range(n):
+        w = written[b]
+        keys = torch.cat([streams[b][0], k[b]], 1)
+        values = torch.cat([streams[b][1], v[b]], 1)
+        lo = max(0, w - window)
+        own = spans[b] or t
+        for i in range(t):
+            if per_query:
+                seen = torch.arange(max(0, w + i - window), w + i + 1)
+                rel = w + i - seen
+            else:
+                seen = torch.arange(lo, w + own)
+                rel = (w - lo) + i - (seen - lo) + t - 1
+            scores = (q[b, :, i:i + 1] @ keys[:, seen].transpose(-1, -2))[:, 0] + bias[b, :, i, rel]
+            att = torch.softmax(scores * d ** -0.5, dim=-1)
+            out[b, i] = (att.unsqueeze(1) @ values[:, seen])[:, 0]
+    return out
+
+
+def _check_stream(mgr, schedule, ieee, tol):
+    """Runs ``schedule`` [(T, each row's span)] through ``mgr`` against brute force."""
+    c = mgr.config
+    h, d, window, per_query = c.num_heads, c.head_dim, c.window_capacity, c.query_window is not None
+    device, dtype = mgr.layer(0).device, mgr.layer(0).dtype
+    rows = len(schedule[0][1])
+    rids = list(range(100, 100 + rows))
+    streams = [(torch.zeros(h, 0, d, dtype=torch.float64),) * 2 for _ in rids]
+    written = [0] * rows
+    for t, spans in schedule:
+        q, k, v = (torch.randn(rows, h, t, d).to(device=device, dtype=dtype) for _ in range(3))
+        width = window + 1 if per_query else window + 2 * t - 1
+        bias = (4 * torch.randn(rows, h, t, width)).to(device=device, dtype=dtype)
+        want = _stream_reference(streams, q.double().cpu(), k.double().cpu(), v.double().cpu(),
+                                 written, spans, window, per_query, bias.double().cpu())
+        step, ctx = _step(rids, written, spans)
+        assert mgr.admit(step, ctx).ok
+        mgr.plan(step, ctx)
+        got = mgr.attend(0, q, k, v, rel_bias=bias, ieee=ieee)
+        mgr.commit(step, ctx)
+        assert torch.isfinite(got.float()).all(), (t, spans)
+        torch.testing.assert_close(got.double().cpu(), want, rtol=tol, atol=tol)
+        for b, span in enumerate(spans):
+            sk, sv = streams[b]
+            streams[b] = (torch.cat([sk, k[b, :, :span].double().cpu()], 1),
+                          torch.cat([sv, v[b, :, :span].double().cpu()], 1))
+            written[b] += span
+
+
+@pytest.mark.parametrize("per_query", [True, False])
+@pytest.mark.parametrize("device,dtype", [
+    ("cpu", torch.float32),
+    pytest.param("cuda", torch.float32, marks=CUDA),
+    pytest.param("cuda", torch.bfloat16, marks=CUDA),
+])
+def test_stream_matches_brute_force(device, dtype, per_query):
+    """Rows at different positions in one batch, over one-token steps and steps
+    longer than 2 x BLOCK_N, rows padded past their span, and rows that only read
+    (span 0), at head_dim 128."""
+    torch.manual_seed(0)
+    mgr = _manager(WINDOW, per_query, dtype, device, heads=2, head_dim=128)
+    schedule = [(1, [1, 1, 0]), (5, [5, 2, 0]), (150, [150, 0, 150]), (3, [3, 3, 1]),
+                (1, [1, 0, 1]), (200, [200, 137, 0]), (2, [2, 2, 2])]
+    _check_stream(mgr, schedule, ieee=True, tol=2e-5 if dtype == torch.float32 else 3e-2)
+
+
+@CUDA
+@pytest.mark.parametrize("t", [1, 150])
+@pytest.mark.parametrize("per_query", [True, False])
+@pytest.mark.parametrize("dtype,ieee,tol", [
+    (torch.float32, True, 2e-5), (torch.float32, False, 2e-3),
+    (torch.bfloat16, True, 3e-2), (torch.bfloat16, False, 3e-2),
+])
+def test_stream_at_many_rows(dtype, ieee, tol, per_query, t):
+    """32 rows x 8 heads (enough programs for the kernel's wide query tiles) at
+    head_dim 128: every tile config a real model reaches compiles and is right."""
+    torch.manual_seed(0)
+    mgr = _manager(WINDOW, per_query, dtype, "cuda", heads=8, head_dim=128, slots=32)
+    spans = [1, 1, 0, 1] if t == 1 else [150, 0, 99, 150]
+    _check_stream(mgr, [(150, [150, 37, 0, 150] * 8), (t, spans * 8)], ieee=ieee, tol=tol)
+
+
+def test_commit_skips_read_only_segments():
+    """An outer step that only reads a row commits after the region that wrote it,
+    and must not put the row's count back."""
+    mgr = _manager(WINDOW, True, torch.float32, "cpu", heads=1, head_dim=4)
+    region, region_ctx = _step([1], [0], [1])
+    outer, outer_ctx = _step([1], [0], [0])
+    assert mgr.admit(outer, outer_ctx).ok
+    mgr.plan(outer, outer_ctx)
+    assert mgr.admit(region, region_ctx).ok
+    mgr.plan(region, region_ctx)
+    mgr.commit(region, region_ctx)
+    mgr.commit(outer, outer_ctx)
+    after, ctx = _step([1], [1], [1])
+    assert mgr.admit(after, ctx).ok
+
+
+def test_admit_refusal_names_the_request():
+    mgr = _manager(WINDOW, True, torch.float32, "cpu", heads=1, head_dim=4)
+    first, ctx = _step([1, 2], [0, 0], [1, 1])
+    assert mgr.admit(first, ctx).ok
+    mgr.plan(first, ctx)
+    mgr.commit(first, ctx)
+    # request 2 declares a stale position; request 1's is right
+    stale, ctx = _step([1, 2], [1, 0], [1, 1])
+    outcome = mgr.admit(stale, ctx)
+    assert not outcome.ok and outcome.reason.request_ids == frozenset({2})
+
+
+def test_rollback_admit_frees_only_fresh_slots():
+    """A refused step gives back the slots its admit took, not one a request
+    already held."""
+    from mstar.engine.resources.kv.bounded.config import StreamPosition
+
+    mgr = _manager(WINDOW, True, torch.float32, "cpu", heads=1, head_dim=4, slots=3)
+    first, ctx = _step([1], [0], [1])
+    assert mgr.admit(first, ctx).ok
+    mgr.plan(first, ctx)
+    mgr.commit(first, ctx)
+    # 2 takes a slot, then 3 (a fresh request declaring written tokens) is refused
+    bad, ctx = _step([1, 2, 3], [1, 0, 0], [1, 1, 1])
+    bad = type(bad)(segments=bad.segments, positions={**bad.positions, 3: StreamPosition(0, 5)})
+    assert not mgr.admit(bad, ctx).ok
+    mgr.rollback_admit(bad, ctx)
+    # both slots are free again, and 1 kept its slot and count
+    fresh, ctx = _step([4, 5], [0, 0], [1, 1])
+    assert mgr.admit(fresh, ctx).ok
+    again, ctx = _step([1], [1], [1])
+    assert mgr.admit(again, ctx).ok
+
+
+def test_attend_refuses_misuse():
+    """Arguments the kernel would read out of bounds or reinterpret are refused
+    on the host, before a launch."""
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVStep, StreamPosition
+    from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
+    from mstar.engine.resources.step import Segment, StepContext
+
+    h, d, t = 1, 16, 2
+    config = BoundedKVConfig(num_layers=1, num_heads=h, head_dim=d, rows_per_request=1, min_source_len=10,
+                             max_source_len=10, retention=SinkWindow(4, 8), max_slots=2)
+    mgr = BoundedKVManager(config, torch.device("cpu"))
+    # row 1 starts from a shared source, row 2 from its own row_source entry
+    step = BoundedKVStep(segments=(Segment(1, "main", t), Segment(2, "main", t)),
+                         positions={1: StreamPosition(10, 0, 0), 2: StreamPosition(10, 0, -1)})
+    ctx = StepContext(request_ids=(1, 2), graph_walk="w", slot=0, capture=False)
+    assert mgr.admit(step, ctx).ok
+    mgr.plan(step, ctx)
+    q, k, v = (torch.randn(2, h, t, d) for _ in range(3))
+    source = torch.randn(1, 1, h, 10, 2 * d)
+    row_source = (torch.randn(2, 1, h, 10, 2 * d), torch.tensor([1, 0], dtype=torch.int32))
+    # 10 retained (4 sink + 6 window, all source) + 2T - 1
+    band = torch.zeros(2, h, t, 10 + 2 * t - 1)
+    mgr.attend(0, q, k, v, source, rel_bias=band, row_source=row_source)
+    for kwargs in (dict(row_source=row_source), dict(source=source),
+                   dict(source=source, row_source=row_source, rel_bias=band[..., :-1])):
+        with pytest.raises(ValueError):
+            mgr.attend(0, q, k, v, **kwargs)
+    with pytest.raises(ValueError):
+        mgr.attend(0, q.double(), k, v, source, row_source=row_source)
+    # a row writes at most the step's T tokens
+    mgr.plan(BoundedKVStep(segments=(Segment(1, "main", t + 1),), positions={1: StreamPosition(10, 0, 0)}),
+             StepContext(request_ids=(1,), graph_walk="w", slot=0, capture=False))
+    with pytest.raises(ValueError):
+        mgr.attend(0, q[:1], k[:1], v[:1], source)
+    # a capture's rows are padding, but its replays read up to 12 retained (4 sink + 8 window)
+    mgr.plan(step, StepContext(request_ids=(1, 2), graph_walk="w", slot=0, capture=True))
+    with pytest.raises(ValueError):
+        mgr.attend(0, q, k, v, source, rel_bias=band, row_source=row_source)
+
+
+def test_kernel_refuses_a_head_dim_it_cannot_tile():
+    pytest.importorskip("triton")
+    from mstar.engine.resources.kv.bounded.kernels import bounded_attention
+    from mstar.engine.resources.kv.bounded.layout import ROW_INTS
+
+    q = torch.randn(1, 1, 1, 24)
+    cache = torch.zeros(1, 1, 1, 4, 48)
+    with pytest.raises(ValueError):
+        bounded_attention(q, q, q, cache, None, torch.zeros(1, ROW_INTS, dtype=torch.int32))
+
+
+def test_per_query_window_config():
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
+
+    def config(retention, **kw):
+        return BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1,
+                               max_source_len=4, retention=retention, **kw)
+
+    assert config(lambda n: SinkWindow(0, 70), query_window=70).query_window == 70
+    # a longer retained window than the query's is allowed (its far keys are masked)
+    config(lambda n: SinkWindow(0, 70 + n), query_window=70)
+    for bad in (SinkWindow(2, 70), SinkWindow(0, 70, window_includes_step=True), SinkWindow(0, 69)):
+        with pytest.raises(ValueError):
+            config(bad, query_window=70)
+    with pytest.raises(ValueError):
+        config(SinkWindow(0, 70), query_window=70, reverse_step_order=True)
+
+
+def test_constant_retention_compares_by_value():
+    """A constant policy works like the callable form, and two configs built from
+    equal ones are equal (a model's spec compared against another's)."""
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
+
+    def config(retention):
+        return BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1,
+                               max_source_len=4, retention=retention, query_window=70)
+
+    assert config(SinkWindow(0, 70)) == config(SinkWindow(0, 70))
+    assert config(SinkWindow(0, 70)) != config(SinkWindow(0, 71))
+    assert config(SinkWindow(0, 70)).retention_for(3) == config(lambda n: SinkWindow(0, 70)).retention_for(3)
+
+
+def test_plan_resolves_retention_once_per_source_len():
+    """The policy is resolved when the config is built, not per row per step."""
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
+    from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
+
+    calls = []
+
+    def retention(n):
+        calls.append(n)
+        return SinkWindow(0, WINDOW)
+
+    config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1, max_source_len=0,
+                             retention=retention, max_slots=4)
+    mgr = BoundedKVManager(config, torch.device("cpu"))
+    built = len(calls)
+    for t in range(3):
+        step, ctx = _step([1, 2], [t, t], [1, 1])
+        assert mgr.admit(step, ctx).ok
+        mgr.plan(step, ctx)
+        mgr.commit(step, ctx)
+    assert len(calls) == built
+
+
+def test_dtype_none_is_the_engines_kv_dtype():
+    from mstar.engine.resources.base import EngineResourceInfo, Resource
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec
+    from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
+
+    config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1, max_source_len=0,
+                             retention=SinkWindow(0, 8), dtype=None)
+    spec = BoundedKVSpec(resource_key="kv", nodes={"node"}, config=config)
+    mgr = BoundedKVManager.build(spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16))
+    assert mgr.layer(0).dtype == torch.bfloat16
+    # left as declared, so the spec still equals one built from the same config
+    assert config.dtype is None
+    # the engine sizes graph tables through main's hook name
+    assert BoundedKVManager.build_accelerator_graph_buffers is not Resource.build_accelerator_graph_buffers
+
+
+def test_max_slots_override_is_checked():
+    from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec
+
+    config = BoundedKVConfig(num_layers=1, num_heads=1, head_dim=4, rows_per_request=1, max_source_len=0,
+                             retention=SinkWindow(0, 8))
+    spec = BoundedKVSpec(resource_key="kv", nodes={"node"}, config=config)
+    with pytest.raises(ValueError):
+        spec.apply_yaml_overrides(max_slots=0)

@@ -8,7 +8,8 @@
 All four set ``disable_torch_compile``, so the engine never wraps their forwards: the
 three wrapped nodes run once per request with no graph to amortize, and the dit's whole
 forward trips Inductor on the CPU-resident UniPC sigma. Instead the dit compiles its inner
-transformer region alone (``config.compile_dit``), leaving the solver eager.
+transformer region alone (``config.compile_dit``) for the shapes in
+``config.compile_dit_sizes``, leaving the solver and every other shape eager.
 
 Numerics are governed by the checkpoint dtypes, not by the engine.
 ``Wan22Model.get_autocast_dtype`` returns None so the engine neither autocasts
@@ -152,6 +153,20 @@ def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
     owner_path, _, attr = dotted_name.rpartition(".")
     owner = module.get_submodule(owner_path) if owner_path else module
     setattr(owner, attr, value)
+
+
+def _loop_step(fwd_info: CurrentForwardPassInfo, time_index: torch.Tensor) -> int:
+    """The denoise iteration this step runs, from the engine's loop counter.
+
+    ``time_index`` holds the same value, but it is the previous step's device
+    output: reading it on the host waits for that step to finish, which stalls
+    the speculative preparation of this one. Callers that drive the submodule
+    without a loop counter (tests, harnesses) fall back to the edge.
+    """
+    counts = getattr(fwd_info, "dynamic_loop_iter_counts", None) or {}
+    if DENOISE_LOOP_NAME in counts:
+        return int(counts[DENOISE_LOOP_NAME])
+    return int(time_index.reshape(-1)[0].item())
 
 
 def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, int]:
@@ -360,16 +375,24 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         # identity — fp32 islands, ``.dtype``, the tests' transformer swap.
         # dynamic=False traces one graph per shape (first request at a new
         # resolution pauses; logged in ``_noise_prediction``); fullgraph=False
-        # allows the SDPA graph break, matching cosmos3.
+        # allows the SDPA graph break, matching cosmos3. Only the latent grids
+        # of ``config.compile_dit_sizes`` reach the compiled forward; every
+        # other grid runs ``_eager_forward``, the transformer's own forward.
         self._compile_dit = bool(config.compile_dit)
+        self._compile_grids = config.compile_dit_grids()
         self._compiled_shapes: set[tuple[int, ...]] = set()
+        self._eager_forward = None
         if self._compile_dit and transformer is not None:
+            # with the transformer it belongs to: one swapped in later runs its own forward
+            self._eager_forward = (transformer, transformer.forward)
             transformer.forward = torch.compile(
                 transformer.forward, fullgraph=False, dynamic=False,
             )
             logger.info(
                 "Wan2.2 DiT: torch.compile enabled on the transformer region "
-                "(fullgraph=False, dynamic=False); UniPC solver stays eager."
+                "(fullgraph=False, dynamic=False) for latent (frames, height, width) %s; other "
+                "shapes and the UniPC solver run eager.",
+                sorted(self._compile_grids),
             )
 
     def prepare_inputs(
@@ -404,7 +427,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
             tensor_inputs["unipc_last_sample"] = torch.zeros(shape, dtype=torch.float32, device=device)
         else:
             time_index = inputs["time_index"][0]
-            k = int(time_index.reshape(-1)[0].item())
+            k = _loop_step(fwd_info, time_index)
             num_steps = int(fwd_info.step_metadata["num_inference_steps"])
             if k >= num_steps:
                 # Async scheduling dispatched an iteration past this request's
@@ -514,7 +537,8 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         # included, so CFG and no-CFG are distinct graphs). Announce the one-time
         # compile pause the first time a shape is seen, so an operator watching the
         # log knows why the first request at a new resolution is slow.
-        if self._compile_dit:
+        compiled = self._compile_dit and tuple(hidden_states.shape[2:]) in self._compile_grids
+        if compiled:
             shape_key = tuple(hidden_states.shape)
             if shape_key not in self._compiled_shapes:
                 self._compiled_shapes.add(shape_key)
@@ -526,7 +550,10 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
         encoder_hidden_states = (
             torch.cat([text_embeds_pos, text_embeds_neg], dim=0) if do_cfg else text_embeds_pos
         ).to(self.transformer.dtype)
-        out = self.transformer(
+        transformer = self.transformer
+        if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
+            transformer = self._eager_forward[1]
+        out = transformer(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
@@ -588,6 +615,16 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
     via ``torch.cuda.mem_get_info``; ``config.vae_decode_tiling`` /
     ``WAN22_VAE_DECODE_TILING`` force either path; the chosen path is logged per
     request. The tiled/untiled numeric gap is priced by the tiled-vs-untiled test.
+
+    With ``config.vae_decode_fast`` the untiled path at a size in
+    ``config.vae_decode_fast_sizes`` runs the shared Wan VAE decoder
+    (``mstar.model.components.wan_vae``) instead of ``vae.decode``: the same
+    per-latent decoder calls from an empty cache, on channels-last weights and
+    activations, compiled. Every other decode switches the VAE back to the
+    layout it loaded in first (an exact copy of the decoder weights), so it is
+    stock ``vae.decode`` / ``tiled_decode`` and compiles nothing. The engine
+    still never wraps the forward; only the decoder's steady-state call is
+    compiled.
     """
 
     disable_torch_compile = True
@@ -605,6 +642,20 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
         # ``_create_submodule`` before any submodule is constructed.
         self.vae = vae.to(self._decode_dtype())
         self._record_fp32_islands()
+        self._fast_step = None
+        self._fast_sizes = config.fast_decode_sizes()
+        if config.vae_decode_fast:
+            from mstar.model.components import wan_vae
+
+            # Before the compile traces the decoder; this VAE instance is the
+            # decoder node's own.
+            wan_vae.to_channels_last(self.vae)
+            self._fast_step = wan_vae.DecoderStep(self.vae, compile=True, deterministic=True)
+            logger.info(
+                "Wan2.2 VAE decode: untiled %s on the shared Wan VAE decoder (channels-last, compiled); "
+                "other sizes decode stock",
+                ", ".join(f"{w}x{h}" for w, h in sorted(self._fast_sizes)),
+            )
 
     def _decode_dtype(self):
         # TODO: pull conv3d-dtype resolution into a common helper shared with
@@ -719,8 +770,22 @@ class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmod
                 "tiled" if tiled else "untiled", height, width, num_frames,
                 estimate / 2**30, free_bytes / 2**30, _DECODE_UNTILED_SAFETY_MARGIN, mode,
             )
+            fast = self._fast_step is not None and not tiled and (width, height) in self._fast_sizes
+            if self._fast_step is not None:
+                from mstar.model.components import wan_vae
+
+                # One request per step, so nothing else decodes on this VAE
+                # while its layout switches. Outside inference mode: a weight
+                # made in it is an inference tensor, whose dispatch keys the
+                # compiled graph's parameter guards reject (a recompile).
+                with torch.inference_mode(False):
+                    (wan_vae.to_channels_last if fast else wan_vae.to_default_layout)(vae)
             if tiled:
                 video = vae.tiled_decode(latents, return_dict=False)[0]
+            elif fast:
+                video = wan_vae.decode_causal(
+                    vae, latents, wan_vae.new_feat_cache(vae), self._fast_step, clip_start=True,
+                )
             else:
                 video = vae.decode(latents, return_dict=False)[0]
             # Quantize to 8-bit at the worker boundary (see class docstring).

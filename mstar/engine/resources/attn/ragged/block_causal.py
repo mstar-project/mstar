@@ -81,7 +81,7 @@ class RaggedBlockCausalWrapper:
         max_num_segments: int | None = None,
         max_total_tokens: int | None = None,
         device: torch.device = torch.device("cuda"),
-        use_cuda_graph: bool = False,
+        accelerator_graph: bool = False,
         sm_scale: float | None = None,
         q_data_type: torch.dtype = torch.bfloat16,
         backend: str = "auto",
@@ -96,21 +96,21 @@ class RaggedBlockCausalWrapper:
         self.block_size = block_size
         self.sm_scale = float(sm_scale) if sm_scale is not None else head_dim ** -0.5
         self.q_data_type = q_data_type
-        self.use_cuda_graph = use_cuda_graph
+        self.accelerator_graph = accelerator_graph
         self.max_num_segments = max_num_segments
         self.max_total_tokens = max_total_tokens
         self._num_segments = 0
         self._total_tokens = 0
 
-        if not use_cuda_graph:
+        if not accelerator_graph:
             self._out_buf = None
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD", backend=backend,
             )
             return
 
-        assert max_num_segments is not None, "max_num_segments required for CUDA graph mode"
-        assert max_total_tokens is not None, "max_total_tokens required for CUDA graph mode"
+        assert max_num_segments is not None, "max_num_segments required for accelerator graph mode"
+        assert max_total_tokens is not None, "max_total_tokens required for accelerator graph mode"
         assert max_num_segments > 0, "max_num_segments must be positive"
         self.max_blocks = max_blocks(max_num_segments, max_total_tokens, block_size)
         self.max_indices = max_prefix_tokens(max_total_tokens, block_size)
@@ -156,7 +156,7 @@ class RaggedBlockCausalWrapper:
         total = sum(seg_lens)
         qo, kv, indices = block_causal_layout(seg_lens, self.block_size)
         n_blocks = len(qo) - 1
-        if self.use_cuda_graph:
+        if self.accelerator_graph:
             if n_seg > self.max_num_segments:
                 raise ValueError(
                     f"RaggedBlockCausalWrapper: {n_seg} segments exceeds the "

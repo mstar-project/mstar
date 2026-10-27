@@ -2,8 +2,10 @@
 
 Keys and values share a ``2 * head_dim`` last axis in the slot and the source:
 keys in ``[0, D)``, values in ``[D, 2D)``. Every row attends to its retained
-ranges and to this step's own tokens, unmasked; dot products use TF32 unless
-``ieee``.
+ranges and to this step's own tokens: unmasked (those it writes, or all T when
+it writes none), or with a per-query window (``BoundedKVConfig.query_window``)
+each query to the keys at distances ``[0, window]``. Dot products use TF32
+unless ``ieee``.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ def _scores(q, k, bias_rows, rel, valid, sm_scale, HAS_BIAS: tl.constexpr, PRECI
 @triton.jit
 def _bounded_attention_kernel(
     q_ptr, k_ptr, v_ptr, o_ptr, cache_ptr, source_ptr, row_source_ptr, row_slots_ptr, table_ptr, bias_ptr,
-    T, H, sm_scale,
+    T, H, sm_scale, window,
     s_qn, s_qh, s_qt,
     s_cs, s_cr, s_ch, s_cp,
     s_sv, s_sr, s_sh, s_sp,
@@ -35,7 +37,7 @@ def _bounded_attention_kernel(
     s_on, s_ot, s_oh,
     s_bn, s_bh, s_bt,
     ROWS: tl.constexpr, HAS_SOURCE: tl.constexpr, HAS_ROW_SOURCE: tl.constexpr, HAS_BIAS: tl.constexpr,
-    ROW_INTS: tl.constexpr, HEAD: tl.constexpr,
+    PER_QUERY: tl.constexpr, ROW_INTS: tl.constexpr, HEAD: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr, PRECISION: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -82,24 +84,49 @@ def _bounded_attention_kernel(
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
 
-    # this step's own tokens (separate k and v tensors, laid out like q); a pair's
-    # band entry is its query position minus its key position, plus T - 1
-    for j0 in range(0, T, BLOCK_N):
+    # A per-query window bounds each loop to the keys some query of this block
+    # sees: query i (stream position total + i) sees back to i - window.
+    if PER_QUERY:
+        m_lo = pid_m * BLOCK_M
+        own_lo = tl.maximum(m_lo - window, 0)
+        own_hi = tl.minimum(m_lo + BLOCK_M, T)
+        old_lo = tl.maximum(total + m_lo - window, 0)
+    else:
+        own = tl.load(row + 2)
+        own_lo = 0
+        own_hi = tl.where(own > 0, tl.minimum(own, T), T)
+        old_lo = 0
+
+    # this step's own tokens (separate k and v tensors, laid out like q), per step
+    # the first ``span`` (``RowLayout.span``); a pair's band entry is its query
+    # position minus its key position, plus T - 1, or with a per-query window the
+    # distance alone (causality already keeps a row's real queries off its padding)
+    for j0 in range(own_lo, own_hi, BLOCK_N):
         offs_n = j0 + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < T
+        mask_n = offs_n < own_hi
         kv_off = n * s_qn + h * s_qh + offs_n[:, None] * s_qt + offs_d[None, :]
         k = tl.load(k_ptr + kv_off, mask=mask_n[:, None], other=0.0)
         v = tl.load(v_ptr + kv_off, mask=mask_n[:, None], other=0.0)
-        rel = offs_m[:, None] - offs_n[None, :] + T - 1
-        s = _scores(q, k, bias_rows, rel, mask_m[:, None] & mask_n[None, :], sm_scale, HAS_BIAS, PRECISION)
+        valid = mask_m[:, None] & mask_n[None, :]
+        if PER_QUERY:
+            rel = offs_m[:, None] - offs_n[None, :]
+            valid = valid & (rel >= 0) & (rel <= window)
+        else:
+            rel = offs_m[:, None] - offs_n[None, :] + T - 1
+        s = _scores(q, k, bias_rows, rel, valid, sm_scale, HAS_BIAS, PRECISION)
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(s - m_new[:, None])
+        # Defensive: a query whose keys so far are all masked keeps m = -inf, and
+        # exp(-inf - -inf) is NaN, so offset by 0 instead. No stored query gets
+        # here while BLOCK_M <= BLOCK_N: this loop runs first, and its first tile
+        # holds one of each query's keys.
+        m_off = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_off)
+        p = tl.exp(s - m_off[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=PRECISION)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision=PRECISION)
         m_i = m_new
 
-    for j0 in range(0, total, BLOCK_N):
+    for j0 in range(old_lo, total, BLOCK_N):
         j = j0 + tl.arange(0, BLOCK_N)
         valid = j < total
         in_source = (j < e1) | ((j >= e2) & (j < e3))
@@ -113,13 +140,19 @@ def _bounded_attention_kernel(
             ptrs = tl.where(in_source[:, None], source_ptrs, ptrs)
         k = tl.load(ptrs, mask=valid[:, None], other=0.0)
         v = tl.load(ptrs + D, mask=valid[:, None], other=0.0)
-        rel = total + offs_m[:, None] - j[None, :] + T - 1
-        s = _scores(q, k, bias_rows, rel, mask_m[:, None] & valid[None, :], sm_scale, HAS_BIAS, PRECISION)
+        seen = mask_m[:, None] & valid[None, :]
+        if PER_QUERY:
+            rel = total + offs_m[:, None] - j[None, :]
+            seen = seen & (rel <= window)
+        else:
+            rel = total + offs_m[:, None] - j[None, :] + T - 1
+        s = _scores(q, k, bias_rows, rel, seen, sm_scale, HAS_BIAS, PRECISION)
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(s - m_new[:, None])
+        m_off = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_off)
+        p = tl.exp(s - m_off[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p, v, input_precision=PRECISION)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, input_precision=PRECISION)
         m_i = m_new
 
     out = acc / l_i[:, None]
@@ -172,6 +205,7 @@ def bounded_attention(
     rel_bias: torch.Tensor | None = None,
     ieee: bool = False,
     row_source: tuple[torch.Tensor, torch.Tensor] | None = None,
+    window: int | None = None,
 ) -> torch.Tensor:
     """``q, k, v [B * rows, H, T, D]`` (contiguous) over their retained ranges:
     ``cache [slots, rows, H, cap, 2D]`` and ``source [sources, rows, H, L, 2D]`` (each
@@ -180,9 +214,16 @@ def bounded_attention(
     at its slot instead. ``rel_bias [B * rows, H, T, R]`` adds to the
     score of query ``i`` and stream key ``j`` its entry ``(n + i) - j + T - 1``,
     ``n`` being the row's retained count (Transformer-XL's position term, which
-    depends on the distance alone). Returns ``[B * rows, T, H, D]``."""
+    depends on the distance alone). With a per-query ``window``
+    (``BoundedKVConfig.query_window``) query ``i`` attends only the keys at
+    distances ``[0, window]`` from it, and the band is indexed by that distance,
+    ``R = window + 1``. Returns ``[B * rows, T, H, D]``."""
     n, h, t, d = q.shape
     rows = cache.shape[1]
+    if d < 16 or d & (d - 1):
+        raise ValueError(f"the kernel tiles head_dim, so it must be a power of two >= 16, got {d}")
+    if not q.dtype == k.dtype == v.dtype == cache.dtype:
+        raise ValueError(f"the cache holds {cache.dtype}; q, k, v are {q.dtype}, {k.dtype}, {v.dtype}")
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert cache.stride(-1) == 1 and table.shape[-1] == ROW_INTS
     has_row_source = row_source is not None
@@ -202,15 +243,21 @@ def bounded_attention(
     has_bias = rel_bias is not None
     if has_bias:
         assert rel_bias.shape[:3] == (n, h, t) and rel_bias.stride(-1) == 1
+        if window is not None and rel_bias.shape[3] <= window:
+            raise ValueError(f"a per-query band holds window + 1 = {window + 1} distances, got {rel_bias.shape[3]}")
         s_bias = (rel_bias.stride(0), rel_bias.stride(1), rel_bias.stride(2))
     else:
         rel_bias, s_bias = q, (0, 0, 0)
     out = torch.empty(n, t, h, d, device=q.device, dtype=q.dtype)
-    block_m = 16 if n * h < 128 else 64
+    # 64-query tiles only where they pay and fit: a short step wastes them, too few
+    # programs idle SMs, and past 256 bytes per head row (fp32 at D=128) one
+    # overflows shared memory under TF32 and spills thousands of registers under
+    # IEEE (H100), where a 16-query tile fits with no spills.
+    block_m = 64 if t > 16 and n * h >= 128 and d * q.element_size() <= 256 else 16
     grid = (triton.cdiv(t, block_m), n * h)
     _bounded_attention_kernel[grid](
         q, k, v, out, cache, source, row_storage, row_slots, table, rel_bias,
-        t, h, d ** -0.5,
+        t, h, d ** -0.5, 0 if window is None else window,
         q.stride(0), q.stride(1), q.stride(2),
         cache.stride(0), cache.stride(1), cache.stride(2), cache.stride(3),
         *s_src,
@@ -218,7 +265,7 @@ def bounded_attention(
         out.stride(0), out.stride(1), out.stride(2),
         *s_bias,
         ROWS=rows, HAS_SOURCE=has_source, HAS_ROW_SOURCE=has_row_source, HAS_BIAS=has_bias,
-        ROW_INTS=ROW_INTS, HEAD=ROW_HEAD,
+        PER_QUERY=window is not None, ROW_INTS=ROW_INTS, HEAD=ROW_HEAD,
         BLOCK_M=block_m, BLOCK_N=64, D=d, PRECISION="ieee" if ieee else "tf32",
     )
     return out

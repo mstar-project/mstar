@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
@@ -42,11 +42,11 @@ def _fa3_unavailable_reason() -> str | None:
 
 
 @functools.cache
-def _warn_dense_fallback(reason: str) -> None:
+def _warn_dense_fallback(reason: str, fallback: AttnBackend) -> None:
     logger.warning(
         "Attention backend 'dense' requested but no varlen kernel is "
-        "available (%s); using the paged 'flashinfer' backend instead.",
-        reason,
+        "available (%s); using the paged %r backend instead.",
+        reason, fallback.value,
     )
 
 
@@ -137,6 +137,9 @@ class DenseAttentionManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
+    def can_capture(self) -> bool:
+        return False
+
     @property
     def requires_kv_write(self) -> bool:
         return False
@@ -159,6 +162,7 @@ class DenseAttentionManager(AttentionManager):
             del self._prefix_cache[key]
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         if ctx.slot_lease is not None or ctx.is_preplan:
             raise RuntimeError(

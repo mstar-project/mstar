@@ -6,6 +6,9 @@ max_seq_len: 16384
 # step takes 40-150 ms, which on a shared loop would hold up the
 # TTS's few-millisecond decode steps (and the LLM's).
 rank_devices: {0: 0, 1: 0, 2: 0}
+# The three workers' kernels overlap as clients of one MPS daemon, rather than
+# time-slicing the GPU.
+mps: true
 node_groups:
   - node_names: [LLM, vision_encoder, audio_encoder]
     ranks: [0]

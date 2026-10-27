@@ -16,6 +16,9 @@ import pytest
 import mstar.model
 from mstar.model.submodule_base import NodeSubmodule
 
+# The package walk below imports every model, and some import flashinfer.
+pytest.importorskip("flashinfer")
+
 
 def _all_subclasses(cls: type) -> set[type]:
     subs = set(cls.__subclasses__())
@@ -30,10 +33,10 @@ def _overriding_subclasses() -> list[type]:
     # NodeSubmodule subclasses.
     for info in pkgutil.walk_packages(mstar.model.__path__, mstar.model.__name__ + "."):
         importlib.import_module(info.name)
-    base_fn = NodeSubmodule.get_piecewise_cuda_graph_configs
+    base_fn = NodeSubmodule.get_piecewise_accelerator_graph_configs
     return [
         cls for cls in _all_subclasses(NodeSubmodule)
-        if cls.get_piecewise_cuda_graph_configs is not base_fn
+        if cls.get_piecewise_accelerator_graph_configs is not base_fn
     ]
 
 
@@ -42,7 +45,7 @@ def test_piecewise_config_accepts_engine_call(cls):
     """Each override must accept the exact args the engine passes."""
     import torch
 
-    sig = inspect.signature(cls.get_piecewise_cuda_graph_configs)
+    sig = inspect.signature(cls.get_piecewise_accelerator_graph_configs)
     # Mirror build_piecewise_runners' call site (self is bound at call time).
     sig.bind(
         object(),  # self placeholder

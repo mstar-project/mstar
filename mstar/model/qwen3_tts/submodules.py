@@ -43,18 +43,19 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
 from mstar.model.qwen3_tts.components.conv_stack import causal_receptive_field_frames, conv_stack
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
 from mstar.model.qwen3_tts.components.speaker_encoder import (
@@ -83,6 +84,7 @@ from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
@@ -93,6 +95,23 @@ from mstar.utils.h2d import PinnedStager
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
+
+
+def prefill_rows(prompt_layout: Sequence[int], language_id: int, speaker: bool) -> int:
+    """The rows `TalkerSubmodule._build_prefill` writes, where ``speaker`` is True when a
+    speaker tag or x-vector takes a row."""
+    instruct_len, text_len, stream_text, ref_text_len, ref_frames = prompt_layout
+    prefix = len(CHATML_ASSISTANT_PREFIX_TOKEN_IDS)
+    # the role, then every codec tag but codec BOS
+    rows = instruct_len + prefix + (3 if language_id < 0 else 4) + int(speaker) + 1
+    if ref_frames:
+        # codec BOS and the reference frames. When the text isn't streamed, both transcripts and TTS EOS come first
+        text = ref_text_len - prefix - 2 + text_len + 1
+        return rows + 1 + ref_frames + (0 if stream_text else text)
+    # a streamed prompt adds its first text token over codec BOS. Any other adds its text and TTS EOS,
+    # then TTS PAD over codec BOS
+    return rows + (1 if stream_text else text_len + 2)
+
 
 # ===========================================================================
 # 1. TalkerSubmodule - autoregressive 12 Hz codec-frame generation
@@ -431,6 +450,10 @@ class TalkerSubmodule(ARNodeSubmodule):
                 speaker_embed=inputs["speaker_embed"][0] if "speaker_embed" in inputs else None,
                 ref_codes=inputs["ref_codes"][0] if "ref_codes" in inputs else None,
             )
+            speaker = int(step_metadata[SPEAKER_ID_KEY]) >= 0 or "speaker_embed" in inputs
+            assert input_embeds.shape[0] == prefill_rows(
+                step_metadata[PROMPT_LAYOUT_KEY], int(step_metadata[LANGUAGE_ID_KEY]), speaker,
+            ), f"the prefill built {input_embeds.shape[0]} rows, not the count `prefill_rows` lays out"
             state = self.request_state(fwd_info.rid_handle)
         elif graph_walk == "talker_decode":
             state = self.request_state(fwd_info.rid_handle)
@@ -777,9 +800,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         generated = int(
             self.request_state(request_id).get("generated_frames", 0)
         )
-        max_tokens = request_info.step_metadata.get(
-            "talker_max_tokens", request_info.max_tokens
-        )
+        max_tokens = request_info.max_tokens
         sampling_config = request_info.resource_configs.get(TALKER_SAMPLER)
         ignore_eos = bool(getattr(sampling_config, "ignore_eos", False))
         reached_eos = (
@@ -807,9 +828,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         del graph_walk
         return self.MAX_BATCH_SIZE
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Capture fixed one-token Talker decode batches and packed prefills,
         sampling included.
 
@@ -830,14 +851,14 @@ class TalkerSubmodule(ARNodeSubmodule):
                 kwargs={"suppress_eos": True},
             )
 
-        prefill = PackedCudaGraphConfig(
+        prefill = PackedAcceleratorGraphConfig(
             capture_graph_walk="talker_prefill",
             capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
             make_node_input=prefill_input,
             capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             compile=False,
         )
-        return [prefill, BatchedCudaGraphConfig(
+        return [prefill, BatchedAcceleratorGraphConfig(
             capture_graph_walk="talker_decode",
             single_request_inputs=ARNodeInputs(
                 input_embeds=torch.zeros(
@@ -855,12 +876,12 @@ class TalkerSubmodule(ARNodeSubmodule):
             compile=True,
         )]
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self,
         device: torch.device,
         autocast_dtype: torch.dtype,
         tp_world_size: int = 1,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Capture the CodePredictor depth loop, sampling included.
 
         The whole-walk decode graph already covers this loop; this runner serves
@@ -913,7 +934,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
         }
 
-    def can_use_cuda_graphs(
+    def can_use_accelerator_graphs(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
         """Replay the whole decode graph or a packed prefill; sampling params
@@ -922,7 +943,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             batch, model_inputs
         ):
             return False
-        return super().can_use_cuda_graphs(batch, model_inputs)
+        return super().can_use_accelerator_graphs(batch, model_inputs)
 
 
 # ===========================================================================
@@ -962,10 +983,18 @@ class CodecSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
     CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
-    def __init__(self, decoder: torch.nn.Module, config: Qwen3TTSModelConfig):
+    def __init__(
+        self,
+        decoder: torch.nn.Module,
+        config: Qwen3TTSModelConfig,
+        watermarker: AudioSealWatermarker | None = None,
+    ):
         super().__init__()
         self.decoder = decoder
         self.config = config
+        # Opt-in (``audio_watermark`` in model_kwargs): marks each request's
+        # trimmed PCM in ``batch_postprocess``; None leaves it untouched.
+        self.watermarker = watermarker
         # Base streams may lead with a full reference tail: capture those windows too.
         leads = (0, config.codec.left_context_frames) if config.supports_reference_audio else (0,)
         self.windows = config.codec.codec_windows(leads)
@@ -1076,7 +1105,10 @@ class CodecSubmodule(ARNodeSubmodule):
         # this one is postprocessed, so request state would be overwritten.
         return ARNodeInputs(
             tensor_inputs={"codec_tokens": codes.t().contiguous()},
-            kwargs={"frames": frames, "context": context, "conv_start": conv_start},
+            kwargs={
+                "frames": frames, "context": context, "conv_start": conv_start,
+                "is_final": chunk is not None and chunk.is_final,
+            },
         )
 
     def preprocess(
@@ -1190,6 +1222,57 @@ class CodecSubmodule(ARNodeSubmodule):
             "codec %s: emit frames %d..%d (%d samples)", request_id, context, frames, max(end - start, 0)
         )
 
+    def batch_postprocess(
+        self,
+        outputs: BatchedModelOutput,
+        request_infos: dict[str, CurrentForwardPassInfo],
+        inputs: list[ARNodeInputs],
+        piecewise_runners: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Watermark the step's trimmed chunks, one AudioSeal call per chunk
+        length, each a replay of its capture (``get_piecewise_accelerator_graph_configs``)
+        where there is one. Each request's stream state lives in its request
+        state, so it goes when the request does."""
+        if self.watermarker is None:
+            return
+        rids, chunks, streams, finals = [], [], [], []
+        for request_id, item in zip(request_infos, inputs, strict=True):
+            out = outputs.get(request_id, {})
+            if "audio_chunk" not in out:
+                continue
+            state = self.request_state(request_id)
+            stream = state.get("watermark_stream")
+            if stream is None:
+                stream = WatermarkStream()
+                state.add("watermark_stream", stream)
+            rids.append(request_id)
+            chunks.append(out["audio_chunk"][0])
+            streams.append(stream)
+            finals.append(bool(item.kwargs.get("is_final", False)))
+        if not rids:
+            return
+        marked = self.watermarker.apply_pcm16(chunks, streams, finals, runners=piecewise_runners)
+        for request_id, chunk in zip(rids, marked, strict=True):
+            outputs.get(request_id)["audio_chunk"][0] = chunk
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """With the watermark on, its generator call per chunk length of the
+        schedule (a shorter final chunk pads into the next) and batch bucket.
+        Only lengths of whole watermark frames; other chunks run eagerly."""
+        del device, autocast_dtype, tp_world_size
+        if self.watermarker is None:
+            return {}
+        codec = self.config.codec
+        lengths = [
+            frames * self.total_upsample for frames in {*codec.chunk_schedule, codec.chunk_frames}
+            if frames * self.total_upsample % self.watermarker.hop == 0
+        ]
+        if not lengths:
+            return {}
+        return self.watermarker.piecewise_configs(lengths, self.CAPTURE_BATCH_SIZES)
+
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Any mix of windows batches (``preprocess`` pads to the widest)."""
         del batch
@@ -1225,13 +1308,13 @@ class CodecSubmodule(ARNodeSubmodule):
         buckets.discard(None)
         return max(buckets) if buckets else None
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """Capture every window of the chunk schedule for all batch buckets."""
         del tp_world_size
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="codec_chunk",
                 replay_graph_walks=["codec_chunk"],
                 single_request_inputs=ARNodeInputs(
@@ -1254,7 +1337,7 @@ class CodecSubmodule(ARNodeSubmodule):
             for window in self.windows
         ]
 
-    def can_use_cuda_graphs(
+    def can_use_accelerator_graphs(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
         return (
@@ -1265,7 +1348,7 @@ class CodecSubmodule(ARNodeSubmodule):
                 in {(self.config.codec.num_quantizers, window) for window in self.windows}
                 for item in model_inputs
             )
-            and super().can_use_cuda_graphs(batch, model_inputs)
+            and super().can_use_accelerator_graphs(batch, model_inputs)
         )
 
 

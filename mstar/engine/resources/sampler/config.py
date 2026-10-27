@@ -19,6 +19,23 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
 
+@dataclass(frozen=True)
+class LoopbackState:
+    """Per-request state a decode loop carries from step to step on the
+    device, beside its last sampled token: one row of ``width`` values per
+    request, kept by sampler slot. A row starts (and restarts, when its slot
+    is reused) at ``default``."""
+    width: int
+    dtype: torch.dtype
+    default: tuple[int | float, ...]
+
+    def __post_init__(self):
+        if len(self.default) != self.width:
+            raise ValueError(
+                f"LoopbackState default has {len(self.default)} values for width {self.width}"
+            )
+
+
 @dataclass
 class SamplerSpec(NodeResourceSpec):
     vocab_size: int | None # must be set for enabled_repetion_penalty
@@ -33,6 +50,10 @@ class SamplerSpec(NodeResourceSpec):
     # per step, so nodes that never ask for it pay nothing; a request that
     # sets ``min_p`` on a node without it is refused at ingest.
     enable_min_p: bool = False
+    # name -> extra loop-back state the node keeps by slot beside the last
+    # token (``SamplerResource.loopback_state`` / ``store_loopback_state``);
+    # only used on the device loop-back path
+    loopback_state: dict[str, LoopbackState] = field(default_factory=dict)
     # Capabilities for the generation-aware request knobs below; each off by
     # default, leaving the node's sampler as it was.
     # The longest ``repetition_window`` a request may ask for (sizes the history).
@@ -56,7 +77,7 @@ class SamplingReqConfig(ResourceReqConfig):
     top_p: float = 1
     ignore_eos: bool = False # used for benchmark parity
     repetition_penalty: float = 1
-    # Min-p (HF ``MinPLogitsWarper`` / vLLM ``min_p``): drop every token whose
+    # Min-p (HF ``MinPLogitsWarper``): drop every token whose
     # probability is below ``min_p`` times the most likely token's, after the
     # penalty and temperature and before top-k/top-p. 0 disables.
     min_p: float = 0.0
@@ -72,7 +93,7 @@ class SamplingReqConfig(ResourceReqConfig):
     top_p_first: bool = False
     # Top-p keeps at least this many tokens (HF's ``min_tokens_to_keep``).
     top_p_min_keep: int = 1
-    # Whether the repetition penalty also counts the prompt's tokens (HF/vLLM do).
+    # Whether the repetition penalty also counts the prompt's tokens (HF does).
     # A node whose step declares no ``prefill_tracked_tokens`` only ever has the
     # generated ones to count.
     penalize_prompt: bool = True
@@ -148,3 +169,6 @@ class SamplerStep(ResourceStep):
     # Rows whose sampled token is kept; None keeps every row. A dropped row
     # still draws, but its RNG offset and seen-token mask are not committed.
     kept_rids: frozenset[int] | None = None
+    # The spec's loop-back states this step's forward stores
+    # (``store_loopback_state``); commit persists them by slot.
+    loopback_writes: frozenset[str] = frozenset()

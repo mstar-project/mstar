@@ -340,16 +340,23 @@ def voice_entry(voice: Token2WavVoice, layout: dict[str, SlotBlock]) -> dict[str
 
 class SlotRows(NamedTuple):
     """A batch's rows of the vocoder's state pool (``slot_layout``): the pool and the step's
-    addressing of them, the same in a captured and an eager forward."""
+    addressing of them, the same in a captured and an eager forward. Reads and writes go
+    through the pool's ``gather`` / ``scatter_``, which cover every row the step declared;
+    ``head`` keeps the first of them."""
 
     pool: RecurrentStatePool
     rows: RecurrentAddressing
 
     def get(self, name: str) -> torch.Tensor:
-        return self.pool.gather(name, self.rows)
+        # a row with no state yet reads zeros; callers pick their initial state for those
+        return self.pool.gather(name)[: self.rows.num_rows]
 
     def set(self, name: str, value: torch.Tensor) -> None:
-        self.pool.scatter_(name, self.rows, value)
+        declared = self.pool.addressing().num_rows
+        if value.shape[0] < declared:
+            # the rows past ``head``: a replay's padding, whose writes land on the sink
+            value = torch.cat([value, value.new_zeros(declared - value.shape[0], *value.shape[1:])])
+        self.pool.scatter_(name, value)
 
     def head(self, n: int) -> SlotRows:
         """The step's first ``n`` rows: its real ones, a captured replay's padding after."""

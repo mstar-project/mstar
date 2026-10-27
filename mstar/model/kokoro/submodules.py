@@ -33,11 +33,11 @@ from torch.nn.utils.rnn import pad_sequence
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
+from mstar.engine.accelerator_graph_config import (
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.model.kokoro.components import KokoroTTS
@@ -375,14 +375,14 @@ class KokoroSynthSubmodule(NodeSubmodule):
             "style": torch.zeros(shape.bs, cfg.style_vector_dim, dtype=torch.float32, device=device),
         }
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """One region per text bucket and per frame bucket. Kokoro holds no
         engine resources, so the regions declare no step."""
         del autocast_dtype, tp_world_size, kwargs
         cfg = self.config
-        regions: dict[str, PiecewiseCudaGraphConfig] = {}
+        regions: dict[str, PiecewiseAcceleratorGraphConfig] = {}
         for bucket in cfg.text_buckets:
             regions[text_region(bucket)] = PiecewiseBatchedConfig(
                 capture_fn=self._text_capture,

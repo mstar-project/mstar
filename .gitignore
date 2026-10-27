@@ -9,11 +9,16 @@ uv.lock
 *.sqlite
 *.prof
 *.json
+!examples/observability/grafana/dashboards/*.json
+!mstar/utils/fused_moe/configs/*.json
+!mstar/model/command_a_plus/tests/fixtures/tiny_config.json
 profiler/
 traces/
 
 # per-user env config
 .env
+# a local virtualenv, or a symlink to one (no trailing slash, so the link is ignored too)
+.venv
 
 # output filenames
 output.png

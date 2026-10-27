@@ -397,7 +397,7 @@ def test_captured_graph_matches_upstream_step_by_step(monkeypatch):
     spy = _ProbsSpy(monkeypatch)
     res = _capable(dev)
     bs = 4
-    res.build_cuda_graph_buffers(
+    res.build_accelerator_graph_buffers(
         [SimpleNamespace(slot=0), SimpleNamespace(slot=1)], max_bs=bs, max_seq_len=1,
     )
     rows = _tts_rows()
@@ -510,7 +510,7 @@ def test_unfiltered_steps_skip_top_k_and_top_p(monkeypatch, captured):
     bs = len(live)
     if captured:
         # before ingest: ingesting registers a request's settings with the graph buffers
-        res.build_cuda_graph_buffers([SimpleNamespace(slot=0)], max_bs=bs, max_seq_len=1)
+        res.build_accelerator_graph_buffers([SimpleNamespace(slot=0)], max_bs=bs, max_seq_len=1)
     for rid in live:
         res.ingest_request(rid, rows[rid].config())
     unfiltered, filtered = SamplerStep(apply_penalty=False, apply_filters=False), SamplerStep(apply_penalty=False)

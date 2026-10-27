@@ -45,6 +45,11 @@ class PositionConfig:
     # FlashInfer, which does not cache sin/cos and causes a torch.compile graph
     # break. Can be more performant for small models. Standard RoPE on CUDA only.
     fused: bool = False
+    # Rotate with a cos/sin table rounded to this dtype (math stays float32),
+    # for checkpoints trained with a low-precision table (Fish S2-Pro:
+    # bfloat16). None computes the angles exactly, in the kernel. XPU rotates
+    # from a table in rope_dtype or the KV dtype and refuses any other value.
+    rope_table_dtype: torch.dtype | None = None
 
     low_freq_factor: float | None = None
     high_freq_factor: float | None = None

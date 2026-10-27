@@ -15,7 +15,9 @@ class _Batch:
     def __init__(self, rids, walk="decode"):
         self.node_name = "llm"
         self.request_ids = list(rids)
-        self.step_context = SimpleNamespace(graph_walk=walk)
+        self.step_context = SimpleNamespace(
+            graph_walk=walk, request_walks={}, walk_of=lambda _r: walk,
+        )
         self.per_request_info_wrapped = {r: SimpleNamespace() for r in rids}
         self.per_request_input_tensors = {}
         self.per_request_input_metadata = {}
@@ -24,6 +26,8 @@ class _Batch:
         self.failed_requests = {}
         self.inputs = None
         self.running_batched = None
+        self.rows_only = False
+        self.loopback_rids = frozenset()
 
     def register_prepare_batch(self, inputs):
         self.inputs = inputs
@@ -100,3 +104,17 @@ def test_loopback_is_per_row_and_tracks_each_request_s_last_step():
     sub.row_loopback.clear()
     eng.prepare_inputs(_Batch([1], walk="prefill"))
     assert sub.row_loopback == [False]
+
+
+def test_a_mixed_step_records_loopback_under_each_row_s_own_walk():
+    sub = _Sub(uniform=None)
+    eng = _engine(sub)
+    walks = {1: "decode", 2: "decode", 3: "prefill"}
+    mixed = _Batch([1, 2, 3], walk="mixed")
+    mixed.step_context.request_walks = walks
+    mixed.step_context.walk_of = walks.__getitem__
+    # rows 1 and 2 kept their token on the device; 3's prompt row routed a tensor
+    mixed.loopback_rids = frozenset({1, 2})
+    eng._record_loopback(mixed)
+    eng.prepare_inputs(_Batch([1, 2, 3]))
+    assert sub.row_loopback == [True, True, False]

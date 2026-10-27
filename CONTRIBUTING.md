@@ -38,7 +38,7 @@ committing or pushing:
 This is opt-in: no Git hooks are installed and running it is not a contribution
 requirement. It uses native `linux/arm64` Docker containers. **Passing these Mac
 checks does not establish that the full x86 CPU suite or GPU tests pass.** GitHub
-continues to run the full CPU manifest on its Ubuntu runners.
+continues to run the full CPU Core suite on its Ubuntu runners.
 
 #### Setup
 
@@ -63,13 +63,13 @@ emulation are outside its supported scope. In particular, setting
 | Command | Checks |
 | --- | --- |
 | `./scripts/ci/mac.sh lint` | Ruff and runner regression tests |
-| `./scripts/ci/mac.sh cpu-smoke` | ARM-compatible subset of the CPU core manifest |
+| `./scripts/ci/mac.sh cpu-smoke` | ARM-compatible subset of the CPU Core suite |
 | `./scripts/ci/mac.sh dynamo` | Dynamo bridges and registration |
 | `./scripts/ci/mac.sh rust` | Native Rust tests, server/extension builds and Python integration tests |
 
 `all` runs these four checks sequentially and stops at the first failure.
-`cpu-smoke` reads [test/cpu-core.txt](test/cpu-core.txt), excluding only the
-modules listed in [test/cpu-mac-exclude.txt](test/cpu-mac-exclude.txt):
+`cpu-smoke` runs the CPU Core job's test paths without
+the modules listed in [test/cpu-mac-exclude.txt](test/cpu-mac-exclude.txt):
 
 - `test_waypoint_components.py`
 - `test_waypoint_dit.py`
@@ -77,14 +77,13 @@ modules listed in [test/cpu-mac-exclude.txt](test/cpu-mac-exclude.txt):
 - `test_waypoint_benchmark_videos.py`
 
 The first three invoke compiled FlexAttention, which requires AVX2 with the
-pinned PyTorch 2.9.1 CPU implementation. The video test hits an illegal
+pinned PyTorch CPU implementation (seen with 2.9.1). The video test hits an illegal
 instruction in PyAV 19.0.1 encoding in the tested Apple VM; this also reproduces
 without mstar. The entire modules are excluded,
 including their portable structural cases. The runner prints the exclusions
-and selected module count, and saves the exact selection in
-`cpu-smoke-tests.txt` with the reports. New core modules are
-included automatically unless explicitly excluded; invalid or stale exclusions
-fail the check. Existing GPU/optional-feature skips are reported by pytest.
+and saves the exact pytest arguments in `cpu-smoke-tests.txt` with the
+reports. New core modules are included automatically unless explicitly
+excluded; invalid or stale exclusions fail the check. Existing GPU/optional-feature skips are reported by pytest.
 No test assertions are changed for the Mac runner.
 
 CPU smoke also disables PyTorch's oneDNN backend in its test process: the
@@ -121,23 +120,48 @@ the dynamic loader. The local Rust check configures `LD_LIBRARY_PATH` for it.
 
 ### CPU core tests on GitHub
 
-The **CPU Core** job runs the full [test/cpu-core.txt](test/cpu-core.txt) manifest
-on a GitHub-hosted Ubuntu runner whenever a PR targeting `main` is opened,
-updated or reopened. It needs no GPU or model weights; mixed modules skip their
-GPU cases explicitly. New updates cancel an older CPU Core run for the same PR.
+The **CPU Core** job runs every test module under the directories in
+`CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)):
+`test/modular/`, `test/distributed/`, the model-local `mstar/model/*/tests/`
+and a few more, on a GitHub-hosted Ubuntu runner whenever a PR targeting `main`
+is opened, updated or reopened, split over the runner's 4 cores with
+pytest-xdist; `test_tp_async_lockstep_sim.py` runs in a second shard beside it,
+"CPU Core (TP lockstep sim)". It needs no GPU or model weights. New updates cancel an older CPU
+Core run for the same PR. The installation and invocation commands are in
+[the CI workflow](.github/workflows/ci.yml).
 
-The installation and invocation commands are in
-[the CI workflow](.github/workflows/ci.yml). To add a CPU-compatible module,
-add its repository-relative path to the manifest after validating it without
-a GPU or model downloads. New cases within a listed module are automatically
-included. Check ARM compatibility before extending the Mac exclusion list.
-The pytest `@file` syntax requires pytest 8.2 or newer, installed by the `dev`
-extra.
+There is no list of test files to add to: a new module under one of those
+directories runs in CI as soon as it exists, so it must pass or skip on a
+CPU-only machine without model weights or optional packages. A test module
+anywhere else must be listed in `NOT_CPU_CORE` in the same script, with the
+place it runs instead; `test/ci/test_cpu_selection.py` fails on a module in
+neither, and on any module the old `test/cpu-core.txt` ran that is no longer
+selected. Within the selected directories:
 
-Keep the selection explicit: other modules under `test/modular/` require GPU
-backends during collection. `test_ragged_attention_cpu.py` contains padding
-validation; GPU attention and capture tests remain in `test_ragged_attention.py`.
-CI prints the slowest tests and retains JUnit reports for seven days. Making
+- a module that needs CUDA throughout sets
+  `pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason=...)`;
+- a module that imports an optional package at module level calls
+  `pytest.importorskip("<module>")` with the import name (`flashinfer`,
+  `misaki`, `qwen_tts`, `mstar_rust`, ...) before that import;
+- a single test that needs one makes the same call at its top, and a
+  real-weights test skips when the checkpoint isn't cached;
+- a test that is broken on `main` gets `@pytest.mark.skip(reason=...)` in its
+  own file, with a reason that says why and names the PR or issue fixing it
+  when one exists, so the fix removes the skip;
+- a test that reads or writes a fixed path or port uses `tmp_path` or a free
+  port instead, since the workers run tests concurrently;
+- a test module outside a Python package has a basename no other selected
+  module has (pytest imports it by that name; the guard checks);
+- a guard on a reference package named like an mstar model (`kokoro`,
+  `chatterbox`, `omnivoice`, ...) imports a submodule only the reference has,
+  e.g. `pytest.importorskip("kokoro.model")`. `mstar/model` is a namespace
+  package, so pytest puts it on `sys.path` for the model-local tests, and from
+  then on the bare name finds mstar's own model package for the rest of the
+  session.
+
+Run the new file with CI's installation before opening the PR. Check ARM
+compatibility before extending the Mac exclusion list. CI prints the slowest
+tests and retains JUnit reports for seven days. Making
 **CPU Core** a required merge check is a separate repository ruleset or branch
 protection setting.
 

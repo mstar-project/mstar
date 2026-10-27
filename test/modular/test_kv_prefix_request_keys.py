@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
@@ -24,9 +25,18 @@ from mstar.conductor.conductor import Conductor
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
-from mstar.model.base import PrefixStream, ProcessPromptOutput
+from mstar.model.base import (
+    KVLabel,
+    LabelLayout,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+    keyed_labels,
+)
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
+from mstar.streaming.topology import PartitionTopology
 
 PAGE_SIZE = 16
 PROMPT = list(range(100))
@@ -59,22 +69,29 @@ class _StubTensorManager:
 
 
 class _Model:
-    """A model that declares one id-keyed stream, or none when asked not to."""
 
     def __init__(
         self, declares: bool = True, metadata: dict | None = None,
-        decode_walk: str | None = None,
+        decode_walk: str | None = None, lays_out: bool = True,
     ):
         self._declares = declares
         self._metadata = metadata
         self._decode_walk = decode_walk
+        self._lays_out = lays_out
 
-    def prefix_key_streams(self):
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
+
+    def kv_labels(self):
         if not self._declares:
             return {}
-        return {"kv": {"main": PrefixStream(
-            "text_inputs", "ids", "prefill", self._decode_walk,
-        )}}
+        growth = () if self._decode_walk is None else ((self._decode_walk, "decode_loop"),)
+        return {"kv": {"main": KVLabel(growth=growth, keys=PrefixKeys(
+            "text_inputs", ("prefill",), growth=self._decode_walk is not None,
+        ))}}
+
+    def max_input_files(self):
+        return {}
 
     def get_node_resources(self):
         return [KVSpec(
@@ -89,9 +106,10 @@ class _Model:
 
     def process_prompt(self, *args, **kwargs):
         tensors = {"text_inputs": [torch.tensor(PROMPT, dtype=torch.long)]}
-        if self._metadata is None:
+        if not self._lays_out:
             return tensors
-        return ProcessPromptOutput(tensors, self._metadata)
+        layout = LabelLayout(spans=(Span("ids", "prefill", len(PROMPT), len(PROMPT), "text_inputs"),))
+        return ProcessPromptOutput(tensors, {"kv_layout": {"kv": {"main": layout}}, **(self._metadata or {})})
 
 
 def _worker(model, model_config: dict | None) -> PreprocessWorkerThread:
@@ -279,13 +297,13 @@ def test_the_metadata_fold_leaves_the_requests_own_kwargs_alone():
     assert kwargs["from_process_prompt"] == 1, "the metadata never arrived"
 
 
-def test_a_model_returning_only_tensors_still_carries_its_keys():
-    worker = _worker(_Model(metadata=None), _deployment())
+def test_a_declared_label_with_no_layout_sends_no_keys():
+    worker = _worker(_Model(lays_out=False), _deployment())
 
     kwargs = _run(worker, {"voice": "tara"})
 
     assert kwargs["voice"] == "tara", "the request's own kwargs were dropped"
-    assert "prefix_keys" in kwargs, "the plain-dict return lost the keys"
+    assert "prefix_keys" not in kwargs, "keys were guessed for a label its request never laid out"
 
 
 # ── the handover to the resource config ─────────────────────────────────
@@ -348,8 +366,9 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     """The configs a request is opened with, as the conductor resolves them:
     the model's own, a default for anything it declared a stream for, and then
     each handed its own chain."""
+    declared = {key: tuple(labels) for key, labels in model.kv_labels().items()}
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model), model_kwargs, {},
+        SimpleNamespace(model=model, _kv_labels=declared), model_kwargs or {}, {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)
@@ -374,7 +393,88 @@ def test_orpheus_is_handed_a_config_for_the_stream_it_declares():
 
     configs = _conductor_configs(orpheus)
 
-    assert set(orpheus.prefix_key_streams()) <= set(configs), (
+    assert set(keyed_labels(orpheus)) <= set(configs), (
         "orpheus returns a sampler config alone, so the resource it declared "
         "a stream for had nothing to carry its chain"
+    )
+
+
+# ── a stream an image walk writes too ───────────────────────────────────
+# An image's pages carry the whole SHA-256 of the file as sent, with how it was
+# read and preprocessed. A digest cut short, or folded into an id, is how
+# LMCache and SGLang served one request another image's KV.
+
+
+class _LaidOut(_Model):
+    """A model whose layout is its text, then one image written by a separate walk."""
+
+    def __init__(self, image: Span, rewrites: bytes | None = None):
+        text = Span("ids", "prefill", len(PROMPT), len(PROMPT), "text_inputs")
+        super().__init__(metadata={"kv_layout": {"kv": {"main": LabelLayout(spans=(text, image))}}})
+        self._rewrites = rewrites
+
+    def kv_labels(self):
+        walks = ("prefill", "prefill_image")
+        return {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", walks))}}
+
+    def preprocess_fingerprint(self):
+        return "stub"
+
+    def load_image(self, filepath, device):
+        if self._rewrites is not None:
+            with open(filepath, "wb") as file:
+                file.write(self._rewrites)
+        return TensorAndMetadata(torch.zeros(3, 2, 2))
+
+    load_video = load_image
+
+
+def _image(params=("default",), modality="image") -> Span:
+    return Span("digest", "prefill_image", 30, 1, (modality, 0), params)
+
+
+def _laid_out_kwargs(tmp_path, content: bytes, image: Span, rewrites: bytes | None = None) -> dict:
+    """Preprocess one request with a file holding ``content`` and return the kwargs the conductor was sent."""
+    path = tmp_path / "file0"
+    path.write_bytes(content)
+    modality = image.source[0]
+    worker = _worker(_LaidOut(image, rewrites), _deployment())
+    worker._process_input(PreprocessInput(
+        request_id="r0", text="hello", file_paths={modality: [str(path)]},
+        input_modalities=["text", modality], output_modalities=["text"], model_kwargs={},
+    ))
+    return worker.communicator.sent[-1].body.model_kwargs
+
+
+_LARGE = b"\x89PNG" + bytes(range(256)) * 512
+# Each pair is two runs of one layout that differ in something that changes what the image's walk writes.
+_APART = {
+    "content": ((b"\x89PNG one", _image()), (b"\x89PNG two", _image())),
+    "a large file's last byte": ((_LARGE + b"\x00", _image()), (_LARGE + b"\x01", _image())),
+    "preprocessing": ((b"\x89PNG same", _image()), (b"\x89PNG same", _image(params=("vllm",)))),
+    "a parameter's type": ((b"\x89PNG same", _image(params=(True,))), (b"\x89PNG same", _image(params=("True",)))),
+    "modality": ((b"GIF89a same", _image()), (b"GIF89a same", _image(modality="video"))),
+}
+
+
+@pytest.mark.parametrize(("one", "other"), _APART.values(), ids=_APART.keys())
+def test_images_that_write_different_kv_key_apart_from_their_first_page(tmp_path, one, other):
+    keys = [
+        _laid_out_kwargs(tmp_path, content, image)["prefix_keys"]["kv"]["main"]
+        for content, image in (one, other)
+    ]
+
+    differs = [page for page, (a, b) in enumerate(zip(*keys, strict=True)) if a != b]
+    assert differs[:1] == [len(PROMPT) // PAGE_SIZE], (
+        "two images whose walks write different KV share keys past the text "
+        "before them, so one is served the other's"
+    )
+
+
+def test_a_file_rewritten_while_it_was_loaded_runs_its_request_uncached(tmp_path):
+    kwargs = _laid_out_kwargs(tmp_path, b"\x89PNG one", _image(), rewrites=b"\x89PNG another")
+
+    assert kwargs.get("prefix_cache") is False and "prefix_keys" not in kwargs, (
+        "a file that changed after it was decoded was keyed by bytes nobody decoded, "
+        "or its request was sent on without turning the cache off"
     )

@@ -63,6 +63,9 @@ from mstar.model.wan22.submodules import (
 
 logger = logging.getLogger(__name__)
 
+# libx264, which postprocess encodes with, refuses a frame wider or taller than this
+_MP4_MAX_SIDE = 16384
+
 
 class Wan22Model(Model):
     """Wan2.2-TI2V-5B video generation model (TI2V-5B variant only)."""
@@ -81,7 +84,11 @@ class Wan22Model(Model):
         model_path_hf: str,
         cache_dir: str | None = None,
         variant: str = WAN22_VARIANT_TI2V_5B,
+        compile_dit_sizes: tuple[str, ...] | None = None,
+        max_video_pixels: int = Wan22Config.max_video_pixels,
         skip_weight_loading: bool = False,
+        vae_decode_fast: bool = True,
+        vae_decode_fast_sizes: tuple[str, ...] | None = None,
         **kwargs,
     ):
         if variant != WAN22_VARIANT_TI2V_5B:
@@ -91,7 +98,12 @@ class Wan22Model(Model):
             )
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
-        self.config = Wan22Config(variant=variant)
+        self.config = Wan22Config(
+            variant=variant, compile_dit_sizes=compile_dit_sizes,
+            max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
+            vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
+        )
+        self.config.compile_dit_grids()  # a malformed list fails at startup
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading
@@ -267,7 +279,9 @@ class Wan22Model(Model):
 
         height and width must be multiples of 32 (VAE downsample 16 x DiT patch 2),
         num_frames must be 4k+1 (the VAE compresses time by 4 around an anchor
-        frame), and fps must be positive.
+        frame), height x width x num_frames must not exceed ``max_video_pixels``, each
+        axis must fit the DiT's rotary table and each side the mp4 encoder, and fps
+        must be positive.
 
         This runs on the data worker because that is where a ValueError becomes a
         400 for the one bad request. Left to fail later, none of these fail well:
@@ -279,11 +293,12 @@ class Wan22Model(Model):
         the raise is swallowed and the client hangs.
         """
         cfg = self.config
+        size = {}
         for name, patch, align, default in (
             ("height", cfg.patch_size[1], cfg.spatial_alignment[0], cfg.default_height),
             ("width", cfg.patch_size[2], cfg.spatial_alignment[1], cfg.default_width),
         ):
-            value = self._require_positive_int(name, model_kwargs.get(name, default))
+            value = size[name] = self._require_positive_int(name, model_kwargs.get(name, default))
             if value % align:
                 lower = value // align * align
                 upper = lower + align
@@ -307,6 +322,30 @@ class Wan22Model(Model):
                 f"(the VAE compresses time by {temporal} around an anchor frame). "
                 f"An unaligned count is silently floored rather than honored. "
                 f"Nearest valid num_frames: {lower} or {upper}."
+            )
+
+        height, width = size["height"], size["width"]
+        if height * width * frames > cfg.max_video_pixels:
+            raise ValueError(
+                f"Wan2.2 height x width x num_frames = {height}x{width}x{frames} = "
+                f"{height * width * frames} exceeds this server's max_video_pixels={cfg.max_video_pixels}."
+            )
+        # One rotary position per post-patch cell on each axis.
+        rope = cfg.rope_max_seq_len
+        max_h, max_w = (rope * a for a in cfg.spatial_alignment)
+        max_frames = (rope - 1) * temporal + 1
+        if height > max_h or width > max_w or frames > max_frames:
+            raise ValueError(
+                f"Wan2.2 supports at most height {max_h}, width {max_w} and num_frames "
+                f"{max_frames} (the DiT's {rope} rotary positions per axis); got "
+                f"{height}x{width}x{frames}."
+            )
+        # postprocess encodes the clip with libx264, which opens no stream past this
+        # side; checked here, not after the video is generated
+        if max(height, width) > _MP4_MAX_SIDE:
+            raise ValueError(
+                f"Wan2.2 supports at most {_MP4_MAX_SIDE} pixels per side (the mp4 encoder's "
+                f"limit); got {height}x{width}."
             )
 
         # An explicit ``fps: null`` means "unset", same as an absent key.
@@ -462,7 +501,7 @@ class Wan22Model(Model):
         }
 
     def _log_config_echo(self, model_kwargs: dict, resolved: dict) -> None:
-        """Emit one vllm-style line per request at generation start, echoing every
+        """Emit one ``key=value`` log line per request at generation start, echoing every
         resolved setting so an operator can read back exactly what ran instead of
         asserting the knobs. ``decode`` is the configured tiling POLICY
         (auto/tiled/untiled, resolved from config + env); the actual per-request

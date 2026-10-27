@@ -1,6 +1,6 @@
 ---
 name: diffusion-scaffold
-description: Building an image/video flow or diffusion model on M*'s DiT scaffold (mstar/model/components/diffusion/, DenoiseLoopSubmodule) — bucket keys, schedules and seeding, multi-stage recipes, ragged attention spans, compile and per-bucket CUDA graphs, and the async overshoot veto. Use when porting a DiT-style model, writing a DenoiseLoopSubmodule subclass, or changing the scaffold itself.
+description: Building an image/video flow or diffusion model on M*'s DiT scaffold (mstar/model/components/diffusion/, DenoiseLoopSubmodule) — bucket keys, schedules and seeding, multi-stage recipes, ragged attention spans, compile and per-bucket accelerator graphs, and the async overshoot veto. Use when porting a DiT-style model, writing a DenoiseLoopSubmodule subclass, or changing the scaffold itself.
 ---
 
 # The DiT scaffold
@@ -13,7 +13,7 @@ Read the [add-mstar-model skill](../add-mstar-model/SKILL.md) for the port as a 
 
 ## The bucket key
 
-`bucket_key_for(fwd_info)` returns everything that has to match for two requests to share a forward. It is also the CUDA-graph bucket key and the key of the per-bucket layout cache (`build_layout`: rotary tables and the like, built once and never evicted because a captured graph reads them at fixed addresses).
+`bucket_key_for(fwd_info)` returns everything that has to match for two requests to share a forward. It is also the accelerator graph bucket key and the key of the per-bucket layout cache (`build_layout`: rotary tables and the like, built once and never evicted because a captured graph reads them at fixed addresses).
 
 - **It is not just shape.** The latent grid and the text length belong in it, but so does anything that changes the forward: whether guidance is on, the conditioning layout, which recipe stage is running.
 - **Too fine a key means no batching, too coarse means wrong output.** Two requests that differ in something the key leaves out are stacked into one forward and one of them is computed with the other's layout. A row-independence test (each row of a batched forward equals that request run alone) catches this.

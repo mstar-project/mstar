@@ -11,6 +11,7 @@ hardware is.
 from __future__ import annotations
 
 import functools
+import os
 from typing import cast
 
 import torch
@@ -29,6 +30,7 @@ __all__ = [
     "Platform",
     "RocmPlatform",
     "XpuPlatform",
+    "apply_process_env_defaults",
     "current_platform",
     "resolve_platform",
 ]
@@ -46,7 +48,8 @@ def resolve_platform() -> Platform:
 
 
 class _CurrentPlatform:
-    """Forwards to ``resolve_platform()``, so importing this probes no device."""
+    """Forwards to ``resolve_platform()``, so importing this touches no device.
+    Ask it ``is_rocm()`` and friends rather than ``isinstance``."""
 
     def __getattr__(self, name: str):
         return getattr(resolve_platform(), name)
@@ -54,5 +57,32 @@ class _CurrentPlatform:
     def __repr__(self) -> str:
         return repr(resolve_platform())
 
+    def __reduce__(self):
+        # pickle by name so a round trip gives back this singleton
+        return "current_platform"
+
 
 current_platform = cast(Platform, _CurrentPlatform())
+
+
+def _built_for() -> Platform:
+    """The platform torch was built for. Needs no device call."""
+    if torch.version.hip is not None:
+        return RocmPlatform()
+    if torch.version.cuda is not None:
+        return CudaPlatform()
+    if getattr(torch.version, "xpu", None) is not None:
+        return XpuPlatform()
+    return CpuPlatform()
+
+
+def apply_process_env_defaults() -> None:
+    """Set the platform's ``process_env_defaults``, keeping any value already set.
+
+    Call it before the first device call, since the HIP and CUDA runtimes read
+    much of their environment at init. Resolving ``current_platform`` counts
+    devices, which initializes the runtime, so this asks the platform torch was
+    built for instead.
+    """
+    for key, value in _built_for().process_env_defaults().items():
+        os.environ.setdefault(key, value)

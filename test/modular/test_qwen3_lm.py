@@ -13,6 +13,7 @@ pytest.importorskip("transformers")
 
 from transformers import Qwen3Config, Qwen3ForCausalLM  # noqa: E402
 
+from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig  # noqa: E402
 
 ATTN, KV, POS = "attn", "kv", "rope"
@@ -77,6 +78,9 @@ class _FakeRope:
     def __init__(self):
         self.next_pos = 0
 
+    def fusable_rope_theta(self, head_dim):
+        return None  # applies RoPE itself: the layer stays on the unfused path
+
     def apply_qk(self, q, k, label, rope_theta, **kwargs):
         del label, kwargs
         n, _, d = q.shape
@@ -128,6 +132,18 @@ def test_weights_load_completely_and_tied_head_is_copied():
         )
 
 
+def test_tp_rank_ties_its_own_vocab_shard():
+    values = dict(TINY, vocab_size=96, tie_word_embeddings=True)
+    torch.manual_seed(0)
+    hf = Qwen3ForCausalLM(Qwen3Config(**values, attn_implementation="eager")).eval()
+    rank1 = CommGroup(my_global_rank=1, my_group_rank=1, group_members=[0, 1])
+    ours = Qwen3DenseLM(Qwen3LMConfig.from_hf(values), attn_key=ATTN, kv_key=KV, pos_key=POS, comm_group=rank1)
+    state = {k.removeprefix("model."): v for k, v in hf.state_dict().items()}
+    del state["lm_head.weight"]
+    ours.load_weights(list(state.items()))
+    assert torch.equal(ours.lm_head.weight, state["embed_tokens.weight"][48:])
+
+
 def test_prefill_and_decode_logits_match_hf():
     hf, ours, rope = _pair()
     torch.manual_seed(3)
@@ -149,3 +165,23 @@ def test_prefill_and_decode_logits_match_hf():
             step = ours.logits(ours(ours.embed(nxt), label="main"))
         assert torch.allclose(step[0], expected[-1], atol=1e-4), (step[0] - expected[-1]).abs().max()
         rope.next_pos += 1
+
+
+@pytest.mark.parametrize("overrides,head_dim,fusable", [
+    ({}, 128, True),
+    ({"rotary_dim": 128}, 128, True),
+    ({"rotary_dim": 64}, 128, False),  # partial rotary
+    ({"interleave": True}, 128, False),
+    ({"rope_scale": 2.0}, 128, False),
+    ({"rope_dtype": torch.float32}, 128, False),
+    ({"low_freq_factor": 1.0, "high_freq_factor": 4.0, "old_context_len": 8192}, 128, False),
+])
+def test_the_position_resource_says_when_a_layer_may_fuse_its_rope(overrides, head_dim, fusable):
+    from mstar.engine.resources.position.config import PositionConfig
+    from mstar.engine.resources.position.manager import RopeManager
+
+    rope = RopeManager(
+        config=PositionConfig(kv_cache="kv", rope_theta=1e6, **overrides),
+        device=torch.device("cpu"), head_dim=head_dim,
+    )
+    assert rope.fusable_rope_theta(head_dim) == (1e6 if fusable else None)

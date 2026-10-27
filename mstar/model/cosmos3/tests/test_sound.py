@@ -23,7 +23,7 @@ import torch.nn.functional as F  # noqa: F401 — keeps parity harness imports u
 from mstar.model.cosmos3.components.packing import build_static_inputs
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
-from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+from mstar.model.cosmos3.submodules import sound_frames
 from mstar.model.cosmos3.tests.test_engine_cache import (
     _engine_resources,
     _forward_step,
@@ -70,18 +70,18 @@ def test_sound_segment_layout() -> None:
 
 
 def test_sound_frame_math() -> None:
-    dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Config())
+    config = Cosmos3Config()
     # Video-duration default: 93 frames @ 16 fps = 5.8125 s -> 279000 samples
     # -> ceil(279000 / 1920) = 146 latent frames.
-    target, frames = dit._resolve_sound_frames({"num_frames": 93, "fps": 16.0})
+    target, frames = sound_frames({"num_frames": 93, "fps": 16.0}, config)
     assert (target, frames) == (279000, 146)
     # 17 frames @ 24 fps = 0.7083 s -> 34000 samples -> 18 latent frames.
-    target, frames = dit._resolve_sound_frames({"num_frames": 17, "fps": 24.0})
+    target, frames = sound_frames({"num_frames": 17, "fps": 24.0}, config)
     assert (target, frames) == (34000, 18)
     # Explicit sound_duration wins; sub-frame durations clamp to one video frame.
-    target, frames = dit._resolve_sound_frames({"num_frames": 17, "fps": 24.0, "sound_duration": 2.0})
+    target, frames = sound_frames({"num_frames": 17, "fps": 24.0, "sound_duration": 2.0}, config)
     assert (target, frames) == (96000, 50)
-    target, frames = dit._resolve_sound_frames({"num_frames": 17, "fps": 24.0, "sound_duration": 0.0})
+    target, frames = sound_frames({"num_frames": 17, "fps": 24.0, "sound_duration": 0.0}, config)
     assert target == round(48000 / 24.0) and frames == 2
 
 
@@ -248,7 +248,7 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
     md = {"height": H, "width": W, "num_frames": FRAMES, "fps": 24.0,
           "guidance_scale": GS, "num_inference_steps": STEPS, "generate_sound": True}
     fwd = CurrentForwardPassInfo(
-        request_id=rid, graph_walk="prefill",
+        request_id=rid, rid_handle=rid, graph_walk="prefill",
         fwd_index=0, random_seed=SEED, max_tokens=0, step_metadata=md,
     )
     text_inputs = [
@@ -285,9 +285,12 @@ def _sound_scenario():
     from mstar.model.cosmos3.components.packing import tokenize_prompt
 
     device, dtype, mpipe, model = base["device"], base["dtype"], base["mpipe"], base["model"]
-    cond_ids, uncond_ids = tokenize_prompt(model.tokenizer, PROMPT, "", num_frames=FRAMES, height=H, width=W)
+    cond_ids, uncond_ids = tokenize_prompt(
+        model.tokenizer, PROMPT, "", num_frames=FRAMES, height=H, width=W,
+        use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
+    )
     lat_t = 1 + (FRAMES - 1) // mpipe.vae_scale_temporal
-    _, t_s = model.get_submodule("dit")._resolve_sound_frames({"num_frames": FRAMES, "fps": 24.0})
+    _, t_s = sound_frames({"num_frames": FRAMES, "fps": 24.0}, model.get_submodule("dit").config)
     gen = torch.Generator(device=device).manual_seed(SEED)
     init = torch.randn((1, 48, lat_t, H // 16, W // 16), generator=gen, device=device, dtype=dtype)
     # The fused pipeline draws its sound noise from `generator` after the video

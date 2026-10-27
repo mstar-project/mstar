@@ -526,7 +526,8 @@ def test_missing_language_backend_is_reported_once(monkeypatch):
     assert frontend.available("j") is False  # cached: not retried
     with pytest.raises(ImportError, match="misaki\\[ja\\]"):
         frontend.backend("j")
-    assert frontend.available("a") is (importlib.util.find_spec("misaki.en") is not None)
+    has_misaki_en = importlib.util.find_spec("misaki") is not None and importlib.util.find_spec("misaki.en") is not None
+    assert frontend.available("a") is has_misaki_en
 
 
 def test_warmup_builds_the_default_language_backend(voices_dir):
@@ -686,7 +687,7 @@ def test_bf16_decoder_keeps_source_and_head_in_fp32():
 def test_piecewise_regions_match_the_eager_halves():
     """Each captured half, run as the runner would run it (padded to its bucket,
     padding rows zeroed), reproduces the eager computation on the real rows."""
-    from mstar.engine.cuda_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
+    from mstar.engine.accelerator_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
     from mstar.model.kokoro.submodules import frame_region, text_region
     from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -696,7 +697,7 @@ def test_piecewise_regions_match_the_eager_halves():
     config.capture_batch_sizes = [1, 2, 4]
     config.max_batch_frames = 128
     submodule = KokoroSynthSubmodule(tiny_model(), config)
-    regions = submodule.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.float32)
+    regions = submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
     assert set(regions) == {text_region(8), text_region(16)} | {frame_region(f) for f in (16, 32, 64)}
     assert regions[text_region(16)].seq_len == 16 and regions[text_region(16)].capture_batch_sizes == [1, 2, 4]
     # bs * frames <= max_batch_frames caps the decoder's batch per bucket
@@ -752,7 +753,7 @@ def test_synthesize_uses_runners_when_they_fit():
     config.text_buckets = [8]
     config.frame_buckets = [16, 64]
     submodule = KokoroSynthSubmodule(tiny_model(), config)
-    regions = submodule.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.float32)
+    regions = submodule.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)
 
     class FakeRunner:
         def __init__(self, config):
@@ -763,7 +764,7 @@ def test_synthesize_uses_runners_when_they_fit():
             return bs <= max(self.config.capture_batch_sizes)
 
         def run(self, static_inputs, real_bs):
-            from mstar.engine.cuda_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
+            from mstar.engine.accelerator_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
 
             bs = next(b for b in self.config.capture_batch_sizes if b >= real_bs)
             seq_len = self.config.seq_len

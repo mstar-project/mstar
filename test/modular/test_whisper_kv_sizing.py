@@ -93,6 +93,7 @@ def _conductor(max_concurrent_requests: int | None) -> Conductor:
     c = object.__new__(Conductor)
     c.requests = {}
     c.waiting_queue = []
+    c._client_streams = {}
     c.max_concurrent_requests = max_concurrent_requests
     c._early_abort_requests = set()
     c.enable_nvtx = False
@@ -120,9 +121,10 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
     specs = _kv_specs(model)
     cross = _manager(specs[CROSS_KV_CACHE].config, CROSS_KV_CACHE)
     self_kv = _manager(specs[KV_CACHE].config, KV_CACHE)
-    batch_size = WhisperDecoderSubmodule.MAX_BATCH_SIZE
+    batch_size = WhisperDecoderSubmodule.MAX_PREFILL_BATCH_SIZE
     for i in range(arrivals):
-        conductor._ingest_request(SimpleNamespace(request_id=f"r{i}", model_kwargs={}))
+        conductor._ingest_request(SimpleNamespace(
+            request_id=f"r{i}", model_kwargs={}, client_request_id=None, client_input=None))
 
     running: list[str] = []
     refused = peak = finished = 0
@@ -165,7 +167,7 @@ def test_default_caches_hold_the_request_cap():
     assert specs[KV_CACHE].config.max_num_pages == 1 + 4 * cap
 
 
-@pytest.mark.parametrize("name", ["whisper_large", "whisper_large_tp2"])
+@pytest.mark.parametrize("name", ["whisper_large", "whisper_large_tp2", "whisper_large_v3_turbo"])
 def test_shipped_yaml_caps_requests_at_what_the_caches_hold(name):
     path = CONFIGS / f"{name}.yaml"
     cfg = yaml.safe_load(path.read_text())
@@ -238,7 +240,7 @@ def test_old_context_cache_refused_a_full_prefill_batch_even_empty():
     model = _make_model()
     config = dataclasses.replace(_kv_specs(model)[CROSS_KV_CACHE].config, max_num_pages=192)
     cross = _manager(config, CROSS_KV_CACHE)
-    batch = [f"r{i}" for i in range(WhisperDecoderSubmodule.MAX_BATCH_SIZE)]
+    batch = [f"r{i}" for i in range(16)]  # the old decoder's prefill batch cap
     for rid in batch:
         cross.ingest_request(rid)
     span = model.config.max_source_positions

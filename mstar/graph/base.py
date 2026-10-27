@@ -109,6 +109,9 @@ class NodeCompletionOutput:
     # loop-back (name, dest) pairs the caller must NOT route; the loop has finished so
     # we do not want the loop-back signals to propagate
     filtered_signals: set[NameAndDest] = field(default_factory=set)
+    # Cache holds relinquished by finished loops, settled AFTER routing/persist.
+    # A list preserves multiplicity when nested loops hold the same UUID.
+    transferred_refs: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -575,14 +578,22 @@ class Loop(GraphSection):
             # (the parent reads them off ``managed_entities``) already filtered
             # by its loop-back, so they are not added again here; the
             # accumulated ones are disjoint by name and ride separately.
-            outer = self._managing_registry.mark_entity_complete(self.name)
-
-            # Don't dereference, becaue the tensors will be used downstream
+            transferred = [
+                info.uuid
+                for cache in (self._cached_outputs, self._accumulated_cache)
+                for infos in cache.values() for info in infos
+            ]
+            # Detach before cascading: a finishing parent clears its children,
+            # which would otherwise release these same accumulated holds again.
+            # The descriptors on our output edges keep the lists; the reference
+            # holds stay alive until routing has established consumer ownership.
             self._cached_outputs.clear()
             self._accumulated_cache.clear()
+            outer = self._managing_registry.mark_entity_complete(self.name)
             return NodeCompletionOutput(
                 output_edges=list(outer.output_edges) + self.accumulated_outputs,
                 filtered_signals=self._loop_back_inputs | outer.filtered_signals,
+                transferred_refs=transferred + outer.transferred_refs,
             )
         else:
             self._advance_one_iter()
@@ -701,6 +712,18 @@ def top_level_entities(section: GraphSection) -> dict[str, "GraphNode | Loop"]:
     return entities
 
 
+def self_triggered(entity: "GraphNode | Loop") -> bool:
+    """Whether the stream alone can re-run a top-level entity once it completes:
+    it is, or (a Loop) holds, a consumer with every input streamed. Completion
+    reseeds streaming readiness only for such nodes (see
+    ``WorkerGraphStateRegistry.reseed_streaming_ready``); a consumer with a
+    non-streamed input has to receive it again first."""
+    return any(
+        node.consumes_stream and node.input_names <= node._streaming_inputs
+        for node in entity.get_nodes().values()
+    )
+
+
 class GraphStateRegistry(ABC):
     def __init__(
         self, graph_section: GraphSection,
@@ -750,6 +773,7 @@ class LoopStateRegistry(GraphStateRegistry):
         if self.is_done:
             loop_out = self.loop.complete_iter()
             output.filtered_signals.update(loop_out.filtered_signals)
+            output.transferred_refs.extend(loop_out.transferred_refs)
             # strip loop-back edges from this entity's raw outputs, then append the
             # loop's declared outputs (either the external outputs if done, or the
             # re-injected external inputs if advancing to the next iteration)

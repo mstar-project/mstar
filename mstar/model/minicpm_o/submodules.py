@@ -16,14 +16,14 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
@@ -111,19 +111,21 @@ class LLMSubmodule(ARNodeSubmodule):
         self.model = model
         self.config = config
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
         """Decode, and one prefill capture every prefill walk replays: ids are
         embedded in `preprocess`, so the forward always takes embeddings."""
         def dummy(n: int) -> ARNodeInputs:
             return ARNodeInputs(input_ids=torch.zeros(n, dtype=torch.long, device=device), input_seq_len=n)
 
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk=DECODE,
                 single_request_inputs=dummy(1),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_image", "prefill_audio", "prefill_omni"],
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -479,9 +481,9 @@ class AudioEncoderSubmodule(NodeSubmodule):
         # one request a step, so it can take the captured block loop
         return 1
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         d_model = self.config.audio.d_model
 
         def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
@@ -590,7 +592,9 @@ class TTSSubmodule(ARNodeSubmodule):
         self.config_tts = model.config
         self.sampling = sampling
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
         hidden = self.config_tts.hidden_size
 
         def prefill_dummy(n: int) -> ARNodeInputs:
@@ -600,14 +604,14 @@ class TTSSubmodule(ARNodeSubmodule):
             )
 
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk=TTS_DECODE,
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=1,
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk=TTS_PREFILL,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=prefill_dummy,
@@ -910,9 +914,9 @@ class Token2WavSubmodule(NodeSubmodule):
     def eager_region(stage: str, first: bool, last: bool) -> str:
         return f"t2w/{stage}_eager/{'first' if first else 'next'}{'_last' if last else ''}"
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         def static_tokens(num_tokens: int):
             def make(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
                 return {

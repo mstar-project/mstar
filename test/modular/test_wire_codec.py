@@ -17,7 +17,7 @@ import pytest
 import torch
 
 import mstar.communication.wire_types  # noqa: F401  (registers the tags)
-from mstar.api_server.request_types import APIServerMessage, ResultTensors
+from mstar.api_server.request_types import APIServerMessage, RequestComplete, ResultTensors
 from mstar.communication.wire import _TYPE_TO_TAG, WireError, decode, encode
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
@@ -158,7 +158,7 @@ def test_polymorphic_body_dispatch():
          WorkerMessageType.SCHEDULE_TP),
         (NewRequest(request_id="r", partition_worker_graph_ids=["wg0"],
                     worker_graph_to_workers={"wg0": ["w0", "w1"]},
-                    initial_inputs=[_edge()], request_info=_fwd_info()),
+                    initial_inputs=[_edge()], request_info=_fwd_info(), loop_caps={}),
          WorkerMessageType.NEW_REQUEST),
     ]:
         got = roundtrip(WorkerMessage(message_type=mtype, body=body))
@@ -200,9 +200,7 @@ def test_worker_graphs_done_full():
             resource_publish_info={},
             partition_name="p0", partition_done=True,
             stream_tokens_consumed={"audio": 12},
-            output_loop_indices={"tok": NestedLoopIndices(
-                loop_name_order=["decode_loop"], loop_indices={"decode_loop": 9},
-                wg_fwd_pass_idx=1)},
+            output_signal_names=["tok", "tok"],
             rx_info=[RxInfo(edge_name="e", source_entity="w1", dest_entity="w0",
                             count=2, num_bytes=99, time=0.5)],
             tx_info=[TxInfo(edge_name="e", source_entity="w0", count=1,
@@ -218,6 +216,19 @@ def test_worker_graphs_done_full():
     assert body.rx_info[0].num_bytes == 99
     assert body.tx_info[0].time == pytest.approx(0.25)
     assert body.partition_done is True
+    assert body.output_signal_names == ["tok", "tok"]
+
+
+def test_api_server_request_complete_carries_chunk_counts():
+    msg = APIServerMessage(
+        message_type="request_complete",
+        body=RequestComplete(
+            request_id="r0", output_chunk_counts={"new_token": 5, "audio_chunk": 2},
+            conductor_ingest_time=1.0, conductor_finish_time=2.0,
+        ),
+    )
+    body = roundtrip(msg).body
+    assert body.output_chunk_counts == {"new_token": 5, "audio_chunk": 2}
 
 
 def test_api_server_result_tensors():

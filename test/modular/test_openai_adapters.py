@@ -110,13 +110,17 @@ def test_qwen3_tts_speech_maps_voice_instructions_and_extra_body(tmp_path):
     assert adapters.OrpheusAdapter.speech_chunk_min_chars is None
 
 
-def test_qwen3_tts_speech_reference_audio_becomes_audio_input(tmp_path):
+def test_qwen3_tts_speech_reference_audio_becomes_audio_input(tmp_path, monkeypatch):
+    # the decode check itself runs on real clips in test_media_paths.py
+    checked = []
+    monkeypatch.setattr(adapters.media_io, "check_ref_audio", lambda path, decoder: checked.append(decoder))
     wav = base64.b64encode(b"RIFF....WAVEfmt ").decode()
     req = SpeechRequest(
         input="clone me", ref_audio=f"data:audio/wav;base64,{wav}", ref_text="reference words",
         x_vector_only_mode=False,
     )
     sa = adapters.Qwen3TTSAdapter().speech_to_request(req, tmp_path)
+    assert checked == ["soundfile"]
     assert sa.input_modalities == ["audio", "text"] and sa.output_modalities == ["audio"]
     (path,) = sa.file_paths["audio"]
     assert Path(path).is_file() and Path(path).read_bytes() == b"RIFF....WAVEfmt "
