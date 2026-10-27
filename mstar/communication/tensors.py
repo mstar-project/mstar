@@ -1344,28 +1344,37 @@ class TensorCommunicationManager(ABC):
         self,
         safety_hold_uuids: set[int],
         routed_edges: list[GraphEdge],
+        transferred_refs: list[int] | tuple[int, ...] = (),
     ):
-        """Adjust ref counts from the safety hold (1) to the actual fanout.
+        """Replace producer and completed-loop cache holds with actual fanout.
 
         Called after ``process_node_outputs`` determines the real routing.
         ``safety_hold_uuids`` is the set of UUIDs that were given ref=1 by
         ``increment_ref_batch_uniform`` after
         ``store_and_return_tensor_info_batch``.
         ``routed_edges`` is the flat list of all edges that will actually be
-        consumed (local ingestion, remote send, persist, emit, streaming).
+        consumed (local ingestion, remote send, emit, streaming). Persist
+        markers must already be set; persistence itself is not a counted read.
+        ``transferred_refs`` lists cache holds relinquished by finished loops,
+        including repeated UUIDs held by multiple nested loops. Keep these
+        holds alive until routing and persist marking have finished.
         """
-        actual_counts: dict[int, int] = {uuid: 0 for uuid in safety_hold_uuids}
+        # Each tensor's change: minus its holds (the producer's safety hold,
+        # plus every loop hold handed over), plus one per routed reader. Older
+        # accumulated tensors are included even if this pass minted none.
+        deltas: dict[int, int] = dict.fromkeys(safety_hold_uuids, -1)
+        for uuid in transferred_refs:
+            deltas[uuid] = deltas.get(uuid, 0) - 1
         for edge in routed_edges:
             for info in edge.tensor_info:
-                if info.uuid in actual_counts:
-                    actual_counts[info.uuid] += 1
+                if info.uuid in deltas:
+                    deltas[info.uuid] += 1
 
         up_uuids: list[int] = []
         up_counts: list[int] = []
         down_uuids: list[int] = []
         down_counts: list[int] = []
-        for uuid, count in actual_counts.items():
-            delta = count - 1  # subtract the safety hold of 1
+        for uuid, delta in deltas.items():
             if delta > 0:
                 up_uuids.append(uuid)
                 up_counts.append(delta)

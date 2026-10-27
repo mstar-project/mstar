@@ -800,6 +800,12 @@ def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size))
 
 
+def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
+    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
+    return _bare(Qwen3ASRModel, config=Qwen3ASRModelConfig())
+
+
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
     return _bare(WhisperModel, config=WhisperModelConfig())
@@ -844,6 +850,7 @@ _FACTORIES = {
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
+    "Qwen3ASRModel": _qwen3_asr,
     "WhisperModel": _whisper,
     # constructed directly: NemotronDuplexModel, OmniVoiceModel, Pi05Model,
     # VJepa2Model, VJepa2ACModel, Wan22Model, WaypointModel
