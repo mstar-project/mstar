@@ -57,11 +57,13 @@ from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
+from mstar.platforms import current_platform
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils import knobs
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.containers import ParallelList, RecentSet
+from mstar.utils.cpu_list import format_cpu_list
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -93,6 +95,7 @@ from mstar.utils.profiler import (
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.step_threads import PINNABLE, StepCore, choose_step_core, pin_step_thread, smt_order
 from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -383,6 +386,11 @@ class Worker:
     _lockstep_led: frozenset[str] = frozenset()
     _lockstep_unread: Mapping[int, set[str]] = MappingProxyType({})
 
+    # The CPU the main, GPU and plan threads share (None: not pinned) and the
+    # process mask everything else keeps; see ``step_threads``.
+    _step_core: StepCore = StepCore(None, "not chosen")
+    _process_cpus: frozenset[int] = frozenset()
+
     @cached_property
     def device_capability(self) -> DeviceCapability:
         return DeviceCapability.of(self.device)
@@ -408,6 +416,7 @@ class Worker:
         tcp_transfer_device="",
         dist_init_method=None,
         status_interval_s: float | None = None,
+        local_worker_devices: list[str] | None = None,
     ):
         # before anything below builds a resource or a submodule that reads one
         knobs.configure((model_config or {}).get("knobs"))
@@ -448,6 +457,7 @@ class Worker:
 
         if self.device_capability.is_accelerator and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
+        self._choose_step_core(worker_ids, local_worker_devices)
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
@@ -2174,11 +2184,50 @@ class Worker:
         lands on device 0's stream, unordered with the real compute.
 
         It also applies mstar's dynamo config, because dynamo config is
-        per-thread since torch 2.12 and this thread compiles.
+        per-thread since torch 2.12 and this thread compiles, and moves the
+        thread to the step-thread CPU.
         """
         if self.device_capability.is_accelerator and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
         apply_dynamo_config()
+        self._pin_step_thread()
+
+    def _choose_step_core(
+        self, worker_ids: list[str], local_worker_devices: list[str] | None,
+    ) -> None:
+        """Pick the CPU this worker's step threads share and log it.
+
+        ``local_worker_devices`` is the device of every worker the conductor
+        started on this host, in ``worker_ids`` order; standalone, this worker
+        is the only one.
+        """
+        if not PINNABLE:
+            logger.info("Worker %s: step threads not pinned (no sched_setaffinity here)", self.worker_id)
+            return
+        self._process_cpus = frozenset(os.sched_getaffinity(0))
+        setting = knobs.step_thread_core()
+        devices = local_worker_devices or [str(self.device)]
+        slot = worker_ids.index(self.worker_id) if local_worker_devices else 0
+        local_cpus = [
+            current_platform.local_cpus(d.index)
+            if setting == "auto" and d.type != "cpu" and d.index is not None else None
+            for d in map(torch.device, devices)
+        ]
+        self._step_core = choose_step_core(
+            setting, slot, local_cpus, self._process_cpus, order=smt_order,
+        )
+        if self._step_core.cpu is None:
+            logger.info("Worker %s: step threads not pinned (%s)", self.worker_id, self._step_core.source)
+        else:
+            logger.info(
+                "Worker %s: step threads (main, GPU, plan) on CPU %d (%s; %s, worker %d of %d, "
+                "allowed %s)", self.worker_id, self._step_core.cpu, self._step_core.source,
+                self.device, slot + 1, len(devices), format_cpu_list(self._process_cpus),
+            )
+
+    def _pin_step_thread(self) -> None:
+        if self._step_core.cpu is not None:
+            pin_step_thread(self._step_core.cpu, self._process_cpus)
 
     @contextmanager
     def _span(self, name: str, cpu: str | None = None):
@@ -4655,6 +4704,11 @@ class Worker:
                 body=SetupDone(worker_id=self.worker_id),
             ),
         )
+
+        # The main thread hands every step to the GPU and plan threads and
+        # back, so all three move to one CPU (each executor thread follows in
+        # its initializer).
+        self._pin_step_thread()
 
         # The async worker path needs decode submission to return quickly so
         # the main loop can overlap queue/tensor polling and post-processing

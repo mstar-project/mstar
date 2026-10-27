@@ -483,6 +483,22 @@ Worker scheduling
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
+   * - ``MSTAR_STEP_THREAD_CORE``
+     - config's ``knobs: step_thread_core``, else ``auto``
+     - The CPU a worker's main, GPU and plan threads share. A step passes
+       between them several times, and a thread woken on another core waits
+       for it to leave a deep idle state; on one shared CPU it starts at once.
+       ``auto`` gives each worker of the deployment its own CPU: the first
+       one local to its GPU (sysfs ``local_cpulist``) that the process may run
+       on and no earlier worker took, else the first free CPU of the process
+       mask, so a ``taskset`` or cgroup pin is respected. When the mask has
+       fewer than one CPU per worker plus one, nothing is pinned. ``off``
+       leaves the threads on the process mask; a number is the first worker's
+       CPU, and the next workers take the allowed CPUs above it. Everything
+       else in the worker (intra-op pools, transport threads) keeps the
+       process mask. Each worker logs its CPU and how it was chosen. Read by
+       ``knobs.step_thread_core``; no effect where ``os.sched_setaffinity``
+       is missing (macOS, Windows).
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
