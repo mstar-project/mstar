@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
+from functools import cached_property
 
 import torch
 
@@ -54,7 +55,7 @@ from mstar.model.media_limits import (
 from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
-from mstar.streaming.topology import client_stream_limits
+from mstar.streaming.topology import ClientStreamLimits, client_stream_limits
 from mstar.utils import profiler
 from mstar.utils.client_errors import client_error_text
 from mstar.utils.ipc_format import (
@@ -529,12 +530,7 @@ class PreprocessWorkerThread:
         self._client_edges = frozenset(
             conn.edge_name for conn in model.get_partition_topology().client_connections()
         ) if model is not None else frozenset()
-        # the client streams with a max_items, which this thread charges as their items pass
-        self._item_limits = {
-            name: limits
-            for name, limits in client_stream_limits(model.get_partition_topology(), model_config).items()
-            if limits.max_items is not None
-        } if model is not None else {}
+        self._model_config = model_config
         # per request, what each of those streams has carried so far
         self._stream_items: dict[str, dict[str, int]] = {}
         # per request, the client streams its client has ended
@@ -832,6 +828,20 @@ class PreprocessWorkerThread:
         if chunk.on_late is not None:
             chunk.on_late(f"the call's {', '.join(map(repr, late))} input has ended")
         return {name: tensors for name, tensors in items.items() if name not in late}
+
+    @cached_property
+    def _item_limits(self) -> dict[str, ClientStreamLimits]:
+        """The client streams with a max_items, which this thread charges as
+        their items pass. Read on first use, after the conductor's
+        validate_deployment has accepted ``client_streams:``, so a bad block
+        is reported with the rest."""
+        if self.model is None:
+            return {}
+        return {
+            name: limits
+            for name, limits in client_stream_limits(self.model.get_partition_topology(), self._model_config).items()
+            if limits.max_items is not None
+        }
 
     def _charge_stream_items(self, request_id: str, items: NameToTensorList) -> None:
         """Charge a call's new stream items to their streams' ``max_items``;

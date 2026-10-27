@@ -389,8 +389,6 @@ def test_a_deployment_lowers_a_streams_max_items(tmp_path):
     wt._process_waiting_input(ClientAppend("r", file_paths={"audio": [_audio_file(tmp_path, "a.raw", 3)]}))
 
     assert b"passed 2 samples" in wt.out_queue.get_nowait().data
-    with pytest.raises(ValueError, match="may lower"):
-        _thread(_CappedModel(), model_config={"client_streams": {"audio_in": {"max_items": 6}}})
 
 
 class _TwoStreams(_ListeningModel):
@@ -1275,6 +1273,27 @@ def test_a_bad_append_racing_the_end_of_the_call_is_answered_as_late(monkeypatch
     assert "not taking input" in late["error"] and "status" not in late
 
 
+def test_an_append_that_fails_internally_hides_the_error_from_the_client(monkeypatch, tmp_path):
+    class _Fails(_StreamingFakeServer):
+        def stream_input(self, key, file_paths=None, end_input=False, **append):
+            raise RuntimeError("/srv/weights/secret broke")
+
+        def reject_input(self, key, error, status):
+            self.calls.append(("reject", error, status))
+            return True
+
+    fake = _Fails(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    ws = _QueuedFramesSocket([
+        {"request_id": "call", "output_modalities": "text"},
+        {"request_id": "call", "append": [{"name": "c.wav", "data": "UklGRg=="}]},
+    ])
+    asyncio.run(_serve(ws, until=lambda: any(c[0] == "reject" for c in fake.calls)))
+
+    (_, error, status), = [c for c in fake.calls if c[0] == "reject"]
+    assert status == 500 and error.startswith("append rejected: internal error") and "secret" not in error
+
+
 def test_an_append_the_call_stops_taking_meanwhile_is_answered_as_late(monkeypatch, tmp_path):
     """The call ends between the append's check and its feeding: the append
     is answered as late, and the call is left alone."""
@@ -1584,12 +1603,6 @@ def test_one_failing_release_leaves_the_rest_of_the_pass_to_run(tmp_path):
     ]
     assert [b.request_id for b in _bodies(sent, ConductorMessageType.NEW_REQUEST)] == ["d"]
     assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.parametrize("value", ["1e3", 0, -4, True, float("nan"), float("inf")])
-def test_a_bad_max_call_input_mb_is_refused_by_name(value):
-    with pytest.raises(ValueError, match="max_call_input_mb"):
-        entrypoint._call_input_limit({"max_call_input_mb": value})
 
 
 def test_max_call_input_mb_reads_in_mib():

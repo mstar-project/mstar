@@ -1192,7 +1192,7 @@ class Worker:
                     "Worker %s: no stream buffer for %s of request %s; dropping it",
                     self.worker_id, [edge.name for edge in unbuffered], body.request_id,
                 )
-            self.tensor_manager.ack_unread_tensors(request_id, unbuffered)
+            self.tensor_manager.ack_unread_tensors(body.request_id, unbuffered)
 
         # Only update fwd_info when there are non-streaming edges (i.e., this is
         # a conductor-triggered forward pass, not just streaming data from another
