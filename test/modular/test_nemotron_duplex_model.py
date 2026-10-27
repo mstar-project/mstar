@@ -92,11 +92,11 @@ def test_duplex_node_resources():
             **dict.fromkeys(nano_keys, {"nano_llm"})}
     assert all(spec.nodes == node.get(spec.resource_key, {"eartts_talker"}) for spec in specs)
 
-    stt = model.config.stt
+    stt = model.config.stt.encoder
     enc = by_key[ENCODER_STATE]
     assert isinstance(enc, RecurrentStateSpec) and enc.config.num_layers == stt.num_layers
     assert set(enc.config.blocks) == {"conv"}
-    assert enc.config.blocks["conv"].shape == (stt.d_model, stt.conv_kernel_size - 1)
+    assert enc.config.blocks["conv"].shape == (stt.hidden_size, stt.conv_kernel_size - 1)
     assert enc.config.usable_slots == model.DEFAULT_SESSIONS
     codec = by_key[CODEC_STATE]
     assert isinstance(codec, RecurrentStateSpec) and codec.config.usable_slots == model.DEFAULT_SESSIONS
@@ -106,7 +106,7 @@ def test_duplex_node_resources():
     assert isinstance(kv, BoundedKVSpec)
     # the checkpoint's: 24 layers of 8 heads of 128, each frame over the 70 before it
     dims = (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim, kv.config.query_window)
-    assert dims == (stt.num_layers, stt.num_heads, stt.head_dim, stt.att_context_size[0]) == (24, 8, 128, 70)
+    assert dims == (stt.num_layers, stt.num_heads, stt.head_dim, stt.left_context) == (24, 8, 128, 70)
     assert kv.config.window_capacity == 70 and kv.config.sink_capacity == 0
     assert kv.config.max_slots == model.DEFAULT_SESSIONS and kv.config.dtype is None
 
@@ -234,10 +234,11 @@ def _stub_checkpoint(monkeypatch, config=None):
     monkeypatch.setattr(NemotronDuplexConfig, "from_pretrained", classmethod(lambda cls, d: config or cls()))
 
 
-@pytest.mark.parametrize("node", sorted(NODES))
+@pytest.mark.parametrize("node", sorted(NODES - {"conformer_encoder"}))
 def test_duplex_builds_every_node_on_meta(monkeypatch, node):
     """Each node's modules are built under ``torch.device("meta")`` before their
-    weights load, so no constructor may read a tensor's values."""
+    weights load, so no constructor may read a tensor's values. (The encoder
+    node is built whole below.)"""
     model = _make_model()
     model.model_path_hf, model.cache_dir = "unused", None
     _stub_checkpoint(monkeypatch)
@@ -251,13 +252,40 @@ def test_duplex_builds_every_node_on_meta(monkeypatch, node):
         model.get_submodule(node, device="cpu")
 
 
+def test_duplex_builds_its_encoder_node_from_a_checkpoint(monkeypatch):
+    """The encoder node through the shared NeMo loader with duplex's featurizer
+    settings, from a checkpoint of a shrunk encoder: every parameter loaded,
+    the featurizer the checkpoint's."""
+    from test_canary_qwen_model import _nemo_perception
+
+    from mstar.model.components.fastconformer import FastConformerConfig, FastConformerEncoder
+
+    config = NemotronDuplexConfig()
+    config.stt.encoder = FastConformerConfig(
+        hidden_size=32, num_layers=2, num_heads=4, intermediate_size=64, num_mel_bins=16, subsampling_channels=8,
+        attention_bias=False, convolution_bias=False, causal=True, left_context=6,
+    )
+    config.stt.output_dim = 24   # _nemo_perception's projection
+    torch.manual_seed(0)
+    weights = _nemo_perception(FastConformerEncoder(config.stt.encoder))
+    monkeypatch.setattr("mstar.model.loader.iterators.iter_safetensors_shards",
+                        lambda *args, prefix, **kwargs: ((prefix + name, t) for name, t in weights.items()))
+    model = _make_model()
+    model.config, model.model_path_hf, model.cache_dir = config, "unused", None
+    _stub_checkpoint(monkeypatch, config)
+    node = model.get_submodule("conformer_encoder", device="cpu")
+    assert torch.equal(node.projection.weight, weights["proj.weight"])
+    assert torch.equal(node.log_mel.window, weights["preprocessor.featurizer.window"])
+    assert node.log_mel.mel_filters.shape == (16, 257)
+
+
 def test_duplex_refuses_a_checkpoint_its_resources_were_not_sized_for(monkeypatch):
     """The resources are declared from the config defaults, before the
     checkpoint is read: a config.json that sizes one differently (another
     encoder depth, here) is refused when the checkpoint is read, rather than
     run against pools of another shape."""
     ckpt = NemotronDuplexConfig()
-    ckpt.stt.num_layers = 12
+    ckpt.stt.encoder.num_layers = 12
     _stub_checkpoint(monkeypatch, ckpt)
     with pytest.raises(ValueError, match=f"resources.{ENCODER_STATE}"):
         _make_model()._json_config("/nonexistent")
@@ -270,10 +298,29 @@ def test_duplex_checks_the_encoder_kv_against_the_checkpoint(monkeypatch):
     _stub_checkpoint(monkeypatch)
     _make_model()._json_config("/nonexistent")
     ckpt = NemotronDuplexConfig()
-    ckpt.stt.att_context_size = (64, 0)
+    ckpt.stt.encoder.left_context = 64
     _stub_checkpoint(monkeypatch, ckpt)
     with pytest.raises(ValueError, match=f"resources.{ENCODER_KV}"):
         _make_model()._json_config("/nonexistent")
+
+
+def test_duplex_refuses_a_featurizer_that_normalizes_per_clip(tmp_path):
+    """A stream has no whole clip to standardize over, so a checkpoint whose
+    preprocessor normalizes per feature is refused when its config is read."""
+    import json
+
+    encoder = {"d_model": 32, "n_layers": 2, "n_heads": 4, "ff_expansion_factor": 2, "conv_kernel_size": 9,
+               "feat_in": 16, "subsampling": "dw_striding", "subsampling_factor": 8,
+               "subsampling_conv_channels": 8}
+    preprocessor = {"sample_rate": 16000, "features": 16, "n_fft": 512, "window_size": 0.025,
+                    "window_stride": 0.01, "window": "hann", "log": True, "frame_splicing": 1,
+                    "normalize": "per_feature"}
+    raw = {"model": {"stt": {"model": {"perception": {
+        "encoder": encoder, "preprocessor": preprocessor, "output_dim": 24,
+    }}}}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="normalize"):
+        NemotronDuplexConfig.from_pretrained(str(tmp_path))
 
 
 def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):

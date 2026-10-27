@@ -6,7 +6,7 @@ dims come from the Spark repo's per-folder ``config.json`` files:
 
     * ``nano/``    — Nemotron-H hybrid Mamba-2 / attention / MLP LLM (9B)
     * ``eartts/``  — Gemma3-text "talker" transformer + RVQ codec (audio out)
-    * (stt)        — Fast-Conformer streaming encoder + RNN-T head (audio in)
+    * (stt)        — Fast-Conformer streaming encoder (audio in)
 
 Only the fields M* actually needs are translated here. Numbers are taken
 verbatim from the published ``nano/config.json`` / ``eartts/config.json``;
@@ -17,6 +17,8 @@ NVIDIA-NeMo/Speech) is flagged with ``TODO(verify)``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from mstar.model.components.fastconformer import FastConformerConfig, check_nemo_preprocessor
 
 # Resource keys shared by the nano submodule, its layers and the model's
 # ``get_node_resources`` (a deployment YAML tunes them under ``resources:``).
@@ -197,50 +199,35 @@ class EarTTSConfig:
     sample_rate: int = 22050
 
 
+def _voicechat_encoder() -> FastConformerConfig:
+    # causal, each frame over the 70 before it ([70, 0]), no linear biases
+    return FastConformerConfig(causal=True, left_context=70, attention_bias=False, convolution_bias=False)
+
+
 @dataclass
-class ConformerSTTConfig:
-    """Audio-input stage (``config.json`` -> ``model.stt.model.perception``).
+class PerceptionConfig:
+    """Audio-input stage (``config.json`` -> ``model.stt.model.perception``):
+    the streaming FastConformer encoder, its featurizer's settings, and the
+    projection of its frames into the nano's hidden size (``output_dim``).
+    The defaults are the checkpoint's, so the resources can be declared
+    before it is read."""
 
-    Fast-Conformer streaming encoder + mel preprocessor. Encodes 16 kHz speech
-    into LLM-space embeddings (``output_dim``); the RNN-T head (``RnntConfig``)
-    emits the streaming user transcription.
-    """
-
-    # --- encoder (``perception.encoder``) ---
-    d_model: int = 1024
-    num_heads: int = 8
-    num_layers: int = 24
-    feat_in: int = 128                       # log-mel bins
-    ff_expansion_factor: int = 4
-    conv_kernel_size: int = 9
-    subsampling_conv_channels: int = 256
-    subsampling_factor: int = 8
-    att_context_size: tuple[int, int] = (70, 0)
-    output_dim: int = 4480                   # projection into the nano hidden size
-    # Right-context lookahead of the encoder, in output frames: the newest output
-    # frame is not final until this many more input frames arrive (the striding-conv
-    # subsampling has a small future receptive field even though attention is causal
-    # [70,0]). The streaming path holds back this many trailing frames so its
-    # re-encoded embeddings match the offline (full-clip) encoding exactly. Measured
-    # structurally as 1 frame (~80 ms) for this Fast-Conformer.
+    encoder: FastConformerConfig = field(default_factory=_voicechat_encoder)
+    output_dim: int = 4480
+    # Frames ``DuplexStream`` holds back until more audio arrives: the newest
+    # encoder frame reads mel frames that later audio still changes (the
+    # subsampling's small future receptive field), so it is not final yet.
     streaming_lookahead_frames: int = 1
 
-    # --- mel preprocessor (``perception.preprocessor``) ---
+    # --- featurizer (``perception.preprocessor``) ---
     sample_rate: int = 16000
     n_fft: int = 512
     window_size: float = 0.025               # seconds -> win_length = round(sr*window_size)
     window_stride: float = 0.01              # seconds -> hop_length = round(sr*window_stride)
-    n_mels: int = 128
     preemph: float = 0.97
-    mag_power: float = 2.0
-
-    @property
-    def head_dim(self) -> int:
-        return self.d_model // self.num_heads
-
-    @property
-    def ff_dim(self) -> int:
-        return self.ff_expansion_factor * self.d_model
+    # the reference (NVIDIA-NeMo/Speech ``nemotron-labs-voicechat``) predates
+    # NeMo 2.5's featurizer: reflected edges, ``samples // hop + 1`` frames
+    reflect_edges: bool = True
 
     @property
     def win_length(self) -> int:
@@ -250,24 +237,15 @@ class ConformerSTTConfig:
     def hop_length(self) -> int:
         return round(self.sample_rate * self.window_stride)
 
-    def num_frames(self, num_samples: int) -> int:
-        """Encoder frames for ``num_samples`` of audio: the mel frame count
-        (``get_seq_len``), then the subsampling's ``calc_length``."""
-        import math
-        n = num_samples // self.hop_length + 1
-        for _ in range(int(math.log2(self.subsampling_factor))):
-            n = n // 2 + 1
-        return n
-
     @property
-    def subsampling_flat(self) -> int:
-        # Freq after log2(factor) causal stride-2 conv stages (kernel 3, causal
-        # pad k-1 + stride-1): out = in // 2 + 1 per stage (128->65->33->17).
-        import math
-        freq = self.n_mels
-        for _ in range(int(math.log2(self.subsampling_factor))):
-            freq = freq // 2 + 1
-        return self.subsampling_conv_channels * freq
+    def log_mel_settings(self) -> dict:
+        """``NemoLogMel``'s settings for this featurizer; its bins are the encoder's
+        (``load_nemo_perception`` passes them)."""
+        return dict(
+            sampling_rate=self.sample_rate, n_fft=self.n_fft, win_length=self.win_length,
+            hop_length=self.hop_length, preemphasis=self.preemph, normalize=False,
+            reflect_edges=self.reflect_edges,
+        )
 
 
 @dataclass
@@ -327,22 +305,6 @@ class CodecConfig:
 
 
 @dataclass
-class RnntConfig:
-    """RNN-T transcription head (``config.json`` -> ``_rnnt_merge_info``)."""
-
-    pred_hidden: int = 640
-    pred_rnn_layers: int = 2
-    encoder_hidden: int = 1024
-    joint_hidden: int = 640
-    vocab_size: int = 1024        # excludes the RNN-T blank
-    activation: str = "relu"
-
-    @property
-    def num_classes(self) -> int:
-        return self.vocab_size + 1  # + blank
-
-
-@dataclass
 class NemotronDuplexConfig:
     """Top-level config bundling the stages plus generation defaults.
 
@@ -353,9 +315,8 @@ class NemotronDuplexConfig:
 
     nano: NanoConfig = field(default_factory=NanoConfig)
     eartts: EarTTSConfig = field(default_factory=EarTTSConfig)
-    stt: ConformerSTTConfig = field(default_factory=ConformerSTTConfig)
+    stt: PerceptionConfig = field(default_factory=PerceptionConfig)
     codec: CodecConfig = field(default_factory=CodecConfig)
-    rnnt: RnntConfig = field(default_factory=RnntConfig)
 
     # generation defaults (text path); keep in sync with create_stream, offline_inference and realtime_api.
     temperature: float = 0.7
@@ -407,6 +368,21 @@ class NemotronDuplexConfig:
             raw = json.load(f)
         cfg = cls()
 
+        perception = raw["model"]["stt"]["model"]["perception"]
+        pre = perception["preprocessor"]
+        encoder = FastConformerConfig.from_nemo(perception["encoder"])
+        # no per-clip normalization: a stream can't
+        check_nemo_preprocessor(pre, features=encoder.num_mel_bins, normalize="NA")
+        cfg.stt = PerceptionConfig(
+            encoder=encoder,
+            output_dim=perception["output_dim"],
+            sample_rate=pre["sample_rate"],
+            n_fft=pre["n_fft"],
+            window_size=pre["window_size"],
+            window_stride=pre["window_stride"],
+            preemph=pre.get("preemph", 0.97),
+        )
+
         cc = raw["model"]["speech_generation"]["model"]["codec_config"]
         cfg.codec = CodecConfig(
             base_hidden_size=cc["base_hidden_size"],
@@ -421,17 +397,6 @@ class NemotronDuplexConfig:
             num_quantizers=cc["num_quantizers"],
             rates=tuple(cc["rates"]),
             wav_to_token_ratio=cc["wav_to_token_ratio"],
-        )
-
-        ri = raw["_rnnt_merge_info"]
-        dc, jc = ri["decoder_config"], ri["joint_config"]
-        cfg.rnnt = RnntConfig(
-            pred_hidden=dc["prednet"]["pred_hidden"],
-            pred_rnn_layers=dc["prednet"]["pred_rnn_layers"],
-            encoder_hidden=jc["jointnet"]["encoder_hidden"],
-            joint_hidden=jc["jointnet"]["joint_hidden"],
-            vocab_size=dc["vocab_size"],
-            activation=jc["jointnet"]["activation"],
         )
 
         sg = raw["model"]["speech_generation"]["model"]
@@ -459,26 +424,6 @@ class NemotronDuplexConfig:
             inference_guidance_scale=sg.get("inference_guidance_scale", 0.5),
             inference_noise_scale=sg.get("inference_noise_scale", 0.8),
             inference_top_p=sg.get("inference_top_p_or_k", 0.8),
-        )
-
-        enc = raw["model"]["stt"]["model"]["perception"]["encoder"]
-        pre = raw["model"]["stt"]["model"]["perception"]["preprocessor"]
-        cfg.stt = ConformerSTTConfig(
-            d_model=enc["d_model"],
-            num_heads=enc["n_heads"],
-            num_layers=enc["n_layers"],
-            feat_in=enc["feat_in"],
-            ff_expansion_factor=enc["ff_expansion_factor"],
-            conv_kernel_size=enc["conv_kernel_size"],
-            subsampling_conv_channels=enc["subsampling_conv_channels"],
-            subsampling_factor=enc["subsampling_factor"],
-            att_context_size=tuple(enc["att_context_size"]),
-            output_dim=raw["model"]["stt"]["model"]["perception"]["output_dim"],
-            sample_rate=pre["sample_rate"],
-            n_fft=pre["n_fft"],
-            window_size=pre["window_size"],
-            window_stride=pre["window_stride"],
-            n_mels=pre["features"],
         )
 
         sm = raw["model"]["stt"]["model"]
