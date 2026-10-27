@@ -17,14 +17,19 @@ whoever owns the resource, not per layer.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from typing import Protocol
 
 import torch
 import torch.nn.functional as F
 
-# ``(q, k, v) -> out`` over packed ``[total_tokens, H, D]`` tensors, one segment per request;
-# called with ``return_lse=True``, ``(out, lse)`` with ``lse`` ``[total_tokens, H]`` (fp32, natural log).
-RaggedAttentionFn = Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]
+
+class RaggedAttentionFn(Protocol):
+    """``(q, k, v) -> out`` over packed ``[total_tokens, H, D]`` tensors, one segment per
+    request; with ``return_lse``, also ``lse`` ``[total_tokens, H]`` (fp32, natural log)."""
+
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def sdpa_attention(
