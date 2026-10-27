@@ -339,8 +339,9 @@ def _stub_worker(sbuf):
     """What ``Worker._process_new_inputs`` touches for a streaming-only signal."""
     reads = []
     req_info = SimpleNamespace(stream_buffers={"audio_in": sbuf})
-    stub = SimpleNamespace(
-        _draining_rids=set(), worker_id="worker_0", enable_nvtx=False, _walk_driven_edges={},
+    stub = Worker.__new__(Worker)
+    vars(stub).update(
+        _reads_done_sent=set(), worker_id="worker_0", enable_nvtx=False, _walk_driven_edges={},
         _rid=lambda rid: 7 if rid == "r" else None,
         request_state=SimpleNamespace(per_request_info={7: req_info}),
         tensor_manager=SimpleNamespace(
