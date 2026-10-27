@@ -241,14 +241,16 @@ class CommGroup:
         (and ``scatter_dim`` must then be divisible by ``world_size``).
 
         One ``all_to_all_single`` over a packed buffer, which replays from a
-        CUDA graph. Only the collective is hidden from torch.compile: the
-        packing and unpacking stay in the caller's graph, where inductor
-        writes the send buffer from the producing kernel and folds the
-        received layout into the consumer.
+        CUDA graph. The collective is hidden from torch.compile, so a compiled
+        caller breaks around this call; tracing it as a functional collective
+        instead gave an illegal memory access in Cosmos3's batched capture.
         """
         if self.world_size == 1:
             return input_
         world_size = self.world_size
+        # positive dims: unflatten below adds a dim, which would shift a negative one
+        scatter_dim %= input_.dim()
+        gather_dim %= input_.dim()
         even_scatter = scatter_sizes is None or len(set(scatter_sizes)) == 1
         even_gather = gather_sizes is None or len(set(gather_sizes)) == 1
         if even_scatter and even_gather:

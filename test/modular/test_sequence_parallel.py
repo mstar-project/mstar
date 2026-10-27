@@ -59,25 +59,27 @@ def _full(total: int, batched: bool, seed: int = 0) -> torch.Tensor:
     return torch.randn(shape, generator=torch.Generator().manual_seed(seed))
 
 
-def _exchanges(rank, world, total, batched):
+def _exchanges(rank, world, total, batched, negative):
     group = _group(rank, world)
     seq_dim, head_dim = _layout(batched)
     sizes = sp_seq_split(total, world)
     full = _full(total, batched)
     shard = full.narrow(seq_dim, sum(sizes[:rank]), sizes[rank])
     per_rank = HEADS // world
-    heads = group.all_to_all(shard, scatter_dim=head_dim, gather_dim=seq_dim, gather_sizes=sizes)
+    seq, head = (seq_dim - full.dim(), head_dim - full.dim()) if negative else (seq_dim, head_dim)
+    heads = group.all_to_all(shard, scatter_dim=head, gather_dim=seq, gather_sizes=sizes)
     assert torch.equal(heads, full.narrow(head_dim, rank * per_rank, per_rank))
-    back = group.all_to_all(heads, scatter_dim=seq_dim, gather_dim=head_dim, scatter_sizes=sizes)
+    back = group.all_to_all(heads, scatter_dim=seq, gather_dim=head, scatter_sizes=sizes)
     assert torch.equal(back, shard)
 
 
+@pytest.mark.parametrize("negative", [False, True], ids=["dims", "negative-dims"])
 @pytest.mark.parametrize("batched", [False, True], ids=["SHD", "BSHD"])
 @pytest.mark.parametrize(
     "world,total", [(2, 6), (2, 7), (3, 9), (3, 11)], ids=["2-even", "2-uneven", "3-even", "3-uneven"],
 )
-def test_all_to_all_exchanges(world, total, batched):
-    _run(_exchanges, world, total, batched)
+def test_all_to_all_exchanges(world, total, batched, negative):
+    _run(_exchanges, world, total, batched, negative)
 
 
 def _sdpa(batched):
