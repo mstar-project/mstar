@@ -981,13 +981,22 @@ TINY_MIMI = dict(hidden_size=32, num_hidden_layers=2, num_attention_heads=2, num
                  sliding_window=250, use_cache=False, upsample_groups=32)
 
 
-def _tiny_codec(seed=0):
+def _tiny_codec(seed=0, layers=TINY_MIMI["num_hidden_layers"]):
+    """A random tiny Mimi whose codebook entries are distinct, so different codes decode differently
+    (a fresh MimiModel's codebooks are all zeros, which would make every code stream sound the same)."""
     from mstar.model.personaplex.components.mimi import MimiCodec, build_hf_mimi
 
     with _without_triton_stub():
         pytest.importorskip("transformers", reason="the Mimi codec builds transformers.MimiModel")
         torch.manual_seed(seed)
-        return MimiCodec(build_hf_mimi(TINY_MIMI).float().eval())
+        model = build_hf_mimi({**TINY_MIMI, "num_hidden_layers": layers}).float().eval()
+    with torch.no_grad():
+        for rvq in (model.quantizer.semantic_residual_vector_quantizer,
+                    model.quantizer.acoustic_residual_vector_quantizer):
+            for layer in rvq.layers:
+                layer.codebook.embed_sum.copy_(torch.randn_like(layer.codebook.embed_sum))
+                layer.codebook._embed = None
+    return MimiCodec(model)
 
 
 def _agent_frames(n, seed=1, card=64):
@@ -1047,21 +1056,34 @@ def test_streamed_decode_within_one_window_matches_the_whole_decode(frames):
     torch.testing.assert_close(streamed, _whole(codec, agent, num_samples), rtol=0, atol=1e-5)
 
 
+def test_tiny_codec_decodes_different_codes_differently():
+    """Guards the fixture itself: the decoder tests below mean nothing if all codes sound alike."""
+    codec = _tiny_codec()
+    a, b = torch.cat(_agent_frames(8, seed=2), dim=-1), torch.cat(_agent_frames(8, seed=3), dim=-1)
+    with torch.no_grad():
+        assert (codec.decode(a) - codec.decode(b)).abs().max().item() > 1e-3
+
+
 @torch.no_grad()
 def test_streamed_decode_past_the_window_differs_only_slightly_and_needs_its_context():
-    """Past one window the stacked layers reach further back than the context (the Qwen3-TTS trade-off)."""
-    codec = _tiny_codec()
-    frames = cfg.STREAM_CONTEXT_FRAMES + 150
+    """With the checkpoint's 8 stacked windowed layers the decoder reaches past any finite context, so a
+    long reply differs slightly from a whole-track decode (the Qwen3-TTS trade-off), less with more context."""
+    codec = _tiny_codec(layers=8)
+    frames = 700
     agent = _agent_frames(frames)
     num_samples = frames * cfg.FRAME_SIZE
     whole = _whole(codec, agent, num_samples)
-    streamed = _stream_decode(MimiDecoderSubmodule(codec), agent, num_samples)
-    window = cfg.STREAM_CONTEXT_FRAMES * cfg.FRAME_SIZE
+
+    def error(context):
+        streamed = _stream_decode(MimiDecoderSubmodule(codec, context_frames=context), agent, num_samples)
+        return (streamed - whole).abs().max().item()
+
+    window = 125 * cfg.FRAME_SIZE  # one attention window: exact while the reply fits
+    streamed = _stream_decode(MimiDecoderSubmodule(codec, context_frames=125), agent, num_samples)
     torch.testing.assert_close(streamed[..., :window], whole[..., :window], rtol=0, atol=1e-5)
-    error = (streamed - whole).abs().max().item()
-    no_context = (_stream_decode(MimiDecoderSubmodule(codec, context_frames=0), agent, num_samples) - whole)
-    assert error < 1e-3, error
-    assert no_context.abs().max().item() > 100 * max(error, 1e-6)  # the context is what keeps chunks close
+    short, default, none = error(125), error(cfg.STREAM_CONTEXT_FRAMES), error(0)
+    assert 0 < default < short < none, (default, short, none)  # the truncation is real, and context reduces it
+    assert none > 100 * default
 
 
 @torch.no_grad()
@@ -1165,6 +1187,9 @@ def test_decoder_state_is_per_request_and_released():
     for rid, frames in (("a", a), ("b", b)):
         torch.testing.assert_close(torch.cat(interleaved[rid], dim=-1), _whole(codec, frames, num_samples),
                                    rtol=0, atol=1e-5)
+    # Without cleanup, request a's context would precede b's frames on a recycled handle.
+    leaked, want_b = _stream_decode(decoder, b, num_samples, rid="a"), _whole(codec, b, num_samples)
+    assert leaked.shape != want_b.shape or (leaked - want_b).abs().max().item() > 1e-3
     decoder.cleanup_request("a")
     assert "a" not in decoder.request_states and "b" in decoder.request_states
     # A recycled handle starts clean: decoding request b's frames under handle "a" gives b's audio.
@@ -1190,6 +1215,31 @@ def test_batched_rows_at_different_stream_offsets_each_get_their_own_audio():
     want_b = _decode_chunk(solo_decoder, "b", b, num_samples)
     torch.testing.assert_close(got["a"]["audio_output"][0], want_a, rtol=0, atol=1e-5)
     torch.testing.assert_close(got["b"]["audio_output"][0], want_b, rtol=0, atol=1e-5)
+    # The rows are distinguishable, so a swap or a shared context would fail the checks above.
+    head = min(want_a.shape[-1], want_b.shape[-1])
+    assert (want_a[..., :head] - want_b[..., :head]).abs().max().item() > 1e-3
+
+
+@torch.no_grad()
+def test_requests_sharing_one_batched_decode_each_get_their_own_audio():
+    """Two requests at the same stream offset are decoded as rows of one batch; each must get its own row."""
+    codec = _tiny_codec()
+    decoder, solo = MimiDecoderSubmodule(codec), MimiDecoderSubmodule(codec)
+    frames = {"a": _agent_frames(12, seed=6), "b": _agent_frames(12, seed=7)}
+    num_samples = 12 * cfg.FRAME_SIZE
+    info = SimpleNamespace(step_metadata={"num_samples": num_samples})
+    engine = SimpleNamespace(request_ids=["a", "b"])
+    got = {"a": [], "b": []}
+    for start, stop in ((0, 4), (4, 12)):  # the first two blocks, both requests in every step
+        nodes = [decoder.prepare_inputs(cfg.CODEC_WALK, info, {"agent_frame": [_chunk_inputs(frames[r][start:stop])]})
+                 for r in ("a", "b")]
+        out = decoder.forward_batched(cfg.CODEC_WALK, engine, **decoder.preprocess(cfg.CODEC_WALK, engine, nodes))
+        for rid in ("a", "b"):
+            got[rid].append(out[rid]["audio_output"][0])
+    for rid in ("a", "b"):
+        want = _stream_decode(solo, frames[rid], num_samples, rid=rid)
+        torch.testing.assert_close(torch.cat(got[rid], dim=-1), want, rtol=0, atol=1e-5)
+    assert (torch.cat(got["a"], dim=-1) - torch.cat(got["b"], dim=-1)).abs().max().item() > 1e-3
 
 
 @torch.no_grad()
