@@ -891,8 +891,6 @@ pub struct GraphRuntime {
         }
     }
 
-    /// Whether this request's current walk actually contains the loop. A stop
-    /// for one it does not is a model bug: logged by the caller and dropped.
     /// `rid`'s iteration of loop `lp` in partition `p`, as
     /// `get_dynamic_loop_iters` reports it (the last worker graph with the
     /// loop wins); 0 when no live worker graph has it.
@@ -908,6 +906,8 @@ pub struct GraphRuntime {
         count
     }
 
+    /// Whether this request's current walk actually contains the loop. A stop
+    /// for one it does not is a model bug: logged by the caller and dropped.
     fn check_dyn_loop(&self, rid: u32, partition: &str, loop_name: &str) -> bool {
         let (Some(p), Some(l)) = (
             self.interner.get(partition),
