@@ -172,6 +172,29 @@ def test_nemo_log_mel_batch_refuses_a_clip_under_two_frames():
     with pytest.raises(ValueError, match="300 samples"):
         NemoLogMel().batch([torch.randn(16_000), torch.randn(300)])
 
+def test_ffmpeg_check_reads_torchcodecs_flag(monkeypatch):
+    """Since FFmpeg became optional, torchcodec's decoders import without it and
+    torchcodec records whether its FFmpeg ops loaded. The check reads that flag,
+    so a missing FFmpeg stays the server's error; an older torchcodec, which has
+    no flag, fails the import instead."""
+    import sys
+    import types
+
+    from mstar.model.components import audio_features
+
+    decoders = types.SimpleNamespace(AudioDecoder=object)
+    monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
+    for flag, expected in ((False, False), (True, True), (None, True)):
+        if flag is None:
+            monkeypatch.delitem(sys.modules, "torchcodec._core.ops", raising=False)
+        else:
+            monkeypatch.setitem(sys.modules, "torchcodec._core.ops", types.SimpleNamespace(_FFMPEG_AVAILABLE=flag))
+        audio_features._ffmpeg_decoder_loads.cache_clear()
+        assert audio_features._ffmpeg_decoder_loads() is expected
+    audio_features._ffmpeg_decoder_loads.cache_clear()
+
+
 def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch):
     from mstar.model.components import audio_features
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import math
+import sys
 
 import numpy as np
 import torch
@@ -270,7 +271,10 @@ def _ffmpeg_decoder_loads() -> bool:
         from torchcodec.decoders import AudioDecoder  # noqa: F401
     except Exception:  # noqa: BLE001 -- ImportError, or RuntimeError without FFmpeg
         return False
-    return True
+    # Since FFmpeg became optional that import succeeds without it, and
+    # torchcodec records whether its FFmpeg ops loaded; older releases fail the
+    # import instead
+    return getattr(sys.modules.get("torchcodec._core.ops"), "_FFMPEG_AVAILABLE", True)
 
 
 def load_audio_file(path: str, sample_rate: int = 16_000, max_seconds: float | None = None) -> torch.Tensor:
