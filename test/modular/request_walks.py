@@ -48,9 +48,11 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
     )
     args = model.get_initial_forward_pass_args(PARTITION, ["text"], ["text"], {"text_inputs": [prompt]})
     metadata = args.full_metadata
+    caps = model.get_loop_caps(max_output_tokens=max_tokens)
     rid = runtime.add_request(
         request_id="r", partition=PARTITION, graph_walk=metadata.graph_walk,
         partition_worker_graph_ids=ids, worker_graph_to_workers=ParallelList(ids, [["w0"]] * len(ids)),
+        loop_caps=caps,
     )
     emitted: list[int] = []
     counted = 0  # the conductor's count: tokens on conductor_new_token edges
@@ -80,7 +82,9 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
                 loop_names=ParallelList([rid], [sorted(stops)]),
             ) if stops else []
             loop = walks[walk]
-            if not isinstance(loop, Loop) or rid in stopped or iteration + 1 >= loop.max_iters:
+            # a loop runs the smaller of its max_iters and the request's cap
+            if not isinstance(loop, Loop) or rid in stopped or iteration + 1 >= min(
+                    loop.max_iters, caps.get(loop.name, loop.max_iters)):
                 break
             inputs = {edge.name: out[edge.name] for edge in edges if edge.next_node == "LLM"}
             iteration += 1

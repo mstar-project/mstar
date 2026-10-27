@@ -23,7 +23,7 @@ def test_process_prompt_refuses_sampling_under_mtp(kwargs):
 
 def test_process_prompt_takes_greedy_under_mtp():
     m = _mtp_model()
-    assert m.process_prompt("hi", ["text"], ["text"])["text_inputs"][0].tolist() == [104, 105]
+    assert m.process_prompt("hi", ["text"], ["text"]).new_input_tensors["text_inputs"][0].tolist() == [104, 105]
     m.process_prompt("hi", ["text"], ["text"], temperature=0.0, repetition_penalty=1.0)
 
 

@@ -75,10 +75,10 @@ class _MtpNode(_Node):
 
 
 @pytest.fixture
-def eager_capture(monkeypatch):
+def eager_capture():
     # capture the eager forward: these streams are compared with eager, and Inductor fuses
     # bf16 chains without eager's intermediate rounding (the compiled capture has its own test)
-    monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
+    return {"graph_compile": False}
 
 
 def _mtp_cfg(k: int) -> dict:
@@ -94,7 +94,7 @@ def test_captured_mtp_matches_eager_and_plain_decode(tmp_path, monkeypatch, eage
     With the seed oracle every step's d1 is right, so replays verify accepted rows too."""
     monkeypatch.setattr(AcceleratorGraphRunner, "CAPTURE_BATCH_SIZES", [1, 2, 4])
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2, 4])
-    model, submodule = _load(tmp_path, monkeypatch, fp8=False, cfg_overrides=_mtp_cfg(0))
+    model, submodule = _load(tmp_path, monkeypatch, fp8=False, cfg_overrides={**_mtp_cfg(0), **eager_capture})
     plain = _Node(model, submodule, capture=False, prompts=PROMPTS)
     reference = plain.generate()
     plain.close()
@@ -103,7 +103,7 @@ def test_captured_mtp_matches_eager_and_plain_decode(tmp_path, monkeypatch, eage
     for capture in (False, True):
         ckpt = tmp_path / f"k{k}-{int(capture)}"
         ckpt.mkdir()
-        model, submodule = _load(ckpt, monkeypatch, fp8=False, cfg_overrides=_mtp_cfg(k))
+        model, submodule = _load(ckpt, monkeypatch, fp8=False, cfg_overrides={**_mtp_cfg(k), **eager_capture})
         node = _MtpNode(model, submodule, capture=capture, prompts=PROMPTS,
                         seed_oracle=reference if oracle else None)
         if capture:
@@ -129,7 +129,7 @@ def test_padded_capture_rows_leave_real_seeds_alone(tmp_path, monkeypatch, eager
     for capture in (False, True):
         ckpt = tmp_path / f"pad{int(capture)}"
         ckpt.mkdir()
-        model, submodule = _load(ckpt, monkeypatch, fp8=False, cfg_overrides=_mtp_cfg(3))
+        model, submodule = _load(ckpt, monkeypatch, fp8=False, cfg_overrides={**_mtp_cfg(3), **eager_capture})
         node = _MtpNode(model, submodule, capture=capture, prompts=PROMPTS)
         streams[capture] = node.generate()
         node.close()

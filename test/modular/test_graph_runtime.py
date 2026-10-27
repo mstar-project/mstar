@@ -167,6 +167,7 @@ def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
         graph_walk=walk,
         partition_worker_graph_ids=[wg_id],
         worker_graph_to_workers=ParallelList([wg_id], [[worker_id]]),
+        loop_caps={},
     )
     mgr.add_request(rid, fwd_info)
     return mgr, runtime, rid
@@ -523,6 +524,7 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         request_id="rid_b", partition="default", graph_walk="decode",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker0"]]),
+        loop_caps={},
     )
     mgr.add_request(rid_b, _fwd_info("decode"))
     for rid in (rid_a, rid_b):
@@ -1011,6 +1013,7 @@ def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset()):
         request_id="r", partition="default", graph_walk="w",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+        loop_caps={},
     )
     tm.register_request(rid, runtime.get_sharding_config(rid))
     return tm, runtime, rid

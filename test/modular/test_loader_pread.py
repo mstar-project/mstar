@@ -181,7 +181,6 @@ def test_a_slice_dim_past_the_tensor_raises(tmp_path):
 
 
 def test_reads_are_split_below_2_gib(tmp_path, monkeypatch):
-    # macOS rejects one iovec of 2 GiB or more with EINVAL
     sizes = []
     real = iterators.os.preadv
     monkeypatch.setattr(iterators, "_PREAD_MAX", 16)

@@ -57,7 +57,7 @@ def test_chat_template_returns_the_bare_ids():
 
     m = Glm5NextModel("x")
     m._tokenizer = ChatTokenizer()
-    ids = m.process_prompt("hi", ["text"], ["text"])["text_inputs"][0]
+    ids = m.process_prompt("hi", ["text"], ["text"]).new_input_tensors["text_inputs"][0]
     assert ids.tolist() == [7, 8, 9]
 
 

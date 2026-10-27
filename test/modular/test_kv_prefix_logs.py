@@ -22,8 +22,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -81,7 +82,7 @@ def _manager(prefix_cache: bool = True, walks=None) -> KVManager:
     return kv
 
 
-def _ingest(kv: KVManager, rid: str, tokens: list[int], keyed: bool = True) -> None:
+def _ingest(kv: KVManager, rid: str, tokens: list[int], keyed: bool = True, decode: int = 0) -> None:
     if not keyed:
         kv.ingest_request(rid, KVReqConfig())
         return
@@ -91,7 +92,10 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int], keyed: bool = True) -> N
             tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)
         ])},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
-        prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
+        kv_layout={"main": StreamLayout(
+            spans=(PrefixSpan(len(tokens), len(tokens), WALK),), growth=(("decode_loop", 1),), keyed_spans=1,
+        )},
+        loop_caps={"decode_loop": decode},
     ))
 
 
@@ -141,10 +145,10 @@ def test_a_hit_reports_how_much_of_the_prompt_was_already_here(caplog):
     _run(kv, "a", len(tokens))
     kv.remove_request("a")
     _ingest(kv, "b", tokens)
-    kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(tokens)))
+    hit = kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(tokens))).tokens
 
     with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
-        _run(kv, "b", len(tokens))
+        _run(kv, "b", len(tokens) - hit)
 
     line = _lines(caplog)[0]
     assert "matched 3 of its 4 pages" in line, line
@@ -163,10 +167,10 @@ def test_a_whole_prompt_that_came_back_says_so(caplog):
     # every whole page this request has is one the first request left behind
     longer = tokens + list(range(9000, 9004))
     _ingest(kv, "b", longer)
-    kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(longer)))
+    hit = kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(longer))).tokens
 
     with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
-        _run(kv, "b", len(longer))
+        _run(kv, "b", len(longer) - hit)
 
     assert "whole prompt already cached True" in _lines(caplog)[0], _lines(caplog)[0]
 
@@ -208,7 +212,7 @@ def test_a_deployment_that_turned_the_cache_off_reports_nothing(caplog):
 def test_a_request_admitted_twice_is_still_one_line(caplog):
     kv = _manager()
     tokens = list(range(64))
-    _ingest(kv, "r0", tokens)
+    _ingest(kv, "r0", tokens, decode=PAGE_SIZE)
 
     with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
         _run(kv, "r0", len(tokens))
@@ -221,15 +225,15 @@ def test_a_request_admitted_twice_is_still_one_line(caplog):
 
 # ── a declared node that its keys never reach ───────────────────────────
 
-DECLARED = {"main": (WALK, "decode")}
+DECLARED = {"main": KeyedWalks((WALK,), ("decode",))}
 
 
 def _serve(kv: KVManager, count: int, keyed: bool) -> None:
     for n in range(count):
         rid = f"r{n}"
         _ingest(kv, rid, list(range(64)), keyed=keyed)
-        kv.resolve_cached_prefix(rid, NODE, WALK, ARNodeInputs(input_seq_len=64))
-        _run(kv, rid, 64)
+        hit = kv.resolve_cached_prefix(rid, NODE, WALK, ARNodeInputs(input_seq_len=64))
+        _run(kv, rid, 64 - (hit.tokens if hit is not None else 0))
         kv.remove_request(rid)
 
 

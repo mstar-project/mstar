@@ -10,8 +10,11 @@ rows, the position they start at and its pages.
 
 The keys live in per-request buffers that grow with the context and the selection runs per
 request on the host, so the path is eager only; past ``topk`` it decodes (one row per request).
+The follow-up moves the keys onto the MLA cache's pages, under its page table, allocator and
+eviction, and gives selection and attention fixed-shape buffers so a decode can capture.
 """
 
+import itertools
 from dataclasses import dataclass
 
 import torch
@@ -151,11 +154,18 @@ class DSASpan:
 @dataclass
 class DSAPlan:
     """A label's rows this step. ``needs_selection``: some row sees more than ``topk`` keys;
-    ``last_selection``: the last FULL layer's pick this forward, which SHARED layers reuse."""
+    ``last_selection``: the last FULL layer's pick this forward, which SHARED layers reuse.
+
+    Under selection every row is its request's one decode row, and ``pages`` holds the rows'
+    page tables back to back on the device: row ``r``'s starts at ``row_page_offset[r]``, and
+    its first token sits ``row_start[r]`` slots into it."""
 
     spans: list[DSASpan]
     needs_selection: bool
     last_selection: torch.Tensor | None = None
+    pages: torch.Tensor | None = None
+    row_page_offset: torch.Tensor | None = None
+    row_start: torch.Tensor | None = None
 
 
 class DSAManager(Resource):
@@ -173,7 +183,7 @@ class DSAManager(Resource):
         self._device = device
         self.keys = IndexKeyStore()
         self._plans: dict[str, DSAPlan] = {}
-        # each decode row's pages, one pinned H2D each
+        # a selecting step's page tables, in one pinned H2D per label
         self._page_stager = PinnedStager(torch.long)
 
     def depends_on(self) -> set[str]:
@@ -202,8 +212,28 @@ class DSAManager(Resource):
                 ))
                 q_start += view.to_compute
             needs = any(view.length > self.config.topk for view in kv_out.views)
-            self._plans[label] = DSAPlan(spans=spans, needs_selection=needs)
+            plan = self._plans[label] = DSAPlan(spans=spans, needs_selection=needs)
+            if needs:
+                self._stage_page_tables(plan)
         return self._plans
+
+    def _stage_page_tables(self, plan: DSAPlan) -> None:
+        """Every layer of the step attends through the same page tables, so they go to the
+        device once, here, rather than once per layer."""
+        for span in plan.spans:
+            if span.q_len != 1:
+                raise RuntimeError(
+                    "sparse attention beyond topk is decode-only (one row per request); a "
+                    "prefill past topk is refused before the step"
+                )
+        pages = [page for span in plan.spans for page in span.pages]
+        offsets = list(itertools.accumulate((len(span.pages) for span in plan.spans[:-1]), initial=0))
+        starts = [span.page_start for span in plan.spans]
+        staged = self._page_stager.to_device(pages + offsets + starts, self._device)
+        n, rows = len(pages), len(plan.spans)
+        plan.pages = staged[:n]
+        plan.row_page_offset = staged[n:n + rows]
+        plan.row_start = staged[n + rows:]
 
     def needs_selection(self, label: str = _MAIN) -> bool:
         """Whether this step's rows attend a pick rather than every key."""
@@ -264,26 +294,17 @@ class DSAManager(Resource):
 
         ``latent_layer`` is the MLA cache's layer view ``[pages, page_size, kv_lora_rank +
         rope]``, this step's latents already written; ``selection`` holds request-local
-        positions (-1: none). Past ``topk`` a request decodes, one row per request."""
+        positions (-1: none). Past ``topk`` a request decodes, so row ``r`` is request ``r``'s."""
+        plan = self._plans[label]
         rank = q_nope.shape[-1]  # the ckv width, after w_kc absorption
         query = torch.cat([q_nope, q_pe], dim=-1).float()  # (T, H, rank + rope)
-        out = torch.empty_like(q_nope)
-        for span in self._plans[label].spans:
-            if span.q_len != 1:
-                raise RuntimeError(
-                    f"request {span.request_id!r}: sparse attention beyond topk is "
-                    "decode-only (one row per request); a prefill past topk is refused "
-                    "before the step"
-                )
-            row = selection[span.q_start]
-            live = row >= 0
-            slots = row.clamp_min(0).long() + span.page_start  # request-local -> page offset
-            pages = self._page_stager.to_device(span.pages, latent_layer.device)
-            picked = latent_layer[pages[slots // self.page_size], slots % self.page_size]
-            # fp32 outside the engine's bf16 autocast, which would run both einsums in bf16
-            with torch.autocast(query.device.type, enabled=False):
-                scores = torch.einsum("hd,kd->hk", query[span.q_start], picked.float()) * sm_scale
-                attn = scores.masked_fill(~live, float("-inf")).softmax(dim=-1)
-                out[span.q_start] = torch.einsum(
-                    "hk,kd->hd", attn, picked[:, :rank].float()).to(out.dtype)
-        return out
+        live = selection >= 0
+        slots = selection.clamp_min(0).long() + plan.row_start[:, None]  # (T, topk)
+        pages = plan.pages[plan.row_page_offset[:, None] + slots // self.page_size]
+        picked = latent_layer[pages, slots % self.page_size].float()  # (T, topk, rank + rope)
+        # fp32 outside the engine's bf16 autocast, which would run both einsums in bf16
+        with torch.autocast(query.device.type, enabled=False):
+            scores = torch.einsum("thd,tkd->thk", query, picked) * sm_scale
+            attn = scores.masked_fill(~live[:, None, :], float("-inf")).softmax(dim=-1)
+            out = torch.einsum("thk,tkd->thd", attn, picked[..., :rank])
+        return out.to(q_nope.dtype)

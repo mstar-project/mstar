@@ -2,6 +2,7 @@
 decode transition, the node's resource declaration, the per-request sampling config, and
 the submodule's stop / preprocess guards.
 """
+import dataclasses
 import sys
 import types
 from pathlib import Path
@@ -376,6 +377,29 @@ def test_glm52_check_stop_ignore_eos_runs_to_max_tokens():
     ) == {"decode_loop"}
 
 
+def test_glm52_check_stop_batched_agrees_with_check_stop():
+    """One tolist for the batch, the same answer per request; a row the step has no token
+    for is skipped, as the per-request path skips a request without outputs."""
+    from mstar.model.submodule_base import HostRows
+
+    sub = _make_submodule(Glm52ModelConfig())
+    infos = {
+        "eos": _fwd_info(), "mid": _fwd_info(), "budget": _fwd_info(max_tokens=8, iters=6),
+        "ignored": _fwd_info(ignore_eos=True), "ended": _fwd_info(), "absent": _fwd_info(),
+    }
+    sub.request_state("ended").add("ended_at_prefill", True)
+    rows = ("eos", "mid", "budget", "ignored", "ended")
+    tokens = torch.tensor([154827, 42, 42, 154820, 7])
+    batched = sub.check_stop_batched(list(infos), infos, HostRows(rows, {"new_token": tokens}))
+    per_request = {
+        rid: loops for rid, token in zip(rows, tokens, strict=True)
+        if (loops := sub.check_stop(rid, infos[rid], {"new_token": [token[None]]}))
+    }
+    assert batched == per_request == {
+        "eos": {"decode_loop"}, "budget": {"decode_loop"}, "ended": {"decode_loop"},
+    }
+
+
 # ── submodule: graph configs ──
 
 
@@ -392,18 +416,20 @@ def test_glm52_no_cuda_graphs_under_reference_dispatch():
     assert len(bf16.get_accelerator_graph_configs(torch.device("cpu"))) == 2
 
 
-def test_glm52_graph_compile_env_escape_hatch(monkeypatch):
-    # MSTAR_GLM52_GRAPH_COMPILE=0 captures the eager forward (both walks) —
-    # the escape hatch for an Inductor-subprocess Triton crash that fails
-    # every capture. Default stays compile-on, in the cuBLAS ("default") mode.
+def test_glm52_graph_compile_off_captures_eager():
+    # graph_compile: false captures the eager forward (both walks), for an Inductor
+    # failure that fails every capture. Default stays compile-on, in the cuBLAS
+    # ("default") mode.
     sub = _make_submodule(Glm52ModelConfig.reduced())
     configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert all(c.compile for c in configs)
     assert all(c.compile_mode == "default" for c in configs)
-    monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
+    assert not sub.disable_torch_compile
+    sub = _make_submodule(dataclasses.replace(Glm52ModelConfig.reduced(), graph_compile=False))
     assert not any(
         c.compile for c in sub.get_accelerator_graph_configs(torch.device("cpu"))
     )
+    assert sub.disable_torch_compile
 
 
 # ── submodule: preprocess ──
@@ -471,17 +497,66 @@ def test_glm52_process_prompt_byte_mode_never_touches_tokenizer():
     m.config = Glm52ModelConfig.reduced()  # vocab 256
     m._tokenizer_mode = "byte"
     m._tokenizer = None
-    out = m.process_prompt("Hi", ["text"], ["text"])
+    out = m.process_prompt("Hi", ["text"], ["text"]).new_input_tensors
     assert set(out) == {"text_inputs"}
     (ids,) = out["text_inputs"]
     assert ids.dtype == torch.long and ids.tolist() == [72, 105]
     # bytes past the vocabulary clip to the last id; an empty prompt is one
     # pad-ish token, not an empty prefill
     m.config.vocab_size = 100
-    assert m.process_prompt("z", ["text"], ["text"])["text_inputs"][0].tolist() == [99]
-    assert m.process_prompt("", ["text"], ["text"])["text_inputs"][0].tolist() == [0]
+    assert m.process_prompt("z", ["text"], ["text"]).new_input_tensors["text_inputs"][0].tolist() == [99]
+    assert m.process_prompt("", ["text"], ["text"]).new_input_tensors["text_inputs"][0].tolist() == [0]
     assert m.process_prompt(None, ["text"], ["text"]) == {}
     assert m._tokenizer is None  # no lazy HF download triggered
+
+
+class _TemplateTokenizer:
+    """Records the messages the chat template is handed."""
+
+    chat_template = "glm"
+
+    def __init__(self, refuse=False):
+        self.messages, self.refuse = None, refuse
+
+    def apply_chat_template(self, messages, **kwargs):
+        if self.refuse:
+            from jinja2 import TemplateError
+
+            raise TemplateError("no user turn")
+        self.messages = messages
+        return torch.tensor([[1, 2, 3]])
+
+
+def _chat_model(tokenizer) -> Glm52Model:
+    m = object.__new__(Glm52Model)
+    m.config = Glm52ModelConfig()
+    m._tokenizer_mode, m._tokenizer = "hf", tokenizer
+    return m
+
+
+def test_glm52_process_prompt_renders_each_turn_in_its_role():
+    """Was: every message's text joined into one user turn, the system prompt and the
+    earlier replies included."""
+    from mstar.model.multimodal import PromptPart
+
+    tok = _TemplateTokenizer()
+    parts = [PromptPart("text", "Be brief.", role="system"), PromptPart("text", "A color?", role="user"),
+             PromptPart("text", "Blue.", role="assistant"), PromptPart("text", "Another.", role="user")]
+    out = _chat_model(tok).process_prompt(
+        "Be brief.\nA color?\nBlue.\nAnother.", ["text"] * 4, ["text"], prompt_parts=parts)
+    assert out.new_input_tensors["text_inputs"][0].tolist() == [1, 2, 3]
+    assert tok.messages == [
+        {"role": "system", "content": "Be brief."}, {"role": "user", "content": "A color?"},
+        {"role": "assistant", "content": "Blue."}, {"role": "user", "content": "Another."},
+    ]
+    # an entrypoint with no messages sends one user turn
+    _chat_model(tok).process_prompt("Hi", ["text"], ["text"])
+    assert tok.messages == [{"role": "user", "content": "Hi"}]
+
+
+def test_glm52_a_chat_the_template_refuses_is_a_400():
+    with pytest.raises(ValueError, match="template refused"):
+        _chat_model(_TemplateTokenizer(refuse=True)).process_prompt("Hi", ["text"], ["text"])
 
 
 def test_glm52_postprocess_byte_mode_never_touches_tokenizer():

@@ -77,7 +77,8 @@ class _Read(NamedTuple):
     narrow: TensorSlice | None  # applied in memory, after the read
 
 
-# per call: macOS rejects an iovec of 2 GiB or more (EINVAL); Linux caps a call below that
+# One preadv asks for at most this much: an iovec of 2 GiB or more fails with EINVAL on some
+# platforms instead of reading short.
 _PREAD_MAX = 1 << 30
 
 
