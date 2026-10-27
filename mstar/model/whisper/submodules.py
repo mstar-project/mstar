@@ -58,12 +58,38 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     (a fixed 30 s window: ``(num_mel_bins, 3000)``) and emits
     ``encoder_states`` of shape ``(max_source_positions, d_model)``
     for the decoder's cross-attention. Runs once per request.
+
+    Every clip is padded to that window, so a batch is one fixed
+    ``(B, num_mel_bins, 3000)`` mel and each batch size is captured whole:
+    uncaptured, the tower's kernel launches take longer than its GPU work.
     """
+
+    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def __init__(self, audio_encoder: nn.Module, config: WhisperModelConfig):
         super().__init__()
         self.audio_encoder = audio_encoder
         self.config = config
+
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[AcceleratorGraphConfig]:
+        conv1, conv2 = self.audio_encoder.conv1, self.audio_encoder.conv2
+        frames = self.config.max_source_positions * conv1.stride[0] * conv2.stride[0]
+        return [
+            BatchedAcceleratorGraphConfig(
+                capture_graph_walk="prefill",
+                single_request_inputs=NodeInputs(
+                    tensor_inputs={"audio_features": torch.zeros(
+                        self.config.num_mel_bins, frames, device=device,
+                    )},
+                    # one window per row, so a step's real_seq_len counts its real rows
+                    input_seq_len=1,
+                ),
+                capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                input_seq_dims={"audio_features": 0},
+            ),
+        ]
 
     def prepare_inputs(
         self,
@@ -73,8 +99,28 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         **kwargs,
     ) -> NodeInputs:
         return NodeInputs(
-            tensor_inputs={"audio_features": inputs["audio_features"][0]}
+            tensor_inputs={"audio_features": inputs["audio_features"][0]},
+            input_seq_len=1,
         )
+
+    def can_batch(
+        self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
+    ) -> bool:
+        return True
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> dict[str, torch.Tensor]:
+        # Real rows only: a replay's padding rows keep what the static buffer
+        # last held, and their outputs are dropped.
+        rows = len(inputs) if engine_inputs.real_seq_len is None else engine_inputs.real_seq_len
+        feats = torch.stack(
+            [inp.tensor_inputs["audio_features"] for inp in inputs[:rows]]
+        )
+        return {"audio_features": feats.to(self.get_device())}
 
     def forward(
         self,
@@ -83,13 +129,22 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         audio_features: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        device = self.get_device()
+        rid = engine_inputs.request_ids[0]
+        return self.forward_batched(graph_walk, engine_inputs, audio_features)[rid]
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        audio_features: torch.Tensor,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
         dtype = next(self.audio_encoder.parameters()).dtype
-        feats = audio_features.to(device=device, dtype=dtype)
-        if feats.dim() == 2:
-            feats = feats.unsqueeze(0)  # (1, num_mel_bins, 3000)
-        encoder_states = self.audio_encoder(feats).last_hidden_state.squeeze(0)
-        return {"encoder_states": [encoder_states]}
+        encoder_states = self.audio_encoder(audio_features.to(dtype)).last_hidden_state
+        return {
+            rid: {"encoder_states": [encoder_states[i]]}
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
 
 
 # ===================================================================
