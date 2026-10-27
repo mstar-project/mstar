@@ -122,7 +122,8 @@ def get_3d_mrope_ids_action_tokens(
 #   * inverse_dynamics  -- video is the condition (all latent frames clean);
 #                          every action token is predicted.
 #   * policy            -- video frame 0 is clean (the rest predicted) and every
-#                          action token is predicted.
+#                          action token is predicted, except an optional leading
+#                          state row (the robot's current state, at video frame 0).
 # ---------------------------------------------------------------------------
 
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
@@ -131,11 +132,14 @@ ACTION_MODE_POLICY = "policy"
 ACTION_MODES = (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_INVERSE_DYNAMICS, ACTION_MODE_POLICY)
 
 
-def action_condition_frame_indexes(mode: str, action_length: int) -> list[int]:
-    """Clean (conditioning) action tokens for ``mode``."""
+def action_condition_frame_indexes(mode: str, action_length: int, state_rows: int = 0) -> list[int]:
+    """Clean (conditioning) action tokens for ``mode``. A policy request's first
+    ``state_rows`` tokens carry the robot's current state."""
     if mode == ACTION_MODE_FORWARD_DYNAMICS:
         return list(range(action_length))
-    if mode in (ACTION_MODE_INVERSE_DYNAMICS, ACTION_MODE_POLICY):
+    if mode == ACTION_MODE_POLICY:
+        return list(range(state_rows))
+    if mode == ACTION_MODE_INVERSE_DYNAMICS:
         return []
     raise ValueError(f"Unknown Cosmos3 action mode: {mode!r}")
 
@@ -535,6 +539,7 @@ def build_action_static_inputs(
     action_fps: float,
     action_start_offset: int,
     device,
+    state_rows: int = 0,
 ) -> dict[str, Any]:
     """Assemble the static transformer inputs for joint video+action generation.
 
@@ -563,7 +568,7 @@ def build_action_static_inputs(
     )
 
     curr = text["und_len"] + vision["num_vision_tokens"]
-    action_clean = set(action_condition_frame_indexes(mode, action_chunk_size))
+    action_clean = set(action_condition_frame_indexes(mode, action_chunk_size, state_rows))
     action_noisy = [a for a in range(action_chunk_size) if a not in action_clean]
     effective_action_fps = action_fps if config.enable_fps_modulation else None
     action_mrope_ids, _ = get_3d_mrope_ids_action_tokens(

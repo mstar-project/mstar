@@ -22,6 +22,17 @@ model_kwargs:
   # flow shift stays at the action default (5.0, the 480p training shift).
   num_inference_steps_action: 4
   guidance_scale_action: 3.0
+  # Policy requests default to the RoboLab server's DROID setup (the Edge
+  # policy's checkpoint.json carries the first three, this one ships none):
+  # 32 predicted rows at 15 fps for droid_lerobot, in the 736x544 bucket the
+  # 640x540 camera composite pads into. The checkpoint keeps the gripper as
+  # 1 - gripper, so robot_state takes the robot's gripper and the reply gives
+  # it back.
+  policy_action_chunk_size: 32
+  policy_conditioning_fps: 15.0
+  policy_domain_name: droid_lerobot
+  policy_size: [736, 544]
+  policy_flip_dims: [7]
 node_groups:
   - node_names: ["dit"]
     ranks: [0]

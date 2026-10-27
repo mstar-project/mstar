@@ -252,8 +252,9 @@ class GenStepInfo:
     speedup; declaring the dense one for a step that does get a slot would try
     to capture an eager-only backend, so the safe direction over-declares.
 
-    ``cfg_active`` narrows the eager single-request declaration only. It is
-    deliberately not part of ``capture_key`` — see ``cg_key_info``.
+    ``cfg_active`` narrows the eager single-request declaration, and an
+    action batch's when no row has it (``_batch_cfg``). It is deliberately
+    not part of ``capture_key`` — see ``cg_key_info``.
     """
     cfg: bool                 # this request has an unconditional branch at all
     cfg_active: bool          # ...and this step is inside its guidance interval
@@ -542,12 +543,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def _build_action_static(
         self, ids: list[int], height: int, width: int, num_frames: int, action_chunk: int,
-        mode: str, fps: float, action_fps: float, action_offset: int, device,
+        mode: str, fps: float, action_fps: float, action_offset: int, device, state_rows: int = 0,
     ) -> dict:
         latent_shape = self._latent_shape(height, width, num_frames)
         static = build_action_static_inputs(
             list(ids), latent_shape, action_chunk, mode,
             self.config, self.config.vae.scale_factor_temporal, fps, action_fps, action_offset, device,
+            state_rows=state_rows,
         )
         assert static["num_vision_tokens"] == latent_shape[2] * frame_tokens(height, width, self.config), (
             f"packing made {static['num_vision_tokens']} vision tokens of {latent_shape}, "
@@ -1060,18 +1062,24 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         mode = md["action_mode"]
         action_chunk = int(md["action_chunk_size"])
         num_frames = int(md.get("num_frames") or action_chunk + 1)
+        # A policy request's robot_state is one more action token, clean at
+        # video frame 0 in front of the predicted rows.
+        state_rows = int(md.get("action_state_rows", 0))
+        action_chunk += state_rows
         raw_action_dim = int(md["raw_action_dim"])
         domain_id = int(md.get("domain_id", 0))
         action_fps = float(md.get("action_fps", fps))
         action_offset = action_start_frame_offset(action_chunk, num_frames)
 
         cond = self._build_action_static(
-            cond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device
+            cond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
+            state_rows,
         )
         uncond = None
         if uncond_ids is not None:
             uncond = self._build_action_static(
-                uncond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device
+                uncond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
+                state_rows,
             )
 
         latent_shape = self._latent_shape(height, width, num_frames)
@@ -1084,6 +1092,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         action_clean = torch.zeros((1, action_chunk, 1), device=device, dtype=dtype)
         if mode == "forward_dynamics":
             action_clean[:] = 1.0
+        elif state_rows:
+            action_clean[:, :state_rows] = 1.0
 
         # The visual conditioning (inverse-dynamics: the whole observed video;
         # forward-dynamics / policy: the conditioning frame) is VAE-encoded by
@@ -1092,7 +1102,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # latent frames are kept clean from it.
 
         # Forward-dynamics conditions on a clean action chunk supplied with the
-        # request; the other modes predict the action (clean values are zero).
+        # request, and a policy request's robot_state is its first row.
+        # Everything else is predicted (clean values are zero).
         clean_action = torch.zeros((1, action_chunk, action_dim), device=device, dtype=dtype)
         action_inputs = (inputs or {}).get("action_inputs")
         raw_act = action_inputs[0] if action_inputs else None
@@ -1105,6 +1116,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             elif act.shape[0] > action_chunk:
                 act = act[:action_chunk]
             clean_action[:, :, :raw_action_dim] = act[:, :raw_action_dim]
+        elif state_rows and raw_act is not None:
+            act = torch.as_tensor(raw_act, device=device, dtype=dtype).reshape(state_rows, -1)
+            clean_action[:, :state_rows, :raw_action_dim] = act[:, :raw_action_dim]
 
         node_inputs = self._get_prefill_node_inputs(cond, uncond)
         self._slim_statics(cond, uncond)
@@ -1112,6 +1126,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cond=cond,
             uncond=uncond,
             gs=gs,
+            guidance_interval=md.get("guidance_interval"),
             scheduler=self._new_scheduler(
                 steps, device, flow_shift=md.get("flow_shift"),
                 use_karras_sigma=md.get("use_karras_sigma")
@@ -1404,11 +1419,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         if len(infos) > 1:
             # Cross-request batch: one combined plan over every request's
-            # guidance branches (a single branch when guidance is off). The
-            # batched forward always applies guidance when the branch exists,
-            # so the interval does not narrow the batched declaration.
+            # guidance branches, or the conditional branch alone (see
+            # `_batch_cfg`).
             labels = (
-                (COND_LABEL, UNCOND_LABEL) if infos[0].cfg else (COND_LABEL,)
+                (COND_LABEL, UNCOND_LABEL) if self._batch_cfg(graph_walk, infos) else (COND_LABEL,)
             )
             return self._gen_step(
                 request_ids, spans, labels, combined=True, attn_key=attn_key,
@@ -1427,6 +1441,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             request_ids, spans, (COND_LABEL, UNCOND_LABEL),
             combined=self.batched_cfg, attn_key=attn_key,
         )
+
+    @staticmethod
+    def _batch_cfg(graph_walk: str, infos: list[GenStepInfo]) -> bool:
+        """Whether a cross-request denoise step runs the unconditional branch.
+        Image and sound batches apply guidance whenever the branch exists. An
+        action batch runs the conditional branch alone when no row is inside
+        its guidance interval this step. ``declare_step`` plans what this
+        says, and ``preprocess`` passes it to the forward."""
+        if not infos[0].cfg:
+            return False
+        return graph_walk not in ACTION_WALKS or any(info.cfg_active for info in infos)
 
     @staticmethod
     def _segments(
@@ -1554,12 +1579,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         if graph_walk in ACTION_WALKS:
             if len(rids) > 1:
+                infos = [self._gen_step_info(inp) for inp in inputs]
                 return {
                     "latents": {r: inp.tensor_inputs["latents"] for r, inp in zip(rids, inputs, strict=True)},
                     "action_latents": {
                         r: inp.tensor_inputs["action_latents"] for r, inp in zip(rids, inputs, strict=True)
                     },
                     "time_index": {r: inp.tensor_inputs["time_index"] for r, inp in zip(rids, inputs, strict=True)},
+                    "cfg": self._batch_cfg(graph_walk, infos),
+                    "cfg_active": {r: info.cfg_active for r, info in zip(rids, infos, strict=True)},
                 }
             return {
                 "latents": inputs[0].tensor_inputs["latents"],
@@ -1635,12 +1663,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _cfg_active(self, st, step_index: int) -> bool:
         """Whether this eager denoise step runs classifier-free guidance (both
         branches combined). False ⇒ the conditional branch runs alone — the
-        guidance_scale==1 case and, for the t2i recipe, steps whose timestep
-        falls outside the guidance_interval [lo, hi].
+        guidance_scale==1 case and steps whose timestep falls outside the
+        guidance_interval [lo, hi] (the t2i recipe's default, or the request's).
 
-        ``prepare_inputs`` (through ``_step_info``) and ``_forward_image_gen``
-        call this for the same step, so the declared attention (batched vs
-        cond-only) matches the forward that runs.
+        ``prepare_inputs`` (through ``_step_info``) and ``_forward_image_gen`` /
+        ``_forward_action_gen`` call this for the same step, so the declared
+        attention (batched vs cond-only) matches the forward that runs. An
+        action batch reads each row's answer off its ``GenStepInfo`` instead.
 
         The captured path does not consult it at all: its graph is fixed at
         both branches and ``postprocess`` combines unconditionally, so an
@@ -1864,7 +1893,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ats = torch.full((st["cond"]["num_noisy_action_tokens"],), t.item(), device=device)
         domain = st["domain_t"]
 
-        if st["uncond"] is None:
+        if not self._cfg_active(st, step_index):
             video_v, action_v = self._denoise_action(
                 attn, st["cond"], latents, action_latents, vts, ats, domain, COND_LABEL
             )
@@ -1976,7 +2005,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             self.transformer.prefill_und(input_ids, text_mrope_ids, label)
             return {}
         if graph_walk in ACTION_WALKS:
-            return self._forward_batched_action(engine_inputs, latents, action_latents, time_index)
+            return self._forward_batched_action(
+                engine_inputs, latents, action_latents, time_index, kwargs["cfg"], kwargs["cfg_active"],
+            )
         if graph_walk in SOUND_WALKS:
             return self._forward_batched_sound(engine_inputs, latents, sound_latents, time_index)
         if graph_walk not in GEN_WALKS:
@@ -2085,16 +2116,20 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             }
         return out
 
-    def _forward_batched_action(self, engine_inputs, latents, action_latents, time_index):
+    def _forward_batched_action(self, engine_inputs, latents, action_latents, time_index, with_cfg, cfg_active):
         """Run several action requests' joint [video | action] denoise step in one
         forward. Mirrors the image batched path: build each request's static gen
         inputs (clamping a request that has run one step past its denoise count),
         run one batched transformer pass, then per request combine the guidance
-        branches (when present) and apply its own joint scheduler step."""
+        branches (when present) and apply its own joint scheduler step.
+
+        ``with_cfg`` is whether the step runs the unconditional branch, as
+        ``declare_step`` planned it (``_batch_cfg``). With it, a row outside its
+        guidance interval (``cfg_active``) keeps the conditional result, as the
+        single-request path does."""
         states = self._states(engine_inputs)
         attn = self._gen_attn(engine_inputs)
         rids = engine_inputs.request_ids
-        with_cfg = states[rids[0]]["uncond"] is not None
         reqs, meta = [], []
         for rid in rids:
             st = states[rid]
@@ -2133,12 +2168,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, act, ti, t), branches in zip(meta, results, strict=True):
-            if with_cfg:
-                (cond_video, cond_action), (uncond_video, uncond_action) = branches
-                video_v = uncond_video + st["gs"] * (cond_video - uncond_video)
-                action_v = uncond_action + st["gs"] * (cond_action - uncond_action)
-            else:
-                (video_v, action_v), = branches
+            video_v, action_v = branches[0]
+            if with_cfg and cfg_active[rid]:
+                uncond_video, uncond_action = branches[1]
+                video_v = uncond_video + st["gs"] * (video_v - uncond_video)
+                action_v = uncond_action + st["gs"] * (action_v - uncond_action)
             new_latents, new_action = self._action_scheduler_step(st, lat, act, video_v, action_v, t)
             out[rid] = {
                 "latents": [new_latents],
