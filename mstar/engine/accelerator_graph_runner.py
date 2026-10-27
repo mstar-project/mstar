@@ -25,7 +25,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.platforms import current_platform
+from mstar.platforms import current_platform, two_element_guard
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
@@ -79,6 +79,34 @@ def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
     if config_mode != "default":
         kwargs["mode"] = config_mode
     return kwargs
+
+
+# ptxas before 13.1.115 (Triton 3.7.1 runs 13.1.80 for Blackwell) miscompiles a
+# floor division of a periodic index under a range select, such as Inductor's
+# fused interleaved mRoPE table, when a thread holds two elements of a pointwise
+# block. On sm_103 with such a ptxas, pointwise autotuning skips those configs;
+# MSTAR_INDUCTOR_TWO_ELEMENT_GUARD=1 or 0 forces it on or off on any device.
+def two_element_guard_enabled(device: torch.device) -> bool:
+    raw = os.environ.get("MSTAR_INDUCTOR_TWO_ELEMENT_GUARD", "").strip()
+    if raw in ("0", "1"):
+        return raw == "1"
+    if raw:
+        logger.warning("MSTAR_INDUCTOR_TWO_ELEMENT_GUARD=%r is not 0 or 1; deciding by device", raw)
+    return (
+        device.type == "cuda"
+        and current_platform.arch(device) == "sm_103"
+        and two_element_guard.ptxas_affected()
+    )
+
+
+def apply_inductor_guards(device: torch.device) -> None:
+    """Install the platform's Inductor workarounds; call before anything compiles."""
+    if two_element_guard_enabled(device):
+        two_element_guard.install()
+        logger.info(
+            "Inductor: no two-element-per-thread pointwise configs (Blackwell ptxas %s)",
+            two_element_guard.blackwell_ptxas_version(),
+        )
 
 
 def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[str]:

@@ -606,3 +606,10 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``MSTAR_INDUCTOR_TWO_ELEMENT_GUARD``
+     - unset
+     - ``1`` / ``0`` force on or off the patch that keeps Inductor's pointwise
+       kernels off launch configs giving each thread two elements, which ptxas
+       before 13.1.115 (Triton 3.7.1 runs 13.1.80 on Blackwell) can miscompile.
+       Unset, it is on for sm_103 with such a ptxas (read by
+       :func:`mstar.engine.accelerator_graph_runner.two_element_guard_enabled`).

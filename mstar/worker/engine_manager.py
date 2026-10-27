@@ -5,6 +5,7 @@ import torch
 
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.accelerator_graph_runner import apply_inductor_guards
 from mstar.engine.engine import Engine
 from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -91,6 +92,7 @@ class EngineManager:
         the latter, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
+        apply_inductor_guards(device)
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, model_config)
 
