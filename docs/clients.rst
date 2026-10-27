@@ -140,10 +140,11 @@ they were sent, so of two under one ``request_id`` it is the later one that gets
 ``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
 loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
 
-**Live input.** A model that listens while it runs (a full-duplex speech model) keeps a
-request's input open after the opening message, so the opening message may carry no media
-at all. An append feeds the running request more input, in order, while its output keeps
-streaming back:
+**Live input.** A model that listens while it runs (a full-duplex speech model, or a TTS
+model fed text as it is written) can keep a request's input open after the opening
+message: an opening with ``"end_input": false`` opens a live call, and may then carry no
+media at all. An append feeds the running request more input, in order, while its output
+keeps streaming back:
 
 .. code-block:: text
 
@@ -162,13 +163,12 @@ controller's actions, say) that ends no stream, that the model turns into no str
 rejected; text sent with files reaches the model, and if it ignores the text, the text is
 dropped without an error. An append's ``model_kwargs`` count toward the call's
 ``max_call_input_mb``, as JSON. ``{"request_id", "end_input": true}``
-ends the input, alone or on an append (or on the opening message, for a one-shot
-request). The request then finishes as usual. Such a model treats every request over the
-socket as live, so a one-shot request to it carries ``end_input: true`` on its opening
-message: without it, the request waits for appends until it times out (or, with no
-``request_id``, is refused). A model may take several client streams
+ends the input, alone or on an append. The request then finishes as usual. An opening
+without ``end_input`` is one-shot, as a request over ``/generate`` is: its input ends with
+the opening message. A model may take several client streams
 (audio and video, say); ``end_input`` may then name the ones it ends, as a list
-(``"end_input": ["video_in"]``), and the call's input has ended once every stream has.
+(``"end_input": ["video_in"]``, on the opening too, which keeps the others open), and
+the call's input has ended once every stream has.
 An append that names a stream already ended, as a file's ``stream`` or in
 ``end_input``, is answered as late, as one after ``end_input: true`` is (below). So is
 one whose files name no stream and that the model routes to a stream already ended:
@@ -205,7 +205,8 @@ slowly (see :doc:`models`).
 
 .. code-block:: python
 
-   ws.send(msgpack.packb({"request_id": "call", "output_modalities": ["text", "audio"]}))
+   ws.send(msgpack.packb({"request_id": "call", "output_modalities": ["text", "audio"],
+                          "end_input": False}))
    for chunk in microphone_chunks():  # e.g. 80 ms WAV files
        ws.send(msgpack.packb({"request_id": "call",
                               "append": [{"name": "chunk.wav", "data": chunk}]}))

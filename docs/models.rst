@@ -735,9 +735,8 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
 - Inputs are user-only 16 kHz mono audio plus an optional system prompt (the
   request's text, primed before the first frame exactly as the reference
   does): one clip uploaded with the request, a live call over
-  ``/generate/ws``, ``append`` messages until ``end_input`` (see
-  :doc:`clients`; a one-shot request over the socket carries ``end_input:
-  true`` on its opening message, or it waits for appends), or an OpenAI
+  ``/generate/ws`` (an opening with ``end_input: false``, then ``append``
+  messages until ``end_input``; see :doc:`clients`), or an OpenAI
   Realtime conversation over ``/v1/realtime``, which takes PCM16 at one of
   the eight rates :doc:`clients` lists (8 to 48 kHz) or G.711, resamples it
   to 16 kHz, appends it in 80 ms frames, and sends each agent reply as one

@@ -1896,12 +1896,14 @@ def _ws_is_append(message: dict) -> bool:
     return "append" in message or (ends and not _WS_INPUT_FIELDS & message.keys())
 
 
-def _ws_end_input(message: dict) -> bool | list[str]:
+def _ws_end_input(message: dict, absent: bool = False) -> bool | list[str]:
     """A message's ``end_input``: true for all of the call's client streams,
-    or a list of the ones it ends; absent or null is false."""
+    or a list of the ones it ends; ``absent`` when it is absent or null."""
     value = message.get("end_input")
-    if value is None or isinstance(value, bool):
-        return bool(value)
+    if value is None:
+        return absent
+    if isinstance(value, bool):
+        return value
     if isinstance(value, list) and all(isinstance(name, str) for name in value):
         return value
     raise ValueError("end_input must be true, false or a list of client stream names")
@@ -1975,14 +1977,15 @@ async def generate_ws(websocket: WebSocket):
     order they were sent; their replies may interleave. Closing the socket aborts
     whatever is still in flight.
 
-    A request to a model with client streams keeps its input open until the
-    client ends it: ``{"request_id", "append": {"text", "files",
-    "model_kwargs"}}`` feeds the request's streams (each file may name its
-    ``stream``; ``"append": [files]`` is short for ``{"files": [files]}``), and
-    ``{"request_id", "end_input": true}`` (alone or on an append, or on the
-    opening message) ends them, or a list of stream names only those. A live call
-    needs a ``request_id``, and only the socket that opened it can append to
-    it. A message with ``append``, or with ``end_input`` (true or a list) and
+    A request to a model with client streams ends its input at open, as on
+    ``/generate``, unless the opening carries ``"end_input": false`` (or a list
+    of the streams it ends): then the input stays open until the client ends
+    it. ``{"request_id", "append": {"text", "files", "model_kwargs"}}`` feeds
+    the request's streams (each file may name its ``stream``; ``"append":
+    [files]`` is short for ``{"files": [files]}``), and ``{"request_id",
+    "end_input": true}`` (alone or on an append) ends them, or a list of
+    stream names only those. A live call needs a ``request_id``, and only the
+    socket that opened it can append to it. A message with ``append``, or with ``end_input`` (true or a list) and
     no ``text`` or ``files``, is an append; one that opens a request under a live call's
     id is refused with a 409. A null field counts as absent. A rejected
     append ends the call with its error (``status`` 400) and no finish; an
@@ -2053,9 +2056,12 @@ async def generate_ws(websocket: WebSocket):
             text = message.get("text")
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")
-            end_input = _ws_end_input(message)
+            # an opening is one-shot unless it says otherwise
+            end_input = _ws_end_input(message, absent=True)
             if not text and not message.get("files") and (end_input is True or not api_server.takes_stream_input):
-                raise ValueError("message carries neither text nor files")
+                # a one-shot opening: the client may have meant a live one
+                hint = " (open a live call with end_input: false)" if api_server.takes_stream_input else ""
+                raise ValueError("message carries neither text nor files" + hint)
             file_paths, parts = await run_in_threadpool(
                 _decode_ws_files, message.get("files"), api_server.upload_dir,
             )
@@ -2266,7 +2272,7 @@ async def generate_ws(websocket: WebSocket):
                        "status": 409}, binary)
                 continue
             call = None
-            if api_server.takes_stream_input and message.get("end_input") is not True:
+            if api_server.takes_stream_input and message.get("end_input") not in (None, True):
                 # a live call: appends find it by id, from the moment it is read
                 if request_id is None:
                     reply({"request_id": None, "error": "a live call needs a request_id"}, binary)

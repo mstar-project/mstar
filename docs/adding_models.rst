@@ -2407,9 +2407,9 @@ streams (audio and video, say): each has its own buffer and its own end.
 - A stream ends when the client ends it: ``end_input: true`` ends all of the call's
   streams, a list of names only those. The consumer gets ``producer_done`` for that edge
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
-  Over ``/generate/ws`` the client appends and ends input explicitly (see
-  :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open for the call's life;
-  every other route ends the input as soon as the request is submitted. ``/generate/ws``
+  Over ``/generate/ws`` a client that opens with ``end_input: false`` appends and ends
+  input explicitly (see :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open
+  for the call's life; every other request ends the input as soon as it is submitted. ``/generate/ws``
   and ``/v1/realtime`` are on the Python frontend only, not ``--rust-frontend``.
 - The API server's data worker is the stream's producer. The conductor tells it the
   consuming node and its ranks once per call, when it dispatches the request, and the data
