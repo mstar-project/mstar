@@ -2023,9 +2023,8 @@ class Conductor:
             for partition in sorted(ended):
                 self._send_producer_done(request_id, CLIENT, partition, edges=ended[partition])
         except Exception as exc:  # noqa: BLE001 — this request's failure, not the batch's
-            logger.exception("Client input for request %s failed", request_id)
-            self._remove_request(request_id, request_data,
-                                 failure_error=f"client input failed: {type(exc).__name__}: {exc}")
+            text, _ = client_error_text(exc, f"Client input for request {request_id} failed", log=logger)
+            self._remove_request(request_id, request_data, failure_error=f"client input failed: {text}")
 
     def _forward_client_chunk(
         self, request_id: str, request_data: RequestData, name: str,

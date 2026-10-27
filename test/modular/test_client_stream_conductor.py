@@ -383,14 +383,15 @@ def test_a_chunk_that_fails_fails_only_its_request(tmp_path, monkeypatch):
 
     def flaky(request_id, *a, **k):
         if request_id == "bad":
-            raise IndexError("no dims")
+            raise IndexError("/srv/weights/secret no dims")
         return real(request_id, *a, **k)
 
     c._send_inputs = flaky
     _run(c, [[_new_request("bad"), _new_request("good")], [_chunk("bad", 1), _chunk("good", 2)]])
 
     assert _stream_signals(c, "good") == [([2], set())]
-    assert c.draining["bad"].failure_error.startswith("client input failed: IndexError")
+    error = c.draining["bad"].failure_error
+    assert error.startswith("client input failed: internal error") and "secret" not in error
     assert c.requests["good"].streaming_connections[CLIENT, "Ear", "audio_in"].token_count == 1
 
 
