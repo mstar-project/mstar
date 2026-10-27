@@ -149,7 +149,9 @@ class RecurrentStatePool(Resource):
         It addresses rows through the step's plan, so a captured and an eager
         forward read the same slots. A row with no saved state (a request's
         first step, or a padding row on the sink) reads ``start``, zeros when
-        none is given. A pool without a sink refuses (``_need_sink``)."""
+        none is given. A row must declare span >= 1 to reach its own slot; a
+        zero-span row addresses the sink, so it reads ``start``. A pool without
+        a sink refuses (``_need_sink``)."""
         if self.config.disable_sink_slot:
             self._need_sink("gather")
         rows = self.addressing(label)
@@ -267,7 +269,8 @@ class RecurrentStatePool(Resource):
                 self._forget_taken(ctx.is_real_row)
         for segment in step.segments or ():
             if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
-                # reads its state without extending it, or a padding row
+                # a zero-span row is addressed at the sink, like a padding row:
+                # it neither reads nor writes its own slot
                 continue
             if self._alloc(segment.request_id, segment.label) is None:
                 return self._out_of_slots(segment.request_id, segment.label)
