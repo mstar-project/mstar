@@ -158,7 +158,7 @@ def test_polymorphic_body_dispatch():
          WorkerMessageType.SCHEDULE_TP),
         (NewRequest(request_id="r", partition_worker_graph_ids=["wg0"],
                     worker_graph_to_workers={"wg0": ["w0", "w1"]},
-                    initial_inputs=[_edge()], request_info=_fwd_info()),
+                    initial_inputs=[_edge()], request_info=_fwd_info(), loop_caps={}),
          WorkerMessageType.NEW_REQUEST),
     ]:
         got = roundtrip(WorkerMessage(message_type=mtype, body=body))

@@ -13,7 +13,6 @@ from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep  # noq
 from mstar.engine.resources.dsa.manager import (  # noqa: E402
     DSAManager,
     DSAPlan,
-    DSASpan,
     IndexKeyStore,
     index_topk,
 )
@@ -219,9 +218,47 @@ def test_attend_matches_masked_reference(selection_row, autocast):
     assert not torch.allclose(out[0], dense_ref, rtol=1e-3, atol=1e-3)
 
 
-def test_attend_refuses_a_prefill_past_topk():
+def test_attend_batches_requests_over_their_own_pages():
+    """Two decode rows of different requests, with their own page tables and a nonzero first
+    slot, attend in one batch exactly as each would alone."""
+    torch.manual_seed(4)
+    page_size, heads, rank, rope = 4, 2, 16, 8
+    dsa = _manager(topk=4, page_size=page_size)
+    cache = torch.randn(10, page_size, rank + rope)
+    views = [SequenceView("r0", "main", [7, 2], length=6, to_compute=1),
+             SequenceView("r1", "main", [4, 9, 0], length=9, to_compute=1, start=2)]
+    _plan(dsa, views)
+    selection = torch.tensor([[5, 1, 3, -1], [8, 0, 6, 2]], dtype=torch.int32)
+    q_nope, q_pe = torch.randn(2, heads, rank), torch.randn(2, heads, rope)
+    out = dsa.attend(selection, q_nope, q_pe, cache, 0.25)
+
+    for row, view in enumerate(views):
+        pages = torch.tensor(view.page_idxs)
+        slot = torch.arange(view.length) + view.start
+        flat = cache[pages[slot // page_size], slot % page_size]
+        ref = _independent_masked_reference(
+            flat.unsqueeze(1), torch.arange(view.length), 1, view.length, selection[row],
+            torch.cat([q_nope, q_pe], dim=-1)[row], 0.25, rank)
+        torch.testing.assert_close(out[row], ref, rtol=1e-6, atol=1e-6)
+
+
+def test_a_selecting_step_stages_its_page_tables_once(monkeypatch):
+    """Every layer reads the same page tables: one H2D per step, not one per layer and row."""
     dsa = _manager(topk=4)
-    dsa._plans = {"main": DSAPlan(spans=[DSASpan("r0", 0, 2, 5, [1, 2])], needs_selection=True)}
+    calls = []
+    stage = dsa._page_stager.to_device
+    monkeypatch.setattr(dsa._page_stager, "to_device", lambda v, d: calls.append(v) or stage(v, d))
+    _plan(dsa, [SequenceView("r0", "main", [0, 1], length=6, to_compute=1),
+                SequenceView("r1", "main", [2, 3], length=7, to_compute=1)])
+    for _ in range(3):
+        dsa.attend(torch.zeros(2, 4, dtype=torch.int32), torch.randn(2, 2, 16),
+                   torch.randn(2, 2, 8), torch.randn(4, 4, 24), 1.0)
+    assert calls == [[0, 1, 2, 3, 0, 2, 0, 0]]  # pages, each row's offset, each row's start
+    _plan(dsa, [SequenceView("r0", "main", [0], length=3, to_compute=1)])
+    assert len(calls) == 1  # dense: nothing to stage
+
+
+def test_plan_refuses_a_prefill_past_topk():
+    dsa = _manager(topk=4)
     with pytest.raises(RuntimeError, match="decode-only"):
-        dsa.attend(torch.zeros(2, 4, dtype=torch.int32), torch.randn(2, 4, 32),
-                   torch.randn(2, 4, 16), torch.zeros(4, 4, 48), 1.0)
+        _plan(dsa, [SequenceView("r0", "main", [1, 2], length=7, to_compute=2)])

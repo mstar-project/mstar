@@ -87,7 +87,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import ACTION_MODES, resolve_action_domain_id
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -113,6 +113,9 @@ from mstar.model.cosmos3.submodules import (
     Cosmos3VAEDecoderSubmodule,
     Cosmos3VAEEncoderSubmodule,
     Cosmos3VisionEncoderSubmodule,
+    frame_tokens,
+    latent_frames,
+    sound_frames,
 )
 from mstar.model.media_limits import VideoBudget
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
@@ -197,6 +200,12 @@ class Cosmos3Model(Model):
         self._detokenizer = None
         self.config: Cosmos3Config = self._load_config()
         self.tokenizer = self._load_tokenizer()
+        if self._windowed_serving_enabled() and not self.config.is_distilled:
+            logger.warning(
+                "Cosmos3 window_mode='kv' is experimental: the checkpoint was not trained "
+                "block-causally, and a kv rollout can leave the conditioning image within a "
+                "few windows. Prefer window_mode='chained', the default for stream_video."
+            )
 
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
         # The Wan VAE is shared between the DiT submodule (conditioning encode)
@@ -346,6 +355,17 @@ class Cosmos3Model(Model):
                 "(expected 'dense_gen' or 'flashinfer')"
             )
         return specs
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        uncond = KVLabel()
+        if not self._reasoner_enabled():
+            return {KV_CACHE: {COND_LABEL: uncond, UNCOND_LABEL: uncond}}
+        main = KVLabel(growth=((self.REASONER_DECODE_WALK, REASONER_DECODE_LOOP),))
+        return {KV_CACHE: {COND_LABEL: main, UNCOND_LABEL: uncond}}
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # The reasoner's stop check allows max_tokens - 1 iterations, and a loop runs at least one.
+        return {REASONER_DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def get_request_resource_configs(
         self,
@@ -804,7 +824,7 @@ class Cosmos3Model(Model):
                     GraphEdge(next_node=REASONER_NODE, name="text_inputs"),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.reasoner.max_position_embeddings,
             outputs=[],
         )
         return {
@@ -832,7 +852,9 @@ class Cosmos3Model(Model):
                 prompt, input_modalities, tensors or {}, prompt_parts, input_metadata or {}, kwargs,
             )
         if prompt is None:
-            return self._action_prompt_output({}, kwargs)
+            p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
+            layout = self._gen_layout(p, [], [], input_modalities, tensors or {})
+            return self._action_prompt_output({}, kwargs, {"kv_layout": {KV_CACHE: layout}})
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             return self._action_prompt_output({
@@ -865,26 +887,73 @@ class Cosmos3Model(Model):
             add_duration_template=allow_templates and bool(kwargs.get("use_duration_template", False)),
             max_sequence_length=p["max_sequence_length"],
         )
+        layout = self._gen_layout(p, cond_ids, uncond_ids, input_modalities, tensors or {})
         return self._action_prompt_output({
             "text_inputs": [
                 torch.tensor(cond_ids, dtype=torch.long),
                 torch.tensor(uncond_ids, dtype=torch.long),
             ]
-        }, kwargs)
+        }, kwargs, {"kv_layout": {KV_CACHE: layout}})
+
+    def _gen_layout(
+        self, p: dict, cond_ids: list[int], uncond_ids: list[int], input_modalities: list[str], tensors: dict,
+    ) -> dict[str, LabelLayout]:
+        """Each guidance branch's writes: its prompt at prefill, one denoise step's
+        latents as scratch, and in window mode ``kv`` each window's latents once
+        they are clean, under the schedule's retention, with the window's denoise
+        steps as that span's scratch."""
+        config = self.config
+        if "video" in input_modalities and "video_inputs" in tensors:
+            prefill = self.PREFILL_COND_VIDEO_WALK
+        elif p.get("has_image_condition") and "image_inputs" in tensors:
+            prefill = self.PREFILL_COND_WALK
+        else:
+            prefill = self.PREFILL_WALK
+        per_frame = frame_tokens(p["height"], p["width"], config)
+        schedule, windows = None, ()
+        if p.get("window_mode") is not None:
+            schedule = WindowSchedule(
+                p["total_latent_units"], p["window_latent_units"],
+                context_units=p["context_latent_units"], overlap_units=p["overlap_latent_units"],
+            )
+            if p["window_mode"] == "kv":
+                scratch = 0
+                for plan in schedule.windows():
+                    commit = (plan.commit_end - plan.commit_start) * per_frame
+                    denoise = plan.units * per_frame
+                    windows += (Span("rows", self.VIDEO_GEN_AR_WALK, commit, commit, "latents", scratch=denoise),)
+            else:
+                scratch = max(plan.units for plan in schedule.windows()) * per_frame
+        elif p.get("action_mode") is not None:
+            action_chunk = int(p["action_chunk_size"])
+            scratch = latent_frames(int(p.get("num_frames") or action_chunk + 1), config) * per_frame + action_chunk
+        else:
+            scratch = latent_frames(p["num_frames"], config) * per_frame
+            if p.get("generate_sound"):
+                scratch += sound_frames(p, config)[1]
+        layouts = {UNCOND_LABEL: LabelLayout()}
+        branches = [(COND_LABEL, cond_ids), (UNCOND_LABEL, uncond_ids)]
+        for label, ids in branches if float(p["guidance_scale"]) != 1.0 else branches[:1]:
+            layouts[label] = LabelLayout(
+                spans=(Span("ids", prefill, len(ids), len(ids), "text_inputs"), *windows), scratch=scratch,
+                retention=schedule.retention(per_frame, len(ids)) if windows else None,
+            )
+        return layouts
 
     @staticmethod
-    def _action_prompt_output(tensors: NameToTensorList, kwargs: dict):
+    def _action_prompt_output(tensors: NameToTensorList, kwargs: dict, metadata: dict | None = None):
         """Put conditioning values on a tensor edge; only their shape is metadata."""
+        metadata = dict(metadata or {})
         mode = str(kwargs.get("action_mode", "")).strip().lower()
-        if mode != "forward_dynamics" or kwargs.get("action") is None:
-            return tensors
-        action = torch.as_tensor(kwargs["action"])
-        tensors["action_inputs"] = [action]
-        return ProcessPromptOutput(tensors, {"action_shape": list(action.shape)})
+        if mode == "forward_dynamics" and kwargs.get("action") is not None:
+            action = torch.as_tensor(kwargs["action"])
+            tensors["action_inputs"] = [action]
+            metadata["action_shape"] = list(action.shape)
+        return ProcessPromptOutput(tensors, metadata) if metadata else tensors
 
     def _process_reasoner_prompt(
         self, prompt, input_modalities, tensors, prompt_parts, input_metadata, model_kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Render the chat prompt, preprocess its media, expand the
         placeholders and compute the mRoPE positions — everything the
         reasoner prefill needs besides the encoder pass.
@@ -969,7 +1038,13 @@ class Cosmos3Model(Model):
         if ordered_patches:
             out["pixel_values"] = [torch.cat(ordered_patches, dim=0)]
             out["vision_grid_thw"] = [torch.tensor(ordered_grids, dtype=torch.long)]
-        return out
+        walk = self.REASONER_PREFILL_VISION_WALK if ordered_patches else self.REASONER_PREFILL_WALK
+        main = LabelLayout(
+            # media rows fill the expanded placeholders, so the span is rows, not ids
+            spans=(Span("rows", walk, ids.numel(), ids.numel(), "text_inputs"),),
+            growth=((REASONER_DECODE_LOOP, 1),),
+        )
+        return ProcessPromptOutput(out, {"kv_layout": {KV_CACHE: {REASONER_LABEL: main, UNCOND_LABEL: LabelLayout()}}})
 
     def load_video(self, filepath: str, device: str):
         """Decode a conditioning / reasoner video to ``[T, C, H, W]`` in [0, 1].
@@ -1345,7 +1420,8 @@ class Cosmos3Model(Model):
                 "This Cosmos3 checkpoint is distilled: classifier-free guidance is baked into the "
                 f"weights, guidance_scale must be 1.0 (got {mk['guidance_scale']}); leave it unset."
             )
-        if action_mode is not None or mk.get("generate_sound") or mk.get("sound_gen") or mk.get("window_mode"):
+        if (action_mode is not None or mk.get("generate_sound") or mk.get("sound_gen")
+                or mk.get("window_mode") or mk.get("stream_video")):
             raise ValueError(
                 "This Cosmos3 checkpoint is distilled for text/image-to-video generation; action, "
                 "sound and windowed modes are not available on it."
@@ -1365,13 +1441,11 @@ class Cosmos3Model(Model):
         submission."""
         window_mode = mk.get("window_mode")
         if window_mode is None:
-            if mk.get("stream_video"):
-                # The non-windowed walks emit one video at the very end; there
-                # is nothing to deliver incrementally.
-                raise ValueError(
-                    "Cosmos3 stream_video requires a windowed request (set window_mode)."
-                )
-            return
+            if not mk.get("stream_video"):
+                return
+            # The non-windowed walks emit one video at the very end, so a
+            # streamed request runs windowed, in the mode that holds the scene.
+            window_mode = "chained"
         window_mode = str(window_mode).strip().lower()
         if window_mode not in ("chained", "kv"):
             raise ValueError(
@@ -1391,7 +1465,8 @@ class Cosmos3Model(Model):
         if not is_kv and mk.get("context_frames") is not None:
             raise ValueError("Cosmos3 context_frames applies to window_mode='kv' only.")
         tf = self.config.vae.scale_factor_temporal
-        window_frames = int(mk.get("window_frames", self.config.window_frames_default))
+        default_window = self.config.kv_window_frames_default if is_kv else self.config.window_frames_default
+        window_frames = int(mk.get("window_frames", default_window))
         if window_frames < 1 + tf:
             raise ValueError(f"Cosmos3 window_frames must be at least {1 + tf}, got {window_frames}.")
         window_units = 1 + (window_frames - 1) // tf
@@ -1429,7 +1504,9 @@ class Cosmos3Model(Model):
             # 0 retains all committed frames (no release).
             if context_frames:
                 context_units = 1 + (context_frames - 1) // tf
-        total_units = 1 + (num_frames - 1) // tf
+        # rounded up: the decoder trims the assembled video back to num_frames,
+        # but cannot add frames a short schedule never generated
+        total_units = 1 + -(-(num_frames - 1) // tf)
         # Sessions: a request may name a session (its last window is kept for
         # a follow-up) and resume one — the stored tail then re-pins the head
         # of window 0 as clean conditioning (the chained overlap, at least the

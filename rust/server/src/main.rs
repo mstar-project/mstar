@@ -364,6 +364,22 @@ fn parse_form_bool(s: &str) -> Result<bool, String> {
     }
 }
 
+/// A request's id rides in every control message about it, so a client-pinned
+/// one is kept short; the same check and message as `check_request_id` in
+/// `mstar/api_server/entrypoint.py`.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
+fn check_request_id(id: &str) -> Result<(), String> {
+    let allowed = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-');
+    if id.len() <= MAX_REQUEST_ID_LEN && id.bytes().all(allowed) {
+        Ok(())
+    } else {
+        Err(format!(
+            "request_id must be at most {MAX_REQUEST_ID_LEN} characters from [A-Za-z0-9._:-]"
+        ))
+    }
+}
+
 /// Resolve the loaded model's adapter and check it serves `surface`; otherwise
 /// an OpenAI-shaped error response (404), matching router.py `_resolve`.
 fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
@@ -1095,10 +1111,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
     .await
 }
 
-/// The files a `/generate` request saved under the upload directory, until
-/// the request takes them with [`SavedUploads::keep`]. A refusal drops them
-/// unkept, which deletes them: the deferred cleanup only covers submitted
-/// requests.
+/// The files a request saved under the upload directory (a `/generate` form,
+/// a chat's attachments), until the request takes them with
+/// [`SavedUploads::keep`]. A refusal drops them unkept, which deletes them:
+/// the deferred cleanup only covers submitted requests.
 struct SavedUploads {
     upload_dir: PathBuf,
     paths: BTreeMap<String, Vec<String>>,
@@ -1134,6 +1150,12 @@ async fn generate_finish(
     request_id: Option<String>,
     uploads: SavedUploads,
 ) -> Response {
+    // An empty id means none, as the Python /generate's form parsing reads it.
+    let request_id = request_id.filter(|id| !id.is_empty());
+    if let Err(msg) = request_id.as_deref().map_or(Ok(()), check_request_id) {
+        // `uploads` drops unkept here, which deletes the saved files.
+        return detail_error(400, &msg);
+    }
     let output_modalities: Vec<String> = out_mods_raw
         .split(',')
         .map(str::trim)
@@ -1556,11 +1578,14 @@ mod tests {
     async fn every_refusal_after_the_form_leaves_no_upload_behind() {
         let mut st = state(None);
         st.upload_dir = socket_dir();
+        let long_id = "a".repeat(MAX_REQUEST_ID_LEN + 1);
         for (field, value, detail) in [
             ("model_kwargs", "[1]", "model_kwargs must be a JSON object"),
             ("model_kwargs", "{", "model_kwargs JSON: EOF while parsing an object at line 1 column 1"),
             ("tokenize", "true", "tokenize=true requires the server to be started with MSTAR_TOKENIZER"),
             ("input_modalities", "video_frame", "'video_frame' is an output-only modality"),
+            ("request_id", "a/b", "request_id must be at most 128 characters from [A-Za-z0-9._:-]"),
+            ("request_id", long_id.as_str(), "request_id must be at most 128 characters from [A-Za-z0-9._:-]"),
         ] {
             let req = multipart_request("/generate", &[
                 ("files", Some("clip.wav"), b"RIFF"),
@@ -1616,6 +1641,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&st.upload_dir);
     }
 
+    #[tokio::test]
+    async fn a_chat_refused_after_an_attachment_leaves_no_upload_behind() {
+        let mut st = state(None);
+        st.upload_dir = socket_dir();
+        let image = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}});
+        let bad_image = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,***"}});
+        let audio = json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}});
+        let mut left = Vec::new();
+        for (adapter, request, detail) in [
+            (
+                "Qwen3_5Adapter",
+                json!({"messages": [{"role": "user", "content": [image, audio, bad_image]}]}),
+                "data URL base64 decode failed: Invalid symbol 42, offset 0.",
+            ),
+            (
+                "Qwen3OmniAdapter",
+                json!({"messages": [{"role": "user", "content": [image, audio]}, {"role": "tool", "content": "42"}]}),
+                "a message's role must be system, developer, user or assistant, not 'tool'",
+            ),
+            (
+                "Cosmos3EdgeAdapter",
+                json!({"messages": [{"role": "user", "content": [image]}], "chat_template_kwargs": true}),
+                "argument of type 'bool' is not iterable",
+            ),
+        ] {
+            st.python_adapter = adapter.into();
+            let req: ChatCompletionRequest = serde_json::from_value(request).unwrap();
+
+            let (status, _, data) = body(chat_completions(State(st.clone()), Ok(Json(req))).await).await;
+
+            let body: Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!((status, body["error"]["message"].as_str()), (StatusCode::BAD_REQUEST, Some(detail)), "{adapter}");
+            left.push((adapter, std::fs::read_dir(&st.upload_dir).unwrap().count()));
+            let _ = std::fs::remove_dir_all(&st.upload_dir);
+            std::fs::create_dir_all(&st.upload_dir).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&st.upload_dir);
+        assert_eq!(left, [("Qwen3_5Adapter", 0), ("Qwen3OmniAdapter", 0), ("Cosmos3EdgeAdapter", 0)]);
+    }
+
     #[test]
     fn max_images_parses_as_python_does() {
         for (raw, cap) in [
@@ -1624,6 +1689,24 @@ mod tests {
             (Some("1.5"), 10), (Some("\u{ff12}"), 10),
         ] {
             assert_eq!(parse_max_images(raw), cap, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn request_id_check_matches_python() {
+        let longest = "a".repeat(MAX_REQUEST_ID_LEN);
+        let minted = Uuid::new_v4().to_string();
+        let prefixed = rid("chatcmpl");
+        for ok in ["", "warmup-0", "obs.1:a_b-C", &longest, &minted, &prefixed] {
+            assert!(check_request_id(ok).is_ok(), "{ok:?}");
+        }
+        let too_long = "a".repeat(MAX_REQUEST_ID_LEN + 1);
+        for bad in [too_long.as_str(), "a b", "a/b", "a#1", "caf\u{e9}", "a\n"] {
+            assert_eq!(
+                check_request_id(bad),
+                Err("request_id must be at most 128 characters from [A-Za-z0-9._:-]".to_string()),
+                "{bad:?}"
+            );
         }
     }
 }

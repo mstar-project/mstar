@@ -91,6 +91,7 @@ def drive(runtime, put, prefills: int, decode_steps: int, inline: bool = False) 
         request_id="r1", partition="default", graph_walk=PREFILL,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     uuid = 100
 

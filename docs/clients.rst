@@ -48,6 +48,11 @@ NDJSON stream.
        again once that request finished, failed or was aborted (a client that
        drops a stream can resubmit its id at once).
 
+A client ``request_id`` is at most 128 characters from ``[A-Za-z0-9._:-]``; any other is
+refused with ``400`` (on ``/generate/ws``, with the in-band error below). An empty
+``request_id`` counts as none: the server mints a fresh one, on both frontends and on
+``/generate/ws``.
+
 A non-streaming response groups outputs by modality, each payload base64-encoded:
 
 .. code-block:: json
@@ -249,7 +254,7 @@ Endpoints and model coverage:
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
        finishes the utterance. Input is ``pcm16`` at 16 kHz (the default) or
        ``{"type": "audio/pcm", "rate": 24000}``, resampled to 16 kHz. Turn
-       detection is null (client commits) or ``server_vad``; see below.
+       detection is null (client commits), ``server_vad`` or ``semantic_vad``; see below.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
@@ -359,6 +364,24 @@ Per-model notes:
   exports take other inputs, and with one of them ``server_vad`` is refused); weights are
   never downloaded. The Dynamo bridge has no turn detection yet and
   refuses it.
+- **Semantic turn detection** — ``"turn_detection": {"type": "semantic_vad", "eagerness":
+  "auto"}`` ends a turn when the speaker sounds finished rather than after a fixed
+  silence, as OpenAI's semantic VAD does. When a pause reaches the eagerness' pause
+  (high 200 ms, medium and auto 300 ms, low 400 ms; all shorter than server_vad's
+  500 ms), Pipecat's Smart Turn v3 judges the turn's last 8 s of audio once; a
+  probability of at least 0.3, 0.5 or 0.7 (high, medium/auto, low) commits there, and
+  otherwise the server keeps listening. A silence of 2, 4 or 8 s always ends the turn.
+  Speech starts on Silero's 0.5 with 300 ms of prefix padding; the events are the same
+  as server_vad's. Smart Turn (BSD-2, 8 MB int8 ONNX, about 45 ms per pause on one CPU
+  thread) runs off the event loop. It needs ``onnxruntime`` and ``transformers``
+  (``mstar[vad]``) and its weights at ``MSTAR_SMART_TURN_PATH`` or in the local Hugging
+  Face cache (``hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx``). Without
+  them, or with an ONNX file whose inputs or outputs differ, the server warns at startup
+  and refuses ``semantic_vad`` with an ``error`` event that says why (no weights, a
+  missing package, or a file that is not the model), as ``server_vad`` is refused
+  without Silero. The session goes on with its previous settings, so the client can
+  choose ``server_vad`` or manual commits instead. See OpenAI's `realtime VAD guide
+  <https://platform.openai.com/docs/guides/realtime-vad>`_.
 - **Kokoro** — ``voice`` is one of the 54 bundled voices (default ``af_heart``) or a
   blend such as ``af_bella+af_sky`` or ``af_bella(2)+af_sky(1)``; ``speed`` scales the
   speaking rate (0.25-4.0). ``lang_code`` and ``phonemes`` go through ``extra_body``.
