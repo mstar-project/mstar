@@ -1010,10 +1010,10 @@ methods are:
    example a flow solve that amplifies TF32 rounding, sets
    ``float32_matmul_precision = "highest"``, and ``cudnn_allow_tf32 = False`` for cuDNN
    convolutions and RNNs. The engine applies these around that node's forward, its
-   compile and its CUDA-graph capture, and restores the default afterwards, so other
-   nodes keep TF32. ``None`` (the default) keeps the process setting. Don't flip
-   ``torch.backends`` flags in model code: they are process-wide, and a CUDA graph keeps
-   the precision it was captured with. The setting covers ``forward`` and
+   compile and its accelerator graph capture, and restores the default afterwards,
+   so other nodes keep TF32. ``None`` (the default) keeps the process setting. Don't flip
+   ``torch.backends`` flags in model code: they are process-wide, and an accelerator
+   graph keeps the precision it was captured with. The setting covers ``forward`` and
    ``forward_batched`` only, not ``preprocess`` or ``postprocess``. It can also be set
    per instance in ``__init__``, for example only when the model loads in fp32.
 
@@ -1264,8 +1264,8 @@ The sampler keeps one row per request by slot, grows it with its other per-reque
 buffers, and resets a row to ``default`` when its slot is given to a new request. A step
 reads the rows with ``sampler.loopback_state(name, request_ids)`` in ``preprocess`` and
 stores the next ones from the forward with ``sampler.store_loopback_state(name,
-request_ids, values)``. Under a CUDA-graph slot the store is captured into a per-step
-buffer and commit persists it, so the step must list the name in
+request_ids, values)``. Under an accelerator graph slot the store is captured into a
+per-step buffer and commit persists it, so the step must list the name in
 ``SamplerStep(loopback_writes=...)``. An eager step writes the rows by request. Both paths
 address rows the same way, and the model never sees a slot index.
 

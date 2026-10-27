@@ -111,8 +111,8 @@ and sampling kernels determine which devices it can capture on; see
      - V-JEPA 2-AC encoder + action-conditioned predictor.
    * - ``whisper_large_v3_turbo``
      - ``openai/whisper-large-v3-turbo``
-     - Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV
-       decoder with write-once cross-attention; language detection, forced
+     - Whisper ASR: batched audio encoder with accelerator graph capture;
+       paged-KV decoder with write-once cross-attention; language detection, forced
        language/task, ``initial_prompt`` context, ``/v1/audio/transcriptions``.
        The 4-decoder-layer distillation of large-v3, same class as below.
    * - ``whisper_large``
@@ -340,8 +340,8 @@ transformers 5.22 turns on the per-frame pixel cap of qwen-vl-utils by
 default, which lowers the token count of short clips. Notes:
 
 - The vision encoder attends within each image and each video frame group
-  separately, and its captured CUDA graphs hold up to 16384 patches and 64 such
-  segments per prompt. A prompt over either limit runs the encoder without the
+  separately, and its captured accelerator graphs hold up to 16384 patches and
+  64 such segments per prompt. A prompt over either limit runs the encoder without the
   graph: a long video at ordinary resolution exceeds the patches, and one over
   ~64 s with frames resized below ~256x256 pixels exceeds the segments.
 - A long video is one wide prefill: one 1-3 minute video is ~11-12k tokens,
@@ -657,7 +657,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   step decodes only the call's new frame against that state, and a fresh,
   zeroed slot is the decoder's causal padding, so a call's PCM equals the full
   decode of its frames from its first frame; at 32 sessions the decode is
-  ~100 GMAC per 80 ms tick, inside the talker's CUDA graph).
+  ~100 GMAC per 80 ms tick, inside the talker's accelerator graph).
   The decode loops are stream-terminated: they end when the upstream stream
   closes, not on EOS, which is an ordinary per-frame token in duplex speech.
 - ``nano_llm`` declares a paged KV cache over its four attention layers with
@@ -769,8 +769,8 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   distances; its conv inputs (``encoder_state``); and its newest audio and mel
   frames (``encoder_front``), the last two recurrent-state pools. A
   call that appends one frame of audio (1280 samples) on the frame grid, every
-  live step of an 80 ms client, runs its whole step as a CUDA graph (the grid is
-  the call's start: an opening clip or append that is not a multiple of 1280
+  live step of an 80 ms client, runs its whole step as an accelerator graph (the grid
+  is the call's start: an opening clip or append that is not a multiple of 1280
   samples keeps the call off it for good); other calls take the front end
   eagerly, then the layer stack as a graph when each got at most one frame (a
   live step, the call's end), or eagerly (a one-shot upload, a large append:
