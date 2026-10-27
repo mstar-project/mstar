@@ -582,10 +582,12 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
 
     healthy_page = manager._streams["healthy"]["main"].page_indices[0]
 
+    # the refusal reaches clients: an error id, the file error itself only in the log
     assert not broken.ok
-    assert "FileNotFoundError" in broken.reason.message
+    assert "internal error (error id" in broken.reason.message
+    assert "missing.pt" not in broken.reason.message
     assert not broken_again.ok
-    assert "FileNotFoundError" in broken_again.reason.message
+    assert broken_again.reason.message == broken.reason.message
     assert healthy.ok and healthy.ready
     torch.testing.assert_close(
         manager.kv_cache.tensor[:, healthy_page, :, :1],

@@ -48,7 +48,6 @@ Response formats
 from __future__ import annotations
 
 import asyncio
-import codecs
 import math
 import os
 import uuid
@@ -62,6 +61,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
+from mstar.utils.utf8_stream import Utf8Stream
 
 _TIMED_FORMATS = ("verbose_json", "srt", "vtt")
 RESPONSE_FORMATS = ("json", "text", *_TIMED_FORMATS)
@@ -641,7 +641,7 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                     submitted += 1
                 raw, emitted = "", ""
                 # holds back a character split across tokens until its last byte
-                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                decoder = Utf8Stream()
                 async for c in api.iter_result_chunks(window.request_id):
                     if c.modality == "error":
                         yield _error_event(c.data.decode("utf-8", "replace"), (c.metadata or {}).get("status"))
@@ -649,11 +649,11 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                         return
                     if c.modality != "text" or not c.data:
                         continue
-                    raw += decoder.decode(c.data)
+                    raw += decoder.feed(c.data)
                     delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
                     if delta:
                         yield sse({"type": "transcript.text.delta", "delta": delta})
-                tail = decoder.decode(b"", final=True)
+                tail = decoder.flush()
                 if tail:
                     raw += tail
                     delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
