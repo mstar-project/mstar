@@ -754,6 +754,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.client_errors.html">mstar.utils.client_errors</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
@@ -950,12 +951,12 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">codecs</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">SSE_DONE</span><span class="p">,</span> <span class="n">error_type</span><span class="p">,</span> <span class="n">now</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">sse</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.utf8_stream</span><span class="w"> </span><span class="kn">import</span> <span class="n">Utf8Stream</span>
 
 
 <div class="viewcode-block" id="create_chat_completion">
@@ -1053,7 +1054,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">role</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"assistant"</span><span class="p">}</span>
     <span class="n">failed</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># a byte-level BPE token's bytes can end inside a character: hold them</span>
-    <span class="n">text</span> <span class="o">=</span> <span class="n">codecs</span><span class="o">.</span><span class="n">getincrementaldecoder</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">)(</span><span class="s2">"replace"</span><span class="p">)</span>
+    <span class="n">text</span> <span class="o">=</span> <span class="n">Utf8Stream</span><span class="p">()</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="c1"># One yield per batch of text chunks: the tokens a request had waiting</span>
         <span class="c1"># when its handler ran go out as one body frame (one write), which is</span>
@@ -1063,7 +1064,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">text_events</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
             <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">batch</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">:</span>
-                    <span class="n">content</span> <span class="o">=</span> <span class="n">text</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
+                    <span class="n">content</span> <span class="o">=</span> <span class="n">text</span><span class="o">.</span><span class="n">feed</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
                     <span class="k">if</span> <span class="n">content</span><span class="p">:</span>
                         <span class="n">text_events</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">chunk</span><span class="p">({</span><span class="o">**</span><span class="n">role</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">content</span><span class="p">}))</span>
                         <span class="n">role</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1098,7 +1099,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">failed</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">yield</span> <span class="n">error</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="o">.</span><span class="n">detail</span><span class="p">),</span> <span class="n">exc</span><span class="o">.</span><span class="n">status_code</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">failed</span><span class="p">:</span>
-        <span class="n">tail</span> <span class="o">=</span> <span class="n">text</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="sa">b</span><span class="s2">""</span><span class="p">,</span> <span class="n">final</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">tail</span> <span class="o">=</span> <span class="n">text</span><span class="o">.</span><span class="n">flush</span><span class="p">()</span>
         <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="o">**</span><span class="n">role</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">tail</span><span class="p">}</span> <span class="k">if</span> <span class="n">tail</span> <span class="k">else</span> <span class="n">role</span><span class="p">,</span> <span class="n">finish</span><span class="o">=</span><span class="s2">"stop"</span><span class="p">)</span>
     <span class="k">yield</span> <span class="n">SSE_DONE</span>
 </pre></div>
