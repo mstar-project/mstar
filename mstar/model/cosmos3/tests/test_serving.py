@@ -182,7 +182,7 @@ def test_process_prompt_emits_cond_and_uncond() -> None:
     eos = model.tokenizer.eos_token_id
 
     out = model.process_prompt("a red cube on a table", ["text"], ["image"], tensors={}, size="256x256")
-    ti = out["text_inputs"]
+    ti = out.new_input_tensors["text_inputs"]
     assert len(ti) == 2, "t2i must emit a conditional and unconditional prompt"
     cond, uncond = ti[0].tolist(), ti[1].tolist()
     assert cond[-2:] == [eos, sog]

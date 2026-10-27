@@ -37,7 +37,11 @@ from request_walks import run_walks  # noqa: E402
 
 from mstar.engine.resources import AllocationFailed, StepContext  # noqa: E402
 from mstar.engine.resources.dsa.config import INDEX_PLANES  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
+from mstar.model.glm52._testing import (  # noqa: E402
+    build_cpu_resources,
+    install_cpu_rope,
+    per_request_outputs,
+)
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     KV_RESOURCE,
@@ -108,10 +112,11 @@ class _Driver:
             request_ids=rids, per_request_info=infos, resources=self.resources, step=step,
         )
         kw = self.sub.preprocess(walk, engine_inputs, inputs)
-        outs = self.sub.forward_batched(walk, engine_inputs, **kw)
+        raw = self.sub.forward_batched(walk, engine_inputs, **kw)
         self.runner.commit(step)
+        outs = per_request_outputs(raw, rids)
         unpacked = self.sub.unpack_packed_outputs(
-            static_output=outs, request_ids=rids,
+            static_output=raw, request_ids=rids,
             real_seq_lens=[inp.input_seq_len for inp in inputs], inputs=inputs,
             per_request_info=infos,
         )
@@ -464,8 +469,8 @@ def _window_cfg(k: int, limit: int) -> Glm52ModelConfig:
     return cfg
 
 
-def _window_stream(model, cfg, mode_k: int, prompt_len: int):
-    """One arm at the window: the stream, the capped budget, and the KV
+def _window_stream(model, cfg, mode_k: int, prompt_len: int, max_tokens: int):
+    """One arm at the window: the stream, the capped budget (None: uncapped), and the KV
     stream's final length and page high-water mark."""
     k = cfg.mtp_num_draft_tokens
     cfg.mtp_num_draft_tokens = mode_k
@@ -473,28 +478,31 @@ def _window_stream(model, cfg, mode_k: int, prompt_len: int):
         sub = Glm52LLMSubmodule(model, cfg)
         driver = _Driver(sub, cfg, ["r0"])
         prompt = torch.arange(prompt_len, dtype=torch.long) + 3
-        stream = _drive(driver, prompt, _fwd_info("r0", 40, True))
+        stream = _drive(driver, prompt, _fwd_info("r0", max_tokens, True))
         kv = driver.resources[KV_RESOURCE]
         pages = len(kv._streams["r0"]["main"].page_indices)
-        return stream, sub.request_state("r0")["token_budget"], kv._streams["r0"]["main"].stored_len, pages
+        budget = sub.request_state("r0").get("token_budget")
+        return stream, budget, kv._streams["r0"]["main"].stored_len, pages
     finally:
         cfg.mtp_num_draft_tokens = k
 
 
 @pytest.mark.parametrize("k", [2, 3])
 def test_stream_stops_cleanly_at_the_context_limit(k):
-    """A request whose max_tokens outruns the context limit stops short of it: the
-    prefill's preprocess caps its budget at limit - prompt, less two blocks under MTP
-    (every step writes a whole block, and the next may run before the stop lands), so the
-    trunk guard never fires and no step writes past the limit (no third KV page)."""
+    """A request sized to the window, the most the conductor admits (limit - prompt + 1
+    tokens: the last is never stored), fills it exactly without MTP. Under MTP the
+    prefill's preprocess caps its budget two blocks short of that (every step writes a
+    whole block, and the next may run before the stop lands), so the trunk guard never
+    fires and no step writes past the limit (no third KV page)."""
     limit, prompt_len = 24, 5
+    fits = limit - prompt_len + 1
     cfg = _window_cfg(k, limit)
     model = _model(cfg)
-    baseline, budget, stored, pages = _window_stream(model, cfg, 0, prompt_len)
-    assert budget == limit - prompt_len
-    assert baseline.numel() == budget
-    assert stored == limit - 1 and pages == limit // 8
-    stream, budget, stored, pages = _window_stream(model, cfg, k, prompt_len)
+    baseline, budget, stored, pages = _window_stream(model, cfg, 0, prompt_len, fits)
+    assert budget is None, "without MTP the conductor sizes the request; nothing caps it"
+    assert baseline.numel() == fits
+    assert stored == limit and pages == limit // 8
+    stream, budget, stored, pages = _window_stream(model, cfg, k, prompt_len, fits)
     assert budget == limit - prompt_len - 2 * (k + 1)
     assert torch.equal(stream, baseline[:budget]), (stream.tolist(), baseline.tolist())
     assert stored <= limit and pages <= limit // 8, (stored, pages)

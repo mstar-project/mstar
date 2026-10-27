@@ -19,6 +19,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.model.glm52._testing import per_request_outputs
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 from mstar.model.glm52.config import (
@@ -204,7 +205,8 @@ class _Serve:
             )
             kw = self.submodule.preprocess(walk, engine_inputs, inputs)
             if batched:
-                out = self.submodule.forward_batched(walk, engine_inputs, **kw)[rid]
+                raw = self.submodule.forward_batched(walk, engine_inputs, **kw)
+                out = per_request_outputs(raw, [rid])[rid]
             else:
                 out = self.submodule.forward(walk, engine_inputs, **kw)
             if step is not None:
