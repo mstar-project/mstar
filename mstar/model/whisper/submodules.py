@@ -107,9 +107,9 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     ENCODER_CAPTURE_BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32]
     # Compiled before capture, like the engine's other captured forwards: at
     # serving concurrency the encoder is most of the GPU time (~6 ms a request
-    # on an H200), and Inductor's kernels cut it. Turbo, split+MPS, one H200:
-    # c=32 +9%, c=64 +20%. The first start on a machine autotunes every bucket
-    # (minutes); the Inductor cache makes later starts ~1 min.
+    # on an H200). Turbo, split+MPS, one H200: c=32 +9%, c=64 +20%, measured
+    # when the default compile was max-autotune (now MSTAR_COMPILE_LEVEL=2);
+    # not yet measured at the default level 1.
     ENCODER_COMPILE = True
     # The engine's blanket torch.compile of ``forward_batched`` traces the
     # per-request Python around the tensor work and guards on request ids
