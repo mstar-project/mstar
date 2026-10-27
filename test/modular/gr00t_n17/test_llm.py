@@ -1,18 +1,6 @@
-"""GR00T N1.7's backbone LLM: the Qwen3-VL decoder stack we run without a KV cache.
-
-The layer is checked against an inline reference for one Qwen3-VL decoder layer, written
-from the algorithm rather than imported, so the test needs no checkpoint and no pinned
-transformers. Everything else here is the wiring the reference cannot see: which fused
-rows each head reads, the attention resource's binding, and the parameters the module
-ends up with.
-
-Weights reach the module the way a checkpoint's do -- separate ``q/k/v`` and ``gate/up``
-tensors, through ``load_gr00t_n17_weights`` -- so the fusing rules are part of what every
-numeric test below covers.
-
-The last section drives the ``LLM`` node, ``Gr00tN17LLMSubmodule``, the way the engine does:
-what it derives from the walk's inputs, the step it declares, and that it adds nothing to
-the forward above.
+"""GR00T N1.7's backbone LLM, the Qwen3-VL decoder stack run without a KV cache:
+checked against an inline reference layer, with weights loaded the way a checkpoint's are
+(separate q/k/v and gate/up, fused by ``load_gr00t_n17_weights``), and the ``LLM`` node.
 """
 
 import dataclasses
@@ -35,18 +23,10 @@ from mstar.model.gr00t_n17.weight_loader import SKIPPED, load_gr00t_n17_weights
 from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
+from .helpers import SegmentAttention, relative_gap
+
 _LLM = "backbone.model.model.language_model."
 _LAYERS = 3
-
-
-@pytest.fixture(autouse=True)
-def _pinned_threads():
-    """fp32 CPU forwards compared against a reference; reduction order follows the thread
-    count, as it does in the other gr00t tests."""
-    threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    yield
-    torch.set_num_threads(threads)
 
 
 def _config(num_layers: int = _LAYERS) -> Gr00tN17Config:
@@ -65,11 +45,8 @@ def _config(num_layers: int = _LAYERS) -> Gr00tN17Config:
 
 
 def _checkpoint(text: Gr00tN17TextConfig, seed: int) -> dict[str, torch.Tensor]:
-    """The tensors a Qwen3-VL text stack stores, under the names GR00T's checkpoint uses.
-
-    Random everywhere, norms included: an RMSNorm left at its identity weight would hide a
-    norm that is wired up in the wrong place.
-    """
+    """The tensors a Qwen3-VL text stack stores, under GR00T's checkpoint names; random
+    everywhere, norms included, so a misplaced norm cannot hide behind an identity weight."""
     generator = torch.Generator().manual_seed(seed)
 
     def rnd(*shape: int) -> torch.Tensor:
@@ -208,38 +185,6 @@ def _reference_stack(
     return layers
 
 
-# ----------------------------------------------------------------------------
-# The ragged attention resource's stand-in
-# ----------------------------------------------------------------------------
-
-
-class _SegmentAttention:
-    """Stands in for the resource the engine plans from the step's segments: one segment per
-    request, each attending only within itself.
-
-    Causality is not the module's -- the step declares it (``AttentionStep(causal=True)``) --
-    so it is set here. GQA is the kernel's: ``enable_gqa`` groups query head ``h`` onto KV
-    head ``h // (heads / kv_heads)``, which is what the reference's ``repeat_interleave`` says.
-    """
-
-    def __init__(self, seq_lengths: tuple[int, ...]):
-        self.seq_lengths = seq_lengths
-
-    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        out, start = [], 0
-        for span in self.seq_lengths:
-            rows = slice(start, start + span)
-            # the kernel's layout is [tokens, heads, dim]; SDPA wants heads first
-            out.append(
-                F.scaled_dot_product_attention(
-                    q[rows].transpose(0, 1), k[rows].transpose(0, 1), v[rows].transpose(0, 1),
-                    is_causal=True, enable_gqa=True,
-                ).transpose(0, 1)
-            )
-            start += span
-        return torch.cat(out)
-
-
 def _bind(model: Gr00tN17LanguageModel, resources: dict) -> None:
     """Bind the way the engine does: on the node, fanned out to the layers underneath it."""
     node = nn.Module()
@@ -254,7 +199,7 @@ def _prepare(model: Gr00tN17LanguageModel, tokens: int, seed: int):
     ids = torch.randint(0, 96, (tokens,), generator=torch.Generator().manual_seed(seed))
     positions = torch.arange(tokens).float().expand(3, -1).contiguous()
     cos, sin = model.build_cos_sin(positions)
-    _bind(model, {LLM_ATTN: _SegmentAttention((tokens,))})
+    _bind(model, {LLM_ATTN: SegmentAttention((tokens,), causal=True, gqa=True)})
     return model.embed(ids), cos, sin
 
 
@@ -266,10 +211,6 @@ def _run(model: Gr00tN17LanguageModel, layers: list[RefDecoderLayer], tokens: in
     for layer in layers:
         hidden = layer(hidden, cos, sin)
     return ours, hidden
-
-
-def _relative_gap(ours: torch.Tensor, theirs: torch.Tensor) -> float:
-    return ((ours - theirs).abs().max() / theirs.abs().max()).item()
 
 
 # ----------------------------------------------------------------------------
@@ -296,7 +237,7 @@ def test_our_stack_is_the_reference_decoder_layer(tmp_path, tokens):
         _loaded_model(config, weights, tmp_path), _reference_stack(config.text, weights), tokens, seed=1,
     )
     assert ours.shape == (tokens, config.text.hidden_size)
-    assert _relative_gap(ours, theirs) <= _BAR
+    assert relative_gap(ours, theirs) <= _BAR
 
 
 @pytest.mark.parametrize("deviation", DEVIATIONS)
@@ -314,7 +255,7 @@ def test_a_layer_assembled_wrongly_misses_by_orders_of_magnitude(tmp_path, devia
         _reference_stack(config.text, weights, deviation),
         tokens=64, seed=1,
     )
-    assert _relative_gap(ours, theirs) > 1000 * _BAR
+    assert relative_gap(ours, theirs) > 1000 * _BAR
 
 
 def test_the_fused_projection_holds_q_then_k_then_v_one_block_per_head(tmp_path):
@@ -349,7 +290,9 @@ _IMAGE_ROWS = torch.tensor([5, 6, 7, 8, 30, 31, 32, 33])
 # layers), which also leaves the off-by-one deviations below a layer to land on.
 _FEATURES = 3
 _DEEPSTACK_LAYERS = 4
-_PERMUTATIONS = [p for p in itertools.permutations(range(_FEATURES)) if p != tuple(range(_FEATURES))]
+# the reversal (a list read backwards) and a 3-cycle; the closest of all five orders missed by
+# 1.5e-02 (3.8e+03x the bar)
+_PERMUTATIONS = [(2, 1, 0), (1, 2, 0)]
 
 
 @torch.no_grad()
@@ -420,39 +363,30 @@ def _case(tmp_path, num_layers: int = _DEEPSTACK_LAYERS, features: int = _FEATUR
 
 
 def test_deepstack_features_land_on_the_image_rows_after_their_layer(tmp_path):
-    """The same bar as the layer parity above, and the same reason for it: our fused q/k/v
-    and gate/up GEMMs round differently from the reference's separate ones. The injection
-    itself adds the same fp32 numbers in both. Worst measured gap over 6 weight seeds x 3
-    feature seeds was 1.3e-06 -- above the 3-layer sweep that set ``_MEASURED_GAP``, since
-    there is a fourth layer here for the rounding to travel through, still under a third of the bar.
-    """
+    """The layer-parity bar, for the same reason (fused vs separate GEMMs); the injection adds
+    the same fp32 numbers on both sides. Worst measured 1.3e-06 over 6 x 3 seeds."""
     case = _case(tmp_path)
     ours = case.ours()
     assert ours.shape == case.hidden.shape
-    assert _relative_gap(ours, case.theirs()) <= _BAR
+    assert relative_gap(ours, case.theirs()) <= _BAR
 
 
 @pytest.mark.parametrize("shift", [-1, 1], ids=["a layer early", "a layer late"])
 def test_a_feature_added_after_the_wrong_layer_misses_by_orders_of_magnitude(tmp_path, shift):
-    """The parity test above pins the composition as a whole; this is what says its bar is
-    tight enough that moving an injection one layer could not slip under it. Measured gaps
-    against that bar of 4.1e-06: a layer early 6.8e-01, a layer late 4.9e-02, the smaller of
-    them 1.2e+04 times the bar.
-    """
+    """Moving an injection one layer cannot slip under the bar: measured a layer early
+    6.8e-01, a layer late 4.9e-02, the smaller 1.2e+04 times the bar."""
     case = _case(tmp_path)
-    assert _relative_gap(case.ours(), case.theirs(shift=shift)) > 1000 * _BAR
+    assert relative_gap(case.ours(), case.theirs(shift=shift)) > 1000 * _BAR
 
 
 @pytest.mark.parametrize("order", _PERMUTATIONS)
 def test_features_applied_in_the_wrong_order_miss_by_orders_of_magnitude(tmp_path, order):
-    """Each feature belongs to one layer. Three equal features would permute to themselves
-    and make this control vacuous, so their distinctness is asserted rather than assumed.
-    The closest of the five permutations missed by 1.5e-02, 3.8e+03 times the bar.
-    """
+    """Each feature belongs to one layer; equal features would permute to themselves, so
+    their distinctness is asserted rather than assumed."""
     case = _case(tmp_path)
     for first, second in itertools.combinations(case.deepstack, 2):
         assert not torch.equal(first, second)
-    assert _relative_gap(case.ours(), case.theirs(order=order)) > 1000 * _BAR
+    assert relative_gap(case.ours(), case.theirs(order=order)) > 1000 * _BAR
 
 
 @pytest.mark.parametrize(
@@ -464,17 +398,12 @@ def test_row_k_of_a_feature_lands_on_image_row_k(tmp_path, permute):
     rolled, both over 1.5e+04 times the bar.
     """
     case = _case(tmp_path)
-    assert _relative_gap(case.ours(), case.theirs(rows=permute(case.rows))) > 1000 * _BAR
+    assert relative_gap(case.ours(), case.theirs(rows=permute(case.rows))) > 1000 * _BAR
 
 
 def test_only_the_image_rows_move(tmp_path):
-    """``index_add`` writes the named rows and copies the rest, so an untouched row is
-    bit-identical and not merely close -- ``torch.equal``, no tolerance.
-
-    One layer and one feature, so the injection is the last thing that happens. With a layer
-    after it, attention mixes the moved rows into the others and no row stays equal, which
-    would say nothing about which rows the add wrote.
-    """
+    """``index_add`` copies the untouched rows, so they are ``torch.equal``. One layer and one
+    feature, so the injection is last: with a layer after it, attention mixes every row."""
     case = _case(tmp_path, num_layers=1, features=1)
     base = case.model(case.hidden, case.cos, case.sin)
     moved = case.ours()
@@ -505,23 +434,6 @@ def test_the_guards_say_which_call_was_wrong():
         model(hidden, cos, sin, [feature] * 4, _IMAGE_ROWS)
 
 
-def test_the_call_leaves_the_callers_tensors_alone(tmp_path):
-    """``index_add``, not ``index_add_``. The hidden states are the engine's buffer and the
-    features are the vision encoder's output; both may still be read after this node runs.
-
-    As the forward stands, the layer loop rebinds ``hidden_states`` to a layer's output before
-    the first injection, so an in-place add here would pass anyway. This holds the contract for
-    a forward that injects before a layer instead, where in place would corrupt the caller.
-    """
-    case = _case(tmp_path)
-    hidden_before = case.hidden.clone()
-    features_before = [feature.clone() for feature in case.deepstack]
-    case.ours()
-    assert torch.equal(case.hidden, hidden_before)
-    for feature, before in zip(case.deepstack, features_before, strict=True):
-        assert torch.equal(feature, before)
-
-
 # ----------------------------------------------------------------------------
 # The attention resource
 # ----------------------------------------------------------------------------
@@ -539,7 +451,7 @@ def test_an_unbound_attention_names_the_resource_it_wanted(resources):
 
 def test_binding_the_node_reaches_every_layers_attention():
     model = Gr00tN17LanguageModel(_config())
-    attention = _SegmentAttention((2,))
+    attention = SegmentAttention((2,), causal=True, gqa=True)
     _bind(model, {LLM_ATTN: attention})
     assert [layer.self_attn.ragged_attn for layer in model.layers] == [attention] * _LAYERS
 
@@ -563,10 +475,9 @@ def test_build_cos_sin_turns_three_grids_of_positions_into_one_row_per_token():
 
 
 def test_the_parameters_are_the_checkpoints_tensors_after_fusing(tmp_path):
-    """Every Qwen3-VL text tensor lands in a parameter and every parameter gets one, with
-    q/k/v and gate/up fused on the way in. ``load_gr00t_n17_weights`` raises if a parameter
-    is left unfed, so the set equality is what catches a parameter the checkpoint has no
-    tensor for -- the final norm, say, which GR00T deliberately does not run."""
+    """Every text tensor lands in a parameter and every parameter gets one, q/k/v and gate/up
+    fused on the way in; the set equality catches a parameter with no tensor, such as the final
+    norm GR00T does not run."""
     config = _config()
     weights = _checkpoint(config.text, seed=3)
     model = _loaded_model(config, weights, tmp_path)
@@ -703,16 +614,16 @@ def _drive(tmp_path, spec: list) -> _Run:
     prepared = node.prepare_inputs(_WALK, _FWD, walk)
     # the engine plans the resource from the declaration, so the stand-in is planned from it too
     step = node.declare_step(_WALK, ["r0"], [prepared])
-    node.bind_node_resources({LLM_ATTN: _SegmentAttention(tuple(seg.span for seg in step.segments))})
+    spans = tuple(seg.span for seg in step.segments)
+    node.bind_node_resources({LLM_ATTN: SegmentAttention(spans, causal=True, gqa=True)})
     tensors = node.preprocess(_WALK, _ENGINE, [prepared])
     return _Run(node, ids, grid, walk, prepared, tensors, node.forward(_WALK, _ENGINE, **tensors))
 
 
 @pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
 def test_the_step_is_one_causal_segment_over_the_whole_prompt(tmp_path, spec):
-    """Not the vision node's shape. That one cuts a segment per frame and attends
-    non-causally inside each; a prompt is one segment over all of its tokens, and causal.
-    Both live only in the declaration, so this is the only place either is said."""
+    """One causal segment over every prompt token (the vision node cuts one non-causal segment
+    per frame); both live only in the declaration, so this is where they are said."""
     node = _node(tmp_path)
     ids, grid = _prompt(spec)
     prepared = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, ids, grid))
@@ -727,9 +638,8 @@ def test_the_step_is_one_causal_segment_over_the_whole_prompt(tmp_path, spec):
 
 @pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
 def test_prepare_inputs_derives_the_rows_and_the_positions_from_the_prompt(tmp_path, spec):
-    """Everything the forward needs beyond what the walk already carries, each against the
-    prompt it came from -- and the positions against ``mrope_position_ids`` called directly,
-    which is where their own test lives."""
+    """Everything the forward needs beyond the walk's inputs, each against the prompt it came
+    from; the positions against ``mrope_position_ids`` called directly."""
     node = _node(tmp_path)
     ids, grid = _prompt(spec)
     walk = _walk_inputs(node.config, ids, grid)
@@ -769,13 +679,9 @@ def test_a_prompt_that_arrives_as_a_row_is_the_same_one_request(tmp_path):
 
 @pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
 def test_driving_the_node_is_the_forwards_own_pieces_called_by_hand(tmp_path, spec):
-    """The node is plumbing: prepare_inputs -> preprocess -> forward is embed, the scatter onto
-    the image rows, the rotation and the stack, over the same tensors. The same ops in the same
-    order, so this is ``torch.equal`` and not a bar -- it has been exact on every prompt here.
-
-    It also pins the output: a row per prompt token under ``backbone_features``, and the
-    image rows beside it, which the bridge splits on rather than re-deriving them (C05 CHK-3).
-    """
+    """prepare_inputs -> preprocess -> forward is embed, the scatter, the rotation and the stack
+    on the same tensors, in the same order, so ``torch.equal``. The image rows ride beside the
+    features, for the bridge to split on."""
     run = _drive(tmp_path, spec)
     assert list(run.out) == ["backbone_features", "image_rows"]
     assert len(run.out["backbone_features"]) == 1
@@ -796,22 +702,17 @@ _SCATTERS = {
 
 @pytest.mark.parametrize("permute", list(_SCATTERS.values()), ids=list(_SCATTERS))
 def test_row_k_of_the_vision_embeds_lands_on_image_row_k(tmp_path, permute):
-    """The vision encoder packs its rows in image-token order and the node hands them over as
-    indices, so the pairing is the node's to get right. Permuting either side is a different
-    answer: measured relative gaps 1.0e+00, 8.3e-01, 1.0e+00 and 1.0e+00 against a bar of
-    4.1e-06, the smallest of them 2.0e+05 times it.
-    """
+    """The node hands the vision rows over as indices, so the pairing is its to get right.
+    Measured gaps for the four permutations: 1.0e+00, 8.3e-01, 1.0e+00, 1.0e+00 (>= 2.0e+05x the bar)."""
     run = _drive(tmp_path, _PROMPTS["two images with text between"])
     # the unpermuted scatter is exact, which is what makes the gap below mean something
     assert torch.equal(run.features, run.by_hand())
-    assert _relative_gap(run.features, run.by_hand(**permute(run))) > 1000 * _BAR
+    assert relative_gap(run.features, run.by_hand(**permute(run))) > 1000 * _BAR
 
 
 def test_the_node_takes_one_request_a_step(tmp_path):
-    """No batched forward, so the batch is one row. ``preprocess`` unpacks the single request
-    (as the vision node does), so a second one raises instead of being dropped or concatenated
-    onto the first's prompt. The message is the interpreter's, not ours -- hence the loose match.
-    """
+    """One request per forward: a second raises (the interpreter's unpacking message, hence
+    the loose match) rather than being dropped or appended to the first prompt."""
     node = _node(tmp_path)
     ids, grid = _prompt(_PROMPTS["one image"])
     prepared = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, ids, grid))

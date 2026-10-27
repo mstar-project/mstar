@@ -42,3 +42,7 @@ class SegmentAttention:
             )
             start += span
         return torch.cat(out)
+
+
+def relative_gap(ours: torch.Tensor, theirs: torch.Tensor) -> float:
+    return ((ours - theirs).abs().max() / theirs.abs().max()).item()
