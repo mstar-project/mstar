@@ -4,6 +4,8 @@ from mstar.model.base import Model
 
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
+    "canary": ("mstar.model.canary.canary_model", "CanaryModel"),
+    "canary_qwen": ("mstar.model.canary_qwen.canary_qwen_model", "CanaryQwenModel"),
     "chatterbox": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_multilingual": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_turbo": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
@@ -47,6 +49,12 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
+    # NVIDIA Canary-1B-v2: FastConformer encoder + Transformer decoder, speech
+    # recognition in 25 European languages and translation to/from English.
+    "canary": {"model_path_hf": "nvidia/canary-1b-v2"},
+    # NVIDIA Canary-Qwen-2.5B: Canary's FastConformer encoder feeding a
+    # LoRA-adapted Qwen3-1.7B (NeMo SALM); English speech recognition.
+    "canary_qwen": {"model_path_hf": "nvidia/canary-qwen-2.5b"},
     # Resemble AI Chatterbox: Llama-520M T3 speech-token LM + S3Gen flow
     # matching decoder + HiFT vocoder, zero-shot voice cloning with CFG and
     # exaggeration control. The Turbo checkpoint is a GPT-2-medium T3 with a

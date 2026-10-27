@@ -80,9 +80,9 @@ def test_released_slots_are_zeroed_and_forks_copy():
     assert pool.block("state", 2).abs().sum() == 0
 
 
-def test_gather_and_scatter_address_the_steps_rows():
-    """A forward reads and writes its rows' slots through the step's addressing, per slot or
-    per layer, and a padding row reaches only the sink."""
+def test_gather_and_scatter_take_no_layer_for_a_per_slot_block():
+    """gather / scatter_ address a per-slot block with ``layer_idx=None`` and a per-layer one
+    with its layer, through the step's plan; each refuses the other's form."""
     pool = build_pool()
     step = RecurrentStep(segments=[Segment("a", "main", 2), Segment("b", "main", 1)])
     for rid in ("a", "b"):
@@ -90,16 +90,24 @@ def test_gather_and_scatter_address_the_steps_rows():
     ctx = StepContext(request_ids=("a", "b"), graph_walk="prefill", slot=0, capture=False)
     assert pool.admit(step, ctx).ok
     pool.plan(step, ctx)
-    rows = pool.addressing()
-    pool.scatter_("count", rows, torch.tensor([[3], [5]]))
+    pool.scatter_("count", torch.tensor([[3], [5]]), None)
     assert int(pool.block("count")[slot_of(pool, "a")]) == 3
     assert int(pool.block("count")[slot_of(pool, "b")]) == 5
-    assert pool.gather("count", rows).tolist() == [[3], [5]]
-    pool.scatter_("state", rows, torch.ones(2, 2, 4), layer_idx=1)
-    assert pool.gather("state", rows, layer_idx=1).sum() == 16
-    assert pool.block("state", 0).abs().sum() == 0
+    pool.scatter_("state", torch.ones(2, 2, 4), layer_idx=1)
+    assert pool.block("state", 1).sum() == 16 and pool.block("state", 0).abs().sum() == 0
     with pytest.raises(ValueError, match="per layer"):
-        pool.gather("state", rows)
+        pool.gather("state", None)
+    with pytest.raises(ValueError, match="per slot"):
+        pool.gather("count")
+    pool.commit(step, ctx)
+
+    # the next step's rows have saved state, so gather reads back what scatter_ wrote
+    step = RecurrentStep(segments=[Segment("a", "main", 1), Segment("b", "main", 1)])
+    ctx = StepContext(request_ids=("a", "b"), graph_walk="decode", slot=0, capture=False)
+    assert pool.admit(step, ctx).ok
+    pool.plan(step, ctx)
+    assert pool.gather("count", None).tolist() == [[3], [5]]
+    assert pool.gather("state", layer_idx=1).sum() == 16
     pool.commit(step, ctx)
 
 

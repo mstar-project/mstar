@@ -1117,6 +1117,99 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
     return language, segments, parts, start is not None
 
 
+def _untimed_transcription_kwargs(req: TranscriptionRequest, model: str, *, translates: bool = False) -> dict:
+    """``model_kwargs`` for a model that takes no conditioning text and emits
+    no timestamps: the OpenAI ``prompt`` is dropped, granularities refused.
+    Whisper's ``task`` is the caller's to read when the model ``translates``;
+    otherwise anything but ``transcribe`` is refused, not silently ignored."""
+    mk = _transcription_kwargs(req)
+    mk.pop("initial_prompt", None)
+    if req.timestamp_granularities:
+        raise ValueError(f"{model} does not produce timestamps; leave timestamp_granularities unset")
+    mk.pop("timestamps", None)
+    if not translates:
+        task = mk.pop("task", None)
+        if task not in (None, "transcribe"):
+            raise ValueError(f"{model} only transcribes; task must be 'transcribe'; got {task!r}")
+    return mk
+
+
+class _UntimedTranscriptionAdapter(OpenAIAdapter):
+    """The FastConformer ASR models' adapters: plain text, which a
+    SentencePiece vocabulary starts with a space."""
+
+    # greedy, unconditioned windows: a retry could only swap a correct
+    # transcript for a sampled one
+    compression_ratio_threshold = None
+
+    def stream_text(self, raw: str) -> str:
+        # parse_transcript strips the text, so the deltas drop the leading
+        # space too; lstrip keeps a growing stream growing
+        return raw.lstrip()
+
+
+class CanaryAdapter(_UntimedTranscriptionAdapter):
+    """NVIDIA Canary: speech recognition, and translation to or from English.
+
+    ``language`` is the speech's language (English by default); an
+    ``extra_body`` ``target_language`` other than it asks for a translation.
+    The decoder takes no free-text conditioning and emits no timestamps, so
+    ``prompt`` is dropped and timestamp granularities are refused.
+    """
+
+    supports_transcriptions = True
+    # Canary was trained on clips of up to 40 s; windows don't condition on
+    # each other, so they run in parallel
+    max_audio_seconds = 40.0
+    long_form = "parallel"
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        from mstar.model.canary.config import check_task
+
+        mk = _untimed_transcription_kwargs(req, "Canary", translates=True)
+        # Whisper's convention: translate means into English
+        task = mk.pop("task", None)
+        if task not in (None, "transcribe", "translate"):
+            raise ValueError(f"task must be 'transcribe' or 'translate'; got {task!r}")
+        source = mk.get("language") or "en"
+        target = mk.get("target_language") or ("en" if task == "translate" else source)
+        mk["language"], mk["target_language"] = check_task(source, target)
+        if not isinstance(mk.get("punctuation", True), bool):
+            raise ValueError(f"punctuation must be true or false; got {mk['punctuation']!r}")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
+class CanaryQwenAdapter(_UntimedTranscriptionAdapter):
+    """NVIDIA Canary-Qwen: English speech recognition by an LLM, under its
+    trained instruction. OpenAI's ``prompt`` is context for the transcript
+    (and carries the previous window in sequential long form), which this
+    model was not trained to take, so it is dropped; no timestamps."""
+
+    supports_transcriptions = True
+    max_audio_seconds = 40.0
+    long_form = "parallel"
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        from mstar.model.utils import base_language
+
+        mk = _untimed_transcription_kwargs(req, "Canary-Qwen")
+        if base_language(mk.get("language") or "en") != "en":
+            raise ValueError("Canary-Qwen transcribes English only")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 class HiggsAudioAdapter(OpenAIAdapter):
     """Higgs-Audio v3 STT: an instruction-following LLM decoder, so the OpenAI
     ``prompt`` is the transcription instruction (the model has a default)."""
@@ -1267,8 +1360,8 @@ class OmnilingualASRAdapter(OpenAIAdapter):
     ``window_seconds`` in extra_body (5 to 40) sets both lengths for one
     request. ``language``, ``prompt`` and ``temperature`` have no
     effect (argmax CTC decoding has nothing to condition or sample). There
-    are no timestamps: ``srt`` / ``vtt`` get one cue spanning the file and
-    ``verbose_json`` an empty segment list.
+    are no timestamps: each window with text is one segment spanning it, so
+    ``srt`` / ``vtt`` get one cue and ``verbose_json`` one segment per window.
     """
 
     supports_transcriptions = True
@@ -1321,6 +1414,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "wan22": Wan22Adapter(),
     "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
+    "canary": CanaryAdapter(),
+    "canary_qwen": CanaryQwenAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
     "omnilingual_asr_ctc_300m": OmnilingualASRAdapter(),
     "omnilingual_asr_ctc_1b": OmnilingualASRAdapter(),
