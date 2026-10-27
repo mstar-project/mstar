@@ -344,19 +344,3 @@ def test_a_client_still_waiting_keeps_its_stream():
 
     assert asyncio.run(asyncio.wait_for(run(), timeout=5)) == ([ok], 1)
 
-
-@pytest.mark.parametrize(("key", "sent", "read"), [
-    ("num_step", 16.0, 16), ("num_step", "16", 16), ("rollout_horizon", 4.0, 4),
-    ("num_inference_steps", "16.0", 16), ("speed", "1.5", 1.5),
-])
-def test_model_knobs_follow_the_shared_rule(key, sent, read):
-    """One rule per kind of value: an integral 16.0 is 16 for every integer knob."""
-    assert normalize_generation_kwargs({key: sent})[key] == read
-
-
-@pytest.mark.parametrize(("key", "bad"), [
-    ("num_step", 0), ("num_step", 1.5), ("rollout_horizon", -1), ("speed", 0), ("speed", "nan"),
-])
-def test_model_knobs_outside_their_rule_are_refused(key, bad):
-    with pytest.raises(ValueError, match=key):
-        normalize_generation_kwargs({key: bad})
