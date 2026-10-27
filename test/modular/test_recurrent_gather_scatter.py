@@ -98,6 +98,24 @@ def test_round_trip_and_a_shorter_step_reads_only_its_rows():
     assert rows.has_state[: rows.num_rows].tolist() == [True, True]
 
 
+def test_each_step_scatters_to_its_own_rows():
+    """Consecutive steps on the same buffers (eager, and one replay bucket) with
+    different rows each write their own slots, not the previous step's."""
+    for steps in (
+        [eager(["a", "b"]), eager(["c"]), eager(["b", "d", "a"])],
+        [replay(["a", "b"], bs=4), replay(["c"], bs=4), replay(["b", "d", "a"], bs=4)],
+    ):
+        pool = build_pool()
+        for n, (step, ctx) in enumerate(steps):
+            plan(pool, step, ctx)
+            rows = pool.addressing("main").num_rows
+            value = torch.full((rows, *SHAPE), float(n + 1))
+            pool.scatter_("h", value, layer_idx=1)
+            for rid in (seg.request_id for seg in step.segments if seg.request_id in "abcd"):
+                assert bool((pool.block("h", 1)[slot_of(pool, rid)] == n + 1).all()), (n, rid)
+            pool.commit(step, ctx)
+
+
 def test_replay_addressing_matches_eager():
     """The same forward on the same requests, once eagerly and once through a
     bucket of 4 with padding rows, leaves the real slots identical; the replay

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -64,6 +64,8 @@ class RecurrentAddressing:
     # kernels by them must not read the device copies back
     host_slot_indices: Sequence[int] | None = None
     host_has_state: Sequence[bool] | None = None
+    # scatter_'s int64 copy of slot_indices, keyed by whether a graph capture made it
+    scatter_index: dict[bool, torch.Tensor] = field(default_factory=dict, compare=False, repr=False)
 
 
 class RecurrentStatePool(Resource):
@@ -155,7 +157,7 @@ class RecurrentStatePool(Resource):
         if self.config.disable_sink_slot:
             self._need_sink("gather")
         rows = self.addressing(label)
-        out = self._blocks[name][layer_idx].index_select(0, rows.slot_indices[: rows.num_rows].long())
+        out = self._blocks[name][layer_idx].index_select(0, rows.slot_indices[: rows.num_rows])
         fresh = ~rows.has_state[: rows.num_rows].view(-1, *(1,) * (out.dim() - 1))
         return torch.where(fresh, 0 if start is None else start, out)
 
@@ -171,7 +173,13 @@ class RecurrentStatePool(Resource):
                 f"recurrent state pool {self._name!r} label {label!r}: {value.shape[0]} rows "
                 f"for a step that declared {rows.num_rows}"
             )
-        self._blocks[name][layer_idx].index_copy_(0, rows.slot_indices[: rows.num_rows].long(), value)
+        # index_copy_ needs int64: cast once per step, not per block and layer. A capture
+        # records its own cast, so a replay recomputes it from that replay's plan.
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        index = rows.scatter_index.get(capturing)
+        if index is None:
+            index = rows.scatter_index[capturing] = rows.slot_indices[: rows.num_rows].long()
+        self._blocks[name][layer_idx].index_copy_(0, index, value)
 
     def _need_sink(self, op: str) -> None:
         # Without a sink, rows with no slot address NO_SLOT, which index_select
