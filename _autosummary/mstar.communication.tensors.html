@@ -1879,19 +1879,24 @@ other requests’ tensors are registered all the same.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.set_output_ref_counts">
-<span class="sig-name descname"><span class="pre">set_output_ref_counts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">safety_hold_uuids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">routed_edges</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.set_output_ref_counts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.set_output_ref_counts" title="Link to this definition">#</a></dt>
-<dd><p>Adjust ref counts from the safety hold (1) to the actual fanout.</p>
+<span class="sig-name descname"><span class="pre">set_output_ref_counts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">safety_hold_uuids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">routed_edges</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transferred_refs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.set_output_ref_counts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.set_output_ref_counts" title="Link to this definition">#</a></dt>
+<dd><p>Replace producer and completed-loop cache holds with actual fanout.</p>
 <p>Called after <code class="docutils literal notranslate"><span class="pre">process_node_outputs</span></code> determines the real routing.
 <code class="docutils literal notranslate"><span class="pre">safety_hold_uuids</span></code> is the set of UUIDs that were given ref=1 by
 <code class="docutils literal notranslate"><span class="pre">increment_ref_batch_uniform</span></code> after
 <code class="docutils literal notranslate"><span class="pre">store_and_return_tensor_info_batch</span></code>.
 <code class="docutils literal notranslate"><span class="pre">routed_edges</span></code> is the flat list of all edges that will actually be
-consumed (local ingestion, remote send, persist, emit, streaming).</p>
+consumed (local ingestion, remote send, emit, streaming). Persist
+markers must already be set; persistence itself is not a counted read.
+<code class="docutils literal notranslate"><span class="pre">transferred_refs</span></code> lists cache holds relinquished by finished loops,
+including repeated UUIDs held by multiple nested loops. Keep these
+holds alive until routing and persist marking have finished.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>safety_hold_uuids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 <li><p><strong>routed_edges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a><em>]</em>)</p></li>
+<li><p><strong>transferred_refs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>

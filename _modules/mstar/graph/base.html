@@ -1072,7 +1072,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">output_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="c1"># loop-back (name, dest) pairs the caller must NOT route; the loop has finished so</span>
     <span class="c1"># we do not want the loop-back signals to propagate</span>
-    <span class="n">filtered_signals</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="n">NameAndDest</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span></div>
+    <span class="n">filtered_signals</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="n">NameAndDest</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
+    <span class="c1"># Cache holds relinquished by finished loops, settled AFTER routing/persist.</span>
+    <span class="c1"># A list preserves multiplicity when nested loops hold the same UUID.</span>
+    <span class="n">transferred_refs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
 
 
 
@@ -1649,14 +1652,22 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># (the parent reads them off ``managed_entities``) already filtered</span>
             <span class="c1"># by its loop-back, so they are not added again here; the</span>
             <span class="c1"># accumulated ones are disjoint by name and ride separately.</span>
-            <span class="n">outer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_managing_registry</span><span class="o">.</span><span class="n">mark_entity_complete</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
-
-            <span class="c1"># Don't dereference, becaue the tensors will be used downstream</span>
+            <span class="n">transferred</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">uuid</span>
+                <span class="k">for</span> <span class="n">cache</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_cached_outputs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">infos</span> <span class="ow">in</span> <span class="n">cache</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">infos</span>
+            <span class="p">]</span>
+            <span class="c1"># Detach before cascading: a finishing parent clears its children,</span>
+            <span class="c1"># which would otherwise release these same accumulated holds again.</span>
+            <span class="c1"># The descriptors on our output edges keep the lists; the reference</span>
+            <span class="c1"># holds stay alive until routing has established consumer ownership.</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_cached_outputs</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+            <span class="n">outer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_managing_registry</span><span class="o">.</span><span class="n">mark_entity_complete</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">NodeCompletionOutput</span><span class="p">(</span>
                 <span class="n">output_edges</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">outer</span><span class="o">.</span><span class="n">output_edges</span><span class="p">)</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accumulated_outputs</span><span class="p">,</span>
                 <span class="n">filtered_signals</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_loop_back_inputs</span> <span class="o">|</span> <span class="n">outer</span><span class="o">.</span><span class="n">filtered_signals</span><span class="p">,</span>
+                <span class="n">transferred_refs</span><span class="o">=</span><span class="n">transferred</span> <span class="o">+</span> <span class="n">outer</span><span class="o">.</span><span class="n">transferred_refs</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_advance_one_iter</span><span class="p">()</span>
@@ -1875,6 +1886,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_done</span><span class="p">:</span>
             <span class="n">loop_out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">complete_iter</span><span class="p">()</span>
             <span class="n">output</span><span class="o">.</span><span class="n">filtered_signals</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">loop_out</span><span class="o">.</span><span class="n">filtered_signals</span><span class="p">)</span>
+            <span class="n">output</span><span class="o">.</span><span class="n">transferred_refs</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">loop_out</span><span class="o">.</span><span class="n">transferred_refs</span><span class="p">)</span>
             <span class="c1"># strip loop-back edges from this entity's raw outputs, then append the</span>
             <span class="c1"># loop's declared outputs (either the external outputs if done, or the</span>
             <span class="c1"># re-injected external inputs if advancing to the next iteration)</span>

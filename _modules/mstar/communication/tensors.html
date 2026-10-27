@@ -2394,28 +2394,37 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">safety_hold_uuids</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
         <span class="n">routed_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
+        <span class="n">transferred_refs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
     <span class="p">):</span>
-<span class="w">        </span><span class="sd">"""Adjust ref counts from the safety hold (1) to the actual fanout.</span>
+<span class="w">        </span><span class="sd">"""Replace producer and completed-loop cache holds with actual fanout.</span>
 
 <span class="sd">        Called after ``process_node_outputs`` determines the real routing.</span>
 <span class="sd">        ``safety_hold_uuids`` is the set of UUIDs that were given ref=1 by</span>
 <span class="sd">        ``increment_ref_batch_uniform`` after</span>
 <span class="sd">        ``store_and_return_tensor_info_batch``.</span>
 <span class="sd">        ``routed_edges`` is the flat list of all edges that will actually be</span>
-<span class="sd">        consumed (local ingestion, remote send, persist, emit, streaming).</span>
+<span class="sd">        consumed (local ingestion, remote send, emit, streaming). Persist</span>
+<span class="sd">        markers must already be set; persistence itself is not a counted read.</span>
+<span class="sd">        ``transferred_refs`` lists cache holds relinquished by finished loops,</span>
+<span class="sd">        including repeated UUIDs held by multiple nested loops. Keep these</span>
+<span class="sd">        holds alive until routing and persist marking have finished.</span>
 <span class="sd">        """</span>
-        <span class="n">actual_counts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="n">uuid</span><span class="p">:</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">safety_hold_uuids</span><span class="p">}</span>
+        <span class="c1"># Each tensor's change: minus its holds (the producer's safety hold,</span>
+        <span class="c1"># plus every loop hold handed over), plus one per routed reader. Older</span>
+        <span class="c1"># accumulated tensors are included even if this pass minted none.</span>
+        <span class="n">deltas</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">dict</span><span class="o">.</span><span class="n">fromkeys</span><span class="p">(</span><span class="n">safety_hold_uuids</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">transferred_refs</span><span class="p">:</span>
+            <span class="n">deltas</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">deltas</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span>
         <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">routed_edges</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span> <span class="ow">in</span> <span class="n">actual_counts</span><span class="p">:</span>
-                    <span class="n">actual_counts</span><span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
+                <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span> <span class="ow">in</span> <span class="n">deltas</span><span class="p">:</span>
+                    <span class="n">deltas</span><span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span>
 
         <span class="n">up_uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">up_counts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">down_uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">down_counts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">for</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">count</span> <span class="ow">in</span> <span class="n">actual_counts</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="n">delta</span> <span class="o">=</span> <span class="n">count</span> <span class="o">-</span> <span class="mi">1</span>  <span class="c1"># subtract the safety hold of 1</span>
+        <span class="k">for</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">delta</span> <span class="ow">in</span> <span class="n">deltas</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">delta</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="n">up_uuids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
                 <span class="n">up_counts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">delta</span><span class="p">)</span>
