@@ -131,6 +131,7 @@ class LTX25Model(Model):
         max_batch_size: int = 4,
         vae_tile_min_pixels: int = 1280 * 720,
         vae_compile: bool = False,
+        vae_compile_shapes: list[list[float]] | None = None,
         max_video_tokens: int = 64 * 1024,
         async_scheduling: bool = True,
         **kwargs,
@@ -158,9 +159,15 @@ class LTX25Model(Model):
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2])]
         self.max_batch_size = int(max_batch_size)
         self.vae_tile_min_pixels = int(vae_tile_min_pixels)
-        # compile the video VAE decode for the capture and refine shapes (warmed at load);
-        # ~55 dB from the eager decode, so off for bit-exact output
+        # compile the video VAE decode, warmed at load for vae_compile_shapes (by default the
+        # capture and refine shapes); ~55 dB from the eager decode, so off for bit-exact output
         self.vae_compile = bool(vae_compile)
+        # separate from the DiT's captures: the decoder may sit on a rank with room to warm a
+        # shape the DiT's ranks leave uncaptured
+        self.vae_compile_shapes = (
+            None if vae_compile_shapes is None
+            else [(int(h), int(w), int(f), float(fps)) for h, w, f, fps in vae_compile_shapes]
+        )
         # Largest latent grid (frames x rows x columns) a request may ask for; the DiT's
         # self-attention is quadratic in it, so an unbounded request could hold a worker
         # for minutes. 64k tokens is ~2x the 1080p, 121-frame grid.
@@ -536,11 +543,14 @@ class LTX25Model(Model):
         ]
 
     def _decode_shapes(self) -> list[LTXShape]:
-        """The video shapes a request decodes at: the single-stage captures and the refine
-        walk's final size."""
+        """The video shapes the compiled decoder is warmed for: ``vae_compile_shapes``, or by
+        default the single-stage captures and the refine walk's final size."""
+        shapes = self.vae_compile_shapes
+        if shapes is None:
+            shapes = self.capture_shapes + self.capture_refine_shapes
         return [
             shape_from_metadata(self.config, {"height": h, "width": w, "num_frames": f, "fps": fps})
-            for h, w, f, fps in dict.fromkeys(self.capture_shapes + self.capture_refine_shapes)
+            for h, w, f, fps in dict.fromkeys(shapes)
         ]
 
     def get_default_sharding_config(self) -> ShardingConfig:

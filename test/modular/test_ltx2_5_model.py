@@ -471,6 +471,21 @@ def test_toy_dit_forward_shapes_and_row_independence():
     assert torch.isfinite(video).all() and torch.isfinite(audio).all()
 
 
+def test_vae_compile_shapes_are_independent_of_the_dit_captures():
+    """The decoder warms the capture and refine shapes by default, and vae_compile_shapes
+    alone when given (the SP2 config warms the 1088x1920 decode it never captures)."""
+    def sizes(model):
+        return [(s.height, s.width, s.frames) for s in model._decode_shapes()]
+
+    model = _make_model(capture_shapes=[[544, 960, 121, 24]], capture_refine_shapes=[[1088, 1920, 121, 24]])
+    assert sizes(model) == [(17, 30, 16), (34, 60, 16)]
+    model = _make_model(capture_shapes=[[544, 960, 121, 24]], capture_refine_shapes=[],
+                        vae_compile_shapes=[[544, 960, 121, 24], [1088, 1920, 121, 24]])
+    assert model.capture_buckets() == [(GENERATE_AV_WALK, model._decode_shapes()[0])]
+    assert sizes(model) == [(17, 30, 16), (34, 60, 16)]
+    assert sizes(_make_model(vae_compile_shapes=[])) == []
+
+
 def test_warmed_vae_decoder_compiles_only_warmed_shapes():
     """vae_compile: the decoder runs compiled (on its channels_last copy) for the shapes
     seen while warming, a tiled decode's tiles included, and eager for any other."""
