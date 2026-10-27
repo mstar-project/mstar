@@ -1167,13 +1167,14 @@ class PythonGraphRuntime(GraphRuntime):
             for (wkr, wkr_edge) in fanout.items():
                 streaming_to_workers.setdefault(wkr, []).append(wkr_edge)
 
-        logger.debug(
-            ("Finished processing outputs from rid %s. \n"
-             "Routed to this worker: %s; sent to others: %s; persist signals: %s; streaming: %d"),
-            rid, format_graph_edge_list(routed_to_this_worker),
-            format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
-            len(streaming_edges),
-        )
+        if logger.isEnabledFor(logging.DEBUG):  # three edge lists per routed rid
+            logger.debug(
+                ("Finished processing outputs from rid %s. \n"
+                 "Routed to this worker: %s; sent to others: %s; persist signals: %s; streaming: %d"),
+                rid, format_graph_edge_list(routed_to_this_worker),
+                format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
+                len(streaming_edges),
+            )
         if completed_worker_graph_ids:
             logger.debug("Completed %d worker graphs", len(completed_worker_graph_ids))
 

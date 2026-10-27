@@ -1175,10 +1175,11 @@ class Worker:
         # producer's segment may be unlinked once every reader ACKs READS_DONE.
         if body.request_id in self._draining_rids:
             return
-        logger.debug(
-            "Received new signals %s at worker %s for request %s",
-            format_graph_edge_list(body.inputs), self.worker_id, body.request_id
-        )
+        if logger.isEnabledFor(logging.DEBUG):  # the edge list is formatted per message
+            logger.debug(
+                "Received new signals %s at worker %s for request %s",
+                format_graph_edge_list(body.inputs), self.worker_id, body.request_id
+            )
         request_id = self._rid(body.request_id)
         if request_id is None:
             # _process_message_list parks or drops signals for an unknown
@@ -4786,7 +4787,7 @@ class Worker:
                 if batch is not None:
                     node_batch = self._build_executing_batch(batch)
                     batch_partition = self.request_state.get_partition_for_node(batch.node_name)
-                    logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
+                    logger.debug("Yield away: %s %s", batch.node_name, node_batch.request_ids)
                     speculation = Speculation(
                         scheduled_batch=batch,
                         node_batch=node_batch,
@@ -5340,7 +5341,7 @@ class Worker:
                 submitted_at = _time.perf_counter() if metrics is not None else 0.0
                 future = self._submit_gpu_step(gpu_executor, batch, node_batch, None)
                 self.wakeup_event.register_future(future)
-                logger.debug(f"Scheduling: {batch.node_name} {node_batch.request_ids}")
+                logger.debug("Scheduling: %s %s", batch.node_name, node_batch.request_ids)
                 _set_pending(PendingBatch(
                     batch=batch,
                     node_batch=node_batch,
