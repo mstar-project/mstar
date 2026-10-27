@@ -157,6 +157,9 @@ class ParakeetModel(Model):
         num_frames = model_kwargs.get(NUM_FRAMES)
         return {} if num_frames is None else {DECODE_LOOP: self.config.transducer.decode_iterations(num_frames)}
 
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
+
     def get_initial_forward_pass_args(
         self,
         partition_name: str,
