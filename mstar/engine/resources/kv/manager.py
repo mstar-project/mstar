@@ -2436,13 +2436,14 @@ class KVManager(AttentionResource):
         """The per-label row arrays of a cached plan, from its views (once,
         at the first hit)."""
         page_size = self.kv_cache.page_size
+        real_rows = cache.rows
         derived: dict[str, _LabelRows] = {}
         for label, views in cache.views.items():
             n_real = 0
             for v in views:
                 if not ctx.is_real_row(v.request_id) and v.request_id not in self._streams:
                     break
-                if not any(v.request_id == seg[0] and v.label == seg[1] for seg in cache.real_segments):
+                if (v.request_id, v.label) not in real_rows:
                     break
                 n_real += 1
             real, pad = views[:n_real], views[n_real:]
