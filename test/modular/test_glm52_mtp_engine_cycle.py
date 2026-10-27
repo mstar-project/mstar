@@ -36,7 +36,11 @@ def _force_cpu_flashinfer(monkeypatch):
 from request_walks import run_walks  # noqa: E402
 
 from mstar.engine.resources import AllocationFailed, StepContext  # noqa: E402
-from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
+from mstar.model.glm52._testing import (  # noqa: E402
+    build_cpu_resources,
+    install_cpu_rope,
+    per_request_outputs,
+)
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     KV_RESOURCE,
@@ -107,10 +111,11 @@ class _Driver:
             request_ids=rids, per_request_info=infos, resources=self.resources, step=step,
         )
         kw = self.sub.preprocess(walk, engine_inputs, inputs)
-        outs = self.sub.forward_batched(walk, engine_inputs, **kw)
+        raw = self.sub.forward_batched(walk, engine_inputs, **kw)
         self.runner.commit(step)
+        outs = per_request_outputs(raw, rids)
         unpacked = self.sub.unpack_packed_outputs(
-            static_output=outs, request_ids=rids,
+            static_output=raw, request_ids=rids,
             real_seq_lens=[inp.input_seq_len for inp in inputs], inputs=inputs,
             per_request_info=infos,
         )
