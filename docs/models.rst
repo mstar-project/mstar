@@ -254,6 +254,11 @@ FastConformer ASR (``canary``, ``canary_qwen``) notes
 - Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
   torchcodec, which needs FFmpeg.
 - One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.
+- Both run the FastConformer encoder ``nemotron_duplex`` streams
+  (``mstar/model/components/fastconformer.py``), over the whole clip. Canary reads its
+  dimensions from the HF ``encoder_config``; Canary-Qwen from NeMo's
+  ``perception.encoder`` (``FastConformerConfig.from_nemo``), which refuses an encoder
+  whose parts NeMo configures as partly causal.
 - Request fields, the same on ``/v1/audio/transcriptions`` and in ``/generate``'s
   ``model_kwargs``:
 
@@ -605,7 +610,11 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   streamed: each chunk runs the layers over its new frames only, against the
   call's cached last 70 frames, so a step costs the same however long the call
   is; it emits the frames no later audio can change, the last ones at the end
-  of input)
+  of input. It is the shared FastConformer, Canary's encoder, as a stream node
+  (``FastConformerStreamSubmodule``), with the featurizer of the VoiceChat
+  reference, which predates NeMo 2.5: reflected clip edges and
+  ``samples // 160 + 1`` mel frames. The checkpoint's RNN-T transcription head
+  is not loaded)
   → ``nano_llm`` (frame-synchronous decode loop: each step fuses one audio frame
   with the previous agent-text and tool-call tokens, emits one agent-text token)
   → ``eartts_talker`` (one text token → 31 RVQ codes, decoded by the RVQ codec
