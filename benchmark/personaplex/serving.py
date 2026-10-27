@@ -48,31 +48,33 @@ def holds_agent_frame(tensor):
 
 
 def verify_ownership_observations(rows, completed):
-    """Each decoder observation holds no agent frame and precedes its own request's hard cleanup.
+    """Each request's decoder steps end holding no agent frame, before its own hard cleanup.
 
-    Worker events carry the worker-local request handle, which is recycled across
-    requests, so a decoder observation is paired with the next hard cleanup of the
-    same handle in the same entity, not the first one ever recorded. Two decoder
-    observations of a handle with no cleanup between them mean it was reused early.
+    The decoder consumes a request's frames chunk by chunk, so after an earlier
+    chunk the LM's newest frame can still be in flight; only the last decoder
+    observation before the request's hard cleanup must hold none. Worker events
+    carry the worker-local request handle, which is recycled across requests, so
+    a handle's observations are grouped by the hard cleanups between them.
     """
     decoders = [r for r in rows if r["event"] == "after_decoder_inputs_consumed"]
     assert len(decoders) >= completed, f"Missing decoder observations: {len(decoders)} for {completed} completions"
-    held = [r["rid"] for r in decoders if any(holds_agent_frame(t) for t in r["tensors"])]
-    assert not held, f"Decoder observations still hold agent frames for handles {held}"
     entities = {r.get("entity") for r in decoders}
     timelines = {}
     for r in rows:
         if r["event"] in ("after_decoder_inputs_consumed", "before_hard_cleanup") and r.get("entity") in entities:
             timelines.setdefault((r.get("entity"), r["rid"]), []).append(r)
+    held = []
     for (entity, rid), events in timelines.items():
-        pending = False
+        last = None
         for event in sorted(events, key=lambda e: (e["time"], e["event"] == "before_hard_cleanup")):
-            if event["event"] == "before_hard_cleanup":
-                pending = False
+            if event["event"] == "after_decoder_inputs_consumed":
+                last = event
                 continue
-            assert not pending, f"Handle {rid} on {entity} observed twice without a hard cleanup between"
-            pending = True
-        assert not pending, f"Decoder observation for handle {rid} on {entity} has no later hard cleanup"
+            if last is not None and any(holds_agent_frame(t) for t in last["tensors"]):
+                held.append(rid)
+            last = None
+        assert last is None, f"Decoder observation for handle {rid} on {entity} has no later hard cleanup"
+    assert not held, f"Decoder observations still hold agent frames for handles {held}"
 
 
 def server_config(settings, root, max_batch_size):

@@ -242,9 +242,20 @@ def test_ownership_gate_pairs_recycled_handles_with_their_own_cleanup():
         _ownership("before_hard_cleanup", 0, 31),
     ]
     verify_ownership_observations(rows, completed=2)
-    reused = rows[:1] + [_ownership("after_decoder_inputs_consumed", 0, 10.5)] + rows[1:2]
-    with pytest.raises(AssertionError, match="observed twice without a hard cleanup"):
-        verify_ownership_observations(reused, completed=2)
+
+
+def test_ownership_gate_allows_frames_in_flight_until_the_last_decoder_step():
+    """A streamed request's earlier chunks leave the LM's newest frame in flight; its last must not."""
+    streaming = [
+        _ownership("after_decoder_inputs_consumed", 0, 10, [(1, 8, 16), (1, 8, 1)]),
+        _ownership("after_decoder_inputs_consumed", 0, 11, [(1, 8, 16), (1, 8, 1)]),
+        _ownership("after_decoder_inputs_consumed", 0, 12, [(1, 8, 16)]),
+        _ownership("before_hard_cleanup", 0, 13),
+    ]
+    verify_ownership_observations(streaming, completed=1)
+    leaked = streaming[:2] + streaming[3:]
+    with pytest.raises(AssertionError, match="still hold agent frames"):
+        verify_ownership_observations(leaked, completed=1)
 
 
 def test_ownership_gate_recognises_unnamed_agent_frames_by_shape():
