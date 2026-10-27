@@ -6,9 +6,12 @@ VAE decode. Oracle venv; see ``record_oracle.py`` for the numerics flags.
 
 Writes to ``<out-dir>/<case>/``: ``s1_*`` / ``s2_*`` DiT inputs and outputs per step,
 ``s1_latents_init.pt`` / ``s1_audio_init.pt``, the stage-1 outputs (``s1_out_video.pt``
-denormalized ``[1, 128, F, H, W]``, ``s1_out_audio.pt`` ``[1, 8, L, 16]``), the upsampler
-output ``upsampled.pt``, stage 2's noised starting latents ``s2_latents_init.pt`` /
-``s2_audio_init.pt``, and ``video.pt`` / ``audio_wave.pt`` / ``out.mp4``.
+denormalized ``[1, 128, F, H, W]``, ``s1_out_audio.pt`` ``[1, 8, L, 16]``), the same
+latents packed and still normalized (``s1_final_video.pt`` / ``s1_final_audio.pt``, the
+latent upsampler node's input), the upsampler output ``upsampled.pt``, stage 2's starting
+latents before the noise blend (``s2_seed_video.pt`` / ``s2_seed_audio.pt``, the node's
+output) and after it (``s2_latents_init.pt`` / ``s2_audio_init.pt``), and ``video.pt`` /
+``audio_wave.pt`` / ``out.mp4``.
 
     .venv-ltx-oracle/bin/python test/ltx2_5/record_oracle_two_stage.py --out-dir <dir> --snapshot <snap>
 """
@@ -82,11 +85,31 @@ def run(args):
         original = getattr(pipe, fn_name)
 
         def wrapped(*a, _original=original, _what=what, **kw):
+            stage["what"] = _what
             result = _original(*a, **kw)
             save(f"{stage['name']}_{_what}", result.cpu())
             return result
 
         setattr(pipe, fn_name, wrapped)
+
+    # The latent upsampler node's input and output: stage 1's final latents, packed and still
+    # normalized, and stage 2's starting latents before the noise blend.
+    for fn_name, name in (("_unpack_latents", "final_video"), ("_denormalize_audio_latents", "final_audio")):
+        original = getattr(pipe, fn_name)
+
+        def keep_input(latents, *a, _original=original, _name=name, **kw):
+            if stage["name"] == "s1":
+                save(f"s1_{_name}", latents.cpu())
+            return _original(latents, *a, **kw)
+
+        setattr(pipe, fn_name, keep_input)
+    noised_state = pipe._create_noised_state
+
+    def keep_seed(latents, *a, **kw):
+        save({"latents_init": "s2_seed_video", "audio_init": "s2_seed_audio"}[stage["what"]], latents.cpu())
+        return noised_state(latents, *a, **kw)
+
+    pipe._create_noised_state = keep_seed
 
     generator = torch.Generator("cpu").manual_seed(args.seed)
     shared = dict(

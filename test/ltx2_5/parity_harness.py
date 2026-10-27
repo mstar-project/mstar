@@ -218,46 +218,31 @@ def check_forced(device="cuda:0", attention="flashinfer", compile_transformer=Tr
 
 @torch.inference_mode()
 def check_two_stage_seed(device="cuda:0"):
-    """The two-stage recipe's hand-offs against the two-stage oracle: the latent
-    upsampler, and stage 2's starting latents (re-normalize, pack, generator replay,
-    sigma-0 noise blend)."""
-    from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video
-    from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
-
+    """The two-stage recipe's hand-offs against the two-stage oracle: the latent upsampler
+    node on stage 1's final latents (denormalize, upsample, re-normalize, pack), then stage
+    2's starting latents from its output (generator replay, sigma-0 noise blend)."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
-    from mstar.model.ltx2_5.submodules import (
-        REFINE_AUDIO,
-        REFINE_LATENTS,
-        LTXDenoiseSubmodule,
-        pack_audio,
-        pack_video,
-        shape_from_metadata,
-    )
+    from mstar.model.ltx2_5.config import UPSAMPLER_NODE
+    from mstar.model.ltx2_5.ltx2_5_model import LTX25Model
+    from mstar.model.ltx2_5.submodules import REFINE_AUDIO, REFINE_LATENTS, LTXDenoiseSubmodule, shape_from_metadata
 
     two = Path(str(ORACLE).replace("t2av", "two_stage"))
-    snapshot, config = snapshot_and_config()
-    up = LTX2LatentUpsamplerModel.from_pretrained(str(snapshot / "latent_upsampler"),
-                                                  torch_dtype=torch.bfloat16).to(device)
-    s1_video = torch.load(two / "s1_out_video.pt").to(device)
-    upsampled = up(s1_video.to(torch.bfloat16))
-    report("latent upsampler", upsampled, torch.load(two / "upsampled.pt"))
-
-    vae = AutoencoderKLLTX2Video.from_pretrained(str(snapshot / "vae"))
-    audio_vae = AutoencoderKLLTX2Audio.from_pretrained(str(snapshot / "audio_vae"))
-    ref_up = torch.load(two / "upsampled.pt").to(device)
-    mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(device, ref_up.dtype)
-    std = vae.latents_std.view(1, -1, 1, 1, 1).to(device, ref_up.dtype)
-    refine_video = pack_video((ref_up - mean) * vae.config.scaling_factor / std)[0]
-    s1_audio = torch.load(two / "s1_out_audio.pt").to(device)          # denormalized [1, 8, L, 16]
-    a_mean, a_std = audio_vae.latents_mean.to(device), audio_vae.latents_std.to(device)
-    refine_audio = ((pack_audio(s1_audio) - a_mean) / a_std)[0]
+    model = LTX25Model()
+    config = model.config
+    meta = {"height": 1088, "width": 1920, "num_frames": 121, "fps": 24.0}
+    up = model.get_submodule(UPSAMPLER_NODE, device).run_batch(
+        latents=torch.load(two / "s1_final_video.pt").to(device),
+        audio_latents=torch.load(two / "s1_final_audio.pt").to(device),
+        shape=shape_from_metadata(config, {**meta, "height": 544, "width": 960}),   # stage 1 runs at half size
+    )
+    report("latent upsampler video", up[REFINE_LATENTS], torch.load(two / "s2_seed_video.pt"))
+    report("latent upsampler audio", up[REFINE_AUDIO], torch.load(two / "s2_seed_audio.pt"))
 
     sub = LTXDenoiseSubmodule(torch.nn.Linear(1, 1).to(device), config, loop_name="denoise_loop",
                               use_ragged_attention=False, refine_walks=frozenset({"refine_av"}))
-    meta = {"height": 1088, "width": 1920, "num_frames": 121, "fps": 24.0}
     info = CurrentForwardPassInfo(request_id="r", graph_walk="refine_av", fwd_index=0, random_seed=0, max_tokens=0,
                                   step_metadata=meta)
-    seeds = sub.initial_loop_back(info, {REFINE_LATENTS: [refine_video], REFINE_AUDIO: [refine_audio]},
+    seeds = sub.initial_loop_back(info, {REFINE_LATENTS: [up[REFINE_LATENTS][0]], REFINE_AUDIO: [up[REFINE_AUDIO][0]]},
                                   shape_from_metadata(config, meta), torch.Generator().manual_seed(0))
     report("stage-2 starting video", seeds["latents"], torch.load(two / "s2_latents_init.pt")[0])
     report("stage-2 starting audio", seeds["audio_latents"], torch.load(two / "s2_audio_init.pt")[0])
