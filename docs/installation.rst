@@ -159,6 +159,12 @@ Model families and some output formats need extra packages, exposed as pip *extr
        package metadata allows ``m-star`` to be published on PyPI. **Also needs**
        ``flash-attn-4``, which is installed separately —
        see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_.
+   * - ``.[asr]``
+     - Speech recognition models: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``einops``, ``soundfile`` (WAV / FLAC / OGG / MP3 uploads), ``torchcodec``
+       (FFmpeg-backed decoding of the other formats), ``huggingface-hub``,
+       ``mooncake-transfer-engine``, and ``datasets`` / ``jiwer`` for
+       ``benchmark/asr_eval.py``.
    * - ``.[audio]``
      - ``soundfile`` — only needed to return **non-WAV** audio containers (mp3/flac/…)
        from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
