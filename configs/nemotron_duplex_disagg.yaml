@@ -15,7 +15,8 @@ model: "nemotron_duplex"
 max_seq_len: 12288
 
 # One recurrent slot per session (DEFAULT_MAMBA_SLOTS); past it the engine spins
-# on admit and wedges every session. Keep the two equal; the overflow queues.
+# on admit and wedges every session. Keep the two equal; a live call past the
+# cap gets a 503, and only one-shot requests queue.
 max_concurrent_requests: 32
 
 # A live call's input files over its whole life; past it the call ends with a
