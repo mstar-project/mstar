@@ -4,6 +4,8 @@ from uuid import uuid4
 
 import torch
 
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+
 
 @dataclass(frozen=True)
 class NodeAndGraphWalk:
@@ -722,6 +724,21 @@ def self_triggered(entity: "GraphNode | Loop") -> bool:
         node.consumes_stream and node.input_names <= node._streaming_inputs
         for node in entity.get_nodes().values()
     )
+
+
+def client_edges(section: GraphSection, in_loop: bool = False) -> list[tuple[GraphEdge, bool]]:
+    """Every edge of ``section`` that emits to the client, with whether it emits
+    on each iteration of a loop around it rather than once per run of the section.
+    A loop's own outputs leave once, when it finishes."""
+    if isinstance(section, GraphNode):
+        return [(edge, in_loop) for edge in section.outputs if edge.next_node == EMIT_TO_CLIENT]
+    if isinstance(section, Loop):
+        return client_edges(section.section, True) + [
+            (edge, in_loop) for edge in section.outputs + section.accumulated_outputs
+            if edge.next_node == EMIT_TO_CLIENT
+        ]
+    assert isinstance(section, Sequential) or isinstance(section, Parallel)
+    return [found for sub in section.sections for found in client_edges(sub, in_loop)]
 
 
 class GraphStateRegistry(ABC):

@@ -235,6 +235,18 @@ def test_an_emitted_signal_reaches_the_api_server(tmp_path):
     assert wgd.output_signal_names == ["out"]
 
 
+def test_an_emitted_tensor_names_the_walk_that_made_it(tmp_path):
+    """The API server's data worker picks the outputs it encodes on its pool by
+    the walk that made them, so the descriptor keeps it on the way there."""
+    mesh = _Mesh(tmp_path, outs=[("out", "emit_to_client", False)])
+    rid = mesh.admit()
+    _put(mesh, 1, _source_node_name="src", _source_graph_walk=WALK)
+    got = mesh.run(rid, uuids=[1])
+
+    (info,) = got["api_server"][0].body.graph_edge.tensor_info
+    assert (info._source_node_name, info._source_graph_walk) == ("src", WALK)
+
+
 def test_a_skipped_rid_sends_nothing(tmp_path):
     """A rid that failed after routing: no peer, client or conductor frame."""
     mesh = _Mesh(

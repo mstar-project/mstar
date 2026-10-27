@@ -9,13 +9,14 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property
+from typing import NamedTuple
 
 import torch
 
-from mstar.graph.base import TensorPointerInfo
+from mstar.graph.base import TensorPointerInfo, client_edges
 from mstar.graph.loop_indices import NestedLoopIndices
 
 try:
@@ -43,6 +44,7 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
+from mstar.conductor.request_info import DEFAULT_PARTITION
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
@@ -78,10 +80,33 @@ from mstar.utils.ipc_format import (
 
 logger = logging.getLogger(__name__)
 
-# Outputs whose postprocess encodes a whole artifact (a PNG takes tens of ms) run
-# on the encode pool, so reads, streamed chunks and prompt preprocessing do not
-# wait behind them. Streamed modalities stay inline, in arrival order.
-POOLED_OUTPUT_MODALITIES = frozenset({"image"})
+def one_shot_outputs(model: Model) -> frozenset[tuple[str, str]]:
+    """The ``(walk, modality)`` outputs a request gets once, which the data worker
+    encodes on its pool so that reads, streamed chunks and prompt preprocessing
+    don't wait behind them (a PNG takes tens of ms, a video mux far longer).
+
+    A partition streams a modality when one of its walks emits it inside a loop,
+    as a decode loop does after the prefill's first token, or when a stream feeds
+    the partition, whose walk then runs once per chunk. Those outputs stay inline,
+    in arrival order.
+    """
+    partition_of: dict[str, str] = {}
+    for part in model.get_partitions():
+        for walk in part.graph_walks:
+            partition_of.setdefault(walk, part.name)
+    fed = {conn.to_partition for conn in model.get_partition_topology().connections}
+    emitted: set[tuple[str, str, str]] = set()
+    streamed: set[tuple[str, str]] = set()
+    for walk, section in model.get_graph_walk_graphs().items():
+        partition = partition_of.get(walk, DEFAULT_PARTITION)
+        for edge, per_iteration in client_edges(section):
+            emitted.add((walk, partition, edge.output_modality))
+            if per_iteration or partition in fed:
+                streamed.add((partition, edge.output_modality))
+    return frozenset(
+        (walk, modality) for walk, partition, modality in emitted
+        if (partition, modality) not in streamed
+    )
 
 
 def encode_workers(cpus: int | None = None) -> int:
@@ -91,6 +116,17 @@ def encode_workers(cpus: int | None = None) -> int:
     if cpus is None:
         cpus = usable_cpus()
     return max(1, min(4, cpus // 8))
+
+
+class _Encode(NamedTuple):
+    """A pooled encode, handed back to the data worker thread when it finishes."""
+    future: Future
+    request_id: str
+    state: "RequestOutputState"
+    sequence: int
+    modality: str
+    metadata: dict
+    uuid: int
 
 
 def _sha256(path: str) -> bytes:
@@ -242,6 +278,7 @@ class PreprocessWorker:
         self.thread = threading.Thread(
             target=_preprocess_loop,
             kwargs=dict(
+                pooled_outputs=one_shot_outputs(model) if model is not None else frozenset(),
                 in_queue=self.request_input_queue,
                 result_tensor_queue=self.result_tensor_input_queue,
                 out_queue=self.output_queue,
@@ -511,7 +548,8 @@ class PreprocessWorkerThread:
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
     MAX_APPENDS_PER_PASS = 32
-    # None (a thread built without __init__) postprocesses every output inline
+    # None (nothing to pool, or a thread built without __init__) postprocesses
+    # every output inline
     _encode_pool: ThreadPoolExecutor | None = None
 
     def __init__(
@@ -536,6 +574,7 @@ class PreprocessWorkerThread:
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
         is_pending: Callable[[str], bool] | None = None,
+        pooled_outputs: frozenset[tuple[str, str]] = frozenset(),
     ):
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
@@ -609,12 +648,15 @@ class PreprocessWorkerThread:
         # with a bare communicator).
         self.wakeup = wakeup
         self.idle_wait_ms = 20
-        self._encode_pool = ThreadPoolExecutor(
-            max_workers=encode_workers(), thread_name_prefix="mstar-encode",
-        )
+        # (walk, modality) outputs encoded on the pool, from one_shot_outputs
+        self._pooled_outputs = pooled_outputs
+        if pooled_outputs:
+            workers = encode_workers()
+            self._encode_pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mstar-encode")
+            logger.info("Encoding %s outputs on %d threads", sorted(pooled_outputs), workers)
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
-        self._encoded: deque = deque()
+        self._encoded: deque[_Encode] = deque()
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -1261,9 +1303,58 @@ class PreprocessWorkerThread:
                     sequence=slot[0] if slot is not None else None, traceback=False,
                 )
 
+    def _chunk_metadata(
+        self, request_id: str, uuid: int, modality: str, tensor: torch.Tensor,
+    ) -> dict:
+        """The metadata a chunk carries: the output's own, and for audio and
+        frames what a client needs to play them."""
+        metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
+        if self.model is None:
+            return metadata
+        if modality == "audio":
+            # Audio is emitted as headerless 16-bit PCM; surface the model's
+            # output sample rate + channel count so clients can wrap it.
+            return {
+                **metadata,
+                "sample_rate": self.model.get_output_sample_rate("audio"),
+                "num_channels": self.model.get_output_audio_channels("audio"),
+            }
+        if modality == "video_frame":
+            return _video_frame_metadata(
+                tensor,
+                fps=self.model.get_output_frame_rate(
+                    "video_frame",
+                    request_kwargs=self.request_model_kwargs.get(request_id),
+                ),
+                # Assigned from emitted order in _queue_completed_output after
+                # any earlier asynchronous reads have completed.
+                frame_index=0,
+                metadata=metadata,
+            )
+        return metadata
+
+    def _queue_chunk(
+        self, request_id: str, sequence: int, modality: str, data: bytes, metadata: dict,
+    ) -> None:
+        if modality == "video_frame" and self.model is not None:
+            expected_bytes = (
+                metadata["frame_count"] * metadata["height"] * metadata["width"] * 3
+            )
+            if len(data) != expected_bytes:
+                raise ValueError(
+                    "video_frame payload length does not match its RGB24 shape: "
+                    f"expected {expected_bytes} bytes, got {len(data)}"
+                )
+        self._queue_completed_output(
+            request_id,
+            sequence,
+            ResultChunk(request_id=request_id, modality=modality, data=data, metadata=metadata),
+        )
+
     def _postprocess_inline(
         self, request_id: str, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
     ) -> None:
+        metadata = self._chunk_metadata(request_id, uuid, modality, tensor)
         if self.enable_nvtx:
             profiler.range_push(f"dataworker.postprocess.{modality}")
         postprocessed = self.model.postprocess(
@@ -1275,54 +1366,8 @@ class PreprocessWorkerThread:
             profiler.mark(
                 f"dataworker.postprocessed.bytes[{len(postprocessed)}]"
             )
-
-        chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
-        # Audio is emitted as headerless 16-bit PCM; surface the
-        # model's output sample rate + channel count so clients can
-        # wrap it.
-        if modality == "audio" and self.model is not None:
-            chunk_metadata = {
-                **chunk_metadata,
-                "sample_rate": self.model.get_output_sample_rate("audio"),
-                "num_channels": self.model.get_output_audio_channels("audio"),
-            }
-        elif modality == "video_frame" and self.model is not None:
-            chunk_metadata = _video_frame_metadata(
-                tensor,
-                fps=self.model.get_output_frame_rate(
-                    "video_frame",
-                    request_kwargs=self.request_model_kwargs.get(request_id),
-                ),
-                # Assigned from emitted order in
-                # _queue_completed_output after any earlier
-                # asynchronous reads have completed.
-                frame_index=0,
-                metadata=chunk_metadata,
-            )
-            expected_bytes = (
-                chunk_metadata["frame_count"]
-                * chunk_metadata["height"]
-                * chunk_metadata["width"]
-                * 3
-            )
-            if len(postprocessed) != expected_bytes:
-                raise ValueError(
-                    "video_frame payload length does not match its RGB24 shape: "
-                    f"expected {expected_bytes} bytes, got {len(postprocessed)}"
-                )
-
-        if self.enable_nvtx:
             profiler.range_push("dataworker.queue_output")
-        self._queue_completed_output(
-            request_id,
-            sequence,
-            ResultChunk(
-                request_id=request_id,
-                modality=modality,
-                data=postprocessed,
-                metadata=chunk_metadata,
-            ),
-        )
+        self._queue_chunk(request_id, sequence, modality, postprocessed, metadata)
         if self.enable_nvtx:
             profiler.range_pop()
 
@@ -1332,14 +1377,14 @@ class PreprocessWorkerThread:
         """Encode on the pool; :meth:`_release_encoded` queues the chunk. The
         transport keeps its reference to ``tensor`` until then."""
         state = self.request_output_state[request_id]
-        metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
+        metadata = self._chunk_metadata(request_id, uuid, modality, tensor)
         future = self._encode_pool.submit(
             self._encode, tensor, modality, self.request_model_kwargs.get(request_id),
         )
         # registered before the wakeup's, so the entry is queued when the thread wakes
-        future.add_done_callback(lambda done: self._encoded.append(
-            (done, request_id, state, sequence, modality, metadata, uuid),
-        ))
+        future.add_done_callback(lambda done: self._encoded.append(_Encode(
+            done, request_id, state, sequence, modality, metadata, uuid,
+        )))
         if self.wakeup is not None:
             self.wakeup.register_future(future)
 
@@ -1358,22 +1403,20 @@ class PreprocessWorkerThread:
         if not encoded:
             return False
         while encoded:
-            future, request_id, state, sequence, modality, metadata, uuid = encoded.popleft()
-            self.tensor_manager.dereference(uuid)
+            done = encoded.popleft()
+            self.tensor_manager.dereference(done.uuid)
             # The request was torn down while this encoded, or its rid reused since.
-            if self.request_output_state.get(request_id) is not state:
+            if self.request_output_state.get(done.request_id) is not done.state:
                 continue
             try:
-                data = future.result()
+                self._queue_chunk(
+                    done.request_id, done.sequence, done.modality, done.future.result(), done.metadata,
+                )
             except Exception as exc:  # noqa: BLE001 — must reach the client
                 self._fail_request(
-                    request_id, exc, f"{modality} output postprocessing", sequence=sequence,
+                    done.request_id, exc, f"{done.modality} output postprocessing",
+                    sequence=done.sequence,
                 )
-                continue
-            self._queue_completed_output(
-                request_id, sequence,
-                ResultChunk(request_id=request_id, modality=modality, data=data, metadata=metadata),
-            )
         return True
 
     def _process_read_tensors(self):
@@ -1411,7 +1454,9 @@ class PreprocessWorkerThread:
                         tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
                         if self.enable_nvtx:
                             profiler.range_pop()
-                        if self._encode_pool is not None and modality in POOLED_OUTPUT_MODALITIES:
+                        if self._encode_pool is not None and (
+                            tensor_info._source_graph_walk, modality,
+                        ) in self._pooled_outputs:
                             self._submit_encode(request_id, sequence, modality, tensor_info.uuid, tensor)
                             pooled = True
                         else:

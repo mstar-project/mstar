@@ -168,7 +168,9 @@ You must implement these abstract methods:
 
 ``postprocess(self, output, modality) -> bytes``
    Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
-   images, raw PCM for audio, and so on.
+   images, raw PCM for audio, and so on. It has to be stateless: the API server encodes
+   the outputs a request gets once (an image, a whole video) on a small thread pool, so
+   several calls can run at once.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load

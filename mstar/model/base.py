@@ -793,6 +793,11 @@ class Model(ABC):
         per-request parameters (e.g. writing a video container at the request's
         frame rate).
 
+        The API server encodes the outputs a request gets once (an image, a
+        whole video) on a small thread pool, beside its data worker thread's
+        calls for streamed ones, so several calls can run at once: this has to
+        be stateless.
+
         Modality to expected encoding type:
         - text: utf-8
         - image: png
