@@ -491,17 +491,17 @@ def test_watermark_runs_fp32_matmuls_and_tf32_cudnn_and_restores_the_flags(monke
 
     monkeypatch.setattr(first_conv, "forward", conv)
     torch_flag(torch.backends.cuda.matmul, "allow_tf32", True)
-    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    torch_flag(torch.backends.cudnn, "allow_tf32", False)
     wmk.apply([torch.zeros(320)], [WatermarkStream()])
     assert seen == [(False, True)]
     assert torch.backends.cuda.matmul.allow_tf32 and not torch.backends.cudnn.allow_tf32
 
 
-def test_precision_getters_answer_while_the_watermark_runs(monkeypatch):
+def test_precision_getters_answer_while_the_watermark_runs(torch_flag):
     """Flipping ``cuda.matmul.allow_tf32`` alone made
     ``get_float32_matmul_precision()`` raise (a mix of the legacy and new
     APIs) for every thread until the window closed."""
-    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    torch_flag(torch.backends.cudnn, "allow_tf32", False)
     previous = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high")
     try:

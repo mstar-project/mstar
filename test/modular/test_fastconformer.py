@@ -405,7 +405,7 @@ def test_triton_encoder_matches_eager_and_single_requests(causal, monkeypatch, t
     gets alone."""
     from mstar.model.components import fastconformer_kernels
 
-    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    torch_flag(torch.backends.cudnn, "allow_tf32", False)
     torch_flag(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(16)
     config = _causal_config(3) if causal else FastConformerConfig.from_hf(TINY)

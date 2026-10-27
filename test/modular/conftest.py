@@ -56,11 +56,11 @@ if "triton" not in sys.modules:
 
 @pytest.fixture
 def torch_flag():
-    """``monkeypatch.setattr`` for flags torch serves through ``__getattr__`` /
-    ``__setattr__`` (``torch._inductor.config``, ``torch.backends.cuda.matmul``).
-    Since pytest 9.2, monkeypatch restores such an attribute by deleting it, which
-    removes the flag for every later test in the process; this restores by
-    assignment."""
+    """``monkeypatch.setattr`` for torch's flags (``torch._inductor.config``,
+    ``torch.backends.*``), restored by assignment. Some of them are served through
+    ``__getattr__`` / ``__setattr__``, which monkeypatch restores by deleting the
+    attribute since pytest 9.2, removing the flag for every later test in the
+    process; one fixture for all of them means nobody has to know which."""
     saved = []
 
     def set_flag(obj, name, value):
