@@ -60,37 +60,49 @@ def test_direct_plan_matches_flashinfer_plan():
         assert torch.equal(full.run(q, cache), direct.run(q, cache))
 
 
-def _prefill_wrapper():
+def _prefill_wrapper(backend):
     ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     return wrappers.FlashInferPrefillWrapper(
         ws, num_qo_heads=QO, num_kv_heads=KV, head_dim=HD, page_size=PAGE,
         batch_size=BS, max_total_tokens=TOKENS, max_num_pages=PAGES,
-        device=torch.device("cuda"), accelerator_graph=True,
+        device=torch.device("cuda"), accelerator_graph=True, backend=backend,
     )
 
 
 TOKENS = 256
 
 
-def _prefill_batch(rng):
-    spans = rng.multinomial(TOKENS - BS, np.ones(BS) / BS) + 1
-    lens = spans + rng.integers(0, 200, BS)
+SINK = PAGES - 1
+
+
+def _prefill_batch(rng, short=False):
+    """A packed step over every captured query row, or a ``short`` one: fewer
+    rows, with the last ones padding, as a captured step shorter than its
+    bucket is (zero span, one sink page each)."""
+    n_pad = int(rng.integers(1, BS // 2 + 1)) if short else 0
+    live = BS - n_pad
+    total = int(rng.integers(live, TOKENS - n_pad)) if short else TOKENS
+    spans = np.concatenate((rng.multinomial(total - live, np.ones(live) / live) + 1, np.zeros(n_pad, int)))
+    lens = np.concatenate((spans[:live] + rng.integers(0, 200, live), np.ones(n_pad, int)))
     npages = (lens + PAGE - 1) // PAGE
+    indices = np.concatenate((rng.permutation(SINK)[: int(npages[:live].sum())], np.full(n_pad, SINK)))
     t = lambda x: torch.from_numpy(np.asarray(x, dtype=np.int32))  # noqa: E731
     return dict(
         qo_indptr=t(np.concatenate(([0], np.cumsum(spans)))),
         paged_kv_indptr=t(np.concatenate(([0], np.cumsum(npages)))),
-        paged_kv_indices=t(rng.permutation(PAGES)[: int(npages.sum())]),
+        paged_kv_indices=t(indices),
         paged_kv_last_page_len=t((lens - 1) % PAGE + 1), kv_lens=t(lens),
     )
 
 
-def test_prefill_direct_plan_matches_flashinfer_plan():
+# fa2 is what "auto" resolves to before Hopper; it takes four more planner arguments than fa3
+@pytest.mark.parametrize("backend", ["auto", "fa2"])
+def test_prefill_direct_plan_matches_flashinfer_plan(backend):
     rng = np.random.default_rng(1)
-    full, direct = _prefill_wrapper(), _prefill_wrapper()
+    full, direct = _prefill_wrapper(backend), _prefill_wrapper(backend)
     cache = torch.randn(PAGES, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
     for step in range(12):
-        batch = _prefill_batch(rng)
+        batch = _prefill_batch(rng, short=step % 2 == 1)
         full._planner_key = None  # forget the direct planner: a full FlashInfer plan
         full.plan(causal=True, dtype=torch.bfloat16, **batch)
         direct.plan(causal=True, dtype=torch.bfloat16, **batch)
@@ -104,7 +116,8 @@ def test_prefill_direct_plan_matches_flashinfer_plan():
             assert getattr(a, name) == getattr(b, name), name
         n = batch["paged_kv_indices"].shape[0]
         assert torch.equal(a._paged_kv_indices_buf[:n], b._paged_kv_indices_buf[:n])
-        q = torch.randn(TOKENS, QO, HD, dtype=torch.bfloat16, device="cuda")
+        # eager run takes exactly the step's rows (a replay runs the bucket's)
+        q = torch.randn(int(batch["qo_indptr"][-1]), QO, HD, dtype=torch.bfloat16, device="cuda")
         assert torch.equal(full.run(q, cache), direct.run(q, cache))
 
 

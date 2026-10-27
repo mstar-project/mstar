@@ -668,6 +668,7 @@ class GDNMixedWrapper(GDNWrapper):
         )
         self._stage = _PinnedIndexStage()
         self._idx: dict[str, torch.Tensor] = {}
+        self._idx_layout: tuple[int, int, int] | None = None
         self._capacity3 = (0, 0, 0)
         self._num_tokens = 0
         self._num_rows = 0
@@ -678,6 +679,8 @@ class GDNMixedWrapper(GDNWrapper):
         ``[perm | dec_src | dec_dst]`` and one int32 block ``[dec_slots |
         pre_slots]``, so each stages in one copy. Allocated once to the bucket
         under capture, whose graph holds their addresses."""
+        if (tokens, bs, cap) == self._idx_layout:
+            return  # the last plan's views stand; under capture every plan has this layout
         need = (tokens + 2 * bs, bs + cap, cap)
         have = self._capacity3
         if any(n > h for n, h in zip(need, have, strict=True)):
@@ -700,6 +703,7 @@ class GDNMixedWrapper(GDNWrapper):
             "dec_dst": i64[tokens + bs:need[0]], "i32": i32[:need[1]],
             "dec_slots": i32[:bs], "pre_slots": i32[bs:need[1]], "pre_has": self._has_block[:cap],
         }
+        self._idx_layout = (tokens, bs, cap)
 
     def plan(
         self,

@@ -2696,9 +2696,7 @@ class KVManager(AttentionResource):
             "KV preplan is already pending; clear_preplan before planning a "
             "different step ahead"
         )
-        laps = PhaseLaps(
-            "res.pre_plan.kv_cache." if ctx.is_preplan else "res.plan.kv_cache."
-        )
+        laps = PhaseLaps(f"{ctx.plan_phase}.kv_cache.")
         self.reset_default_cursors()
         if self._preplanned:
             if self._preplan_key == self._plan_key(step, ctx):
