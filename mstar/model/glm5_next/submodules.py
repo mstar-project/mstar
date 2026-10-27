@@ -502,9 +502,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         """The next step's draft seed in each row's slot: the MTP state and d1, the draft for
         the token after ``prev`` (the step's next input)."""
         pool = engine_inputs.resources[KDA_STATE]
-        rows = pool.addressing()
-        pool.scatter_(MTP_HIDDEN, rows, hidden)
-        pool.scatter_(MTP_DRAFT, rows, self._draft_tokens(hidden, prev)[:, None])
+        pool.scatter_(MTP_HIDDEN, hidden, None)
+        pool.scatter_(MTP_DRAFT, self._draft_tokens(hidden, prev)[:, None], None)
 
     def _mtp_prefill(self, engine_inputs, input_ids, hidden, last, new_tokens, mtp_keep) -> None:
         """The MTP pass over the prompt: row i pairs the trunk's state at token i with the
@@ -532,8 +531,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
 
         # Drafts: d1 was seeded by the last step; each further one is an MTP pass whose
         # query sits at its row of this step's block.
-        h = pool.gather(MTP_HIDDEN, rows)
-        drafts = [pool.gather(MTP_DRAFT, rows)[:, 0]]
+        h = pool.gather(MTP_HIDDEN, None)
+        drafts = [pool.gather(MTP_DRAFT, None)[:, 0]]
         attn = lm.mtp.transformer_layer.self_attn
         latents = h.new_zeros(n, block, attn.kv_lora_rank + attn.mla_cache_kpe)
         for row in range(k - 1):
