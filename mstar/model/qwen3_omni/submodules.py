@@ -267,7 +267,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
             "position_ids": get_vision_position_ids(grid_thw, encoder.spatial_merge_size),
             "cu_seqlens": get_vision_cu_seqlens(grid_thw),
         }
-        for name in ("pixel_values", "interp_indices", "interp_weights", "position_ids"):
+        for name in ("pixel_values", "interp_indices", "interp_weights", "position_ids", "cu_seqlens"):
             torch._dynamo.mark_dynamic(tensor_inputs[name], 0)
         return NodeInputs(tensor_inputs=tensor_inputs)
 
