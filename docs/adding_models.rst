@@ -1137,7 +1137,7 @@ methods are:
    only the common checks; the graph runtime then runs them over the step's token column
    without calling ``check_stop``. That takes the batched output carrying the policies'
    ``token_signal`` as a stop buffer (``BatchedModelOutput(check_stop_buffers={...})``,
-   as Qwen3.5, Orpheus and Whisper return); a step without one, or one that mixes walks,
+   as Qwen3.5 and Orpheus return); a step without one, or one that mixes walks,
    still calls ``check_stop``. ``StopPolicy(StopKind.AR, token_signal=...,
    eos_tokens=..., sampler=...)`` stops its loop on an EOS token (unless the ``sampler``
    resource's request config sets ``ignore_eos``) or when the loop's iteration count plus
