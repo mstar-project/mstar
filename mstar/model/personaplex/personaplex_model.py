@@ -4,17 +4,21 @@ Nodes:
     MimiEncoder - user PCM -> 8-codebook Mimi codes (whole sequence, ring mask)
     LM          - temporal transformer + depformer + delayed token cache;
                   one 80 ms frame (one temporal forward) per iteration
-    MimiDecoder - accumulated agent codes -> 24 kHz PCM trimmed to the input
+    MimiDecoder - streamed agent codes -> 24 kHz PCM chunks, at most the input's length
 
 Walks, stepped through ``kwargs["walk_schedule"]`` (Wan2.2 pattern):
     encode_user_audio - MimiEncoder; persists ``user_audio_codes``
     conditioning      - Loop over LM: voice embeddings, 6 silence, persona text,
                         6 silence ([PP] models/lm.py:1110-1121); persists the
                         final ``lm_state`` (token cache, mask, offset, step)
-    generate[_audio]  - Loop over LM, one iteration per user frame, then
-                        MimiDecoder; ``agent_frame`` accumulates across
-                        iterations, and ``generate`` also sends each frame's
-                        ``text_frame`` to the client as it is produced
+    generate[_audio]  - Loop over LM, one iteration per user frame; each
+                        ``agent_frame`` streams to the codec partition, and
+                        ``generate`` also sends each frame's ``text_frame`` to
+                        the client as it is produced
+    codec_chunk       - MimiDecoder over each chunk of streamed agent frames
+
+Two async partitions: ``LM`` runs the first three walks in order and streams
+``agent_frame`` to ``Codec``, which decodes it in chunks while generation goes on.
 
 The LM is one node name in two walks (``Sequential`` keys a walk's nodes by name).
 Its loop-backs are consumed and seeded empty at iteration 0, and async
@@ -32,15 +36,17 @@ from pathlib import Path
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
-from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
+from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 from . import config as cfg
 from .voice import VOICES_ARCHIVE, extract_voice_presets, load_voice_preset, resolve_voice_path
@@ -166,24 +172,19 @@ class PersonaPlexModel(Model):
         )
 
     def _generate_walk(self, with_text: bool) -> GraphSection:
-        accumulated = [GraphEdge(next_node=cfg.MIMI_DECODER_NODE, name="agent_frame")]
         lm = self._lm_node(cfg.GENERATE_WALK)
+        # Each frame's agent codes stream to the codec partition, which decodes
+        # them in chunks while the loop goes on.
+        lm.outputs.append(StreamingGraphEdge(
+            next_node=cfg.MIMI_DECODER_NODE, name="agent_frame", target_partition=cfg.CODEC_PARTITION,
+        ))
         if with_text:
             # Text goes to the client every frame instead of accumulating: an
             # accumulated client output is sent only when the loop ends, and by
             # then the worker has reused the pinned host buffers that staged the
-            # earlier frames, so every frame arrived as the last token. Only the
-            # Mimi decoder needs the agent codes as a sequence.
+            # earlier frames, so every frame arrived as the last token.
             lm.outputs.append(GraphEdge(next_node=EMIT_TO_CLIENT, name="text_frame", output_modality="text"))
-        decode_loop = Loop(
-            name=cfg.DECODE_LOOP, section=lm,
-            max_iters=cfg.MAX_TEMPORAL_FORWARDS, outputs=[], accumulated_outputs=accumulated,
-        )
-        decoder = GraphNode(
-            name=cfg.MIMI_DECODER_NODE, input_names=["agent_frame"],
-            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_output", output_modality="audio")],
-        )
-        return Sequential(sections=[decode_loop, decoder])
+        return Loop(name=cfg.DECODE_LOOP, section=lm, max_iters=cfg.MAX_TEMPORAL_FORWARDS, outputs=[])
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode = GraphNode(
@@ -196,12 +197,45 @@ class PersonaPlexModel(Model):
             # The final iteration's token-cache state carries into the generate walk.
             outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name="lm_state", persist=True)],
         )
+        # The decoder keeps each request's code context in its own state and
+        # updates it in the forward, so a step must not be prepared ahead of the
+        # previous one.
+        decoder = GraphNode(
+            name=cfg.MIMI_DECODER_NODE, input_names=["agent_frame"], consumes_stream=True,
+            enable_async_scheduling=False,
+            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_output", output_modality="audio")],
+        )
         return {
             cfg.ENCODE_USER_AUDIO_WALK: encode,
             cfg.CONDITIONING_WALK: conditioning,
             cfg.GENERATE_WALK: self._generate_walk(with_text=True),
             GENERATE_AUDIO_WALK: self._generate_walk(with_text=False),
+            cfg.CODEC_WALK: decoder,
         }
+
+    def get_partitions(self) -> list[PartitionDefinition]:
+        return [
+            PartitionDefinition(
+                name=cfg.LM_PARTITION,
+                graph_walks={cfg.ENCODE_USER_AUDIO_WALK, cfg.CONDITIONING_WALK, cfg.GENERATE_WALK, GENERATE_AUDIO_WALK},
+                initial_walk=cfg.ENCODE_USER_AUDIO_WALK, producer_partitions=[],
+            ),
+            PartitionDefinition(
+                name=cfg.CODEC_PARTITION, graph_walks={cfg.CODEC_WALK}, initial_walk=cfg.CODEC_WALK,
+                producer_partitions=[cfg.LM_PARTITION],
+            ),
+        ]
+
+    def get_partition_topology(self) -> PartitionTopology:
+        # Non-overlapping chunks of new frames: the decoder keeps its own left
+        # context, so the stream must not deliver the overlap again. The stream
+        # ends with the LM partition, after its generate walk.
+        return PartitionTopology(partitions=[cfg.LM_PARTITION, cfg.CODEC_PARTITION], connections=[
+            Connection(
+                from_partition=cfg.LM_PARTITION, to_partition=cfg.CODEC_PARTITION, edge_name="agent_frame",
+                chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=cfg.STREAM_CHUNK_FRAMES),
+            ),
+        ])
 
     # ------------------------------------------------------------------
     # Model ABC: request I/O (data worker)
@@ -446,6 +480,8 @@ class PersonaPlexModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
+        if partition_name == cfg.CODEC_PARTITION:
+            return self._codec_forward_pass_args(input_modalities, output_modalities, input_signals)
         # Backstops only: process_prompt rejected these on the data worker.
         for name in ("audio_inputs", "voice_embeddings", "voice_cache", "persona_tokens"):
             if len(input_signals.get(name) or []) != 1:
@@ -481,6 +517,24 @@ class PersonaPlexModel(Model):
             step_metadata=self._step_metadata(metadata),
         )
 
+    @staticmethod
+    def _codec_forward_pass_args(input_modalities, output_modalities, input_signals) -> ForwardPassArgs:
+        """The codec partition is driven by the agent-frame stream; it needs only the sample budget.
+
+        No input tensor: the budget is read off the upload's dims, so the
+        decoder never emits past the input's length, whichever chunk comes last.
+        """
+        audio = input_signals.get("audio_inputs") or []
+        if len(audio) != 1:
+            raise ValueError("PersonaPlex request is missing audio_inputs")
+        num_samples = int(audio[0].dims[-1])
+        budget = {"num_samples": num_samples, "num_user_frames": math.ceil(num_samples / cfg.FRAME_SIZE)}
+        metadata = CurrentForwardConductorMetadata(
+            input_modalities=input_modalities, output_modalities=output_modalities,
+            graph_walk=cfg.CODEC_WALK, is_prefill=False, kwargs=dict(budget),
+        )
+        return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], step_metadata=budget)
+
     def get_partition_forward_pass_args(
         self,
         partition_name: str,
@@ -488,8 +542,15 @@ class PersonaPlexModel(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
-        """encode_user_audio -> conditioning -> generate[_audio] -> done."""
+        """LM: encode_user_audio -> conditioning -> generate[_audio] -> done.
+
+        The codec partition never finishes here: it ends when its decoder
+        consumes the stream's final chunk, which the worker reports.
+        """
         metadata = partition_metadata
+        if partition_name == cfg.CODEC_PARTITION:
+            budget = {key: metadata.kwargs[key] for key in ("num_samples", "num_user_frames")}
+            return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], step_metadata=budget)
         schedule = metadata.kwargs["walk_schedule"]
         step = metadata.kwargs["walk_step"] + 1
         inputs: list[GraphEdge] = []

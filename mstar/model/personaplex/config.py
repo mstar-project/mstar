@@ -170,6 +170,14 @@ LM_NODE, MIMI_ENCODER_NODE, MIMI_DECODER_NODE = "LM", "MimiEncoder", "MimiDecode
 ENCODE_USER_AUDIO_WALK, CONDITIONING_WALK, GENERATE_WALK = "encode_user_audio", "conditioning", "generate"
 GENERATE_AUDIO_WALK = "generate_audio"  # generate without emitting text
 CONDITIONING_LOOP, DECODE_LOOP = "cond_loop", "decode_loop"
+# The reply's audio streams from the LM partition to the codec partition one agent frame at a time.
+LM_PARTITION, CODEC_PARTITION, CODEC_WALK = "LM", "Codec", "codec_chunk"
+# New agent frames per decoded audio chunk (4 x 80 ms = 320 ms).
+STREAM_CHUNK_FRAMES = 4
+# Agent frames of left context each chunk is decoded behind: one window of Mimi's decoder
+# transformer (250 steps at 2 per frame). Its 8 stacked layers reach further back, so a chunk
+# past the first window differs slightly from a whole-clip decode, as for Qwen3-TTS's codec.
+STREAM_CONTEXT_FRAMES = 125
 KV_LABEL = "main"  # the LM's one paged KV label
 LM_KV, LM_ATTN, LM_POS = "lm_kv", "lm_attn", "lm_pos"
 TEXT_SAMPLER, DEPTH_SAMPLER = "text_sampler", "depth_sampler"
