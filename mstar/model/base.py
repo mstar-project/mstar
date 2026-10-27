@@ -1,7 +1,7 @@
 import itertools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from typing import NamedTuple, Type
 
@@ -29,37 +29,64 @@ from mstar.graph.base import (
     TensorPointerInfo,
     top_level_entities,
 )
+from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
-from mstar.model.submodule_base import ChunkingPolicy, chunk_loop_name
+from mstar.model.submodule_base import (
+    ChunkingPolicy,
+    chunk_loop_name,
+)
 
 
 def _wrap_node_in_loop(
-    section: GraphSection, node_name: str, loop_name: str,
+    section: GraphSection, node_name: str, graph_walk: str, loop_name: str,
+    policy: "ChunkingPolicy",
 ) -> GraphSection:
     """``section`` with ``node_name`` wrapped in the Loop its chunks run as.
 
-    The node keeps its own outputs and the Loop declares none, so routing is
-    exactly what it was unwrapped. Moving the outputs onto ``Loop.outputs``,
-    which is what drops a non-final chunk's by construction, comes next.
+    The node's real edges move onto the Loop, which is what makes a chunk's
+    output the loop's business rather than the worker's: an edge the policy
+    gathers gets every chunk's tensors at the end, and any other gets the
+    final chunk's alone, earlier ones dropped as the loop advances.
+
+    The body keeps a bare same-named edge to ``EMPTY_DESTINATION``. The Loop
+    caches by edge NAME, so the body has to emit the name for the Loop to have
+    anything to carry; the copy routes nowhere and drops every flag, since
+    persisting or counting a per-chunk tick would stage it and bill the
+    conductor for a token per chunk.
+
+    The body also routes ``chunk_tick_name`` back to itself, which is what
+    makes the next chunk a speculation target; see that function for why the
+    conductor seeds the first one. The submodule produces no tensor for it, and
+    a declared signal with no tensor still satisfies readiness, so it is free.
     """
     if isinstance(section, GraphNode):
         if section.name != node_name:
             return section
-        # max_iters=1 while the worker still drives chunking: it holds a
-        # non-final chunk's row back without completing the node, so the loop
-        # is only ever completed once, by the final chunk. It becomes a real
-        # bound when the engine takes over ending the loop.
+        ticks, final, gathered = [], [], []
+        for edge in section.outputs:
+            ticks.append(GraphEdge(next_node=EMPTY_DESTINATION, name=edge.name))
+            dest = gathered if edge.name in policy.accumulated_outputs else final
+            dest.append(edge)
+        tick = f"{loop_name}.next_chunk"
+        ticks.append(GraphEdge(next_node=node_name, name=tick))
         return Loop(
-            name=loop_name, section=section, max_iters=1, outputs=[],
+            name=loop_name,
+            section=replace(
+                section, outputs=ticks,
+                input_names=set(section.input_names) | {tick},
+            ),
+            max_iters=policy.max_chunks,
+            outputs=final,
+            accumulated_outputs=gathered,
         )
     if isinstance(section, Sequential):
         return Sequential([
-            _wrap_node_in_loop(s, node_name, loop_name) for s in section.sections
+            _wrap_node_in_loop(s, node_name, graph_walk, loop_name, policy) for s in section.sections
         ])
     if isinstance(section, Parallel):
         return Parallel([
-            _wrap_node_in_loop(s, node_name, loop_name) for s in section.sections
+            _wrap_node_in_loop(s, node_name, graph_walk, loop_name, policy) for s in section.sections
         ])
     if isinstance(section, Loop):
         # A chunkable node inside an existing Loop nests one loop in another,
@@ -918,7 +945,7 @@ class Model(ABC):
                     if section is None:
                         continue
                     walk_graphs[walk] = _wrap_node_in_loop(
-                        section, node, chunk_loop_name(node, walk),
+                        section, node, walk, chunk_loop_name(node, walk), policy,
                     )
         return walk_graphs
 

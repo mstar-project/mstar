@@ -2363,6 +2363,166 @@ def _chunk_loop_graph(out_edge, max_iters=2):
     ])
 
 
+# --- the chunk Loop a chunkable walk is wrapped in --------------------------
+#
+# Built by the real `_wrap_node_in_loop`, not a copy of its output: the shape
+# is the contract between the model, the conductor's seed and both runtimes,
+# and a hand-written mirror of it keeps passing after the wrapper changes.
+
+CHUNK_WALK = "prefill_text"
+
+
+def _wrapped_chunk_walk(max_chunks=8):
+    from mstar.model.base import _wrap_node_in_loop
+    from mstar.model.submodule_base import ChunkingPolicy, chunk_loop_name
+
+    node = GraphNode(
+        name="llm", input_names={"text_inputs"},
+        outputs=[GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT, persist=True)],
+    )
+    return _wrap_node_in_loop(
+        node, "llm", CHUNK_WALK, chunk_loop_name("llm", CHUNK_WALK),
+        ChunkingPolicy(
+            walks=(CHUNK_WALK,), chunkable=True, max_chunks=max_chunks,
+        ),
+    )
+
+
+def _chunk_runtime(which):
+    section = _wrapped_chunk_walk()
+    wg = WorkerGraph(
+        section=section, graph_walks={CHUNK_WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {CHUNK_WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: set(section.get_loops())},
+        all_wg_ids_to_nodes={WG_ID: {"llm"}},
+        node_to_partition={"llm": "default"},
+        sharding_config=_sharding(),
+    )
+    if which == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+    else:
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    return rt, book
+
+
+def _enter_chunk_walk(rt, seed_tick=True):
+    """What the conductor sends on entering the walk: the prompt, and the
+    chunk Loop's loop-back seed."""
+    from mstar.model.submodule_base import chunk_tick_name
+
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk=CHUNK_WALK,
+        partition_worker_graph_ids=[WG_ID],
+        worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        loop_caps={},
+    )
+    specs = [_spec("text_inputs", "llm")]
+    if seed_tick:
+        specs.append(_spec(chunk_tick_name("llm", CHUNK_WALK), "llm"))
+    rt.ingest_inputs_batch(_ingest_block([rid] * len(specs), specs))
+    return rid
+
+
+def _run_chunk(rt, book, rid, uuid):
+    """One chunk: the submodule produces a token and nothing for the tick."""
+    signals = rt.get_output_signals("llm", CHUNK_WALK)
+    rt.pop_rids("llm", CHUNK_WALK, [rid])
+    book.put_tensor(uuid, _info(uuid))
+    book.increment_ref(uuid, 1)
+    tensors, counts = [], []
+    for signal in signals:
+        if signal == "new_token":
+            tensors.append(uuid)
+            counts.append(1)
+        else:
+            counts.append(0)
+    return rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=CHUNK_WALK, node_name="llm",
+        output_signals=list(signals), wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=tensors, num_tensors=counts,
+    ))
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_chunk_walk_is_ready_for_its_first_chunk(which):
+    """The loop-back the node declares has no producer before chunk one, so
+    without the conductor's seed the walk never runs at all -- a hang, not an
+    error."""
+    rt, _book = _chunk_runtime(which)
+    assert _ready(rt) == []
+    rid = _enter_chunk_walk(rt)
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_without_the_seed_a_chunk_walk_never_becomes_ready(which):
+    rt, _book = _chunk_runtime(which)
+    _enter_chunk_walk(rt, seed_tick=False)
+    assert _ready(rt) == [], "the seed is what makes the first chunk runnable"
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_the_next_chunk_is_ready_and_speculable(which):
+    """A chunk re-readies the node off the re-injected prompt, and the
+    loop-back makes the next iteration a speculation target -- without it a
+    chunk-only step has nothing queued behind it."""
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    out = _run_chunk(rt, book, rid, 1)
+
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+    assert [(t.node_name, t.is_new_loop_iter)
+            for t in rt.speculate_node("llm", [CHUNK_WALK], [rid])] == [("llm", True)]
+    assert out.register_uuids == [], "a non-final chunk emits nothing"
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_only_the_final_chunks_token_leaves_the_loop(which):
+    """Earlier chunks' tokens are dropped as the loop advances, which is what
+    takes the engine out of the business of joining them."""
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _run_chunk(rt, book, rid, 1)
+    _run_chunk(rt, book, rid, 2)
+    rt.stop_loops_batched(
+        partition="default", graph_walk=CHUNK_WALK, last_node_run="llm",
+        loop_names=ParallelList([rid], [["chunk_loop:llm:prefill_text"]]),
+    )
+    out = _run_chunk(rt, book, rid, 3)
+
+    assert sorted(out.register_uuids) == [3]
+    assert _ready(rt) == [], "the loop is over, so the node is not ready again"
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_re_entering_a_chunk_walk_needs_another_seed(which):
+    """A walk entered twice (BAGEL's think-mode prefills twice) gets its seed
+    from every entry, not only the request's first."""
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    _run_chunk(rt, book, rid, 1)
+    rt.stop_loops_batched(
+        partition="default", graph_walk=CHUNK_WALK, last_node_run="llm",
+        loop_names=ParallelList([rid], [["chunk_loop:llm:prefill_text"]]),
+    )
+    _run_chunk(rt, book, rid, 2)
+    assert _ready(rt) == []
+
+    from mstar.model.submodule_base import chunk_tick_name
+    rt.ingest_inputs_batch(_ingest_block(
+        [rid, rid],
+        [_spec("text_inputs", "llm"), _spec(chunk_tick_name("llm", CHUNK_WALK), "llm")],
+    ))
+    assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+
+
 def _chunk_loop(which, remote=True):
     """``embed -> loop(llm)``, llm emitting nowhere, the Loop emitting the
     last iteration's token. Persisted and remote so staging is observable."""

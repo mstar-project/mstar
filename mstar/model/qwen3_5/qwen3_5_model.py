@@ -309,6 +309,8 @@ class Qwen3_5DenseModel(Model):
         return {"LLM": (
             ChunkingPolicy(
                 walks=("prefill_text",), chunkable=True, max_batch_tokens=budget,
+                # a prompt cannot have more chunks than tokens
+                max_chunks=self.config.max_position_embeddings,
             ),
             # carries the budget for the steps that mix a chunk with decode rows
             ChunkingPolicy(walks=(LLM_MIXED,), max_batch_tokens=budget),

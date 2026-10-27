@@ -310,6 +310,18 @@ class ChunkingPolicy:
     walks: tuple[str, ...] = ()
     # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
     chunkable: bool = False
+    # output edges a consumer needs every chunk of, gathered on the Loop and
+    # handed over as one item per chunk when the prompt finishes. An edge not
+    # named here carries the final chunk's tensors alone, the earlier chunks'
+    # being dropped as the loop advances. A consumer of a gathered edge sees a
+    # list, so it joins the pieces itself -- the engine no longer concatenates.
+    accumulated_outputs: frozenset[str] = frozenset()
+    # most chunks one prompt may take, as the chunk Loop's `max_iters`. A
+    # runaway guard, not the real count: the engine ends the loop on the final
+    # chunk, and the count is not known until the budget cuts each step. A
+    # prompt cannot have more chunks than tokens, so the model's longest
+    # prompt is always a safe value.
+    max_chunks: int = 1
     # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
     max_batch_tokens: int | None = None
     # output edge -> how its chunks are joined; unlisted edges CONCAT on dim 0
@@ -334,6 +346,18 @@ def chunk_loop_name(node_name: str, graph_walk: str) -> str:
     each has its own loop state.
     """
     return f"chunk_loop:{node_name}:{graph_walk}"
+
+
+def chunk_tick_name(node_name: str, graph_walk: str) -> str:
+    """The chunk Loop's loop-back signal, carrying nothing.
+
+    Speculation offers a next-iteration target only for a node that routes an
+    edge back to itself, so without this a chunk-only step is a pipeline
+    bubble. The node declares it as an input too -- an edge it does not read is
+    no loop-back, just an output nobody consumes -- which leaves it unready for
+    its FIRST chunk, so the conductor seeds one with the request's inputs.
+    """
+    return f"{chunk_loop_name(node_name, graph_walk)}.next_chunk"
 
 
 class InputSeqLenInfo(NamedTuple):
