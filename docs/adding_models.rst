@@ -2299,8 +2299,9 @@ Override these methods:
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
 The consuming partition's ``get_partition_forward_pass_args`` reads
-``incoming_connections``, which provides token counts and a ``producer_done`` flag, and
-uses them to decide when to run.
+``incoming_connections``, which provides token counts and a ``producer_done`` flag for
+each stream from another partition, and uses them to decide when to run. A stream from the
+client (below) has no entry there.
 
 Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
 later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer
@@ -2387,6 +2388,12 @@ streams (audio and video, say): each has its own buffer and its own end.
   Over ``/generate/ws`` the client appends and ends input explicitly (see
   :doc:`clients`); every other route ends the input as soon as the request is submitted.
   ``/generate/ws`` is on the Python frontend only, not ``--rust-frontend``.
+- The API server's data worker is the stream's producer. The conductor tells it the
+  consuming node and its ranks once per call, when it dispatches the request, and the data
+  worker sends each append's items to every one of those ranks itself, and then the
+  stream's end with how many items it carried. Every rank gets each item whole, so a client
+  stream can't take a ``sharding_config.shard_dim`` entry (startup refuses one). Once the
+  consuming partition ends, later appends for its streams are answered as late.
 
 Checklist
 ---------

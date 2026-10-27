@@ -1261,22 +1261,23 @@ class Worker:
             range_pop(synchronize=False)
             range_push("process_new_inputs.start_read")
         # Start RDMA reads for non-streaming edges with tensor_info
-        futures = self.tensor_manager.start_read_tensors(
-            request_id, non_streaming,
-            graph_walk=body.request_info.graph_walk
-        )
-        self.wakeup_event.register_futures(futures)
+        if non_streaming:
+            futures = self.tensor_manager.start_read_tensors(
+                request_id, non_streaming,
+                graph_walk=body.request_info.graph_walk
+            )
+            self.wakeup_event.register_futures(futures)
         # Start RDMA reads for streaming edges with tensor_info (will be routed to buffer in _check_ready_tensors)
         if streaming_with_tensors:
             futures = self.tensor_manager.start_read_tensors(
                 request_id, streaming_with_tensors,
             )
             self.wakeup_event.register_futures(futures)
+            # a client stream's chunks come with no forward-pass info, and drive no walk
+            walks = body.request_info.stream_consumer_walks if body.request_info is not None else {}
             for edge in streaming_with_tensors:
                 stream_buf = req_info.stream_buffers[edge.name]
-                walk = body.request_info.stream_consumer_walks.get(
-                    self._walk_driven_edges.get(edge.name)
-                )
+                walk = walks.get(self._walk_driven_edges.get(edge.name))
                 for info in edge.tensor_info:
                     stream_buf.pre_read_register(info.uuid, walk)
         if self.enable_nvtx:
