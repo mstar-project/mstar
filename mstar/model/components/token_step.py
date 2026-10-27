@@ -44,8 +44,8 @@ class TokenStepNode:
         return True
 
     def max_batch_size(self, graph_walk: str) -> int | None:
-        # the engine caps decode at its largest capture config, and with accelerator
-        # graphs off leaves it uncapped; prefill isn't captured
+        # the base default, which subclasses may narrow: the engine caps decode at
+        # its largest capture config (uncapped with accelerator graphs off)
         return None if graph_walk == self.DECODE_WALK else self.MAX_PREFILL_BATCH_SIZE
 
     def postprocess(
@@ -83,9 +83,9 @@ class TokenStepNode:
         host_rows: HostRows,
         step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``. ``step_walk``
-        changes nothing: as in ``check_stop``, prefill's token can end the
-        decode loop too."""
+        """``check_stop`` for every request off one ``tolist``. The base default
+        ignores ``step_walk``, so prefill's token can end the decode loop too;
+        subclasses may narrow that."""
         tokens = host_rows.buffers.get("new_token")
         if not torch.is_tensor(tokens) or tokens.dim() == 0:
             return None
