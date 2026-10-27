@@ -48,6 +48,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 
 from benchmark.personaplex.controls import HalfSplitRope, candidates, first_reference_decision
+from benchmark.personaplex.decode import stream_decode
 from benchmark.personaplex.resources import ResourceBackend
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.components.mimi import load_mimi_codec
@@ -511,9 +512,7 @@ def pipeline(ref, native):
     ]
     report["checks"]["max_hidden_error"] = max(r["hidden"]["max_abs"] for r in records)
     stage("production Mimi decoder and final PCM from own generated codes")
-    decoder = MimiDecoderSubmodule(codec)
-    prepared = decoder.prepare_inputs("generate", info, {"agent_frame": agent})
-    ours_pcm = decoder.forward("generate", None, **prepared.tensor_inputs, **prepared.kwargs)["audio_output"][0]
+    ours_pcm = stream_decode(MimiDecoderSubmodule(codec), agent, info)
     with ref_codec.streaming(1):
         reference_pcm = torch.cat([ref_codec.decode(c) for c in ref_agent], -1)[..., :samples]
     report["checks"]["final_pcm"] = metrics(ours_pcm, reference_pcm)

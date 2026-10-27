@@ -132,7 +132,9 @@ def test_partitions_stream_agent_frames_to_the_codec():
     assert (connection.from_partition, connection.to_partition, connection.edge_name) == (
         cfg.LM_PARTITION, cfg.CODEC_PARTITION, "agent_frame")
     policy = connection.chunk_policy_factory()
-    assert type(policy).__name__ == "FixedChunkPolicy" and policy._chunk_size == cfg.STREAM_CHUNK_FRAMES
+    assert type(policy).__name__ == "ScheduledLeftContextChunkPolicy"
+    assert (policy._schedule, policy._chunk, policy._left_context) == (
+        cfg.STREAM_CHUNK_SCHEDULE, cfg.STREAM_CHUNK_FRAMES, 0)
 
 
 def test_codec_partition_carries_the_sample_budget_and_never_finishes_itself():

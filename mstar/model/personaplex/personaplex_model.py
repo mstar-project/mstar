@@ -45,7 +45,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, TensorAndMetadata
-from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 from . import config as cfg
@@ -227,13 +227,14 @@ class PersonaPlexModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
-        # Non-overlapping chunks of new frames: the decoder keeps its own left
-        # context, so the stream must not deliver the overlap again. The stream
-        # ends with the LM partition, after its generate walk.
+        # Chunks of STREAM_CHUNK_SCHEDULE, then STREAM_CHUNK_FRAMES new frames, with no
+        # overlap: the decoder keeps its own left context. The stream ends with the LM
+        # partition, after its generate walk.
         return PartitionTopology(partitions=[cfg.LM_PARTITION, cfg.CODEC_PARTITION], connections=[
             Connection(
                 from_partition=cfg.LM_PARTITION, to_partition=cfg.CODEC_PARTITION, edge_name="agent_frame",
-                chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=cfg.STREAM_CHUNK_FRAMES),
+                chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
+                    schedule=cfg.STREAM_CHUNK_SCHEDULE, chunk=cfg.STREAM_CHUNK_FRAMES, left_context=0),
             ),
         ])
 
@@ -613,6 +614,7 @@ class PersonaPlexModel(Model):
             # Separate instances per node, like Wan2.2's VAEs; NVIDIA's other_mimi is omitted:
             # offline.py discards its outputs ([PP] offline.py:101,108,120).
             codec = load_mimi_codec(load_file(self._download(MIMI_CHECKPOINT_NAME)), device=device)
-            cls = MimiEncoderSubmodule if node_name == cfg.MIMI_ENCODER_NODE else MimiDecoderSubmodule
-            return cls(codec)
+            if node_name == cfg.MIMI_ENCODER_NODE:
+                return MimiEncoderSubmodule(codec)
+            return MimiDecoderSubmodule(codec, max_batch_size=self.max_batch_size)
         raise ValueError(f"PersonaPlex has no node {node_name!r}")

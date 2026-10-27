@@ -66,7 +66,7 @@ MAX_TEMPORAL_FORWARDS = CONTEXT_FRAMES - 1
 # Upper bound on decoded user audio: every forward a user frame, no conditioning.
 # The exact per-request limit (after conditioning) is validate_context_budget's.
 MAX_USER_AUDIO_SAMPLES = MAX_TEMPORAL_FORWARDS * FRAME_SIZE
-# Requests the LM runs in one step (the max_batch_size model kwarg). The served
+# Requests the LM and the decoder each run in one step (the max_batch_size model kwarg). The served
 # YAML's max_concurrent_requests is the tighter bound in practice; 1 runs every
 # request alone, which makes outputs independent of what else is being served.
 DEFAULT_MAX_BATCH_SIZE = 8
@@ -172,12 +172,19 @@ GENERATE_AUDIO_WALK = "generate_audio"  # generate without emitting text
 CONDITIONING_LOOP, DECODE_LOOP = "cond_loop", "decode_loop"
 # The reply's audio streams from the LM partition to the codec partition one agent frame at a time.
 LM_PARTITION, CODEC_PARTITION, CODEC_WALK = "LM", "Codec", "codec_chunk"
-# New agent frames per decoded audio chunk (4 x 80 ms = 320 ms).
-STREAM_CHUNK_FRAMES = 4
-# Agent frames of left context each chunk is decoded behind: one window of Mimi's decoder
-# transformer (250 steps at 2 per frame). Its 8 stacked layers reach further back, so a chunk
-# past the first window differs slightly from a whole-clip decode, as for Qwen3-TTS's codec.
-STREAM_CONTEXT_FRAMES = 125
+# New agent frames per decoded audio chunk: the first audio leaves after 4 frames (320 ms), then
+# chunks grow to 25 frames (2 s), as Qwen3-TTS's 12 Hz codec streams, so a running stream costs
+# few decodes. A chunk is decoded in these blocks whatever the stream delivers, so a request's
+# audio does not depend on delivery timing.
+STREAM_CHUNK_SCHEDULE = (4, 8, 16)
+STREAM_CHUNK_FRAMES = 25
+# Agent frames of left context each block is decoded behind. Mimi's decoder transformer attends
+# 250 steps (125 frames) per layer, but its 8 stacked layers reach further back; 500 frames brings
+# a long reply to the TF32 rounding floor of a whole-clip decode (measured on the checkpoint).
+STREAM_CONTEXT_FRAMES = 500
+# Frames before a block's new ones that Mimi's causal SEANet decoder reruns over: its receptive
+# field, so only the transformer pays for the long context.
+SEANET_MARGIN_FRAMES = 4
 KV_LABEL = "main"  # the LM's one paged KV label
 LM_KV, LM_ATTN, LM_POS = "lm_kv", "lm_attn", "lm_pos"
 TEXT_SAMPLER, DEPTH_SAMPLER = "text_sampler", "depth_sampler"

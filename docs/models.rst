@@ -1192,20 +1192,24 @@ request), barge-in and tensor parallelism are out of scope.
    # the Hugging Face cache on first use; set model_kwargs.voice_dir in a copy
    # of configs/personaplex.yaml to use a local directory instead.
 
-Concurrent requests share LM steps, up to ``model_kwargs.max_batch_size``
-(default 8) and the YAML's ``max_concurrent_requests``. A batched step rounds
-differently from a request run alone, so a greedy response can depend on what
-else is being served; ``max_batch_size: 1`` runs every request alone.
+Concurrent requests share LM and decoder steps, up to
+``model_kwargs.max_batch_size`` (default 8) and the YAML's
+``max_concurrent_requests``. A batched step rounds differently from a request
+run alone, so a greedy response can depend on what else is being served;
+``max_batch_size: 1`` runs every request alone.
 
 The agent's audio streams from the LM to a codec partition one frame at a
-time and is decoded in chunks of 4 frames (320 ms). Each chunk is decoded
-behind the request's last 125 frames (one window of Mimi's decoder
-transformer), so a reply within that window matches a whole-track decode;
-past it, the decoder's 8 stacked windowed layers reach further back than the
-context, and the streamed audio differs slightly from a whole-track decode
-(as for Qwen3-TTS's codec). ``python -m benchmark.personaplex.sessions``
-measures streamed delivery (time to first audio, response onset, playback
-underruns) for concurrent sessions.
+time. The first chunk is 4 frames (320 ms), then 8, 16 and 25 frames (2 s)
+each, as Qwen3-TTS's 12 Hz codec streams, so a running stream needs few
+decodes. Each block is decoded behind the request's last 500 frames: Mimi's
+decoder transformer attends 125 frames per layer, but its 8 stacked layers
+reach further back, and 500 frames keeps a long reply at the rounding floor of
+a whole-track decode (the same trade-off as Qwen3-TTS's codec). Only the
+transformer runs over that context; the causal SEANet decoder reruns over 4
+frames before the new ones, its receptive field. A request's audio does not
+depend on how the stream groups its frames. ``python -m
+benchmark.personaplex.sessions`` measures streamed delivery (time to first
+audio, response onset, playback underruns) for concurrent sessions.
 
 Request: ``/generate`` with one audio input (decoded at 24 kHz; **channel 0** is
 used, not a downmix) and output modalities ``audio`` or ``audio`` + ``text``.

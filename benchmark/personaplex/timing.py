@@ -78,6 +78,7 @@ def main():
     from moshi.utils.compile import no_cuda_graph
     from safetensors.torch import load_file
 
+    from benchmark.personaplex.decode import stream_decode
     from mstar.model.personaplex import config as cfg
     from mstar.model.personaplex.components.mimi import load_mimi_codec
     from mstar.model.personaplex.personaplex_model import PersonaPlexModel
@@ -214,8 +215,7 @@ def main():
                         host_ms.append((t1 - t0) * 1000)
             finally:
                 resources.close(rid)
-            prepared = decoder.prepare_inputs("generate", info, {"agent_frame": agent})
-            _, decode_ms = timed(lambda: decoder.forward("generate", None, **prepared.tensor_inputs, **prepared.kwargs))
+            _, decode_ms = timed(lambda: stream_decode(decoder, agent, info))  # every chunk, back to back
             total = time.perf_counter() - start
             out = summarize(frame_ms, meta["num_samples"] / cfg.SAMPLE_RATE, total)
             out.update(conditioning_ms=cond_ms, encode_ms=encode_ms, decode_ms=decode_ms,
