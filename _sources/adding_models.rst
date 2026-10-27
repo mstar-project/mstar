@@ -2036,9 +2036,12 @@ Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
 ``max_concurrent_requests: 64``, so the conductor queues further requests instead of the
 worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
 refuses at startup a cap that either cache cannot hold after the YAML's ``resources:``
-overrides.
+overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model with KV caches
+can call the same way.
 
-Whisper's ``declare_step`` shows how a write-once context is expressed with spans. The
+The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
+It lives in ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``), which
+Whisper's and Canary's decoder nodes share; Whisper adds only its token suppression. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
 0 in every later step. The ``commit`` in the prefill step converts the reservation into
 resident pages that the later steps read.

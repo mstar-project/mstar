@@ -9,6 +9,12 @@ mstar.utils.h2d
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      to_device_nonblocking
+   
    
 
    

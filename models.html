@@ -273,6 +273,8 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.canary.html">mstar.model.canary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.canary_qwen.html">mstar.model.canary_qwen</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
 </ul>
@@ -652,6 +654,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-notes">OmniVoice notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnilingual-asr-notes">Omnilingual ASR notes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>) notes</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>
@@ -829,6 +832,19 @@ only); check it before deploying.</p></td>
 in 1,600+ languages with no language code. Not autoregressive; batched across
 requests. Apache-2.0.</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">canary</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvidia/canary-1b-v2</span></code></p></td>
+<td><p>FastConformer encoder + Transformer decoder: speech recognition in 25 European
+languages and translation to or from English (<code class="docutils literal notranslate"><span class="pre">language</span></code>, English if unset, and
+<code class="docutils literal notranslate"><span class="pre">target_language</span></code> or <code class="docutils literal notranslate"><span class="pre">task=&quot;translate&quot;</span></code>). Clips up to 40 s; longer uploads are
+windowed. No timestamps.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvidia/canary-qwen-2.5b</span></code></p></td>
+<td><p>English speech recognition by an LLM: Canary’s FastConformer encoder projected into
+Qwen3-1.7B (LoRA merged at load). Clips up to 40 s; longer uploads are windowed. The
+OpenAI <code class="docutils literal notranslate"><span class="pre">prompt</span></code> is ignored. No timestamps.</p></td>
+</tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
 <td><p>Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.</p></td>
@@ -930,7 +946,7 @@ this policy. <code class="docutils literal notranslate"><span class="pre">/gener
 <li><p>The CTC head covers every language at once: <code class="docutils literal notranslate"><span class="pre">language</span></code>, <code class="docutils literal notranslate"><span class="pre">prompt</span></code> and <code class="docutils literal notranslate"><span class="pre">temperature</span></code>
 have no effect (the reference ignores a language code for CTC models too), and
 decoding is a per-frame argmax. There are no timestamps: <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code> get one cue
-spanning the file and <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> an empty segment list. Nothing detects the
+per window and <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> one segment per window, timed to the windows. Nothing detects the
 language either: <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code>’s <code class="docutils literal notranslate"><span class="pre">language</span></code> is the request’s <code class="docutils literal notranslate"><span class="pre">language</span></code> as given,
 or null. <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> is not supported.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">dtype</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">bfloat16</span></code>, the reference’s inference dtype; <code class="docutils literal notranslate"><span class="pre">float32</span></code> also
@@ -943,6 +959,33 @@ characters nearly tie, as the reference’s own batched <code class="docutils li
 <li><p>Parity scripts against Meta’s pipeline live in <code class="docutils literal notranslate"><span class="pre">test/omnilingual_asr/</span></code>
 (<code class="docutils literal notranslate"><span class="pre">record_oracle.py</span></code> runs the reference in its own venv, as it pins torch 2.8 and
 fairseq2).</p></li>
+</ul>
+</section>
+<section id="fastconformer-asr-canary-canary-qwen-notes">
+<h3>FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>) notes<a class="headerlink" href="#fastconformer-asr-canary-canary-qwen-notes" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Install with <code class="docutils literal notranslate"><span class="pre">.[asr]</span></code>. Uploads that libsndfile can’t read (M4A, WebM) are decoded by
+torchcodec, which needs FFmpeg.</p></li>
+<li><p>One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.</p></li>
+<li><p>Request fields, the same on <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code> and in <code class="docutils literal notranslate"><span class="pre">/generate</span></code>’s
+<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>:</p>
+<ul>
+<li><p><code class="docutils literal notranslate"><span class="pre">canary</span></code>: <code class="docutils literal notranslate"><span class="pre">language</span></code> (the speech’s, default <code class="docutils literal notranslate"><span class="pre">en</span></code>; one of bg, hr, cs, da, nl, en,
+et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk),
+<code class="docutils literal notranslate"><span class="pre">target_language</span></code> (a translation to or from English; the OpenAI route also takes
+<code class="docutils literal notranslate"><span class="pre">task=&quot;translate&quot;</span></code>) and <code class="docutils literal notranslate"><span class="pre">punctuation</span></code> (default on).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>: English only (checked on the OpenAI route). <code class="docutils literal notranslate"><span class="pre">instruction</span></code>
+replaces the trained one, “Transcribe the following:”; <code class="docutils literal notranslate"><span class="pre">/generate</span></code>’s text is unused.</p></li>
+</ul>
+</li>
+<li><p>A request holds up to 40.96 s. <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code> cuts longer uploads (up to
+30 min) into windows at quiet moments and joins their text. Neither model emits
+timestamps.</p></li>
+<li><p>Their YAMLs size the KV caches for <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> (64),
+and startup refuses a cap the caches can’t hold.</p></li>
+<li><p>Canary-Qwen’s default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
+smaller GPU, lower <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">resources.kv_cache.max_num_pages</span></code>
+together.</p></li>
 </ul>
 </section>
 </section>
@@ -2005,6 +2048,7 @@ fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-notes">OmniVoice notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnilingual-asr-notes">Omnilingual ASR notes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>) notes</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>

@@ -29,6 +29,8 @@
 
    audio_watermark
    base
+   canary
+   canary_qwen
    chatterbox
    command_a_plus
    components

@@ -272,6 +272,8 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.canary.html">mstar.model.canary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.canary_qwen.html">mstar.model.canary_qwen</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
 </ul>
@@ -2628,8 +2630,11 @@ Sizing the caches is only half of it: <code class="docutils literal notranslate"
 <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests:</span> <span class="pre">64</span></code>, so the conductor queues further requests instead of the
 worker offloading decoding requests to admit them. <code class="docutils literal notranslate"><span class="pre">WhisperModel.validate_config_yaml</span></code>
 refuses at startup a cap that either cache cannot hold after the YAML’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code>
-overrides.</p>
-<p>Whisper’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> shows how a write-once context is expressed with spans. The
+overrides, through <code class="docutils literal notranslate"><span class="pre">mstar.model.utils.check_kv_pools_fit</span></code>, which any model with KV caches
+can call the same way.</p>
+<p>The decoder node’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> shows how a write-once context is expressed with spans.
+It lives in <code class="docutils literal notranslate"><span class="pre">EncoderDecoderNode</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/components/encoder_decoder.py</span></code>), which
+Whisper’s and Canary’s decoder nodes share; Whisper adds only its token suppression. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
 0 in every later step. The <code class="docutils literal notranslate"><span class="pre">commit</span></code> in the prefill step converts the reservation into
 resident pages that the later steps read.</p>

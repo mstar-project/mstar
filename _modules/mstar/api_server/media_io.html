@@ -626,6 +626,8 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.canary.html">mstar.model.canary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.canary_qwen.html">mstar.model.canary_qwen</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
 </ul>
@@ -1441,7 +1443,9 @@ window.runMermaid = runMermaid;</script>
             <span class="n">frames</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">frames</span> <span class="o">&gt;</span> <span class="n">limit</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="n">AudioTooLongError</span><span class="p">(</span><span class="n">max_seconds</span><span class="p">)</span>
-            <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">data</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">))</span>
+            <span class="c1"># a mono block is its own mean, and numpy's reduction over the</span>
+            <span class="c1"># length-1 axis costs ~10x the copy</span>
+            <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">data</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">data</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">data</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">))</span>
     <span class="k">return</span> <span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span> <span class="k">if</span> <span class="n">parts</span> <span class="k">else</span> <span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)),</span> <span class="n">rate</span></div>
 
 
@@ -1489,26 +1493,13 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Decode an audio file to a float32 mono numpy waveform at ``sample_rate``,</span>
 <span class="sd">    refused with :class:`AudioTooLongError` past ``max_seconds``.</span>
 
-<span class="sd">    libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —</span>
-<span class="sd">    then torchcodec for the rest (m4a, webm, ...).</span>
+<span class="sd">    The same decode as a model's own uploads (``load_speech_file``): a file</span>
+<span class="sd">    neither libsndfile nor FFmpeg reads raises ``ValueError`` (HTTP 400), while a</span>
+<span class="sd">    missing FFmpeg stays the server's error.</span>
 <span class="sd">    """</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="n">audio</span><span class="p">,</span> <span class="n">sr</span> <span class="o">=</span> <span class="n">read_soundfile_capped</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">max_seconds</span><span class="p">)</span>
-    <span class="k">except</span> <span class="n">AudioRefusedError</span><span class="p">:</span>
-        <span class="k">raise</span>
-    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — not a libsndfile container</span>
-        <span class="k">return</span> <span class="n">decode_torchcodec_capped</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">max_seconds</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
-    <span class="n">check_resample_rate</span><span class="p">(</span><span class="n">sr</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">sr</span> <span class="o">!=</span> <span class="n">sample_rate</span><span class="p">:</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-            <span class="kn">import</span><span class="w"> </span><span class="nn">torchaudio</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.audio_features</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_speech_file</span>
 
-            <span class="n">audio</span> <span class="o">=</span> <span class="n">torchaudio</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">resample</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">audio</span><span class="p">),</span> <span class="n">sr</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span>
-        <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
-            <span class="n">idx</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">linspace</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="nb">round</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span> <span class="o">*</span> <span class="n">sample_rate</span> <span class="o">/</span> <span class="n">sr</span><span class="p">)))</span>
-            <span class="n">audio</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">interp</span><span class="p">(</span><span class="n">idx</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">audio</span><span class="p">)),</span> <span class="n">audio</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">audio</span></div>
+    <span class="k">return</span> <span class="n">load_speech_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">max_seconds</span><span class="p">)</span><span class="o">.</span><span class="n">numpy</span><span class="p">()</span></div>
 
 
 

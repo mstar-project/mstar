@@ -273,6 +273,8 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.canary.html">mstar.model.canary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.canary_qwen.html">mstar.model.canary_qwen</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
 </ul>
@@ -659,6 +661,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.copy_"><code class="docutils literal notranslate"><span class="pre">PinnedStager.copy_()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.to_device_nonblocking"><code class="docutils literal notranslate"><span class="pre">to_device_nonblocking()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -679,6 +682,15 @@ the graph; H2D copies and event waits do not. So host values go to the device
 in ONE copy from pinned memory (<code class="docutils literal notranslate"><span class="pre">PinnedStager</span></code>), padding written on the host,
 never via a device-side staging tensor. An <code class="docutils literal notranslate"><span class="pre">H2DMirror</span></code> skips re-copying
 values a destination already holds, as in a steady decode batch.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.h2d.to_device_nonblocking" title="mstar.utils.h2d.to_device_nonblocking"><code class="xref py py-obj docutils literal notranslate"><span class="pre">to_device_nonblocking</span></code></a>(tensor, device)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tensor</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without the host waiting: a CPU source goes through pinned memory, so the copy queues behind the work already on the stream instead of draining it first (a pageable copy blocks until then).</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -792,6 +804,25 @@ ahead of anything that reads <code class="docutils literal notranslate"><span cl
 
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.h2d.to_device_nonblocking">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.h2d.</span></span><span class="sig-name descname"><span class="pre">to_device_nonblocking</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/h2d.html#to_device_nonblocking"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.h2d.to_device_nonblocking" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">tensor</span></code> on <code class="docutils literal notranslate"><span class="pre">device</span></code> without the host waiting: a CPU source goes
+through pinned memory, so the copy queues behind the work already on the
+stream instead of draining it first (a pageable copy blocks until then).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tensor</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -851,6 +882,7 @@ ahead of anything that reads <code class="docutils literal notranslate"><span cl
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.PinnedStager.copy_"><code class="docutils literal notranslate"><span class="pre">PinnedStager.copy_()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.h2d.to_device_nonblocking"><code class="docutils literal notranslate"><span class="pre">to_device_nonblocking()</span></code></a></li>
 </ul>
   </nav></div>
 

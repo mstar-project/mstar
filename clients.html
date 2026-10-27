@@ -273,6 +273,8 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.canary.html">mstar.model.canary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.canary_qwen.html">mstar.model.canary_qwen</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
 </ul>
@@ -935,7 +937,7 @@ that key, which the client sends as <code class="docutils literal notranslate"><
 <td><p>The <code class="docutils literal notranslate"><span class="pre">voice</span></code> ids the served model accepts, plus its default.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/audio/transcriptions</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code>, <code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code>, <code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_*</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code>, <code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code>, <code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_*</span></code>, <code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code></p></td>
 <td><p>Speech-to-text (multipart upload; <code class="docutils literal notranslate"><span class="pre">json</span></code> / <code class="docutils literal notranslate"><span class="pre">text</span></code> / <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> /
 <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code>; streaming via <code class="docutils literal notranslate"><span class="pre">transcript.text.delta</span></code> events).</p></td>
 </tr>
@@ -997,7 +999,9 @@ Non-OpenAI knobs (e.g. <code class="docutils literal notranslate"><span class="p
 <code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code>), and <code class="docutils literal notranslate"><span class="pre">response_format</span></code>
 <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> / <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code> (or <code class="docutils literal notranslate"><span class="pre">timestamp_granularities[]</span></code>) asks the
 model for timestamps. Whisper’s language and timestamp tokens travel in the
-text stream and are lifted into <code class="docutils literal notranslate"><span class="pre">language</span></code> / <code class="docutils literal notranslate"><span class="pre">segments</span></code> by the server; a
+text stream and are lifted into <code class="docutils literal notranslate"><span class="pre">language</span></code> / <code class="docutils literal notranslate"><span class="pre">segments</span></code> by the server;
+Higgs-Audio emits no timestamps, so its <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> / <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code> get
+one segment per window, timed to the windows. A
 streaming client receives only the spoken words. Uploads longer than the
 model’s clip (30 s for Whisper) are served as consecutive windows. By default
 they run in order, openai-whisper style: each window gets the transcript so
@@ -1021,8 +1025,15 @@ its 1,600+ languages, and <code class="docutils literal notranslate"><span class
 clip of up to 20 s is one request; a longer upload is cut into windows of about equal
 length, at most 16 s, at quiet points and transcribed in parallel (<code class="docutils literal notranslate"><span class="pre">window_seconds</span></code>
 in <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>, 5 to 40, sets both lengths). There are no timestamps: <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code>
-get one cue spanning the file. Nothing detects the language: <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code>’s
+get one cue per window, timed to the windows. Nothing detects the language: <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code>’s
 <code class="docutils literal notranslate"><span class="pre">language</span></code> is the request’s <code class="docutils literal notranslate"><span class="pre">language</span></code> as given, or null.</p></li>
+<li><p><strong>Canary / Canary-Qwen</strong> — no conditioning text (<code class="docutils literal notranslate"><span class="pre">prompt</span></code> is dropped) and no
+timestamps: <code class="docutils literal notranslate"><span class="pre">timestamp_granularities</span></code> is a 400, and <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code> /
+<code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> get one segment per window. Canary takes <code class="docutils literal notranslate"><span class="pre">language</span></code> (the speech’s,
+English by default) and, through <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>, <code class="docutils literal notranslate"><span class="pre">target_language</span></code> or
+<code class="docutils literal notranslate"><span class="pre">task=&quot;translate&quot;</span></code> (into English) and <code class="docutils literal notranslate"><span class="pre">punctuation</span></code>. Canary-Qwen only transcribes
+English, and refuses a <code class="docutils literal notranslate"><span class="pre">task</span></code> other than <code class="docutils literal notranslate"><span class="pre">transcribe</span></code>. Uploads longer than the
+models’ 40 s clip run as parallel windows.</p></li>
 <li><p><strong>Realtime transcription</strong> — every <code class="docutils literal notranslate"><span class="pre">chunk_seconds</span></code> (default 2 s) of new audio the
 session re-transcribes everything heard so far as one engine request whose assistant
 turn is prefilled with the previous hypothesis minus its last <code class="docutils literal notranslate"><span class="pre">unfixed_tokens</span></code>

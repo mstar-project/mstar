@@ -273,6 +273,8 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.canary.html">mstar.model.canary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.canary_qwen.html">mstar.model.canary_qwen</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
 </ul>
@@ -1020,8 +1022,9 @@ resampling to <code class="docutils literal notranslate"><span class="pre">targe
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">decode_audio</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16000</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">MAX_AUDIO_SECONDS</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#decode_audio"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.decode_audio" title="Link to this definition">#</a></dt>
 <dd><p>Decode an audio file to a float32 mono numpy waveform at <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code>,
 refused with <a class="reference internal" href="#mstar.api_server.media_io.AudioTooLongError" title="mstar.api_server.media_io.AudioTooLongError"><code class="xref py py-class docutils literal notranslate"><span class="pre">AudioTooLongError</span></code></a> past <code class="docutils literal notranslate"><span class="pre">max_seconds</span></code>.</p>
-<p>libsndfile (<code class="docutils literal notranslate"><span class="pre">soundfile</span></code>) first — no FFmpeg needed for wav/flac/ogg/mp3 —
-then torchcodec for the rest (m4a, webm, …).</p>
+<p>The same decode as a model’s own uploads (<code class="docutils literal notranslate"><span class="pre">load_speech_file</span></code>): a file
+neither libsndfile nor FFmpeg reads raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> (HTTP 400), while a
+missing FFmpeg stays the server’s error.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
