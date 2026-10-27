@@ -1179,8 +1179,9 @@ serves it as an **offline, preloaded-input replay**: the whole user WAV arrives
 with the request, the model advances once per 80 ms frame across all of it, and
 the response is an agent audio track time-aligned to the input (plus the
 agent's text stream). It is not turn-based: the agent may speak while the user
-speaks. Live ingress, barge-in, streamed output and tensor parallelism are out
-of scope.
+speaks. The reply streams back while the model works through the clip: text
+every frame, audio in chunks. Live ingress (feeding audio into a running
+request), barge-in and tensor parallelism are out of scope.
 
 .. code-block:: bash
 
@@ -1195,6 +1196,16 @@ Concurrent requests share LM steps, up to ``model_kwargs.max_batch_size``
 (default 8) and the YAML's ``max_concurrent_requests``. A batched step rounds
 differently from a request run alone, so a greedy response can depend on what
 else is being served; ``max_batch_size: 1`` runs every request alone.
+
+The agent's audio streams from the LM to a codec partition one frame at a
+time and is decoded in chunks of 4 frames (320 ms). Each chunk is decoded
+behind the request's last 125 frames (one window of Mimi's decoder
+transformer), so a reply within that window matches a whole-track decode;
+past it, the decoder's 8 stacked windowed layers reach further back than the
+context, and the streamed audio differs slightly from a whole-track decode
+(as for Qwen3-TTS's codec). ``python -m benchmark.personaplex.sessions``
+measures streamed delivery (time to first audio, response onset, playback
+underruns) for concurrent sessions.
 
 Request: ``/generate`` with one audio input (decoded at 24 kHz; **channel 0** is
 used, not a downmix) and output modalities ``audio`` or ``audio`` + ``text``.

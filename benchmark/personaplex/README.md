@@ -94,6 +94,15 @@ every stage passed or was skipped.
 stage's token differences from its saved arrays and exits 1 if any token
 differs.
 
+`python -m benchmark.personaplex.sessions` runs N concurrent streamed requests
+against a running server on a clip of user speech followed by silence
+(`test/personaplex/duplex_clip.py` makes one). It reports per session:
+time to first audio; response onset on the audio timeline (signed, with
+speech already running at the user's speech end reported separately); and
+playback underruns with a fixed buffer. It exits 1 if any session fails or
+returns the wrong length of audio. A discarded warm-up wave runs first. It measures streamed delivery;
+`benchmark.runner` remains the throughput harness.
+
 ## Limits
 
 - Exact-token parity on the served path is not guaranteed: FlashInfer's

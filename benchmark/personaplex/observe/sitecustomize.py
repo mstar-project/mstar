@@ -1,4 +1,4 @@
-"""Opt-in hooks for harness-launched server workers: CPU tensor ownership observation, and an eager control."""
+"""Opt-in hooks for harness-launched server workers: tensor ownership observation, an eager control, a replay trace."""
 
 import json
 import os
@@ -110,3 +110,22 @@ if os.environ.get("PERSONAPLEX_EAGER_CONTROL") == "1":
 
     LMSubmodule.get_accelerator_graph_configs = lambda self, device, tp_world_size=1: []
     print("PERSONAPLEX_EAGER_CONTROL: LM capture configs suppressed", flush=True)
+
+if os.environ.get("PERSONAPLEX_REPLAY_TRACE") == "1":
+    # Diagnostic evidence that captured graphs actually replay under load (a capture
+    # at startup does not prove it): count replays per node and log every 100th.
+    from collections import Counter
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    replays = Counter()
+    original_replay = AcceleratorGraphRunner._replay
+
+    def counted_replay(self, lease):
+        replays[self._submodule_name] += 1
+        if replays[self._submodule_name] % 100 == 1:
+            print(f"PERSONAPLEX_REPLAY_TRACE {self._submodule_name} replays={replays[self._submodule_name]} "
+                  f"bucket={lease.bucket}", flush=True)
+        return original_replay(self, lease)
+
+    AcceleratorGraphRunner._replay = counted_replay

@@ -455,6 +455,69 @@ def test_server_close_stops_workers_whose_launcher_already_exited(tmp_path):
             pass
 
 
+def test_sessions_playback_counts_underruns_and_shifts_later_deadlines():
+    from benchmark.personaplex.sessions import playback
+
+    rate = 24000
+    on_time = [(1.0, rate), (1.5, rate), (2.0, 0)]  # each second of audio arrives before it is needed
+    assert playback(on_time, rate=rate, buffer_s=0.5) == {"underruns": 0, "stall_s": 0.0}
+    late = [(1.0, rate), (3.0, rate), (3.2, rate)]  # needed at 2.5, arrives 3.0; playback resumes from 3.0
+    result = playback(late, rate=rate, buffer_s=0.5)
+    assert result["underruns"] == 1 and abs(result["stall_s"] - 0.5) < 1e-9
+    assert playback([], rate=rate) == {"underruns": 0, "stall_s": 0.0}
+
+
+def test_sessions_onset_is_found_within_chunks_and_respects_overlap():
+    from benchmark.personaplex.sessions import response_onset, speech_segments
+
+    rate = 24000
+    track = np.zeros(rate * 6, dtype=np.float32)
+    track[int(3.37 * rate) : int(4.5 * rate)] = 0.3  # starts mid-way through a 320 ms chunk
+    segments = speech_segments(track, rate)
+    assert len(segments) == 1 and abs(segments[0][0] - 3.36) < 0.021
+    onset = response_onset(segments, speech_end=3.0)
+    assert not onset["already_speaking_at_speech_end"] and abs(onset["onset_s"] - 0.36) < 0.021
+    # The agent began before the user finished: a negative onset, not ~0.
+    early = response_onset([(2.6, 4.0)], speech_end=3.0)
+    assert abs(early["onset_s"] + 0.4) < 1e-9 and not early["already_speaking_at_speech_end"]
+    # Talking long before speech end and still going: reported as such, and the next segment is the onset.
+    running = response_onset([(0.5, 3.5), (4.2, 5.0)], speech_end=3.0)
+    assert running["already_speaking_at_speech_end"] and abs(running["onset_s"] - 1.2) < 1e-9
+    assert speech_segments(np.zeros(100, dtype=np.float32), rate) == []
+    blip = np.zeros(rate, dtype=np.float32)
+    blip[: int(0.05 * rate)] = 0.5  # shorter than the minimum voiced duration
+    assert speech_segments(blip, rate) == []
+
+
+def test_sessions_cell_is_invalid_and_exits_nonzero_when_a_session_fails(tmp_path, monkeypatch):
+    from benchmark.personaplex import sessions
+
+    clip = tmp_path / "user.wav"
+    with wave.open(str(clip), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(np.zeros(4800, dtype="<i2").tobytes())
+
+    def fake_session(url, audio, voice, timeout, out):
+        failing = len(calls) == 1
+        calls.append(1)
+        samples = np.zeros(4800 if not failing else 1920, dtype=np.float32)
+        out.update(wall_s=0.1, arrivals=[(0.05, len(samples))], pcm=samples)
+        if failing:
+            out["error"] = "RuntimeError('stream cut')"
+
+    calls = []
+    monkeypatch.setattr(sessions, "run_session", fake_session)
+    cell = sessions.run_cell("http://x", str(clip), 2, 0.1, "NATF2", 0.32, 60)
+    assert cell["completed"] == 1 and not cell["valid"]
+    monkeypatch.setattr(sys, "argv", ["sessions", "--url", "http://x", "--audio", str(clip), "--speech-end", "0.1",
+                                      "--sessions", "2", "--warmup", "0", "--output", str(tmp_path / "out.json")])
+    calls.clear()
+    assert sessions.main() == 1
+    assert json.loads((tmp_path / "out.json").read_text())["cells"][0]["valid"] is False
+
+
 def test_serving_config_override_copies_the_yaml_with_one_batch_size(tmp_path):
     import yaml
 
