@@ -31,7 +31,6 @@
    add_layernorm
    attention
    causal_conv1d
-   client_errors
    containers
    device
    exitcode

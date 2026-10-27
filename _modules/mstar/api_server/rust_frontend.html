@@ -754,7 +754,6 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.client_errors.html">mstar.utils.client_errors</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
@@ -1002,7 +1001,6 @@ window.runMermaid = runMermaid;</script>
     <span class="n">RustZMQCommunicator</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">PromptPart</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.client_errors</span><span class="w"> </span><span class="kn">import</span> <span class="n">client_error_text</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1139,10 +1137,8 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"data"</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">detail</span><span class="p">)</span><span class="o">.</span><span class="n">encode</span><span class="p">(),</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"status"</span><span class="p">:</span> <span class="n">status</span><span class="p">},</span>
                 <span class="p">})</span>
                 <span class="k">return</span>
-            <span class="n">text</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">client_error_text</span><span class="p">(</span>
-                <span class="n">e</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"submit </span><span class="si">{</span><span class="n">rid</span><span class="si">}</span><span class="s2"> failed"</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="n">logger</span><span class="p">,</span> <span class="n">type_name</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-            <span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_err</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="n">text</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"submit </span><span class="si">%s</span><span class="s2"> failed: </span><span class="si">%r</span><span class="s2">"</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_err</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="nb">repr</span><span class="p">(</span><span class="n">e</span><span class="p">))</span>
             <span class="k">return</span>
         <span class="c1"># Bound to this submission now, not when the task first runs: a later</span>
         <span class="c1"># submit in the same receive batch may reuse the rid.</span>
@@ -1160,15 +1156,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">})</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_send</span><span class="p">({</span><span class="s2">"t"</span><span class="p">:</span> <span class="s2">"done"</span><span class="p">,</span> <span class="s2">"rid"</span><span class="p">:</span> <span class="n">rid</span><span class="p">,</span> <span class="s2">"sub"</span><span class="p">:</span> <span class="n">sub</span><span class="p">})</span>
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — includes the per-request timeout</span>
-            <span class="n">detail</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">detail</span><span class="p">:</span>
-                <span class="n">detail</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">detail</span><span class="p">)</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"request </span><span class="si">%s</span><span class="s2"> failed: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">detail</span><span class="p">)</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">detail</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">client_error_text</span><span class="p">(</span>
-                    <span class="n">e</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"request </span><span class="si">{</span><span class="n">rid</span><span class="si">}</span><span class="s2"> failed"</span><span class="p">,</span> <span class="n">log</span><span class="o">=</span><span class="n">logger</span><span class="p">,</span> <span class="n">type_name</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
-                <span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_err</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="n">detail</span><span class="p">)</span>
+            <span class="n">detail</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">repr</span><span class="p">(</span><span class="n">e</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"request </span><span class="si">%s</span><span class="s2"> failed: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">detail</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_err</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">sub</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">detail</span><span class="p">))</span>
         <span class="k">finally</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_keys</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">sub</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
 
