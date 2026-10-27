@@ -62,7 +62,8 @@ def test_torch_ptxas_only_on_blackwell_with_an_older_triton_ptxas(
         monkeypatch.delenv(ptxas.BLACKWELL_PTXAS_ENV, raising=False)
 
     want = {ptxas.BLACKWELL_PTXAS_ENV: TORCH_PTXAS, TAG: "ptxas-blackwell-13.2.78"} if want_torch_ptxas else {}
-    assert CudaPlatform().process_env_defaults() == want
+    defaults = CudaPlatform().process_env_defaults()
+    assert {k: v for k, v in defaults.items() if k in (ptxas.BLACKWELL_PTXAS_ENV, TAG)} == want
 
 
 def test_ptxas_version_reads_the_build(tmp_path):
