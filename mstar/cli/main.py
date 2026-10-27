@@ -49,8 +49,11 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
-    # ASR (Beta, un-optimized) — audio in, transcript out.
+    # ASR — audio in, transcript out.
     "whisper_large": "whisper_large.yaml",
+    "whisper_large_v3_turbo": "whisper_large_v3_turbo.yaml",
+    "qwen3_asr": "qwen3_asr.yaml",
+    "qwen3_asr_realtime": "qwen3_asr_realtime.yaml",
     "higgs_audio": "higgs_audio.yaml",
     "omnilingual_asr_ctc_300m": "omnilingual_asr_ctc_300m.yaml",
     "omnilingual_asr_ctc_1b": "omnilingual_asr_ctc_1b.yaml",
@@ -190,15 +193,17 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
-    if model.startswith("omnilingual_asr_ctc_") or model in (
-        "whisper_large", "higgs_audio", "canary", "canary_qwen",
-    ):
+    if model in ("whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
+                 "canary", "canary_qwen"):
+        lines.append("    print(client.transcribe(\"speech.wav\", language=\"en\"))")
+    if model.startswith("omnilingual_asr_ctc_"):
         lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
                      "input_modalities=(\"audio\",\"text\"))")
         lines.append("    print(res.text)  # transcript")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
+                 "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
                  "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
@@ -213,6 +218,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
             lines.append("    oai.images.generate(model=\"bagel\", prompt=\"a cat\")")
         if model in ("cosmos3", "cosmos3_super"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a red cube\", size=\"320x192\")")
+        if model in ("whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime"):
+            lines.append(f"    oai.audio.transcriptions.create(model=\"{model}\", "
+                         "file=open(\"speech.wav\", \"rb\"), language=\"en\")")
         if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a cat in a hat\", size=\"1024x1024\")")
         if model == "ltx2_5":

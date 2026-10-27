@@ -262,6 +262,7 @@ def _preprocess_thread(model):
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.out_queue = queue.Queue()
     wt.model = model
+    wt._client_edges = frozenset()
     wt.request_model_kwargs = {}
     wt.tensor_uuid_to_metadata_per_request = {"r1": {"u1": {}}}
     wt.enable_prof = False

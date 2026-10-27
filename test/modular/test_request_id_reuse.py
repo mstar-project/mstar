@@ -37,6 +37,7 @@ from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
 from mstar.api_server.entrypoint import request_id_in_use
 from mstar.api_server.request_types import APIServerMessage, RequestFailed, ResultChunk
+from mstar.streaming.topology import PartitionTopology
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     NewRequestConductor,
@@ -50,6 +51,9 @@ TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
 
 class _Model:
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
+
     def process_prompt(self, *args, **kwargs):
         return None
 
@@ -80,6 +84,13 @@ class _Socket:
 
     def send(self, entity, msg):
         self.sent.append((entity, msg))
+
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
 
     def deliver(self, message_type, body):
         self.inbox.put(WorkerMessage(message_type=message_type, body=body))

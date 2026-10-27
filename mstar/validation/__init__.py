@@ -12,6 +12,7 @@ from typing import Any, NamedTuple
 
 from mstar.distributed.base import ShardingConfig
 from mstar.model.base import Model, WorkerGraph
+from mstar.validation.client_streams import check_client_streams
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems
 from mstar.validation.resources import check_resources, resources_shape_problem
@@ -68,6 +69,8 @@ def validate_deployment(
     problems = list(check_knobs())
     if "max_seq_len" not in config:
         problems.append("the config must define `max_seq_len`")
+    if not isinstance(mps := config.get("mps", False), bool):
+        problems.append(f"mps must be true or false, got {mps!r}")
     # model hooks read `resources:` as a mapping; check_resources reports a bad one
     if resources_shape_problem(config) is None:
         try:
@@ -113,6 +116,8 @@ def validate_deployment(
         problems.append(_unreadable("get_node_resources", e))
     if specs is not None:
         problems += _checked("checking the node resources", check_resources, model, specs, config)
+    # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
+    problems += _checked("checking the client streams", check_client_streams, model, config)
     if deployment is not None:
         problems += _checked(
             "checking the worker graphs", check_worker_graphs,
