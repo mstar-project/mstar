@@ -24,6 +24,7 @@ import torch
 from mstar.model.cosmos3.components.packing import (
     action_condition_frame_indexes,
     build_action_static_inputs,
+    build_static_inputs,
     get_3d_mrope_ids_action_tokens,
     vision_condition_frame_indexes,
 )
@@ -116,6 +117,31 @@ def test_action_static_layout() -> None:
         exp_act_noisy = action_chunk - len(_ref_action_condition_indexes(mode, action_chunk))
         assert s["num_noisy_action_tokens"] == exp_act_noisy
         assert s["action_mse_loss_indexes"].numel() == exp_act_noisy
+
+
+def test_gen_position_ids_do_not_depend_on_prompt_length() -> None:
+    """The denoise step is compiled with static shapes and strides, so the
+    generation band's position ids must look the same for every prompt length."""
+    cfg = _cfg()
+    latent_shape = (1, cfg.latent_channel, 3, 4, 4)
+    builds = {
+        "action": lambda ids: build_action_static_inputs(
+            ids, latent_shape, 8, "policy", cfg, cfg.vae.scale_factor_temporal,
+            fps=10.0, action_fps=10.0, action_start_offset=1, device="cpu",
+        ),
+        "sound": lambda ids: build_static_inputs(
+            ids, latent_shape, cfg, cfg.vae.scale_factor_temporal, fps=10.0, device="cpu",
+            sound_latent_frames=4,
+        ),
+    }
+    for build in builds.values():
+        layouts = set()
+        for n in (4, 9, 23):
+            s = build(list(range(1, n + 1)))
+            gen = s["gen_position_ids"]
+            assert torch.equal(gen, s["position_ids"][:, s["und_len"]:])
+            layouts.add((tuple(gen.shape), gen.stride(), gen.storage_offset()))
+        assert len(layouts) == 1
 
 
 def _run_mode(model, cfg, mode, latent_shape, action_chunk, ids):
