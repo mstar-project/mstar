@@ -147,3 +147,27 @@ def test_remove_uploads_leaves_a_file_outside_the_upload_dir(tmp_path):
     media_io.remove_uploads({"audio": [str(saved), str(preset)]}, upload_dir)
 
     assert not saved.exists() and preset.exists()
+
+
+# G.711 reference pairs from CPython's audioop (ulaw2lin / alaw2lin / lin2ulaw /
+# lin2alaw), the same tables as ITU-T G.711 and Sun's g711.c
+_ULAW_DECODE = {0x00: -32124, 0x01: -31100, 0x0F: -16764, 0x10: -15996, 0x3F: -1980, 0x70: -120,
+                0x7E: -8, 0x7F: 0, 0x80: 32124, 0x8F: 16764, 0xC0: 1884, 0xF0: 120, 0xFE: 8, 0xFF: 0}
+_ALAW_DECODE = {0x00: -5504, 0x0F: -6784, 0x10: -2752, 0x2A: -32256, 0x54: -24, 0x55: -8, 0x7F: -848,
+                0x80: 5504, 0xAA: 32256, 0xD4: 24, 0xD5: 8, 0xFF: 848}
+_PCM = [-32768, -32124, -8159, -100, -1, 0, 1, 7, 8, 100, 1000, 8158, 32000, 32767]
+_ULAW_ENCODE = [0, 0, 31, 114, 126, 255, 255, 254, 254, 242, 206, 159, 128, 128]
+_ALAW_ENCODE = [42, 42, 10, 83, 85, 213, 213, 213, 213, 211, 250, 138, 170, 170]
+
+
+@pytest.mark.parametrize("law, decode, encode", [
+    ("audio/pcmu", _ULAW_DECODE, _ULAW_ENCODE),
+    ("audio/pcma", _ALAW_DECODE, _ALAW_ENCODE),
+])
+def test_g711_matches_the_reference_tables(law, decode, encode):
+    codes = bytes(decode)
+    assert media_io.g711_decode(codes, law).tolist() == list(decode.values())
+    assert list(media_io.g711_encode(np.array(_PCM, dtype="<i2"), law)) == encode
+    # every code decodes to a level that encodes back to a code of the same level
+    levels = media_io.g711_decode(bytes(range(256)), law)
+    assert (media_io.g711_decode(media_io.g711_encode(levels, law), law) == levels).all()
