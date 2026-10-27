@@ -95,6 +95,7 @@ impl NodeState {
 
 #[derive(Clone, Default)]
 struct LoopState {
+    max_iters: u32,          // Loop.max_iters, this request's copy
     curr_iter: u32,          // Loop.curr_iter
     finish_signal: bool,     // Loop._finish_signal
     done: bool,              // Loop.is_done
@@ -193,7 +194,11 @@ pub struct RequestState {
 impl RequestState {
     pub fn new(graph: GraphRef) -> Self {
         let nodes = graph.nodes.iter().map(|n| NodeState::new(n.inputs.len())).collect();
-        let loops = vec![LoopState::default(); graph.loops.len()];
+        let loops = graph
+            .loops
+            .iter()
+            .map(|l| LoopState { max_iters: l.max_iters, ..LoopState::default() })
+            .collect();
         let w = graph.n_ready_words();
         let mut s = Self {
             nodes, loops, ready: vec![0; w], ready_streaming: vec![0; w],
@@ -563,7 +568,7 @@ impl RequestState {
 
         let finishing = {
             let st = &self.loops[lid as usize];
-            st.finish_signal || lspec.max_iters == st.curr_iter + 1
+            st.finish_signal || st.max_iters == st.curr_iter + 1
         };
         if finishing {
             self.finish_loop(g, lid, out, filtered);
@@ -764,6 +769,15 @@ impl RequestState {
         st.done || st.finish_signal
     }
 
+    pub fn loop_max_iters(&self, lid: LoopId) -> u32 {
+        self.loops[lid as usize].max_iters
+    }
+
+    pub fn cap_loop(&mut self, lid: LoopId, cap: u32) {
+        let st = &mut self.loops[lid as usize];
+        st.max_iters = st.max_iters.min(cap);
+    }
+
     pub fn loop_indices(&self) -> Vec<u32> {
         self.loops.iter().map(|l| l.curr_iter).collect()
     }
@@ -840,7 +854,7 @@ impl RequestState {
             n.clear();
         }
         for l in self.loops.iter_mut() {
-            *l = LoopState::default();
+            *l = LoopState { max_iters: l.max_iters, ..LoopState::default() };
         }
         for w in self.ready.iter_mut() { *w = 0 }
         for w in self.ready_streaming.iter_mut() { *w = 0 }

@@ -190,6 +190,6 @@ def test_rust_frontend_submit_without_text_is_a_400(server, text):
 
 
 def test_text_is_still_tokenized_with_its_voice():
-    (ids,) = _orpheus().process_prompt("hi", ["text"], ["audio"], voice="tara")["text_inputs"]
+    (ids,) = _orpheus().process_prompt("hi", ["text"], ["audio"], voice="tara").new_input_tensors["text_inputs"]
     config = OrpheusModelConfig()
     assert ids.tolist() == [config.start_token_id, *map(ord, "tara: hi"), *config.end_token_ids]

@@ -62,6 +62,9 @@ class _TensorManager:
         ready, self.ready = self.ready, {}
         return ready
 
+    def take_failed_reads(self):
+        return []
+
     def get_tensor(self, uuid):
         return object()
 

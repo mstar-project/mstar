@@ -61,6 +61,7 @@ def test_preprocess_failure_emits_error_chunk():
         force_cleanup_request=cleaned.append,
         has_inflight_reads=lambda rid: False,
         get_ready_tensors=lambda: {},
+        take_failed_reads=lambda: [],
     )
     wt.model = _RejectingModel()
     wt.device = "cpu"

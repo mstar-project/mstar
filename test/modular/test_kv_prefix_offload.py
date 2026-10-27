@@ -6,15 +6,16 @@ the index first leaves the transfer with whatever is genuinely new, which for a
 second turn of the same conversation can be nothing at all.
 
 An offload meets the same sharing from the other side. A page the suspended
-request shares with the index can be evicted while it is away, so the pages it
-left are not there to take back: its host copy is the authoritative one, and
-reload allocates fresh pages and copies into them.
+request shares with the index can be evicted while it is away, so reload takes
+back what the index still holds and copies the rest from the host into fresh
+pages.
 """
 
 from __future__ import annotations
 
 import sys
 import threading
+import time
 
 sys.path.insert(0, ".")
 
@@ -22,7 +23,8 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv import page_copier
+from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import (
     KVManager,
@@ -30,6 +32,7 @@ from mstar.engine.resources.kv.manager import (
     PublishedKVInfo,
 )
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.model.submodule_base import ARNodeInputs
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the host pool pins its memory"
@@ -74,12 +77,16 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _manager(max_num_pages: int = 64, cpu_offload_pages: int = 0) -> KVManager:
+def _manager(
+    max_num_pages: int = 64, cpu_offload_pages: int = 0, layout: KVLayout = KVLayout.NHD,
+) -> KVManager:
+    mla = (dict(kv_lora_rank=3, qk_rope_head_dim=1, num_qo_heads=2)
+           if layout == KVLayout.MLA else {})
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
             max_num_pages=max_num_pages, page_size=PAGE_SIZE,
-            cpu_offload_pages=cpu_offload_pages,
+            cpu_offload_pages=cpu_offload_pages, layout=layout, **mla,
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cuda" if cpu_offload_pages else "cpu"),
@@ -100,7 +107,7 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": _keys(tokens)},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
-        prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
+        kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
     ))
 
 
@@ -112,6 +119,29 @@ def _run(kv: KVManager, rid: str, tokens: list[int]) -> None:
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
     kv.commit(step, ctx)
+
+
+def _serve(kv: KVManager, rid: str, tokens: list[int]) -> None:
+    _ingest(kv, rid, tokens)
+    inputs = ARNodeInputs(input_seq_len=len(tokens))
+    prefix = kv.resolve_cached_prefix(rid, NODE, WALK, inputs)
+    kv.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
+    held = prefix.tokens if prefix is not None else 0
+    step = KVStep(segments=(Segment(rid, "main", len(tokens) - held),))
+    ctx = StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False)
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
+
+
+def _paint(kv: KVManager, pages: list[int], base: float) -> torch.Tensor:
+    for i, page in enumerate(pages):
+        kv.kv_cache.tensor[:, page] = base + i
+    return kv.kv_cache.tensor[:, pages].clone()
+
+
+def _scribble_free(kv: KVManager) -> None:
+    kv.kv_cache.tensor[:, list(kv._arena.allocator.free_pages.queue)] = -99.0
 
 
 def _published(kv: KVManager, rid: str, seq_len: int, pages: list[int]):
@@ -226,7 +256,7 @@ def test_a_shared_page_can_be_evicted_while_its_request_is_away():
     assert kv._index.pages(), "nothing was indexed, so nothing is shared"
 
     assert kv.offload("a") > 0, "the request did not move to the host"
-    freed = kv._index.evict(len(shared))
+    freed = len(kv._index.evict(len(shared)))
 
     assert freed > 0, (
         "the pages the request left behind could not be given back while it "
@@ -287,3 +317,47 @@ def test_a_pool_of_running_requests_still_refuses_a_reload():
     )
     assert kv.is_offloaded("a"), "a refused reload moved the request anyway"
     kv.assert_pages_conserved()
+
+
+SHARED = list(range(4 * PAGE_SIZE))
+
+
+@requires_cuda
+@pytest.mark.parametrize("layout", [KVLayout.NHD, KVLayout.MLA])
+def test_every_page_comes_back_byte_for_byte(layout):
+    kv = _manager(cpu_offload_pages=32, layout=layout)
+    _serve(kv, "seed", SHARED + [1])
+    _serve(kv, "a", SHARED + list(range(100, 100 + 2 * PAGE_SIZE + 3)))
+    expected = _paint(kv, kv._streams["a"]["main"].page_indices, base=1.0)
+
+    assert kv.offload("a") > 0, "a did not move to the host"
+    # a's own keyed pages leave the device index, so they come back from the host
+    kv._index.evict(2)
+    _scribble_free(kv)
+    assert kv.reload("a"), "a did not come back"
+
+    assert torch.equal(kv.kv_cache.tensor[:, kv._streams["a"]["main"].page_indices], expected), (
+        "a page came back from the round trip with other bytes"
+    )
+    kv.assert_pages_conserved()
+
+
+
+
+@requires_cuda
+def test_copies_by_key_do_not_block_the_host():
+    kv = _manager(cpu_offload_pages=32)
+    assert not isinstance(kv._cpu_pool._copier, page_copier.TorchCopier), (
+        "no 2D async memcpy binding loaded on a CUDA or ROCm build of torch"
+    )
+    prompt = list(range(6 * PAGE_SIZE + 3))
+    _serve(kv, "a", prompt)
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(500_000_000)  # a few hundred ms of compute ahead of the copies
+    start = time.perf_counter()
+    assert kv.offload("a") > 0
+    kv._index.evict(6)
+    assert kv.reload("a")
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.05, f"the host waited {elapsed * 1e3:.0f} ms on an offload and reload by key"

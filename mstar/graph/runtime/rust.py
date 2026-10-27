@@ -292,6 +292,7 @@ class RustGraphRuntime(GraphRuntime):
         self, request_id: str, partition: str, graph_walk: str,
         partition_worker_graph_ids: list[int],
         worker_graph_to_workers: ParallelList[int, list[str]],
+        loop_caps: dict[str, int],
     ) -> int:
         flat: list[str] = []
         counts: list[int] = []
@@ -306,6 +307,7 @@ class RustGraphRuntime(GraphRuntime):
             # is derived from.
             list(partition_worker_graph_ids),
             list(worker_graph_to_workers.keys), flat, counts,
+            list(loop_caps), list(loop_caps.values()),
         )
         # One NewRequest arrives PER PARTITION, all carrying the same map, so
         # the first one settles it.

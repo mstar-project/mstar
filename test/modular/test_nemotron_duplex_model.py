@@ -227,7 +227,7 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
     out = model.process_prompt(
         None, ["audio"], ["audio", "text"],
         tensors={"audio_inputs": [torch.zeros(16000)]},
-    )
+    ).new_input_tensors
     assert "audio_features" in out
     assert int(out["prev_text"][0].item()) == model.config.text_bos_id
     assert int(out["prev_func"][0].item()) == model.config.text_pad_id
@@ -238,7 +238,7 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
     out_p = model.process_prompt(
         "You are NVIDIA Voice Chat.", ["audio", "text"], ["audio", "text"],
         tensors={"audio_inputs": [torch.zeros(16000)]},
-    )
+    ).new_input_tensors
     assert int(out_p["prev_text"][0].item()) == model.config.text_pad_id
     assert out_p["text_inputs"][0].tolist() == [5, 6, 7] and "has_prompt" in out_p
 
@@ -253,7 +253,7 @@ def test_duplex_process_prompt_rejects_audio_under_one_frame():
         with pytest.raises(ValueError, match="need at least"):
             model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(n)]})
     out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(frame)]})
-    assert out["audio_features"][0].numel() == frame
+    assert out.new_input_tensors["audio_features"][0].numel() == frame
 
 
 def test_duplex_process_prompt_rejects_bad_requests():
@@ -283,10 +283,10 @@ def test_duplex_process_prompt_scales_down_over_full_scale_audio():
     model = _make_model()
     wav = torch.sin(torch.arange(16000) / 10.0)
     out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [wav * 1e6]})
-    assert torch.allclose(out["audio_features"][0], wav, atol=1e-6)
+    assert torch.allclose(out.new_input_tensors["audio_features"][0], wav, atol=1e-6)
     quiet = wav * 0.5
     out = model.process_prompt(None, ["audio"], ["audio", "text"], tensors={"audio_inputs": [quiet]})
-    assert torch.equal(out["audio_features"][0], quiet)
+    assert torch.equal(out.new_input_tensors["audio_features"][0], quiet)
 
 
 def test_duplex_no_prompt_seeds_initial_decode_inputs():

@@ -59,6 +59,8 @@ class _FakeMooncake:
         self.regions: dict[int, int] = {}
         self.calls: list[tuple] = []
         self.gate: threading.Event | None = None
+        self._batch_ids = itertools.count(1)
+        self.batches: dict[int, int] = {}
         self.instances.append(self)
 
     def initialize(self, hostname, metadata_server, protocol, device):
@@ -87,16 +89,22 @@ class _FakeMooncake:
         self.calls.append(("unregister", ptr, ret))
         return ret
 
-    def batch_transfer_sync_read(self, session, local_ptrs, remote_ptrs, lengths):
+    def batch_transfer_async_read(self, session, local_ptrs, remote_ptrs, lengths):
         self.calls.append(("read", tuple(lengths)))
         if self.gate is not None:
             self.gate.wait(10)
         peer = self.sessions[session]
+        batch_id = next(self._batch_ids)
         if any(n and not peer._covers(r, n) for r, n in zip(remote_ptrs, lengths, strict=True)):
-            return -1
+            self.batches[batch_id] = -1
+            return batch_id
         for local, remote, n in zip(local_ptrs, remote_ptrs, lengths, strict=True):
             ctypes.memmove(local, remote, n)
-        return 0
+        self.batches[batch_id] = 1
+        return batch_id
+
+    def transfer_check_status(self, batch_id):
+        return self.batches.pop(batch_id)
 
 
 @pytest.fixture

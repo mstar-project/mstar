@@ -31,6 +31,7 @@ from mstar.model.bagel.components.modeling_utils import (
     get_flattened_position_ids_extrapolate,
     patchify,
     vllm_vae_resize,
+    vllm_vae_size,
     vllm_vit_resize,
 )
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN
@@ -123,6 +124,19 @@ def vit_patches(
     height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)
     height, width = _VIT_TRANSFORM.resize_transform.target_size(height, width)
     return (height // patch_size) * (width // patch_size)
+
+
+def vae_latents(
+    height: int, width: int, image_preprocess: str,
+    latent_downsample: int, max_latent_size: int,
+) -> int:
+    """How many latents the VAE encodes an image of this size into. The VAE's
+    ``prepare_inputs`` asserts the same count."""
+    if image_preprocess == "vllm":
+        height, width = vllm_vae_size(height, width, latent_downsample, max_latent_size * latent_downsample)
+    else:
+        height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)
+    return (height // latent_downsample) * (width // latent_downsample)
 
 
 class ViTEncoderSubmodule(NodeSubmodule):
@@ -543,6 +557,10 @@ class VAEEncoderSubmodule(NodeSubmodule):
         _, img_h, img_w = image_tensor.shape
         h = (img_h // ds)
         w = (img_w // ds)
+        assert h * w == vae_latents(*img.shape[-2:], image_preprocess, ds, self.max_latent_size), (
+            f"the VAE encoded a {tuple(img.shape[-2:])} image into {h * w} latents, "
+            "not the count `vae_latents` gives a layout to size it by"
+        )
 
         packed_vae_position_ids = get_flattened_position_ids_extrapolate(
             img_h, img_w,
@@ -803,6 +821,8 @@ class LLMSubmodule(ARNodeSubmodule):
         # on the step (`cg_key_info`) so a replay lands on its own bucket.
         return [
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="decode",
                 additional_key_info=False,
                 single_request_inputs=ARNodeInputs(
@@ -811,6 +831,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             ),
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="decode",
                 additional_key_info=True,
                 single_request_inputs=ARNodeInputs(
@@ -820,6 +842,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             ),
             PackedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="prefill_text",
                 # decode rows of a mixed step are one-token segments
                 replay_graph_walks=["prefill_text", MIXED_TEXT],
@@ -941,10 +965,9 @@ class LLMSubmodule(ARNodeSubmodule):
         """This batch's step: which cache streams it touches, by how much,
         what backs them, and what commits.
 
-        The three CFG branches are three labels on the same cache. Which of
-        them are live is a per-request property, so it rides in on
-        ``NodeInputs.resource_step_info`` from ``prepare_inputs`` rather than
-        being read off the batch here.
+        The three CFG branches are three labels on the same cache. Whether
+        the batch runs them rides in on ``NodeInputs.resource_step_info`` from
+        ``prepare_inputs``.
         """
         requires_cfg = requires_cfg_for_inputs(inputs)
         labels = self._get_active_labels(graph_walk, requires_cfg)
@@ -991,6 +1014,18 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             })
 
+        info = per_request_info or {}
+        guided = sink = frozenset()
+        if requires_cfg:
+            # A pre-plan declares over the bucket's template rows, which are all
+            # guided, so whether a row is guided comes from its request.
+            guided = frozenset(
+                rid for rid, inp in zip(request_ids, inputs, strict=True)
+                if (info[rid].step_metadata.get("requires_cfg", False) if rid in info else inp.resource_step_info)
+            )
+            sink = frozenset(
+                (rid, label) for label in labels if label != "main" for rid in request_ids if rid not in guided
+            )
         writes = graph_walk not in ("image_gen", "image_gen_cfg")
         if graph_walk in ("prefill_vit", "prefill_vae"):
             pos_advance = (IMAGE_ADVANCE,) * len(segments)
@@ -1016,19 +1051,19 @@ class LLMSubmodule(ARNodeSubmodule):
                 # decode row sharing the step
                 fork_rids = frozenset(
                     rid for rid, walk in zip(request_ids, row_walks, strict=True)
-                    if walk == "prefill_text"
+                    if walk == "prefill_text" and rid in guided
                 )
                 pre_forks = (("main", "cfg_text"),)
             elif graph_walk in ("prefill_vit", "prefill_vae"):
                 # cfg_text tracks the context including this image, so it
                 # forks at commit, after the step's writes have landed.
+                fork_rids = guided
                 post_forks = (("main", "cfg_text"),)
 
         # `cg_key_info` picks among the walk's capture buckets; it must match
         # the `additional_key_info` on the configs in get_cuda_graph_configs.
         steps: dict = {}
         # the rows whose token `postprocess` keeps
-        info = per_request_info or {}
         kept_rids = frozenset(
             rid for rid, walk in zip(request_ids, row_walks, strict=True)
             if walk == "decode" or (
@@ -1062,6 +1097,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 pre_forks=pre_forks,
                 post_forks=post_forks,
                 fork_rids=fork_rids,
+                sink=sink,
             ),
             "attn": AttentionStep(
                 segments=segments,
