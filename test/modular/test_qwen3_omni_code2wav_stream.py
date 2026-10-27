@@ -1,6 +1,7 @@
-"""Qwen3-Omni Code2Wav streaming: the stitched chunks are one continuous decode.
+"""Qwen3-Omni streaming: the Talker's text conditioning past the Thinker's
+stream, and Code2Wav's stitched chunks as one continuous decode.
 
-Each test drives Talker codec frames through the edge's real
+The Code2Wav tests drive Talker codec frames through the edge's real
 ``LeftContextChunkPolicy`` and ``StreamBuffer``, then through
 ``Code2WavSubmodule``'s ``prepare_inputs`` / ``preprocess`` /
 ``forward_batched`` / ``postprocess``, and compares the concatenated audio
@@ -23,6 +24,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.qwen3_omni.components import code2wav as code2wav_module
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.config import Code2WavConfig, Qwen3OmniModelConfig
@@ -30,6 +32,8 @@ from mstar.model.qwen3_omni.submodules import Code2WavSubmodule, TalkerSubmodule
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, StopCheck
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
+from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.worker import Worker
 
 UPSAMPLE = 1920
 
@@ -717,3 +721,83 @@ def test_ramp_boundaries_are_no_worse_than_25_frame_chunks(long_reach_code2wav):
     assert statistics.median(steady) >= statistics.median(base_steady) - 1
     assert min(steady) >= min(base_steady) - 2
     assert len(ramp) == 8 and min(ramp) > 80
+
+
+def test_a_talker_step_refused_at_the_streams_end_feeds_the_text_eos_on_every_retry():
+    """The first decode step past the Thinker's stream is conditioned on TTS
+    EOS, later ones on pad. A step whose admit is refused is prepared again
+    with the same inputs while the worker keeps polling the stream: every retry
+    must feed EOS again, or the Talker never sees the end of the text. Drives
+    the worker's own stream polling, with a one-slot stand-in for the Talker
+    node (a streamed chunk is refused while the pending step holds one)."""
+    from mstar.model.qwen3_omni.qwen3_omni_model import _thinker_to_talker_policy
+
+    hidden, rid, edge = 4, 7, "thinker_states"
+    # the edge as the worker builds it: walk-driven, so a chunk past the
+    # stream's end is released only to the decode walk
+    sbuf = StreamBuffer(request_id=rid, edge_name=edge, from_partition="Thinker",
+                        policy=_thinker_to_talker_policy(), walk_tagged=True)
+    for i in range(2):  # the Thinker streams two states, then ends
+        sbuf.pre_read_register(f"t{i}", "talker_decode")
+        sbuf.put(f"t{i}", torch.zeros(1, hidden))
+    sbuf.signal_done(2)
+
+    class TalkerNode:
+        holds_chunk = False
+
+        def ingest_inputs_batch(self, block, can_buffer=True, is_streaming=False):
+            assert not can_buffer and is_streaming
+            if self.holds_chunk:
+                return list(range(len(block.rids)))
+            self.holds_chunk = True
+            return []
+
+    request_state = RequestStateManager(node_to_partition={"Talker": "Talker"})
+    request_state.add_request(rid, CurrentForwardPassInfo(
+        request_id="r", graph_walk="talker_decode", fwd_index=0, random_seed=0, max_tokens=0,
+        partition_name="Talker",
+    ))
+    request_state.per_request_info[rid].stream_buffers[edge] = sbuf
+    request_state.per_request_info[rid].stream_buffers_by_consumer["Talker"] = {edge: sbuf}
+    worker = Worker.__new__(Worker)
+    worker.__dict__.update(
+        request_state=request_state,
+        _consumer_node_cache={edge: "Talker"}, _walk_driven_edges={edge: "Talker"}, _graph_runtime=TalkerNode(),
+        tensor_manager=SimpleNamespace(
+            store_and_return_tensor_info=lambda r, t, skip_cuda_sync: {edge: [SimpleNamespace(uuid=0)]},
+        ),
+    )
+
+    class TextProjection:
+        # fp32 like the loop-back input, so .to() hands back that very tensor
+        linear_fc1 = SimpleNamespace(weight=torch.zeros(1))
+
+        def __call__(self, states):
+            return torch.full((1, hidden), 3.0)
+
+    talker = TalkerSubmodule(
+        talker_model=SimpleNamespace(model=SimpleNamespace(codec_embedding=None), text_projection=TextProjection()),
+        code_predictor=None, config=SimpleNamespace(code_predictor=SimpleNamespace(num_code_groups=1)),
+    )
+    talker.__dict__.update(
+        _cached_device=torch.device("cpu"),
+        _tts_eos_embed_cached=torch.ones(hidden), _tts_pad_embed_cached=torch.zeros(hidden),
+    )
+
+    loop_back = torch.zeros(1, hidden)  # a pushed-back step holds the same tensor
+    fed, refusals = [], 3
+    while len(fed) < 8:
+        worker._poll_stream_buffers()
+        chunks = worker._stream_chunks_for(rid, "Talker", {edge: []})
+        states = [torch.zeros(1, hidden)] if chunks[edge].num_items else []
+        embeds = talker.prepare_inputs(
+            "talker_decode", SimpleNamespace(rid_handle=rid), {"talker_input_embeds": [loop_back], edge: states},
+            input_metadata=InputMetadata(stream_chunks=chunks),
+        ).input_embeds
+        fed.append(embeds.sum().item() / hidden)  # 3 text, 1 EOS, 0 pad
+        if not chunks[edge].num_items and refusals:
+            refusals -= 1  # admit refused: pushed back holding its inputs
+            continue
+        worker._graph_runtime.holds_chunk = False  # the step ran
+
+    assert fed == [3, 3, 1, 1, 1, 1, 0, 0], "a retried step lost the text EOS embed"

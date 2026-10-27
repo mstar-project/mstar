@@ -69,6 +69,7 @@ from mstar.model.qwen3_omni.config import (
 )
 from mstar.model.qwen3_omni.qwen3_omni_model import image_span
 from mstar.model.submodule_base import (
+    EMPTY_INPUT_METADATA,
     ARNodeInputs,
     ARNodeSubmodule,
     InputMetadata,
@@ -1227,11 +1228,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         # with True at positions to suppress.  Cached on first forward.
         self._suppress_mask: torch.Tensor | None = None
 
-        # Per-request flag: whether we've already sent tts_eos_embed as
-        # the text conditioning for this request. We use this flag to
-        # inject tts_eos_embed for ONE step before falling back to pad.
-        self._eos_embed_sent: set[str] = set()
-
         # Lazy-built CodePredictor scratch KV cache, overwritten every step.
         self._cp_kv_cache: torch.Tensor | None = None
 
@@ -1371,6 +1367,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
@@ -1397,21 +1394,22 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         elif graph_walk == "talker_decode":
             dtype = self.model.text_projection.linear_fc1.weight.dtype
-            input_embeds = inputs["talker_input_embeds"][0].to(dtype)
-
             thinker_states = inputs.get("thinker_states", [])
-            rid = fwd_info.rid_handle
             if thinker_states:
                 # Decode is always text → text_projection.
                 text_hidden = self.model.text_projection(
                     thinker_states[0].to(dtype)
                 )
-            elif rid not in self._eos_embed_sent:
-                text_hidden = self._tts_eos_embed_cached
-                self._eos_embed_sent.add(rid)
             else:
-                text_hidden = self._tts_pad_embed_cached
-            input_embeds += text_hidden
+                # TTS EOS on the first chunk past the Thinker's stream, then
+                # pad. The chunk says which, so a step the engine prepares
+                # again feeds the same embed.
+                chunk = input_metadata.stream_chunks.get("thinker_states")
+                assert chunk is not None, "a talker_decode step without its thinker_states chunk"
+                text_hidden = self._tts_eos_embed_cached if chunk.first_past_end else self._tts_pad_embed_cached
+            # out of place: when the dtypes match, .to() returns the loop-back
+            # tensor itself, which a step prepared again reads a second time
+            input_embeds = inputs["talker_input_embeds"][0].to(dtype) + text_hidden
             seq_len = 1
 
         return ARNodeInputs(
@@ -1700,11 +1698,6 @@ class TalkerSubmodule(ARNodeSubmodule):
                 (request_info.dynamic_loop_iter_counts.get("talker_decode_loop", 0) + 1 >= max_tokens):
             stops = {"talker_decode_loop"}
         return StopCheck(stops, withheld=("codec_tokens",)) if is_eos else stops
-
-    def cleanup_request(self, request_id: str) -> None:
-        """Remove per-request state when a request completes."""
-        super().cleanup_request(request_id)
-        self._eos_embed_sent.discard(request_id)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk in [
