@@ -2367,9 +2367,9 @@ streams (audio and video, say): each has its own buffer and its own end.
   file names (``None`` where the client named none, so the model decides);
   ``model_kwargs``, the append's own; and ``request_kwargs``, the opening message's.
   Raise ``ValueError`` for an append the model doesn't take (the client gets a 400). An
-  append of text alone that yields no item is refused rather than dropped, but the data
-  worker can't tell which items text sent with files yielded: refuse such text yourself
-  if the model takes none. Keep it stateless; the
+  append of text alone, or of ``model_kwargs`` alone that ends no stream, that yields no
+  item is refused rather than dropped, but the data worker can't tell which items text
+  sent with files yielded: refuse such text yourself if the model takes none. Keep it stateless; the
   consuming node keeps its own state, in its resources or ``request_state``.
 - Tensors ``process_prompt`` returns under a client edge's name are the stream's first
   chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.

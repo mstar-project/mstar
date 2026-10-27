@@ -375,38 +375,53 @@ def test_an_append_s_text_settings_and_target_streams_reach_the_hook(tmp_path):
 
 
 class _Transcribing(_ListeningModel):
-    """Takes text appends too: each becomes one item of its byte values."""
+    """Takes text appends too, as text or as ``model_kwargs["say"]``: each
+    becomes one item of its byte values."""
 
     def process_stream_chunk(self, chunk):
         items = super().process_stream_chunk(chunk)
-        if chunk.text:
-            items["audio_in"] = [*items["audio_in"], torch.tensor(list(chunk.text.encode()), dtype=torch.float32)]
+        text = chunk.text or chunk.model_kwargs.get("say")
+        if text:
+            items["audio_in"] = [*items["audio_in"], torch.tensor(list(text.encode()), dtype=torch.float32)]
         return items
 
 
-def test_a_text_only_append_reaches_a_model_that_takes_text():
+@pytest.mark.parametrize("append", [
+    ClientAppend("r", text="hi"), ClientAppend("r", model_kwargs={"say": "hi"}),
+], ids=["text", "model_kwargs"])
+def test_a_text_or_model_kwargs_only_append_reaches_the_hook(append):
     wt, sent, _tm = _thread(_Transcribing())
     _open(wt)
 
-    wt._process_stream_input(ClientAppend("r", text="hi"))
+    wt._process_stream_input(append)
 
     (chunk,) = wt.model.chunk_calls
-    assert chunk.text == "hi" and chunk.tensors == {} and chunk.streams == {}
+    assert chunk.tensors == {} and chunk.streams == {}
     _route(wt)
     assert _signals(sent) == [("w0", "audio_in", [[2]], {})]
 
 
-def test_a_text_only_append_to_a_model_that_takes_none_is_refused_with_a_400():
+@pytest.mark.parametrize("append", [
+    ClientAppend("r", text="hello?"), ClientAppend("r", model_kwargs={"say": "hello?"}),
+    ClientAppend("r", model_kwargs={"say": "hello?"}, ends=END),
+], ids=["text", "model_kwargs", "model_kwargs_ending_input"])
+def test_an_append_the_model_turns_into_nothing_is_refused_with_a_400(append):
     """The hook returns nothing for the text: dropped silently, the client
-    would never learn its words went nowhere."""
+    would never learn its words went nowhere. ``model_kwargs`` beside
+    ``end_input`` still end the input."""
     wt, sent, _tm = _thread()
     _open(wt)
 
-    wt._process_waiting_input(ClientAppend("r", text="hello?"))
+    wt._process_waiting_input(append)
 
+    if append.ends:
+        assert wt.out_queue.empty()
+        _route(wt)
+        assert _signals(sent) == [("w0", None, [], {"audio_in": 0})]
+        return
     error = wt.out_queue.get_nowait()
     assert error.modality == "error" and error.metadata["status"] == 400
-    assert b"takes no text" in error.data
+    assert b"takes no text or model_kwargs" in error.data
     _route(wt)
     assert _signals(sent) == []
     assert [b.request_id for b in _bodies(sent, ConductorMessageType.ABORT_REQUEST)] == ["r"]
@@ -980,11 +995,15 @@ def test_an_opening_file_naming_a_stream_the_model_lacks_is_refused_with_a_400()
     assert isinstance(server.preprocess_worker.items[0], PreprocessInput)
 
 
-def test_an_append_s_text_counts_against_the_input_budget():
+def test_an_append_s_text_and_model_kwargs_count_against_the_input_budget():
     server = _server()
     server.max_call_input_bytes = 8
     key = _submit(server, end_input=False)
     assert server.stream_input(key, text="four") is True                 # 4 of 8
+    with pytest.raises(ValueError, match="max_call_input_mb"):
+        server.stream_input(key, model_kwargs={"a": 1})                  # 4 + 8 of 8
+    with pytest.raises(ValueError, match="max_call_input_mb"):
+        server.stream_input(key, model_kwargs={"b": b"xy"})              # a msgpack frame's bytes: 4 + 11
     with pytest.raises(ValueError, match="max_call_input_mb"):
         server.stream_input(key, text="fives")                           # 9 of 8
     assert server.preprocess_worker.items[-1] == ClientAppend(key, text="four")
@@ -1072,6 +1091,7 @@ def test_generate_ws_takes_the_append_record_and_its_shorthand_alike(monkeypatch
         {"request_id": "call", "append": {"text": "hello"}},                     # text only
         {"request_id": "call", "append": {"files": [{**wav, "stream": "audio_in"}],
                                           "model_kwargs": {"gain": 2}, "text": None}},
+        {"request_id": "call", "append": {"model_kwargs": {"gain": 4}}},           # model_kwargs only
         {"request_id": "call", "append": {"model_kwargs": '{"gain": 3}', "text": "x"}, "end_input": True},
     ])
     # until the call finishes: the socket's close aborts a call still running
@@ -1079,13 +1099,15 @@ def test_generate_ws_takes_the_append_record_and_its_shorthand_alike(monkeypatch
 
     assert ws.sent == [{"request_id": "call", "finish": True}]
     assert [c[2:] for c in fake.calls[1:]] == [
-        (["chunk.wav"], False), (["chunk.wav"], False), ([], False), (["chunk.wav"], False), ([], True),
+        (["chunk.wav"], False), (["chunk.wav"], False), ([], False), (["chunk.wav"], False), ([], False),
+        ([], True),
     ]
     assert fake.appended == [
         {"text": None, "file_streams": None, "model_kwargs": None},
         {"text": None, "file_streams": None, "model_kwargs": None},
         {"text": "hello", "file_streams": None, "model_kwargs": None},
         {"text": None, "file_streams": {"audio": ["audio_in"]}, "model_kwargs": {"gain": 2}},
+        {"text": None, "file_streams": None, "model_kwargs": {"gain": 4}},
         {"text": "x", "file_streams": None, "model_kwargs": {"gain": 3}},
     ]
 

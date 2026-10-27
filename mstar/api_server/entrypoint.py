@@ -379,6 +379,19 @@ def _file_bytes(file_paths: dict[str, list[str]] | None) -> int:
     return sum(os.path.getsize(path) for paths in (file_paths or {}).values() for path in paths)
 
 
+def _json_bytes(value: dict | None) -> int:
+    """``value``'s size as JSON; a binary value (a msgpack frame's) counts its length."""
+    binary = 0
+
+    def as_empty_string(v):
+        nonlocal binary
+        if not isinstance(v, (bytes, bytearray)):
+            raise ValueError(f"model_kwargs carry a {type(v).__name__}, which has no JSON size")
+        binary += len(v)
+        return ""
+    return len(json.dumps(value, default=as_empty_string)) + binary if value else 0
+
+
 class DeadConductorError(RuntimeError):
     """The conductor process exited before the workers finished setup (it
     exits when a worker dies during init), so the server must not bind."""
@@ -809,6 +822,7 @@ class APIServer:
             name for names in (file_streams or {}).values() for name in names if name is not None
         )
         ending = None if end_input is True else self._check_streams(end_input or ())
+        kwargs_bytes = _json_bytes(model_kwargs)
         with self.request_lock:
             req = self.pending_requests.get(key)
             if req is None or not req.open_streams or req.event.is_set():
@@ -817,7 +831,7 @@ class APIServer:
                 ending = req.open_streams
             if (named | ending) - req.open_streams:
                 return False  # late for a stream the client already ended
-            size = req.input_bytes + _file_bytes(file_paths) + len((text or "").encode())
+            size = req.input_bytes + _file_bytes(file_paths) + len((text or "").encode()) + kwargs_bytes
             self._check_call_input(size)
             req.input_bytes = size
             req.last_input_time = time.time()
@@ -2165,8 +2179,8 @@ async def generate_ws(websocket: WebSocket):
                 _decode_ws_files, record.get("files"), api_server.upload_dir,
             )
             file_streams = _ws_file_streams(record.get("files"), parts)
-            if not file_paths and not text and not end_input:
-                raise ValueError("an append needs text, files or end_input")
+            if not file_paths and not text and not model_kwargs and not end_input:
+                raise ValueError("an append needs text, files, model_kwargs or end_input")
             loop = asyncio.get_running_loop()
 
             def on_late(error: str) -> None:

@@ -856,7 +856,7 @@ class PreprocessWorkerThread:
             if call is None or self._torn_down(request_id):
                 return  # ended, failed or aborted: nothing will read it
             items: NameToTensorList = {}
-            if chunk.file_paths or chunk.text:
+            if chunk.file_paths or chunk.text or chunk.model_kwargs:
                 items = self.model.process_stream_chunk(self._client_chunk(chunk))
                 unknown = set(items) - self._client_edges
                 if unknown:  # the model's bug, not the client's: a 500
@@ -864,8 +864,9 @@ class PreprocessWorkerThread:
                         f"process_stream_chunk returned {sorted(unknown)}, which are "
                         f"not client streams ({sorted(self._client_edges)})"
                     )
-                if chunk.text and not any(items.values()):
-                    raise ValueError("this model takes no text in an append")
+                # model_kwargs beside end_input end the input whether or not the model reads them
+                if (chunk.text or not (chunk.file_paths or chunk.ends)) and not any(items.values()):
+                    raise ValueError("this model takes no text or model_kwargs in an append")
                 items = self._without_ended_streams(call, chunk, items)
                 self._charge_stream_items(call, items)
             items = {name: tensors for name, tensors in items.items() if tensors}

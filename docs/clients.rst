@@ -150,15 +150,18 @@ streaming back:
    {"request_id": ..., "append": {"text": ..., "files": [{"name": ..., "data": ..., "stream": ...}],
                                   "model_kwargs": {...}}}
 
-Every field of the record is optional, but an append needs text, files or ``end_input``.
+Every field of the record is optional, but an append needs text, files, ``model_kwargs`` or
+``end_input``.
 ``stream`` names the client stream a file is for (the model decides when it is absent; a
 name the model doesn't have is rejected), and ``model_kwargs`` are this append's own: they
 reach only the model's ``process_stream_chunk``, so they mean what that model reads from
 them, and the opening message's still hold for the request (its sampling settings, say).
 ``"append": [files]`` is short for ``"append": {"files": [files]}``. What a model takes
-in an append is its own. An append of text alone that the model turns into no stream item
-is rejected; text sent with files reaches the model, and if it ignores the text, the text
-is dropped without an error. ``{"request_id", "end_input": true}``
+in an append is its own. An append of text alone, or of ``model_kwargs`` alone (a game
+controller's actions, say) that ends no stream, that the model turns into no stream item is
+rejected; text sent with files reaches the model, and if it ignores the text, the text is
+dropped without an error. An append's ``model_kwargs`` count toward the call's
+``max_call_input_mb``, as JSON. ``{"request_id", "end_input": true}``
 ends the input, alone or on an append (or on the opening message, for a one-shot
 request). The request then finishes as usual. Such a model treats every request over the
 socket as live, so a one-shot request to it carries ``end_input: true`` on its opening
