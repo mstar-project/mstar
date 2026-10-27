@@ -73,9 +73,11 @@ def test_eager_prefill_is_not_held_to_the_captured_rows():
 
     sub = object.__new__(Glm5NextLLMSubmodule)
     sub.config = Glm5NextModelConfig.reduced()
+    # the reduced config's 16 is below the fused KDA prefill's head dims (kda_triton.supported)
+    sub.config.linear_head_dim = 32
     sub.config.prefill_graphs = True
     sub.config.moe_quant_kernel = "auto"
     if sub._captured_prefill_rows() is None:
-        pytest.skip("no fused KDA on this host")
+        pytest.skip("no Triton for the fused KDA kernels")
     sub._prefill_captured = False  # get_accelerator_graph_configs declared none
     assert sub._captured_prefill_rows() is None
