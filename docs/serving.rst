@@ -258,10 +258,6 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
        shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
        ``false``.
-   * - ``knobs``
-     - *(optional)* Engine knobs for this deployment, e.g. ``pre_plan: false``
-       (``whisper_large_v3_turbo.yaml``). Each one's environment variable overrides
-       it; see :doc:`environment_variables`.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
    * - ``speculation_mixes_walks``
@@ -313,13 +309,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
-       ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs`` and
-       ``gc_gen0_threshold``
+       ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
+       ``gc_gen0_threshold`` and ``pre_plan``
        (``true``/``false`` or an integer). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
-       ingraph_decode_rope: true}``.
+       ingraph_decode_rope: true}``, or ``knobs: {pre_plan: false}``
+       (``whisper_large_v3_turbo.yaml``).
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /

@@ -435,7 +435,6 @@ class Worker:
         self._host_rows_slot = 0
         self._stream_buffer_rids = set()
 
-
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
         # record into it too; run() owns the periodic flush.
