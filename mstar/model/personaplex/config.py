@@ -172,9 +172,9 @@ GENERATE_AUDIO_WALK = "generate_audio"  # generate without emitting text
 CONDITIONING_LOOP, DECODE_LOOP = "cond_loop", "decode_loop"
 # The reply's audio streams from the LM partition to the codec partition one agent frame at a time.
 LM_PARTITION, CODEC_PARTITION, CODEC_WALK = "LM", "Codec", "codec_chunk"
-# New agent frames per decoded audio chunk: the first audio leaves after 4 frames (320 ms), then
-# chunks grow to 25 frames (2 s), as Qwen3-TTS's 12 Hz codec streams, so a running stream costs
-# few decodes. A chunk is decoded in these blocks whatever the stream delivers, so a request's
+# New agent frames per decoded audio chunk: the first block holds 4 frames (320 ms of audio), then
+# blocks grow to 25 frames (2 s), a ramp like Qwen3-TTS's for its 12 Hz codec, so a running stream
+# costs few decodes. A chunk is decoded in these blocks whatever the stream delivers, so a request's
 # audio does not depend on delivery timing.
 STREAM_CHUNK_SCHEDULE = (4, 8, 16)
 STREAM_CHUNK_FRAMES = 25

@@ -1199,9 +1199,9 @@ run alone, so a greedy response can depend on what else is being served;
 ``max_batch_size: 1`` runs every request alone.
 
 The agent's audio streams from the LM to a codec partition one frame at a
-time. The first chunk is 4 frames (320 ms), then 8, 16 and 25 frames (2 s)
-each, as Qwen3-TTS's 12 Hz codec streams, so a running stream needs few
-decodes. Each block is decoded behind the request's last 500 frames: Mimi's
+time. The first chunk holds 4 frames (320 ms of audio), then 8, 16 and 25
+frames (2 s) each, a ramp like Qwen3-TTS's for its 12 Hz codec, so a running
+stream needs few decodes. Each block is decoded behind the request's last 500 frames: Mimi's
 decoder transformer attends 125 frames per layer, but its 8 stacked layers
 reach further back, and 500 frames keeps a long reply at the rounding floor of
 a whole-track decode (the same trade-off as Qwen3-TTS's codec). Only the
@@ -1256,14 +1256,15 @@ implementation on GH200 and H100 GPUs:
   GPU memory flat.
 - The LM's generate step runs from CUDA graphs captured at batch sizes up to
   ``max_batch_size`` (conditioning frames run eagerly). On one H100 over HTTP
-  (``benchmark.runner``, closed loop, a 17.7 s clip, ``max_batch_size`` 32),
-  M* delivered 3.8 to 4.1 seconds of audio per second at one request, 11.4 to
+  (``benchmark.runner``, closed loop, a 17.7 s clip, ``max_batch_size`` 32;
+  measured before audio streaming was added), M* delivered 3.8 to 4.1 seconds of audio per second at one request, 11.4 to
   12.1 at four and 30 to 32 at 32, against 1.2 to 1.3, 4.0 to 4.5 and 19 to 21
   with the graphs and the depformer cut both off, in one container. The eager
   step is bound by CPU overhead (``benchmark/worker_phases``), so its speed
-  also varies between hosts. Streaming the audio costs 0 to 8% of that
-  throughput (more at higher concurrency); 16 streamed sessions play back
-  without underruns.
+  also varies between hosts (a second host ran 15 to 25% slower). Streaming
+  the audio costs an estimated 0 to 8% of that throughput, more at higher
+  concurrency; 16 concurrent streamed requests played back without underruns
+  (the whole clip uploaded at once, not live input).
 - Audio quality has not been formally assessed. Whisper transcripts of M*'s
   and NVIDIA's responses matched on an English clip (word error rate 0) and
   differed on a second clip, after their tokens diverge; no listening study
