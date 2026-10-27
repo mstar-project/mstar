@@ -101,6 +101,23 @@ def convert_mimi_state_dict(
             converted[new_key.replace("in_proj_weight", "v_proj.weight")] = v
         else:
             converted[new_key] = value
+    # Transformers 5.21 moved each codec half into a model containing its SEANet,
+    # transformer and resampler. Select names from the actual target state dict.
+    prefixes = (
+        ("encoder.layers.", "encoder.encoder_seanet.layers."),
+        ("decoder.layers.", "decoder.decoder_seanet.layers."),
+        ("encoder_transformer.", "encoder.encoder_transformer."),
+        ("decoder_transformer.", "decoder.decoder_transformer."),
+        ("downsample.", "encoder.downsample."),
+        ("upsample.", "decoder.upsample."),
+    )
+    for key in list(converted):
+        if key in expected:
+            continue
+        for old, new in prefixes:
+            if key.startswith(old) and (target := new + key[len(old):]) in expected:
+                converted[target] = converted.pop(key)
+                break
     extra, missing = sorted(converted.keys() - expected.keys()), sorted(expected.keys() - converted.keys())
     if extra or missing:
         raise ValueError(f"Mimi conversion mismatch: extra keys {extra[:8]}, missing keys {missing[:8]}")
@@ -176,6 +193,15 @@ def build_hf_mimi(config_kwargs: dict | None = None) -> nn.Module:
     return MimiModel(config).eval()
 
 
+def _mimi_modules(model: nn.Module, side: str) -> tuple[nn.Module, nn.Module, nn.Module]:
+    """Select the same SEANet, transformer and resampler across HF's flat/nested layouts."""
+    half = getattr(model, side)
+    resampler = "downsample" if side == "encoder" else "upsample"
+    if hasattr(half, f"{side}_seanet"):
+        return getattr(half, f"{side}_seanet"), getattr(half, f"{side}_transformer"), getattr(half, resampler)
+    return half, getattr(model, f"{side}_transformer"), getattr(model, resampler)
+
+
 class MimiCodec(nn.Module):
     """Whole-sequence encode/decode equal to NVIDIA's per-frame streaming Mimi."""
 
@@ -193,8 +219,8 @@ class MimiCodec(nn.Module):
         """``[B, 1, N*1920]`` PCM -> unquantized ``[B, D, N]`` latent."""
         if pcm.dim() != 3 or pcm.shape[1] != 1 or pcm.shape[-1] % FRAME_SIZE:
             raise ValueError(f"expected [B, 1, N*{FRAME_SIZE}] mono PCM, got {tuple(pcm.shape)}")
-        m = self.model
-        return m.downsample(self._transformer(m.encoder_transformer, m.encoder(pcm)))
+        encoder, transformer, downsample = _mimi_modules(self.model, "encoder")
+        return downsample(self._transformer(transformer, encoder(pcm)))
 
     def encode(self, pcm: torch.Tensor) -> torch.Tensor:
         """``[B, 1, N*1920]`` PCM -> ``[B, 8, N]`` codes."""
@@ -204,9 +230,9 @@ class MimiCodec(nn.Module):
         """``[B, 8, N]`` codes -> ``[B, 1, N*1920]`` PCM."""
         if codes.dim() != 3 or codes.shape[1] != self.num_codebooks:
             raise ValueError(f"expected [B, {self.num_codebooks}, N] codes, got {tuple(codes.shape)}")
-        m = self.model
-        x = m.upsample(m.quantizer.decode(codes))
-        return m.decoder(self._transformer(m.decoder_transformer, x))
+        decoder, transformer, upsample = _mimi_modules(self.model, "decoder")
+        x = upsample(self.model.quantizer.decode(codes))
+        return decoder(self._transformer(transformer, x))
 
     def decode_last(self, codes: torch.Tensor, frames: int, margin: int) -> torch.Tensor:
         """``[B, 8, N]`` codes -> PCM of the last ``frames`` frames, ``[B, 1, frames * 1920]``.
@@ -216,10 +242,10 @@ class MimiCodec(nn.Module):
         """
         if not 0 < frames <= codes.shape[-1]:
             raise ValueError(f"expected 0 < frames <= {codes.shape[-1]}, got {frames}")
-        m = self.model
-        h = self._transformer(m.decoder_transformer, m.upsample(m.quantizer.decode(codes)))
+        decoder, transformer, upsample = _mimi_modules(self.model, "decoder")
+        h = self._transformer(transformer, upsample(self.model.quantizer.decode(codes)))
         steps = (frames + margin) * MIMI_STEPS_PER_FRAME
-        return m.decoder(h[..., max(h.shape[-1] - steps, 0) :])[..., -frames * FRAME_SIZE :]
+        return decoder(h[..., max(h.shape[-1] - steps, 0) :])[..., -frames * FRAME_SIZE :]
 
 
 def load_mimi_codec(

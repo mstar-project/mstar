@@ -68,6 +68,9 @@ def _synthetic_moshi_state():
         "encoder_transformer.transformer.layers.0.linear1.weight": torch.randn(16, d),
         "encoder_transformer.transformer.layers.0.norm1.weight": torch.randn(d),
         "encoder_transformer.transformer.layers.0.layer_scale_2.scale": torch.randn(d),
+        "decoder_transformer.transformer.layers.0.linear1.weight": torch.randn(16, d),
+        "downsample.conv.conv.weight": torch.randn(d, d, 4),
+        "upsample.convtr.convtr.weight": torch.randn(d, d, 4),
         "quantizer.rvq_first.vq.layers.0._codebook.embedding_sum": torch.randn(32, 4),
         "quantizer.rvq_rest.vq.layers.3._codebook._initialized": torch.ones(1),
         "quantizer.rvq_rest.input_proj.weight": torch.randn(4, d, 1),
@@ -75,7 +78,8 @@ def _synthetic_moshi_state():
     return state, d, h
 
 
-def test_conversion_renames_splits_and_is_strict():
+@pytest.mark.parametrize("nested", [False, True])
+def test_conversion_renames_splits_and_is_strict(nested):
     state, d, h = _synthetic_moshi_state()
     prefix = "encoder_transformer.layers.0."
     expected_names = {
@@ -83,6 +87,7 @@ def test_conversion_renames_splits_and_is_strict():
         prefix + "self_attn.q_proj.weight", prefix + "self_attn.k_proj.weight", prefix + "self_attn.v_proj.weight",
         prefix + "self_attn.o_proj.weight", prefix + "mlp.fc1.weight", prefix + "input_layernorm.weight",
         prefix + "mlp_layer_scale.scale",
+        "decoder_transformer.layers.0.mlp.fc1.weight", "downsample.conv.weight", "upsample.conv.weight",
         "quantizer.semantic_residual_vector_quantizer.layers.0.codebook.embed_sum",
         "quantizer.acoustic_residual_vector_quantizer.layers.3.codebook.initialized",
         "quantizer.acoustic_residual_vector_quantizer.input_proj.weight",
@@ -97,6 +102,19 @@ def test_conversion_renames_splits_and_is_strict():
         if new in expected and expected[new] is None:
             expected[new] = value.shape
     assert None not in expected.values()
+    if nested:
+        # Target names in Transformers 5.21's split encoder/decoder models.
+        names = {
+            "encoder.layers.0.conv.weight": "encoder.encoder_seanet.layers.0.conv.weight",
+            "decoder.layers.2.conv.weight": "decoder.decoder_seanet.layers.2.conv.weight",
+            "decoder_transformer.layers.0.mlp.fc1.weight": "decoder.decoder_transformer.layers.0.mlp.fc1.weight",
+            "downsample.conv.weight": "encoder.downsample.conv.weight",
+            "upsample.conv.weight": "decoder.upsample.conv.weight",
+            **{key: "encoder." + key for key in expected if key.startswith("encoder_transformer.")},
+        }
+        expected = {names.get(key, key): shape for key, shape in expected.items()}
+        expected_names = {names.get(key, key) for key in expected_names}
+        prefix = "encoder." + prefix
     out = convert_mimi_state_dict(state, expected, num_heads=h, num_kv_heads=h)
     assert set(out) == expected_names
     qkv = state[next(k for k in state if k.endswith("in_proj_weight"))]
