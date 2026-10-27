@@ -832,6 +832,13 @@ span's tokens as ``k`` and ``v``. One resource has one head geometry, so a model
 attentions differ in head count or head dim declares one spec per (kind, geometry).
 LTX-2.5 is the reference (``mstar/model/ltx2_5/submodules.py``).
 
+Called with ``return_lse=True``, a ragged or ragged cross-attention callable on the FlashInfer
+backend also returns each query row's log-sum-exp (``[total_tokens, H]``, fp32, natural log)
+from the same plan, which is what merging attentions over disjoint key sets needs. Under sequence parallelism
+LTX-2.5's audio queries attend each rank's share of the video tokens, and
+``attention_over_sharded_keys`` (``mstar/model/components/distributed/sequence_parallel.py``)
+merges them.
+
 Block-causal attention within spans
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

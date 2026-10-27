@@ -336,15 +336,19 @@ class _RaggedManagerBase:
     @torch.compiler.disable
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        label: str | None = None,
-    ) -> torch.Tensor:
-        """One layer's attention through the plan for ``label``.
+        label: str | None = None, return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """One layer's attention through the plan for ``label``; with ``return_lse``
+        also the log-sum-exp ``[total_tokens, H]`` (fp32, natural log), for merging
+        attentions over disjoint key sets. The plan is the same either way.
 
         Not behind a custom op, unlike the paged backend's ``run``: the ragged
         caller (an encoder tower) has no per-layer KV write to keep in the same
         graph, so the break this costs is one per layer of a region that is
         CUDA-graph captured rather than compiled.
         """
+        if return_lse:
+            return self._wrapper(label).run(q, k, v, return_lse=True)
         return self._wrapper(label).run(q, k, v)
 
 
