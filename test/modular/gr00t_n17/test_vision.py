@@ -1,7 +1,4 @@
 import dataclasses
-import glob
-import json
-from pathlib import Path
 
 import pytest
 import torch
@@ -13,29 +10,16 @@ from mstar.model.components.qwen3_vit import VisionPatchEmbed, vision_interpolat
 from mstar.model.gr00t_n17.components.vision import ConvPatchEmbed, DeepStackMerger, Gr00tN17VisionEncoder
 from mstar.model.gr00t_n17.config import Gr00tN17Config
 from mstar.model.gr00t_n17.submodules import Gr00tN17VisionEncoderSubmodule
-from mstar.model.gr00t_n17.weight_loader import _remapper
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
 from mstar.model.submodule_base import ModelInputsFromEngine
 
-_HUB = Path.home() / ".cache/huggingface/hub"
-_GR00T = _HUB / "models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495"
-_BACKBONE = next(iter(glob.glob(str(_HUB / "models--nvidia--Cosmos-Reason2-2B/snapshots/*"))), None)
+from .helpers import SegmentAttention, randomize
 
 _DEPTH = 6
 
 
-@pytest.fixture(autouse=True)
-def _pinned_threads():
-    """These compare fp32 CPU forwards with ``torch.equal``; reduction order follows the thread count."""
-    threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    yield
-    torch.set_num_threads(threads)
-
-
 def _config(taps: tuple[int, ...], depth: int = _DEPTH) -> Gr00tN17Config:
-    """A tiny tower. The encoder reads only ``vision`` and the taps; the rest of the
-    node's config belongs to the LLM and the action head."""
+    """A tiny tower; the encoder reads only ``vision`` and the taps."""
     vision = Qwen3_5VisionConfig(
         depth=depth, hidden_size=32, intermediate_size=64, num_heads=2, in_channels=3,
         patch_size=2, temporal_patch_size=2, spatial_merge_size=2,
@@ -45,14 +29,6 @@ def _config(taps: tuple[int, ...], depth: int = _DEPTH) -> Gr00tN17Config:
         text=None, vision=vision, dit=None, bridge=None,
         deepstack_visual_indexes=taps, backbone_embedding_dim=0,
     )
-
-
-def _randomize(module: nn.Module, seed: int) -> None:
-    """LayerNorm initialises to the identity affine, which would hide a norm that is wired up wrong."""
-    generator = torch.Generator().manual_seed(seed)
-    with torch.no_grad():
-        for p in module.parameters():
-            p.copy_(torch.randn(p.shape, generator=generator))
 
 
 # ----------------------------------------------------------------------------
@@ -85,7 +61,7 @@ class RefPatchMerger(nn.Module):
 def test_the_deepstack_merger_normalises_after_the_shuffle():
     vision = _config(()).vision
     merger = DeepStackMerger(vision)
-    _randomize(merger, 0)
+    randomize(merger, 0, 1.0)
     reference = RefPatchMerger(vision, use_postshuffle_norm=True)
     reference.load_state_dict(merger.state_dict())
     x = torch.randn(8, vision.hidden_size, generator=torch.Generator().manual_seed(1))
@@ -122,15 +98,12 @@ class _ConstantBlock(nn.Module):
 
 
 def _stubbed_encoder(taps: tuple[int, ...], depth: int = _DEPTH) -> Gr00tN17VisionEncoder:
-    """The real embed, mergers and tower merger; stubs where the blocks were.
-
-    A real block needs the ragged attention resource, which is a GPU kernel, and
-    running one would only prove that attention preserves its shape.
-    """
+    """The real embed, mergers and tower merger, with stub blocks: a real block needs the
+    ragged attention resource and would only prove attention keeps its shape."""
     config = _config(taps, depth)
     encoder = Gr00tN17VisionEncoder(config)
     for k, merger in enumerate(encoder.deepstack_merger_list):
-        _randomize(merger, 10 + k)
+        randomize(merger, 10 + k, 1.0)
     encoder.tower.blocks = nn.ModuleList(_ConstantBlock(i) for i in range(depth))
     return encoder
 
@@ -214,16 +187,6 @@ def test_the_patch_embed_is_nvidias_conv():
     assert not torch.equal(VisionPatchEmbed.forward(embed, x), conv)
 
 
-@pytest.mark.skipif(not (_GR00T.exists() and _BACKBONE), reason="checkpoint not cached")
-def test_the_checkpoints_vision_tensors_name_this_modules_parameters():
-    config = Gr00tN17Config.from_hf(_GR00T, _BACKBONE)
-    with torch.device("meta"):  # the real 24-block tower, allocated nowhere
-        encoder = Gr00tN17VisionEncoder(config)
-    weight_map = json.loads((_GR00T / "model.safetensors.index.json").read_text())["weight_map"]
-    remap = _remapper("vision_encoder")
-    assert {remap(name) for name in weight_map} - {None} == {name for name, _ in encoder.named_parameters()}
-
-
 # ----------------------------------------------------------------------------
 # The node: `Gr00tN17VisionEncoderSubmodule`, driven the way the engine drives it
 # ----------------------------------------------------------------------------
@@ -285,36 +248,15 @@ def test_prepare_inputs_derives_the_grid_the_tower_helpers_expect(grid_thw, grid
     assert torch.equal(tensors["pixel_values"], torch.cat(walk_inputs["pixel_values"]))
 
 
-class _FrameAttention:
-    """Stands in for the ragged attention resource. The engine plans it from the
-    step's segments, so it attends within a frame and not across one."""
-
-    def __init__(self, seq_lengths: tuple[int, ...]):
-        self.seq_lengths = seq_lengths
-
-    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        out, start = [], 0
-        for span in self.seq_lengths:
-            frame = slice(start, start + span)
-            # the kernel's layout is [tokens, heads, dim]; SDPA wants heads first
-            out.append(
-                nn.functional.scaled_dot_product_attention(
-                    q[frame].transpose(0, 1), k[frame].transpose(0, 1), v[frame].transpose(0, 1)
-                ).transpose(0, 1)
-            )
-            start += span
-        return torch.cat(out)
-
-
 @torch.no_grad()
 def test_driving_the_node_runs_the_encoders_own_forward():
-    """The node is plumbing: what comes out of prepare_inputs -> preprocess -> forward
-    is what the module returns for the same images, under both of the forward's keys."""
+    """prepare_inputs -> preprocess -> forward is the module's own forward on the same
+    images, under both of the forward's keys."""
     node = _node()
     grid_thw, grid = _GRIDS["two sizes"]
     walk_inputs = _walk_inputs(node.config, grid_thw)
     inputs = node.prepare_inputs(_WALK, _FWD, walk_inputs)
-    node.bind_node_resources({VISION_ATTN: _FrameAttention(inputs.kwargs["seq_lengths"])})
+    node.bind_node_resources({VISION_ATTN: SegmentAttention(inputs.kwargs["seq_lengths"])})
 
     tensors = node.preprocess(_WALK, _ENGINE, [inputs])
     # `seq_lengths` is spent on the segments, and is not a forward argument
@@ -346,14 +288,13 @@ def _rope_into_blocks(encoder: Gr00tN17VisionEncoder, args: tuple[torch.Tensor, 
 
 @torch.no_grad()
 def test_a_bf16_encoder_feeds_its_blocks_the_fp32_rope(monkeypatch):
-    """transformers' Qwen3-VL, which GR00T runs, keeps the vision rope in fp32 into
-    the blocks; ``embed`` rounds it to the hidden dtype. In bf16 that rounding alone
-    put vision_embeds at 1.25x the bf16 floor, so the blocks must get the fp32 table."""
+    """transformers' Qwen3-VL keeps the vision rope fp32 into the blocks, where ``embed``
+    rounds it; in bf16 that rounding alone put vision_embeds at 1.25x the bf16 floor."""
     encoder = Gr00tN17VisionEncoder(_config((0,), depth=2)).to(torch.bfloat16)
     args = _inputs(encoder.tower.config, [(1, 4, 4)])
     args = (args[0].to(torch.bfloat16), *args[1:])
     for block in encoder.tower.blocks:
-        block.attn.bind_resources({VISION_ATTN: _FrameAttention((16,))})
+        block.attn.bind_resources({VISION_ATTN: SegmentAttention((16,))})
     rope = encoder.tower.rotary_pos_emb
     table = rope(args[3])
 

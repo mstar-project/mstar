@@ -1,7 +1,5 @@
-import glob
 import json
 import re
-from pathlib import Path
 
 import pytest
 import torch
@@ -12,9 +10,7 @@ from torch import nn
 from mstar.model.gr00t_n17.config import Gr00tN17Config
 from mstar.model.gr00t_n17.weight_loader import SKIPPED, load_gr00t_n17_weights, node_of
 
-_HUB = Path.home() / ".cache/huggingface/hub"
-_GR00T = _HUB / "models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495"
-_BACKBONE = next(iter(glob.glob(str(_HUB / "models--nvidia--Cosmos-Reason2-2B/snapshots/*"))), None)
+from .helpers import BACKBONE, GR00T, needs_checkpoint
 
 
 @pytest.mark.parametrize("name, node", [
@@ -102,16 +98,16 @@ def _expected_shapes(c: Gr00tN17Config) -> dict[str, tuple[int, ...]]:
     }
 
 
-@pytest.mark.skipif(not (_GR00T.exists() and _BACKBONE), reason="checkpoint not cached")
+@needs_checkpoint
 def test_the_checkpoint_matches_the_config():
-    c = Gr00tN17Config.from_hf(_GR00T, _BACKBONE)
-    weight_map = json.loads((_GR00T / "model.safetensors.index.json").read_text())["weight_map"]
+    c = Gr00tN17Config.from_hf(GR00T, BACKBONE)
+    weight_map = json.loads((GR00T / "model.safetensors.index.json").read_text())["weight_map"]
     nodes = {name: node_of(name) for name in weight_map}  # raises on an unclaimed tensor
     assert {n for n, node in nodes.items() if node is None} == SKIPPED
 
     shapes = {}
     for shard in set(weight_map.values()):
-        with safe_open(_GR00T / shard, "pt") as f:  # headers only, no tensor data
+        with safe_open(GR00T / shard, "pt") as f:  # headers only, no tensor data
             shapes |= {k: tuple(f.get_slice(k).get_shape()) for k in f.keys()}
     expected = _expected_shapes(c)
     for pattern, shape in expected.items():

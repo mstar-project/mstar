@@ -16,16 +16,6 @@ _TEXT = 1
 _MERGE = 2
 
 
-@pytest.fixture(autouse=True)
-def _pinned_threads():
-    """``arange`` and ``meshgrid`` don't reduce, but these compare with ``torch.equal``;
-    pin the count the way the other bit-exact CPU tests do."""
-    threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    yield
-    torch.set_num_threads(threads)
-
-
 def _prompt(spec: list) -> tuple[torch.Tensor, torch.Tensor]:
     """A spec of text-span lengths (``int``) and image grids (``(t, h, w)``) -> the two inputs."""
     tokens, grids = [], []
