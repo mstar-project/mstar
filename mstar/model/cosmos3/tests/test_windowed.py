@@ -537,7 +537,7 @@ def test_windowed_decoder_streams_chunks(monkeypatch) -> None:
 
 
 def test_windowed_stream_video_gen_params() -> None:
-    """stream_video resolves only alongside a windowed mode."""
+    """stream_video always runs windowed: chained unless a mode is named."""
     model = _windowed_model()
     p = model._resolve_gen_params(
         {"window_mode": "chained", "num_frames": 189, "stream_video": True}, [], ["video"],
@@ -545,8 +545,12 @@ def test_windowed_stream_video_gen_params() -> None:
     assert p["stream_video"] is True
     q = model._resolve_gen_params({"window_mode": "kv", "num_frames": 189}, [], ["video"])
     assert q["stream_video"] is False
-    with pytest.raises(ValueError):
-        model._resolve_gen_params({"num_frames": 189, "stream_video": True}, [], ["video"])
+    d = model._resolve_gen_params({"num_frames": 189, "stream_video": True}, [], ["video"])
+    assert d["window_mode"] == "chained" and d["stream_video"] is True
+    assert (d["window_latent_units"], d["overlap_latent_units"]) == (8, 2)
+    plain = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    with pytest.raises(ValueError, match="disabled"):
+        plain._resolve_gen_params({"num_frames": 189, "stream_video": True}, [], ["video"])
 
 
 def test_video_streaming_ndjson_lines() -> None:

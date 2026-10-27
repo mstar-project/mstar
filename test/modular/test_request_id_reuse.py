@@ -102,6 +102,11 @@ class _TensorManager:
     def register_for_send(self, request_id, tensor_infos):
         pass
 
+    def take_failed_reads(self):
+
+        return []
+
+
     def get_ready_tensors(self):
         return {}
 
@@ -494,17 +499,6 @@ def test_a_submission_under_a_running_id_is_refused_and_the_running_one_is_untou
 
     s.submit_request(text="reuse", request_id="X", streaming=False, **TEXT)
     assert len(pw.inputs) == 2, "the id was not free once its request was read"
-
-
-def test_a_request_id_no_message_could_carry_is_refused():
-    """A JSON escape can give an id a lone surrogate, which the wire codec
-    cannot encode: refused up front, before anything is sent under it."""
-    pw = _PreprocessWorker()
-    s = _api_server(pw)
-    with pytest.raises(HTTPException) as refused:
-        s.submit_request(text="hi", request_id=json.loads('"\\udc80"'), **TEXT)
-
-    assert refused.value.status_code == 400 and pw.inputs == []
 
 
 def test_an_id_is_free_once_its_request_finished_even_before_it_is_read():

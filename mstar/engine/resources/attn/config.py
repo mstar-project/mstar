@@ -40,6 +40,13 @@ class AttentionConfig:
     # one-token rows on the decode wrapper and their prompt rows on a prefill
     # wrapper sized to them (`FlashInferMixedWrapper`)
     splits: tuple[CombinedSplit, ...] = ()
+    sliding_window: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.sliding_window is not None and (
+            type(self.sliding_window) is not int or self.sliding_window <= 0
+        ):
+            raise ValueError("sliding_window must be a positive integer or None")
 
 
 @dataclass

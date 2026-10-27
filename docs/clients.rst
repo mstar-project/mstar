@@ -48,6 +48,11 @@ NDJSON stream.
        again once that request finished, failed or was aborted (a client that
        drops a stream can resubmit its id at once).
 
+A client ``request_id`` is at most 128 characters from ``[A-Za-z0-9._:-]``; any other is
+refused with ``400`` (on ``/generate/ws``, with the in-band error below). An empty
+``request_id`` counts as none: the server mints a fresh one, on both frontends and on
+``/generate/ws``.
+
 A non-streaming response groups outputs by modality, each payload base64-encoded:
 
 .. code-block:: json
@@ -67,6 +72,13 @@ length-framed binary chunks instead, which skips the base64 pass on multi-megaby
 ``video_frame`` payloads; a server without the framing keeps answering NDJSON, so a
 client must parse by the response ``Content-Type``. ``GET /health`` returns
 ``{"status": "healthy"}``.
+
+Streamed ``text`` chunks (``/generate`` and ``/generate/ws``) are the raw UTF-8 bytes
+of each token, so one character can be split across two chunks. Decode the stream
+incrementally (``codecs.getincrementaldecoder("utf-8")``, as the Python SDK does)
+or join the chunks before decoding; decoding each chunk on its own with
+``errors="strict"`` raises on a split character, and with ``"replace"`` turns both
+halves into U+FFFD.
 
 .. code-block:: bash
 
@@ -239,7 +251,7 @@ Endpoints and model coverage:
      - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/audio/transcriptions``
-     - ``whisper_large``, ``higgs_audio``, ``omnilingual_asr_ctc_*``
+     - ``whisper_large``, ``higgs_audio``, ``omnilingual_asr_ctc_*``, ``canary``, ``canary_qwen``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
    * - ``WS /v1/realtime?intent=transcription``
@@ -249,7 +261,7 @@ Endpoints and model coverage:
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
        finishes the utterance. Input is ``pcm16`` at 16 kHz (the default) or
        ``{"type": "audio/pcm", "rate": 24000}``, resampled to 16 kHz. Turn
-       detection is null (client commits) or ``server_vad``; see below.
+       detection is null (client commits), ``server_vad`` or ``semantic_vad``; see below.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
@@ -297,7 +309,9 @@ Per-model notes:
   ``initial_prompt``), and ``response_format``
   ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
   model for timestamps. Whisper's language and timestamp tokens travel in the
-  text stream and are lifted into ``language`` / ``segments`` by the server; a
+  text stream and are lifted into ``language`` / ``segments`` by the server;
+  Higgs-Audio emits no timestamps, so its ``verbose_json`` / ``srt`` / ``vtt`` get
+  one segment per window, timed to the windows. A
   streaming client receives only the spoken words. Uploads longer than the
   model's clip (30 s for Whisper) are served as consecutive windows. By default
   they run in order, openai-whisper style: each window gets the transcript so
@@ -321,8 +335,15 @@ Per-model notes:
   clip of up to 20 s is one request; a longer upload is cut into windows of about equal
   length, at most 16 s, at quiet points and transcribed in parallel (``window_seconds``
   in ``extra_body``, 5 to 40, sets both lengths). There are no timestamps: ``srt`` / ``vtt``
-  get one cue spanning the file. Nothing detects the language: ``verbose_json``'s
+  get one cue per window, timed to the windows. Nothing detects the language: ``verbose_json``'s
   ``language`` is the request's ``language`` as given, or null.
+- **Canary / Canary-Qwen** — no conditioning text (``prompt`` is dropped) and no
+  timestamps: ``timestamp_granularities`` is a 400, and ``srt`` / ``vtt`` /
+  ``verbose_json`` get one segment per window. Canary takes ``language`` (the speech's,
+  English by default) and, through ``extra_body``, ``target_language`` or
+  ``task="translate"`` (into English) and ``punctuation``. Canary-Qwen only transcribes
+  English, and refuses a ``task`` other than ``transcribe``. Uploads longer than the
+  models' 40 s clip run as parallel windows.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
@@ -359,6 +380,24 @@ Per-model notes:
   exports take other inputs, and with one of them ``server_vad`` is refused); weights are
   never downloaded. The Dynamo bridge has no turn detection yet and
   refuses it.
+- **Semantic turn detection** — ``"turn_detection": {"type": "semantic_vad", "eagerness":
+  "auto"}`` ends a turn when the speaker sounds finished rather than after a fixed
+  silence, as OpenAI's semantic VAD does. When a pause reaches the eagerness' pause
+  (high 200 ms, medium and auto 300 ms, low 400 ms; all shorter than server_vad's
+  500 ms), Pipecat's Smart Turn v3 judges the turn's last 8 s of audio once; a
+  probability of at least 0.3, 0.5 or 0.7 (high, medium/auto, low) commits there, and
+  otherwise the server keeps listening. A silence of 2, 4 or 8 s always ends the turn.
+  Speech starts on Silero's 0.5 with 300 ms of prefix padding; the events are the same
+  as server_vad's. Smart Turn (BSD-2, 8 MB int8 ONNX, about 45 ms per pause on one CPU
+  thread) runs off the event loop. It needs ``onnxruntime`` and ``transformers``
+  (``mstar[vad]``) and its weights at ``MSTAR_SMART_TURN_PATH`` or in the local Hugging
+  Face cache (``hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx``). Without
+  them, or with an ONNX file whose inputs or outputs differ, the server warns at startup
+  and refuses ``semantic_vad`` with an ``error`` event that says why (no weights, a
+  missing package, or a file that is not the model), as ``server_vad`` is refused
+  without Silero. The session goes on with its previous settings, so the client can
+  choose ``server_vad`` or manual commits instead. See OpenAI's `realtime VAD guide
+  <https://platform.openai.com/docs/guides/realtime-vad>`_.
 - **Kokoro** — ``voice`` is one of the 54 bundled voices (default ``af_heart``) or a
   blend such as ``af_bella+af_sky`` or ``af_bella(2)+af_sky(1)``; ``speed`` scales the
   speaking rate (0.25-4.0). ``lang_code`` and ``phonemes`` go through ``extra_body``.

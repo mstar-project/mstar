@@ -116,6 +116,7 @@ def _pending():
             node_name=NODE, graph_walk=WALK, request_to_worker_graph={CONTINUING: 0},
         ),
         node_name=NODE, graph_walk=WALK, partition=PART, tp_seq=5,
+        node_batch=SimpleNamespace(commit_done=SimpleNamespace(is_set=lambda: True)),
     )
 
 
@@ -137,11 +138,12 @@ def _leader_speculation(final: bool):
 def _follower_speculation(final: bool):
     head = SimpleNamespace(
         speculative=True, spec_from_seq=5, spec_seq=6, node_name=NODE, graph_walk=WALK,
-        walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH],
+        walks=[], walk_idx=[], request_ids=[CONTINUING, FRESH], read_check=False,
     )
     scheduler = SimpleNamespace(
         peek_tp_follow=lambda: head,
-        settle_tp_follow_delta=lambda: True,
+        settle_tp_follow_delta=lambda caught_up: True,
+        unread_rows=lambda h, rids: set(),
         tp_rids=lambda h: list(h.request_ids),
         pop_ready_rids=lambda *a, **k: PopReadyResult(
             {FRESH: 0}, _fresh_edges(final), ("prev_text",),
