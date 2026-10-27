@@ -874,9 +874,9 @@ class VJepa2Model(Model):
         horizon = (model_kwargs or {}).get("rollout_horizon")
         if horizon is None:
             return 0
-        limit = self.config.max_rollout_horizon
-        if isinstance(horizon, bool) or not isinstance(horizon, int) or not 0 <= horizon <= limit:
-            raise ValueError(f"rollout_horizon must be an integer in [0, {limit}]; got {horizon!r}")
+        # past the rollout loop's max_iters, the conductor refuses it (get_loop_caps)
+        if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 0:
+            raise ValueError(f"rollout_horizon must be an integer >= 0; got {horizon!r}")
         return horizon
 
     def _initial_walk(self, model_kwargs: dict | None) -> str:
@@ -970,7 +970,7 @@ class VJepa2Model(Model):
             # Per-request horizon enforced by ``VJepa2RolloutPredictorSubmodule``
             # via ``check_stop`` once iter_idx + 1 reaches it.  The
             # graph's Loop is always built with ``max_iters=config.max_rollout_horizon``,
-            # which _rollout_horizon already bounds the request by.
+            # and the conductor refuses a horizon past it (get_loop_caps).
             # Streaming variant uses the same horizon logic — the submodule
             # doesn't distinguish walks.
             step_metadata["rollout_horizon"] = self._rollout_horizon(model_kwargs or {})

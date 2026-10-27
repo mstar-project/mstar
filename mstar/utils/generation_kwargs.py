@@ -44,11 +44,14 @@ _REAL_RULES = {
     **REAL_KNOB_RULES,
     "fps": ("> 0", lambda v: v > 0),
     "guidance_scale": ("of any sign", lambda v: True),
+    "speed": ("> 0", lambda v: v > 0),
 }
 _INT_RULES = {
     **INT_KNOB_RULES,
     "max_output_tokens": (">= 1", lambda v: v >= 1),
     "num_inference_steps": (">= 1", lambda v: v >= 1),
+    "num_step": (">= 1", lambda v: v >= 1),
+    "rollout_horizon": (">= 0", lambda v: v >= 0),
     "num_frames": (">= 1", lambda v: v >= 1),
     "height": (">= 1", lambda v: v >= 1),
     "width": (">= 1", lambda v: v >= 1),

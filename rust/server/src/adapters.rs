@@ -265,10 +265,6 @@ fn apply_sampling(mk: &mut Map<String, Value>, s: Sampling) {
     }
 }
 
-fn json_num(f: f64) -> Value {
-    serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
-}
-
 /// Which OpenAI surfaces a model serves + the request translation. One
 /// variant per ported `OpenAIAdapter` subclass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,8 +515,8 @@ impl Adapter {
                 if let Some(nf) = req.num_frames {
                     set_default(&mut mk, "num_frames", Value::from(nf));
                 }
-                if let Some(fps) = req.fps {
-                    set_default(&mut mk, "fps", json_num(fps));
+                if let Some(fps) = &req.fps {
+                    set_default(&mut mk, "fps", fps.clone());
                 }
                 // The conditioning frame (image-to-video) or clip (video-to-video)
                 // is persisted and VAE-encoded by the worker into the clean

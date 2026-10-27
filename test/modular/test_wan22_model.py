@@ -332,10 +332,10 @@ def test_wan22_num_inference_steps_in_range_are_honored(requested):
     assert args.step_metadata["num_inference_steps"] == requested
 
 
-@pytest.mark.parametrize("requested", [0, -1, 101, 10_000, 50.0, "50", True])
+@pytest.mark.parametrize("requested", [0, -1, 50.0, "50", True])
 def test_wan22_num_inference_steps_out_of_range_is_a_400(requested):
     model = _make_model()
-    with pytest.raises(ValueError, match=r"num_inference_steps must be an integer in \[1, 100\]"):
+    with pytest.raises(ValueError, match="num_inference_steps must be an integer >= 1"):
         model.get_initial_forward_pass_args(
             partition_name="default",
             input_modalities=["text"],
@@ -348,6 +348,22 @@ def test_wan22_num_inference_steps_out_of_range_is_a_400(requested):
             prompt="a cat surfing", input_modalities=["text"], output_modalities=["video"],
             num_inference_steps=requested,
         )
+
+
+@pytest.mark.parametrize("requested", [101, 10_000])
+def test_wan22_steps_past_the_denoise_loop_are_refused_by_the_conductor(requested):
+    from mstar.conductor.conductor import Conductor
+
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = model = _make_model()
+    conductor._loop_max_iters = {
+        name: loop.max_iters
+        for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    assert conductor._loop_caps({"num_inference_steps": 100})[model.DENOISE_LOOP_NAME] == 100
+    with pytest.raises(ValueError, match="iterations"):
+        conductor._loop_caps({"num_inference_steps": requested})
 
 
 @pytest.mark.parametrize("kwargs,fragment", [

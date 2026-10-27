@@ -289,11 +289,19 @@ def test_omnivoice_valid_knobs_pass_through():
     assert meta["postprocess_output"] is False
 
 
+def test_omnivoice_num_step_past_the_unmask_loop_is_refused_by_the_conductor():
+    model = _omnivoice_model()
+    top = model.config.generation.max_num_step
+    conductor = _loop_conductor(model)
+    assert conductor._loop_caps({"num_step": top})[OmniVoiceModel.UNMASK_LOOP_NAME] == top
+    with pytest.raises(ValueError, match="iterations"):
+        conductor._loop_caps({"num_step": top + 1})
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"num_step": 0}, r"num_step must be an integer in \[1, 64\]"),
-        ({"num_step": 65}, r"num_step must be an integer in \[1, 64\]"),
+        ({"num_step": 0}, "num_step must be an integer >= 1"),
         ({"num_step": 16.0}, "num_step must be an integer"),
         ({"num_step": "16"}, "num_step must be an integer"),
         ({"guidance_scale": "2"}, "guidance_scale must be a finite number"),
@@ -593,10 +601,15 @@ def test_vjepa2_request_kwargs_and_no_token_limit(vjepa2_masked):
     assert {"context_mask", "target_mask"} <= declared
 
 
-@pytest.mark.parametrize("horizon", [-1, 17, 2.0, "4", True])
-def test_vjepa2_bad_rollout_horizon_is_a_400(vjepa2_masked, horizon):
+def test_vjepa2_rollout_horizon_past_the_loop_is_refused_by_the_conductor(vjepa2_masked):
     limit = vjepa2_masked.config.max_rollout_horizon
-    with pytest.raises(ValueError, match=rf"rollout_horizon must be an integer in \[0, {limit}\]"):
+    with pytest.raises(ValueError, match="iterations"):
+        _loop_conductor(vjepa2_masked)._loop_caps({"rollout_horizon": limit + 1})
+
+
+@pytest.mark.parametrize("horizon", [-1, 2.0, "4", True])
+def test_vjepa2_bad_rollout_horizon_is_a_400(vjepa2_masked, horizon):
+    with pytest.raises(ValueError, match="rollout_horizon must be an integer >= 0"):
         vjepa2_masked._initial_walk({"rollout_horizon": horizon})
     with pytest.raises(ValueError, match="rollout_horizon"):
         vjepa2_masked.process_prompt(None, ["video"], ["video"], tensors=_vjepa2_video(4), rollout_horizon=horizon)

@@ -231,8 +231,9 @@ pub struct VideoGenerationRequest {
     /// First-class video fields (not passed through `extra`), as in mstar.
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub num_frames: Option<i64>,
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub fps: Option<f64>,
+    /// Passed on as sent, like the sampling floats.
+    #[serde(default)]
+    pub fps: Option<Value>,
     /// URL or data URI conditioning frame (image-to-video).
     #[serde(default)]
     pub image: Option<String>,
@@ -377,7 +378,7 @@ mod tests {
         assert_eq!(img.seed, Some(3));
         let vid: VideoGenerationRequest =
             serde_json::from_str(r#"{"prompt":"x","fps":"12","num_frames":"24"}"#).unwrap();
-        assert_eq!(vid.fps, Some(12.0));
+        assert_eq!(vid.fps, Some(json!("12")));
         assert_eq!(vid.num_frames, Some(24));
     }
 }

@@ -103,8 +103,9 @@ def _text(kwargs: dict, key: str) -> str | None:
 def resolve_step_knobs(kwargs: dict, defaults) -> dict:
     """The per-request unmask and output knobs, validated; ValueError names the bad one."""
     num_step = kwargs.get("num_step", defaults.num_step)
-    if isinstance(num_step, bool) or not isinstance(num_step, int) or not 1 <= num_step <= defaults.max_num_step:
-        raise ValueError(f"num_step must be an integer in [1, {defaults.max_num_step}]; got {num_step!r}")
+    # past the unmask loop's max_iters, the conductor refuses it (get_loop_caps)
+    if isinstance(num_step, bool) or not isinstance(num_step, int) or num_step < 1:
+        raise ValueError(f"num_step must be an integer >= 1; got {num_step!r}")
     return {
         "num_step": num_step,
         # 0 disables CFG
@@ -673,6 +674,13 @@ class OmniVoiceModel(Model):
         numerics equal to the reference pipeline.
         """
         return None
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # check_stop ends the unmask loop after exactly num_step iterations
+        num_step = model_kwargs.get("num_step", self.config.generation.num_step)
+        if isinstance(num_step, int) and not isinstance(num_step, bool) and num_step >= 1:
+            return {UNMASK_LOOP_NAME: num_step}
+        return {}
 
     def request_kwargs(self) -> frozenset[str]:
         return REQUEST_KWARGS

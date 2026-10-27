@@ -375,10 +375,9 @@ class Wan22Model(Model):
         """num_inference_steps, guidance_scale and negative_prompt, validated; ``ValueError`` names the bad one."""
         cfg = self.config
         steps = self._get(model_kwargs, "num_inference_steps", cfg.default_num_inference_steps)
-        if isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= cfg.max_denoise_steps:
-            raise ValueError(
-                f"Wan2.2 num_inference_steps must be an integer in [1, {cfg.max_denoise_steps}]; got {steps!r}."
-            )
+        # past the denoise loop's max_iters, the conductor refuses it (get_loop_caps)
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError(f"Wan2.2 num_inference_steps must be an integer >= 1; got {steps!r}.")
         guidance = self._get(model_kwargs, "guidance_scale", cfg.guidance_scale)
         if not _is_number(guidance):
             raise ValueError(f"Wan2.2 guidance_scale must be a finite number; got {guidance!r}.")
@@ -471,6 +470,13 @@ class Wan22Model(Model):
                 f"Wan2.2 conditioning image is {got[0]}x{got[1]} (HxW) but the request is "
                 f"{expected[0]}x{expected[1]}; resize it client-side (the server does not resize)."
             )
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # check_stop ends the denoise loop after exactly num_inference_steps iterations
+        steps = self._get(model_kwargs, "num_inference_steps", self.config.default_num_inference_steps)
+        if isinstance(steps, int) and not isinstance(steps, bool) and steps >= 1:
+            return {DENOISE_LOOP_NAME: steps}
+        return {}
 
     def request_kwargs(self) -> frozenset[str]:
         return REQUEST_KWARGS
