@@ -102,6 +102,10 @@ class CudaPlatform(Platform):
     def local_cpus(self, device_index: int) -> frozenset[int] | None:
         return _pci_local_cpus(device_index)
 
+    def process_env_defaults(self) -> dict[str, str]:
+        # NCCL registering the buffers captured in CUDA graphs gave wrong Cosmos3 SP4 images
+        return {"NCCL_GRAPH_REGISTER": "0"}
+
 
 class RocmPlatform(Platform):
     name = "rocm"
