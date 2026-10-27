@@ -842,21 +842,28 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: Rid, graph_edges: list[GraphEdge],
         graph_walk: str | None = None,
     ):
+        return self._start_reads([(request_id, graph_edges)], graph_walk)
+
+    def start_read_tensors_multi(self, reads):
+        """One stream context, peer sweep, event and wake for every request's
+        reads, not one each."""
+        return self._start_reads(reads, None)
+
+    def _start_reads(self, requests, graph_walk):
         # Increment races are benign here: a torn count can only make
         # eviction OVER-cautious (skip a sweep), never unsafe.
         self._reads_active += 1
         try:
-            if not any(e.tensor_info for e in graph_edges):
+            if not any(e.tensor_info for _rid, edges in requests for e in edges):
                 # signal-only edges: no stream context to pay for, but the
                 # (time-gated) sweep of dead peers' segments still runs here
                 self._evict_dead_peers()
                 return []
-            return self._start_read_tensors(request_id, graph_edges,
-                                            graph_walk)
+            return self._start_read_tensors(requests, graph_walk)
         finally:
             self._reads_active -= 1
 
-    def _start_read_tensors(self, request_id, graph_edges, graph_walk):
+    def _start_read_tensors(self, requests, graph_walk):
         self._evict_dead_peers()
         h2d_did_work = False
         stats = self.transfer_stats
@@ -868,47 +875,48 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             else _nullcontext()
         )
         with ctx:
-            for graph_edge in graph_edges:
-                if len(graph_edge.tensor_info) == 0:
-                    continue
-                rx_t0 = time.perf_counter()
-                fp = FutureAndPointers(
-                    future=None, graph_edges=[graph_edge], request_id=request_id,
-                )
-                for info in graph_edge.tensor_info:
-                    if info.source_entity == self.my_entity_id:
-                        self._slice_existing_tensor(
-                            request_id=request_id, name=graph_edge.name,
-                            next_node=graph_edge.next_node,
-                            graph_walk=graph_walk, info=info,
-                        )
-                        self.tensor_store.increment_ref(info.uuid, 1)
+            for request_id, graph_edges in requests:
+                for graph_edge in graph_edges:
+                    if len(graph_edge.tensor_info) == 0:
                         continue
-                    producer_uuid = info.uuid
-                    if self._take_cached_read(request_id, info):
-                        continue
-                    if info.shm_segment is None:
-                        # Spilled at the producer (arena saturated): read the
-                        # per-uuid file, the old protocol's path.
-                        path = self._shm_path(info.source_entity, producer_uuid)
-                        with open(path, "rb") as f:
-                            f.seek(info.offset)
-                            data = f.read(info.nbytes)
-                        tensor = _deserialize_tensor(
-                            data, self.device, tensor_info=info)
-                    else:
-                        tensor = self._read_from_arena(info)
-                    h2d_did_work = h2d_did_work or tensor.numel() > 0
-                    self.tensor_store.put_tensor(
-                        request_id, info.uuid, tensor, info)
-                    self.tensor_store.set_metadata(info.uuid, mem_registered=False)
-                    # +1 transit (released by get_ready_tensors), +1 usage
-                    # (released by _cleanup_consumed_inputs).
-                    self.tensor_store.increment_ref(info.uuid, 2)
-                    if stats is not None:
-                        fp.count_read(info)
-                fp.rx_time = time.perf_counter() - rx_t0
-                reads.append(fp)
+                    rx_t0 = time.perf_counter()
+                    fp = FutureAndPointers(
+                        future=None, graph_edges=[graph_edge], request_id=request_id,
+                    )
+                    for info in graph_edge.tensor_info:
+                        if info.source_entity == self.my_entity_id:
+                            self._slice_existing_tensor(
+                                request_id=request_id, name=graph_edge.name,
+                                next_node=graph_edge.next_node,
+                                graph_walk=graph_walk, info=info,
+                            )
+                            self.tensor_store.increment_ref(info.uuid, 1)
+                            continue
+                        producer_uuid = info.uuid
+                        if self._take_cached_read(request_id, info):
+                            continue
+                        if info.shm_segment is None:
+                            # Spilled at the producer (arena saturated): read the
+                            # per-uuid file, the old protocol's path.
+                            path = self._shm_path(info.source_entity, producer_uuid)
+                            with open(path, "rb") as f:
+                                f.seek(info.offset)
+                                data = f.read(info.nbytes)
+                            tensor = _deserialize_tensor(
+                                data, self.device, tensor_info=info)
+                        else:
+                            tensor = self._read_from_arena(info)
+                        h2d_did_work = h2d_did_work or tensor.numel() > 0
+                        self.tensor_store.put_tensor(
+                            request_id, info.uuid, tensor, info)
+                        self.tensor_store.set_metadata(info.uuid, mem_registered=False)
+                        # +1 transit (released by get_ready_tensors), +1 usage
+                        # (released by _cleanup_consumed_inputs).
+                        self.tensor_store.increment_ref(info.uuid, 2)
+                        if stats is not None:
+                            fp.count_read(info)
+                    fp.rx_time = time.perf_counter() - rx_t0
+                    reads.append(fp)
         future = None
         if h2d_did_work and self._h2d_stream is not None:
             # Downstream kernels see the data (device-side ordering only).

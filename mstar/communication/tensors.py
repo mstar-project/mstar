@@ -1561,6 +1561,17 @@ class TensorCommunicationManager(ABC):
     ) -> list[Future]:
         ...
 
+    def start_read_tensors_multi(
+        self, reads: list[tuple[Rid, list[GraphEdge]]],
+    ) -> list[Future]:
+        """``start_read_tensors`` for several requests' edges at once (a
+        STREAM_ITEMS frame); a transport with per-call setup overrides it to
+        pay that once."""
+        futures: list[Future] = []
+        for request_id, graph_edges in reads:
+            futures.extend(self.start_read_tensors(request_id, graph_edges))
+        return futures
+
     def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
         """``registered`` is the transport's ``mem_registered`` flag, passed in
         by a batched dereference that has already dropped the record it lives

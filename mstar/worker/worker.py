@@ -23,6 +23,8 @@ from torch.distributed import ReduceOp
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
+from mstar.communication.stream_items import row_infos, row_input_signals
+from mstar.communication.stream_items import rows as stream_rows
 from mstar.communication.tensors import (
     LocalTransferEngine,
     NameToTensorList,
@@ -79,6 +81,7 @@ from mstar.utils.ipc_format import (
     ScheduleTPNode,
     SetupDone,
     StopLoops,
+    StreamItems,
     TensorReceived,
     TPNoSpeculation,
     UnpersistTensors,
@@ -1241,12 +1244,15 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.start_read")
-        # Start RDMA reads for non-streaming edges with tensor_info
-        futures = self.tensor_manager.start_read_tensors(
-            request_id, non_streaming,
-            graph_walk=body.request_info.graph_walk
-        )
-        self.wakeup_event.register_futures(futures)
+        # Start RDMA reads for non-streaming edges with tensor_info; a
+        # streamed row of a STREAM_ITEMS replayed from the park has none, and
+        # no forward-pass info either
+        if non_streaming:
+            futures = self.tensor_manager.start_read_tensors(
+                request_id, non_streaming,
+                graph_walk=body.request_info.graph_walk
+            )
+            self.wakeup_event.register_futures(futures)
         # Start RDMA reads for streaming edges with tensor_info (will be routed to buffer in _check_ready_tensors)
         if streaming_with_tensors:
             futures = self.tensor_manager.start_read_tensors(
@@ -1275,6 +1281,33 @@ class Worker:
             )
         if self.enable_nvtx:
             range_pop()
+
+    def _process_stream_items(self, frame: StreamItems) -> None:
+        """A step's streamed tensors from one producer (STREAM_ITEMS): each
+        row is what one INPUT_SIGNALS of a single streamed edge did, and the
+        frame's reads start in one call."""
+        reads: list[tuple[int, list[GraphEdge]]] = []
+        for row in stream_rows(frame):
+            rid = self._rid(row.request_id)
+            if rid is None or rid not in self.request_state.per_request_info:
+                # not here yet, or removed: parked or dropped as the
+                # INPUT_SIGNALS it replaces
+                self._process_message_list([WorkerMessage(
+                    message_type=WorkerMessageType.INPUT_SIGNALS,
+                    body=row_input_signals(frame, row),
+                )])
+                continue
+            if row.request_id in self._draining_rids:
+                continue  # as _process_new_inputs: no new reads
+            stream_buf = self.request_state.per_request_info[rid].stream_buffers[row.signal]
+            for uuid in frame.uuids[row.start:row.start + row.count]:
+                stream_buf.pre_read_register(uuid)
+            reads.append((rid, [GraphEdge(
+                next_node=row.next_node, name=row.signal,
+                tensor_info=row_infos(frame, row), is_streaming=True,
+            )]))
+        if reads:
+            self.wakeup_event.register_futures(self.tensor_manager.start_read_tensors_multi(reads))
 
     def _unpersist_tensors(self, body: UnpersistTensors):
         for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
@@ -1330,6 +1363,8 @@ class Worker:
                 self._remove_request(message.body)
             elif message.message_type == WorkerMessageType.INPUT_SIGNALS:
                 self._process_new_inputs(message.body)
+            elif message.message_type == WorkerMessageType.STREAM_ITEMS:
+                self._process_stream_items(message.body)
             elif message.message_type == WorkerMessageType.TENSOR_RECEIVED:
                 self._handle_tensor_received(message.body)
             elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:

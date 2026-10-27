@@ -1265,3 +1265,30 @@ def test_a_failed_pin_leaves_cuda_usable():
 
     assert not arena._pin(4096, 4096)  # not a mapping of this process
     assert (torch.ones(4, device="cuda") + 1).sum().item() == 8
+
+
+def test_several_requests_read_in_one_call_as_in_one_call_each(tmp_path):
+    """``start_read_tensors_multi`` (a STREAM_ITEMS frame's reads) leaves the
+    store and the pending reads as one ``start_read_tensors`` per request
+    does: every tensor read, each request's edge pending under its own rid."""
+    prod = _manager("w0", tmp_path)
+    sent = {}
+    for rid in ("r1", "r2"):
+        infos = prod.store_and_return_tensor_info(rid, {"tok": [torch.arange(4) + len(sent)]})
+        prod.register_for_send(rid, infos["tok"])
+        sent[rid] = infos["tok"]
+    edges = {
+        rid: [GraphEdge(next_node="B", name="tok", tensor_info=il, is_streaming=True)]
+        for rid, il in sent.items()
+    }
+    together, apart = _manager("w1", tmp_path), _manager("w2", tmp_path)
+    together.start_read_tensors_multi(list(edges.items()))
+    for rid, e in edges.items():
+        apart.start_read_tensors(rid, e)
+    for cons in (together, apart):
+        for il in sent.values():
+            for info in il:
+                assert torch.equal(cons.tensor_store.get_tensor(info.uuid), prod.tensor_store.get_tensor(info.uuid))
+    assert [(fp.request_id, [e.name for e in fp.graph_edges]) for fp in together.pending] == [
+        (fp.request_id, [e.name for e in fp.graph_edges]) for fp in apart.pending
+    ]

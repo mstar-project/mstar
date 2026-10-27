@@ -35,6 +35,7 @@ class WorkerMessageType(Enum):
     DRAIN_REQUEST = "drain_request"
     REMOVE_REQUEST = "remove_request"
     INPUT_SIGNALS = "input_signals"
+    STREAM_ITEMS = "stream_items"
     UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
@@ -89,6 +90,48 @@ class InputSignals(MessageBody):
     # Stream edge -> items its producer sent this worker in total. The stream
     # ends only once that many have arrived.
     producer_done_items: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class StreamItems(MessageBody):
+    """One step's streamed tensors from a producer worker to one consumer
+    worker, as columns: a row per (request, streaming edge), and per row its
+    items, row-major. It carries what one INPUT_SIGNALS per (request, worker)
+    did for an edge that is nothing but streamed tensors -- unsharded, no
+    forward-pass info -- so the receiver decodes, reads and routes a step's
+    tokens once instead of once per request.
+
+    The fields above the columns are shared by every item: a row whose
+    tensors differ in them goes as INPUT_SIGNALS instead.
+    """
+
+    partition_name: str
+    source_session_id: str
+    source_entity: str
+    tp_size: int
+    tp_rank: int
+    source_node_name: str | None = None
+    # signal, node, walk and arena segment names the columns index
+    names: list[str] = field(default_factory=list)
+    # per row
+    request_ids: list[str] = field(default_factory=list)
+    signal_idx: list[int] = field(default_factory=list)
+    next_node_idx: list[int] = field(default_factory=list)
+    walk_idx: list[int] = field(default_factory=list)
+    num_items: list[int] = field(default_factory=list)
+    # per item
+    uuids: list[int] = field(default_factory=list)
+    addresses: list[int] = field(default_factory=list)
+    nbytes: list[int] = field(default_factory=list)
+    offsets: list[int] = field(default_factory=list)
+    ndims: list[int] = field(default_factory=list)
+    dims_flat: list[int] = field(default_factory=list)
+    stride_flat: list[int] = field(default_factory=list)
+    dtype_idx: list[int] = field(default_factory=list)
+    dtype_names: list[str] = field(default_factory=list)
+    # the arena segment each item is in (an index into names), -1 for none
+    shm_segment_idx: list[int] = field(default_factory=list)
+    shm_offsets: list[int] = field(default_factory=list)
 
 
 @dataclass

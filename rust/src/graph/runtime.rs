@@ -3960,6 +3960,12 @@ impl GraphRuntime {
             // (rid, edge, worker, items): what each consumer will register, so
             // counted from the descriptors that go out, not the refs.
             let mut stream_items: Vec<(u32, String, Sym, i64)> = Vec::new();
+            // A step's plain streamed edges (unsharded, one producer) go to
+            // each worker as one STREAM_ITEMS, not one INPUT_SIGNALS per
+            // request: the receiver then decodes, reads and routes the step's
+            // items once. Worker order kept as first seen.
+            let mut streamed: Vec<(Sym, frames::StreamItems)> = Vec::new();
+            let mut streamed_at: FxHashMap<Sym, usize> = FxHashMap::default();
             {
                 // One acquisition for every descriptor lookup in the batch, not
                 // one per edge. Released before the sends -- holding it across
@@ -3971,6 +3977,20 @@ impl GraphRuntime {
                         stream_items.push((
                             w.rid, w.signal.clone(), w.worker, infos.len() as i64,
                         ));
+                        if w.shard_dim.is_none() && w.total_fanin == 1 {
+                            let request_id = self.rids.name(w.rid).ok_or_else(|| {
+                                PyValueError::new_err(format!("unknown rid handle {}", w.rid))
+                            })?;
+                            let i = *streamed_at.entry(w.worker).or_insert_with(|| {
+                                streamed.push((w.worker, frames::StreamItems::new(&partition)));
+                                streamed.len() - 1
+                            });
+                            if streamed[i].1.try_add(
+                                bk.strings(), request_id, &w.signal, &w.next_node, &infos,
+                            ) {
+                                continue;
+                            }
+                        }
                     }
                     let key = (w.rid, w.worker);
                     let edge = frames::OutEdge {
@@ -4013,6 +4033,11 @@ impl GraphRuntime {
                         }
                         .encode(bk.strings()),
                     ));
+                }
+                for (worker, items) in &streamed {
+                    if !items.is_empty() {
+                        frames_out.push((*worker, items.encode(bk.strings())));
+                    }
                 }
             }
             for (worker, bytes) in frames_out {

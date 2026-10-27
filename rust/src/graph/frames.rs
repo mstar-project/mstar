@@ -22,6 +22,7 @@ use rmpv::Value;
 use crate::graph::compile::EMIT_TO_CLIENT;
 use crate::graph::spec::{StrToId, Sym};
 use crate::tensors::TensorPointerInfo;
+use rustc_hash::FxHashMap;
 
 // -- writers -----------------------------------------------------------------
 //
@@ -400,6 +401,170 @@ impl InputSignals<'_> {
             // A set, which msgpack cannot express; the codec sends a list.
             // Always empty: only the conductor ever populates it.
             w_arr(m.key("producer_done"), 0);
+        });
+        out
+    }
+}
+
+/// STREAM_ITEMS to one peer worker: a step's streamed tensors as columns
+/// (Python's `StreamItems`). Rows go in with `try_add`; a row whose
+/// descriptors differ from the frame's shared fields is refused, and the
+/// caller sends it as INPUT_SIGNALS.
+pub struct StreamItems {
+    partition_name: String,
+    // (session, entity, node, tp_size, tp_rank), fixed by the first row
+    shared: Option<(Sym, Sym, Option<Sym>, u32, u32)>,
+    names: Vec<String>,
+    name_at: FxHashMap<String, i64>,
+    dtype_names: Vec<String>,
+    dtype_at: FxHashMap<Sym, i64>,
+    request_ids: Vec<String>,
+    signal_idx: Vec<i64>,
+    next_node_idx: Vec<i64>,
+    walk_idx: Vec<i64>,
+    num_items: Vec<i64>,
+    uuids: Vec<u64>,
+    addresses: Vec<u64>,
+    nbytes: Vec<i64>,
+    offsets: Vec<i64>,
+    ndims: Vec<i64>,
+    dims_flat: Vec<i64>,
+    stride_flat: Vec<i64>,
+    dtype_idx: Vec<i64>,
+    shm_segment_idx: Vec<i64>,
+    shm_offsets: Vec<i64>,
+}
+
+impl StreamItems {
+    pub fn new(partition_name: &str) -> Self {
+        StreamItems {
+            partition_name: partition_name.to_string(),
+            shared: None,
+            names: Vec::new(), name_at: FxHashMap::default(),
+            dtype_names: Vec::new(), dtype_at: FxHashMap::default(),
+            request_ids: Vec::new(), signal_idx: Vec::new(), next_node_idx: Vec::new(),
+            walk_idx: Vec::new(), num_items: Vec::new(),
+            uuids: Vec::new(), addresses: Vec::new(), nbytes: Vec::new(), offsets: Vec::new(),
+            ndims: Vec::new(), dims_flat: Vec::new(), stride_flat: Vec::new(),
+            dtype_idx: Vec::new(), shm_segment_idx: Vec::new(), shm_offsets: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.request_ids.is_empty()
+    }
+
+    fn name_idx(&mut self, name: &str) -> i64 {
+        if let Some(&i) = self.name_at.get(name) {
+            return i;
+        }
+        let i = self.names.len() as i64;
+        self.names.push(name.to_string());
+        self.name_at.insert(name.to_string(), i);
+        i
+    }
+
+    /// Add one (request, edge) row of streamed tensors; false, adding
+    /// nothing, when its descriptors don't share the frame's fields (or
+    /// each other's walk).
+    pub fn try_add(
+        &mut self, bk: &StrToId, request_id: &str, signal: &str, next_node: &str,
+        infos: &[TensorPointerInfo],
+    ) -> bool {
+        let Some(first) = infos.first() else { return false };
+        let shared = (
+            first.source_session_id, first.source_entity, first.source_node_name,
+            first.source_tp_size, first.source_tp_rank,
+        );
+        if *self.shared.get_or_insert(shared) != shared {
+            return false;
+        }
+        let walk = first.source_graph_walk;
+        if infos.iter().any(|i| {
+            (i.source_session_id, i.source_entity, i.source_node_name, i.source_tp_size,
+             i.source_tp_rank) != shared || i.source_graph_walk != walk
+        }) {
+            return false;
+        }
+        self.request_ids.push(request_id.to_string());
+        let sig = self.name_idx(signal);
+        self.signal_idx.push(sig);
+        let node = self.name_idx(next_node);
+        self.next_node_idx.push(node);
+        let w = walk.map_or(-1, |w| self.name_idx(bk.name(w)));
+        self.walk_idx.push(w);
+        self.num_items.push(infos.len() as i64);
+        for i in infos {
+            self.uuids.push(i.uuid);
+            self.addresses.push(i.address);
+            self.nbytes.push(i.nbytes);
+            self.offsets.push(i.offset);
+            self.ndims.push(i.dims.len() as i64);
+            self.dims_flat.extend_from_slice(&i.dims);
+            self.stride_flat.extend_from_slice(&i.stride);
+            let n = self.dtype_names.len() as i64;
+            let d = *self.dtype_at.entry(i.dtype).or_insert(n);
+            if d == n {
+                self.dtype_names.push(bk.name(i.dtype).to_string());
+            }
+            self.dtype_idx.push(d);
+            let seg = i.shm_segment.map_or(-1, |s| self.name_idx(bk.name(s)));
+            self.shm_segment_idx.push(seg);
+            self.shm_offsets.push(i.shm_offset);
+        }
+        true
+    }
+
+    pub fn encode(&self, bk: &StrToId) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256 + 64 * self.uuids.len());
+        open_frame(&mut out, "worker_msg", "stream_items", Some("stream_items"));
+        let (session, entity, node, tp_size, tp_rank) =
+            self.shared.expect("StreamItems::encode with no rows");
+        fn ints(out: &mut Vec<u8>, v: &[i64]) {
+            w_arr(out, v.len() as u32);
+            for &x in v {
+                w_i64(out, x);
+            }
+        }
+        fn uints(out: &mut Vec<u8>, v: &[u64]) {
+            w_arr(out, v.len() as u32);
+            for &x in v {
+                w_u64(out, x);
+            }
+        }
+        fn strs(out: &mut Vec<u8>, v: &[String]) {
+            w_arr(out, v.len() as u32);
+            for x in v {
+                w_str(out, x);
+            }
+        }
+        w_map_counted(&mut out, |m| {
+            w_str(m.key("partition_name"), &self.partition_name);
+            w_str(m.key("source_session_id"), bk.name(session));
+            w_str(m.key("source_entity"), bk.name(entity));
+            // Omitted when absent, so the decoder's None default stands.
+            if let Some(n) = node {
+                w_str(m.key("source_node_name"), bk.name(n));
+            }
+            w_u64(m.key("tp_size"), tp_size as u64);
+            w_u64(m.key("tp_rank"), tp_rank as u64);
+            strs(m.key("names"), &self.names);
+            strs(m.key("request_ids"), &self.request_ids);
+            ints(m.key("signal_idx"), &self.signal_idx);
+            ints(m.key("next_node_idx"), &self.next_node_idx);
+            ints(m.key("walk_idx"), &self.walk_idx);
+            ints(m.key("num_items"), &self.num_items);
+            uints(m.key("uuids"), &self.uuids);
+            uints(m.key("addresses"), &self.addresses);
+            ints(m.key("nbytes"), &self.nbytes);
+            ints(m.key("offsets"), &self.offsets);
+            ints(m.key("ndims"), &self.ndims);
+            ints(m.key("dims_flat"), &self.dims_flat);
+            ints(m.key("stride_flat"), &self.stride_flat);
+            ints(m.key("dtype_idx"), &self.dtype_idx);
+            strs(m.key("dtype_names"), &self.dtype_names);
+            ints(m.key("shm_segment_idx"), &self.shm_segment_idx);
+            ints(m.key("shm_offsets"), &self.shm_offsets);
         });
         out
     }
