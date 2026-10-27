@@ -130,10 +130,10 @@ def attention_over_sharded_keys(
     if sp_group.world_size == 1:
         return run_attention(q, k, v)
     out, lse = run_attention(q, k, v, return_lse=True)
-    outs = sp_group.all_gather(out.unsqueeze(0).contiguous(), dim=0)
-    lses = sp_group.all_gather(lse.unsqueeze(0).float().contiguous(), dim=0)
-    weights = torch.softmax(lses, dim=0).unsqueeze(-1)
-    return (outs.float() * weights).sum(dim=0).to(q.dtype)
+    # one gather for both: [P, B, Lq, H, D + 1] fp32, the log-sum-exp in the last column
+    gathered = sp_group.all_gather(torch.cat([out.float(), lse.float().unsqueeze(-1)], dim=-1).unsqueeze(0), dim=0)
+    outs, lses = gathered[..., :-1], gathered[..., -1:]
+    return (outs * torch.softmax(lses, dim=0)).sum(dim=0).to(q.dtype)
 
 
 def sp_head_slice(sp_group: CommGroup, x: torch.Tensor) -> torch.Tensor:
