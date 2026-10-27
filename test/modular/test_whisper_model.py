@@ -324,6 +324,7 @@ def _decoder_submodule(cfg: WhisperModelConfig) -> WhisperDecoderSubmodule:
     sub.request_states = {}
     sub.node_resources = {}
     sub.config = cfg
+    sub.stop_token_ids = frozenset({cfg.eos_token_id})
     sub._suppress_ids = sub._begin_suppress_ids = sub._language_mask = None
     sub._stager = PinnedStager(torch.long)
     sub._inactive = None
@@ -553,9 +554,9 @@ def test_decoder_logit_rules():
     scored = logits.clone()
     scored[0, DE], scored[0, EN], scored[1, EN] = 3.0, 1.0, 2.0
     assert sub._detect_language(scored).tolist() == [DE, EN]
-    suppressed = sub._apply_suppress(logits.clone(), is_first_token=True)
+    suppressed = sub.process_logits(logits.clone(), PREFILL_WALK)
     assert torch.isinf(suppressed[0, [1, 2, 220, EOT]]).all()
-    later = sub._apply_suppress(logits.clone(), is_first_token=False)
+    later = sub.process_logits(logits.clone(), DECODE_WALK)
     assert torch.isinf(later[0, [1, 2]]).all() and torch.isfinite(later[0, EOT])
 
 

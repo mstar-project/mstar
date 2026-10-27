@@ -2,7 +2,6 @@
 
 from collections.abc import Mapping
 from dataclasses import asdict
-from time import perf_counter
 
 import torch
 
@@ -25,7 +24,7 @@ from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
-from mstar.utils.profiler import PHASE_PERIOD, phase_record
+from mstar.utils.profiler import PhaseLaps
 
 
 class SamplerResource(Resource):
@@ -474,17 +473,14 @@ class SamplerResource(Resource):
                     keep=keep,
                 )
             return
-        t0 = perf_counter() if PHASE_PERIOD else 0.0
+        laps = PhaseLaps("res.commit.sampler.")
         if keep_gpu is None:
             keep_gpu = self._cg_buffers.keep_mask(keep)
         self._cg_buffers.scatter_offset(ctx.slot_lease.slot, keep=keep_gpu)
-        if PHASE_PERIOD:
-            phase_record("res.commit.sampler.offset", perf_counter() - t0)
-            t0 = perf_counter()
+        laps.lap("offset")
         if self._keep_last_token:
             self._cg_buffers.scatter_last_token(ctx.slot_lease.slot, keep=keep_gpu)
-            if PHASE_PERIOD:
-                phase_record("res.commit.sampler.last_token", perf_counter() - t0)
+            laps.lap("last_token")
         # Skipped when nothing read the mask this step: there is then nothing to
         # copy back, and the rows go stale only for requests at penalty 1.0,
         # which never read them. See `_penalty_live` for why that stays sound.

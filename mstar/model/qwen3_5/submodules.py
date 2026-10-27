@@ -76,7 +76,7 @@ from mstar.model.submodule_base import (
     device_loopback_enabled,
 )
 from mstar.utils.knobs import ingraph_decode_rope
-from mstar.utils.profiler import PHASE_PERIOD, phase_record
+from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
 logger = logging.getLogger(__name__)
 
@@ -451,10 +451,13 @@ class LLMSubmodule(ARNodeSubmodule):
                 [inp.input_embeds for inp in inputs], dim=0,
             )
 
+        laps = PhaseLaps("engine.preprocess.")
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
+        laps.lap("position_ids")
         cos, sin = self.model.model.build_cos_sin(
             position_ids_3d, dtype=self.model.model.embed_tokens.weight.dtype,
         )
+        laps.lap("cos_sin")
         out["cos_3d"] = cos
         out["sin_3d"] = sin
         return out

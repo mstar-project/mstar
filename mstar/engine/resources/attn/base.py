@@ -57,10 +57,15 @@ class AttentionManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
+        backend = resolve_attn_backend(spec.config.backend, info.device)
+        if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
+            raise ValueError(
+                f"sliding_window is unsupported for attention backend {backend!r}; "
+                "use the flashinfer backend"
+            )
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
-        backend = resolve_attn_backend(spec.config.backend, info.device)
         # Before `shard`, so a mismatch is reported rather than half-applied to
         # a config the KV resource also holds.
         if backend not in _BACKEND_KV_CONFIG:
@@ -127,6 +132,7 @@ class AttentionManager(AttentionResource):
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
                 decode_tensor_cores=spec.config.decode_tensor_cores,
+                sliding_window=spec.config.sliding_window,
             )
 
         if backend == AttnBackend.FLEX:
