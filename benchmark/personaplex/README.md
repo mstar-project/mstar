@@ -5,9 +5,11 @@ it as served. M* serves PersonaPlex as an offline replay: a prerecorded user
 clip in, an agent track of the same length out, streamed back in chunks while
 the model runs. Concurrent requests share LM and decoder steps
 (`model_kwargs.max_batch_size`). Streamed output is exercised three ways: the
-served stages (lifecycle, soak, warm, batch) receive it through HTTP, which
+served stages (lifecycle, soak, warm) receive it through HTTP, which
 joins the chunks; the parity stages and `timing.py` feed the decoder node chunk
 by chunk (`decode.py`); and `sessions.py` timestamps chunks as they arrive.
+`batch-resources` drives the LM and its resources directly, without HTTP or
+the production worker scheduler, and compares emitted tokens rather than decoded audio.
 Nothing here exercises live duplex input (audio fed into a running request).
 
 NVIDIA's numbers come from running its reference model code
@@ -23,11 +25,11 @@ own subprocess with a timeout, and records every command, log and result:
 |---|---|---|
 | `parity-<clip>-dense` | M*'s LM with dense attention, step by step against NVIDIA's `LMGen`, greedy, from each side's own Mimi codes; then a negative control, M* rotating RoPE over split halves instead of adjacent pairs | Every text and audio token matches, and the negative control is reported as a mismatch; float audio error is reported |
 | `parity-<clip>-resources` | The same, on the served path (paged KV + FlashInfer); then NVIDIA again under PyTorch's math SDPA kernel | As above, without the negative control. Near-tied token choices can flip here; the first divergence is recorded with its logit margin, next to how far NVIDIA moves against itself under the other kernel |
-| `batch-resources` | Each clip alone, then 2 and 4 requests batched with staggered starts and two voices, on the served path | Every emitted token matches the request run alone; otherwise the first differing choice is recorded with both runs' margins. LM step time per batch size is reported |
+| `batch-resources` | Direct LM calls with paged KV and FlashInfer: each clip alone, then 2 and 4 requests batched with staggered starts and two voices; no HTTP or worker scheduling | Every emitted token matches the request run alone; otherwise the first differing choice is recorded with both runs' margins. LM step time per batch size is reported |
 | `judge` | Whisper transcripts of each served-path parity stage's input, NVIDIA and M* audio | Informational: the agents' word error rate, not a quality score |
-| `lifecycle-python`, `lifecycle-rust` | A real server on each graph runtime, one request per LM step (`max_batch_size` 1): each clip alone, then 1, 2 and 4 concurrent requests, cancellation mid-request, then malformed, empty, over-length and invalid-option requests, each followed by a normal one | Concurrent and post-cancellation outputs are byte-identical to the same request run alone, bad input gets a 4xx, and no agent frame is left in the worker's tensor store after the decoder runs |
+| `lifecycle-python`, `lifecycle-rust` | A real server on each graph runtime, one request per step (`max_batch_size` 1): each clip alone, then 1, 2 and 4 concurrent requests, cancellation by a 1.5-second client timeout, then malformed, empty, over-length and invalid-option requests, each followed by a normal one | Concurrent and post-cancellation outputs are byte-identical to the same request run alone, bad input gets a 4xx, and each observed request lifetime's final decoder snapshot before hard cleanup holds no agent frame |
 | `soak-rust` | 20 minutes of mixed short/long requests with periodic cancellations, batched | Every response is well formed, the request tensor store drains, and idle allocated GPU memory does not grow; agreement with the isolated control is recorded |
-| `warm-rust` | `benchmark.runner` per clip at concurrency 1, 2 and 4, batched: 3 warm-up and 10 measured requests | Every measured request completes; a compile detected during measurement invalidates the cell, which is retried once |
+| `warm-rust` | `benchmark.runner` per clip at concurrency 1, 2 and 4, batched: 3 warm-up waves and 10 measured requests | Every measured request completes; a compile detected during measurement invalidates the cell, which is retried once |
 
 The soak and benchmark run only if `lifecycle-rust` passed. A failing parity
 stage does not stop the serving stages.
@@ -124,3 +126,8 @@ streamed delivery; `benchmark.runner` remains the throughput harness.
 - Ten requests per benchmark cell make the percentiles descriptive only.
 - The soak covers 20 minutes of one request mix; it is not proof against every
   leak.
+- The cancellation timeout does not establish that decoding began before the
+  client disconnected. Cancellation after an audio chunk arrives remains untested
+  by the lifecycle harness.
+- The ownership gate counts request lifetimes with decoder evidence but does
+  not match them individually to successful HTTP requests.
