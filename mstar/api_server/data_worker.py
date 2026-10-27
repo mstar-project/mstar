@@ -738,10 +738,12 @@ class PreprocessWorkerThread:
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV. Likewise
-        # only process_prompt sets the model's INTERNAL_KWARGS.
+        # only process_prompt sets the model's INTERNAL_KWARGS, and only this
+        # worker knows which client streams the opening leaves open.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", *internal):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "open_streams", *internal):
             model_kwargs.pop(name, None)
+        open_streams = self._client_edges - input.ends
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -750,6 +752,7 @@ class PreprocessWorkerThread:
                 tensors=tensors,
                 input_metadata=input_metadata,
                 prompt_parts=input.prompt_parts,
+                open_streams=open_streams,
                 **model_kwargs,
             )
             if isinstance(prompt_tensors, ProcessPromptOutput):
@@ -804,7 +807,7 @@ class PreprocessWorkerThread:
                 input_metadata=input_metadata,
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
-                input_open=bool(self._client_edges - input.ends),
+                input_open=bool(open_streams),
             ),
         )
         self.communicator.send("conductor", msg)

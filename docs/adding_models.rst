@@ -2373,6 +2373,9 @@ streams (audio and video, say): each has its own buffer and its own end.
   consuming node keeps its own state, in its resources or ``request_state``.
 - Tensors ``process_prompt`` returns under a client edge's name are the stream's first
   chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.
+  ``process_prompt`` gets ``open_streams``, the client streams the opening leaves open; a
+  model whose request settings can't take appends on one (Qwen3-TTS text in a layout that
+  streams none) raises ``ValueError`` there, so the live opening gets a 400.
 - A client stream may declare limits, ``Connection(..., limits=ClientStreamLimits(...))``
   (``mstar.streaming.topology``), which the client-stream layer enforces before any of
   the model's code runs: ``max_items``, what the stream may carry over a call's life,

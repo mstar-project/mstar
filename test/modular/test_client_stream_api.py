@@ -442,6 +442,23 @@ def test_prompt_tensors_named_after_a_client_stream_are_its_first_chunk(tmp_path
     assert _signals(sent) == [("w0", "audio_in", [[8]], {}), ("w0", None, [], {"audio_in": 1})]
 
 
+@pytest.mark.parametrize("ends, open_streams", [(frozenset(), {"audio_in"}), (END, frozenset())])
+def test_process_prompt_is_told_which_streams_the_opening_leaves_open(ends, open_streams):
+    """So a model can refuse a live opening its settings can't serve
+    (Qwen3-TTS text in a layout that streams none); a client's own
+    ``open_streams`` kwarg can't stand in for it."""
+    model, seen = _ListeningModel(), []
+    model.process_prompt = lambda *args, open_streams, **kwargs: (
+        seen.append(open_streams) or {"text_inputs": [torch.tensor([1])]}
+    )
+    wt, _sent, _tm = _thread(model)
+    wt._process_input(PreprocessInput(
+        request_id="r", text="hi", file_paths=None, input_modalities=["text"], output_modalities=["text"],
+        model_kwargs={"open_streams": ["audio_in"]}, ends=ends,
+    ))
+    assert seen == [open_streams]
+
+
 def test_an_append_for_a_finished_request_is_dropped(tmp_path):
     wt, sent, _tm = _thread()
     path = _audio_file(tmp_path, "late.raw", 4)

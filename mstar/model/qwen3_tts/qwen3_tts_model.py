@@ -68,7 +68,16 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import (
+    ClientChunk,
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+)
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -84,8 +93,8 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
-from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
+from mstar.streaming.topology import CLIENT, ClientStreamLimits, Connection, PartitionTopology, StreamingGraphEdge
 
 
 def clip_digest(clip: torch.Tensor) -> str:
@@ -532,12 +541,14 @@ class Qwen3TTSModel(Model):
             )
 
         # Each loop iteration predicts one complete 16-group codec frame and
-        # feeds the summed codec embedding back into the next Talker step.
+        # feeds the summed codec embedding back into the next Talker step,
+        # with the frame's text token from the client's ``text_in`` stream.
         talker_decode = Loop(
             name="talker_decode_loop",
             section=GraphNode(
                 name="Talker",
-                input_names=["talker_input_embeds"],
+                input_names=["talker_input_embeds", "text_in"],
+                consumes_stream=True,
                 outputs=[
                     GraphEdge(
                         next_node="Talker",
@@ -599,7 +610,13 @@ class Qwen3TTSModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
-        """Buffer codec frames in a ramp of chunks with left context.
+        """Feed the decode its text, and buffer codec frames in a ramp of
+        chunks with left context.
+
+        ``text_in`` takes one text token per decode frame: the ones the
+        prefill left (``text_stream_start``), then any the client appends. It
+        keeps popping empty chunks once it ends, which the decode reads as TTS
+        EOS and then TTS PAD; the loop ends on codec EOS.
 
         The first Codec invocation runs after ``chunk_schedule[0]`` frames so
         audio starts flowing early; chunks then grow to ``chunk_frames``. Every
@@ -612,6 +629,13 @@ class Qwen3TTSModel(Model):
         return PartitionTopology(
             partitions=["Talker", "Codec"],
             connections=[
+                Connection(
+                    from_partition=CLIENT,
+                    to_partition="Talker",
+                    edge_name="text_in",
+                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True),
+                    limits=ClientStreamLimits(max_items=self.config.talker.max_position_embeddings),
+                ),
                 Connection(
                     from_partition="Talker",
                     to_partition="Codec",
@@ -822,6 +846,8 @@ class Qwen3TTSModel(Model):
         request sets ``non_streaming_mode``. ``CODEC_STREAM_LEAD_KEY`` reports
         how many reference frames lead the codec stream (context only, 0
         without an in-context clone; see ``get_initial_forward_pass_args``).
+        ``text_in`` is the first chunk of the decode's text stream: the text
+        tokens the prefill leaves, one item each.
         """
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
@@ -846,6 +872,14 @@ class Qwen3TTSModel(Model):
         stream_text = not bool(
             kwargs.get("non_streaming_mode", self.config.default_non_streaming_mode)
         )
+        if "text_in" in kwargs.get("open_streams", ()) and not (stream_text and not ref_frames):
+            # the prefill pairs the whole text (non-streaming) or the clone's
+            # reference frames with it, so no text can follow the opening
+            raise ValueError(
+                "Qwen3-TTS takes live text only with non_streaming_mode: false and no "
+                "in-context clone (x_vector_only_mode for Base); send the whole text in "
+                "a one-shot call instead"
+            )
 
         assistant_ids = self._tokenize(self.ASSISTANT_TEMPLATE.format(text=prompt))
         wrapper_len = len(CHATML_ASSISTANT_PREFIX_TOKEN_IDS) + len(
@@ -876,7 +910,7 @@ class Qwen3TTSModel(Model):
         clips = (tensors or {}).get("audio_inputs", [])
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
-        from mstar.model.qwen3_tts.submodules import prefill_rows
+        from mstar.model.qwen3_tts.submodules import prefill_rows, text_stream_start
 
         # a clone's x-vector takes the speaker row
         clone = "audio" in input_modalities
@@ -885,9 +919,33 @@ class Qwen3TTSModel(Model):
             spans=(Span("rows", "talker_prefill_clone" if clone else "talker_prefill", rows, rows, "text_inputs"),),
             growth=(("talker_decode_loop", 1),),
         )}}
-        return ProcessPromptOutput(
-            {"text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])]}, metadata
-        )
+        prefix = len(CHATML_ASSISTANT_PREFIX_TOKEN_IDS)
+        spoken = torch.cat([ref_ids[prefix:ref_ids.numel() - 2], assistant_ids[prefix:prefix + text_len]])
+        start = text_stream_start(metadata[PROMPT_LAYOUT_KEY])
+        streamed = spoken[start:] if start is not None else spoken[:0]
+        return ProcessPromptOutput({
+            "text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])],
+            "text_in": self._text_items(streamed),
+        }, metadata)
+
+    @staticmethod
+    def _text_items(ids: torch.Tensor) -> list[torch.Tensor]:
+        """``text_in`` items: one ``(1,)`` id each."""
+        return list(ids.view(-1, 1).unbind(0))
+
+    def process_stream_chunk(self, chunk: ClientChunk) -> NameToTensorList:
+        """Live text: each append's tokens join ``text_in``, one item each.
+
+        Each append is tokenized alone, which matches tokenizing the whole
+        text when the cut falls before a space or at punctuation. Only the
+        text-streaming layout with no in-context clone takes it: in
+        ``non_streaming_mode`` and an in-context clone the prefill's pairing
+        fixes the text's length and where TTS EOS sits, so ``process_prompt``
+        refuses a live opening.
+        """
+        if chunk.tensors:
+            raise ValueError("Qwen3-TTS takes text appends only")
+        return {"text_in": self._text_items(self._tokenize(chunk.text))} if chunk.text else {}
 
     @staticmethod
     def _check_chatml(assistant_ids: torch.Tensor) -> None:
@@ -999,7 +1057,11 @@ class Qwen3TTSModel(Model):
                     full_metadata=partition_metadata,
                     inputs=[edge],
                     unpersist_tensors=list(edge.tensor_info),
-                    step_metadata=self._talker_step_metadata(partition_metadata),
+                    step_metadata={
+                        **self._talker_step_metadata(partition_metadata),
+                        # the decode reads where its text stream ends from the layout
+                        PROMPT_LAYOUT_KEY: partition_metadata.kwargs[PROMPT_LAYOUT_KEY],
+                    },
                 )
             if partition_metadata.graph_walk == "talker_decode":
                 return ForwardPassArgs(

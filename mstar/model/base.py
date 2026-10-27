@@ -688,6 +688,7 @@ class Model(ABC):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
+        open_streams: frozenset[str] = frozenset(),
         **kwargs,
     ) -> "NameToTensorList | ProcessPromptOutput":
         """Tokenize prompt and produce initial tensors for the request.
@@ -710,6 +711,10 @@ class Model(ABC):
             prompt_parts: Ordered text/attachment sequence as written.
                 ``None`` from entrypoints with no ordering to preserve; see
                 :func:`mstar.model.multimodal.parts_from_modalities`.
+            open_streams: The client streams the opening leaves open for
+                appends; empty for a one-shot request. Raise
+                ``ValueError`` here for a live opening the request's settings
+                can't serve.
             **kwargs: Model-specific parameters (e.g., from model_kwargs).
 
         Returns:

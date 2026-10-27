@@ -505,6 +505,15 @@ Qwen3-TTS notes
 - Text layout follows the reference defaults: CustomVoice and VoiceDesign put
   the whole text in the prefill; Base feeds it one token per frame. Override
   per request with ``non_streaming_mode``.
+- Live text: with ``non_streaming_mode: false`` (Base, or x-vector-only
+  cloning), a ``/generate/ws`` call opened with ``end_input: false`` takes the
+  rest of its text as ``append`` messages, one token per frame as it arrives,
+  through the ``text_in`` client stream (see :doc:`clients`). Each append is
+  tokenized alone, which matches tokenizing the whole text when the cut falls
+  before a space or at punctuation. In ``non_streaming_mode`` and for an
+  in-context clone, the prefill's pairing fixes the text's length and where TTS
+  EOS sits, so a live opening (``end_input: false``) gets a 400; send those
+  one-shot.
 - ``/v1/audio/speech`` inputs of 600 or more characters are synthesized as
   ordered sentence chunks of about 400 characters (one Talker request each,
   two kept in flight while the current one streams); set
