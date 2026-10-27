@@ -391,6 +391,20 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
+- ``configs/qwen3omni_colocated_split3.yaml`` runs the Thinker (with the
+  encoders), the Talker and Code2Wav as three workers on GPU 0
+  (``rank_devices``), so they no longer take turns on one worker loop as in
+  ``qwen3omni_colocated.yaml``. On one MI300X it served about 40% more audio
+  per second than the colocated config for 32 concurrent text questions (100
+  against 70 audio-s/s) and 25-50% more for audio and image questions, its
+  first audio at one request came 55-85 ms sooner, and the three workers held
+  a few GB more GPU memory than one. On an NVIDIA GPU the workers' kernels
+  only overlap under a CUDA MPS daemon (see the Qwen3-TTS split note below).
+  On AMD GPUs the shared-memory arena (``MSTAR_SHM_ARENA=1``) can't pin its
+  segments, since it pins through libcudart, which a ROCm build of torch
+  doesn't load: each worker logs "cannot load libcudart" and copies tensors to
+  and from the others at pageable bandwidth, as the default file transport
+  does.
 
 Qwen3-TTS notes
 ---------------
