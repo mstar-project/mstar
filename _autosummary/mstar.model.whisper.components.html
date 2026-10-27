@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.model.whisper.config" href="mstar.model.whisper.config.html" />
+    <link rel="next" title="mstar.model.whisper.components.alignment" href="mstar.model.whisper.components.alignment.html" />
     <link rel="prev" title="mstar.model.whisper" href="mstar.model.whisper.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -204,6 +204,7 @@
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../architecture.html">Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../models.html">Supported Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../asr.html">Speech recognition: Whisper and Qwen3-ASR</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.auth.html">mstar.api_server.auth</a></li>
@@ -354,6 +355,11 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.qwen3_asr.html">mstar.model.qwen3_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_asr.constants.html">mstar.model.qwen3_asr.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
@@ -654,6 +660,12 @@
 <p class="rubric">Modules</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.whisper.components.alignment.html#module-mstar.model.whisper.components.alignment" title="mstar.model.whisper.components.alignment"><code class="xref py py-obj docutils literal notranslate"><span class="pre">alignment</span></code></a></p></td>
+<td><p>Word-level timestamps from the decoder's cross-attention.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.whisper.components.timestamps.html#module-mstar.model.whisper.components.timestamps" title="mstar.model.whisper.components.timestamps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">timestamps</span></code></a></p></td>
+<td><p>Whisper timestamp decoding rules as a per-request state that travels with the token.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -680,11 +692,11 @@
       </div>
     </a>
     <a class="right-next"
-       href="mstar.model.whisper.config.html"
+       href="mstar.model.whisper.components.alignment.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.model.whisper.config</p>
+        <p class="prev-next-title">mstar.model.whisper.components.alignment</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

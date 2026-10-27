@@ -208,6 +208,7 @@
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="architecture.html">Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="models.html">Supported Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="asr.html">Speech recognition: Whisper and Qwen3-ASR</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
@@ -358,6 +359,11 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.qwen3_asr.html">mstar.model.qwen3_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_asr.constants.html">mstar.model.qwen3_asr.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
@@ -939,6 +945,30 @@ checkpoint the registry names. For serving a fine-tune of the same
 architecture off a mounted volume, where the registry entry would
 otherwise pull the public weights from the Hub.</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ASR_DATA</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">data/asr</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">test/asr</span></code> (GPU parity tests): the set <code class="docutils literal notranslate"><span class="pre">benchmark.asr_data</span></code> built.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WHISPER_REPO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3-turbo</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">test/asr/test_whisper_parity.py</span></code>: the Whisper checkpoint to compare.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN_ASR_REPO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-ASR-1.7B</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">test/asr/test_qwen3_asr_parity.py</span></code>: the Qwen3-ASR checkpoint to compare.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN_ASR_REF</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">refs/Qwen3-ASR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">test/asr/test_qwen3_asr_parity.py</span></code>: a checkout of the qwen-asr SDK,
+the reference transcripts come from.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN_ASR_REF_SITE</span></code></p></td>
+<td><p>unset</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">test/asr/test_qwen3_asr_parity.py</span></code>: a directory holding transformers
+4.57, put first on the path of the subprocess that runs the SDK (whose
+model code does not run on transformers 5). Unset under transformers 5,
+the SDK comparison skips.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -1219,10 +1249,12 @@ refuse to start on a mismatch. Leave <code class="docutils literal notranslate">
 which serialises the very overlap this flag buys.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_PRE_PLAN_SPEC</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">pre_plan</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Pre-plan the speculative batch’s attention on a dedicated thread
 while the previous replay runs. <code class="docutils literal notranslate"><span class="pre">0</span></code> plans inline on the GPU
-thread.</p></td>
+thread, which Whisper turbo’s serve config sets: its 4-layer steps
+are too short to hide the planning in. Read by
+<code class="docutils literal notranslate"><span class="pre">knobs.pre_plan_enabled</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1,2,4,8,16,32,48,64,96,128</span></code></p></td>

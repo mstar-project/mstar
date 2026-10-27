@@ -50,6 +50,7 @@
    orpheus
    pi05
    qwen3_5
+   qwen3_asr
    qwen3_omni
    qwen3_tts
    registry

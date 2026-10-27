@@ -227,6 +227,25 @@ model, so they are named for it.
        checkpoint the registry names. For serving a fine-tune of the same
        architecture off a mounted volume, where the registry entry would
        otherwise pull the public weights from the Hub.
+   * - ``MSTAR_ASR_DATA``
+     - ``data/asr``
+     - ``test/asr`` (GPU parity tests): the set ``benchmark.asr_data`` built.
+   * - ``MSTAR_WHISPER_REPO``
+     - ``openai/whisper-large-v3-turbo``
+     - ``test/asr/test_whisper_parity.py``: the Whisper checkpoint to compare.
+   * - ``MSTAR_QWEN_ASR_REPO``
+     - ``Qwen/Qwen3-ASR-1.7B``
+     - ``test/asr/test_qwen3_asr_parity.py``: the Qwen3-ASR checkpoint to compare.
+   * - ``MSTAR_QWEN_ASR_REF``
+     - ``refs/Qwen3-ASR``
+     - ``test/asr/test_qwen3_asr_parity.py``: a checkout of the qwen-asr SDK,
+       the reference transcripts come from.
+   * - ``MSTAR_QWEN_ASR_REF_SITE``
+     - unset
+     - ``test/asr/test_qwen3_asr_parity.py``: a directory holding transformers
+       4.57, put first on the path of the subprocess that runs the SDK (whose
+       model code does not run on transformers 5). Unset under transformers 5,
+       the SDK comparison skips.
 
 Serving (Python frontend)
 -------------------------
@@ -458,10 +477,12 @@ Worker scheduling
        ``0`` with it: that throttle holds the GPU thread until step N drains,
        which serialises the very overlap this flag buys.
    * - ``MSTAR_PRE_PLAN_SPEC``
-     - ``1``
+     - config's ``knobs: pre_plan``, else ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
-       thread.
+       thread, which Whisper turbo's serve config sets: its 4-layer steps
+       are too short to hide the planning in. Read by
+       ``knobs.pre_plan_enabled``.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads

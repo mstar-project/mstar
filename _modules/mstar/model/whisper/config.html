@@ -561,6 +561,7 @@ window.runMermaid = runMermaid;</script>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../../architecture.html">Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../models.html">Supported Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../asr.html">Speech recognition: Whisper and Qwen3-ASR</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
@@ -711,6 +712,11 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_asr.html">mstar.model.qwen3_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_asr.constants.html">mstar.model.qwen3_asr.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
@@ -942,15 +948,18 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.whisper.config</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""Config for Whisper encoder-decoder ASR models (large-v3 and friends).</span>
+<span></span><span class="sd">"""Config for Whisper encoder-decoder ASR models (large-v3, large-v3-turbo, ...).</span>
 
-<span class="sd">Values are read from the HF checkpoint's ``config.json`` +</span>
-<span class="sd">``generation_config.json`` so the same class serves any Whisper size.</span>
+<span class="sd">Values are read from the HF checkpoint's ``config.json``,</span>
+<span class="sd">``generation_config.json`` and ``preprocessor_config.json`` so one class</span>
+<span class="sd">serves every Whisper size: turbo differs from large-v3 only in</span>
+<span class="sd">``decoder_layers`` (4 vs 32) and its alignment heads.</span>
 <span class="sd">"""</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">cached_property</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -971,6 +980,24 @@ window.runMermaid = runMermaid;</script>
 <span class="n">CROSS_ATTN</span> <span class="o">=</span> <span class="s2">"cross_attn"</span>
 <span class="n">CONTEXT_LABEL</span> <span class="o">=</span> <span class="s2">"main"</span>
 
+<span class="c1"># Graph node names, shared by the model, the submodules and the configs.</span>
+<span class="n">ENCODER_NODE</span> <span class="o">=</span> <span class="s2">"audio_encoder"</span>
+<span class="n">DECODER_NODE</span> <span class="o">=</span> <span class="s2">"decoder"</span>
+
+<span class="c1"># Graph walks. ``prefill`` runs the encoder and the whole forced prompt.</span>
+<span class="c1"># ``detect_language`` runs the encoder and ``&lt;|startoftranscript|&gt;`` alone,</span>
+<span class="c1"># sampling only among language tokens. ``prefill_prompt`` then appends the</span>
+<span class="c1"># rest of the forced prompt to that detected token. ``decode`` is the loop.</span>
+<span class="n">PREFILL_WALK</span> <span class="o">=</span> <span class="s2">"prefill"</span>
+<span class="n">DETECT_LANGUAGE_WALK</span> <span class="o">=</span> <span class="s2">"detect_language"</span>
+<span class="n">PREFILL_PROMPT_WALK</span> <span class="o">=</span> <span class="s2">"prefill_prompt"</span>
+<span class="n">DECODE_WALK</span> <span class="o">=</span> <span class="s2">"decode"</span>
+<span class="n">DECODE_LOOP</span> <span class="o">=</span> <span class="s2">"decode_loop"</span>
+<span class="c1"># ``align`` runs after the decode loop when word timestamps were asked for:</span>
+<span class="c1"># one teacher-forced pass over the transcript whose cross-attention gives</span>
+<span class="c1"># every word its start and end (see ``components/alignment.py``).</span>
+<span class="n">ALIGN_WALK</span> <span class="o">=</span> <span class="s2">"align"</span>
+
 
 <div class="viewcode-block" id="WhisperModelConfig">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig">[docs]</a>
@@ -982,6 +1009,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">decoder_attention_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">20</span>
     <span class="n">decoder_ffn_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">5120</span>
     <span class="n">encoder_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">32</span>
+    <span class="n">encoder_attention_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">20</span>
+    <span class="n">encoder_ffn_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">5120</span>
     <span class="n">num_mel_bins</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128</span>
     <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">51866</span>
     <span class="n">max_target_positions</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">448</span>
@@ -993,6 +1022,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">decoder_start_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50258</span>
     <span class="n">eos_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50257</span>
     <span class="n">no_timestamps_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50364</span>
+    <span class="n">prev_sot_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50362</span>
+    <span class="c1"># the first timestamp token may not exceed this index (HF/openai parity)</span>
+    <span class="n">max_initial_timestamp_index</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50</span>
 
     <span class="c1"># generation_config maps: "&lt;|en|&gt;" -&gt; 50259, "transcribe" -&gt; 50360</span>
     <span class="n">lang_to_id</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
@@ -1002,17 +1034,107 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># tokens additionally blocked for the first generated token.</span>
     <span class="n">suppress_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="n">begin_suppress_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="c1"># (layer, head) pairs of the cross-attention heads whose weights align</span>
+    <span class="c1"># text to audio, used for word-level timestamps (DTW).</span>
+    <span class="n">alignment_heads</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+
+    <span class="c1"># log-mel front end (preprocessor_config.json)</span>
+    <span class="n">sampling_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16000</span>
+    <span class="n">hop_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">160</span>
+    <span class="n">n_fft</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">400</span>
+    <span class="n">chunk_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">30</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">head_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">decoder_attention_heads</span>
 
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">encoder_head_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">d_model</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_attention_heads</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">n_samples</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Samples in one encoder window (30 s at 16 kHz)."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunk_length</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_rate</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">num_frames</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Mel frames in one encoder window (3000); the encoder's conv2 halves</span>
+<span class="sd">        them to ``max_source_positions``."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">n_samples</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">hop_length</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">timestamp_begin</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``&lt;|0.00|&gt;``; token ``timestamp_begin + i`` means ``0.02 * i`` s."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">no_timestamps_token_id</span> <span class="o">+</span> <span class="mi">1</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">timestamp_precision</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mf">0.02</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_prev_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How much ``&lt;|startofprev|&gt;`` context fits before the prompt proper</span>
+<span class="sd">        (openai-whisper / HF: half the context window, minus the marker)."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_target_positions</span> <span class="o">//</span> <span class="mi">2</span> <span class="o">-</span> <span class="mi">1</span>
+
+    <span class="nd">@cached_property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">language_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lang_to_id</span><span class="o">.</span><span class="n">values</span><span class="p">())</span>
+
+    <span class="nd">@cached_property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_id_to_lang</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="n">tok</span><span class="p">:</span> <span class="n">name</span><span class="o">.</span><span class="n">strip</span><span class="p">(</span><span class="s2">"&lt;|&gt;"</span><span class="p">)</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">tok</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">lang_to_id</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+
+<div class="viewcode-block" id="WhisperModelConfig.language_token">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.language_token">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">language_token</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">language</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="n">lang_token</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"&lt;|</span><span class="si">{</span><span class="n">language</span><span class="si">}</span><span class="s2">|&gt;"</span>
+        <span class="k">if</span> <span class="n">lang_token</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">lang_to_id</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Unknown Whisper language </span><span class="si">{</span><span class="n">language</span><span class="si">!r}</span><span class="s2">; "</span>
+                <span class="sa">f</span><span class="s2">"available: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">strip</span><span class="p">(</span><span class="s1">'&lt;|&gt;'</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">lang_to_id</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">lang_to_id</span><span class="p">[</span><span class="n">lang_token</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="WhisperModelConfig.language_of">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.language_of">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">language_of</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_id_to_lang</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">token_id</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="WhisperModelConfig.task_token">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.task_token">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">task_token</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">task</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">task_to_id</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Unknown Whisper task </span><span class="si">{</span><span class="n">task</span><span class="si">!r}</span><span class="s2">; available: </span><span class="si">{</span><span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">task_to_id</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">task_to_id</span><span class="p">[</span><span class="n">task</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="WhisperModelConfig.is_timestamp">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.is_timestamp">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_timestamp</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">token_id</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">timestamp_begin</span></div>
+
+
+<div class="viewcode-block" id="WhisperModelConfig.timestamp_seconds">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.timestamp_seconds">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">timestamp_seconds</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">token_id</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">timestamp_begin</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">timestamp_precision</span></div>
+
+
     <span class="c1"># generation_config.json keys (not in config.json); the rest of the</span>
     <span class="c1"># dataclass fields map 1:1 to config.json keys by name.</span>
     <span class="n">_GEN_KEYS</span> <span class="o">=</span> <span class="p">(</span>
-        <span class="s2">"lang_to_id"</span><span class="p">,</span> <span class="s2">"task_to_id"</span><span class="p">,</span> <span class="s2">"no_timestamps_token_id"</span><span class="p">,</span>
-        <span class="s2">"suppress_tokens"</span><span class="p">,</span> <span class="s2">"begin_suppress_tokens"</span><span class="p">,</span>
+        <span class="s2">"lang_to_id"</span><span class="p">,</span> <span class="s2">"task_to_id"</span><span class="p">,</span> <span class="s2">"no_timestamps_token_id"</span><span class="p">,</span> <span class="s2">"prev_sot_token_id"</span><span class="p">,</span>
+        <span class="s2">"max_initial_timestamp_index"</span><span class="p">,</span> <span class="s2">"suppress_tokens"</span><span class="p">,</span> <span class="s2">"begin_suppress_tokens"</span><span class="p">,</span>
+        <span class="s2">"alignment_heads"</span><span class="p">,</span>
     <span class="p">)</span>
+    <span class="c1"># preprocessor_config.json keys</span>
+    <span class="n">_FEATURE_KEYS</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"sampling_rate"</span><span class="p">,</span> <span class="s2">"hop_length"</span><span class="p">,</span> <span class="s2">"n_fft"</span><span class="p">,</span> <span class="s2">"chunk_length"</span><span class="p">)</span>
 
 <div class="viewcode-block" id="WhisperModelConfig.from_pretrained">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.from_pretrained">[docs]</a>
@@ -1027,39 +1149,66 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">gen_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
             <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">gen_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
                 <span class="n">gen</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+        <span class="n">feat</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">feat_path</span> <span class="o">=</span> <span class="n">local_dir</span> <span class="o">/</span> <span class="s2">"preprocessor_config.json"</span>
+        <span class="k">if</span> <span class="n">feat_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">feat_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">feat</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
 
         <span class="c1"># Every field is named to match its source key; pull from</span>
-        <span class="c1"># generation_config.json for the _GEN_KEYS, else config.json. Fields</span>
-        <span class="c1"># absent from both keep their dataclass default.</span>
-        <span class="n">names</span> <span class="o">=</span> <span class="p">{</span><span class="n">f</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">cls</span><span class="p">)}</span>
-        <span class="n">values</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="n">name</span><span class="p">:</span> <span class="p">(</span><span class="n">gen</span> <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_GEN_KEYS</span> <span class="k">else</span> <span class="n">hf</span><span class="p">)[</span><span class="n">name</span><span class="p">]</span>
-            <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">names</span>
-            <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="n">gen</span> <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_GEN_KEYS</span> <span class="k">else</span> <span class="n">hf</span><span class="p">)</span>
-        <span class="p">}</span>
+        <span class="c1"># generation_config.json for the _GEN_KEYS, preprocessor_config.json</span>
+        <span class="c1"># for the _FEATURE_KEYS, else config.json. Fields absent from every</span>
+        <span class="c1"># source keep their dataclass default.</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">source</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_GEN_KEYS</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">gen</span>
+            <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_FEATURE_KEYS</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">feat</span>
+            <span class="k">return</span> <span class="n">hf</span>
+
+        <span class="n">names</span> <span class="o">=</span> <span class="p">{</span><span class="n">f</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"_"</span><span class="p">)}</span>
+        <span class="n">values</span> <span class="o">=</span> <span class="p">{</span><span class="n">name</span><span class="p">:</span> <span class="n">source</span><span class="p">(</span><span class="n">name</span><span class="p">)[</span><span class="n">name</span><span class="p">]</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">names</span> <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">source</span><span class="p">(</span><span class="n">name</span><span class="p">)}</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">values</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="WhisperModelConfig.decoder_prompt_ids">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.decoder_prompt_ids">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">decoder_prompt_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">language</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"en"</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"transcribe"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">"""``&lt;|startoftranscript|&gt;&lt;|{lang}|&gt;&lt;|{task}|&gt;&lt;|notimestamps|&gt;``."""</span>
-        <span class="n">lang_token</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"&lt;|</span><span class="si">{</span><span class="n">language</span><span class="si">}</span><span class="s2">|&gt;"</span>
-        <span class="k">if</span> <span class="n">lang_token</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">lang_to_id</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"Unknown Whisper language </span><span class="si">{</span><span class="n">language</span><span class="si">!r}</span><span class="s2">; "</span>
-                <span class="sa">f</span><span class="s2">"available: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">strip</span><span class="p">(</span><span class="s1">'&lt;|&gt;'</span><span class="p">)</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">lang_to_id</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
-            <span class="p">)</span>
-        <span class="k">if</span> <span class="n">task</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">task_to_id</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"Unknown Whisper task </span><span class="si">{</span><span class="n">task</span><span class="si">!r}</span><span class="s2">; available: </span><span class="si">{</span><span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">task_to_id</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
-            <span class="p">)</span>
-        <span class="k">return</span> <span class="p">[</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">decoder_start_token_id</span><span class="p">,</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">lang_to_id</span><span class="p">[</span><span class="n">lang_token</span><span class="p">],</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">task_to_id</span><span class="p">[</span><span class="n">task</span><span class="p">],</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">no_timestamps_token_id</span><span class="p">,</span>
-        <span class="p">]</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">decoder_prompt_ids</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">language</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="s2">"en"</span><span class="p">,</span>
+        <span class="n">task</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"transcribe"</span><span class="p">,</span>
+        <span class="n">timestamps</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">prev_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The forced decoder prompt.</span>
+
+<span class="sd">        ``[&lt;|startofprev|&gt; prev...] &lt;|startoftranscript|&gt; &lt;|lang|&gt; &lt;|task|&gt;</span>
+<span class="sd">        [&lt;|notimestamps|&gt;]``. With ``language=None`` the prompt stops after</span>
+<span class="sd">        ``&lt;|startoftranscript|&gt;``: the language token is *sampled* next</span>
+<span class="sd">        (``detect_language`` walk) and :meth:`prompt_tail_ids` supplies the</span>
+<span class="sd">        rest. ``prev_tokens`` is the previous window's transcript for</span>
+<span class="sd">        long-form carry-over, kept to the last :attr:`max_prev_tokens`.</span>
+<span class="sd">        """</span>
+        <span class="n">ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">if</span> <span class="n">prev_tokens</span><span class="p">:</span>
+            <span class="n">ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">prev_sot_token_id</span><span class="p">)</span>
+            <span class="n">ids</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">prev_tokens</span><span class="p">[</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">max_prev_tokens</span><span class="p">:])</span>
+        <span class="n">ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">decoder_start_token_id</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">language</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">ids</span>
+        <span class="n">ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">language_token</span><span class="p">(</span><span class="n">language</span><span class="p">))</span>
+        <span class="n">ids</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">prompt_tail_ids</span><span class="p">(</span><span class="n">task</span><span class="o">=</span><span class="n">task</span><span class="p">,</span> <span class="n">timestamps</span><span class="o">=</span><span class="n">timestamps</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">ids</span></div>
+
+
+<div class="viewcode-block" id="WhisperModelConfig.prompt_tail_ids">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.prompt_tail_ids">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prompt_tail_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"transcribe"</span><span class="p">,</span> <span class="n">timestamps</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""What follows the language token: ``&lt;|task|&gt; [&lt;|notimestamps|&gt;]``."""</span>
+        <span class="n">ids</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">task_token</span><span class="p">(</span><span class="n">task</span><span class="p">)]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">timestamps</span><span class="p">:</span>
+            <span class="n">ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">no_timestamps_token_id</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">ids</span></div>
 </div>
 
 </pre></div>

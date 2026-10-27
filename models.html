@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="API Reference" href="api.html" />
+    <link rel="next" title="Speech recognition: Whisper and Qwen3-ASR" href="asr.html" />
     <link rel="prev" title="Architecture" href="architecture.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -208,6 +208,7 @@
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="architecture.html">Architecture</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Supported Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="asr.html">Speech recognition: Whisper and Qwen3-ASR</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
@@ -358,6 +359,11 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.qwen3_asr.html">mstar.model.qwen3_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_asr.constants.html">mstar.model.qwen3_asr.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
@@ -818,43 +824,62 @@ only); check it before deploying.</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">vjepa2-ac-vitg</span></code></p></td>
 <td><p>V-JEPA 2-AC encoder + action-conditioned predictor.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code> <em>(Beta)</em></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
-<td><p>Encoder-decoder ASR (audio in, transcript out). Beta / un-optimized.</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large_v3_turbo</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3-turbo</span></code></p></td>
+<td><p>Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV
+decoder with write-once cross-attention; language detection, forced
+language/task, <code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code> context, <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code>.
+The 4-decoder-layer distillation of large-v3, same class as below.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
+<td><p>Whisper large-v3 (32 decoder layers) on the same scaffold.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_asr</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-ASR-1.7B</span></code></p></td>
+<td><p>Qwen3-ASR: AuT audio encoder (8 s attention windows, ragged attention)
++ dense Qwen3 decoder; up to 20 min of audio per request, 30 languages
+(detected or forced), <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code>. A repetition loop
+in the transcript is collapsed as the reference SDK does.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_asr_realtime</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-ASR-0.6B</span></code></p></td>
+<td><p>The 0.6B Qwen3-ASR checkpoint on the same class, sized in its config for the
+short steps of <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> sessions.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bosonai/higgs-audio-v3-stt</span></code></p></td>
 <td><p>Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_{300m,1b,3b,7b}</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_{300m,1b,3b,7b}</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">facebook/omniASR-CTC-300M</span></code> (v1); v2 from Meta’s CDN (default)</p></td>
 <td><p>Meta Omnilingual ASR, CTC variants: wav2vec 2.0 encoder + CTC head, speech-to-text
 in 1,600+ languages with no language code. Not autoregressive; batched across
 requests. Apache-2.0.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">canary</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">canary</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/canary-1b-v2</span></code></p></td>
 <td><p>FastConformer encoder + Transformer decoder: speech recognition in 25 European
 languages and translation to or from English (<code class="docutils literal notranslate"><span class="pre">language</span></code>, English if unset, and
 <code class="docutils literal notranslate"><span class="pre">target_language</span></code> or <code class="docutils literal notranslate"><span class="pre">task=&quot;translate&quot;</span></code>). Clips up to 40 s; longer uploads are
 windowed. No timestamps.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/canary-qwen-2.5b</span></code></p></td>
 <td><p>English speech recognition by an LLM: Canary’s FastConformer encoder projected into
 Qwen3-1.7B (LoRA merged at load). Clips up to 40 s; longer uploads are windowed. The
 OpenAI <code class="docutils literal notranslate"><span class="pre">prompt</span></code> is ignored. No timestamps.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
 <td><p>Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">waypoint</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">waypoint</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Overworld/Waypoint-1.5-1B</span></code></p></td>
 <td><p>Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
 frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">lingbot_world_1_3b</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lingbot_world_1_3b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">robbyant/lingbot-world-v2-1.3b-causal-fast</span></code></p></td>
 <td><p>LingBot-World-V2 1.3B causal-fast: camera-controlled image-to-world video, streamed
 chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
@@ -864,23 +889,23 @@ rows for up to the 4,077-frame maximum. Needs <code class="docutils literal notr
 The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
 before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (<code class="docutils literal notranslate"><span class="pre">Robbyant/lingbot-world</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-4B</span></code></p></td>
 <td><p>FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
 image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">black-forest-labs/FLUX.2-klein-9B</span></code></p></td>
 <td><p>FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
 the FLUX Non-Commercial License; check it before deploying.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code> <em>(Beta)</em></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2.5-Diffusers</span></code></p></td>
 <td><p>LTX-2.5 (22B) text-to-audio+video: the distilled 8-step recipe, no guidance; native
 joint audio-video DiT and Gemma-4 text encoder, emitting an H.264 video and 48 kHz
 stereo audio. Gated; LTX-2.x Community License.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Tongyi-MAI/Z-Image-Turbo</span></code></p></td>
 <td><p>Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
 encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.</p></td>
@@ -2102,11 +2127,11 @@ fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
       </div>
     </a>
     <a class="right-next"
-       href="api.html"
+       href="asr.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">API Reference</p>
+        <p class="prev-next-title">Speech recognition: Whisper and Qwen3-ASR</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

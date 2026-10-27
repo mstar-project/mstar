@@ -27,5 +27,8 @@ mstar.model.whisper.components
    :toctree:
    :recursive:
 
+   alignment
    decoder
+   encoder
+   timestamps
 
