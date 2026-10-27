@@ -31,6 +31,7 @@
    add_layernorm
    attention
    causal_conv1d
+   client_errors
    containers
    device
    exitcode
@@ -48,4 +49,5 @@
    quant_fp8
    socket_prefix
    streams
+   utf8_stream
 

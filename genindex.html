@@ -754,6 +754,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.client_errors.html">mstar.utils.client_errors</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
@@ -769,6 +770,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -2168,6 +2170,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.clear_speculative_inputs">clear_speculative_inputs() (mstar.graph.graph_io.WorkerGraphIO method)</a>
 </li>
+      <li><a href="_autosummary/mstar.utils.client_errors.html#mstar.utils.client_errors.client_error_text">client_error_text() (in module mstar.utils.client_errors)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput.client_request_id">client_request_id (mstar.api_server.request_types.PreprocessInput attribute)</a>
 
       <ul>
@@ -2843,6 +2847,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.communication.codec.html#mstar.communication.codec.decode_each">decode_each() (in module mstar.communication.codec)</a>
 </li>
       <li><a href="_autosummary/mstar.model.omnilingual_asr.audio.html#mstar.model.omnilingual_asr.audio.decode_file">decode_file() (in module mstar.model.omnilingual_asr.audio)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.utf8_stream.html#mstar.utils.utf8_stream.decode_joined">decode_joined() (in module mstar.utils.utf8_stream)</a>
 </li>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.submodules.html#mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule.DECODE_KEY">DECODE_KEY (mstar.model.nemotron_duplex.submodules.EarTTSTalkerSubmodule attribute)</a>
 
@@ -3567,7 +3573,11 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.omnilingual_asr.components.wav2vec2.html#mstar.model.omnilingual_asr.components.wav2vec2.FeatureExtractor">FeatureExtractor (class in mstar.model.omnilingual_asr.components.wav2vec2)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.realtime_vad.html#mstar.api_server.openai.realtime_vad.TurnSegmenter.feed">feed() (mstar.api_server.openai.realtime_vad.TurnSegmenter method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.utf8_stream.html#mstar.utils.utf8_stream.Utf8Stream.feed">(mstar.utils.utf8_stream.Utf8Stream method)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.omnilingual_asr.components.wav2vec2.html#mstar.model.omnilingual_asr.components.wav2vec2.FeedForward">FeedForward (class in mstar.model.omnilingual_asr.components.wav2vec2)</a>
 </li>
       <li><a href="_autosummary/mstar.model.omnilingual_asr.weight_loader.html#mstar.model.omnilingual_asr.weight_loader.fetch_cdn">fetch_cdn() (in module mstar.model.omnilingual_asr.weight_loader)</a>
@@ -3764,6 +3774,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.flush">(mstar.api_server.openai.serving_realtime.RealtimeSession method)</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.utf8_stream.html#mstar.utils.utf8_stream.Utf8Stream.flush">(mstar.utils.utf8_stream.Utf8Stream method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.S3GenMelConfig.fmax">fmax (mstar.model.chatterbox.config.S3GenMelConfig attribute)</a>
@@ -6684,6 +6696,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.utils.adarms_norm.html#module-mstar.utils.adarms_norm">mstar.utils.adarms_norm</a>
 </li>
+        <li><a href="_autosummary/mstar.utils.client_errors.html#module-mstar.utils.client_errors">mstar.utils.client_errors</a>
+</li>
         <li><a href="_autosummary/mstar.utils.containers.html#module-mstar.utils.containers">mstar.utils.containers</a>
 </li>
         <li><a href="_autosummary/mstar.utils.device.html#module-mstar.utils.device">mstar.utils.device</a>
@@ -6714,6 +6728,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.utils.streams.html#module-mstar.utils.streams">mstar.utils.streams</a>
 </li>
+        <li><a href="_autosummary/mstar.utils.utf8_stream.html#module-mstar.utils.utf8_stream">mstar.utils.utf8_stream</a>
+</li>
         <li><a href="_autosummary/mstar.worker.html#module-mstar.worker">mstar.worker</a>
 </li>
         <li><a href="_autosummary/mstar.worker.batch_builder.html#module-mstar.worker.batch_builder">mstar.worker.batch_builder</a>
@@ -6743,10 +6759,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.MooncakeCommunicationManager">MooncakeCommunicationManager (class in mstar.communication.tensors)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.MooncakeTransferEngine">MooncakeTransferEngine (class in mstar.communication.tensors)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.mpc_cost_fn">mpc_cost_fn (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.mrope_interleaved">mrope_interleaved (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
@@ -8185,6 +8201,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    mstar.utils.client_errors
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.client_errors.html#module-mstar.utils.client_errors">module</a>
+</li>
+      </ul></li>
+      <li>
     mstar.utils.containers
 
       <ul>
@@ -8287,6 +8310,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.utils.streams.html#module-mstar.utils.streams">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.utils.utf8_stream
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.utf8_stream.html#module-mstar.utils.utf8_stream">module</a>
 </li>
       </ul></li>
       <li>
@@ -11501,6 +11531,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.StreamLayout.scratch">(mstar.engine.resources.kv.config.StreamLayout attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.utils.client_errors.html#mstar.utils.client_errors.scrub_paths">scrub_paths() (in module mstar.utils.client_errors)</a>
+</li>
       <li><a href="_autosummary/mstar.model.omnivoice.config.html#mstar.model.omnivoice.config.OmniVoiceConfig.seconds_for_target_tokens">seconds_for_target_tokens() (mstar.model.omnivoice.config.OmniVoiceConfig method)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.section">section (mstar.graph.base.Loop attribute)</a>
@@ -13128,6 +13160,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.nemotron_duplex.config.html#mstar.model.nemotron_duplex.config.NemotronDuplexConfig.user_audio_weight">user_audio_weight (mstar.model.nemotron_duplex.config.NemotronDuplexConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.flashinfer_mla.html#mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager.uses_kernel">uses_kernel (mstar.engine.resources.attn.flashinfer_mla.FlashInferMLAManager property)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.utf8_stream.html#mstar.utils.utf8_stream.Utf8Stream">Utf8Stream (class in mstar.utils.utf8_stream)</a>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.uuid">uuid (mstar.graph.base.TensorPointerInfo attribute)</a>
 </li>
