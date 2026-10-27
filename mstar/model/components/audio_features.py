@@ -25,8 +25,8 @@ import torch
 from torch import nn
 
 from mstar.api_server.media_io import check_resample_rate
+from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
 from mstar.utils.h2d import to_device_nonblocking
-from mstar.utils.precision import ieee_fp32_matmul
 
 
 def _hertz_to_mel(freq: np.ndarray | float) -> np.ndarray | float:
@@ -247,8 +247,9 @@ class NemoLogMel:
         )
         # sqrt then square, as the reference does: it rounds differently
         power = torch.view_as_real(stft).pow(2).sum(-1).sqrt().pow(2)
-        with ieee_fp32_matmul():
-            mel = torch.log(self.mel_filters @ power + 2.0 ** -24)[:, :, :max(frames)]
+        # full fp32, as the reference: the process default is TF32
+        with fp32_precision_scope(Fp32Precision(matmul="highest", cudnn_allow_tf32=None)):
+            mel =torch.log(self.mel_filters @ power + 2.0 ** -24)[:, :, :max(frames)]
         if self.normalize:
             # the mean taken as an offset from the first frame: the plain mean up
             # to rounding, and exact for a constant bin, so digital silence stays
@@ -280,27 +281,33 @@ def load_audio_file(path: str, sample_rate: int = 16_000, max_seconds: float | N
     Resampling goes through torchaudio. Audio longer than ``max_seconds``
     (default ``media_io.MAX_AUDIO_SECONDS``) is refused while it decodes.
     """
-    from mstar.api_server.media_io import (
-        MAX_AUDIO_SECONDS,
-        AudioRefusedError,
-        decode_torchcodec_capped,
-        read_soundfile_capped,
-    )
+    from mstar.api_server.media_io import MAX_AUDIO_SECONDS
 
     if max_seconds is None:
         max_seconds = MAX_AUDIO_SECONDS
+    return _resample(*_decode(path, sample_rate, max_seconds), sample_rate)
+
+
+def _decode(path: str, sample_rate: int, max_seconds: float) -> tuple[torch.Tensor, int]:
+    """The waveform and its rate: libsndfile at the file's own rate, else
+    FFmpeg, which decodes straight to ``sample_rate``."""
+    from mstar.api_server.media_io import AudioRefusedError, decode_torchcodec_capped, read_soundfile_capped
+
     try:
         audio, sr = read_soundfile_capped(path, max_seconds)
-        waveform = torch.from_numpy(audio)
     except AudioRefusedError:
         raise
     except Exception:  # noqa: BLE001 — not a libsndfile container; try FFmpeg
-        return decode_torchcodec_capped(path, sample_rate, max_seconds).to(torch.float32)
-    check_resample_rate(sr, sample_rate)
-    if sr != sample_rate:
+        return decode_torchcodec_capped(path, sample_rate, max_seconds).to(torch.float32), sample_rate
+    return torch.from_numpy(audio), sr
+
+
+def _resample(waveform: torch.Tensor, rate: int, sample_rate: int) -> torch.Tensor:
+    check_resample_rate(rate, sample_rate)
+    if rate != sample_rate:
         import torchaudio
 
-        waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
+        waveform = torchaudio.functional.resample(waveform, rate, sample_rate)
     return waveform.contiguous()
 
 
@@ -309,9 +316,10 @@ def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.T
     ``max_seconds`` as it decodes, so a small file whose header understates
     its length cannot expand past it. An undecodable file is the client's
     error, so it surfaces as ``ValueError`` (HTTP 400). A missing decoder or
-    memory is the server's, and stays as it is."""
+    memory, and anything after the decode, is the server's, and stays as it is."""
     try:
-        return load_audio_file(path, sample_rate, max_seconds)
+        # decoded at its own rate, so a resampling failure isn't blamed on the file
+        waveform, rate = _decode(path, sample_rate, max_seconds)
     except (ImportError, MemoryError, ValueError):
         raise
     except Exception as exc:  # noqa: BLE001 -- libsndfile and FFmpeg both refused it
@@ -319,6 +327,8 @@ def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.T
             raise
         # FFmpeg's message (paths, internals) stays out of the response
         raise ValueError("could not decode the audio upload") from exc
+    return _resample(waveform, rate, sample_rate)
+
 
 SAMPLE_RATE = 16_000
 # the mel hop of every FastConformer checkpoint, 10 ms

@@ -23,7 +23,7 @@ from test_transducer import _head, _reference
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_runner import dummy_rid_handle
-from mstar.engine.fp32_precision import fp32_precision_scope, node_fp32_precision
+from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.recurrent import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
@@ -41,7 +41,6 @@ from mstar.model.parakeet.config import (
 from mstar.model.parakeet.parakeet_model import ParakeetModel
 from mstar.model.parakeet.submodules import TransducerSubmodule, _batch_sizes
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, ModelInputsFromEngine
-from mstar.utils.precision import ieee_fp32_matmul
 
 BUCKETS = (8, 32)
 # steps an iteration, fewer than the node's CHUNK, so that requests span several iterations
@@ -122,7 +121,7 @@ def _frozen_step(head, s):
 
 @torch.no_grad()
 def _frozen_greedy_decode(head, encoder_states, lengths, prompt_ids=None):
-    with ieee_fp32_matmul():
+    with fp32_precision_scope(Fp32Precision("highest", None)):
         frames = head.project_frames(encoder_states, prompt_ids)
         state = _frozen_start(head, frames, lengths)
         chunks = []

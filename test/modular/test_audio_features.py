@@ -182,15 +182,20 @@ def test_load_speech_file_blames_the_upload_only_for_decoding(monkeypatch):
 
     # the decoders ran and refused the file: the client's error
     monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: True)
-    monkeypatch.setattr(audio_features, "load_audio_file", raises(RuntimeError("Invalid data found")))
+    monkeypatch.setattr(audio_features, "_decode", raises(RuntimeError("Invalid data found")))
     with pytest.raises(ValueError):
         load_speech_file("x.wav", 16_000, 10.0)
     # no decoder to run, or no memory: the server's
     for exc in (ImportError("torchcodec"), MemoryError()):
-        monkeypatch.setattr(audio_features, "load_audio_file", raises(exc))
+        monkeypatch.setattr(audio_features, "_decode", raises(exc))
         with pytest.raises(type(exc)):
             load_speech_file("x.wav", 16_000, 10.0)
+    # it decoded, and resampling failed: the server's too
+    monkeypatch.setattr(audio_features, "_decode", lambda *args: (torch.zeros(4800), 48_000))
+    monkeypatch.setattr(audio_features, "_resample", raises(RuntimeError("can't allocate memory")))
+    with pytest.raises(RuntimeError):
+        load_speech_file("x.wav", 16_000, 10.0)
     monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: False)
-    monkeypatch.setattr(audio_features, "load_audio_file", raises(RuntimeError("Could not load libtorchcodec")))
+    monkeypatch.setattr(audio_features, "_decode", raises(RuntimeError("Could not load libtorchcodec")))
     with pytest.raises(RuntimeError):
         load_speech_file("x.wav", 16_000, 10.0)

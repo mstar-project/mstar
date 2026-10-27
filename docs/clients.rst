@@ -303,7 +303,9 @@ Per-model notes:
   ``initial_prompt``), and ``response_format``
   ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
   model for timestamps. Whisper's language and timestamp tokens travel in the
-  text stream and are lifted into ``language`` / ``segments`` by the server; a
+  text stream and are lifted into ``language`` / ``segments`` by the server;
+  Higgs-Audio emits no timestamps, so its ``verbose_json`` / ``srt`` / ``vtt`` get
+  one segment per window, timed to the windows. A
   streaming client receives only the spoken words. Uploads longer than the
   model's clip (30 s for Whisper) are served as consecutive windows. By default
   they run in order, openai-whisper style: each window gets the transcript so
