@@ -680,3 +680,14 @@ def test_ramp_boundaries_are_no_worse_than_25_frame_chunks(long_reach_code2wav):
     assert statistics.median(steady) >= statistics.median(base_steady) - 1
     assert min(steady) >= min(base_steady) - 2
     assert len(ramp) == 8 and min(ramp) > 80
+
+
+def test_only_the_vocoder_asks_for_the_conv_algorithm_search():
+    """The engine runs the search around the vocoder's forwards only: the
+    encoders' input sizes change per request, and the search would time each
+    new one on its first call."""
+    from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, VisionEncoderSubmodule
+
+    assert Code2WavSubmodule.cudnn_benchmark is True
+    assert AudioEncoderSubmodule.cudnn_benchmark is None
+    assert VisionEncoderSubmodule.cudnn_benchmark is None

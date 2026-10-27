@@ -75,6 +75,7 @@ if SNAPSHOT is None:
 
 from safetensors.torch import load_file  # noqa: E402
 
+from mstar.engine.cudnn_benchmark import cudnn_benchmark_scope  # noqa: E402
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav  # noqa: E402
 from mstar.model.qwen3_omni.config import Code2WavConfig, Qwen3OmniModelConfig  # noqa: E402
 from mstar.model.qwen3_omni.submodules import Code2WavSubmodule  # noqa: E402
@@ -90,18 +91,14 @@ def code2wav():
     config = Code2WavConfig.from_dict(json.loads((SNAPSHOT / "config.json").read_text())["code2wav_config"])
     model = Qwen3OmniMoeCode2Wav(config)
     load_weights_from_hf_shards(repo_dir=SNAPSHOT, modules=[ModuleAndPrefix(model, prefix="code2wav")], device="cuda:0")
-    benchmark = torch.backends.cudnn.benchmark
-    # what _create_code2wav_submodule sets before the warm-up and capture
-    torch.backends.cudnn.benchmark = True
     model.eval()
     eager_forward = type(model).forward.__get__(model)
     model.consolidate()
     # what the engine manager does with a disable_autocast node: device only
     model.to(device="cuda:0")
-    try:
+    # what the engine sets around the node's forwards
+    with cudnn_benchmark_scope(Code2WavSubmodule.cudnn_benchmark):
         yield model, eager_forward, config
-    finally:
-        torch.backends.cudnn.benchmark = benchmark
 
 
 def stream(submodule: Code2WavSubmodule, frames: torch.Tensor) -> list[tuple[StreamChunkInfo, torch.Tensor]]:

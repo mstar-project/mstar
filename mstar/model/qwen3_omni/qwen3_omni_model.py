@@ -1646,12 +1646,6 @@ class Qwen3OmniModel(Model):
         from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
-        # The vocoder is dominated by Conv1d/ConvTranspose1d at small channel
-        # counts where cuDNN's default heuristic picks a sub-optimal algo.
-        # benchmark=True autotunes per shape on the warm-up call, before
-        # CUDA-graph capture, so the chosen algo is baked into the graph.
-        torch.backends.cudnn.benchmark = True
-
         code2wav_model = Qwen3OmniMoeCode2Wav(self.config.code2wav)
         load_weights_from_hf_shards(
             repo_dir=self.local_dir,

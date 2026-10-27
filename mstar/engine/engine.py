@@ -22,6 +22,7 @@ from mstar.engine.accelerator_graph_runner import (
     fail_if_graphs_required,
     plan_captures,
 )
+from mstar.engine.cudnn_benchmark import cudnn_benchmark_scope, node_cudnn_benchmark
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope, node_fp32_precision
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -133,6 +134,8 @@ class SubmoduleManagement:
     capture_runner: AcceleratorGraphRunner | None = None
     # the submodule's declared float32 settings; None keeps the process default
     fp32_precision: Fp32Precision | None = None
+    # its declared conv algorithm search; None keeps the process default
+    cudnn_benchmark: bool | None = None
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -578,6 +581,7 @@ class Engine:
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources,
                 fp32_precision=node_fp32_precision(node_name, submodule),
+                cudnn_benchmark=node_cudnn_benchmark(node_name, submodule),
             )
             submodule.bind_node_resources(resources)
             if getattr(submodule, "reads_device_loopback", False):
@@ -680,9 +684,10 @@ class Engine:
         for node_name, submodule_mgmt in self._submodules.items():
             runner = ag_runners[node_name]
             # the kernels a capture (and the compile inside it) picks are what
-            # every replay runs, so it happens under the node's precision
+            # every replay runs, so it happens under the node's settings
             with self._capture_into(plan, node_name) as planned, \
-                    fp32_precision_scope(submodule_mgmt.fp32_precision):
+                    fp32_precision_scope(submodule_mgmt.fp32_precision), \
+                    cudnn_benchmark_scope(submodule_mgmt.cudnn_benchmark):
                 runner.warmup_and_capture(planned)
             if plan is not None or runner.any_graphs:
                 submodule_mgmt.capture_runner = runner
@@ -692,7 +697,8 @@ class Engine:
             captured: dict[str, PiecewiseAcceleratorGraphRunner] = {}
             with self._capture_into(plan, f"{node_name} piecewise") as planned:
                 for label, pw_runner in piecewise[node_name].items():
-                    with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                    with fp32_precision_scope(submodule_mgmt.fp32_precision), \
+                            cudnn_benchmark_scope(submodule_mgmt.cudnn_benchmark):
                         pw_runner.warmup_and_capture(
                             None if planned is None else {bucket for region, bucket in planned if region == label}
                         )
@@ -742,8 +748,9 @@ class Engine:
             """A plan over what ``size`` says each runner's buckets cost."""
             pools: dict[str, dict] = {}
             for node_name, submodule_mgmt in self._submodules.items():
-                # sizing runs the forwards and captures, so under the node's precision too
-                with fp32_precision_scope(submodule_mgmt.fp32_precision):
+                # sizing runs the forwards and captures, so under the node's settings too
+                with fp32_precision_scope(submodule_mgmt.fp32_precision), \
+                        cudnn_benchmark_scope(submodule_mgmt.cudnn_benchmark):
                     pools[node_name] = size(ag_runners[node_name])
                     # one pool for all of a node's regions (see `_build_piecewise_runners`)
                     pools[f"{node_name} piecewise"] = {
@@ -1657,7 +1664,8 @@ class Engine:
         t0 = phase_start()
         try:
             # eager, compiled (its first call traces under it too) or replayed
-            with fp32_precision_scope(submodule_mgmt.fp32_precision):
+            with fp32_precision_scope(submodule_mgmt.fp32_precision), \
+                    cudnn_benchmark_scope(submodule_mgmt.cudnn_benchmark):
                 raw = self._forward(
                     batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
                     lease, running_batched, request_ids, release_event,

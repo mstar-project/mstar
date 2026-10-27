@@ -41,8 +41,8 @@ _MIB = 2**20
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a throwaway capture needs a GPU")
 
 
-# a node with no float32 setting of its own
-_NO_PRECISION = SimpleNamespace(fp32_precision=None)
+# a node with no float32 or conv search setting of its own
+_NO_PRECISION = SimpleNamespace(fp32_precision=None, cudnn_benchmark=None)
 
 
 def _bucket(walk: str, bs: int, tokens: int) -> BucketKey:

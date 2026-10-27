@@ -518,6 +518,14 @@ class NodeSubmodule(torch.nn.Module, ABC):
     float32_matmul_precision: str | None = None
     cudnn_allow_tf32: bool | None = None
 
+    # Set True on a node whose convolutions should get cuDNN's (MIOpen's)
+    # timed algorithm search, ``torch.backends.cudnn.benchmark``, rather than
+    # its heuristic pick: worth it for convs that see a few fixed input sizes,
+    # such as a captured vocoder, and costly for ones whose input size changes
+    # per request. The engine applies it like the float32 settings above (see
+    # ``mstar.engine.cudnn_benchmark``). None keeps the process default (off).
+    cudnn_benchmark: bool | None = None
+
     # Set True on a submodule whose decode walk may read its last sampled
     # tokens back off the sampler's slot masters (``device_loopback_signals``).
     # The sampler keeps the masters only for a node that says so: the eager

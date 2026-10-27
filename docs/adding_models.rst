@@ -960,6 +960,13 @@ methods are:
    ``forward_batched`` only, not ``preprocess`` or ``postprocess``. It can also be set
    per instance in ``__init__``, for example only when the model loads in fp32.
 
+   ``cudnn_benchmark = True`` asks for cuDNN's (MIOpen's on AMD GPUs) timed convolution
+   algorithm search, ``torch.backends.cudnn.benchmark``, on that node only, applied the
+   same way. It suits convolutions that see a few fixed input sizes, such as Qwen3-Omni's
+   Code2Wav vocoder: the search runs in the warm-up and the capture records its pick. A
+   node whose convolutions see new input sizes per request, such as an image or audio
+   encoder, leaves it off, since the first call at every new size pays the search.
+
 ``postprocess(...)`` (optional)
    Metadata-only fixups that run on the GPU thread. This method must not read tensor
    values. Do not call ``.item()``, ``.cpu()`` or ``.tolist()`` here. This is a

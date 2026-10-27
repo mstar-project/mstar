@@ -1716,6 +1716,11 @@ class Code2WavSubmodule(NodeSubmodule):
     # compiles the forward itself, so the engine must not compile it again.
     disable_torch_compile = True
     disable_autocast = True
+    # Its Conv1d/ConvTranspose1d at small channel counts get a better algorithm
+    # from the search than from the heuristic, and every window is padded to
+    # one length, so it searches once per batch size (in the warm-up for the
+    # captured ones).
+    cudnn_benchmark = True
 
     # No capture carries this key, so a batch of terminal flushes runs eager
     # and skips the decode when none of its windows has a new frame.
