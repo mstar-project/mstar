@@ -132,12 +132,14 @@ class RecurrentStatePool(Resource):
         self._preplanned = False
         self._cached_plan_output: dict[str, RecurrentAddressing] | None = None
 
+        # from the blocks, not the config: a dtype=None block is sized as resolved
+        total_bytes = sum(t.nbytes for t in self._blocks.values())
         logger.info(
             "recurrent state pool: %d usable slots (+%d sink) x %d layers, "
             "%.2f MiB (%.2f KiB/slot), blocks=%s",
             config.usable_slots, config.max_slots - config.usable_slots,
             config.num_layers,
-            config.total_bytes / 2**20, config.slot_bytes / 2**10,
+            total_bytes / 2**20, total_bytes / config.max_slots / 2**10,
             {n: tuple(b.shape) for n, b in config.blocks.items()},
         )
 
