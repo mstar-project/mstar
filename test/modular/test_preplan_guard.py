@@ -17,7 +17,7 @@ from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.resources.step import AdmitOutcome, AllocationFailed, Segment, StepContext
 
 PS = 8
 
@@ -246,3 +246,69 @@ def test_admit_of_a_foreign_step_still_sweeps_everything() -> None:
     assert runner.admit(_step("b", span=17, slot=None)).ok
     assert kv.events == ["pre_admit", "pre_plan", "clear", "admit"]
     assert attn.events == ["pre_admit", "pre_plan", "clear", "admit"]
+
+
+class _RefusesOnce(Resource):
+    """Admits after KV and does not pre-plan, like waypoint's ring KV; refuses
+    its first admit."""
+
+    def __init__(self):
+        self.refused = False
+
+    @classmethod
+    def build(cls, spec, info):  # pragma: no cover - not built from a spec here
+        raise NotImplementedError
+
+    def depends_on(self):
+        return {"kv"}
+
+    def admit(self, step, ctx):
+        if self.refused:
+            return AdmitOutcome(ok=True)
+        self.refused = True
+        return AdmitOutcome(ok=False, reason=AllocationFailed(
+            message="ring full", pages_short=1, label="main", request_id="a",
+        ))
+
+    def plan(self, step, ctx):
+        return None
+
+
+def test_a_staged_step_refused_after_kv_retries_on_fresh_pages() -> None:
+    """The refusal gives the pre-plan's pages back, so the stage goes with
+    them: a retry of the same step must not promote views over pages the
+    stream no longer holds."""
+    m = _manager()
+    m.ingest_request("a")
+    _grow(m, "a", PS)
+    runner = StepRunner({"kv": m, "ring": _RefusesOnce()})
+
+    def step(preplan: bool) -> SubmoduleStep:
+        s = SubmoduleStep(
+            steps={
+                "kv": KVStep(segments=(Segment("a", "main", PS),), commit=True),
+                "ring": ResourceStep(),
+            },
+            segments=[Segment("a", "main", PS)],
+        )
+        s.set_ctx(_ctx("a", preplan=preplan))
+        return s
+
+    staged = step(preplan=True)
+    assert runner.pre_admit(staged).ok
+    runner.pre_plan(staged)
+    stream = m._streams["a"]["main"]
+    held = list(stream.page_indices)
+    assert len(held) == 2 and stream.step_in_flight
+
+    assert not runner.admit(step(preplan=False)).ok
+    assert not runner.staged and not m._preplanned
+    assert stream.page_indices == held[:1] and not stream.step_in_flight
+
+    retry = step(preplan=False)
+    assert runner.admit(retry).ok
+    out = runner.plan(retry)
+    assert len(stream.page_indices) == 2
+    assert out["kv"]["main"].views[0].request_id == "a"
+    runner.commit(retry)
+    assert stream.stored_len == 2 * PS
