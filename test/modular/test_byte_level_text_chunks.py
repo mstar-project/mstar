@@ -216,6 +216,9 @@ class _BatchAPI:
     def __init__(self, chunks):
         self._chunks = chunks
 
+    def submission_key(self, request_id):
+        return request_id
+
     async def iter_result_chunk_batches(self, request_id):
         for c in self._chunks:
             yield [c]
