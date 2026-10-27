@@ -73,6 +73,13 @@ length-framed binary chunks instead, which skips the base64 pass on multi-megaby
 client must parse by the response ``Content-Type``. ``GET /health`` returns
 ``{"status": "healthy"}``.
 
+Streamed ``text`` chunks (``/generate`` and ``/generate/ws``) are the raw UTF-8 bytes
+of each token, so one character can be split across two chunks. Decode the stream
+incrementally (``codecs.getincrementaldecoder("utf-8")``, as the Python SDK does)
+or join the chunks before decoding; decoding each chunk on its own with
+``errors="strict"`` raises on a split character, and with ``"replace"`` turns both
+halves into U+FFFD.
+
 .. code-block:: bash
 
    # text (non-streaming → JSON)

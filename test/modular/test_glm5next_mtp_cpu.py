@@ -369,7 +369,7 @@ def test_acceptance_is_logged(caplog):
     assert any("drafts accepted per step" in r.getMessage() for r in caplog.records)
 
 
-def test_temperature_is_refused_under_mtp():
+def test_temperature_is_refused_under_mtp(caplog):
     engine, _, _ = _build_engine(2)
     engine.add_request("t", {SAMPLER: SamplingReqConfig(temperature=0.7)})
     batch = _batch(
@@ -382,8 +382,13 @@ def test_temperature_is_refused_under_mtp():
         step_context=StepContext(request_ids=("t",), graph_walk="prefill", slot=0,
                                  capture=False),
     )
-    engine.prepare_inputs(batch)
-    assert "greedy only" in str(batch.failed_requests.get("t"))
+    with caplog.at_level(logging.ERROR, logger="mstar.engine.engine"):
+        engine.prepare_inputs(batch)
+    # process_prompt refuses this as a 400; past it, the client sees an error id, the log the reason
+    error = batch.failed_requests["t"]
+    assert error.startswith("internal error (error id ")
+    error_id = error.removeprefix("internal error (error id ").removesuffix(")")
+    assert any(error_id in r.getMessage() and "greedy only" in r.getMessage() for r in caplog.records)
 
 
 def test_prompts_leave_two_blocks_of_index_topk():

@@ -20,10 +20,11 @@ A failed reply has no ``Finish``. A whole reply is ``collect``-ed, and
 from __future__ import annotations
 
 import asyncio
-import codecs
 from dataclasses import dataclass, field
 
 from fastapi import HTTPException
+
+from mstar.utils.utf8_stream import Utf8Stream
 
 # how often a non-streaming handler checks whether its client is still there
 _DISCONNECT_POLL_S = 0.05
@@ -175,7 +176,7 @@ async def _events(batches, served, parser, stops, usage):
     matcher = StopMatcher(stops) if stops else None
     stop: str | None = None
     # a byte-level BPE token's bytes can end inside a character: hold them
-    text = codecs.getincrementaldecoder("utf-8")("replace")
+    text = Utf8Stream()
     failed = False
     try:
         async for batch in batches:
@@ -185,7 +186,7 @@ async def _events(batches, served, parser, stops, usage):
                     usage.add(c)
                     if parser is not None and parser.reasoning:
                         usage.reasoning += (c.metadata or {}).get("tokens", 0)
-                    piece = text.decode(c.data)
+                    piece = text.feed(c.data)
                     if not piece:
                         continue
                     deltas = [{"content": piece}] if parser is None else parser.feed(piece)
@@ -222,7 +223,7 @@ async def _events(batches, served, parser, stops, usage):
         await batches.aclose()
     if failed:
         return
-    tail = text.decode(b"", final=True)
+    tail = text.flush()
     if parser is None:
         deltas = [{"content": tail}] if tail else []
     else:

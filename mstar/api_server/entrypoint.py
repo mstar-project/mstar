@@ -53,6 +53,7 @@ from mstar.observability.metrics import (
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
@@ -1711,16 +1712,20 @@ async def generate_ws(websocket: WebSocket):
         except (WebSocketDisconnect, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
-            reply = {"request_id": request_id, "error": str(exc)}
             if isinstance(exc, HTTPException):
-                reply.update(error=exc.detail, status=exc.status_code)
-            if isinstance(exc, HTTPException) and exc.status_code < 500:
-                logger.info(
-                    "generate/ws request %s refused (%d): %s",
-                    request_id, exc.status_code, exc.detail,
-                )
+                reply = {"request_id": request_id, "error": exc.detail, "status": exc.status_code}
+                if exc.status_code < 500:
+                    logger.info(
+                        "generate/ws request %s refused (%d): %s",
+                        request_id, exc.status_code, exc.detail,
+                    )
+                else:
+                    logger.exception("generate/ws request failed")
             else:
-                logger.exception("generate/ws request failed")
+                text, _ = client_error_text(
+                    exc, f"generate/ws request {request_id} failed", log=logger, type_name=False,
+                )
+                reply = {"request_id": request_id, "error": text}
             try:
                 await send(reply, binary)
             except Exception:  # noqa: BLE001
@@ -1926,7 +1931,10 @@ async def generate(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        text, _ = client_error_text(
+            e, f"generate request {request_id} failed", log=logger, type_name=False,
+        )
+        raise HTTPException(status_code=500, detail=text) from e
     finally:
         # Deferred cleanup of uploaded files
         if file_paths:

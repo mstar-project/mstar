@@ -60,6 +60,7 @@ from mstar.model.submodule_base import (
 )
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
@@ -407,8 +408,12 @@ class ExecutingBatch:
         self.outputs_ready.set()
         self.commit_done.set()
 
-    def register_failure(self, rid: int, error: Exception):
-        self.failed_requests[rid] = f"{type(error).__name__}: {error}"
+    def register_failure(self, rid: int, error: Exception, walk: str | None = None):
+        self.failed_requests[rid], _ = client_error_text(
+            error,
+            f"request {rid} failed (node={self.node_name}, walk={walk or self.graph_walk})",
+            log=logger,
+        )
 
     def drop_rids(self, rids: set[int]):
         """Take rids out of the step, leaving the rest of the batch intact."""
@@ -1000,11 +1005,7 @@ class Engine:
                     # the submodule reads a mixed step's rows by their own walk
                     req_inputs.graph_walk = row_walk
             except Exception as error:
-                logger.exception(
-                    "prepare_inputs failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, row_walk,
-                )
-                batch.register_failure(rid, error)
+                batch.register_failure(rid, error, walk=row_walk)
                 continue
             if req_inputs is None:
                 batch.skipped_rids.add(rid)
@@ -1777,10 +1778,6 @@ class Engine:
                     inputs=node_inputs,
                 )
             except Exception as error:
-                logger.exception(
-                    "postprocess failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, batch.step_context.graph_walk,
-                )
                 batch.register_failure(rid, error)
         if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
             live = [
@@ -1879,10 +1876,6 @@ class Engine:
                     rid, batch.per_request_info_wrapped[rid], rid_outputs
                 )
             except Exception as error:
-                logger.exception(
-                    "check_stop failed for request %s (node=%s, walk=%s)",
-                    rid, batch.node_name, batch.step_context.graph_walk,
-                )
                 batch.register_failure(rid, error)
                 continue
             if rid_stops:
