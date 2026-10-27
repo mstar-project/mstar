@@ -266,9 +266,10 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   Canary-Qwen. ``/v1/audio/transcriptions`` cuts longer uploads (up to 30 min) into windows
   at quiet moments and joins their text. None of the four emits timestamps.
 - Parakeet and Nemotron hold no cache. Each clip's decoder state (the LSTM's, and the
-  cursor) sits in a recurrent state slot from its first decode iteration to its last; the
-  YAMLs size ``resources.transducer_state.max_slots`` (129) for ``max_concurrent_requests``
-  (128) and the sink slot, and startup refuses a cap the pool can't hold. A decode iteration
+  cursor) sits in a recurrent state slot from its first decode iteration until the request
+  is torn down; the YAMLs size ``resources.transducer_state.max_slots`` (129) for
+  ``max_concurrent_requests`` (128) and the sink slot, and startup refuses a cap the pool
+  can't hold. A decode iteration
   is 16 greedy steps, and its tokens stream out as it ends. ``compile_step: false`` in
   their ``model_kwargs`` decodes with eager kernels instead of the compiled step.
 - Canary's and Canary-Qwen's YAMLs size the KV caches for ``max_concurrent_requests`` (64),

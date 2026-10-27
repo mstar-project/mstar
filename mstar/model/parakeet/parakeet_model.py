@@ -101,7 +101,7 @@ class ParakeetModel(Model):
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a ``max_concurrent_requests`` the state pool can't hold. A
-        request holds its slot from its first decode iteration to its last;
+        request holds its slot from its first decode iteration until it is torn down;
         past the pool, a decode step's admit waits for a slot while the
         request's frames sit on the GPU, where the conductor would have
         queued the request."""
@@ -149,8 +149,8 @@ class ParakeetModel(Model):
             section=GraphNode(
                 name="transducer",
                 # the loop re-injects the frames every iteration; the clock
-                # carries no data, it only makes the node a same-node
-                # speculation target
+                # carries each row's active flag, which makes the node a
+                # same-node speculation target and which check_stop reads
                 input_names=["frames", "clock"],
                 outputs=[
                     GraphEdge(next_node="transducer", name="clock"),

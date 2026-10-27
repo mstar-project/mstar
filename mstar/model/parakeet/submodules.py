@@ -248,8 +248,8 @@ class TransducerSubmodule(NodeSubmodule):
         tokens, active = self.head.advance(frames, lengths, state, CHUNK, self._step)
         for name, value in state.items():
             pool.scatter_(name, value)
-        # tokens are -1 where a step emitted none. The clock only makes the
-        # node a speculation target; no input reads it.
+        # tokens are -1 where a step emitted none. The clock carries active: it
+        # makes the node a speculation target, and check_stop reads it.
         return BatchedModelOutput(
             row_outputs={"tokens": tokens, "clock": active},
             check_stop_buffers={"active": active},
