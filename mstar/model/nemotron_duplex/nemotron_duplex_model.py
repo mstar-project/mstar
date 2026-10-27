@@ -77,7 +77,12 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ClientChunk, ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.components.audio_features import NemoLogMel
-from mstar.model.components.fastconformer_stream import encoder_kv_config, encoder_state_blocks, front_state_blocks
+from mstar.model.components.fastconformer_stream import (
+    encoder_kv_config,
+    encoder_state_blocks,
+    front_state_blocks,
+    samples_per_frame,
+)
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
 from mstar.model.nemotron_duplex.config import (
@@ -743,13 +748,18 @@ class NemotronDuplexModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
+        stt = self.config.stt
         return PartitionTopology(partitions=["Encoder", "LLM", "Talker"], connections=[
-            # the user's audio, one item per uploaded file or append, at most a
-            # session's samples: past them the talker KV and the decode loops run out
+            # the user's audio, at most a session's samples: past them the talker KV
+            # and the decode loops run out. No item is longer than an encoder frame
+            # (step_rows), so an upload streams as one-frame steps batched with the
+            # live calls'. The front pool holds the same frame, so a checkpoint that
+            # frames otherwise is refused with the resources.
             Connection(from_partition=CLIENT, to_partition="Encoder", edge_name=AUDIO_IN,
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
                        limits=ClientStreamLimits(max_items=self.max_session_samples,
-                                                 item_size=torch.numel, unit="samples")),
+                                                 item_size=torch.numel, unit="samples"),
+                       step_rows=samples_per_frame(stt.encoder, stt.hop_length)),
             # one audio frame per nano decode step. continue_after_done=False:
             # the duplex nano text loop is 1:1 with audio frames, so when the
             # encoder's frames are exhausted the decode loop must terminate

@@ -8,13 +8,16 @@
     python test/nemotron_duplex/parity_compare.py --audio user.wav --engine-text engine.txt --precision fp32
 
 ``--precision bf16`` runs the standalone path with bf16 weights under autocast,
-the engine's serving precision: the two must agree token for token, save the
-last frame, which the server encodes in a pass of its own when the upload's
-end of input reaches the encoder after its audio. ``fp32`` is the
-reference-verified oracle; it can legitimately differ from a bf16 run where
-the text channel's decision is a knife-edge, which the printed top-2 logit
-margins show (e.g. the agent's turn start: <s> vs <SPECIAL_12>). A mismatch
-prints the first differing frame and its margin.
+the engine's serving precision. ``fp32`` is the reference-verified oracle. The
+standalone path encodes the clip in one pass and the server in 80 ms steps
+(about 0.7% apart under bf16), so at either precision the text can
+legitimately differ where the text channel's decision is a knife-edge, which
+the printed top-2 logit margins show (e.g. the agent's turn start: <s> vs
+<SPECIAL_12>). A mismatch prints the first differing frame and its margin, and
+exits 1 unless it is the last frame under bf16 (which the server encodes in a
+step of its own when the end of input reaches the encoder after the audio). A
+failing exit needs the printed margin read: at a small margin the difference is
+the chunking, at a clear one a bug.
 
 Loads the full model on the GPU (fp32 ~44 GB, bf16 ~22 GB): with a bf16 server
 resident (~31 GB) prefer ``--precision bf16``. offline_inference is O(T^2) in

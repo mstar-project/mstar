@@ -719,39 +719,45 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   featurize, fails with a 500 (the worker reports it without a client status).
   Appends must be 16 kHz audio (they are neither
   resampled nor rescaled one by one, which would put a seam at every append).
-  Send appends of 80 ms or more: the encoder takes one append per step, so
-  shorter appends need several steps per frame and fall behind once a step
-  takes longer than an append.
+  Send appends of 80 ms: the encoder takes at most one frame of a call's audio
+  per step, so shorter appends need several steps per frame and fall behind
+  once a step takes longer than an append, and a longer append takes a step for
+  each frame of the call's grid it touches (from 640 samples in, a
+  2560-sample append takes three).
 - Encoder numerics, measured on CPU at the checkpoint's dimensions with random
-  weights: an upload is one encoder pass, bit for bit the offline encoder's in
-  fp32 and under bf16 autocast, save the last frame when the end of input
-  reaches the encoder after the audio (about 1e-6 in fp32). 80 ms appends put
-  the frames within about 2e-6 of offline in fp32 and about 0.7% under bf16
-  autocast. So live and one-shot text should agree token for token in fp32
-  (inferred from those frames, not measured on served text); under the served
-  bf16 a different chunking can flip a knife-edge frame such as the agent's
-  turn start.
+  weights: the server encodes every call, uploads included, in 80 ms steps,
+  which put the frames within about 2e-6 of the offline encoder's (the whole
+  clip in one pass) in fp32 and about 0.7% under bf16 autocast. So served text
+  should match offline token for token in fp32 (inferred from those frames, not
+  measured on served text); under the served bf16 a knife-edge frame such as the
+  agent's turn start can flip, for an upload as for a live call.
 - The encoder keeps each call's state in a slot per session of three
   resources: its attention keys and values in a bounded KV (``encoder_kv``),
   which keeps a call's last 70 frames per layer and runs the attention, each new
   frame over the 70 before it, with the relative-position term as a band of
   distances; its conv inputs (``encoder_state``); and its newest audio and mel
-  frames (``encoder_front``), the last two recurrent-state pools. A
-  call that appends one frame of audio (1280 samples) on the frame grid, every
-  live step of an 80 ms client, runs its whole step as a CUDA graph (the grid is
-  the call's start: an opening clip or append that is not a multiple of 1280
-  samples keeps the call off it for good); other calls take the front end
-  eagerly, then the layer stack as a graph when each got at most one frame (a
-  live step, the call's end), or eagerly (a one-shot upload, a large append:
-  a chunk over a second is not batched with other calls, so the engine runs
-  each call of that step on its own). Appends of other sizes are served the same,
-  without the whole-step graph.
+  frames (``encoder_front``), the last two recurrent-state pools. ``audio_in``
+  declares one frame of audio (1280 samples) as its ``step_rows``, so an upload
+  or an append longer than a frame reaches the encoder cut on the call's frame
+  grid, at most a frame per call per step, and an upload is batched with the
+  live calls. The grid starts at the call's start, and a call is on it while its
+  running sample count is a multiple of 1280. A call two frames in that gets one
+  frame on the grid runs its whole step as a CUDA graph: every live step of an
+  80 ms client, and an opening upload's whole frames after its second. An upload
+  or append that ends off the grid keeps the call off it: a longer append's
+  whole frames still run as the graph, but 80 ms appends after it don't, until
+  an append ends back on the grid.
+  Other calls take the front end eagerly, then the layer stack as a graph when
+  each got at most one frame (a live step, the call's end), or eagerly.
 - Checks: ``test/nemotron_duplex/duplex_request.py`` prepares a clip from the
   bundled ``turn_taking.wav`` and sends it; ``parity_compare.py`` runs the
   standalone reference path on the same clip and checks the served text
-  against it token for token (bf16, the serving precision, must match save the
-  last frame; the fp32 oracle can differ where the agent's turn-taking decision
-  is a knife-edge, which its printed logit margins show).
+  against it token for token, printing the reference's top-2 logit margin at
+  the first frame that differs. The reference encodes the clip in one pass and
+  the server in 80 ms steps, so at either precision a frame where the agent's
+  turn-taking decision is a knife-edge (a small margin) can differ. The script
+  exits 1 on any difference except the last frame under bf16, so read the
+  printed margin of a failure: a small one is the chunking, a clear one a bug.
   ``live_ws_request.py`` streams a clip in 80 ms appends and reports per-frame
   lag; with ``--compare-one-shot`` it checks that a live call sending the whole
   clip as one append matches the upload save the last frame, and reports where

@@ -68,6 +68,12 @@ class StreamState:
         self.position = StreamPosition(source_len=0, written=value)
 
 
+def samples_per_frame(config: FastConformerConfig, hop_length: int) -> int:
+    """Audio samples per encoder frame: the step the node takes from its input
+    stream, which that edge declares as its ``step_rows``."""
+    return hop_length * config.subsampling_factor
+
+
 def front_state_blocks(config: FastConformerConfig, hop_length: int) -> dict[str, RecurrentBlockConfig]:
     """A stream's front-end state, all a later step reads: its newest
     preemphasized samples (``sig``; every sample until its first mel frame,
@@ -75,7 +81,7 @@ def front_state_blocks(config: FastConformerConfig, hop_length: int) -> dict[str
     subsampling window of the next encoder frame) and its last raw sample, for
     the preemphasis. Right-aligned: the newest sample / frame is last."""
     return {
-        "sig": RecurrentBlockConfig(shape=(hop_length * config.subsampling_factor,), dtype=torch.float32),
+        "sig": RecurrentBlockConfig(shape=(samples_per_frame(config, hop_length),), dtype=torch.float32),
         "mel": RecurrentBlockConfig(shape=(2 * config.subsampling_factor, config.num_mel_bins), dtype=torch.float32),
         "last": RecurrentBlockConfig(shape=(1,), dtype=torch.float32),
     }
@@ -108,19 +114,20 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     ``output_edge``; the end of input emits the last ones. A frame per item
     lets a consumer's ``FixedChunkPolicy(1)`` pace a frame-synchronous loop.
 
-    Live streams' chunks run in one batched pass, except that a step holding a
-    chunk of more than a second (an upload, a large append) is not batched
-    (``can_batch``): the engine then runs each stream of it on its own. The
-    encoder is bound to the bounded KV and the conv pool; ``front_key`` names
-    the pool of each stream's audio and mel tails.
+    A step's streams run in one batched pass, which pads every stream to its
+    longest chunk: declare ``step_rows=samples_per_frame(...)`` on the input
+    edge, so an upload or a large append arrives cut into chunks of at most a
+    frame on the stream's frame grid. The encoder is bound to the bounded KV
+    and the conv pool; ``front_key`` names the pool of each stream's audio and
+    mel tails.
 
-    A stream one frame of audio further on the frame grid (every live step of
-    a client appending 80 ms) runs whole as a CUDA graph (``STEP_REGION``). The
+    A stream two frames in that gets one frame of audio on the frame grid
+    (every live step of a client appending 80 ms, an opening upload's whole
+    frames after its second) runs whole as a CUDA graph (``STEP_REGION``). The
     others take the front end eagerly, then the blocks as a graph
-    (``LAYERS_REGION``) when each got at most one frame (a live step, the
-    stream's end), else eagerly (a one-shot upload, a large append). In a step
-    whose other streams take the eager blocks, or when the whole-step region
-    has no graph for its streams, those streams run eagerly too.
+    (``LAYERS_REGION``) when each got at most one frame, else eagerly. In a
+    step whose other streams take the eager blocks, or when the whole-step
+    region has no graph for its streams, those streams run eagerly too.
     """
 
     # The captured regions are not compiled (compile=False); the eager front end
@@ -130,9 +137,6 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     STEP_REGION = "conformer_step"
     LAYERS_REGION = "conformer_layers"
     STATE_KEY = "encoder_stream"         # a stream's StreamState
-    # Longest chunk batched with other streams': a pass pads every stream to its
-    # longest chunk. One second is a judgement, not a measured crossover.
-    BATCHED_CHUNK_S = 1.0
 
     def __init__(
         self,
@@ -147,7 +151,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     ):
         super().__init__()
         c = encoder.config
-        frame_samples = log_mel.hop_length * c.subsampling_factor
+        frame_samples = samples_per_frame(c, log_mel.hop_length)
         unsupported = {
             name: value for name, value, ok in (
                 ("causal", c.causal, c.causal), ("lookahead", c.lookahead, c.lookahead == 0),
@@ -250,7 +254,6 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                 "position": at.position,
                 "n": self.new_frames(at, samples, final),
             },
-            input_seq_len=0 if wav is None else wav.numel(),   # samples, for can_batch
         )
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
@@ -262,12 +265,8 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         }
 
     def can_batch(self, batch, model_inputs) -> bool:
-        # A pass pads every stream to its longest chunk, so a chunk of more than
-        # BATCHED_CHUNK_S keeps its step from being batched, and the engine runs
-        # each stream's step on its own (declare, admit, plan, forward, commit).
-        # Such chunks are uploads and large appends, so it is a rare step.
-        longest = int(self.BATCHED_CHUNK_S * self.log_mel.sampling_rate)
-        return len(model_inputs) == 1 or all(inp.input_seq_len <= longest for inp in model_inputs)
+        # the input edge's step_rows keeps every chunk to a frame or less
+        return True
 
     def max_batch_size(self, graph_walk: str) -> int:
         # The engine caps a batch at its whole-forward graphs only; past the
@@ -519,8 +518,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
 
         # The rest: the same math eagerly, reading this step's plans where it
         # uses them, before any region plans its own; its blocks as a graph when
-        # no stream got more than a frame. A chunk of more than a second comes in
-        # a step of its own (see can_batch).
+        # no stream got more than a frame.
         x = None
         if len(steady) < len(rids):
             x = self._front(states, chunks, final, eager_n)

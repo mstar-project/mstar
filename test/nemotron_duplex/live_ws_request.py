@@ -12,12 +12,14 @@ audio stream back while it is still being sent. Reports, per session:
 
 ``--compare-one-shot`` also sends the whole clip to ``/generate``, and once
 more over the socket as one append carrying ``end_input``: the same input as
-the upload, so the encoder runs it in one pass and that call's text must match
-the upload's token for token, save the last frame (the correctness gate for the
-client stream). The last frame is encoded in a pass of its own when the end of
+the upload, cut into the same frame steps, so that call's text must match the
+upload's token for token, save the last frame (the correctness gate for the
+client stream). The last frame is encoded in a step of its own when the end of
 input reaches the encoder after the audio, which can happen on either side.
-The paced call is compared too, for information only: its appends cut the clip
-differently, and under bf16 a different chunking can flip a knife-edge frame.
+The paced call is compared too, for information only: appends of a whole
+number of frames reach the encoder as the upload's pieces, but other sizes cut
+the clip differently, and under bf16 a different chunking can flip a
+knife-edge frame.
 
     python test/nemotron_duplex/live_ws_request.py                       # demo clip, one call
     python test/nemotron_duplex/live_ws_request.py --chunk-ms 400 --compare-one-shot

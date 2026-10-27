@@ -454,6 +454,15 @@ def test_duplex_stream_connection_policies():
     assert set(conns) == {"audio_in", "audio_frame", "new_token"}
 
 
+def test_duplex_audio_in_steps_the_encoder_fronts_frame():
+    """audio_in's step_rows is the frame the encoder's front pool holds: a larger
+    one pads batched steps and a smaller one keeps every call off the graph."""
+    model = _make_model()
+    (client,) = model.get_partition_topology().client_connections()
+    front = {s.resource_key: s for s in model.get_node_resources()}[ENCODER_FRONT]
+    assert client.step_rows == front.config.blocks["sig"].shape[0]
+
+
 def test_duplex_process_prompt_seeds_frame0_feedback():
     """The frame-0 decode step lists prev_text / prev_func as inputs but has no
     prior sampled token; process_prompt must seed them (BOS / PAD) or the decode
