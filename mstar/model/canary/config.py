@@ -27,8 +27,10 @@ CONTEXT_LABEL = "main"
 # the HF feature extractor's settings that NemoLogMel implements
 MEL_SETTINGS = dict(sampling_rate=16_000, n_fft=512, win_length=400, hop_length=160, preemphasis=0.97)
 
-# the decoder prompt is 9 tokens for every task (``prompt_ids``)
-PROMPT_LENGTH = 9
+# the decoder prompt is 10 tokens for every task (``prompt_ids``)
+PROMPT_LENGTH = 10
+# SentencePiece's word-boundary piece, which starts NeMo's decoder prompt
+WORD_BOUNDARY = "\u2581"
 
 # Languages canary-1b-v2 transcribes, and translates to or from English.
 LANGUAGES = GRANARY_LANGUAGES
@@ -58,6 +60,8 @@ class CanaryModelConfig:
     eos_token_id: int = 3
     # token id by content, for the prompt's task tokens
     special_ids: dict[str, int] = field(default_factory=dict)
+    # id of WORD_BOUNDARY, the prompt's first token
+    word_boundary_id: int = 0
     sampling_rate: int = 16_000
 
     @property
@@ -77,6 +81,8 @@ class CanaryModelConfig:
             raise ValueError(f"unsupported mel front end settings {unsupported}; expected {expected}")
         if dec.get("hidden_act", "relu") != "relu":
             raise ValueError(f"unsupported Canary decoder activation {dec['hidden_act']!r}")
+        if WORD_BOUNDARY not in tok["model"]["vocab"]:
+            raise ValueError(f"tokenizer.json has no {WORD_BOUNDARY!r} piece, which starts the decoder prompt")
         return cls(
             encoder=FastConformerConfig.from_hf(hf["encoder_config"]),
             hidden_size=dec["hidden_size"],
@@ -87,18 +93,24 @@ class CanaryModelConfig:
             max_position_embeddings=dec["max_position_embeddings"],
             eos_token_id=hf["eos_token_id"],
             special_ids={t["content"]: t["id"] for t in tok["added_tokens"]},
+            word_boundary_id=tok["model"]["vocab"][WORD_BOUNDARY],
         )
 
     def prompt_ids(
         self, source_lang: str = "en", target_lang: str | None = None, punctuation: bool = True,
     ) -> list[int]:
-        """The decoder prompt the checkpoint's chat template renders:
-        ``<|startofcontext|><|startoftranscript|><|emo:undefined|><|src|><|tgt|>``
-        ``<|pnc|><|noitn|><|notimestamp|><|nodiarize|>``."""
+        """The decoder prompt NeMo's ``transcribe`` feeds the model:
+        ``▁<|startofcontext|><|startoftranscript|><|emo:undefined|><|src|><|tgt|>``
+        ``<|pnc|><|noitn|><|notimestamp|><|nodiarize|>``.
+
+        NeMo tokenizes the rendered prompt with the checkpoint's SentencePiece
+        model, whose dummy prefix puts ``▁`` first. The HF chat template leaves
+        it out; without it, transcripts drift from NeMo's and translations
+        degrade."""
         source_lang, target_lang = check_task(source_lang, target_lang or source_lang)
         tokens = [
             "<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>",
             f"<|{source_lang}|>", f"<|{target_lang}|>", "<|pnc|>" if punctuation else "<|nopnc|>",
             "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>",
         ]
-        return [self.special_ids[t] for t in tokens]
+        return [self.word_boundary_id] + [self.special_ids[t] for t in tokens]
