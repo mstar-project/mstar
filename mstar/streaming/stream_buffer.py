@@ -4,7 +4,6 @@ from typing import NamedTuple
 
 import torch
 
-from mstar.graph.base import GraphEdge
 from mstar.streaming.chunk_policy import ChunkPolicy
 
 
@@ -41,9 +40,19 @@ class StreamChunkInfo(NamedTuple):
 
 
 class StreamingEdge(NamedTuple):
-    """A synthetic streaming-input edge and the chunk it carries."""
-    edge: GraphEdge
+    """A popped chunk as a synthetic input edge into its consumer node: the
+    uuid of each of its items, and its place in the stream."""
+    name: str
+    next_node: str
+    uuids: list[int]
     chunk: StreamChunkInfo
+
+
+def collate(items: list[torch.Tensor]) -> torch.Tensor:
+    """A chunk's items as its consumer takes them: one item as itself,
+    several stacked. A consumer must not write into it: a single item is the
+    stored tensor, which other destinations may read too."""
+    return items[0] if len(items) == 1 else torch.stack(items)
 
 
 @dataclass
@@ -51,8 +60,8 @@ class StreamBuffer:
     """Per-request, per-edge buffer on the CONSUMER worker.
 
     Items arrive one-by-one via normal routing: tensors, or handles to them
-    (the worker puts each item's ``TensorPointerInfo`` and collates the
-    tensors when the consuming batch is built). The buffer accumulates them
+    (the worker puts each item's uuid and collates the tensors when the
+    consuming batch is built). The buffer accumulates them
     and applies a ChunkPolicy to decide when the consuming node has enough
     data to proceed.
 
@@ -257,7 +266,5 @@ class StreamBuffer:
         if not items:
             return {"data": None}
         if isinstance(items[0], torch.Tensor):
-            if len(items) == 1:
-                return {"data": items[0]}
-            return {"data": torch.stack(items)}
+            return {"data": collate(items)}
         return {"data": items}

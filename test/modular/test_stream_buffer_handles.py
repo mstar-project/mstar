@@ -10,7 +10,6 @@ import torch
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.graph.base import TensorPointerInfo
-from mstar.graph.runtime.base import ColumnarEdgeSpecs
 from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -71,7 +70,7 @@ def _produce(tm, buf, values, first_uuid=100):
         tm.tensor_store.put_tensor(RID, uuid, torch.tensor([v]), _info(uuid))
         tm.tensor_store.increment_ref(uuid, 1)
         buf.pre_read_register(uuid)
-        buf.put(uuid, _info(uuid))
+        buf.put(uuid, uuid)
         uuids.append(uuid)
     return uuids
 
@@ -79,10 +78,8 @@ def _produce(tm, buf, values, first_uuid=100):
 def _consume(streams, tm, se):
     """Build the consuming batch's input from the chunk's edge, then release
     the edge's references as the runtime does once the node consumed it."""
-    block = ColumnarEdgeSpecs.empty()
-    block.add(RID, EDGE, [i.uuid for i in se.edge.tensor_info], se.edge._final_stream_chunk)
-    by_rid = streams.input_tensors(block, NODE, [RID]).by_rid
-    tm.dereference_batch_uniform([i.uuid for i in se.edge.tensor_info])
+    by_rid = streams.input_tensors(streams.edge_block([(RID, se)]), NODE, [RID]).by_rid
+    tm.dereference_batch_uniform(se.uuids)
     return by_rid[RID].get(EDGE)
 
 
@@ -115,7 +112,7 @@ def test_a_sliding_window_keeps_its_overlap_alive_and_frees_everything_once_cons
         (tensor,) = _consume(streams, tm, se)
         assert tensor.shape == (1,) and tensor.tolist() == flushed
     else:
-        assert se.edge.tensor_info == []
+        assert se.uuids == []
     assert not any(present(u) for u in uuids), "every item is released once consumed"
 
 

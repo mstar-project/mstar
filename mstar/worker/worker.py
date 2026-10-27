@@ -43,7 +43,6 @@ from mstar.graph.base import GraphEdge, GraphSection
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
-    EdgeSpec,
     GraphRuntime,
     InlineColumn,
     PostprocessNeed,
@@ -1414,7 +1413,7 @@ class Worker:
         # in _postprocess_batch — NOT here, where an earlier in-flight pass's
         # WGD could read it before the final output chunk is emitted.
         refused = set(self._graph_runtime.ingest_inputs_batch(
-            self._edge_block((rid, [se.edge]) for rid, se in polled),
+            self.streams.edge_block(polled),
             # important: only ingest for this loop iter!
             can_buffer=False,
             is_streaming=True,
@@ -2978,13 +2977,7 @@ class Worker:
             graph_walk=spec_walk,
             rids=continuing,
             room_for_continuing=None,
-            streaming_edges=[
-                EdgeSpec(
-                    signal=e.name, next_node=e.next_node,
-                    uuids=[i.uuid for i in e.tensor_info],
-                    is_final_streaming_chunk=e._final_stream_chunk,
-                ) for _r, (e, _chunk) in polled
-            ],
+            streaming_edges=self.streams.edge_specs(polled),
             streaming_edges_per_rid=per_rid_counts,
         ))
         if prep is None:
@@ -3692,14 +3685,10 @@ class Worker:
         # fwd_info that rides with the streamed edges.
         self._assign_consumer_walks(batch_N)
 
-        # Local streaming stays here: a StreamBuffer holds real tensors, so it
-        # cannot move behind the runtime's contract.
-        # The buffer holds each item by its handle, taking over the routing
-        # reference the local stream destination holds (see
-        # ``_route_streaming_tensor``).
+        # The buffer holds each item by its uuid, taking over the routing
+        # reference the runtime counted for the local stream destination.
         for signal, per_signal in route_output.local_streaming_by_signal.items():
             consumer = self._walk_driven_edges.get(signal)
-            get_info = self.tensor_manager.tensor_store.get_info
             for rid, uuid in per_signal:
                 req_info = self.request_state.per_request_info[rid]
                 stream_buf = req_info.stream_buffers[signal]
@@ -3707,7 +3696,7 @@ class Worker:
                 stream_buf.pre_read_register(
                     uuid, walks.get(consumer) if consumer else None,
                 )
-                stream_buf.put(uuid, get_info(uuid))
+                stream_buf.put(uuid, uuid)
         laps.lap("local_streams")
 
         send_rids = [rid for rid in rids if rid not in failed_rids] if failed_rids else list(rids)

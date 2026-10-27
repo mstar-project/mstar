@@ -194,9 +194,7 @@ class PerRequestInfo:
 
     Everything graph-shaped -- node/loop routing, the sharding config, the
     worker graph ids, the live queues -- belongs to PythonGraphRuntime. What
-    is left is the forward-pass info (a wire object) and the stream buffers
-    (which hold real tensors), neither of which can live behind the runtime's
-    contract.
+    is left is the forward-pass info (a wire object) and the stream buffers.
     """
     # edge_name -> StreamBuffer
     stream_buffers: dict[str, StreamBuffer] = field(default_factory=dict)

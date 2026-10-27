@@ -2380,6 +2380,11 @@ The consuming partition's ``get_partition_forward_pass_args`` reads
 ``incoming_connections``, which provides token counts and a ``producer_done`` flag, and
 uses them to decide when to run.
 
+The consumer receives each chunk as its items stacked along a new leading dimension, or as
+the item itself when the chunk holds one. Don't write into a streamed input in place: a
+one-item chunk is the stored tensor, which the producer may also have routed to other
+destinations, and a sliding window's overlap items reappear in the next chunk.
+
 Keep a walk that consumes a stream to one node or one ``Loop`` on one node group, and move
 later work into a downstream partition fed by its own ``StreamingGraphEdge``. A consumer
 whose every input is streamed runs again as soon as the next chunk arrives, and the

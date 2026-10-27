@@ -1610,9 +1610,9 @@ class PythonGraphRuntime(GraphRuntime):
                         ),
                     ))
 
-            # streaming_local is NOT here: it feeds a StreamBuffer, which holds
-            # real tensors and so stays on the Python side. RouteOutput's
-            # local_streaming_by_signal is how the caller finds those.
+            # streaming_local is NOT here: it feeds the worker's StreamBuffers,
+            # which take over the reference counted for it.
+            # RouteOutput's local_streaming_by_signal is how the caller finds them.
             for worker_id, edges in routing.streaming_to_workers.items():
                 self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
 
