@@ -220,10 +220,10 @@ Under NVIDIA Dynamo, Dynamo's own frontend serves HTTP and does not forward
 ``Authorization`` to backends, so the M\* worker cannot check a key there: authenticate at
 Dynamo's frontend or a gateway in front of it.
 
-The Dynamo worker (``python -m mstar.integrations.dynamo``) does not serve a model that
-takes live client input (``nemotron_duplex``): no Dynamo surface carries a live call's
-appends, so it exits at startup saying so, before any GPU process starts. Serve such a
-model with ``mstar serve`` and call it over ``/v1/realtime`` or ``/generate/ws``.
+No Dynamo surface carries a live call's appends: the Dynamo worker
+(``python -m mstar.integrations.dynamo``) serves one-shot calls, whose input ends with the
+request. For live input, serve the model with ``mstar serve`` and call it over
+``/v1/realtime`` or ``/generate/ws``.
 
 Config files
 ------------

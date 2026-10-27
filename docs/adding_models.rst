@@ -2410,8 +2410,7 @@ streams (audio and video, say): each has its own buffer and its own end.
   Over ``/generate/ws`` the client appends and ends input explicitly (see
   :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open for the call's life;
   every other route ends the input as soon as the request is submitted. ``/generate/ws``
-  and ``/v1/realtime`` are on the Python frontend only, not ``--rust-frontend``, and the
-  Dynamo worker refuses a model with client streams.
+  and ``/v1/realtime`` are on the Python frontend only, not ``--rust-frontend``.
 - The API server's data worker is the stream's producer. The conductor tells it the
   consuming node and its ranks once per call, when it dispatches the request, and the data
   worker sends each append's items to every one of those ranks itself, and then the
