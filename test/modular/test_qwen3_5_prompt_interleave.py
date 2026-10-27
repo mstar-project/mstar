@@ -62,6 +62,7 @@ def test_segments_rebuild_the_prompt(model, modalities):
         tensors={"image_inputs": [an_image()] * n_images},
         prompt_parts=None,
     )
+    out = out.new_input_tensors
     segments = out["text_inputs"]
     assert len(out["image_grid_thw"]) == n_images
     assert len(out["pixel_values"]) == n_images
@@ -112,6 +113,7 @@ def test_schedule_matches_the_split(model):
         tensors={"image_inputs": [an_image(), an_image()]},
         prompt_parts=parts,
     )
+    out = out.new_input_tensors
     # the conductor passes tensor handles; the identity is all that matters
     signals = {
         "text_inputs": list(out["text_inputs"]),
@@ -155,6 +157,7 @@ def test_schedule_matches_the_split(model):
 def test_text_only_prompt_still_uses_prefill_text(model):
     """No images, no merged walk: the plain text path is unchanged."""
     out = model.process_prompt("just text", ["text"], ["text"], tensors={})
+    out = out.new_input_tensors
     signals = {"text_inputs": list(out["text_inputs"])}
     schedule = model._prefill_schedule(["text"], signals)
 
@@ -184,15 +187,6 @@ def test_empty_prompt_fails_legibly(model):
         model.get_initial_forward_pass_args("LLM", ["text"], ["text"], {})
 
 
-def test_video_is_refused_rather_than_run_as_an_image(model):
-    # a ValueError, so the server answers 400 rather than 500
-    with pytest.raises(ValueError, match="video"):
-        model.process_prompt(
-            "What happens?", ["video", "text"], ["text"],
-            tensors={"video_inputs": [an_image()]},
-        )
-
-
 def test_image_only_message_renders_an_empty_text_span(model):
     """A chat message with just an image arrives with no text at all; that is
     still a prompt, so it must render (an empty span around the image) rather
@@ -200,6 +194,7 @@ def test_image_only_message_renders_an_empty_text_span(model):
     out = model.process_prompt(
         None, ["image"], ["text"], tensors={"image_inputs": [an_image()]},
     )
+    out = out.new_input_tensors
     assert len(out["pixel_values"]) == 1 and len(out["image_grid_thw"]) == 1
     # the template's framing around the image: a span before it and one after
     assert len(out["text_inputs"]) == 2
@@ -216,6 +211,7 @@ def test_rgba_image_is_accepted(model):
     out = model.process_prompt(
         "Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [rgba]},
     )
+    out = out.new_input_tensors
     assert out["pixel_values"][0].shape[0] > 0
 
 

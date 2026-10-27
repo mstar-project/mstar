@@ -760,7 +760,7 @@ pub struct GraphRuntime {
         let Some(state) = self.state(wg, rid) else {
             return false;
         };
-        state.loop_iter(lid) + 1 < g.lp(lid).max_iters && !state.loop_finished(lid)
+        state.loop_iter(lid) + 1 < state.loop_max_iters(lid) && !state.loop_finished(lid)
     }
 
     /// One rid: ingest its chunks, check readiness, gather inputs. Returns
@@ -1607,6 +1607,9 @@ impl GraphRuntime {
     ///
     /// `worker_graph_workers` is flattened; `workers_per_worker_graph` gives
     /// each worker graph's slice, parallel to `worker_graph_ids`.
+    ///
+    /// Each loop in `loop_names` runs at most the matching `loop_caps`
+    /// iterations for this request.
     // Struct-of-arrays across the boundary, as everywhere else here: a dict
     // per worker graph would be a Python allocation per admission.
     #[allow(clippy::too_many_arguments)]
@@ -1619,6 +1622,8 @@ impl GraphRuntime {
         worker_graph_ids: Vec<u32>,
         worker_graph_workers: Vec<String>,
         workers_per_worker_graph: Vec<usize>,
+        loop_names: Vec<String>,
+        loop_caps: Vec<u32>,
     ) -> PyResult<u32> {
         let (handle, grew) = self.rids.intern(&request_id);
         if grew {
@@ -1694,8 +1699,15 @@ impl GraphRuntime {
             // In range by construction: the vectors were grown for this
             // handle above.
             if self.states[wg as usize][handle as usize].is_none() {
-                self.states[wg as usize][handle as usize] =
-                    Some(RequestState::new(self.graphs[wg as usize].clone()));
+                let g = &self.graphs[wg as usize];
+                let mut state = RequestState::new(g.clone());
+                for (name, &cap) in loop_names.iter().zip(&loop_caps) {
+                    let lid = self.interner.get(name).and_then(|s| g.loop_by_name.get(&s));
+                    if let Some(&lid) = lid {
+                        state.cap_loop(lid, cap);
+                    }
+                }
+                self.states[wg as usize][handle as usize] = Some(state);
             }
         }
 
@@ -2481,6 +2493,15 @@ impl GraphRuntime {
             if several_walks {
                 rid_walk.insert(rid, (walk_sym, wg));
             }
+            // No group means singleton / non-TP, which is rank 0. The
+            // conductor counts one report per request, so a rank wrongly
+            // claiming rank 0 multiplies that count by tp_size.
+            let node_sym = self.interner.get(&input.node_name);
+            let is_first_tp_rank = self
+                .info(rid)
+                .zip(node_sym)
+                .and_then(|(i, n)| i.shard.as_ref()?.group_of(n, walk_sym))
+                .is_none_or(|g| g.tp_rank == Some(0));
             // Slice this rid's uuids back out of the flat, rid-major layout.
             let mut by_signal: FxHashMap<Sym, Vec<TensorRef>> =
                 FxHashMap::default();
@@ -2524,6 +2545,7 @@ impl GraphRuntime {
             let completed = state.complete(&g, node, &out_tensors);
             let mut pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
+            let transferred = completed.transferred;
             // A loop that cached this node's outputs holds a reference on
             // each, as `Loop.maybe_cache_output` takes one. Applied before
             // `freed_inputs`, which can release the same tensors (an advance
@@ -2547,7 +2569,9 @@ impl GraphRuntime {
                 .filter(|e| e.persist && !e.streaming)
                 .map(|e| (e.name, e.tensors.clone()))
                 .collect();
-            {
+            // Leader only, as in Python: a follower does not keep the
+            // tensors behind these edges, so its counts would name freed ones.
+            if is_first_tp_rank {
                 // First edge of a signal name wins, as in Python's
                 // _count_new_tokens: one output routed twice is two edges
                 // over the SAME tensors.
@@ -2615,17 +2639,7 @@ impl GraphRuntime {
             
             speculative.insert(rid, was_speculative);
 
-            // No group means singleton / non-TP, which is rank 0. The
-            // conductor counts one report per request, so a rank wrongly
-            // claiming rank 0 multiplies that count by tp_size.
-            let node_sym = self.interner.get(&input.node_name);
-            first_tp_rank.insert(
-                rid,
-                self.info(rid)
-                    .zip(node_sym)
-                    .and_then(|(i, n)| i.shard.as_ref()?.group_of(n, walk_sym))
-                    .is_none_or(|g| g.tp_rank == Some(0)),
-            );
+            first_tp_rank.insert(rid, is_first_tp_rank);
 
             // Sweep EVERY worker graph this request runs in this walk, not
             // just the one owning the completed node: a wg can become done
@@ -2945,18 +2959,25 @@ impl GraphRuntime {
                     *contributed.entry(t.uuid).or_insert(0) += refs;
                 }
             }
-            // Settle from the safety hold of 1 to the real fanout. persist is
-            // excluded from the COUNT: those are held by the marker, and
+            // Exchange producer AND finished-loop cache holds for real fanout.
+            // Older accumulated tensors need settlement too, even if this pass
+            // produced none of them. Nested loops may hold the same UUID twice.
+            // The map stays empty, and allocates nothing, unless a loop finished.
+            let mut loop_holds: FxHashMap<u64, i64> = FxHashMap::default();
+            for uuid in transferred {
+                *loop_holds.entry(uuid).or_insert(0) += 1;
+            }
+            // Persist is excluded from the COUNT: those are held by the marker, and
             // counting them would double-count a signal whose destination is
             // EMPTY_DESTINATION.
             {
                 let mut bk = self.bookkeeping.lock().unwrap();
-                for uuid in owned {
+                let mut settle = |uuid: u64, held: i64| -> PyResult<()> {
                     let count = contributed.get(&uuid).copied().unwrap_or(0);
                     // Pre-fanout: a rank whose persist edge the fanout
                     // dropped still holds the tensor for the conductor, and
                     // an unmarked one would be dereferenced to zero right here.
-                    let delta = count - 1;
+                    let delta = count - held;
                     if delta > 0 {
                         bk.increment_ref(uuid, delta)?;
                     } else if delta < 0 {
@@ -2970,6 +2991,18 @@ impl GraphRuntime {
                         out.freed_input_uuids.extend(uuids);
                         out.freed_input_registered.extend(registered);
                     }
+                    Ok(())
+                };
+                for uuid in owned {
+                    let held = if loop_holds.is_empty() {
+                        1
+                    } else {
+                        1 + loop_holds.remove(&uuid).unwrap_or(0)
+                    };
+                    settle(uuid, held)?;
+                }
+                for (uuid, held) in loop_holds {
+                    settle(uuid, held)?;
                 }
             }
 
@@ -3162,11 +3195,13 @@ impl GraphRuntime {
     /// -- because that is the shape `ParallelList` already holds it in.
     /// Zipping them into tuples on the Python side just to unzip here is a
     /// per-rid interpreted loop per argument, every forward pass.
+    ///
+    /// `skip_rids` failed after routing: none of their frames go out.
     #[pyo3(signature = (
         completion_id, info_rids, request_infos,
         ntc_rids, new_token_counts,
         consumed_rids, stream_tokens_consumed, prof_rids, profiling,
-        publish_rids, publications,
+        publish_rids, publications, skip_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send_outputs(
@@ -3185,6 +3220,7 @@ impl GraphRuntime {
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
         publications: Vec<Option<Vec<u8>>>,
+        skip_rids: Vec<u32>,
     ) -> PyResult<Vec<u32>> {
         // Released for the whole frame phase rather than around each send.
         // Nothing below touches Python: the arguments arrive already
@@ -3229,6 +3265,14 @@ impl GraphRuntime {
                 .map(|c| c.speculative.clone())
                 .unwrap_or_default();
             let mut plan = self.take_send_plan(completion_id)?;
+            if !skip_rids.is_empty() {
+                let skip: FxHashSet<u32> = skip_rids.into_iter().collect();
+                plan.to_workers.retain(|w| !skip.contains(&w.rid));
+                plan.persist.retain(|(rid, ..)| !skip.contains(rid));
+                plan.emit.retain(|(rid, ..)| !skip.contains(rid));
+                plan.emit_inline.retain(|(rid, ..)| !skip.contains(rid));
+                plan.completed.retain(|(rid, ..)| !skip.contains(rid));
+            }
             let partition = plan.partition.clone();
             let encoded: FxHashMap<u32, Option<Vec<u8>>> =
                 request_infos.into_iter().collect();

@@ -11,6 +11,7 @@ import io
 import json
 import sys
 import tempfile
+import time
 import types
 import wave
 from pathlib import Path
@@ -275,7 +276,10 @@ def test_speech_maps_adapter_errors(client_and_stub, monkeypatch, exc, status):
     stub.model_name = "orpheus"
     monkeypatch.setattr(adapters.OrpheusAdapter, "speech_to_request", raising)
     r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": "hi", "voice": "tara"})
-    assert r.status_code == status and str(exc) in r.json()["error"]["message"]
+    assert r.status_code == status
+    # a refusal keeps its message; the server's own error shows only an error id
+    message = r.json()["error"]["message"]
+    assert (str(exc) in message) == (status == 400)
     assert stub.last_submit is None
 
 
@@ -764,3 +768,150 @@ def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
     r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True})
     assert r.headers["content-type"].startswith("audio/wav") and r.content[:4] == b"RIFF"
     assert r.content[44:] == _pcm([1, 2, 3])
+
+
+_PNG_URL = "data:image/png;base64," + base64.b64encode(
+    base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+).decode()
+
+
+def _wav_b64(seconds=1, rate=16000) -> str:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(bytes(2 * rate * seconds))
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+@pytest.fixture
+def no_cleanup_delay(monkeypatch):
+    from mstar.api_server import media_io
+
+    monkeypatch.setattr(media_io, "UPLOAD_CLEANUP_DELAY_S", 0.0, raising=False)
+
+
+def _left_after_cleanup(directory: Path, timeout_s: float = 5.0) -> list[str]:
+    """The upload dir's files once the deferred cleanup has had its chance."""
+    deadline = time.monotonic() + timeout_s
+    while any(directory.iterdir()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return sorted(p.name for p in directory.iterdir())
+
+
+_CHAT = {"messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": _PNG_URL}},
+    {"type": "input_audio", "input_audio": {"data": _wav_b64(), "format": "wav"}},
+    {"type": "text", "text": "what is this?"},
+]}]}
+
+
+@pytest.mark.parametrize("model,path,body,chunks", [
+    ("qwen3_omni", "/v1/chat/completions", {"json": _CHAT}, [_Chunk("text", b"a cat")]),
+    ("qwen3_omni", "/v1/chat/completions", {"json": {**_CHAT, "stream": True}}, [_Chunk("text", b"a cat")]),
+    ("bagel", "/v1/images/edits",
+     {"data": {"prompt": "make it neon"}, "files": {"image": ("in.png", b"\x89PNGinput", "image/png")}},
+     [_Chunk("image", b"\x89PNGout")]),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "a cat", "image": _PNG_URL}},
+     [_Chunk("video", b"mp4")]),
+    ("qwen3_tts_base", "/v1/audio/speech",
+     {"json": {"input": "hi", "ref_text": "hi", "ref_audio": "data:audio/wav;base64," + _wav_b64()}},
+     [_Chunk("audio", _pcm([1, 2, 3]))]),
+    ("qwen3_tts_base", "/v1/audio/speech",
+     {"json": {"input": "hi", "ref_text": "hi", "ref_audio": _wav_b64(), "stream": True}},
+     [_Chunk("audio", _pcm([1, 2, 3]))]),
+], ids=["chat", "chat-stream", "edits", "videos", "speech-clip", "speech-clip-stream"])
+def test_a_served_request_leaves_no_upload_behind(client_and_stub, no_cleanup_delay, model, path, body, chunks):
+    """What a request saved is deleted after it is served, as /generate and the
+    Rust frontend do, and was on disk when it was submitted."""
+    if model == "qwen3_tts_base":
+        pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = model
+    stub.next_chunks = chunks
+
+    r = client.post(path, **body)
+
+    assert r.status_code == 200, r.text
+    saved = [p for ps in stub.last_submit["file_paths"].values() for p in ps]
+    assert saved and all(Path(p).parent == stub.upload_dir for p in saved)
+    assert _left_after_cleanup(stub.upload_dir) == []
+
+
+@pytest.mark.parametrize("model,path,body", [
+    ("qwen3_omni", "/v1/chat/completions", {"json": _CHAT}),
+    ("bagel", "/v1/images/edits",
+     {"data": {"prompt": "make it neon"}, "files": {"image": ("in.png", b"\x89PNGinput", "image/png")}}),
+], ids=["chat", "edits"])
+def test_a_submission_the_server_refuses_leaves_no_upload_behind(
+    client_and_stub, no_cleanup_delay, model, path, body,
+):
+    from fastapi import HTTPException
+
+    client, stub = client_and_stub
+    stub.model_name = model
+
+    def unavailable(**kw):
+        raise HTTPException(status_code=503, detail="shutting down")
+
+    stub.submit_request = unavailable
+    r = client.post(path, **body)
+
+    assert r.status_code == 503
+    assert _left_after_cleanup(stub.upload_dir) == []
+
+
+_ATTACHMENTS = _CHAT["messages"][0]["content"][:2]
+
+
+@pytest.mark.parametrize("model,body,message", [
+    ("bagel", {"messages": [{"role": "user", "content": [
+        *_ATTACHMENTS, {"type": "image_url", "image_url": {"url": "data:image/png;base64,%%%"}},
+    ]}]}, "Only base64 data is allowed"),
+    ("qwen3_omni", {"messages": [{"role": "user", "content": _ATTACHMENTS}, {"role": "tool", "content": "42"}]},
+     "a message's role must be system, developer, user or assistant, not 'tool'"),
+    ("cosmos3_edge", {"messages": [{"role": "user", "content": _ATTACHMENTS}], "chat_template_kwargs": True},
+     "argument of type 'bool' is not iterable"),
+], ids=["bad-attachment", "bad-role", "bad-template-kwargs"])
+def test_a_chat_refused_after_its_attachments_leaves_no_upload_behind(client_and_stub, model, body, message):
+    """A chat refused once some attachments are saved is never submitted, so
+    nothing else would delete them."""
+    client, stub = client_and_stub
+    stub.model_name = model
+
+    r = client.post("/v1/chat/completions", json=body)
+
+    assert r.status_code == 400 and r.json()["error"]["message"].startswith(message), r.text
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+def test_a_chunked_speech_stream_keeps_its_clip_until_the_last_chunk_is_submitted(client_and_stub, no_cleanup_delay):
+    """Every sentence chunk reads the reference clip, and a stream submits the
+    later ones while it plays: the clip stays until the stream ends."""
+    pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = "qwen3_tts_base"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2, 3]))]
+    on_disk_at_submit = []
+    submit, batches = stub.submit_request, stub.iter_result_chunk_batches
+
+    def recording_submit(**kw):
+        on_disk_at_submit.append(all(Path(p).exists() for ps in kw["file_paths"].values() for p in ps))
+        return submit(**kw)
+
+    async def slow_batches(request_id):
+        await asyncio.sleep(0.05)  # room for a cleanup scheduled too early to run
+        async for batch in batches(request_id):
+            yield batch
+
+    stub.submit_request, stub.iter_result_chunk_batches = recording_submit, slow_batches
+    text = " ".join(f"Sentence number {i} is long enough to count toward the chunking threshold." for i in range(30))
+
+    r = client.post("/v1/audio/speech", json={
+        "input": text, "ref_text": "hi", "ref_audio": _wav_b64(), "stream": True, "response_format": "pcm",
+    })
+
+    assert r.status_code == 200 and r.content == _pcm([1, 2, 3]) * len(on_disk_at_submit)
+    assert len(on_disk_at_submit) > 2 and all(on_disk_at_submit)
+    assert _left_after_cleanup(stub.upload_dir) == []

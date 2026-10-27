@@ -16,10 +16,12 @@ import pytest
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
+from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig, RetentionPolicy
-from mstar.engine.resources.kv.cpu_page_pool import OffloadedStream
-from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
+from mstar.engine.resources.kv.manager import KVManager, PageArena
 from mstar.engine.resources.kv.plan import SINK_PAGE
+from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.engine.windowing import WindowSchedule
@@ -200,46 +202,24 @@ def test_remove_request_returns_every_page() -> None:
     _assert_pages_conserved(m)
 
 
-class _FakePool:
-    """The CPUPagePool surface `offload` / `reload` use, minus the copies
-    (those need a device)."""
+class _FakePool(CPUPagePool):
+    def __init__(self, max_cpu_pages: int = 64):
+        self.arena = PageArena(kv_cache=None, allocator=PageAllocator(max_cpu_pages))
+        self.index = PrefixIndex(self.arena)
+        self.offloaded = {}
+        self._refused_logged_at = None
+        self._refused_unlogged = 0
+        self.dropped = 0
+        self._dropped_logged_at = None
 
-    def __init__(self):
-        self.states: dict = {}
+    def copy_out(self, gpu_kv_cache, copies):
+        pass
 
-    def offload_stream(
-        self, rid, label, gpu_kv_cache, gpu_page_indices, stored_len, position,
-        released=0, protected_prefix=0,
-    ):
-        self.states.setdefault(rid, {})[label] = OffloadedStream(
-            cpu_page_indices=list(gpu_page_indices), stored_len=stored_len,
-            position=position, released=released, protected_prefix=protected_prefix,
-        )
-        return True
-
-    def reload_stream(self, rid, label, gpu_kv_cache, gpu_page_indices):
-        state = self.states[rid].pop(label)
-        if not self.states[rid]:
-            del self.states[rid]
-        return state
+    def copy_in(self, gpu_kv_cache, copies):
+        pass
 
     def sync(self):
         pass
-
-    def is_offloaded(self, rid):
-        return bool(self.states.get(rid))
-
-    def labels(self, rid):
-        return list(self.states.get(rid, {}))
-
-    def num_pages(self, rid, label):
-        return len(self.states[rid][label].cpu_page_indices)
-
-    def discard(self, rid, label):
-        self.states.get(rid, {}).pop(label, None)
-
-    def remove_request(self, rid):
-        self.states.pop(rid, None)
 
 
 def test_retention_releases_at_commit() -> None:

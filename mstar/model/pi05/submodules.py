@@ -394,6 +394,8 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             # Action generation always has latents of the same size, so it is a
             # similar paradigm to AR decode and can use the batched cuda graphs.
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="action_gen",
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=self.config.action_horizon,
@@ -407,6 +409,8 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
             ),
             PackedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="prefill",
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,

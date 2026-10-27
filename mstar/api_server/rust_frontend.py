@@ -60,6 +60,7 @@ from mstar.communication.rust_communicator import (
     RustZMQCommunicator,
 )
 from mstar.model.multimodal import PromptPart
+from mstar.utils.client_errors import client_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -185,8 +186,10 @@ class RustFrontendBridge:
                     "data": str(detail).encode(), "metadata": {"status": status},
                 })
                 return
-            logger.warning("submit %s failed: %r", rid, e)
-            self._err(rid, sub, repr(e))
+            text, _ = client_error_text(
+                e, f"submit {rid} failed", log=logger, type_name=False,
+            )
+            self._err(rid, sub, text)
             return
         # Bound to this submission now, not when the task first runs: a later
         # submit in the same receive batch may reuse the rid.
@@ -204,9 +207,15 @@ class RustFrontendBridge:
                 })
             self._send({"t": "done", "rid": rid, "sub": sub})
         except Exception as e:  # noqa: BLE001 — includes the per-request timeout
-            detail = getattr(e, "detail", None) or repr(e)
-            logger.warning("request %s failed: %s", rid, detail)
-            self._err(rid, sub, str(detail))
+            detail = getattr(e, "detail", None)
+            if detail:
+                detail = str(detail)
+                logger.warning("request %s failed: %s", rid, detail)
+            else:
+                detail, _ = client_error_text(
+                    e, f"request {rid} failed", log=logger, type_name=False,
+                )
+            self._err(rid, sub, detail)
         finally:
             self._keys.pop(sub, None)
 

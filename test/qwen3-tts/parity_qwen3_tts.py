@@ -245,7 +245,7 @@ class MStarTalkerDriver:
         return CurrentForwardPassInfo(
             request_id=rid, graph_walk="talker_prefill", fwd_index=0, random_seed=1234,
             max_tokens=8192, resource_configs=configs,
-            step_metadata={"talker_max_tokens": 8192, "is_prefill": True, **prompt},
+            step_metadata={"is_prefill": True, **prompt},
         )
 
     def close_request(self, rid: str) -> None:

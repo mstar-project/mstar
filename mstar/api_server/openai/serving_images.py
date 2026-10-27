@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from mstar.api_server import media_io
 from mstar.api_server.openai._util import now, release_unread, rid
 
 
@@ -97,17 +98,19 @@ async def create_image_edit(
         raise
     request_id = rid("img")
 
-    api.submit_request(
-        text=args.text,
-        file_paths=args.file_paths,
-        input_modalities=args.input_modalities,
-        output_modalities=["image"],
-        model_kwargs=args.model_kwargs,
-        streaming=False,
-        request_id=request_id,
-    )
-
-    chunks = await api.collect_results(request_id, raw_request)
+    try:
+        api.submit_request(
+            text=args.text,
+            file_paths=args.file_paths,
+            input_modalities=args.input_modalities,
+            output_modalities=["image"],
+            model_kwargs=args.model_kwargs,
+            streaming=False,
+            request_id=request_id,
+        )
+        chunks = await api.collect_results(request_id, raw_request)
+    finally:
+        media_io.schedule_upload_cleanup({"image": [str(image_path)]}, upload_dir)
     data = [
         {"b64_json": base64.b64encode(c.data).decode("ascii"), "url": None}
         for c in chunks
