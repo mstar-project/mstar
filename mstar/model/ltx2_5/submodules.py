@@ -487,7 +487,9 @@ class _WarmedDecoder(nn.Module):
         if self.warming:
             self._warmed.add(key)
         if key in self._warmed:
-            return self._compiled(z.contiguous(memory_format=torch.channels_last_3d), temb, causal=causal)
+            # clone, not contiguous: at batch 1 a request's latents can already count as channels_last_3d
+            # with a batch stride unlike the warm-up's, and the compiled decoder guards on strides
+            return self._compiled(z.clone(memory_format=torch.channels_last_3d), temb, causal=causal)
         return self.eager(z, temb, causal=causal)
 
 
