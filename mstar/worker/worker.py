@@ -3339,8 +3339,17 @@ class Worker:
             request_ids=batch_N.node_batch.request_ids,
         )
         engine.step_finished(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
-        request = self._get_postprocess_request(batch_N, host_rows, engine)
         _pp_stage("prematerialize")
+        runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
+        checked = None
+        if not runtime_stops:
+            # the model's check_stop decides, before the runtime, which then
+            # routes without stopping for it
+            checked, _ = self._check_stops(batch_N, outputs, cpu_outputs, host_rows, engine)
+            _pp_stage("check_stop")
+        request = self._get_postprocess_request(
+            batch_N, host_rows, engine, runtime_stops, tokens, checked,
+        )
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.runtime", synchronize=False)
@@ -3398,11 +3407,30 @@ class Worker:
         self.tensor_manager.drop_host_copies()
         _pp_stage("tail")
 
+    def _runtime_stop_column(
+        self, batch_N: PendingBatch, host_rows: "HostRows | None",
+    ) -> tuple[bool, "torch.Tensor | None"]:
+        """Whether the runtime checks the step's declared stop policies, and
+        the token column they read (None when none reads one). A step that
+        mixes walks, has no declared policies, or has no column keeps
+        check_stop."""
+        key = (batch_N.node_name, batch_N.graph_walk)
+        if key not in self._stop_token_signal or len(batch_N.batch.rids_by_walk()) > 1:
+            return False, None
+        token_signal = self._stop_token_signal[key]
+        if token_signal is None:
+            return True, None
+        tokens = _host_column(host_rows, token_signal)
+        return tokens is not None, tokens
+
     def _get_postprocess_request(
         self, batch_N: PendingBatch, host_rows: "HostRows | None", engine,
+        runtime_stops: bool, tokens: "torch.Tensor | None",
+        checked: dict[int, set[str]] | None,
     ) -> PostprocessRequest:
         """The step's ``PostprocessRequest``: its rows, its stops known before
-        the check, and the host columns the runtime reads in place."""
+        the runtime's check (``checked``: the model's, when the runtime does
+        not check), and the host columns the runtime reads in place."""
         batch = batch_N.batch
         by_walk = batch.rids_by_walk()
         walks = list(by_walk) or [batch_N.graph_walk]
@@ -3435,15 +3463,8 @@ class Worker:
             loop_name = self._innermost_loop_by_node.get((batch.walk_of(rid), batch_N.node_name))
             if loop_name is not None:
                 stops.setdefault(rid, set()).add(loop_name)
-        # The declared stop policies, read off the token column in place; a
-        # step that mixes walks, or has no column, keeps check_stop.
-        key = (batch_N.node_name, batch_N.graph_walk)
-        runtime_stops = rid_walk_idx is None and key in self._stop_token_signal
-        tokens = None
-        token_signal = self._stop_token_signal.get(key)
-        if runtime_stops and token_signal is not None:
-            tokens = _host_column(host_rows, token_signal)
-            runtime_stops = tokens is not None
+        for rid, loops in (checked or {}).items():
+            stops.setdefault(rid, set()).update(loops)
         # Device loop-back: every routed signal stays on the device and the
         # client's copy rides inline, so the route stores nothing.
         inline = None
@@ -3474,7 +3495,8 @@ class Worker:
         self, batch_N: PendingBatch, outputs: BatchedModelOutput, cpu_outputs,
         host_rows: "HostRows | None", engine,
     ) -> tuple[dict[int, set[str]], list[int]]:
-        """STOPS: the model's ``check_stop``, and the rows it failed."""
+        """The model's ``check_stop``, and the rows it failed, which leave the
+        batch."""
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
         if not batch_N.node_batch.failed_requests:
             return stops, []

@@ -544,8 +544,9 @@ class PostprocessNeed(IntEnum):
     """What a step's postprocess (``begin_postprocess``) waits on from the
     worker, or that it is done."""
     DONE = 0
-    # the step's stops, which the runtime cannot check (the model's own
-    # check_stop): resume with ``stops`` and the ``dropped`` rows
+    # the step's stops, when the runtime's own check failed or a row had no
+    # limits (the model's check_stop decides): resume with ``stops`` and the
+    # ``dropped`` rows
     STOPS = 1
     # the outputs stored as tensors, to route: resume with ``stored``
     STORE = 2
@@ -573,7 +574,9 @@ class PostprocessRequest(NamedTuple):
     # several walks in one step: wg_ids.keys[i] ran walks[rid_walk_idx[i]]
     walks: list[str] | None = None
     rid_walk_idx: list[int] | None = None
-    # stops known before the check: stream-terminated loops
+    # The step's stops known before the runtime's check: stream-terminated
+    # loops, and with runtime_stops False the model's check_stop too, so they
+    # are all of them and the step routes without stopping for STOPS.
     stops: Mapping[int, set[str]] | None = None
     # whether the runtime checks the walk's declared stop policies itself
     runtime_stops: bool = False
@@ -692,6 +695,10 @@ class PhasedPostprocess:
         pp = self._postprocess
         req = pp.request
         if pp.phase is _PostprocessPhase.STOPS:
+            if pp.stops is None and not req.runtime_stops:
+                # checked by the worker: the request's stops are all of them
+                pp.stops = _merged_stops(req.stops)
+                self._keep_rows(pp, set())
             if pp.stops is None:
                 found = None
                 if req.runtime_stops:

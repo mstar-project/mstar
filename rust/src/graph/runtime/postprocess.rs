@@ -91,7 +91,8 @@ pub(super) struct Postprocess {
     pub rids: Vec<u32>,
     pub walks: Option<Vec<String>>,
     pub rid_walk_idx: Option<Vec<u32>>,
-    /// stops known before the check: stream-terminated loops
+    /// stops known before the runtime's check: stream-terminated loops, and
+    /// without `runtime_stops` the model's too (all of the step's stops)
     pub known_stops: Vec<(u32, Vec<String>)>,
     pub runtime_stops: bool,
     pub tokens: Option<TokenColumn>,
@@ -397,6 +398,10 @@ impl GraphRuntime {
     /// the step parked in `self.postprocess`.
     pub(super) fn pp_run(&mut self, py: Python<'_>, mut pp: Postprocess) -> PyResult<PostprocessOut> {
         if pp.phase == Phase::Stops {
+            if pp.stops.is_none() && !pp.runtime_stops {
+                // checked by the worker: the request's stops are all of them
+                pp.stops = Some(merged_stops([&pp.known_stops, &[]]));
+            }
             if pp.stops.is_none() && pp.runtime_stops {
                 // a check that fails, or misses a row's limits, leaves the
                 // decision to check_stop

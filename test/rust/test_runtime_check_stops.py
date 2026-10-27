@@ -85,8 +85,10 @@ def test_the_runtime_stops_what_the_policy_does_through_a_speculated_loop(kind, 
         order = rng.permutation(len(ids))[: len(ids) - int(rng.random() < 0.5)]
         tokens = torch.tensor(rng.choice([EOS, 1, 2], size=len(order)))[:, None]
         host_rows = HostRows(tuple(ids[i] for i in order), {"new_token": tokens})
-        req = w._get_postprocess_request(pending, host_rows, _ENGINE)
-        assert req.runtime_stops and req.inline is None
+        runtime_stops, tokens = w._runtime_stop_column(pending, host_rows)
+        assert runtime_stops
+        req = w._get_postprocess_request(pending, host_rows, _ENGINE, runtime_stops, tokens, None)
+        assert req.inline is None
         got = w._graph_runtime.check_stops(
             req.partition, req.node_name, req.graph_walk, list(req.wg_ids.keys),
             req.tokens, list(req.row_rids),
