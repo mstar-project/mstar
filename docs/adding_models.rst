@@ -538,9 +538,11 @@ The spec types are:
        ``RaggedAttentionConfig`` holds ``num_qo_heads``, ``num_kv_heads`` and
        ``head_dim`` (all pre-sharding, as in ``KVConfig``), an ``sm_scale`` that
        defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO``, the
-       default, or ``RaggedAttnBackend.FLASHINFER``), ``flashinfer_backend``, and the
+       default, ``RaggedAttnBackend.FLASHINFER``, or ``RaggedAttnBackend.DENSE``),
+       ``flashinfer_backend``, and the
        two CUDA-graph ceilings ``max_segments_per_request`` and
-       ``max_tokens_per_request``. See `Cacheless attention (encoder towers)`_.
+       ``max_tokens_per_request``. ``DENSE`` runs FA3 ``flash_attn_varlen`` (AITER on ROCm)
+       and falls back to FlashInfer if that kernel is missing. See `Cacheless attention (encoder towers)`_.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
      - The cross-attention counterpart: one span of each request attends another
        (``RaggedCrossAttentionStep(pairs=...)``). Same config. See `Cross-attention
@@ -565,6 +567,21 @@ The spec types are:
        ``enable_min_p``, ``max_repetition_window``, ``min_tokens_stop_ids`` and
        ``enable_top_p_first`` are capabilities of the same kind. See
        ``SamplingReqConfig`` above.
+   * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
+     - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
+       ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
+       state, a streaming encoder's caches): one slot per request and label, ``blocks``
+       naming a shape and dtype for each piece (dtype None: the engine's compute dtype,
+       what its KV caches store), ``num_layers`` copies of each, ``max_slots`` slots
+       (deployment-tunable) with slot 0 the sink that padding rows address. A recurrent
+       kernel reads the step's ``addressing``. ``declare_step`` gives each row a
+       ``RecurrentStep`` segment with span >= 1. The forward reads its rows with
+       ``pool.gather(name, start=...)`` and writes them back with
+       ``pool.scatter_(name, value)``; both follow the step's plan, so there is no
+       addressing to fetch, and eager and captured steps reach the same slots. A row with
+       no saved state (a request's first step, or a padding row) reads ``start``, zeros
+       when none is given. ``gather`` / ``scatter_`` need the sink, so leave
+       ``disable_sink_slot`` unset. Parakeet's transducer decode is the example.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -621,6 +638,9 @@ appears in no spec, so it receives no resources:
    * - Decoder of an encoder-decoder model
      - The three or four specs above, plus a second ``KVSpec`` for the encoder context
        and a ``CrossAttentionSpec`` over that second cache.
+   * - A node that carries per-request state between steps of a loop (an RNN-T
+       decoder, recurrent attention)
+     - A ``RecurrentStateSpec``, read and written with ``gather`` / ``scatter_``.
    * - A node that samples with two different sets of parameters
      - Two ``SamplerSpec`` objects that both name the node, under different keys.
    * - An encoder tower that attends within the segments of one packed forward
@@ -731,6 +751,15 @@ outside the graph, into buffers whose addresses do not change, and the captured 
 attends through them. A kernel that reads ``cu_seqlens`` as an argument, or builds its
 mask from it, cannot be captured this way.
 
+``RaggedAttnBackend.AUTO`` (and an explicit ``FLASHINFER``) plan through FlashInfer's
+ragged prefill wrapper. ``RaggedAttnBackend.DENSE`` plans the same layouts into static
+``cu_seqlens`` buffers and runs FA3 ``flash_attn_varlen`` (AITER on ROCm) instead, with
+no page scatter. If that kernel is not importable, or the spec is a
+``RaggedBlockCausalAttentionSpec`` (whose overlapping prefixes varlen cannot express),
+the factory logs a warning and builds FlashInfer. The fallback does not cover a GPU or
+dtype the kernel lacks: ``fa3-fwd`` 0.0.3 is built for Hopper (``sm_90a``) and runs bf16
+but not fp16.
+
 BAGEL's SigLIP2 tower is the reference implementation. The spec stands alone, over the
 encoder node only, and names no cache:
 
@@ -840,7 +869,9 @@ within itself and matches the offline mask. ``rel_bias`` is then indexed by that
 ``head_dim ** -0.5``). A per-query window takes no sink, and its right context is 0.
 ``retention`` may be a single ``SinkWindow`` when it does not depend on the source length.
 ``BoundedKVConfig(dtype=None)`` stores the cache in the engine's KV dtype, for layers that
-compute in it.
+compute in it. Nemotron VoiceChat's streaming encoder (``ENCODER_KV``,
+``encoder_kv_config`` in ``mstar/model/nemotron_duplex/components/conformer.py``) is the
+per-query example.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -947,6 +978,18 @@ methods are:
    engine then does not cast its parameters to the autocast dtype, does not wrap its
    forward in autocast, and explicitly disables any enclosing autocast. These two class
    attributes replace the removed ``get_stateless_flavor`` method.
+
+   The engine runs float32 matmuls as TF32 in every process
+   (``torch.set_float32_matmul_precision("high")``). A node that needs full fp32, for
+   example a flow solve that amplifies TF32 rounding, sets
+   ``float32_matmul_precision = "highest"``, and ``cudnn_allow_tf32 = False`` for cuDNN
+   convolutions and RNNs. The engine applies these around that node's forward, its
+   compile and its CUDA-graph capture, and restores the default afterwards, so other
+   nodes keep TF32. ``None`` (the default) keeps the process setting. Don't flip
+   ``torch.backends`` flags in model code: they are process-wide, and a CUDA graph keeps
+   the precision it was captured with. The setting covers ``forward`` and
+   ``forward_batched`` only, not ``preprocess`` or ``postprocess``. It can also be set
+   per instance in ``__init__``, for example only when the model loads in fp32.
 
 ``postprocess(...)`` (optional)
    Metadata-only fixups that run on the GPU thread. This method must not read tensor
@@ -2013,9 +2056,12 @@ Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
 ``max_concurrent_requests: 64``, so the conductor queues further requests instead of the
 worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
 refuses at startup a cap that either cache cannot hold after the YAML's ``resources:``
-overrides.
+overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model with KV caches
+can call the same way.
 
-Whisper's ``declare_step`` shows how a write-once context is expressed with spans. The
+The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
+It lives in ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``), which
+Whisper's and Canary's decoder nodes share; Whisper adds only its token suppression. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
 0 in every later step. The ``commit`` in the prefill step converts the reservation into
 resident pages that the later steps read.
@@ -2119,6 +2165,58 @@ such a consumer sharing its worker graph with another top-level node or ``Loop``
 stream-consuming walk split over worker graphs, unless every consumer also waits on a
 non-streamed input and all the walk's worker graphs run on the same workers. That input
 must arrive once per pass (from the conductor, say); startup cannot check this.
+
+Streams from the client
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A model that listens while it runs (a full-duplex speech model, say) takes its live input
+as a stream the client feeds. Declare it like any other connection, with the reserved
+producer ``CLIENT``:
+
+.. code-block:: python
+
+   from mstar.streaming.topology import CLIENT, Connection
+
+   Connection(from_partition=CLIENT, to_partition="Encoder", edge_name="audio_in",
+              chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1))
+
+``CLIENT`` is not a partition: it has no walks and no worker, and it must not appear in
+``partitions``. The node that lists ``audio_in`` in its ``input_names`` (with
+``consumes_stream=True``) consumes it through a ``StreamBuffer`` and the connection's
+chunk policy, exactly as it would a stream from another partition. Its partition
+self-triggers from the stream, so its forward-pass args send no inputs. That node must be
+the only one, in any walk, that takes the edge; the conductor checks this at startup, and
+that the model implements ``process_stream_chunk``. A partition may take several client
+streams (audio and video, say): each has its own buffer and its own end.
+
+- ``process_stream_chunk(chunk)`` turns each append the client sends into stream items,
+  keyed by client edge name. ``chunk`` is a ``ClientChunk`` (``mstar.model.base``):
+  ``text``; ``tensors`` and ``input_metadata``, the append's files loaded as for a request
+  (``audio_inputs`` and so on); ``streams``, per ``tensors`` list the client stream each
+  file names (``None`` where the client named none, so the model decides);
+  ``model_kwargs``, the append's own; and ``request_kwargs``, the opening message's.
+  Raise ``ValueError`` for an append the model doesn't take (the client gets a 400). An
+  append of text alone that yields no item is refused rather than dropped, but the data
+  worker can't tell which items text sent with files yielded: refuse such text yourself
+  if the model takes none. Keep it stateless; the
+  consuming node keeps its own state, in its resources or ``request_state``.
+- Tensors ``process_prompt`` returns under a client edge's name are the stream's first
+  chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.
+- A client stream may declare limits, ``Connection(..., limits=ClientStreamLimits(...))``
+  (``mstar.streaming.topology``), which the client-stream layer enforces before any of
+  the model's code runs: ``max_items``, what the stream may carry over a call's life,
+  each item counting ``item_size(item)`` (1 by default; a stream of variable-length
+  chunks counts their frames or samples, named by ``unit``). A call past
+  ``max_items`` ends with a 400 that names the limit, so the consumer need not check a
+  session cap of its own. Declare the most the consumer can take: a deployment may
+  lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise
+  it.
+- A stream ends when the client ends it: ``end_input: true`` ends all of the call's
+  streams, a list of names only those. The consumer gets ``producer_done`` for that edge
+  and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
+  Over ``/generate/ws`` the client appends and ends input explicitly (see
+  :doc:`clients`); every other route ends the input as soon as the request is submitted.
+  ``/generate/ws`` is on the Python frontend only, not ``--rust-frontend``.
 
 Checklist
 ---------

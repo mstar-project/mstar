@@ -45,6 +45,7 @@ def test_preprocess_failure_emits_error_chunk():
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.in_queue = queue.Queue()
+    wt._is_pending = lambda key: True
     wt.out_queue = queue.Queue()
     wt.result_tensor_queue = queue.Queue()
     wt.cleanup_request_queue = queue.Queue()
@@ -61,6 +62,7 @@ def test_preprocess_failure_emits_error_chunk():
         force_cleanup_request=cleaned.append,
         has_inflight_reads=lambda rid: False,
         get_ready_tensors=lambda: {},
+        take_failed_reads=lambda: [],
     )
     wt.model = _RejectingModel()
     wt.device = "cpu"

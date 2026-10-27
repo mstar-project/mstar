@@ -246,13 +246,41 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        below).
    * - ``max_concurrent_requests``
      - *(optional)* How many requests run at once. Requests past the cap wait in the
-       conductor's queue.
+       conductor's queue, except a live call (open client input), which is refused with
+       a 503.
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
        whatever is free.
+   * - ``max_call_input_mb``
+     - *(optional, default 512)* For a model that takes live client input: how many MiB
+       of files (and append text) one call may send over its whole life, its opening
+       message's included.
+       A live call's opening message past it is refused, and an append that would pass
+       it ends the call with a 400; a one-shot request is not counted. It caps a call's input, not memory:
+       decoded input is larger than its files, and how much of it waits in buffers
+       depends on how fast the model consumes it.
+   * - ``client_streams``
+     - *(optional)* For a model that takes live client input: per client stream (by
+       its edge name, e.g. ``audio_in``), overrides of the limits the model declares on
+       it (``ClientStreamLimits``, see :doc:`adding_models`). ``max_items``: what the
+       stream may carry over a call's life, in the model's units (items, or the frames
+       or samples a model counts per item); a call past it ends with a 400. A deployment
+       may set a bound the model leaves open (``null`` is none) or lower one it
+       declares, which is the most the model can take, but not raise or lift it: a
+       model sizes its buffers from its own settings (for ``nemotron_duplex``, raise
+       ``max_session_s`` instead). An unknown stream, key or value fails loading. Unlike
+       ``max_call_input_mb`` it counts what the model was handed, not bytes uploaded.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``ws_per_message_deflate``
+     - *(optional, default true)* Whether the server offers per-message deflate on its
+       WebSocket routes (``/generate/ws``, ``/v1/realtime``); it applies to every route.
+       Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
+       55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
+       costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
+       ``/generate/ws``, whose configs turn it off. Turn it off where the server's
+       event loop, not the network, is the bottleneck.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
@@ -279,18 +307,20 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        JIT or CUDA-graph capture can exceed that default.
    * - ``tp_allreduce``
      - *(optional)* Small-message all-reduce path of every TP and SP group:
-       ``nccl`` (default), ``symm_oneshot`` or ``symm_multimem``; any other value
-       fails at startup. The last two send
+       ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
+       any other value fails at startup. ``flashinfer`` sends 2-D bf16 CUDA messages
+       up to ``tp_allreduce_max_kb`` through FlashInfer's one-kernel all-reduce.
+       The symmetric-memory modes send
        contiguous bf16 and fp32 CUDA messages up to ``tp_allreduce_max_kb`` through
        torch symmetric memory: one-shot reads every peer's buffer over NVLink and
        reduces locally, multimem uses NVLS multicast (NVSwitch and driver support).
        Larger messages stay on NCCL, and so does one-shot inside a
        ``torch.compile``'d forward. Both are CUDA-graph capturable. Reduction order
        differs from NCCL's, so bf16 results can differ at the last bit. Falls back
-       to NCCL, with a warning, where symmetric memory cannot be set up on every
+       to NCCL, with a warning, where the chosen path cannot be set up on every
        rank of the group.
    * - ``tp_allreduce_max_kb``
-     - *(optional)* Largest message, in KiB, the symmetric-memory path takes;
+     - *(optional)* Largest message, in KiB, the non-NCCL path takes;
        larger ones go to NCCL. It is also the size of the buffer each group
        rendezvouses. Default 512.
    * - ``tp_async_sched``
@@ -300,13 +330,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
-       ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs`` and
-       ``gc_gen0_threshold``
+       ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
+       ``gc_gen0_threshold`` and ``pre_plan``
        (``true``/``false`` or an integer). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
        fails at startup. For example ``knobs: {kv_plan_cache: 1,
-       ingraph_decode_rope: true}``.
+       ingraph_decode_rope: true}``, or ``knobs: {pre_plan: false}``
+       (``whisper_large_v3_turbo.yaml``).
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /

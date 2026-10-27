@@ -719,6 +719,7 @@ class RustGraphRuntime(GraphRuntime):
                     for value in input.resource_publish_info.values
                 ]
             ),
+            skip_rids=list(input.failed_rids),
         )
         if PHASE_PERIOD:
             _t1 = _time.perf_counter()

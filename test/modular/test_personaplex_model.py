@@ -231,6 +231,9 @@ def test_data_worker_emits_requested_modalities(with_text, reverse_ready):
         def get_ready_tensors(self):
             return {"request": list(reversed(self.ready)) if reverse_ready else self.ready}
 
+        def take_failed_reads(self):
+            return []
+
         def get_tensor(self, uuid):
             return tensors[uuid]
 
@@ -654,13 +657,11 @@ def test_kv_layout_and_loop_caps_match_the_frames_each_loop_runs(tmp_path):
 
 
 def test_kv_declarations_pass_the_worker_startup_checks():
-    from mstar.worker.engine_manager import _refuse_undeclared_pools, _refuse_unknown_walks, _refuse_unservable_walks
+    from mstar.validation.resources import check_resources
 
     model = _model()
     specs = model.get_node_resources()
-    _refuse_unknown_walks(model)
-    _refuse_undeclared_pools(specs, model)
-    _refuse_unservable_walks(specs, model)
+    assert check_resources(model, specs, {}) == []
     growth = model.kv_labels()[cfg.LM_KV][cfg.KV_LABEL].growth
     assert set(growth) == {(cfg.CONDITIONING_WALK, cfg.CONDITIONING_LOOP), (cfg.GENERATE_WALK, cfg.DECODE_LOOP),
                            (cfg.GENERATE_AUDIO_WALK, cfg.DECODE_LOOP)}
