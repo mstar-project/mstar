@@ -120,7 +120,7 @@ def _serve(model: WhisperModel, conductor: Conductor, arrivals: int) -> tuple[in
     specs = _kv_specs(model)
     cross = _manager(specs[CROSS_KV_CACHE].config, CROSS_KV_CACHE)
     self_kv = _manager(specs[KV_CACHE].config, KV_CACHE)
-    batch_size = WhisperDecoderSubmodule.MAX_BATCH_SIZE
+    batch_size = WhisperDecoderSubmodule.prefill_rows(specs[CROSS_KV_CACHE].config)
     for i in range(arrivals):
         conductor._ingest_request(SimpleNamespace(
             request_id=f"r{i}", model_kwargs={}, client_request_id=None))
@@ -233,15 +233,23 @@ def test_uncapped_arrivals_refuse_prefills_once_the_cache_is_full():
     assert peak == 3 * WhisperModel.MAX_CONCURRENT_REQUESTS
 
 
-def test_old_context_cache_refused_a_full_prefill_batch_even_empty():
-    """Why the old sizing collapsed from 16 in flight: 192 pages less the sink
-    hold 15 contexts, and a full prefill batch is 16."""
+def test_default_prefill_cap_is_the_request_cap():
+    model = _make_model()
+    config = _kv_specs(model)[CROSS_KV_CACHE].config
+    assert WhisperDecoderSubmodule.prefill_rows(config) == WhisperModel.MAX_CONCURRENT_REQUESTS
+
+
+def test_prefill_cap_follows_a_smaller_context_cache():
+    """192 pages less the sink hold 15 contexts: the cap is 15, a batch of 15
+    is admitted into the empty cache, and one more row could not be."""
     model = _make_model()
     config = dataclasses.replace(_kv_specs(model)[CROSS_KV_CACHE].config, max_num_pages=192)
+    cap = WhisperDecoderSubmodule.prefill_rows(config)
+    assert cap == 15
     cross = _manager(config, CROSS_KV_CACHE)
-    batch = [f"r{i}" for i in range(WhisperDecoderSubmodule.MAX_BATCH_SIZE)]
+    batch = [f"r{i}" for i in range(cap + 1)]
     for rid in batch:
         cross.ingest_request(rid)
     span = model.config.max_source_positions
     assert not _step(cross, CONTEXT_LABEL, dict.fromkeys(batch, span), "prefill")
-    assert _step(cross, CONTEXT_LABEL, dict.fromkeys(batch[:-1], span), "prefill")
+    assert _step(cross, CONTEXT_LABEL, dict.fromkeys(batch[:cap], span), "prefill")

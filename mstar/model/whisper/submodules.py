@@ -22,6 +22,7 @@ from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, Batche
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.submodule_base import (
@@ -172,8 +173,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
 
     # Every prefill is the same shape (a 4-token forced prompt over a
     # max_source_positions encoder window), so decode is the only walk whose
-    # capture buys anything.
-    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # capture buys anything. Up to the requests the decoder caches hold
+    # (`WhisperModel.MAX_CONCURRENT_REQUESTS`), so they all decode in one step.
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
     def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig):
         super().__init__()
@@ -347,21 +349,26 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             )]
         }
 
-    # Prefill isn't captured, so the engine's capture cap doesn't bound it and
-    # `can_batch` would take the whole ready set. A set too big for the context
-    # cache can't be admitted; with offload configured it evicts and retries,
-    # without it there is nothing to evict and the batch reforms identically.
-    MAX_BATCH_SIZE = 16
-
     def can_batch(
         self, batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ) -> bool:
         return True
 
+    @staticmethod
+    def prefill_rows(context_kv: PagedKVConfig) -> int:
+        """Prefill rows the encoder-context cache holds at once, next to its
+        sink page: each row reserves a whole context."""
+        per_request = -(-context_kv.max_seq_len // context_kv.page_size)
+        return (context_kv.max_num_pages - 1) // per_request
+
     def max_batch_size(self, graph_walk: str) -> int | None:
-        del graph_walk
-        return self.MAX_BATCH_SIZE
+        # Decode is bounded by its captured sizes. Prefill isn't captured, so
+        # nothing else bounds it, and a batch past the contexts the cache holds
+        # could never be admitted.
+        if graph_walk != "prefill":
+            return None
+        return self.prefill_rows(self.node_resources[CROSS_KV_CACHE].config)
 
     def forward_batched(
         self,
