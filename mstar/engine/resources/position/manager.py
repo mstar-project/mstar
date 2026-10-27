@@ -65,6 +65,13 @@ class PositionManager(Resource):
             )
         raise ValueError(f"Unknown position backend {spec.config.backend!r}")
 
+    def fusable_rope_theta(self, head_dim: int) -> float | None:
+        """The theta of the RoPE ``apply_qk`` applies, when that is plain
+        rotate-half RoPE over the whole ``head_dim`` (not interleaved, no
+        scaling, no RoPE dtype), which a layer may apply in a fused kernel of
+        its own instead; None otherwise."""
+        return None
+
 
 class RopeManager(PositionManager):
     """rotary position on top flashinfer in-place kernels"""
@@ -153,6 +160,14 @@ class RopeManager(PositionManager):
         # `clear_preplan` can put the targets back. Unlike KV's, these forks are
         # staged: a counter is host-only, so copying it early races nothing.
         self._preplan_fork_undo: list[tuple[str, str, int | None]] = []
+
+    def fusable_rope_theta(self, head_dim: int) -> float | None:
+        cfg = self._config
+        plain = (
+            cfg.rope_scale == 1.0 and not cfg.interleave and cfg.rope_dtype is None
+            and not cfg.llama31_params and cfg.rotary_dim in (None, head_dim)
+        )
+        return float(cfg.rope_theta) if plain else None
 
     def depends_on(self):
         return {self._kv_cache_name}

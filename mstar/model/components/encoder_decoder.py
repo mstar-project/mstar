@@ -1,4 +1,4 @@
-"""The decoder node of an encoder-decoder speech model (Whisper, Canary): the
+"""The decoder node of an encoder-decoder speech model (Canary): the
 encoder's output written once into a cross-attention context at prefill, then
 one token per decode step. The model supplies the decoder, its stop token and
 its logit rules."""

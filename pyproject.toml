@@ -375,6 +375,7 @@ asr = [
     "transformers",
     "datasets",
     "jiwer",  # WER computation for asr_eval.py
+    "numba>=0.61",  # Whisper word timestamps' DTW (components/alignment.py)
 ]
 
 # GLM-5.x
