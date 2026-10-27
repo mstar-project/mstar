@@ -855,7 +855,7 @@ def test_sampler_defaults(contract_model, tmp_path) -> None:
     assert _contract_sampler(contract_model, {}).temperature == 0.0
 
 
-# ----- generator knobs: 400 instead of clamp / coercion -----
+# ----- generator knobs: out of range or mistyped is a 400 -----
 
 
 @pytest.mark.parametrize("mk, match", [
