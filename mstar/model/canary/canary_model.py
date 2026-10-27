@@ -281,7 +281,7 @@ class CanaryModel(Model):
         context = int(self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH))
         kv_layout = {
             KV_CACHE: {"main": LabelLayout(
-                spans=(Span("ids", "prefill", len(prompt_ids), len(prompt_ids), "text_inputs"),),
+                spans=(Span("rows", "prefill", len(prompt_ids), len(prompt_ids), "text_inputs"),),
                 growth=(("decode_loop", 1),),
             )},
             CROSS_KV_CACHE: {CONTEXT_LABEL: LabelLayout(
