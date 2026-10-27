@@ -16,7 +16,7 @@ from mstar.conductor.conductor import Conductor
 from mstar.model.glm52.config import KV_RESOURCE
 from mstar.model.glm52.glm52_model import Glm52Model
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor, SetupDone
-from mstar.worker.engine_manager import _refuse_undeclared_pools, _refuse_unknown_walks
+from mstar.validation.resources import _undeclared_pools, _unknown_prefix_walks
 
 PROMPT = len("hello")  # _preprocess's prompt, a token per byte
 
@@ -62,8 +62,8 @@ def _dispatched(sent: list):
 def test_every_paged_label_is_declared_at_load(kwargs):
     model = _model(**kwargs)
 
-    _refuse_undeclared_pools(model.get_node_resources(), model)
-    _refuse_unknown_walks(model)
+    assert list(_undeclared_pools(model.get_node_resources(), model)) == []
+    assert list(_unknown_prefix_walks(model)) == []
 
 
 def test_a_request_decodes_one_step_fewer_than_its_max_tokens(tmp_path, monkeypatch):
