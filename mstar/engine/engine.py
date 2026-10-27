@@ -1432,46 +1432,57 @@ class Engine:
         )
         slot_events: dict[int, Any] = {}
 
-        for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
-            req_info = {rid: batch.per_request_info_wrapped[rid]}
-            slot = ctxs[rid].slot
-            submodule_mgmt.set_piecewise_slot(slot)
-            in_flight = slot_events.get(slot)
-            if in_flight is not None:
-                in_flight.synchronize()
+        # A raise outside the per-rid try below is no one request's, so it
+        # fails the batch; the drain and `commit_done` still run on the way out.
+        try:
+            for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
+                req_info = {rid: batch.per_request_info_wrapped[rid]}
+                slot = ctxs[rid].slot
+                submodule_mgmt.set_piecewise_slot(slot)
+                in_flight = slot_events.get(slot)
+                if in_flight is not None:
+                    in_flight.synchronize()
 
-            if nvtx:
-                range_push(f"engine.per_request.{rid}")
-            try:
-                raw, _ = self._drive_step(
-                    batch, submodule_mgmt, [rid], [inp], req_info, ctxs[rid],
-                    lease=None, running_batched=False,
-                    step=steps[rid], set_launch=not launched,
-                )
-                if raw is None:
-                    continue
-                launched = True
-                if fence:
-                    slot_events[slot] = torch.Event(device=self._device)
-                    slot_events[slot].record()
-
-                merged.update(self._collect_outputs(
-                    submodule_mgmt, None, raw, [inp], req_info,
-                    request_ids=[rid], step_request_ids=(rid,),
-                ))
-            finally:
                 if nvtx:
-                    range_pop()
+                    range_push(f"engine.per_request.{rid}")
+                try:
+                    raw, _ = self._drive_step(
+                        batch, submodule_mgmt, [rid], [inp], req_info, ctxs[rid],
+                        lease=None, running_batched=False,
+                        step=steps[rid], set_launch=not launched,
+                    )
+                    if raw is None:
+                        continue
+                    launched = True
 
-        # Releasing `commit_done` lets the plan thread pre-plan the next batch,
-        # which stages `next_slot` while this batch's work may still be queued.
-        # Only that slot needs draining: every other one the loop touched is
-        # re-consumed a batch or more later, by which point the worker has
-        # synced on this step.
-        event = slot_events.get(submodule_mgmt.next_slot)
-        if event is not None:
-            event.synchronize()
-        batch.commit_done.set()
+                    merged.update(self._collect_outputs(
+                        submodule_mgmt, None, raw, [inp], req_info,
+                        request_ids=[rid], step_request_ids=(rid,),
+                    ))
+                except Exception as error:
+                    # This rid's own forward: it fails alone and the worker drops
+                    # it, as for prepare_inputs. Its admitted state goes with the
+                    # REMOVE that follows, once the step is out of flight. Under
+                    # TP/SP the ranks stay in step only if every rank raised here.
+                    batch.register_failure(rid, error)
+                finally:
+                    # on every exit: a raise after plan can leave this slot's
+                    # staging copy queued
+                    if fence:
+                        slot_events[slot] = torch.Event(device=self._device)
+                        slot_events[slot].record()
+                    if nvtx:
+                        range_pop()
+        finally:
+            # Releasing `commit_done` lets the plan thread pre-plan the next
+            # batch, which stages `next_slot` while this batch's work may still
+            # be queued. Only that slot needs draining: every other one the loop
+            # touched is re-consumed a batch or more later, by which point the
+            # worker has synced on this step.
+            event = slot_events.get(submodule_mgmt.next_slot)
+            if event is not None:
+                event.synchronize()
+            batch.commit_done.set()
         # Same optional 1-step launch throttle as _exec_single. This path is
         # always eager (never capturing), but the guard is kept for parity.
         if (
@@ -1752,7 +1763,12 @@ class Engine:
     ) -> None:
         submodule_mgmt = self._submodules[batch.node_name]
         submodule = submodule_mgmt.submodule
+        failed = batch.failed_requests
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
+            if failed and rid in failed:
+                # its per-request forward raised: nothing to finish, and a
+                # second raise here would replace the error the client gets
+                continue
             try:
                 submodule.postprocess(
                     request_id=rid,

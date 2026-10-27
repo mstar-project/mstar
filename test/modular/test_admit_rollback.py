@@ -39,6 +39,7 @@ from mstar.engine.resources.step import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.model.submodule_base import NodeSubmodule
 
 PAGE = 16
 
@@ -303,6 +304,86 @@ def test_a_per_request_refusal_unwinds_every_resource_of_the_earlier_rows():
     assert batch.admit_error is not None
     assert pool.num_free_slots == slots, "row 1 kept its recurrent slot"
     assert pool._slots[1] == {} and pool._slots[2] == {}
+
+
+# --- a forward that raises fails its own row, on real resources --------------
+
+
+class _RaisingSub(NodeSubmodule):
+    """``_Sub``'s declaration, through the engine's own plan, preprocess,
+    forward, commit and collect."""
+
+    _keys = ("kv",)
+    declare_step = _Sub.declare_step
+
+    def prepare_inputs(self, *a, **kw):  # pragma: no cover - the test builds inputs
+        raise NotImplementedError
+
+    def forward(self, *a, **kw):  # pragma: no cover - SubmoduleManagement.forward runs
+        raise NotImplementedError
+
+
+def _forward_raising_on(row):
+    def forward(graph_walk, engine_inputs, **kwargs):
+        del graph_walk, kwargs
+        if engine_inputs.request_ids == [row]:
+            raise RuntimeError(f"forward failed for row {row}")
+        return {"token": torch.zeros(1)}
+    return forward
+
+
+def test_a_per_request_forward_that_raises_fails_only_its_row():
+    """Rows 1 and 3 commit and return outputs; row 2 is failed for the worker
+    to drop. Row 2 keeps what its admit took until the removal its failure
+    leads to, as every rid of a batch that raises does."""
+    kv = _kv("kv", pages=16)
+    eng = _engine({"kv": kv})
+    mgmt = eng._submodules["n"]
+    mgmt.submodule = _RaisingSub.__new__(_RaisingSub)
+    mgmt.forward = _forward_raising_on(2)
+    for rid in (1, 2, 3):
+        kv.ingest_request(rid, None)
+    free = kv._arena.num_free
+
+    batch = _per_request_batch([1, 2, 3], 2 * PAGE)
+    batch.inputs = [SimpleNamespace(input_seq_len=2 * PAGE, tensor_inputs={}, kwargs={})] * 3
+    out = eng._exec_per_request(batch)
+
+    assert batch.admit_error is None
+    assert set(batch.failed_requests) == {2}
+    assert set(out.per_rid_outputs[1]) == {"token"} and set(out.per_rid_outputs[3]) == {"token"}
+    assert out.per_rid_outputs[2] == {}
+    for rid in (1, 3):
+        stream = kv._streams[rid]["main"]
+        assert stream.stored_len == 2 * PAGE and not stream.step_in_flight, rid
+    failed = kv._streams[2]["main"]
+    assert failed.stored_len == 0 and failed.step_in_flight
+
+    kv.remove_request(2)
+    assert kv._arena.num_free == free - 4, "only rows 1 and 3 hold pages"
+    assert not any(rid == 2 for rid, _ in kv._admit_reserved_pages)
+
+
+def test_a_step_that_raised_before_commit_is_released_by_the_removal():
+    """Why a raise gets no unwind of its own: the rid is failed, its REMOVE
+    comes once the step is out of flight, and ``remove_request`` frees the
+    pages, the reservation record and the ``step_in_flight`` mark the admit
+    left. Unwinding on the GPU thread right after the raise would free the
+    pages while the forward's queued kernels may still write them."""
+    kv = _kv("kv", pages=8)
+    runner = StepRunner({"kv": kv})
+    kv.ingest_request(1, None)
+    free = kv._arena.num_free
+    step = SubmoduleStep(steps={"kv": _kv_step(1, 2 * PAGE)})
+    step.set_ctx(_ctx(1))
+    assert runner.admit(step).ok
+    runner.plan(step)
+    assert kv._streams[1]["main"].step_in_flight
+
+    kv.remove_request(1)
+
+    assert kv._arena.num_free == free
+    assert 1 not in kv._streams and not kv._admit_reserved_pages
 
 
 # --- the recurrent pool gives back the slots a refused step took --------------
