@@ -22,7 +22,7 @@ from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, Batche
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.fp32_precision import fp32_precision_scope, node_fp32_precision
 from mstar.engine.resources import Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.recurrent import RecurrentAddressing, RecurrentStatePool, RecurrentStep
+from mstar.engine.resources.recurrent import RecurrentStatePool, RecurrentStep
 from mstar.model.components.transducer import CHUNK, TransducerHead
 from mstar.model.parakeet.config import DECODE_LOOP, DECODE_WALK, NUM_FRAMES, TRANSDUCER_STATE
 from mstar.model.submodule_base import (
@@ -214,15 +214,6 @@ class TransducerSubmodule(NodeSubmodule):
         del graph_walk
         return self.MAX_BATCH_SIZE
 
-    def _read_state(self, pool: RecurrentStatePool, rows: RecurrentAddressing) -> dict[str, torch.Tensor]:
-        """The rows' state from their slots; a fresh slot, and a padding row on
-        the sink, from the start state."""
-        fresh = ~rows.has_state[:rows.num_rows]
-        return {
-            name: torch.where(fresh.view(-1, *(1,) * start.dim()), start, pool.gather(name, rows))
-            for name, start in self._start.items()
-        }
-
     def forward_batched(
         self,
         graph_walk: str,
@@ -252,14 +243,11 @@ class TransducerSubmodule(NodeSubmodule):
         self, engine_inputs: ModelInputsFromEngine, frames: torch.Tensor, lengths: torch.Tensor,
     ) -> BatchedModelOutput:
         pool: RecurrentStatePool = engine_inputs.resources[TRANSDUCER_STATE]
-        rows = pool.addressing("main")
-        assert frames.shape[0] == rows.num_rows, (
-            f"{frames.shape[0]} rows of frames for a step that addresses {rows.num_rows}"
-        )
-        state = self._read_state(pool, rows)
+        # a fresh slot, and a padding row on the sink, start from the start state
+        state = {name: pool.gather(name, start=start) for name, start in self._start.items()}
         tokens, active = self.head.advance(frames, lengths, state, CHUNK, self._step)
         for name, value in state.items():
-            pool.scatter_(name, rows, value)
+            pool.scatter_(name, value)
         # tokens are -1 where a step emitted none. The clock only makes the
         # node a speculation target; no input reads it.
         return BatchedModelOutput(
