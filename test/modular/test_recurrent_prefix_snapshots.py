@@ -343,6 +343,16 @@ def test_a_keyed_node_loads_with_a_recurrent_pool_and_the_resource_over_it():
     )
 
 
+@pytest.mark.parametrize("variant", [LinearAttnVariant.KDA, LinearAttnVariant.MAMBA2])
+def test_a_keyed_node_refuses_a_pool_whose_backend_writes_no_snapshots(variant):
+    specs = _specs(prefix_slots=2)
+    specs["gdn"] = LinearAttnSpec(resource_key="gdn", nodes={"LLM"}, config=LinearAttnConfig(
+        recurrent_state="state", variant=variant,
+    ))
+    problems = list(_unskippable_resources(list(specs.values()), _Keyed()))
+    assert problems and "'state' cannot serve a request" in problems[0], problems
+
+
 @pytest.mark.parametrize("depends_on", [set(), {"kv"}])
 def test_a_keyed_node_still_refuses_a_resource_that_cant_skip_a_prefix(depends_on):
     class _Unskippable(NodeResourceSpec):
