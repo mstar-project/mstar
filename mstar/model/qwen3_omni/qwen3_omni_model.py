@@ -1296,7 +1296,12 @@ class Qwen3OmniModel(Model):
 
         if not attached:
             return ProcessPromptOutput(result, {})
-        return ProcessPromptOutput(result, {"kv_layout": self._kv_layout(plan, result, "audio" in output_modalities)})
+        audio_output = "audio" in output_modalities
+        metadata = {"kv_layout": self._kv_layout(plan, result, audio_output)}
+        if audio_output:
+            # A hit would skip the Thinker rows the Talker reads for every prompt token.
+            metadata["prefix_cache"] = False
+        return ProcessPromptOutput(result, metadata)
 
     def _kv_layout(self, plan: list[PromptPart], tensors: NameToTensorList, audio_output: bool) -> dict:
         """What each Thinker prefill step writes and, with audio out, what the Talker writes of it.

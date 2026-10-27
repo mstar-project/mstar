@@ -205,26 +205,6 @@ def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> Non
                         )
 
 
-def streamed_partitions(specs: list[NodeResourceSpec], model: Model) -> frozenset[str]:
-    """The partitions a node streams into when its label is keyed over several walks.
-
-    A walk the cache serves streams nothing for the tokens it skips, so the
-    conductor doesn't cache a request that runs one of these partitions.
-    """
-    graphs = model.get_graph_walk_graphs()
-    partition_of = {walk: p.name for p in model.get_partitions() for walk in p.graph_walks}
-    nodes_of = {spec.resource_key: spec.nodes for spec in specs}
-    return frozenset(
-        edge.target_partition
-        for key, by_label in keyed_labels(model).items()
-        for kv_label in by_label.values() if len(kv_label.keys.walks) > 1
-        for walk in kv_label.keys.walks
-        for name, node in graphs[walk].get_nodes().items() if name in nodes_of[key]
-        for edge in node.outputs
-        if isinstance(edge, StreamingGraphEdge) and edge.target_partition != partition_of[walk]
-    )
-
-
 @dataclass
 class EngineManager:
     """Owns the worker's engine.

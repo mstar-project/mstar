@@ -446,9 +446,10 @@ request's inputs on the keyed walk and cuts a prefix only from inputs that
 there. The default ``split_inputs`` slices only the sequence, so a request whose inputs
 carry ``tensor_inputs`` is probed only when the submodule sets ``cuts_tensor_inputs``
 and overrides ``split_inputs`` to cut those tensors. For a label keyed over several
-walks, where a keyed node streams into a partition other than its own, a request that
-runs that partition is not cached either, since a hit would skip the rows the node
-streams for the tokens the cache holds. BAGEL
+walks, a keyed node may stream into a partition other than its own. A hit skips the
+rows the node streams for the tokens the cache holds, so the model's ``process_prompt``
+returns ``prefix_cache: False`` for a request that runs that partition, as Qwen3-Omni
+does for one with audio output. BAGEL
 keys an understanding prompt's text and images, and a generation's first span when it
 is text: an edit's images are resized before their walks see them, and a file's digest
 doesn't cover the resize. A label under a sliding window files pages only up to its
