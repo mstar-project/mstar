@@ -466,10 +466,10 @@ def test_process_prompt_ends_with_the_reply_prefix(make, tmp_path):
     mk = adapters.get_adapter("glm52").chat_to_request(
         _chat(tools=[WEATHER], tool_choice="required"), tmp_path).model_kwargs
     out = m.process_prompt("ignored", ["text"], ["text"], **mk)
-    assert out["text_inputs"][0].tolist() == [1, 2, 3, 100 + len("<tool_call>get_weather")]
+    assert out.new_input_tensors["text_inputs"][0].tolist() == [1, 2, 3, 100 + len("<tool_call>get_weather")]
     m._tokenizer_mode = "byte"
     out = m.process_prompt("hi", ["text"], ["text"], reply_prefix="<t")
-    assert out["text_inputs"][0].tolist() == list(b"hi<t")
+    assert out.new_input_tensors["text_inputs"][0].tolist() == list(b"hi<t")
 
 
 @pytest.mark.parametrize("raw", ["1e400", "[1e309]", "-1e999", '{"x": 1e400}'])
