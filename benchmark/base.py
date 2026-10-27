@@ -314,6 +314,12 @@ class Qwen3_5_Dense(Model):
     def get_supported_modalities(self):
         return {RequestType.T2T, RequestType.I2T, RequestType.V2T}
 
+    def get_model_kwargs(self, request_type: RequestType):
+        # Greedy everywhere (mstar's sampler defaults to 0.6), and the same prompt
+        # render: mstar always opens a <think> block, while the 0.8B/2B templates
+        # only do when asked, so vLLM/SGLang get it through chat_template_kwargs.
+        return {"temperature": 0.0, "chat_template_kwargs": {"enable_thinking": True}}
+
 
 class Qwen3_8_Dense(Qwen3_5_Dense):
     """Qwen3.8 dense: the Qwen3.5 architecture, defaulting to the 27B."""
