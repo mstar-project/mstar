@@ -73,20 +73,20 @@ def rows_of(n: int, base: float) -> torch.Tensor:
     return base + torch.arange(n * SHAPE[0] * SHAPE[1], dtype=torch.float32).view(n, *SHAPE)
 
 
-def advance(pool: RecurrentStatePool, rows, inc: torch.Tensor) -> None:
+def advance(pool: RecurrentStatePool, inc: torch.Tensor) -> None:
     """A stand-in forward: read every row's state, update it, write it back."""
-    pool.scatter_("h", rows, pool.gather("h", rows, layer_idx=1) * 2 + inc, layer_idx=1)
-    cursor = pool.gather("cursor", rows)
-    pool.scatter_("cursor", rows, cursor + 1)
+    pool.scatter_("h", pool.gather("h", layer_idx=1) * 2 + inc, layer_idx=1)
+    pool.scatter_("cursor", pool.gather("cursor") + 1)
 
 
 def test_round_trip_and_a_shorter_step_reads_only_its_rows():
     pool = build_pool()
     step, ctx = eager(["a", "b", "c"])
-    rows = plan(pool, step, ctx)
+    plan(pool, step, ctx)
     value = rows_of(3, 1.0)
-    pool.scatter_("h", rows, value, layer_idx=1)
-    torch.testing.assert_close(pool.gather("h", rows, layer_idx=1), value)
+    pool.scatter_("h", value, layer_idx=1)
+    # has_state comes from the plan, so this step's own writes read as no saved state yet
+    torch.testing.assert_close(pool.gather("h", layer_idx=1), torch.zeros_like(value))
     pool.commit(step, ctx)
     assert torch.equal(pool.block("h", 0), torch.zeros(MAX_SLOTS, *SHAPE)), "layer 0 untouched"
 
@@ -94,7 +94,7 @@ def test_round_trip_and_a_shorter_step_reads_only_its_rows():
     step, ctx = eager(["c", "a"])
     rows = plan(pool, step, ctx)
     assert rows.num_rows == 2 and rows.slot_indices.numel() == 3
-    torch.testing.assert_close(pool.gather("h", rows, layer_idx=1), value[[2, 0]])
+    torch.testing.assert_close(pool.gather("h", layer_idx=1), value[[2, 0]])
     assert rows.has_state[: rows.num_rows].tolist() == [True, True]
 
 
@@ -107,22 +107,23 @@ def test_replay_addressing_matches_eager():
     for pool in pools.values():
         # same history in both: a, b and c take slots 1, 2 and 3 and hold state
         step, ctx = eager(["a", "b", "c"])
-        pool.scatter_("h", plan(pool, step, ctx), rows_of(3, 1.0), layer_idx=1)
+        plan(pool, step, ctx)
+        pool.scatter_("h", rows_of(3, 1.0), layer_idx=1)
         pool.commit(step, ctx)
 
     step, ctx = eager(real)
-    rows = plan(pools["eager"], step, ctx)
-    advance(pools["eager"], rows, rows_of(3, 100.0))
+    plan(pools["eager"], step, ctx)
+    advance(pools["eager"], rows_of(3, 100.0))
     pools["eager"].commit(step, ctx)
 
     pool = pools["replay"]
-    sink_before = pool.block("h", 1)[SINK_SLOT].clone()
+    pool.block("h", 1)[SINK_SLOT].fill_(7.0)
     step, ctx = replay(real, bs=4)
     rows = plan(pool, step, ctx)
     assert rows.num_rows == 4, "num_rows counts the padding rows the step declared"
     assert rows.slot_indices.tolist()[3] == SINK_SLOT
-    torch.testing.assert_close(pool.gather("h", rows, layer_idx=1)[3], sink_before)
-    advance(pool, rows, torch.cat([rows_of(3, 100.0), rows_of(1, 100.0)]))
+    assert bool((pool.gather("h", layer_idx=1)[3] == 0).all()), "a padding row reads zeros, not the sink"
+    advance(pool, torch.cat([rows_of(3, 100.0), rows_of(1, 100.0)]))
     pool.commit(step, ctx)
 
     for rid in real:
@@ -162,13 +163,16 @@ def test_padding_rows_read_and_write_only_the_sink():
     pool = build_pool()
     pool.block("h", 1)[SINK_SLOT].fill_(7.0)
     step, ctx = replay(["a"], bs=4)
-    rows = plan(pool, step, ctx)
-    got = pool.gather("h", rows, layer_idx=1)
-    assert bool((got[1:] == 7.0).all()), "padding rows read the sink"
-    assert bool((got[0] == 0).all()), "a fresh slot reads as zeros"
+    plan(pool, step, ctx)
+    got = pool.gather("h", layer_idx=1)
+    assert bool((got == 0).all()), "a fresh slot and the padding rows read zeros, not the sink's leftovers"
+    start = torch.full(SHAPE, 2.0)
+    assert bool((pool.gather("h", layer_idx=1, start=start) == 2.0).all()), "or the start state given"
 
     value = torch.cat([torch.full((1, *SHAPE), 5.0), torch.full((3, *SHAPE), -1.0)])
-    pool.scatter_("h", rows, value, layer_idx=1)
+    with pytest.raises(ValueError, match="1 rows for a step that declared 4"):
+        pool.scatter_("h", value[:1], layer_idx=1)
+    pool.scatter_("h", value, layer_idx=1)
     h = pool.block("h", 1)
     assert bool((h[slot_of(pool, "a")] == 5.0).all())
     assert bool((h[SINK_SLOT] == -1.0).all())
@@ -181,8 +185,8 @@ def test_padding_rows_read_and_write_only_the_sink():
 def test_a_freed_slot_reads_as_zeros():
     pool = build_pool()
     step, ctx = eager(["a"])
-    rows = plan(pool, step, ctx)
-    pool.scatter_("h", rows, rows_of(1, 3.0), layer_idx=1)
+    plan(pool, step, ctx)
+    pool.scatter_("h", rows_of(1, 3.0), layer_idx=1)
     pool.commit(step, ctx)
     freed = slot_of(pool, "a")
     pool.remove_request("a")
@@ -191,7 +195,13 @@ def test_a_freed_slot_reads_as_zeros():
     rows = plan(pool, step, ctx)
     assert slot_of(pool, "d") == freed
     assert not rows.has_state[0].item()
-    assert bool((pool.gather("h", rows, layer_idx=1) == 0).all())
+    assert bool((pool.gather("h", layer_idx=1) == 0).all())
+    # a resumed slot reads its saved state whatever start is given
+    pool.scatter_("h", rows_of(1, 4.0), layer_idx=1)
+    pool.commit(step, ctx)
+    step, ctx = eager(["d"])
+    plan(pool, step, ctx)
+    torch.testing.assert_close(pool.gather("h", layer_idx=1, start=torch.full(SHAPE, 2.0)), rows_of(1, 4.0))
 
 
 def test_a_pool_without_a_sink_refuses_gather_and_scatter():
@@ -211,9 +221,9 @@ def test_a_pool_without_a_sink_refuses_gather_and_scatter():
     rows = plan(pool, step, ctx)
     assert rows.slot_indices.tolist()[1] == NO_SLOT
     with pytest.raises(ValueError, match="'no_sink_state' has no sink slot"):
-        pool.gather("h", rows)
+        pool.gather("h")
     with pytest.raises(ValueError, match="'no_sink_state' has no sink slot"):
-        pool.scatter_("h", rows, rows_of(2, 0.0))
+        pool.scatter_("h", rows_of(2, 0.0))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
@@ -226,16 +236,16 @@ def test_a_captured_graph_addresses_the_rows_each_replay_plans():
     inc = torch.zeros(bs, *SHAPE, device="cuda")
 
     step, ctx = replay([], bs=bs, capture=True)
-    rows = plan(pool, step, ctx)
+    plan(pool, step, ctx)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         for _ in range(2):
-            advance(pool, rows, inc)
+            advance(pool, inc)
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        advance(pool, rows, inc)
+        advance(pool, inc)
 
     for n, real in enumerate((["a", "b"], ["c"], ["b", "d", "a", "c"], ["d", "a"])):
         values = rows_of(len(real), 10.0 * (n + 1)).cuda()
@@ -247,7 +257,8 @@ def test_a_captured_graph_addresses_the_rows_each_replay_plans():
         pool.commit(step, ctx)
 
         step, ctx = eager(real)
-        advance(ref, plan(ref, step, ctx), values)
+        plan(ref, step, ctx)
+        advance(ref, values)
         ref.commit(step, ctx)
 
         for rid in "abcd":
