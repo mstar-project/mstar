@@ -1140,7 +1140,8 @@ handled as special cases. BAGEL uses all of them, in
   graph, for example in ``preprocess`` before the replay. Their addressing stays an
   ordinary plan rather than the slot's static buffers, which are sized for the bucket's
   in-graph tokens. Whisper's prefill uses it to write its 1500-token encoder context
-  while replaying a graph sized by its few prompt tokens.
+  while replaying a graph sized by its few prompt tokens, and Canary's
+  (``EncoderDecoderNode``) for a context as long as the clip.
 
 **Writing K/V yourself.** A layer that writes its K/V inside a fused kernel of its own,
 rather than through ``write_kv``, asks the KV resource where the step's tokens go:

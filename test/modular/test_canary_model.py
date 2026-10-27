@@ -328,6 +328,8 @@ def test_prefill_reserves_each_clips_context_once():
     from mstar.model.submodule_base import ARNodeInputs
 
     node = _tiny_node()
+    written = []
+    node.decoder.write_cross_kv = written.append
     clips = [torch.randn(13, 32), torch.randn(7, 32)]
     prefill = [ARNodeInputs(input_ids=torch.arange(9), input_seq_len=9, tensor_inputs={"encoder_states": c})
                for c in clips]
@@ -335,11 +337,41 @@ def test_prefill_reserves_each_clips_context_once():
     for key in (CROSS_KV_CACHE, CROSS_ATTN):
         assert [(s.request_id, s.span) for s in step.steps[key].segments] == [("a", 13), ("b", 7)]
     assert [s.span for s in step.segments] == [9, 9]
-    assert torch.equal(node.preprocess("prefill", None, prefill)["encoder_states"], torch.cat(clips))
+    assert "encoder_states" not in node.preprocess("prefill", None, prefill)
+    (context,) = written
+    assert torch.equal(context, torch.cat(clips))
     decode = [ARNodeInputs(input_ids=torch.tensor([5]), input_seq_len=1) for _ in clips]
     step = node.declare_step("decode", ["a", "b"], decode)
     assert [s.span for s in step.steps[CROSS_KV_CACHE].segments] == [0, 0]
     assert "encoder_states" not in node.preprocess("decode", None, decode)
+    assert len(written) == 1
+
+
+def test_prefill_writes_its_context_outside_the_forward():
+    """The context write is `preprocess`'s and declared `eager_write`, so the
+    captured prefill holds the prompt alone. A replay's padding rows bring no
+    context and write none, and the forward writes nothing even when handed
+    the encoder output."""
+    from mstar.model.canary.config import CROSS_KV_CACHE
+    from mstar.model.submodule_base import ARNodeInputs
+
+    node = _tiny_node()
+    written = []
+    node.decoder.write_cross_kv = written.append
+    node._forward = lambda graph_walk, engine_inputs, input_ids: torch.zeros(1, dtype=torch.long)
+    ids, context = torch.zeros(PROMPT_LENGTH, dtype=torch.long), torch.randn(13, 32)
+    real = ARNodeInputs(input_ids=ids, input_seq_len=PROMPT_LENGTH, tensor_inputs={"encoder_states": context})
+    padding = ARNodeInputs(input_ids=ids[:0], input_seq_len=0)
+    step = node.declare_step("prefill", ["a", "pad"], [real, padding])
+    assert [s.span for s in step.steps[CROSS_KV_CACHE].segments] == [13, 0]
+    assert step.steps[CROSS_KV_CACHE].eager_write
+    assert not node.declare_step("decode", ["a"], [padding]).steps[CROSS_KV_CACHE].eager_write
+    assert node.preprocess("prefill", None, [real, padding])["input_ids"].shape == (PROMPT_LENGTH,)
+    (states,) = written
+    assert torch.equal(states, context)
+    node.preprocess("prefill", None, [padding])
+    node.forward_batched("prefill", None, ids, encoder_states=context)
+    assert len(written) == 1
 
 
 def test_batched_stop_check_agrees_with_the_per_request_one():
@@ -372,14 +404,26 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
 
 def test_decoder_node_caps_captures_and_names(snapshot):
     """What the shared TokenStepNode gives the decoder node: prefill batches
-    capped, decode bounded by its captures, the sampled token fed back, and
-    the walk, loop and sampler names of Canary's graph."""
+    capped, decode bounded by its captures, prefill captured per batch size up
+    to its cap in packed buckets of PROMPT_LENGTH tokens a row, the sampled
+    token fed back, and the walk, loop and sampler names of Canary's graph."""
+    from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
     from mstar.model.canary.config import SAMPLER
 
     node = _tiny_node()
     assert node.max_batch_size("prefill") == 32 and node.max_batch_size("decode") is None
-    (capture,) = node.get_accelerator_graph_configs(torch.device("cpu"))
-    assert capture.capture_graph_walk == "decode" and capture.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
+    decode, prefill = node.get_accelerator_graph_configs(torch.device("cpu"))
+    assert decode.capture_graph_walk == "decode" and decode.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
+    # packed: a bucket is leased only once the batch's inputs exist, so no
+    # pre-plan runs over template rows
+    assert prefill.capture_graph_walk == "prefill"
+    assert prefill.get_config_type() == AcceleratorGraphConfigType.FLASH_INFER_PACKED
+    assert prefill.capture_batch_sizes == [1, 2, 4, 8, 16, 32] and not prefill.compile
+    assert [prefill.get_total_tokens(bs) for bs in (1, 4, 32)] == [[bs * PROMPT_LENGTH] for bs in (1, 4, 32)]
+    rows = prefill.get_node_inputs(4, 4 * PROMPT_LENGTH)
+    assert [r.input_seq_len for r in rows] == [PROMPT_LENGTH] * 4 and not any(r.tensor_inputs for r in rows)
+    (pad,) = prefill.get_node_inputs(1, 0)
+    assert pad.input_seq_len == 0 and pad.input_ids.shape == (0,)
     outputs = {"new_token": [torch.tensor([5])]}
     node.postprocess("a", None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"]

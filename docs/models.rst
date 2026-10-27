@@ -269,6 +269,9 @@ FastConformer ASR (``canary``, ``canary_qwen``) notes
   timestamps.
 - Their YAMLs size the KV caches for ``max_concurrent_requests`` (64),
   and startup refuses a cap the caches can't hold.
+- Canary's decoder replays prefill from a capture per batch size, as it does decode: every
+  prompt is ``PROMPT_LENGTH`` tokens, and the clip's context is written ahead of the replay
+  (``KVStep.eager_write``). Canary-Qwen's prefill runs eagerly: its prompt holds the clip.
 - Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
   smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
   together.
