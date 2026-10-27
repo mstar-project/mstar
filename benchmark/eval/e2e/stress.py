@@ -339,16 +339,80 @@ async def workload(url: str, cfg: dict, refs: Refs, tag: str, seed: int) -> dict
 # ---------------------------------------------------------------- the server side (on the GPU host)
 
 def server_namespaces(server) -> set[str]:
-    """This server's deployment token in its tensor file names (``mstar_<token>_<entity>_<uuid>``): the SHA-1 of
-    its conductor's IPC endpoint (``tensors._deployment_namespace``), found under its ``--socket-path-prefix``.
-    Empty when there is no such socket (another layout): its tensor files then go uncounted, never misattributed."""
+    """This server's deployment namespace in its tensor file names (``mstar_<ns>_<entity>_<uuid>``): the SHA-1 of
+    its launch token (``launch_tokens``) and its conductor's IPC endpoint (``tensors._deployment_namespace``), found
+    under its ``--socket-path-prefix``. With a token, the endpoint-only SHA-1 is kept beside it: a build without the
+    token in its names inherits one from a harness environment that carries it. Empty when there is no such socket
+    (another layout): its tensor files then go uncounted, never misattributed."""
     try:
         cmd = server.command()
         prefix = Path(cmd[cmd.index("--socket-path-prefix") + 1])
     except (AttributeError, AssertionError, ValueError, IndexError):
         return set()
-    return {hashlib.sha1(f"ipc://{os.path.realpath(p)}".encode()).hexdigest()[:12]
-            for p in prefix.rglob("conductor.ipc")}
+    tokens = launch_tokens(server.pid) if getattr(server, "pid", None) else set()
+    keys = [f"ipc://{os.path.realpath(p)}" for p in prefix.rglob("conductor.ipc")]
+    keys += [f"{token}\0{k}" for token in sorted(tokens) for k in list(keys)]
+    return {hashlib.sha1(k.encode()).hexdigest()[:12] for k in keys}
+
+
+def _proc_env_token(pid: int) -> str | None:
+    """``MSTAR_DEPLOYMENT_TOKEN`` in ``/proc/<pid>/environ``, the environment at exec. A later ``os.environ`` write
+    does not show up here, and an empty value counts as unset."""
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    for kv in env:
+        if kv.startswith(b"MSTAR_DEPLOYMENT_TOKEN="):
+            token = kv.split(b"=", 1)[1].decode()
+            return token or None
+    return None
+
+
+def launch_tokens(pgid: int) -> set[str]:
+    """Tokens that name this launch's files.
+
+    The API server mints ``MSTAR_DEPLOYMENT_TOKEN`` after it starts, so ``/proc`` of its own pid can still hold
+    the empty or previous token it was exec'd with. The processes it spawned carry the token that names the
+    files. With none of those, the server's own non-empty token is used: a launcher-set token is kept, and a
+    single process is its own server."""
+    pids = group_pids(pgid)
+    spawned = {t for pid in pids if pid != pgid and (t := _proc_env_token(pid))}
+    if spawned:
+        return spawned
+    own = _proc_env_token(pgid)
+    return {own} if own else set()
+
+
+def namespace_file(name: str, namespaces: set[str]) -> bool:
+    """A tensor file under one of ``namespaces``. Arena segments named under it (``mstar_<ns>_arena_*``) are not:
+    an arena keeps the segments it grew into until shutdown."""
+    return any(name.startswith(f"mstar_{ns}_") and not name.startswith(f"mstar_{ns}_arena_") for ns in namespaces)
+
+
+def unmapped_arena_segments(root: str, namespaces: set[str], pids: set[int]) -> list[str]:
+    """Arena segments under one of ``namespaces`` in ``root`` that none of ``pids`` maps. A live arena maps every
+    segment it grew, so these were left by a process that exited without its exit-time unlink (a crash, a
+    SIGKILL) and that no live peer still reads. Asked only once a process of the server has exited: a segment the
+    dead process grew and a live peer still maps is not counted, so this can miss a leak but never names a live
+    arena's memory as one."""
+    try:
+        names = {n for n in os.listdir(root) if any(n.startswith(f"mstar_{ns}_arena_") for ns in namespaces)}
+    except OSError:
+        return []
+    prefix = os.path.join(root, "")
+    for pid in pids:
+        if not names:
+            break
+        try:
+            with open(f"/proc/{pid}/maps") as f:
+                for line in f:
+                    path = line.split(None, 5)[5:]
+                    if path and path[0].startswith(prefix):
+                        names.discard(path[0].rstrip("\n").removesuffix(" (deleted)")[len(prefix):])
+        except OSError:
+            continue   # exited meanwhile, or not ours to read: it maps nothing we can see
+    return sorted(names)
 
 
 def shm_owner(name: str) -> int | None:
@@ -363,8 +427,8 @@ def shm_owner(name: str) -> int | None:
 def shm_entries(root: str, namespaces: set[str], pids: set[int]) -> int:
     """This server's M* files in ``root``: tensor files under one of its deployment tokens, and per-process ones
     of its processes. Other servers on the host (other GPU slots, other users' jobs) name theirs with another
-    token or pid. Arena segments (``mstar_arena_*``) are left out: an arena keeps the segments it grew into until
-    shutdown, so their count rises under load without a leak."""
+    token or pid. Arena segments (``mstar_arena_*``, ``mstar_<ns>_arena_*``) are left out: an arena keeps the
+    segments it grew into until shutdown, so their count rises under load without a leak."""
     try:
         names = [n for n in os.listdir(root) if n.startswith("mstar_") and not n.startswith("mstar_arena_")]
     except OSError:
@@ -372,13 +436,23 @@ def shm_entries(root: str, namespaces: set[str], pids: set[int]) -> int:
     n = 0
     for name in names:
         pid = shm_owner(name)
-        n += any(name.startswith(f"mstar_{ns}_") for ns in namespaces) if pid is None else pid in pids
+        n += namespace_file(name, namespaces) if pid is None else pid in pids
     return n
 
 
+def helper_process(pid: int) -> bool:
+    """A process the server's group holds that is not part of the server: Torch Inductor's compile-worker pool,
+    which a cold start spawns (one per core) and which exits once compiles go quiet, so its exit is no crash."""
+    try:
+        return b"/torch/_inductor/compile_worker/" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+
+
 def group_pids(pgid: int) -> set[int]:
+    """The server's processes, helpers (``helper_process``) left out."""
     r = subprocess.run(["ps", "-o", "pid=", "-g", str(pgid)], capture_output=True, text=True, check=False)
-    return {int(x) for x in r.stdout.split()}
+    return {pid for pid in map(int, r.stdout.split()) if not helper_process(pid)}
 
 
 def alive(pid: int) -> bool:
@@ -458,7 +532,10 @@ def run_session(url: str, pgid: int, arm: str, session: int, d: Path, cfg: dict,
         if gone:
             lost_runs(runs[i + 1:], arm, session, d, ["crash"], f"not run: the server exited during run {r}",
                       publish)
-            log(f"{arm} s{session}: {len(gone)} server process(es) exited; the next session starts a fresh server")
+            left = unmapped_arena_segments(shm, namespaces, group_pids(pgid))
+            log(f"{arm} s{session}: {len(gone)} server process(es) exited"
+                + (f", leaving {len(left)} arena segment(s) no live process maps" if left else "")
+                + "; the next session starts a fresh server")
             return
 
 

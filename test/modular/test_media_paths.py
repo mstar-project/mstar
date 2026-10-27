@@ -62,7 +62,7 @@ def test_chat_media_parts_refuse_server_paths(dirs):
             adapters.Qwen3OmniAdapter().chat_to_request(req, uploads)
 
 
-@pytest.mark.parametrize("adapter", [adapters.Qwen3TTSAdapter, adapters.OmniVoiceAdapter])
+@pytest.mark.parametrize("adapter", [adapters.Qwen3TTSAdapter, adapters.OmniVoiceAdapter, adapters.ChatterboxAdapter])
 def test_voice_clone_references_refuse_server_paths(adapter, dirs):
     uploads, secret = dirs
     before = sorted(uploads.iterdir())
@@ -170,14 +170,15 @@ def test_omnivoice_accepts_bare_base64_that_torchcodec_reads(clip, dirs):
 
 
 @pytest.mark.parametrize("clip", SOUNDFILE_ONLY)
-def test_omnivoice_refuses_audio_its_decoder_cannot_read(clip, dirs):
+@pytest.mark.parametrize("adapter", [adapters.OmniVoiceAdapter, adapters.ChatterboxAdapter])
+def test_libsndfile_first_voice_clones_accept_audio_only_libsndfile_reads(adapter, clip, dirs):
+    """Their loaders try libsndfile before FFmpeg, as Model.load_audio does."""
     uploads, _ = dirs
-    _audio_decoder()
     req = SpeechRequest(input="hi", ref_audio=_clip(*clip), ref_text="hi")
-    # FFmpeg reads a MAT4 or MAT5 header as AMR-NB with a bitrate-estimated
-    # duration over a minute, so the length cap can refuse it before the decode
-    with pytest.raises(ValueError, match=f"{REFUSED}|{TOO_LONG}"):
-        adapters.OmniVoiceAdapter().speech_to_request(req, uploads)
+    (path,) = adapter().speech_to_request(req, uploads).file_paths["audio"]
+    import soundfile
+
+    assert path.startswith(str(uploads)) and soundfile.read(path)[0].size
 
 
 @pytest.mark.parametrize("decodes", [True, False])
@@ -339,23 +340,14 @@ def test_a_wav_data_url_is_held_to_the_rate_floor(adapter, rate, dirs):
     assert set(uploads.iterdir()) == before
 
 
-@pytest.mark.parametrize("adapter, accepted", [(adapters.OmniVoiceAdapter, False), (adapters.Qwen3TTSAdapter, True)])
-def test_a_mat5_data_url_is_checked_by_the_model_decoder(adapter, accepted, dirs):
-    """torchcodec (OmniVoice) cannot decode MAT5 samples, so the data worker returned
-    a 500; soundfile (Qwen3-TTS) reads it, so it stays accepted there. FFmpeg's
-    header for it claims over a minute, so OmniVoice may refuse it on length."""
-    if adapter is adapters.OmniVoiceAdapter:
-        _audio_decoder()
+@pytest.mark.parametrize("adapter", [adapters.OmniVoiceAdapter, adapters.ChatterboxAdapter, adapters.Qwen3TTSAdapter])
+def test_a_mat5_data_url_is_checked_by_the_model_decoder(adapter, dirs):
+    """torchcodec cannot decode MAT5 samples, and FFmpeg's header for it claims
+    over a minute; libsndfile, which all three loaders try first, reads it."""
     uploads, _ = dirs
-    before = set(uploads.iterdir())
     req = SpeechRequest(input="hi", ref_audio="data:audio/wav;base64," + _clip("MAT5", "FILE", None), ref_text="hi")
-    if accepted:
-        (path,) = adapter().speech_to_request(req, uploads).file_paths["audio"]
-        assert path.startswith(str(uploads))
-        return
-    with pytest.raises(ValueError, match=f"{UNDECODABLE}|{TOO_LONG}"):
-        adapter().speech_to_request(req, uploads)
-    assert set(uploads.iterdir()) == before
+    (path,) = adapter().speech_to_request(req, uploads).file_paths["audio"]
+    assert path.startswith(str(uploads))
 
 
 @pytest.mark.parametrize("form", ["base64", "data URL"])
@@ -395,10 +387,10 @@ def test_omnivoice_caps_the_decode_when_the_header_hides_the_length(
 
 
 @pytest.mark.parametrize("seconds", [59, 61])
-@pytest.mark.parametrize("adapter", [adapters.OmniVoiceAdapter, adapters.Qwen3TTSAdapter])
+@pytest.mark.parametrize("adapter", [adapters.OmniVoiceAdapter, adapters.ChatterboxAdapter, adapters.Qwen3TTSAdapter])
 def test_a_wav_longer_than_the_cap_is_refused_before_decoding(adapter, seconds, dirs, monkeypatch):
-    """Real decoders, 8 kHz WAV. torchcodec is spied on so a refusal is shown to
-    come from the header."""
+    """Real decoders, 8 kHz WAV. torchcodec is spied on: libsndfile reads a WAV,
+    so neither the check nor the refusal decodes it with FFmpeg."""
     decodes = []
     if adapter is adapters.OmniVoiceAdapter:
         decoder = _audio_decoder()
@@ -416,7 +408,7 @@ def test_a_wav_longer_than_the_cap_is_refused_before_decoding(adapter, seconds, 
     if seconds <= media_io.MAX_REF_AUDIO_SECONDS:
         (path,) = adapter().speech_to_request(req, uploads).file_paths["audio"]
         assert path.startswith(str(uploads))
-        assert decodes == ([True] if adapter is adapters.OmniVoiceAdapter else [])
+        assert decodes == []
         return
     with pytest.raises(media_io.RefAudioTooLongError, match=TOO_LONG):
         adapter().speech_to_request(req, uploads)

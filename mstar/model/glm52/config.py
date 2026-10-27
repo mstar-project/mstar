@@ -106,13 +106,12 @@ class Glm52ModelConfig:
     rope_theta: float = 8_000_000.0
     rope_interleave: bool = True
     max_position_embeddings: int = 1_048_576
-    # Serving cap, consumed by get_kv_cache_config (the top-level YAML
-    # max_seq_len key is only presence-checked by the conductor — it does
-    # not override this). Held to index_topk while dsa_long_context is off:
-    # dense MLA is exactly GLM-5.2's DSA computation only within the
-    # top-2048 window, and the submodule's preprocess guard enforces the
-    # same bound. With dsa_long_context on, Glm52Model raises this from the
-    # ``max_seq_len`` model kwarg and the guard checks against it instead.
+    # The serving window with dsa_long_context on, raised by the
+    # ``max_seq_len`` model kwarg (the top-level YAML max_seq_len key is
+    # only presence-checked by the conductor). With it off the window is
+    # index_topk: dense MLA is exactly GLM-5.2's DSA computation only within
+    # the top-2048 window. The KV pool is sized to the window
+    # (``Glm52Model.context_limit``), which the conductor holds requests to.
     max_seq_len: int = 2048
 
     # --- MTP layer (built and loaded only when mtp_num_draft_tokens > 0) ---
@@ -176,6 +175,10 @@ class Glm52ModelConfig:
     # then sums its two partials as moe_fused_allreduce does. Off by default: the norm
     # rounds differently.
     fused_add_rmsnorm: bool = False
+    # torch.compile the forward the CUDA graphs capture and the uncaptured steps run. False
+    # (model_kwargs.graph_compile) captures and runs it eager, for an Inductor failure that
+    # would otherwise fail every capture and serve eager.
+    graph_compile: bool = True
 
     # Prefill runs the last layer's FFN half (norm, MoE, all-reduce) on the rows it samples
     # only. Those few rows take the small-batch MoE path, so the first token's numerics

@@ -14,7 +14,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.model.glm52._testing import fake_quantize_fp8_block
+from mstar.model.glm52._testing import fake_quantize_fp8_block, per_request_outputs
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
 from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
@@ -215,7 +215,8 @@ class _Serve:
             )
             kw = self.submodule.preprocess(walk, engine_inputs, inputs)
             if batched:
-                out = self.submodule.forward_batched(walk, engine_inputs, **kw)[rid]
+                raw = self.submodule.forward_batched(walk, engine_inputs, **kw)
+                out = per_request_outputs(raw, [rid])[rid]
             else:
                 out = self.submodule.forward(walk, engine_inputs, **kw)
             if step is not None:
@@ -283,7 +284,7 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     assert cfg.quantization_config is not None
 
     prompt_tensors = model.process_prompt("hello glm", ["text"], ["text"])
-    prompt_ids = prompt_tensors["text_inputs"][0].to(DEVICE)
+    prompt_ids = prompt_tensors.new_input_tensors["text_inputs"][0].to(DEVICE)
     assert prompt_ids.tolist() == list("hello glm".encode("utf-8"))
 
     submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
@@ -325,7 +326,7 @@ def test_serve_path_is_deterministic_fp8(tmp_path):
     _write_checkpoint(tmp_path, seed=1)
     model = _load_model(tmp_path)
     submodule = model.get_submodule(NODE, device="cuda", autocast_dtype=DTYPE)
-    prompt_ids = model.process_prompt("serve", ["text"], ["text"])["text_inputs"][0].to(DEVICE)
+    prompt_ids = model.process_prompt("serve", ["text"], ["text"]).new_input_tensors["text_inputs"][0].to(DEVICE)
 
     runs = [
         _run_generation(model, submodule, model.config, prompt_ids, max_tokens=5)[0]

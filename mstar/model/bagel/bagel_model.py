@@ -81,10 +81,21 @@ from mstar.model.bagel.submodules import (
     VAEDecoderSubmodule,
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
+    vae_latents,
     vit_patches,
     vit_preprocess,
 )
-from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream, ProcessPromptOutput, Span
+from mstar.model.base import (
+    DECODE,
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    prompt_spans,
+)
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
@@ -615,11 +626,9 @@ class BagelModel(Model):
         attachments gets its own span and no seam is re-tokenized. The schedule
         builder walks the same :func:`prefill_plan`.
 
-        An understanding prompt with images, given their tensors, also returns
-        the main stream's ``prefix_layout``, so it is keyed past its images.
+        Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
         """
         result: NameToTensorList = {}
-        layout = None
 
         if prompt is not None:
             target_output = output_modalities[0] if output_modalities else "text"
@@ -670,13 +679,6 @@ class BagelModel(Model):
                     spans,
                     len(segments),
                 )
-                # An edit gets no layout. Its image is resized below before the ViT
-                # sees it, and the file's digest doesn't cover that resize.
-                if is_understanding and "image" not in output_modalities and tensors is not None:
-                    layout = self._prefix_layout(
-                        parts, segments, tensors["image_inputs"],
-                        vit_preprocess(kwargs.get("image_preprocess")),
-                    )
                 if think_mode and not is_understanding:
                     # Not part of the request layout: tokenized on its own and
                     # prefilled ahead of the plan.
@@ -704,31 +706,76 @@ class BagelModel(Model):
                 for img in tensors["image_inputs"]
             ]
 
-        if layout is None:
+        if tensors is None:
             return result
-        return ProcessPromptOutput(result, {"prefix_layout": {"kv": {"main": layout}}})
+        if prompt is None:
+            parts, segments = parts_from_modalities(input_modalities), []
+        images = result.get("image_inputs") or tensors.get("image_inputs", [])
+        params = self._request_params(input_modalities, output_modalities, kwargs)
+        layout = self._kv_layout(parts, segments, images, output_modalities, params)
+        return ProcessPromptOutput(result, {"kv_layout": {"kv": layout}})
 
-    def _prefix_layout(
-        self, parts: list[PromptPart], segments: list[torch.Tensor],
-        images: list[torch.Tensor], image_preprocess: str,
-    ) -> list[Span]:
-        """The main stream's writes in walk order: text by its ids, an image by its file."""
+    def _kv_layout(
+        self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
+        output_modalities: list[str], params: dict,
+    ) -> dict[str, LabelLayout]:
+        """Each label's writes, in the order `_build_prefill_schedule` runs them.
+
+        ``main`` holds every span. A generation keys only its first span, if that is
+        text: its images are resized before their walks see them, and a file's digest
+        doesn't cover the resize. Under guidance, ``cfg_img`` holds the text alone.
+        ``cfg_text`` forks before a text walk and after an image walk, so it holds all
+        but the last span when the last span is text, and every span when the prompt
+        ends on an image. Without guidance a generation still denoises on all three
+        labels on a CFG-parallel deployment, which isn't known here.
+        """
+        cfg = self.config
+        target_output = (output_modalities or ["text"])[0]
+        understanding = target_output == "text"
+        think_mode, image_preprocess = params["think_mode"], vit_preprocess(params["image_preprocess"])
         spans = []
-        for step in prefill_plan(parts, leading_text=True):
-            if step.modality == TEXT:
-                length = segments[step.index].numel()
-                spans.append(Span("ids", "prefill_text", length, length, "text_inputs"))
-                continue
+        if think_mode and not understanding and segments:
+            spans.append(Span("ids", "prefill_text", segments[0].numel(), segments[0].numel(), "text_inputs"))
+
+        def image(step: PromptPart) -> list[Span]:
             _, height, width = images[step.index].shape
+            item = (("image", step.index), (image_preprocess,))
             patches = vit_patches(
-                height, width, image_preprocess,
-                self.config.vit_config.patch_size, self.config.vit_max_num_patch_per_side,
+                height, width, image_preprocess, cfg.vit_config.patch_size, cfg.vit_max_num_patch_per_side,
             )
-            spans.append(Span(
-                "digest", "prefill_vit", patches + IMAGE_SENTINELS, IMAGE_ADVANCE,
-                ("image", step.index), (image_preprocess,),
-            ))
-        return spans
+            vit = Span("digest", "prefill_vit", patches + IMAGE_SENTINELS, IMAGE_ADVANCE, *item)
+            if understanding:
+                return [vit]
+            latents = vae_latents(height, width, image_preprocess, cfg.latent_downsample, cfg.max_latent_size)
+            return [Span("digest", "prefill_vae", latents + IMAGE_SENTINELS, IMAGE_ADVANCE, *item), vit]
+
+        texts = segments[len(spans):]
+        # skip a text step the prompt has no tensor for, as `_build_prefill_schedule` does
+        plan = prefill_plan(parts, leading_text=understanding)
+        plan = [step for step in plan if step.modality != TEXT or step.index < len(texts)]
+        spans += prompt_spans(plan, texts, "prefill_text", image)
+        keyed = int(bool(spans) and spans[0].kind == "ids")
+        if understanding:
+            main = LabelLayout(
+                spans=tuple(spans), growth=(("decode_loop", 1),),
+                keyed_spans=None if "image" not in output_modalities else keyed,
+            )
+            return {"main": main}
+        height, width = images[0].shape[-2:] if images else (params["height"], params["width"])
+        scratch = (height // cfg.latent_downsample) * (width // cfg.latent_downsample) + IMAGE_SENTINELS
+        growth = (("decode_loop", 1),) if think_mode else ()
+        main = LabelLayout(spans=tuple(spans), growth=growth, scratch=scratch, keyed_spans=keyed)
+        if not self._requires_cfg(target_output=target_output, **params):
+            return {"main": main, "cfg_text": LabelLayout(scratch=scratch), "cfg_img": LabelLayout(scratch=scratch)}
+        return {
+            "main": main,
+            "cfg_text": LabelLayout(
+                spans=tuple(spans[:-1] if spans and spans[-1].walk == "prefill_text" else spans), scratch=scratch,
+            ),
+            "cfg_img": LabelLayout(
+                spans=tuple(span for span in spans if span.walk == "prefill_text"), growth=growth, scratch=scratch,
+            ),
+        }
 
     @staticmethod
     def _resize_to_fit(
@@ -797,17 +844,26 @@ class BagelModel(Model):
             num_qo_heads=self.config.num_attention_heads,
         )
 
-    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         """The text walk's prompt is its token ids, and so is every step it takes.
 
         An image in an understanding prompt is keyed by its file. An edit's VAE
-        walk writes this stream too, over positions no layout describes, so it
-        is not named. A chat sends a reply back as its own assistant turn, so
-        its pages match.
+        walk writes ``main`` too, but the keys of ``main`` leave that walk out. A
+        chat sends a reply back as its own assistant turn, so its pages match.
         """
-        return {"kv": {"main": PrefixStream(
-            "text_inputs", "ids", "prefill_text", "decode", ("prefill_vit",),
-        )}}
+        decode = ((DECODE, "decode_loop"),)
+        return {"kv": {
+            "main": KVLabel(
+                growth=decode, keys=PrefixKeys("text_inputs", ("prefill_text", "prefill_vit"), growth=True),
+            ),
+            # forks from main fill cfg_text, so it declares no growth
+            "cfg_text": KVLabel(),
+            "cfg_img": KVLabel(growth=decode),
+        }}
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # The stop check allows max_tokens - 1 iterations, and a loop runs at least one.
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def checkpoint_path(self) -> str:
         return snapshot_download(
@@ -873,7 +929,10 @@ class BagelModel(Model):
         from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
 
         model_kwargs = model_kwargs or {}
-        cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs["requires_cfg"]
+        request = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs
+        cfg = request["requires_cfg"]
+        # only a generation's image_gen_cfg runs the CFG nodes
+        nodes = self._LLM_NODES if self._has_cfg_parallel and request["target_output"] == "image" else {"LLM"}
         sampling = self.get_sampling_config("LLM", model_kwargs)
         publish_labels: dict[tuple[str, str], list[str]] = {}
         final_publish_labels: dict[tuple[str, str], list[str]] = {}
@@ -903,7 +962,7 @@ class BagelModel(Model):
             "kv": KVReqConfig(
                 needed_labels_per_node_walk={
                     (node, walk): active_labels(walk, cfg, node)
-                    for node in self._LLM_NODES
+                    for node in nodes
                     for walk in LLM_GRAPH_WALKS
                 },
                 # Only the main LLM instance creates cache branches consumed
@@ -1052,7 +1111,7 @@ class BagelModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.max_position_embeddings,
             outputs=[],
         )
 
@@ -1218,6 +1277,30 @@ class BagelModel(Model):
                 schedule.append(("prefill_vit", images[step.index]))
         return schedule
 
+    def _request_params(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict | None,
+    ) -> dict:
+        overridable_keys = [
+            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
+            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
+        ]
+        params = {k: getattr(self.config, k) for k in overridable_keys}
+        params["width"] = 1024
+        params["height"] = 1024
+        params["image_preprocess"] = "default"
+        overridable_keys += ["width", "height", "image_preprocess"]
+
+        if "image" in input_modalities and "image" in output_modalities:
+            params["cfg_img_scale"] = 2.0
+            params["cfg_interval"] = [0.0, 1.0]
+            params["cfg_renorm_type"] = "text_channel"
+
+        if model_kwargs:
+            for key in overridable_keys:
+                if key in model_kwargs:
+                    params[key] = model_kwargs[key]
+        return params
+
     def _requires_cfg(
         self, **kwargs,
     ):
@@ -1340,27 +1423,7 @@ class BagelModel(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         target_output = output_modalities[0]  # "text" or "image"
-
-        # Per-request overrides with config defaults
-        overridable_keys = [
-            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
-            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
-        ]
-        params = {k: getattr(self.config, k) for k in overridable_keys}
-        params["width"] = 1024
-        params["height"] = 1024
-        params["image_preprocess"] = "default"
-        overridable_keys += ["width", "height", "image_preprocess"]
-
-        if "image" in input_modalities and "image" in output_modalities:
-            params["cfg_img_scale"] = 2.0
-            params["cfg_interval"] = [0.0, 1.0]
-            params["cfg_renorm_type"] = "text_channel"
-
-        if model_kwargs:
-            for key in overridable_keys:
-                if key in model_kwargs:
-                    params[key] = model_kwargs[key]
+        params = self._request_params(input_modalities, output_modalities, model_kwargs)
 
         if "image" in output_modalities and input_signals.get("image_inputs"):
             image = input_signals["image_inputs"][0]

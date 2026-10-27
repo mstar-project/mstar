@@ -73,7 +73,7 @@ def test_qwen3_tts_a_client_cannot_set_the_codec_stream_lead(variant, mode, lead
     )
     assert codec.stream_lead_items == ({"codec_tokens": lead} if lead else {})
     # every key the conductor reads back is one the data worker strips from the client
-    assert set(result.metadata) <= set(model.INTERNAL_KWARGS)
+    assert set(result.metadata) - {"kv_layout"} <= set(model.INTERNAL_KWARGS)
 
 
 class _RecordingCommunicator:
