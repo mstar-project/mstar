@@ -12,8 +12,7 @@ resources:
 # so each rank attends the full sequence over a quarter of the heads (sp_size 4
 # divides the 8 KV heads -> 2 heads/rank). Weights are replicated (no tensor
 # parallelism). A 4-GPU correctness cross-check. The denoise accelerator graph captures
-# the image step via the all-gather Ulysses exchange (the all-to-all is
-# point-to-point send/recv, which an accelerator graph cannot replay).
+# the image step, all-to-all included.
 node_groups:
   - node_names: ["dit"]
     ranks: [0, 1, 2, 3]

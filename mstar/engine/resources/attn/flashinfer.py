@@ -36,6 +36,7 @@ class FlashInferManager(AttentionManager):
         backend: str="auto",
         splits: tuple[CombinedSplit, ...] = (),
         max_rows_in_combined: Mapping[str, int | None] | None = None,
+        decode_tensor_cores: bool = True,
         sliding_window: int | None = None,
     ):
         self._kv_cache_name = kv_cache
@@ -68,6 +69,7 @@ class FlashInferManager(AttentionManager):
             device=device,
             backend=backend
         )
+        self._decode_tensor_cores = decode_tensor_cores
 
         self._workspaces = WorkspacePool(device)
 
@@ -115,6 +117,7 @@ class FlashInferManager(AttentionManager):
                 max_prefill_rows=split.max_prefill_rows(
                     self._max_rows_in_combined, num_rows,
                 ),
+                use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
         elif bucket.bs == bucket.num_tokens and not force_prefill:
@@ -122,6 +125,7 @@ class FlashInferManager(AttentionManager):
                 workspace_buffer=buffer,
                 batch_size=num_rows,
                 accelerator_graph=True,
+                use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
         else:
@@ -147,11 +151,16 @@ class FlashInferManager(AttentionManager):
         key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            cls = FlashInferDecodeWrapper if is_decode else FlashInferPrefillWrapper
-            wrapper = self._eager_plan_states[key] = cls(
-                workspace_buffer=self._workspaces.get(label, slot),
-                **self._wrapper_kv_kwargs,
-            )
+            workspace = self._workspaces.get(label, slot)
+            if is_decode:
+                wrapper = FlashInferDecodeWrapper(
+                    workspace_buffer=workspace,
+                    use_tensor_cores=self._decode_tensor_cores,
+                    **self._wrapper_kv_kwargs,
+                )
+            else:
+                wrapper = FlashInferPrefillWrapper(workspace_buffer=workspace, **self._wrapper_kv_kwargs)
+            self._eager_plan_states[key] = wrapper
         return wrapper
 
     @property

@@ -12,7 +12,7 @@ from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
-from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
@@ -24,7 +24,9 @@ from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
 logger = logging.getLogger(__name__)
 
 
-def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
+def topo_sort(resources: Mapping[str, Resource | NodeResourceSpec]) -> tuple[str, ...]:
+    """Keys in dependency order; built resources at load, their specs when the
+    conductor validates a deployment."""
     deps: dict[str, set[str]] = {
         key: set(resource.depends_on()) for key, resource in resources.items()
     }

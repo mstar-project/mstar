@@ -70,6 +70,7 @@ def _assemble(worker, spec_target, rids, continuing):
         {rid: {} for rid in rids},         # per_request_inputs
         {},                                # consumed_streaming_edges
         continuing,
+        {},                                # fresh_final_edges
         is_same_node=spec_target.node_name == "dit",
     )
 

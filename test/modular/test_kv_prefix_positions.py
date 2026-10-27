@@ -36,11 +36,29 @@ from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.graph.base import GraphNode, Loop
 from mstar.model.base import KVLabel, PrefixKeys
-from mstar.worker.engine_manager import (
-    _refuse_uncacheable_positions,
-    _refuse_unknown_walks,
-    _refuse_unskippable_resources,
+from mstar.validation.resources import (
+    _uncacheable_positions,
+    _unknown_prefix_walks,
+    _unskippable_resources,
 )
+
+
+def _raise_first(problems):
+    """The checks report every problem; these tests look at one."""
+    for problem in problems:
+        raise ValueError(problem)
+
+
+def _refuse_uncacheable_positions(specs, model):
+    _raise_first(_uncacheable_positions(specs, model))
+
+
+def _refuse_unskippable_resources(specs, model):
+    _raise_first(_unskippable_resources(specs, model))
+
+
+def _refuse_unknown_walks(model):
+    _raise_first(_unknown_prefix_walks(model))
 
 KV = "kv"
 ROPE = "rope"

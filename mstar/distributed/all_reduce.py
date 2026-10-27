@@ -9,6 +9,7 @@ FlashInfer's one-kernel all-reduce. ``AllReduce.new`` picks one.
 import logging
 import math
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -39,6 +40,19 @@ def _all_ranks_agree(flag: bool, cpu_group) -> bool:
     t = torch.tensor([int(flag)])
     dist.all_reduce(t, op=dist.ReduceOp.MIN, group=cpu_group)
     return bool(t.item())
+
+
+def flagged_on_any_rank(flags: Sequence[bool], groups: Iterable["CommGroup"]) -> list[bool]:
+    """Per entry, OR ``flags`` across the ranks of each group in ``groups`` in
+    turn: one gloo all-reduce (MAX) each, skipping a group of one rank. Over a
+    TP group and then an SP group, an entry ends up set on every rank of the
+    grid if any rank set it. Every rank passes the same number of entries, in
+    the same order. CPU tensors: it waits on the other ranks, never on a device."""
+    t = torch.tensor(list(flags), dtype=torch.int32)
+    for group in groups:
+        if group.world_size > 1:
+            dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group.cpu_group)
+    return [bool(f) for f in t.tolist()]
 
 
 class AllReduce:

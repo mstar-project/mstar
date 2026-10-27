@@ -300,6 +300,7 @@ def test_stopping_data_worker_drops_tracked_requests():
         force_cleanup_request=cleaned.append,
         has_inflight_reads=lambda rid: False,
         get_ready_tensors=lambda: {},
+        take_failed_reads=lambda: [],
     )
     wt.in_flight_requests = {"r1", "r2"}
     wt.tensor_uuid_to_metadata_per_request = {"r2": {}}
