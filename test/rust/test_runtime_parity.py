@@ -2328,3 +2328,93 @@ def test_an_unread_loop_back_sends_nothing():
         ),
     )
     assert out.rids_needing_request_info == frozenset()
+
+
+# --- a loop body that emits only to EMPTY_DESTINATION ------------------------
+#
+# Chunked prefill's shape: the chunked node has no loop-back edge -- each
+# iteration re-runs it on the next slice of the same re-injected input -- and
+# no destination of its own, so only the Loop's declared output carries a
+# chunk's result on. The two runtimes cache loop outputs from different
+# sources: Python from the node's declared ``outputs`` list
+# (``LoopStateRegistry.mark_entity_complete``), Rust from the routed-edge
+# slice (``cache_outputs`` over ``out[from..]``). An edge that routes nowhere
+# is where those two sets could differ, and the failure is silent -- an empty
+# ``Loop.outputs`` drops the final chunk instead of raising.
+
+CHUNK_NODES = {"embed", "llm"}
+
+
+def _chunk_loop_graph(out_edge, max_iters=2):
+    return Sequential(sections=[
+        GraphNode(
+            name="embed", input_names={"prompt"},
+            outputs=[GraphEdge(name="text_inputs", next_node="llm")],
+        ),
+        Loop(
+            name="chunk_loop",
+            section=GraphNode(
+                name="llm", input_names={"text_inputs"},
+                outputs=[GraphEdge(name="new_token", next_node=EMPTY_DESTINATION)],
+            ),
+            outputs=[out_edge],
+            max_iters=max_iters,
+        ),
+    ])
+
+
+def _chunk_loop(which, remote=True):
+    """``embed -> loop(llm)``, llm emitting nowhere, the Loop emitting the
+    last iteration's token. Persisted and remote so staging is observable."""
+    wg = WorkerGraph(
+        section=_chunk_loop_graph(
+            GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT, persist=True),
+        ),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}, 1: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"chunk_loop"}, 1: set()},
+        all_wg_ids_to_nodes={WG_ID: CHUNK_NODES, 1: {"remote"}},
+        node_to_partition={**dict.fromkeys(CHUNK_NODES, "default"), "remote": "default"},
+        sharding_config=_sharding(),
+    )
+    if which == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+    else:
+        book = RustTensorBookkeeping()
+        rt = rust_runtime.RustGraphRuntime(bookkeeping=book, **common)
+    return rt, book, _admit_with_remote(rt, remote)
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_loop_output_reads_an_empty_destination_body_edge(which):
+    """The Loop's output takes the last iteration's tensor off a body edge
+    that routes nowhere. ``[]`` means the runtime never cached it; ``[2, 3]``
+    means it accumulated instead of keeping only the final iteration."""
+    rt, book, rid = _chunk_loop(which)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "embed")]))
+    _route_one(rt, book, None, rid, "embed", "text_inputs", 1)
+
+    out = None
+    for uuid in (2, 3):
+        out = _route_one(rt, book, None, rid, "llm", "new_token", uuid)
+
+    assert sorted(out.register_uuids) == [3]
+    assert out.register_rids == [rid]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_superseded_chunk_output_is_released_on_advance(which):
+    """Only the final iteration's tensor survives, so an earlier chunk's has
+    to be dropped when the loop advances rather than held to loop end."""
+    rt, book, rid = _chunk_loop(which)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "embed")]))
+    _route_one(rt, book, None, rid, "embed", "text_inputs", 1)
+    _route_one(rt, book, None, rid, "llm", "new_token", 2)
+
+    assert _released(book, 2), "the superseded chunk's output was held"
