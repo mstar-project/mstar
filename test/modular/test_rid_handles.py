@@ -207,7 +207,7 @@ def test_tensor_ack_is_keyed_by_uuid_alone():
         dereference_batch=lambda uuids, counts: acked.append((uuids, counts)),
     )
     w._handle_tensor_received(TensorReceived(
-        request_id="gone", successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
+        successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
     ))
     assert acked == [([1, 3], [2, 1])]
 

@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, field
@@ -737,10 +737,11 @@ class TensorCommunicationManager(ABC):
         self._transfer_status: Callable[[int], int] | None = None
         self.read_finished: dict[Rid, set[int]] = {}
         # req_id -> {(producer uuid, offset, nbytes, dims) -> local uuid} for
-        # the received slices ``_take_cached_read`` re-pointed, and req_id ->
-        # {local uuid -> producer uuid} so their acks name the producer's.
+        # the received slices ``_take_cached_read`` re-pointed, and local uuid
+        # -> producer uuid so their acks name the producer's. Local uuids are
+        # minted here, so one map serves every request's acks.
         self.slice_uuids: dict[Rid, dict[tuple[int, int, int, tuple[int, ...]], int]] = {}
-        self.slice_origins: dict[Rid, dict[int, int]] = {}
+        self.slice_origins: dict[int, int] = {}
 
         self.req_rx_info: dict[Rid, SourceAndEdgeToRxInfo] = {}
         self.req_tx_info: dict[Rid, EdgeNameToTxInfo] = {}
@@ -1550,7 +1551,7 @@ class TensorCommunicationManager(ABC):
             return True
         local = self._uuid_minter.mint()
         slices[key] = local
-        self.slice_origins.setdefault(request_id, {})[local] = info.uuid
+        self.slice_origins[local] = info.uuid
         info.uuid = local
         return False
 
@@ -1581,14 +1582,11 @@ class TensorCommunicationManager(ABC):
 
     # ---- shared: polling & ACKs ----
 
-    def _collect_and_send_acks(
-        self, request_id: Rid | None, graph_edges: list[GraphEdge],
-        wire_request_id: str | None = None,
-    ):
-        """``wire_request_id`` overrides ``rid_to_str(request_id)``, for a
-        request that no longer has a handle."""
+    def _collect_and_send_acks(self, graph_edges: Iterable[GraphEdge]):
+        """One TENSOR_RECEIVED per producer for the tensors of ``graph_edges``,
+        whichever requests they belong to."""
         acks: dict[str, dict[int, int]] = {}
-        origins = self.slice_origins.get(request_id)
+        origins = self.slice_origins
         for edge in graph_edges:
             for info in edge.tensor_info:
                 uuid = info.uuid
@@ -1601,30 +1599,24 @@ class TensorCommunicationManager(ABC):
         for source_entity, tensors in acks.items():
             if source_entity == self.my_entity_id:
                 continue
-            if wire_request_id is None:
-                wire_request_id = self.rid_to_str(request_id)
             self.communicator.send(
                 source_entity,
                 WorkerMessage(
                     message_type=WorkerMessageType.TENSOR_RECEIVED,
                     body=TensorReceived(
-                        request_id=wire_request_id,
                         successful_tensors=tensors,
                         failed_tensor_ids=[],
                     ),
                 ),
             )
 
-    def ack_unread_tensors(
-        self, request_id: str, graph_edges: list[GraphEdge],
-    ):
+    def ack_unread_tensors(self, graph_edges: list[GraphEdge]):
         """Ack tensors for an already-removed request without reading them.
 
         The producer holds these buffers until it gets the TENSOR_RECEIVED ack;
-        emit it here so it can reclaim them. ``request_id`` is the wire string:
-        a removed request has no handle on a worker.
+        emit it here so it can reclaim them.
         """
-        self._collect_and_send_acks(None, graph_edges, wire_request_id=request_id)
+        self._collect_and_send_acks(graph_edges)
 
     def enable_transfer_metrics(self) -> EdgeTransfers:
         """Count what this manager reads from now on (see ``EdgeTransfers``).
@@ -1677,7 +1669,7 @@ class TensorCommunicationManager(ABC):
         one completed, so it is acked and its buffers go with the request.
         """
         if error is None:
-            self._collect_and_send_acks(ep.request_id, ep.graph_edges)
+            self._collect_and_send_acks(ep.graph_edges)
         else:
             if ep.request_id not in self._failed_read_errors:
                 logger.error(
@@ -1825,9 +1817,9 @@ class TensorCommunicationManager(ABC):
                 still_pending.append(ep)
         self.pending = still_pending
 
+        self._collect_and_send_acks(e for edges in ready.values() for e in edges)
         final_ready: dict[Rid, list[GraphEdge]] = {}
         for req_id, edges in ready.items():
-            self._collect_and_send_acks(req_id, edges)
             seen_uuids = self.read_finished.setdefault(req_id, set())
             rx_infos = self.req_rx_info.setdefault(req_id, {})
             for edge in edges:
@@ -2139,9 +2131,9 @@ class TensorCommunicationManager(ABC):
                     continue
                 self._cleanup_by_uuid(uuid)
 
-        self._collect_and_send_acks(request_id, ack_edges)
-        self.slice_uuids.pop(request_id, None)
-        self.slice_origins.pop(request_id, None)
+        self._collect_and_send_acks(ack_edges)
+        for local in self.slice_uuids.pop(request_id, {}).values():
+            self.slice_origins.pop(local, None)
 
     def force_cleanup_request(self, request_id: Rid):
         """Unconditional teardown: drop every tensor for the request and unlink

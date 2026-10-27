@@ -136,7 +136,8 @@ class StreamItems(MessageBody):
 
 @dataclass
 class TensorReceived(MessageBody):
-    request_id: str
+    # Keyed by uuid, which is global, so one ack covers every request whose
+    # reads from this producer finished together.
     successful_tensors: dict[int, int] # uuid -> graph edge count
     failed_tensor_ids: list[int] # uuids
 

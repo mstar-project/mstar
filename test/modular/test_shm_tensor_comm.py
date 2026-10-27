@@ -429,6 +429,28 @@ def test_ack_sent_on_remote_read():
         assert entity_id == "worker_0"
 
 
+def test_reads_finished_together_are_acked_once_per_producer():
+    """Acks are by uuid, so the reads of several requests that finish in one
+    ``get_ready_tensors`` go back to their producer as one TENSOR_RECEIVED."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sender = _make_manager(tmpdir, entity_id="worker_0")
+        receiver = _make_manager(tmpdir, entity_id="worker_1")
+        uuids = {}
+        for rid in ("req1", "req2"):
+            sender.register_request(rid, _empty_sharding_config())
+            receiver.register_request(rid, _empty_sharding_config())
+            edges = [GraphEdge(next_node="node", name="t")]
+            _store_on_edges(sender, rid, {"t": [torch.randn(2, 4)]}, edges)
+            sender.register_for_send(rid, edges[0].tensor_info)
+            uuids[rid] = edges[0].tensor_info[0].uuid
+            receiver.start_read_tensors(rid, edges, graph_walk="decode")
+        receiver.get_ready_tensors(graph_walk="decode")
+
+        [(entity_id, msg)] = receiver.communicator.sent
+        assert entity_id == "worker_0"
+        assert msg.body.successful_tensors == {uuids["req1"]: 1, uuids["req2"]: 1}
+
+
 def _produce_registered_output(mgr, request_id, name="audio_output"):
     """Producer stores an output edge bound for the api server and registers it
     for send, leaving it held by the +1 awaiting-ack ref (returns the uuid)."""
@@ -473,7 +495,7 @@ def test_ack_unread_tensors_lets_producer_reclaim_buffer():
         # api server never registered "req1" (unknown/removed request) yet still
         # acks the abandoned tensors back to the producer.
         api_server = _make_manager(tmpdir, entity_id="api_server_preprocess_worker")
-        api_server.ack_unread_tensors("req1", edges)
+        api_server.ack_unread_tensors(edges)
 
         sent = api_server.communicator.sent
         assert len(sent) == 1
@@ -489,9 +511,9 @@ def test_ack_unread_tensors_lets_producer_reclaim_buffer():
         assert not os.path.isfile(shm_path)  # reclaimed -> no leak
 
 
-def test_a_worker_acks_unread_tensors_under_the_wire_id():
+def test_a_worker_acks_unread_tensors_without_a_handle():
     """A worker installs a handle-to-string ``rid_to_str``, and a removed
-    request has no handle, so the unread ack must carry the wire id as is."""
+    request has no handle, so the unread ack must not look one up."""
     with tempfile.TemporaryDirectory() as tmpdir:
         producer = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
         edges, uuid = _produce_registered_output(producer, "req1")
@@ -502,11 +524,10 @@ def test_a_worker_acks_unread_tensors_under_the_wire_id():
             raise KeyError(f"no live request has handle {handle}")
 
         consumer.rid_to_str = _released
-        consumer.ack_unread_tensors("req1", edges)
+        consumer.ack_unread_tensors(edges)
 
         [(entity_id, msg)] = consumer.communicator.sent
         assert entity_id == "worker_0"
-        assert msg.body.request_id == "req1"
         assert msg.body.successful_tensors == {uuid: 1}
 
 

@@ -527,7 +527,10 @@ class Sender:
             acked = msg.body.successful_tensors
             t0 = time.perf_counter()
             mgr.dereference_batch(list(acked), list(acked.values()))
-            mgr.cleanup_request(msg.body.request_id)
+            # an ack covers whatever reads finished together, so it names uuids, not a request
+            for uuid in acked:
+                if uuid in rid_of:
+                    mgr.cleanup_request(rid_of[uuid])
             if timed[0]:
                 res.add_phase("cleanup", time.perf_counter() - t0)
             for uuid in acked:
@@ -782,7 +785,7 @@ class Receiver:
             del tensor
             self._send(WorkerMessage(
                 message_type=WorkerMessageType.TENSOR_RECEIVED,
-                body=TensorReceived(request_id="control", successful_tensors={msg["seq"]: 1},
+                body=TensorReceived(successful_tensors={msg["seq"]: 1},
                                     failed_tensor_ids=[]),
             ))
         elif kind == "pool":

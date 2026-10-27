@@ -97,7 +97,7 @@ class _TM:
     def force_cleanup_request(self, request_id):
         pass
 
-    def ack_unread_tensors(self, request_id, graph_edges):
+    def ack_unread_tensors(self, graph_edges):
         pass
 
 

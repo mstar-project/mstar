@@ -125,7 +125,7 @@ class _TensorManager:
     def force_cleanup_request(self, request_id):
         self.forced.append(request_id)
 
-    def ack_unread_tensors(self, request_id, graph_edges):
+    def ack_unread_tensors(self, graph_edges):
         pass
 
 
