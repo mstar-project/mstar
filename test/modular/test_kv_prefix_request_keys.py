@@ -36,6 +36,7 @@ from mstar.model.base import (
 )
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
+from mstar.streaming.topology import PartitionTopology
 
 PAGE_SIZE = 16
 PROMPT = list(range(100))
@@ -77,6 +78,9 @@ class _Model:
         self._metadata = metadata
         self._decode_walk = decode_walk
         self._lays_out = lays_out
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
     def kv_labels(self):
         if not self._declares:

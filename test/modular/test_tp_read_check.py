@@ -392,7 +392,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
 
     w.continuing, w.inputs = [], []
 
-    def assemble(pending, info, rows, inputs, streamed, continuing, **kwargs):
+    def assemble(pending, info, rows, inputs, streamed, continuing, fresh_final, **kwargs):
         w.assembled.append(list(rows))
         w.continuing.append(list(continuing))
         w.inputs.append(dict(inputs))
