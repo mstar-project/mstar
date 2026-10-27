@@ -299,6 +299,9 @@ class CanaryModel(Model):
             CROSS_KV_CACHE: {CONTEXT_LABEL: KVLabel()},
         }
 
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
+
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
