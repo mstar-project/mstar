@@ -25,7 +25,7 @@ from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.model.submodule_base import NO_CHUNKING, BatchedModelOutput  # noqa: E402
+from mstar.model.submodule_base import BatchedModelOutput  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
@@ -45,9 +45,6 @@ class _Sub:
 
     def uniform_row_inputs(self, graph_walk, has_loopback=False):
         return None
-
-    def get_chunking_policy(self, graph_walk):
-        return NO_CHUNKING
 
     def prepare_inputs(self, **kw):
         rid = kw["fwd_info"].info.rid

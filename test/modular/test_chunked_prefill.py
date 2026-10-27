@@ -154,7 +154,8 @@ def test_a_removed_request_leaves_nothing_held():
 # ── engine: prepare once, cut per chunk ─────────────────────────────────
 
 
-def _engine_with(submodule):
+def _engine_with(submodule, policies=None):
+    """``policies`` is the model's ``chunking_policy_of()``: (node, walk) -> policy."""
     from types import SimpleNamespace
 
     from mstar.engine.chunking import ChunkingManagement
@@ -164,6 +165,7 @@ def _engine_with(submodule):
     engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={})}
     engine._keyed_walks = {}
     engine._chunking = ChunkingManagement(engine._submodules)
+    engine._chunking.set_policies(policies or {})
     return engine
 
 
@@ -269,11 +271,6 @@ class _KeyedPrompt(_Prompt):
 
         return InputSeqLenInfo(self.n)
 
-    def get_chunking_policy(self, graph_walk):
-        from mstar.model.submodule_base import ChunkingPolicy
-
-        return ChunkingPolicy(chunkable=True, reuses_cached_prefix=lambda info: self.reuses)
-
     def prepare_inputs(self, **kwargs):
         inputs = super().prepare_inputs(**kwargs)
         inputs.resource_step_info = self.guided
@@ -281,7 +278,10 @@ class _KeyedPrompt(_Prompt):
 
 
 def _keyed_engine(sub, matched):
-    engine = _engine_with(sub)
+    engine = _engine_with(sub, {("LLM", "prefill"): ChunkingPolicy(
+        walks=("prefill",), chunkable=True,
+        reuses_cached_prefix=lambda info, sub=sub: sub.reuses,
+    )})
     engine._keyed_walks = {"LLM": {"prefill"}}
     engine._runner = _Runner(matched)
     engine._prefix_model = "Test"
@@ -352,7 +352,7 @@ def test_a_row_prepared_at_another_length_than_it_was_cut_by_fails():
 def test_the_mismatched_row_fails_and_the_rest_of_the_step_runs():
     from mstar.engine.engine import ExecutingBatch
     from mstar.engine.resources.step import StepContext
-    from mstar.model.submodule_base import NO_CHUNKING, ARNodeInputs
+    from mstar.model.submodule_base import ARNodeInputs
 
     class _Sub(_Prompt):
         def uniform_row_inputs(self, graph_walk, has_loopback=False):
@@ -360,9 +360,6 @@ def test_the_mismatched_row_fails_and_the_rest_of_the_step_runs():
 
         def can_batch(self, batch, model_inputs):
             return True
-
-        def get_chunking_policy(self, graph_walk):
-            return NO_CHUNKING
 
         def prepare_inputs(self, **kwargs):
             # row 1 is a 10-token prompt; row 2 a one-token decode row
@@ -392,9 +389,10 @@ def test_a_step_over_its_token_budget_is_reported(caplog):
     from mstar.engine.chunking import ChunkingManagement
     from mstar.model.submodule_base import ChunkingPolicy
 
-    chunking = ChunkingManagement({"LLM": SimpleNamespace(
-        submodule=SimpleNamespace(get_chunking_policy=lambda walk: ChunkingPolicy(max_batch_tokens=4)),
-    )})
+    chunking = ChunkingManagement({"LLM": SimpleNamespace(submodule=SimpleNamespace())})
+    chunking.set_policies(
+        {("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=4)},
+    )
     batch = SimpleNamespace(node_name="LLM", step_context=SimpleNamespace(graph_walk="mixed"))
     # over the budget of 4 and the chunk floor's slack of 4 more
     over = [SimpleNamespace(input_seq_len=6), SimpleNamespace(input_seq_len=3)]
@@ -455,11 +453,13 @@ def _budgeted_engine():
     from mstar.engine.engine import Engine
     from mstar.model.submodule_base import ChunkingPolicy
 
-    budgets = {"prefill": 512, "vision": 2048}
-    sub = SimpleNamespace(get_chunking_policy=lambda walk: ChunkingPolicy(max_batch_tokens=budgets.get(walk)))
     engine = Engine.__new__(Engine)
-    engine._submodules = {"LLM": SimpleNamespace(submodule=sub)}
+    engine._submodules = {"LLM": SimpleNamespace(submodule=SimpleNamespace())}
     engine._chunking = ChunkingManagement(engine._submodules)
+    engine.set_chunking_policies({
+        ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
+        ("LLM", "vision"): ChunkingPolicy(walks=("vision",), max_batch_tokens=2048),
+    })
     return engine
 
 
@@ -484,12 +484,12 @@ def test_a_node_the_worker_will_not_chunk_keeps_no_budget():
     no chunking whatever the model declares -- the scheduler then takes the
     same path as a walk the model never budgeted."""
     engine = _budgeted_engine()
-    budgets = {"prefill": 512, "vision": 2048}
-    engine._submodules["LLM"] = SimpleNamespace(submodule=SimpleNamespace(
-        get_chunking_policy=lambda walk: ChunkingPolicy(
-            chunkable=True, max_batch_tokens=budgets.get(walk),
-        ),
-    ))
+    engine.set_chunking_policies({
+        ("LLM", "prefill"): ChunkingPolicy(
+            walks=("prefill",), chunkable=True, max_batch_tokens=512),
+        ("LLM", "vision"): ChunkingPolicy(
+            walks=("vision",), chunkable=True, max_batch_tokens=2048),
+    })
     engine.set_token_budgets(
         {"LLM": {"vision": 4096}}, {"prefill", "vision"}, no_chunking={"LLM"},
     )
@@ -518,17 +518,15 @@ WALKS = {"prefill", "decode"}
 
 
 def _mixed_engine():
-    from types import SimpleNamespace
 
     from mstar.model.submodule_base import ChunkingPolicy
 
     engine = _budgeted_engine()
-    budgets = {"prefill": 512, "mixed": 1024}
-    engine._submodules["LLM"] = SimpleNamespace(submodule=SimpleNamespace(
-        get_chunking_policy=lambda walk: ChunkingPolicy(
-            chunkable=walk == "prefill", max_batch_tokens=budgets.get(walk),
-        ),
-    ))
+    engine.set_chunking_policies({
+        ("LLM", "prefill"): ChunkingPolicy(
+            walks=("prefill",), chunkable=True, max_batch_tokens=512),
+        ("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=1024),
+    })
     return engine
 
 
@@ -625,11 +623,7 @@ def test_a_non_final_chunks_row_leaves_the_kept_rows():
 
 
 class _Chunker:
-    """A submodule that chunks and reports row lengths, as a chunked walk must."""
-
-    def get_chunking_policy(self, graph_walk):
-        del graph_walk
-        return ChunkingPolicy(chunkable=True, max_batch_tokens=512)
+    """A submodule that reports row lengths, as a chunked walk must."""
 
     def get_input_sequence_len(self, graph_walk, request_info, inputs):
         del graph_walk, request_info, inputs
@@ -642,8 +636,10 @@ class _Unmeasured(_Chunker):
 
 
 def _chunking_model():
-    section = SimpleNamespace(get_nodes=lambda: ["LLM"])
-    return SimpleNamespace(get_graph_walk_graphs=lambda: {"prefill": section})
+    return SimpleNamespace(chunking_policy_of=lambda: {
+        ("LLM", "prefill"): ChunkingPolicy(
+            walks=("prefill",), chunkable=True, max_batch_tokens=512),
+    })
 
 
 def _groups(width):

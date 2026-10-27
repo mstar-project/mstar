@@ -28,11 +28,9 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
-    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    ChunkingPolicy,
     InputMetadata,
     InputSeqLenInfo,
     ModelInputsFromEngine,
@@ -67,13 +65,6 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
     MAX_BATCH_TOKENS = 512
-
-    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
-        if graph_walk == "prefill":
-            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
-        if graph_walk == "mixed":
-            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
-        return NO_CHUNKING
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,

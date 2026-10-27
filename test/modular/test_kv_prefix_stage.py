@@ -71,11 +71,6 @@ class _Submodule:
         """The span a step would declare from these inputs."""
         return inputs.input_seq_len
 
-    def get_chunking_policy(self, graph_walk):
-        from mstar.model.submodule_base import NO_CHUNKING
-
-        return NO_CHUNKING  # NodeSubmodule's default
-
 
 def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]):
     engine = Engine.__new__(Engine)

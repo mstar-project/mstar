@@ -48,11 +48,9 @@ from mstar.model.bagel.components.vit_encoder import VIT_ATTN
 from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
 from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
-    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    ChunkingPolicy,
     InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
@@ -980,16 +978,6 @@ class LLMSubmodule(ARNodeSubmodule):
         return None
 
     MAX_BATCH_TOKENS = 1024
-
-    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
-        if graph_walk == "prefill_text":
-            return ChunkingPolicy(
-                chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS,
-                reuses_cached_prefix=_unguided,
-            )
-        if graph_walk == MIXED_TEXT:
-            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
-        return NO_CHUNKING
 
     def split_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,

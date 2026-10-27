@@ -1,6 +1,6 @@
 """Chunked prefill's state on the engine.
 
-Per (node, walk): the submodule's chunking policy and the token budget a step
+Per (node, walk): the model's chunking policy and the token budget a step
 runs under, after the serving config's overrides. Per row mid-prefill: its
 whole prepared input, which every chunk is cut from. And the count of steps
 that ran over their budget, for the warning.
@@ -10,7 +10,12 @@ import logging
 from collections.abc import Collection, Mapping
 from typing import TYPE_CHECKING, Any
 
-from mstar.model.submodule_base import ChunkedPrefillOutputPolicy, ChunkingPolicy, NodeInputs
+from mstar.model.submodule_base import (
+    NO_CHUNKING,
+    ChunkedPrefillOutputPolicy,
+    ChunkingPolicy,
+    NodeInputs,
+)
 
 if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch, SubmoduleManagement
@@ -31,7 +36,7 @@ class ChunkingManagement:
     def __init__(self, submodules: Mapping[str, "SubmoduleManagement"]):
         # the engine's own mapping, which it fills as it loads nodes
         self._submodules = submodules
-        # (node, walk) -> the submodule's chunking policy, asked once
+        # (node, walk) -> the model's chunking policy, from set_budgets
         self._policies: dict[tuple[str, str], ChunkingPolicy] = {}
         # the serving config's max_batch_tokens: node -> budget, (node, walk) -> budget; None is off
         self._overrides: dict[str | tuple[str, str], int | None] = {}
@@ -50,13 +55,23 @@ class ChunkingManagement:
         self.prepared: dict[tuple[int, str], NodeInputs] = {}
 
     def policy(self, node_name: str, graph_walk: str) -> ChunkingPolicy:
-        """The submodule's, asked once per (node, walk)."""
-        key = (node_name, graph_walk)
-        policy = self._policies.get(key)
-        if policy is None:
-            submodule = self._submodules[node_name].submodule
-            policy = self._policies[key] = submodule.get_chunking_policy(graph_walk)
-        return policy
+        """The model's, or ``NO_CHUNKING`` where it declares none.
+
+        Declared on the model rather than the submodule because the graph build
+        needs it too: a chunkable walk runs the node inside a Loop, and
+        ``get_graph_walk_graphs`` is read long before any submodule loads.
+        """
+        return self._policies.get((node_name, graph_walk), NO_CHUNKING)
+
+    def set_policies(
+        self, policies: Mapping[tuple[str, str], ChunkingPolicy],
+    ) -> None:
+        """The model's ``chunking_policy_of()``, bound at load.
+
+        Separate from ``set_budgets``: the policy is the model's and fixed, the
+        budget is the deployment's and layered on top.
+        """
+        self._policies = dict(policies)
 
     def max_batch_tokens(self, node_name: str, graph_walk: str) -> int | None:
         """The walk's budget, unless the serving config overrides it or the
@@ -79,8 +94,10 @@ class ChunkingManagement:
     ) -> None:
         """Apply a serving config's ``max_batch_tokens`` to this engine's nodes.
 
+        Overrides the budgets ``set_policies`` declared, so it runs after it.
+
         Per node, one budget for every walk the model budgets, or a mapping of
-        walk -> budget; null turns chunking off. Only walks the submodule
+        walk -> budget; null turns chunking off. Only walks the model
         budgets can be overridden: elsewhere the setting would do nothing.
 
         A walk inside a combined walk runs in the combined walk's steps, under

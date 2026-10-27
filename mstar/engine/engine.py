@@ -52,6 +52,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     BatchedModelOutput,
     ChunkedPrefillOutputPolicy,
+    ChunkingPolicy,
     HostRows,
     InputMetadata,
     InputSeqLenInfo,
@@ -2331,6 +2332,11 @@ class Engine:
         self._chunking.set_budgets(
             overrides, walks, combined_walk_of, override_mixed, no_chunking,
         )
+
+    def set_chunking_policies(
+        self, policies: Mapping[tuple[str, str], ChunkingPolicy],
+    ) -> None:
+        self._chunking.set_policies(policies)
 
     def walk_token_caps(self, node_name: str, graph_walk: str) -> dict[str, int] | None:
         return self._chunking.walk_caps(node_name, graph_walk)

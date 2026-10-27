@@ -73,14 +73,19 @@ def test_text_and_decode_rows_report_their_length(walk, inputs, length):
 
 
 def test_text_prefill_chunks_under_a_budget_that_fits_the_captures():
-    llm = object.__new__(LLMSubmodule)
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
-    assert llm.get_chunking_policy("prefill_text").chunkable
-    assert not llm.get_chunking_policy("prefill_vision").chunkable
-    mixed = llm.get_chunking_policy(LLM_MIXED)
-    assert not mixed.chunkable and mixed.max_batch_tokens == llm.MAX_BATCH_TOKENS
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    model.config = SimpleNamespace(max_position_embeddings=4096)
+    model.vision_config = None
+    policies = model.chunking_policy_of()
+
+    assert policies[("LLM", "prefill_text")].chunkable
+    assert ("LLM", "prefill_vision") not in policies
+    mixed = policies[("LLM", LLM_MIXED)]
+    assert not mixed.chunkable and mixed.max_batch_tokens == LLMSubmodule.MAX_BATCH_TOKENS
     largest = max(LLMSubmodule.PREFILL_TOKEN_BUCKETS)
-    assert llm.MAX_BATCH_TOKENS + max(LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES) <= largest
+    assert LLMSubmodule.MAX_BATCH_TOKENS + max(LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES) <= largest
 
 
 def test_a_chunked_prompt_keeps_only_its_final_chunks_token():

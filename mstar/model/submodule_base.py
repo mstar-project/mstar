@@ -303,6 +303,11 @@ class ChunkedPrefillOutputPolicy:
 @dataclass(frozen=True)
 class ChunkingPolicy:
     """How a walk's prefill may be split across steps; the default is not at all."""
+    # the walks this policy covers. Declared per node at the model level
+    # (``Model.get_chunking_policies``) rather than per walk on the submodule,
+    # because the graph build needs it: a chunkable node is wrapped in a Loop
+    # for exactly these walks, and a chunk is one iteration of it.
+    walks: tuple[str, ...] = ()
     # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them
     chunkable: bool = False
     # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
@@ -318,6 +323,17 @@ class ChunkingPolicy:
 
 
 NO_CHUNKING = ChunkingPolicy()
+
+
+def chunk_loop_name(node_name: str, graph_walk: str) -> str:
+    """The Loop a chunkable ``(node, walk)``'s prefill runs as.
+
+    Derived rather than declared so the graph build, the engine's stop check
+    and the startup validation all name the same loop without passing it
+    around. Per walk, not per node: a node can chunk under several walks and
+    each has its own loop state.
+    """
+    return f"chunk_loop:{node_name}:{graph_walk}"
 
 
 class InputSeqLenInfo(NamedTuple):
@@ -620,11 +636,6 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         del graph_walk, per_request_info, per_request_input_metadata, kwargs
         return None
-
-    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
-        """How this walk's prefill may be split across steps; the engine asks once per walk."""
-        del graph_walk
-        return NO_CHUNKING
 
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,

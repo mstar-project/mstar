@@ -44,7 +44,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,16 @@ class OrpheusModel(Model):
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         return {"LLM": {"mixed": {"prefill", "decode"}}}
 
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+
+        budget = OrpheusLLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(walks=("prefill",), chunkable=True, max_batch_tokens=budget),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=("mixed",), max_batch_tokens=budget),
+        )}
+
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
             name="LLM",
@@ -161,11 +171,11 @@ class OrpheusModel(Model):
             ],
         )
 
-        return dict(
+        return self.apply_chunking(dict(
             prefill=prefill,
             decode=decode,
             snac_chunk=snac_chunk,
-        )
+        ))
 
     # -------------------------------------------------------------------
     # Partition API: async streaming (LLM + SNAC)

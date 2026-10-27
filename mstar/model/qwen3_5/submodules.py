@@ -66,11 +66,9 @@ from mstar.model.qwen3_5.config import (
 )
 from mstar.model.qwen3_5.qwen3_5_model import TEXT_PART, VIDEO_PART
 from mstar.model.submodule_base import (
-    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
-    ChunkingPolicy,
     HostRows,
     InputSeqLenInfo,
     ModelInputsFromEngine,
@@ -319,13 +317,6 @@ class LLMSubmodule(ARNodeSubmodule):
     # 1024 costs 3-10% throughput in steps and speculation, 4096 gives back
     # most of the short-prompt TTFT gain and doubles decode ITL p99 at c48
     MAX_BATCH_TOKENS = 2048
-
-    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
-        if graph_walk == "prefill_text":
-            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
-        if graph_walk == LLM_MIXED:
-            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
-        return NO_CHUNKING
 
     def get_input_sequence_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,

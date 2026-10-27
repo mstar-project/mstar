@@ -31,6 +31,48 @@ from mstar.graph.base import (
 )
 from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.model.submodule_base import ChunkingPolicy, chunk_loop_name
+
+
+def _wrap_node_in_loop(
+    section: GraphSection, node_name: str, loop_name: str,
+) -> GraphSection:
+    """``section`` with ``node_name`` wrapped in the Loop its chunks run as.
+
+    The node keeps its own outputs and the Loop declares none, so routing is
+    exactly what it was unwrapped. Moving the outputs onto ``Loop.outputs``,
+    which is what drops a non-final chunk's by construction, comes next.
+    """
+    if isinstance(section, GraphNode):
+        if section.name != node_name:
+            return section
+        # max_iters=1 while the worker still drives chunking: it holds a
+        # non-final chunk's row back without completing the node, so the loop
+        # is only ever completed once, by the final chunk. It becomes a real
+        # bound when the engine takes over ending the loop.
+        return Loop(
+            name=loop_name, section=section, max_iters=1, outputs=[],
+        )
+    if isinstance(section, Sequential):
+        return Sequential([
+            _wrap_node_in_loop(s, node_name, loop_name) for s in section.sections
+        ])
+    if isinstance(section, Parallel):
+        return Parallel([
+            _wrap_node_in_loop(s, node_name, loop_name) for s in section.sections
+        ])
+    if isinstance(section, Loop):
+        # A chunkable node inside an existing Loop nests one loop in another,
+        # where the two runtimes order the completion cascade differently
+        # (rust/src/graph/state.rs, "two deliberate divergences"). Refuse it
+        # rather than ship a shape only one runtime gets right.
+        if node_name in section.section.get_nodes():
+            raise ValueError(
+                f"node {node_name!r} is chunkable and already inside Loop "
+                f"{section.name!r}; nested chunk loops are not supported"
+            )
+        return section
+    raise TypeError(f"cannot wrap a chunkable node in {type(section).__name__}")
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -485,6 +527,7 @@ class Model(ABC):
 
         walk_graphs = self.get_graph_walk_graphs()
         self._check_walk_placement(walk_graphs, node_groups, config_path)
+        self._check_chunkable_nodes_are_looped(walk_graphs, config_path)
         # TODO: merge identical worker graphs from different graph walks
         walk_to_wgs = {
             graph_walk: self._get_worker_graphs_for_graph_walk(graph_walk, graph, node_groups)
@@ -493,6 +536,29 @@ class Model(ABC):
         self._check_stream_driven_walks(walk_to_wgs, config_path)
         self._check_loop_successors(walk_to_wgs, config_path)
         return sum(walk_to_wgs.values(), start=[])
+
+    def _check_chunkable_nodes_are_looped(
+        self, walk_graphs: dict[str, GraphSection], config_path: str,
+    ) -> None:
+        """Reject a chunkable ``(node, walk)`` whose graph has no chunk Loop.
+
+        A chunk is an iteration of that Loop, so without it the walk would run
+        the node once and report the prompt done after its first chunk. The
+        model opts in by passing its walk dict through ``apply_chunking``;
+        forgetting the call is a silent wrong answer, so it fails at load.
+        """
+        for (node, walk), policy in self.chunking_policy_of().items():
+            if not policy.chunkable:
+                continue
+            name = chunk_loop_name(node, walk)
+            loop = walk_graphs[walk].get_loops().get(name)
+            if loop is None or node not in loop.section.get_nodes():
+                raise ValueError(
+                    f"{config_path}: node {node!r} declares chunkable walk "
+                    f"{walk!r}, but the walk's graph has no Loop {name!r} "
+                    "around it. Return apply_chunking(...) from "
+                    "get_graph_walk_graphs()."
+                )
 
     def _check_walk_placement(
         self, walk_graphs: dict[str, GraphSection], node_groups: list[dict], config_path: str,
@@ -784,6 +850,77 @@ class Model(ABC):
         return SamplingConfig(
             ignore_eos=(model_kwargs or {}).get("ignore_eos", False)
         )
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        """``{node: (policy, ...)}``, each policy naming the walks it covers.
+
+        A node's prefill for a chunkable walk runs as a Loop, one iteration per
+        chunk, so the declaration has to be here rather than on the submodule:
+        the graph build reads it to wrap the node. Pass the walk dict through
+        ``apply_chunking`` to do that; a policy whose node was left unwrapped is
+        refused at load.
+        """
+        return {}
+
+    def chunking_policy_of(self) -> dict[tuple[str, str], ChunkingPolicy]:
+        """``(node, walk) -> policy``, validated."""
+        walks = self.get_graph_walk_graphs()
+        combined = self.get_combined_graph_walks()
+        out: dict[tuple[str, str], ChunkingPolicy] = {}
+        for node, policies in self.get_chunking_policies().items():
+            for policy in policies:
+                if not policy.walks:
+                    raise ValueError(
+                        f"{type(self).__name__}: a chunking policy for node "
+                        f"{node!r} names no walks"
+                    )
+                for walk in policy.walks:
+                    # a combined walk carries a budget for the steps it batches,
+                    # and is not a walk of its own
+                    real = walk in walks and node in walks[walk].get_nodes()
+                    if not real and walk not in combined.get(node, {}):
+                        raise ValueError(
+                            f"{type(self).__name__}: chunking policy names walk "
+                            f"{walk!r}, which is neither a walk of node {node!r} "
+                            "nor a combined walk of it"
+                        )
+                    if policy.chunkable and not real:
+                        raise ValueError(
+                            f"{type(self).__name__}: node {node!r} cannot chunk "
+                            f"combined walk {walk!r}; chunk its constituents"
+                        )
+                    if (node, walk) in out:
+                        raise ValueError(
+                            f"{type(self).__name__}: node {node!r} gets two "
+                            f"chunking policies for walk {walk!r}"
+                        )
+                    out[(node, walk)] = policy
+        return out
+
+    def apply_chunking(
+        self, walk_graphs: dict[str, GraphSection],
+    ) -> dict[str, GraphSection]:
+        """``get_graph_walk_graphs``'s result with every chunkable node wrapped
+        in a Loop, one iteration per chunk.
+
+        Called by the model at the end of its own ``get_graph_walk_graphs``,
+        rather than applied to it from outside, because that method is what
+        declares the graph and ~20 call sites read it directly; a model that
+        declares a chunkable walk and forgets the call is caught at load by
+        ``_check_chunkable_nodes_are_looped``.
+        """
+        for node, policies in self.get_chunking_policies().items():
+            for policy in policies:
+                if not policy.chunkable:
+                    continue
+                for walk in policy.walks:
+                    section = walk_graphs.get(walk)
+                    if section is None:
+                        continue
+                    walk_graphs[walk] = _wrap_node_in_loop(
+                        section, node, chunk_loop_name(node, walk),
+                    )
+        return walk_graphs
 
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

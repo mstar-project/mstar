@@ -139,13 +139,9 @@ def test_a_refused_reservation_unwinds_with_the_step():
 class _Sub:
     def __init__(self, reserve_whole_prefill=True):
         self.policy = ChunkingPolicy(
-            chunkable=True, max_batch_tokens=8,
+            walks=("prefill",), chunkable=True, max_batch_tokens=8,
             reserve_whole_prefill=reserve_whole_prefill,
         )
-
-    def get_chunking_policy(self, graph_walk):
-        del graph_walk
-        return self.policy
 
     def declare_step(self, **kwargs):
         return SubmoduleStep(steps={})
@@ -167,6 +163,7 @@ def _declare(sub: "_Sub"):
     eng._runner = _Runner()
     eng._submodules = {"LLM": SimpleNamespace(piecewise_runners={}, submodule=sub)}
     eng._chunking = ChunkingManagement(eng._submodules)
+    eng._chunking.set_policies({("LLM", "prefill"): sub.policy})
     ctx = StepContext(request_ids=(1, 2, 3), graph_walk="prefill", slot=0, capture=False)
     batch = SimpleNamespace(
         node_name="LLM", graph_walk="prefill", per_request_info={},

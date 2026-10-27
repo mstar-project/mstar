@@ -89,18 +89,17 @@ def _unchunkable_nodes(
     every model that chunks, so those nodes run their prefills whole instead.
     """
     off = set()
-    for walk, section in model.get_graph_walk_graphs().items():
-        for node in section.get_nodes():
-            submodule = submodules.get(node)
-            if submodule is None or not submodule.get_chunking_policy(walk).chunkable:
-                continue
-            if type(submodule).get_input_sequence_len is NodeSubmodule.get_input_sequence_len:
-                raise ValueError(
-                    f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
-                    "report get_input_sequence_len"
-                )
-            if parallel_groups.get_instance_world_size_for_node(node) > 1:
-                off.add(node)
+    for (node, walk), policy in model.chunking_policy_of().items():
+        submodule = submodules.get(node)
+        if submodule is None or not policy.chunkable:
+            continue
+        if type(submodule).get_input_sequence_len is NodeSubmodule.get_input_sequence_len:
+            raise ValueError(
+                f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
+                "report get_input_sequence_len"
+            )
+        if parallel_groups.get_instance_world_size_for_node(node) > 1:
+            off.add(node)
     if off:
         logger.warning(
             "chunked prefill is off for %s: not supported under TP/SP yet, so "
@@ -247,10 +246,9 @@ class LoadedSubmodules:
         must never target (``disable_spec_node_walks``)."""
         return sorted(
             (node, walk)
-            for walk, section in model.get_graph_walk_graphs().items()
-            for node in section.get_nodes()
-            if node in self.submodules and node not in self.no_chunking
-            and self.submodules[node].get_chunking_policy(walk).chunkable
+            for (node, walk), policy in model.chunking_policy_of().items()
+            if policy.chunkable and node in self.submodules
+            and node not in self.no_chunking
         )
 
 
@@ -375,6 +373,7 @@ class EngineManager:
                 raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         if not all(isinstance(flag, bool) for flag in override_mixed.values()):
             raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")
+        engine.set_chunking_policies(model.chunking_policy_of())
         engine.set_token_budgets(
             budgets, set(model.get_graph_walk_graphs()),
             combined_walk_of=model.combined_walk_of(),

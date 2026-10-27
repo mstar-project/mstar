@@ -65,10 +65,8 @@ from mstar.model.qwen3_omni.config import (
     Qwen3OmniModelConfig,
 )
 from mstar.model.submodule_base import (
-    NO_CHUNKING,
     ARNodeInputs,
     ARNodeSubmodule,
-    ChunkingPolicy,
     InputMetadata,
     InputSeqLenInfo,
     ModelInputsFromEngine,
@@ -584,13 +582,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
 
     MAX_BATCH_TOKENS = 1024
-
-    def get_chunking_policy(self, graph_walk: str) -> ChunkingPolicy:
-        if graph_walk in ("prefill_text", "prefill_audio", "prefill_vision"):
-            return ChunkingPolicy(chunkable=True, max_batch_tokens=self.MAX_BATCH_TOKENS)
-        if graph_walk == THINKER_MIXED:
-            return ChunkingPolicy(max_batch_tokens=self.MAX_BATCH_TOKENS)
-        return NO_CHUNKING
 
     def split_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,

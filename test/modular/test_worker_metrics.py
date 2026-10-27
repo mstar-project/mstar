@@ -35,7 +35,7 @@ from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig  # noqa:
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.model.submodule_base import NO_CHUNKING, ARNodeInputs  # noqa: E402
+from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
@@ -81,9 +81,6 @@ class _Sub:
 
     def uniform_row_inputs(self, graph_walk, has_loopback=False):
         return None
-
-    def get_chunking_policy(self, graph_walk):
-        return NO_CHUNKING
 
     def prepare_inputs(self, **kw):
         info = kw["fwd_info"].info
