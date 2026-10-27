@@ -23,6 +23,8 @@ mstar.engine.resources.attn.ragged.wrappers
 
    .. autosummary::
    
+      FlashInferRaggedCrossPrefillWrapper
+      FlashInferRaggedPrefillWrapper
       RaggedCrossPrefillWrapper
       RaggedPrefillWrapper
    

@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 26, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 27, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -651,7 +651,7 @@
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.ragged.base.html#module-mstar.engine.resources.attn.ragged.base" title="mstar.engine.resources.attn.ragged.base"><code class="xref py py-obj docutils literal notranslate"><span class="pre">base</span></code></a></p></td>
-<td><p>The cacheless attention resource: the spec-time factory.</p></td>
+<td><p>The cacheless attention resource: the spec-time factory, and the plan machinery its backends share.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.ragged.block_causal.html#module-mstar.engine.resources.attn.ragged.block_causal" title="mstar.engine.resources.attn.ragged.block_causal"><code class="xref py py-obj docutils literal notranslate"><span class="pre">block_causal</span></code></a></p></td>
 <td><p>Block-causal cacheless attention through FlashInfer's paged prefill.</p></td>
@@ -663,7 +663,7 @@
 <td><p>Cacheless varlen attention through FlashInfer's ragged prefill wrapper.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.ragged.wrappers.html#module-mstar.engine.resources.attn.ragged.wrappers" title="mstar.engine.resources.attn.ragged.wrappers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wrappers</span></code></a></p></td>
-<td><p></p></td>
+<td><p>Cacheless (ragged) prefill wrappers: queries and keys packed by segment into <code class="docutils literal notranslate"><span class="pre">[total_tokens,</span> <span class="pre">H,</span> <span class="pre">D]</span></code> tensors, laid out by <code class="docutils literal notranslate"><span class="pre">cu_seqlens</span></code>.</p></td>
 </tr>
 </tbody>
 </table>
@@ -734,7 +734,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 26, 2026.
+  Last updated on Oct 27, 2026.
   <br/>
 </p>
   </div>

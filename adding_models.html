@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 26, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 27, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1213,9 +1213,11 @@ forward. Nothing is paged, and nothing carries to the next step.
 <code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> and
 <code class="docutils literal notranslate"><span class="pre">head_dim</span></code> (all pre-sharding, as in <code class="docutils literal notranslate"><span class="pre">KVConfig</span></code>), an <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code> that
 defaults to <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>, <code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.AUTO</span></code>, the
-default, or <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.FLASHINFER</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, and the
+default, <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.FLASHINFER</span></code>, or <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.DENSE</span></code>),
+<code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, and the
 two CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> and
-<code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
+<code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs FA3 <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm)
+and falls back to FlashInfer if that kernel is missing. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
 <td><p>The cross-attention counterpart: one span of each request attends another
@@ -1406,6 +1408,14 @@ inside a CUDA graph. The plan is what makes that possible: the engine plans the 
 outside the graph, into buffers whose addresses do not change, and the captured region
 attends through them. A kernel that reads <code class="docutils literal notranslate"><span class="pre">cu_seqlens</span></code> as an argument, or builds its
 mask from it, cannot be captured this way.</p>
+<p><code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.AUTO</span></code> (and an explicit <code class="docutils literal notranslate"><span class="pre">FLASHINFER</span></code>) plan through FlashInfer’s
+ragged prefill wrapper. <code class="docutils literal notranslate"><span class="pre">RaggedAttnBackend.DENSE</span></code> plans the same layouts into static
+<code class="docutils literal notranslate"><span class="pre">cu_seqlens</span></code> buffers and runs FA3 <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm) instead, with
+no page scatter. If that kernel is not importable, or the spec is a
+<code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec</span></code> (whose overlapping prefixes varlen cannot express),
+the factory logs a warning and builds FlashInfer. The fallback does not cover a GPU or
+dtype the kernel lacks: <code class="docutils literal notranslate"><span class="pre">fa3-fwd</span></code> 0.0.3 is built for Hopper (<code class="docutils literal notranslate"><span class="pre">sm_90a</span></code>) and runs bf16
+but not fp16.</p>
 <p>BAGEL’s SigLIP2 tower is the reference implementation. The spec stands alone, over the
 encoder node only, and names no cache:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">RaggedAttentionSpec</span><span class="p">(</span>
@@ -2911,7 +2921,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 26, 2026.
+  Last updated on Oct 27, 2026.
   <br/>
 </p>
   </div>

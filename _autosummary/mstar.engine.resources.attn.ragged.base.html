@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 26, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 27, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -676,7 +676,8 @@
                   
   <section id="module-mstar.engine.resources.attn.ragged.base">
 <span id="mstar-engine-resources-attn-ragged-base"></span><h1>mstar.engine.resources.attn.ragged.base<a class="headerlink" href="#module-mstar.engine.resources.attn.ragged.base" title="Link to this heading">#</a></h1>
-<p>The cacheless attention resource: the spec-time factory.</p>
+<p>The cacheless attention resource: the spec-time factory, and the plan
+machinery its backends share.</p>
 <p>Sibling of <code class="docutils literal notranslate"><span class="pre">attn.base</span></code>’s <code class="docutils literal notranslate"><span class="pre">AttentionManager</span></code>, for attention that is not
 backed by a KV cache, e.g., an encoder tower attending within variable-length
 segments of one packed forward. There is nothing to page, nothing to advance,
@@ -896,7 +897,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 26, 2026.
+  Last updated on Oct 27, 2026.
   <br/>
 </p>
   </div>

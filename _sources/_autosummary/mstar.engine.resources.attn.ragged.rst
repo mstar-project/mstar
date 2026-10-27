@@ -30,6 +30,8 @@ mstar.engine.resources.attn.ragged
    base
    block_causal
    config
+   dense
+   dense_wrappers
    flashinfer
    wrappers
 
