@@ -241,6 +241,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -1234,10 +1235,9 @@ fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
 Talker-width inputs through <code class="docutils literal notranslate"><span class="pre">small_to_mtp_projection</span></code> before its depth loop.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">configs/qwen3tts_1p7b_split.yaml</span></code> runs the Codec on a second worker that
 shares GPU 0 (<code class="docutils literal notranslate"><span class="pre">rank_devices</span></code>) and caps the Talker KV pool so both fit.
-On its own it lowers first-audio latency at high concurrency; with a
-user-level CUDA MPS daemon (<code class="docutils literal notranslate"><span class="pre">nvidia-cuda-mps-control</span> <span class="pre">-d</span></code> before
-<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code>) the two workers’ kernels also overlap, which raised c=32
-throughput by about a fifth on an H100.</p></li>
+On its own it lowers first-audio latency at high concurrency; with
+<code class="docutils literal notranslate"><span class="pre">mps:</span> <span class="pre">true</span></code> in the YAML (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>) the two workers’ kernels also
+overlap, which raised c=32 throughput by about a fifth on an H100.</p></li>
 <li><p>The codec decoder runs in float32 by default, reproducing the reference
 decoder bit for bit. <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{codec_dtype:</span> <span class="pre">bfloat16}</span></code> in the
 deployment YAML halves its GPU time when throughput matters more than

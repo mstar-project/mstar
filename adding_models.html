@@ -240,6 +240,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -1203,7 +1204,11 @@ Leave it at <code class="docutils literal notranslate"><span class="pre">AUTO</s
 and MLA attention require a <code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code>; FlexAttention requires a
 <code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code>.
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> selects a kernel generation: <code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;fa2&quot;</span></code> or
-<code class="docutils literal notranslate"><span class="pre">&quot;fa3&quot;</span></code> when the FlashInfer backend is selected. <code class="docutils literal notranslate"><span class="pre">FLASHINFER_MLA</span></code> is
+<code class="docutils literal notranslate"><span class="pre">&quot;fa3&quot;</span></code> when the FlashInfer backend is selected. <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code>
+(default <code class="docutils literal notranslate"><span class="pre">True</span></code>) runs one-token decode rows on FlashInfer’s tensor-core
+kernel; <code class="docutils literal notranslate"><span class="pre">False</span></code> picks the CUDA-core decode kernel, which can be faster for
+MHA and narrow GQA (few query heads per KV head). Measure before changing it:
+Whisper and Qwen3-ASR declare <code class="docutils literal notranslate"><span class="pre">False</span></code>. <code class="docutils literal notranslate"><span class="pre">FLASHINFER_MLA</span></code> is
 Multi-head Latent Attention over a <code class="docutils literal notranslate"><span class="pre">KVLayout.MLA</span></code> cache. It needs <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code>,
 the softmax scale of the model’s original qk head dim, which the other backends
 refuse. Its <code class="docutils literal notranslate"><span class="pre">run</span></code> takes the absorbed query (<code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">heads,</span> <span class="pre">kv_lora_rank]</span></code>)
@@ -1218,6 +1223,8 @@ pages behind the window stay allocated.</p></td>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
 <td><p>Attention over a paged context that is written once and never extended.
 <code class="docutils literal notranslate"><span class="pre">backend</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">AttnBackend.AUTO</span></code>. Only FlashInfer is implemented.
+A step whose rows each query one token runs FlashInfer’s decode kernel, and
+<code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code> picks its variant as for <code class="docutils literal notranslate"><span class="pre">AttentionConfig</span></code>.
 See <a class="reference internal" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
@@ -1258,7 +1265,9 @@ Whether the penalty runs on a given step is decided from the
 <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> values of the resident requests.
 <code class="docutils literal notranslate"><span class="pre">enable_min_p</span></code>, <code class="docutils literal notranslate"><span class="pre">max_repetition_window</span></code>, <code class="docutils literal notranslate"><span class="pre">min_tokens_stop_ids</span></code> and
 <code class="docutils literal notranslate"><span class="pre">enable_top_p_first</span></code> are capabilities of the same kind. See
-<code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code> above.</p></td>
+<code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code> above. <code class="docutils literal notranslate"><span class="pre">loopback_state</span></code> declares per-request state a
+decode loop keeps on the device beside its last sampled token. See
+<a class="reference internal" href="#device-loop-back">Device loop-back</a>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec(config=RecurrentStateConfig(...))</span></code></p></td>
 <td><p>Fixed-size per-request state that carries between steps (an LSTM’s <code class="docutils literal notranslate"><span class="pre">h</span></code> and
@@ -1709,7 +1718,8 @@ in this step. <code class="docutils literal notranslate"><span class="pre">span<
 nothing. A request contributes one segment per label that is active for it.</p></li>
 <li><p>The <code class="docutils literal notranslate"><span class="pre">segments</span></code> argument of <code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code> is a default value. Any <code class="docutils literal notranslate"><span class="pre">ResourceStep</span></code>
 that does not set its own <code class="docutils literal notranslate"><span class="pre">segments</span></code> uses this list.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">KVStep(commit=,</span> <span class="pre">combined_labels=,</span> <span class="pre">pre_forks=,</span> <span class="pre">post_forks=)</span></code>. See below.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">KVStep(commit=,</span> <span class="pre">eager_write=,</span> <span class="pre">combined_labels=,</span> <span class="pre">pre_forks=,</span> <span class="pre">post_forks=)</span></code>. See
+below.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">AttentionStep(causal=,</span> <span class="pre">context_only=)</span></code> describes the attention plan.
 <code class="docutils literal notranslate"><span class="pre">context_only=True</span></code> has the queries attend to the stored context alone, not to the
 tokens this step appends, and the step’s own <code class="docutils literal notranslate"><span class="pre">segments</span></code> then give the query counts.
@@ -1719,9 +1729,11 @@ extension of a cache. See <a class="reference internal" href="#cacheless-attenti
 <li><p><code class="docutils literal notranslate"><span class="pre">PositionStep(pos_ids=,</span> <span class="pre">advance=)</span></code>. With <code class="docutils literal notranslate"><span class="pre">pos_ids=None</span></code>, positions are derived from
 the stream counters. Pass explicit ids, keyed by plan label, when the model computes
 positions itself.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">SamplerStep(apply_penalty=,</span> <span class="pre">prefill_tracked_tokens=)</span></code>. <code class="docutils literal notranslate"><span class="pre">prefill_tracked_tokens</span></code>
-initializes the repetition-penalty mask with the prompt tokens. Only the prefill step
-passes them, because the sampler tracks every token it samples afterwards.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">SamplerStep(apply_penalty=,</span> <span class="pre">prefill_tracked_tokens=,</span> <span class="pre">loopback_writes=)</span></code>.
+<code class="docutils literal notranslate"><span class="pre">prefill_tracked_tokens</span></code> initializes the repetition-penalty mask with the prompt
+tokens. Only the prefill step passes them, because the sampler tracks every token it
+samples afterwards. <code class="docutils literal notranslate"><span class="pre">loopback_writes</span></code> names the declared loop-back states this step’s
+forward stores (see <a class="reference internal" href="#device-loop-back">Device loop-back</a>).</p></li>
 </ul>
 <p>The Orpheus declaration is the simplest form. It uses one label, computes spans directly
 from the prepared inputs, and steps all four resources together:</p>
@@ -1776,7 +1788,18 @@ cache stream from another. <code class="docutils literal notranslate"><span clas
 branch that must keep the context from before this step. <code class="docutils literal notranslate"><span class="pre">post_forks</span></code> forks at commit
 time, for a branch that must include this step’s
 writes.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">eager_write=True</span></code>: the step’s tokens for this cache are written outside any captured
+graph, for example in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> before the replay. Their addressing stays an
+ordinary plan rather than the slot’s static buffers, which are sized for the bucket’s
+in-graph tokens. Whisper’s prefill uses it to write its 1500-token encoder context
+while replaying a graph sized by its few prompt tokens.</p></li>
 </ul>
+<p><strong>Writing K/V yourself.</strong> A layer that writes its K/V inside a fused kernel of its own,
+rather than through <code class="docutils literal notranslate"><span class="pre">write_kv</span></code>, asks the KV resource where the step’s tokens go:
+<code class="docutils literal notranslate"><span class="pre">kv.write_target(layer_idx,</span> <span class="pre">label)</span></code> returns <code class="docutils literal notranslate"><span class="pre">(layer</span> <span class="pre">cache,</span> <span class="pre">page</span> <span class="pre">of</span> <span class="pre">each</span> <span class="pre">token,</span> <span class="pre">slot</span> <span class="pre">in</span>
+<span class="pre">page</span> <span class="pre">of</span> <span class="pre">each</span> <span class="pre">token,</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">tokens</span> <span class="pre">to</span> <span class="pre">write)</span></code> for the current plan (NHD layout only).
+Tokens past that number are the plan’s padding and must not be written. Qwen3-ASR’s
+fused q/k norm, RoPE and KV-write kernel (<code class="docutils literal notranslate"><span class="pre">Qwen3Attention</span></code>) is the example.</p>
 <p><strong>Testing.</strong> <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. <code class="docutils literal notranslate"><span class="pre">test/modular/vjepa2/fake_resources.py</span></code> shows how to stub
 the resources, and <code class="docutils literal notranslate"><span class="pre">test/modular/test_resource_runner.py</span></code> tests the runner’s lifecycle
@@ -1834,6 +1857,32 @@ drives the layer stack binds the label once, then advances the index for each la
 </div>
 <p>Cursors are used instead of arguments because passing the layer index as an argument makes
 inductor specialize on that integer. The frame is then retraced once per layer.</p>
+<p id="device-loop-back"><strong>Device loop-back.</strong> A decode loop normally routes its sampled token back to itself as a
+tensor per request. A node that sets <code class="docutils literal notranslate"><span class="pre">reads_device_loopback</span> <span class="pre">=</span> <span class="pre">True</span></code> can instead read
+each row’s last sampled token off the sampler on the device. It names those signals in
+<code class="docutils literal notranslate"><span class="pre">device_loopback_signals(graph_walk)</span></code>, so the worker routes them without a tensor, and
+reads them in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> with <code class="docutils literal notranslate"><span class="pre">sampler.loopback_tokens(request_ids)</span></code>. A row whose
+last step did not keep its value on the device (its first decode step, after the prefill)
+still brings it routed; put it over the one read from the device with
+<code class="docutils literal notranslate"><span class="pre">sampler.overwrite_rows(rows,</span> <span class="pre">(ids,</span> <span class="pre">routed_ids))</span></code>.</p>
+<p>State that a decode loop carries from step to step beside the token, such as Whisper’s
+timestamp rule state, is declared on the sampler, not kept in the model:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">SamplerSpec</span><span class="p">(</span>
+    <span class="n">resource_key</span><span class="o">=</span><span class="n">SAMPLER</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"decoder"</span><span class="p">},</span> <span class="n">vocab_size</span><span class="o">=</span><span class="n">vocab</span><span class="p">,</span>
+    <span class="n">loopback_state</span><span class="o">=</span><span class="p">{</span><span class="s2">"ts_rules"</span><span class="p">:</span> <span class="n">LoopbackState</span><span class="p">(</span>
+        <span class="n">width</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">inactive_state</span><span class="p">()),</span>
+    <span class="p">)},</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>The sampler keeps one row per request by slot, grows it with its other per-request
+buffers, and resets a row to <code class="docutils literal notranslate"><span class="pre">default</span></code> when its slot is given to a new request. A step
+reads the rows with <code class="docutils literal notranslate"><span class="pre">sampler.loopback_state(name,</span> <span class="pre">request_ids)</span></code> in <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> and
+stores the next ones from the forward with <code class="docutils literal notranslate"><span class="pre">sampler.store_loopback_state(name,</span>
+<span class="pre">request_ids,</span> <span class="pre">values)</span></code>. Under a CUDA-graph slot the store is captured into a per-step
+buffer and commit persists it, so the step must list the name in
+<code class="docutils literal notranslate"><span class="pre">SamplerStep(loopback_writes=...)</span></code>. An eager step writes the rows by request. Both paths
+address rows the same way, and the model never sees a slot index.</p>
 <div class="admonition warning">
 <p class="admonition-title">Warning</p>
 <p>Where the callable is passed into a traced function, create one <code class="docutils literal notranslate"><span class="pre">AttentionCallable</span></code>
@@ -2277,11 +2326,12 @@ that a misspelled setting is never silently ignored:</p>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code> / <code class="docutils literal notranslate"><span class="pre">flex</span></code> / <code class="docutils literal notranslate"><span class="pre">xpu_paged</span></code>),
-<code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>)</p></td>
+<code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code>
+(<code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code>)</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
-(<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>)</p></td>
+(<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>), <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code> (<code class="docutils literal notranslate"><span class="pre">true</span></code> / <code class="docutils literal notranslate"><span class="pre">false</span></code>)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
@@ -2664,8 +2714,8 @@ refuses at startup a cap that either cache cannot hold after the YAML’s <code 
 overrides, through <code class="docutils literal notranslate"><span class="pre">mstar.model.utils.check_kv_pools_fit</span></code>, which any model with KV caches
 can call the same way.</p>
 <p>The decoder node’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> shows how a write-once context is expressed with spans.
-It lives in <code class="docutils literal notranslate"><span class="pre">EncoderDecoderNode</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/components/encoder_decoder.py</span></code>), which
-Whisper’s and Canary’s decoder nodes share; Whisper adds only its token suppression. The
+Canary’s comes from <code class="docutils literal notranslate"><span class="pre">EncoderDecoderNode</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/components/encoder_decoder.py</span></code>);
+Whisper’s declares its own, since it writes the context eagerly and captures prefill. The
 context segments have a non-zero span in the prefill step that writes them, and a span of
 0 in every later step. The <code class="docutils literal notranslate"><span class="pre">commit</span></code> in the prefill step converts the reservation into
 resident pages that the later steps read.</p>

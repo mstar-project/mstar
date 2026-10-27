@@ -241,6 +241,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -986,7 +987,15 @@ a 503.</p></td>
 done, for workers that share a GPU (see below). Unset, capture plans against
 whatever is free.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mps</span></code></p></td>
+<td><p><em>(optional)</em> <code class="docutils literal notranslate"><span class="pre">true</span></code> runs the workers as clients of a CUDA MPS control daemon the
+conductor starts in a private directory, so workers that share a GPU overlap their
+kernels instead of time-slicing (the ASR <code class="docutils literal notranslate"><span class="pre">*_split</span></code> configs). NVIDIA only, and it
+needs <code class="docutils literal notranslate"><span class="pre">nvidia-cuda-mps-control</span></code> on <code class="docutils literal notranslate"><span class="pre">PATH</span></code>. The conductor stops the daemon on
+shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
+<code class="docutils literal notranslate"><span class="pre">false</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code></p></td>
 <td><p><em>(optional, default 512)</em> For a model that takes live client input: how many MiB
 of files (and append text) one call may send over its whole life, its opening
 message’s included.
@@ -995,7 +1004,7 @@ it ends the call with a 400; a one-shot request is not counted. It caps a call�
 decoded input is larger than its files, and how much of it waits in buffers
 depends on how fast the model consumes it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">client_streams</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">client_streams</span></code></p></td>
 <td><p><em>(optional)</em> For a model that takes live client input: per client stream (by
 its edge name, e.g. <code class="docutils literal notranslate"><span class="pre">audio_in</span></code>), overrides of the limits the model declares on
 it (<code class="docutils literal notranslate"><span class="pre">ClientStreamLimits</span></code>, see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>). <code class="docutils literal notranslate"><span class="pre">max_items</span></code>: what the
@@ -1007,10 +1016,10 @@ model sizes its buffers from its own settings (for <code class="docutils literal
 <code class="docutils literal notranslate"><span class="pre">max_session_s</span></code> instead). An unknown stream, key or value fails loading. Unlike
 <code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code> it counts what the model was handed, not bytes uploaded.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
 <td><p><em>(optional)</em> Server-init model parameters (see below).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code></p></td>
 <td><p><em>(optional, default true)</em> Whether the server offers per-message deflate on its
 WebSocket routes (<code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>); it applies to every route.
 Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
@@ -1019,7 +1028,7 @@ costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, whose configs turn it off. Turn it off where the server’s
 event loop, not the network, is the bottleneck.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speculation_mixes_walks</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">speculation_mixes_walks</span></code></p></td>
 <td><p><em>(optional)</em> Per node, <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> for every walk of the node’s combined
 walks, or a mapping of walk -&gt; <code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code>. On for a walk, a speculation
 chain on it merges ready rows of the other walks of its combined walk, so
@@ -1028,7 +1037,7 @@ keeps to its own walk and yields to the others, and a step mixes walks only
 when the scheduler builds one fresh. Naming a node with no combined walk, or a
 walk outside its combined walks, fails loading.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
 <td><p><em>(optional)</em> Requests the server runs after the workers are ready and before it
 binds, so no client pays a shape’s first-request cost (torch.compile of a step,
 a cold cache). Each entry is a <code class="docutils literal notranslate"><span class="pre">/generate</span></code> request in yaml form: <code class="docutils literal notranslate"><span class="pre">text</span></code>,
@@ -1040,13 +1049,13 @@ comes from the extension, or give <code class="docutils literal notranslate"><sp
 long prompts take (a long-context prefill). A malformed or failing warmup
 is logged and skipped.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dist_timeout_s</span></code></p></td>
 <td><p><em>(optional)</em> Timeout in seconds for the NCCL world group and its parallel
 subgroups during weight load and warmup; serving keeps PyTorch’s default.
 Unset keeps PyTorch’s default throughout. Raise it only where weight load,
 JIT or CUDA-graph capture can exceed that default.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce</span></code></p></td>
 <td><p><em>(optional)</em> Small-message all-reduce path of every TP and SP group:
 <code class="docutils literal notranslate"><span class="pre">nccl</span></code> (default), <code class="docutils literal notranslate"><span class="pre">symm_oneshot</span></code>, <code class="docutils literal notranslate"><span class="pre">symm_multimem</span></code> or <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>;
 any other value fails at startup. <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> sends 2-D bf16 CUDA messages
@@ -1061,17 +1070,17 @@ differs from NCCL’s, so bf16 results can differ at the last bit. Falls back
 to NCCL, with a warning, where the chosen path cannot be set up on every
 rank of the group.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_allreduce_max_kb</span></code></p></td>
 <td><p><em>(optional)</em> Largest message, in KiB, the non-NCCL path takes;
 larger ones go to NCCL. It is also the size of the buffer each group
 rendezvouses. Default 512.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code></p></td>
 <td><p><em>(optional)</em> Async scheduling for the parallel nodes: <code class="docutils literal notranslate"><span class="pre">true</span></code>, <code class="docutils literal notranslate"><span class="pre">false</span></code>
 (default) or a list of node names (see <code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code>, which
 overrides it).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
 <td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
 <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code>,
 <code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code>,
@@ -1097,7 +1106,7 @@ them by that name:</p>
 <span class="w">    </span><span class="nt">max_num_pages</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">      </span><span class="c1"># also: page_size, max_seq_len, cpu_offload_pages,</span>
 <span class="w">                             </span><span class="c1"># prefix_cache, prefix_cache_salt, prefix_cache_tp</span>
 <span class="w">  </span><span class="nt">talker_attn</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">flashinfer_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fa2</span><span class="w">  </span><span class="c1"># also: backend (flashinfer / dense)</span>
+<span class="w">    </span><span class="nt">flashinfer_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fa2</span><span class="w">  </span><span class="c1"># also: backend (flashinfer / dense), decode_tensor_cores</span>
 <span class="w">  </span><span class="nt">vit_attn</span><span class="p">:</span><span class="w">                  </span><span class="c1"># a cacheless (ragged) attention resource</span>
 <span class="w">    </span><span class="nt">max_segments_per_request</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w">  </span><span class="c1"># also: max_tokens_per_request, flashinfer_backend</span>
 </pre></div>
@@ -1149,6 +1158,12 @@ still fits beside them; a bucket left out runs eagerly. Workers sharing a GPU se
 other’s memory only as used, so the first to capture can take the other’s room. Set
 <code class="docutils literal notranslate"><span class="pre">gpu_memory_fraction</span></code> (<code class="docutils literal notranslate"><span class="pre">0.45</span></code> for two workers, say) to bound what each plans for. It
 counts PyTorch allocations, not the CUDA context or NCCL buffers, so leave room for those.</p>
+<p>Workers that share a GPU time-slice it by default: one process’s kernels wait for the
+other’s. <code class="docutils literal notranslate"><span class="pre">mps:</span> <span class="pre">true</span></code> makes the conductor start a CUDA MPS control daemon of its own
+before it spawns the workers, run every worker as its client so their kernels overlap,
+and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
+processes on the GPU are unaffected. <code class="docutils literal notranslate"><span class="pre">nvidia-cuda-mps-control</span></code> (part of the NVIDIA
+driver) must be on <code class="docutils literal notranslate"><span class="pre">PATH</span></code>. The <code class="docutils literal notranslate"><span class="pre">*_split.yaml</span></code> configs for Whisper and Qwen3-ASR set it.</p>
 <p><strong>Disaggregation.</strong> The same node can live on different GPUs <em>per graph walk</em> — e.g.
 prefill, decode, and image generation on three GPUs:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">node_groups</span><span class="p">:</span>

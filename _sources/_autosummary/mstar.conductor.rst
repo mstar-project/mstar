@@ -28,5 +28,6 @@
    :recursive:
 
    conductor
+   mps
    request_info
 

@@ -594,6 +594,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -967,7 +968,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">CrossAttentionSpec</span><span class="p">,</span>
     <span class="n">refuse_context_only</span><span class="p">,</span>
 <span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="n">FlashInferPrefillWrapper</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">FlashInferDecodeWrapper</span><span class="p">,</span>
+    <span class="n">FlashInferPrefillWrapper</span><span class="p">,</span>
+<span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">AttentionResource</span><span class="p">,</span>
     <span class="n">CGSlotKey</span><span class="p">,</span>
@@ -981,6 +985,17 @@ window.runMermaid = runMermaid;</script>
     <span class="n">SequenceView</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">StepContext</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_LastPlan</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""What a wrapper was last planned with. The context's KV manager hands</span>
+<span class="sd">    back the same plan object while the context streams are untouched, so the</span>
+<span class="sd">    same object over the same query rows skips building the arrays; a new</span>
+<span class="sd">    object over the same pages still skips FlashInfer's plan."""</span>
+    <span class="n">context</span><span class="p">:</span> <span class="n">Any</span>  <span class="c1"># the context label's KVPlanOutput</span>
+    <span class="n">request_ids</span><span class="p">:</span> <span class="nb">tuple</span>
+    <span class="n">qo_indptr</span><span class="p">:</span> <span class="nb">tuple</span>
+    <span class="n">plan_key</span><span class="p">:</span> <span class="n">PlanCacheKey</span>
 
 
 <div class="viewcode-block" id="QueryPacking">
@@ -1019,6 +1034,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
                 <span class="n">kv_config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">,</span>
                 <span class="n">backend</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
+                <span class="n">decode_tensor_cores</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">decode_tensor_cores</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown cross attention backend </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 </div>
@@ -1048,9 +1064,11 @@ window.runMermaid = runMermaid;</script>
         <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
         <span class="n">kv_config</span><span class="p">:</span> <span class="n">PagedKVConfig</span><span class="p">,</span>
         <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span><span class="p">,</span>
+        <span class="n">decode_tensor_cores</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span> <span class="o">=</span> <span class="n">kv_cache</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_query_kv_cache_name</span> <span class="o">=</span> <span class="n">query_kv_cache</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_decode_tensor_cores</span> <span class="o">=</span> <span class="n">decode_tensor_cores</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_context_label</span> <span class="o">=</span> <span class="n">context_label</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="n">dtype</span>
@@ -1063,11 +1081,8 @@ window.runMermaid = runMermaid;</script>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="c1"># wrapper key (plan label, or CGSlotKey under capture) -&gt; fingerprint</span>
-        <span class="c1"># of the last plan call made on that wrapper</span>
-        <span class="c1"># NOTE: a little bit (very) sketchy should be refined; goal is to avoid</span>
-        <span class="c1"># redundant plan comp. how to do the mapping to track is another issue</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_plan_keys</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="n">PlanCacheKey</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># wrapper key (EagerSlotKey, or CGSlotKey under capture) -&gt; its last plan</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_last_plans</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="n">_LastPlan</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span> <span class="o">=</span> <span class="n">kv_config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
@@ -1127,38 +1142,48 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
             <span class="k">return</span>
 
-        <span class="n">context_views</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_context_views</span><span class="p">(</span><span class="n">ctx</span><span class="p">)</span>
+        <span class="n">context_out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_context_output</span><span class="p">(</span><span class="n">ctx</span><span class="p">)</span>
+        <span class="n">context_views</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># a preplan leases a different cg slot, so its wrappers and workspaces</span>
         <span class="c1"># are disjoint from the ones the in-flight forward reads</span>
         <span class="n">plan_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span>
 
         <span class="n">plan_states</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">plan_label</span><span class="p">,</span> <span class="n">packing</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_query_packings</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="n">indptrs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_indptrs</span><span class="p">(</span><span class="n">packing</span><span class="p">,</span> <span class="n">context_views</span><span class="p">,</span> <span class="n">plan_label</span><span class="p">)</span>
+            <span class="n">qo_indptr</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">packing</span><span class="o">.</span><span class="n">qo_indptr</span><span class="o">.</span><span class="n">tolist</span><span class="p">())</span>
+            <span class="n">num_rows</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">qo_indptr</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span>
+            <span class="c1"># every row queries one token (a span-0 row does not)</span>
+            <span class="n">decode</span> <span class="o">=</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">force_prefill</span> <span class="ow">and</span> <span class="n">qo_indptr</span> <span class="o">==</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">num_rows</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
             <span class="n">state_key</span><span class="p">,</span> <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_for</span><span class="p">(</span>
-                <span class="n">plan_label</span><span class="p">,</span> <span class="n">lease</span><span class="p">,</span> <span class="n">num_rows</span><span class="o">=</span><span class="n">indptrs</span><span class="o">.</span><span class="n">qo_indptr</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span>
-                <span class="n">slot</span><span class="o">=</span><span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span>
+                <span class="n">plan_label</span><span class="p">,</span> <span class="n">lease</span><span class="p">,</span> <span class="n">num_rows</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">decode</span><span class="o">=</span><span class="n">decode</span><span class="p">,</span>
             <span class="p">)</span>
+            <span class="n">request_ids</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">packing</span><span class="o">.</span><span class="n">request_ids</span><span class="p">)</span>
+            <span class="n">last</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_plans</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">state_key</span><span class="p">)</span>
+            <span class="k">if</span> <span class="p">(</span>
+                <span class="n">last</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">last</span><span class="o">.</span><span class="n">context</span> <span class="ow">is</span> <span class="n">context_out</span>
+                <span class="ow">and</span> <span class="n">last</span><span class="o">.</span><span class="n">request_ids</span> <span class="o">==</span> <span class="n">request_ids</span> <span class="ow">and</span> <span class="n">last</span><span class="o">.</span><span class="n">qo_indptr</span> <span class="o">==</span> <span class="n">qo_indptr</span>
+            <span class="p">):</span>
+                <span class="n">plan_states</span><span class="p">[</span><span class="n">plan_label</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
+                <span class="k">continue</span>
+            <span class="k">if</span> <span class="n">context_views</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">context_views</span> <span class="o">=</span> <span class="p">{</span><span class="n">view</span><span class="o">.</span><span class="n">request_id</span><span class="p">:</span> <span class="n">view</span> <span class="k">for</span> <span class="n">view</span> <span class="ow">in</span> <span class="n">context_out</span><span class="o">.</span><span class="n">views</span><span class="p">}</span>
+            <span class="n">indptrs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_indptrs</span><span class="p">(</span><span class="n">packing</span><span class="p">,</span> <span class="n">context_views</span><span class="p">,</span> <span class="n">plan_label</span><span class="p">)</span>
 
-            <span class="c1"># The context pages are immutable once written, so between steps</span>
-            <span class="c1"># only the query side moves; when neither moved the whole plan is</span>
-            <span class="c1"># skippable. Every tensor here is on CPU, so `.tolist()` costs no</span>
-            <span class="c1"># sync.</span>
-
-            <span class="c1"># context is immutable; between step only q will change; when nothing</span>
-            <span class="c1"># changes we can skip plan (use old)</span>
+            <span class="c1"># The context pages are immutable once written, so only the query</span>
+            <span class="c1"># side moves between steps; when neither moved, FlashInfer's plan</span>
+            <span class="c1"># is skippable. Every tensor here is on CPU: `.tolist()` costs no sync.</span>
             <span class="n">plan_key</span> <span class="o">=</span> <span class="n">PlanCacheKey</span><span class="p">(</span>
-                <span class="n">q_seq_lens</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">indptrs</span><span class="o">.</span><span class="n">qo_indptr</span><span class="o">.</span><span class="n">tolist</span><span class="p">()),</span>
+                <span class="n">q_seq_lens</span><span class="o">=</span><span class="n">qo_indptr</span><span class="p">,</span>
                 <span class="n">page_indices</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">indptrs</span><span class="o">.</span><span class="n">paged_kv_indices</span><span class="o">.</span><span class="n">tolist</span><span class="p">()),</span>
                 <span class="n">last_page_lens</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">indptrs</span><span class="o">.</span><span class="n">paged_kv_last_page_len</span><span class="o">.</span><span class="n">tolist</span><span class="p">()),</span>
             <span class="p">)</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_keys</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">state_key</span><span class="p">)</span> <span class="o">!=</span> <span class="n">plan_key</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">last</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">last</span><span class="o">.</span><span class="n">plan_key</span> <span class="o">!=</span> <span class="n">plan_key</span><span class="p">:</span>
                 <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
                     <span class="n">causal</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
                     <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
                     <span class="o">**</span><span class="n">indptrs</span><span class="o">.</span><span class="n">to_kwargs_dict</span><span class="p">()</span>
                 <span class="p">)</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_plan_keys</span><span class="p">[</span><span class="n">state_key</span><span class="p">]</span> <span class="o">=</span> <span class="n">plan_key</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_last_plans</span><span class="p">[</span><span class="n">state_key</span><span class="p">]</span> <span class="o">=</span> <span class="n">_LastPlan</span><span class="p">(</span><span class="n">context_out</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">qo_indptr</span><span class="p">,</span> <span class="n">plan_key</span><span class="p">)</span>
             <span class="n">plan_states</span><span class="p">[</span><span class="n">plan_label</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span></div>
@@ -1172,11 +1197,10 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="o">=</span> <span class="p">{}</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_context_views</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">SequenceView</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">"""context stream of each request in batch by request id</span>
-
-<span class="sd">        key by request rather than zip with query view because not</span>
-<span class="sd">        necessarily same length"""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_context_output</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""The context label's KV plan output (its views are each request's</span>
+<span class="sd">        context stream; key by request rather than zip with the query rows,</span>
+<span class="sd">        which need not line up)."""</span>
         <span class="n">plan_outputs</span><span class="p">:</span> <span class="n">KVPlanOutputs</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">plan_results</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span>
         <span class="p">)</span>
@@ -1190,7 +1214,7 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">"that attends the context must declare a zero-span segment on "</span>
             <span class="sa">f</span><span class="s2">"that label. planned: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">plan_outputs</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
         <span class="p">)</span>
-        <span class="k">return</span> <span class="p">{</span><span class="n">view</span><span class="o">.</span><span class="n">request_id</span><span class="p">:</span> <span class="n">view</span> <span class="k">for</span> <span class="n">view</span> <span class="ow">in</span> <span class="n">kv_out</span><span class="o">.</span><span class="n">views</span><span class="p">}</span>
+        <span class="k">return</span> <span class="n">kv_out</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_query_packings</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span>
@@ -1295,40 +1319,66 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_wrapper_for</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">plan_label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">decode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">Any</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""``num_rows`` is this label's qo_indptr row count — bucket.bs for an</span>
 <span class="sd">        ordinary label, more when the query plan combines labels. See</span>
-<span class="sd">        ``FlashInferManager._cg_wrapper``."""</span>
+<span class="sd">        ``FlashInferManager._cg_wrapper``.</span>
+
+<span class="sd">        ``decode``: every row queries one token, as a decoder's cross</span>
+<span class="sd">        attention does each step against the whole encoder context, which the</span>
+<span class="sd">        decode kernel serves."""</span>
         <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">key</span> <span class="o">=</span> <span class="n">CGSlotKey</span><span class="p">(</span>
                 <span class="n">bucket</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="n">plan_label</span>
             <span class="p">)</span>
             <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">wrapper</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="c1"># built on first plan for the key; see FlashInferManager._cg_wrapper</span>
-                <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">FlashInferPrefillWrapper</span><span class="p">(</span>
-                    <span class="n">workspace_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
-                        <span class="n">plan_label</span><span class="p">,</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span>
-                    <span class="p">),</span>
-                    <span class="n">batch_size</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span>
-                    <span class="n">max_total_tokens</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span>
-                    <span class="n">accelerator_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                    <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span><span class="p">,</span>
+            <span class="k">if</span> <span class="n">wrapper</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="c1"># a captured graph replays the kernel it was recorded with</span>
+                <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">wrapper</span><span class="p">,</span> <span class="n">FlashInferDecodeWrapper</span><span class="p">)</span> <span class="o">==</span> <span class="n">decode</span><span class="p">,</span> <span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"cross attention </span><span class="si">{</span><span class="n">plan_label</span><span class="si">!r}</span><span class="s2"> in </span><span class="si">{</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="si">}</span><span class="s2"> was captured as "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'decode'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="ow">not</span><span class="w"> </span><span class="n">decode</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'prefill'</span><span class="si">}</span><span class="s2"> but this step plans "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="s1">'decode'</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">decode</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'prefill'</span><span class="si">}</span><span class="s2"> rows"</span>
                 <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># built on first plan for the key; see FlashInferManager._cg_wrapper</span>
+                <span class="n">workspace</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">plan_label</span><span class="p">,</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">decode</span><span class="p">:</span>
+                    <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_wrapper</span><span class="p">(</span><span class="n">workspace</span><span class="p">,</span> <span class="n">batch_size</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span> <span class="n">accelerator_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">wrapper</span> <span class="o">=</span> <span class="n">FlashInferPrefillWrapper</span><span class="p">(</span>
+                        <span class="n">workspace_buffer</span><span class="o">=</span><span class="n">workspace</span><span class="p">,</span>
+                        <span class="n">batch_size</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span>
+                        <span class="n">max_total_tokens</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span>
+                        <span class="n">accelerator_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                        <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span><span class="p">,</span>
+                    <span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
             <span class="k">return</span> <span class="n">key</span><span class="p">,</span> <span class="n">wrapper</span>
 
         <span class="c1"># slotted like the captured one, and on the same workspace; see</span>
         <span class="c1"># `FlashInferManager._eager_wrapper`</span>
-        <span class="n">key</span> <span class="o">=</span> <span class="n">EagerSlotKey</span><span class="p">(</span><span class="n">label</span><span class="o">=</span><span class="n">plan_label</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">)</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="n">EagerSlotKey</span><span class="p">(</span><span class="n">label</span><span class="o">=</span><span class="n">plan_label</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">,</span> <span class="n">is_decode</span><span class="o">=</span><span class="n">decode</span><span class="p">)</span>
         <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">wrapper</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">wrapper</span> <span class="o">=</span> <span class="n">FlashInferPrefillWrapper</span><span class="p">(</span>
-                <span class="n">workspace_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">plan_label</span><span class="p">,</span> <span class="n">slot</span><span class="p">),</span>
-                <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span><span class="p">,</span>
-            <span class="p">)</span>
+            <span class="n">workspace</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">plan_label</span><span class="p">,</span> <span class="n">slot</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">decode</span><span class="p">:</span>
+                <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_decode_wrapper</span><span class="p">(</span><span class="n">workspace</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">wrapper</span> <span class="o">=</span> <span class="n">FlashInferPrefillWrapper</span><span class="p">(</span><span class="n">workspace_buffer</span><span class="o">=</span><span class="n">workspace</span><span class="p">,</span> <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
         <span class="k">return</span> <span class="n">key</span><span class="p">,</span> <span class="n">wrapper</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_decode_wrapper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">workspace</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">FlashInferDecodeWrapper</span><span class="p">:</span>
+        <span class="n">kv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span>
+        <span class="k">return</span> <span class="n">FlashInferDecodeWrapper</span><span class="p">(</span>
+            <span class="n">workspace_buffer</span><span class="o">=</span><span class="n">workspace</span><span class="p">,</span>
+            <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">kv</span><span class="p">[</span><span class="s2">"num_qo_heads"</span><span class="p">],</span> <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">kv</span><span class="p">[</span><span class="s2">"num_kv_heads"</span><span class="p">],</span>
+            <span class="n">head_dim</span><span class="o">=</span><span class="n">kv</span><span class="p">[</span><span class="s2">"head_dim"</span><span class="p">],</span> <span class="n">page_size</span><span class="o">=</span><span class="n">kv</span><span class="p">[</span><span class="s2">"page_size"</span><span class="p">],</span>
+            <span class="n">max_num_pages</span><span class="o">=</span><span class="n">kv</span><span class="p">[</span><span class="s2">"max_num_pages"</span><span class="p">],</span> <span class="n">device</span><span class="o">=</span><span class="n">kv</span><span class="p">[</span><span class="s2">"device"</span><span class="p">],</span> <span class="n">backend</span><span class="o">=</span><span class="n">kv</span><span class="p">[</span><span class="s2">"backend"</span><span class="p">],</span>
+            <span class="n">use_tensor_cores</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_decode_tensor_cores</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+        <span class="p">)</span>
 
 <div class="viewcode-block" id="FlashInferCrossManager.run">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.cross.html#mstar.engine.resources.attn.cross.FlashInferCrossManager.run">[docs]</a>

@@ -594,6 +594,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -969,6 +970,26 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
 
 
+<div class="viewcode-block" id="LoopbackState">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.LoopbackState">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">LoopbackState</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Per-request state a decode loop carries from step to step on the</span>
+<span class="sd">    device, beside its last sampled token: one row of ``width`` values per</span>
+<span class="sd">    request, kept by sampler slot. A row starts (and restarts, when its slot</span>
+<span class="sd">    is reused) at ``default``."""</span>
+    <span class="n">width</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span>
+    <span class="n">default</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">default</span><span class="p">)</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">width</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"LoopbackState default has </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">default</span><span class="p">)</span><span class="si">}</span><span class="s2"> values for width </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">width</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="SamplerSpec">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.SamplerSpec">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -985,6 +1006,10 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># per step, so nodes that never ask for it pay nothing; a request that</span>
     <span class="c1"># sets ``min_p`` on a node without it is refused at ingest.</span>
     <span class="n">enable_min_p</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># name -&gt; extra loop-back state the node keeps by slot beside the last</span>
+    <span class="c1"># token (``SamplerResource.loopback_state`` / ``store_loopback_state``);</span>
+    <span class="c1"># only used on the device loop-back path</span>
+    <span class="n">loopback_state</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">LoopbackState</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="c1"># Capabilities for the generation-aware request knobs below; each off by</span>
     <span class="c1"># default, leaving the node's sampler as it was.</span>
     <span class="c1"># The longest ``repetition_window`` a request may ask for (sizes the history).</span>
@@ -1114,7 +1139,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">prefill_tracked_tokens</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="c1"># Rows whose sampled token is kept; None keeps every row. A dropped row</span>
     <span class="c1"># still draws, but its RNG offset and seen-token mask are not committed.</span>
-    <span class="n">kept_rids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">kept_rids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># The spec's loop-back states this step's forward stores</span>
+    <span class="c1"># (``store_loopback_state``); commit persists them by slot.</span>
+    <span class="n">loopback_writes</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span></div>
 
 </pre></div>
 

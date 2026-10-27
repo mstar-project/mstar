@@ -594,6 +594,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -968,6 +969,8 @@ window.runMermaid = runMermaid;</script>
 <span class="n">KV_CACHE</span> <span class="o">=</span> <span class="s2">"kv_cache"</span>
 <span class="n">ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>
 <span class="n">SAMPLER</span> <span class="o">=</span> <span class="s2">"sampler"</span>
+<span class="c1"># The sampler's loop-back state holding each request's timestamp rule state</span>
+<span class="n">TS_RULES</span> <span class="o">=</span> <span class="s2">"ts_rules"</span>
 <span class="c1"># Positions: Whisper has no RoPE. The resource is declared for its</span>
 <span class="c1"># per-(request, label) position counter, which drives the learned absolute</span>
 <span class="c1"># ``embed_positions`` lookup; the attention layers never call it.</span>
@@ -997,6 +1000,10 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># one teacher-forced pass over the transcript whose cross-attention gives</span>
 <span class="c1"># every word its start and end (see ``components/alignment.py``).</span>
 <span class="n">ALIGN_WALK</span> <span class="o">=</span> <span class="s2">"align"</span>
+<span class="c1"># The align walk's word timings follow the transcript after this marker, one</span>
+<span class="c1"># ``&lt;|start|&gt; word &lt;|end|&gt;`` per word in the timestamp vocabulary. Here so the</span>
+<span class="c1"># API server's adapter reads it without loading the model's modules.</span>
+<span class="n">WORDS_MARKER</span> <span class="o">=</span> <span class="s2">"&lt;|startoflm|&gt;"</span>
 
 
 <div class="viewcode-block" id="WhisperModelConfig">

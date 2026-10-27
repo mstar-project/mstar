@@ -23,6 +23,7 @@ mstar.engine.resources.sampler.config
 
    .. autosummary::
    
+      LoopbackState
       SamplerSpec
       SamplerStep
       SamplingReqConfig

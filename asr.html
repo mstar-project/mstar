@@ -241,6 +241,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -715,11 +716,14 @@ speculative next-step launch never sees a stale history.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">align</span></code></dt><dd><p>only when word timestamps were asked for: one teacher-forced pass over
 <code class="docutils literal notranslate"><span class="pre">&lt;|startoftranscript|&gt;&lt;|lang|&gt;&lt;|task|&gt;&lt;|notimestamps|&gt;</span> <span class="pre">transcript</span>
-<span class="pre">&lt;|endoftext|&gt;</span></code> on the served decoder weights, outside the caches. The
-alignment heads’ cross-attention becomes word start/end times (per-head
-standardization, median filter, dynamic time warping), emitted in
-Whisper’s own timestamp vocabulary after <code class="docutils literal notranslate"><span class="pre">&lt;|startoflm|&gt;</span></code> so the same
-detokenizer renders it and the serving layer lifts it into <code class="docutils literal notranslate"><span class="pre">words</span></code>.</p>
+<span class="pre">&lt;|endoftext|&gt;</span></code> on the served decoder weights, outside the caches. On the
+GPU, the alignment heads’ cross-attention is standardized per head,
+median-filtered and averaged, and the walk emits that matrix with the
+token ids as one float32 tensor. The API server’s <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> runs the
+dynamic time warping (compiled by numba, part of the <code class="docutils literal notranslate"><span class="pre">asr</span></code> extra, when
+the API server loads the model) and groups tokens into words, rendered in
+Whisper’s own timestamp vocabulary after <code class="docutils literal notranslate"><span class="pre">&lt;|startoflm|&gt;</span></code>, which the
+serving layer lifts into <code class="docutils literal notranslate"><span class="pre">words</span></code>.</p>
 </dd>
 </dl>
 <p><strong>Request options</strong> (<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> / the OpenAI fields): <code class="docutils literal notranslate"><span class="pre">language</span></code>
@@ -789,24 +793,32 @@ hold about 13 of them at full size at once. More concurrent long files than
 the pool holds offload to the host pool and, once that is full too, wait on
 each other until they time out: 16 concurrent single-window 20 minute files
 stalled on 2048 pages, and peaked at 2352 pages with 4096 in the pool.</p>
-<p><code class="docutils literal notranslate"><span class="pre">qwen3_asr.yaml</span></code> therefore caps Qwen3-ASR at 12 concurrent requests, which
-any mix of files up to 20 minutes fits. The cap costs short-utterance
+<p><code class="docutils literal notranslate"><span class="pre">qwen3_asr.yaml</span></code> and <code class="docutils literal notranslate"><span class="pre">qwen3_asr_split.yaml</span></code> therefore cap Qwen3-ASR at 12
+concurrent requests, which any mix of files up to 20 minutes fits. The cap costs short-utterance
 throughput: on LibriSpeech test-clean (one H200, Qwen3-ASR 1.7B) RTFx was
 about 420 at 8 concurrent requests, 900 at 32 and 1280 at 64. A deployment
 that only serves short audio can raise <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> (64 fits
 the default pool); one that serves many long files at once can raise
 <code class="docutils literal notranslate"><span class="pre">kv_cache.max_num_pages</span></code> with the cap. Admission that sizes the cap by each
 request’s pages instead is planned.</p>
-<p>Whisper’s decode loop hands a window’s tokens to the client in one message
-when the loop ends (<code class="docutils literal notranslate"><span class="pre">Loop.accumulated_outputs</span></code>), so a streaming request
-receives one delta per window. Qwen3-ASR’s decode loop keeps its token on the
-device (<code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code>) and the worker sends the batch’s tokens
-inline, one frame per step (<code class="docutils literal notranslate"><span class="pre">inline_client_signals</span></code>), so they reach the API
-server while the window decodes: a 20 minute window is about 3,450 tokens,
-which, sent as one tensor apiece when the loop ended, could miss the API
-server’s 15 s delivery deadline under load. Each chunk is one byte-level BPE
-token, which can end inside a UTF-8 character; the transcription route
+<p>Both decode loops stream their transcript token by token. A decode step
+keeps its rows’ tokens on the device for the next step (the sampler’s device
+loop-back, <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code>), and the worker sends the batch’s
+tokens to the client in one frame per step from the stop check’s host copy
+(<code class="docutils literal notranslate"><span class="pre">inline_client_signals</span></code>), rather than one tensor message per request. A
+streaming request therefore receives one delta per token, and tokens reach
+the API server while the window decodes: a 20 minute Qwen3-ASR window is
+about 3,450 tokens, which, sent as one tensor apiece when the loop ended,
+could miss the API server’s 15 s delivery deadline under load. Each chunk is
+one byte-level BPE token, which can end inside a UTF-8 character; the server
 decodes the joined bytes.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">*_split</span></code> configs (<code class="docutils literal notranslate"><span class="pre">whisper_large_split.yaml</span></code>,
+<code class="docutils literal notranslate"><span class="pre">whisper_large_v3_turbo_split.yaml</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_asr_split.yaml</span></code>,
+<code class="docutils literal notranslate"><span class="pre">qwen3_asr_realtime_split.yaml</span></code>) put the encoder and the decoder in two
+worker processes on one GPU (<code class="docutils literal notranslate"><span class="pre">rank_devices</span></code>), so a decode step never queues
+behind an encoder batch on the same stream. They set <code class="docutils literal notranslate"><span class="pre">mps:</span> <span class="pre">true</span></code>, so both
+workers run as clients of one CUDA MPS daemon and their kernels overlap rather
+than time-slice (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>).</p>
 </section>
 <section id="benchmarks-and-parity">
 <h2>Benchmarks and parity<a class="headerlink" href="#benchmarks-and-parity" title="Link to this heading">#</a></h2>

@@ -594,6 +594,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -1091,6 +1092,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">backend</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
                 <span class="n">splits</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">splits</span><span class="p">,</span>
                 <span class="n">max_rows_in_combined</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">max_rows_in_combined</span><span class="p">,</span>
+                <span class="n">decode_tensor_cores</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">decode_tensor_cores</span><span class="p">,</span>
                 <span class="n">sliding_window</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sliding_window</span><span class="p">,</span>
             <span class="p">)</span>
 
@@ -1165,8 +1167,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""</span>
     <span class="n">label</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="c1"># decode and prefill take different wrapper classes; cross-attention plans</span>
-    <span class="c1"># one wrapper per label either way and leaves this False</span>
+    <span class="c1"># decode and prefill take different wrapper classes</span>
     <span class="n">is_decode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
 
 

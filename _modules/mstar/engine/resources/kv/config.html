@@ -594,6 +594,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -1503,6 +1504,12 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">KVStep</span><span class="p">(</span><span class="n">ResourceStep</span><span class="p">):</span>
     <span class="c1"># write: bool # @nsagan: opting to remove this for now bc it's dead code</span>
     <span class="n">commit</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># The step writes this cache's planned tokens eagerly, outside any captured</span>
+    <span class="c1"># graph (e.g. in ``preprocess``, before the replay). Its addressing stays an</span>
+    <span class="c1"># ordinary plan state rather than the slot's static buffers, which are sized</span>
+    <span class="c1"># for the bucket's in-graph tokens: a decoder prefill whose encoder context</span>
+    <span class="c1"># is far longer than its prompt can then replay a graph sized by the prompt.</span>
+    <span class="n">eager_write</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="c1"># e.g., for batched CFG</span>
     <span class="n">combined_labels</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>

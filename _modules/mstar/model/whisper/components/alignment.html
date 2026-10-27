@@ -594,6 +594,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -969,12 +970,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">   characters in a language written without spaces); a word starts with its first token and ends where the next word</span>
 <span class="sd">   starts, the last one where end-of-text is predicted.</span>
 
-<span class="sd">The functions here are pure tensor/numpy code with no engine dependencies,</span>
-<span class="sd">so the same math is unit-tested on the CPU and run by the decoder</span>
-<span class="sd">submodule's ``align`` walk on the GPU.</span>
+<span class="sd">Steps 1 and 2 are GPU work: the decoder submodule's ``align`` walk emits the</span>
+<span class="sd">matrix (``alignment_output``). Steps 3 and 4 run on the host in the API</span>
+<span class="sd">server, when ``WhisperModel.postprocess`` renders that output</span>
+<span class="sd">(``word_timings``). The functions here are pure tensor/numpy code with no</span>
+<span class="sd">engine dependencies, so the same math is unit-tested on the CPU.</span>
 <span class="sd">"""</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">functools</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">string</span>
 
@@ -987,6 +991,9 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># encoder positions per second: a 30 s window is 1500 positions</span>
 <span class="n">FRAMES_PER_SECOND</span> <span class="o">=</span> <span class="mi">50</span>
 <span class="n">MEDIAN_FILTER_WIDTH</span> <span class="o">=</span> <span class="mi">7</span>
+<span class="c1"># Rows of the teacher-forced sequence before the first that predicts a text</span>
+<span class="c1"># token: &lt;|sot|&gt;&lt;|lang|&gt;&lt;|task|&gt; (the &lt;|notimestamps|&gt; row predicts it)</span>
+<span class="n">PROMPT_ROWS</span> <span class="o">=</span> <span class="mi">3</span>
 <span class="n">PREPENDED_PUNCTUATION</span> <span class="o">=</span> <span class="s2">"</span><span class="se">\"</span><span class="s2">'“¿([{-"</span>
 <span class="n">APPENDED_PUNCTUATION</span> <span class="o">=</span> <span class="s2">"</span><span class="se">\"</span><span class="s2">'.。,，!！?？:：”)]}、"</span>
 <span class="c1"># Written without spaces between words: without morpheme analysis, each run of</span>
@@ -1032,33 +1039,35 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="n">trace</span>
 
 
-<span class="c1"># The double loop is ~60k cells for a full window: ~1 ms compiled by numba</span>
-<span class="c1"># (the asr extra), far longer as plain Python on the GPU thread.</span>
-<span class="k">try</span><span class="p">:</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">numba</span><span class="w"> </span><span class="kn">import</span> <span class="n">njit</span>
-
-    <span class="n">_dtw_trace_fast</span> <span class="o">=</span> <span class="n">njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">nogil</span><span class="o">=</span><span class="kc">True</span><span class="p">)(</span><span class="n">_dtw_trace</span><span class="p">)</span>
-<span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
-    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-        <span class="s2">"numba is not installed: word timestamps run the DTW in plain Python on the "</span>
-        <span class="s2">"GPU thread, far slower. Install mstar[asr]."</span>
-    <span class="p">)</span>
-    <span class="n">_dtw_trace_fast</span> <span class="o">=</span> <span class="n">_dtw_trace</span>
+<span class="nd">@functools</span><span class="o">.</span><span class="n">cache</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_compiled_dtw_trace</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">"""``_dtw_trace`` compiled by numba (the asr extra), once, on first use: the</span>
+<span class="sd">    double loop is up to ~670k cells (444 rows by 1500 frames), milliseconds</span>
+<span class="sd">    compiled and far longer as plain Python. Imported here, not at module</span>
+<span class="sd">    load, so only the process that runs the DTW loads numba. Without numba, or</span>
+<span class="sd">    if it cannot compile, the DTW stays plain Python, loudly."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">numba</span><span class="w"> </span><span class="kn">import</span> <span class="n">njit</span>
+    <span class="k">except</span> <span class="ne">ImportError</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"numba is not installed: word timestamps run the DTW in plain Python, far slower. "</span>
+                       <span class="s2">"Install mstar[asr]."</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">_dtw_trace</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">fast</span> <span class="o">=</span> <span class="n">njit</span><span class="p">(</span><span class="n">cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">nogil</span><span class="o">=</span><span class="kc">True</span><span class="p">)(</span><span class="n">_dtw_trace</span><span class="p">)</span>
+        <span class="n">fast</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float64</span><span class="p">))</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — any compile failure: keep serving</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"numba could not compile the DTW (</span><span class="si">%s</span><span class="s2">): word timestamps fall back to plain Python"</span><span class="p">,</span> <span class="n">exc</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">_dtw_trace</span>
+    <span class="k">return</span> <span class="n">fast</span>
 
 
 <div class="viewcode-block" id="warm_up">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.whisper.components.alignment.html#mstar.model.whisper.components.alignment.warm_up">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">warm_up</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Compile the DTW now, at load, rather than inside the first word-timestamp</span>
-<span class="sd">    request; fall back to plain Python, loudly, if numba cannot compile it."""</span>
-    <span class="k">global</span> <span class="n">_dtw_trace_fast</span>
-    <span class="k">if</span> <span class="n">_dtw_trace_fast</span> <span class="ow">is</span> <span class="n">_dtw_trace</span><span class="p">:</span>
-        <span class="k">return</span>
-    <span class="k">try</span><span class="p">:</span>
-        <span class="n">_dtw_trace_fast</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float64</span><span class="p">))</span>
-    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — any compile failure: keep serving</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"numba could not compile the DTW (</span><span class="si">%s</span><span class="s2">): word timestamps fall back to plain Python"</span><span class="p">,</span> <span class="n">exc</span><span class="p">)</span>
-        <span class="n">_dtw_trace_fast</span> <span class="o">=</span> <span class="n">_dtw_trace</span></div>
+<span class="w">    </span><span class="sd">"""Compile the DTW now, in the process that runs it (the API server's data</span>
+<span class="sd">    worker, at model load), rather than inside the first word-timestamp</span>
+<span class="sd">    request."""</span>
+    <span class="n">_compiled_dtw_trace</span><span class="p">()</span></div>
 
 
 
@@ -1069,7 +1078,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``cost`` (rows x frames), moving right, down or diagonally. Returns the</span>
 <span class="sd">    path's row and frame indices, each of length ``len(path)``."""</span>
     <span class="n">cost</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">ascontiguousarray</span><span class="p">(</span><span class="n">cost</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float64</span><span class="p">)</span>
-    <span class="n">trace</span> <span class="o">=</span> <span class="n">_dtw_trace_fast</span><span class="p">(</span><span class="n">cost</span><span class="p">)</span>
+    <span class="n">trace</span> <span class="o">=</span> <span class="n">_compiled_dtw_trace</span><span class="p">()(</span><span class="n">cost</span><span class="p">)</span>
     <span class="n">trace</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="p">:]</span> <span class="o">=</span> <span class="mi">2</span>
     <span class="n">trace</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">i</span><span class="p">,</span> <span class="n">j</span> <span class="o">=</span> <span class="n">cost</span><span class="o">.</span><span class="n">shape</span>
@@ -1106,6 +1115,38 @@ window.runMermaid = runMermaid;</script>
     <span class="n">w</span> <span class="o">=</span> <span class="n">median_filter</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="n">medfilt_width</span><span class="p">)</span>
     <span class="c1"># a head that never varies (or a broken pass) must not derail the DTW</span>
     <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">nan_to_num</span><span class="p">(</span><span class="n">w</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span> <span class="n">nan</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="alignment_output">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.whisper.components.alignment.html#mstar.model.whisper.components.alignment.alignment_output">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">alignment_output</span><span class="p">(</span><span class="n">weights</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">num_frames</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The align walk's one output tensor, from the alignment heads'</span>
+<span class="sd">    ``weights`` over the whole teacher-forced ``tokens``</span>
+<span class="sd">    (``&lt;|sot|&gt;&lt;|lang|&gt;&lt;|task|&gt;&lt;|notimestamps|&gt; text &lt;|eot|&gt;``).</span>
+
+<span class="sd">    Layout, float32 ``[n_text + 1, frames + 1]``: ``alignment_matrix`` of the</span>
+<span class="sd">    rows that predict each text token and end-of-text, then one column of</span>
+<span class="sd">    token ids (exact in float32): row ``i``'s text token, and on the last row</span>
+<span class="sd">    the language token, which word splitting needs. Device ops only, so the</span>
+<span class="sd">    walk never waits on the host.</span>
+<span class="sd">    """</span>
+    <span class="n">matrix</span> <span class="o">=</span> <span class="n">alignment_matrix</span><span class="p">(</span><span class="n">weights</span><span class="p">[:,</span> <span class="n">PROMPT_ROWS</span><span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">num_frames</span><span class="p">)</span>
+    <span class="n">ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">tokens</span><span class="p">[</span><span class="n">PROMPT_ROWS</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">tokens</span><span class="p">[</span><span class="mi">1</span><span class="p">:</span><span class="mi">2</span><span class="p">]])</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">matrix</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">matrix</span><span class="p">,</span> <span class="n">ids</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="unpack_output">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.whisper.components.alignment.html#mstar.model.whisper.components.alignment.unpack_output">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">unpack_output</span><span class="p">(</span><span class="n">output</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``alignment_output``'s tensor -&gt; (matrix, text token ids, language token id)."""</span>
+    <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">!=</span> <span class="mi">2</span> <span class="ow">or</span> <span class="n">output</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"an alignment output is [tokens, frames + 1] with at least one frame; got </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+        <span class="p">)</span>
+    <span class="n">ids</span> <span class="o">=</span> <span class="n">output</span><span class="p">[:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">long</span><span class="p">()</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">output</span><span class="p">[:,</span> <span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">ids</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">],</span> <span class="n">ids</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span></div>
 
 
 
@@ -1194,19 +1235,17 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="word_timings">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.whisper.components.alignment.html#mstar.model.whisper.components.alignment.word_timings">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">word_timings</span><span class="p">(</span>
-    <span class="n">weights</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">text_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">decode</span><span class="p">,</span> <span class="n">num_frames</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">language</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">matrix</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">text_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">decode</span><span class="p">,</span> <span class="n">language</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""Words with ``start`` / ``end`` seconds for one window.</span>
 
-<span class="sd">    ``weights`` holds the alignment heads' attention for the rows that</span>
-<span class="sd">    predict ``text_tokens`` plus the final row that predicts end-of-text</span>
-<span class="sd">    (``len(text_tokens) + 1`` rows); ``num_frames`` is how many mel frames</span>
-<span class="sd">    of the window carry audio; ``language`` is the transcript's language code.</span>
+<span class="sd">    ``matrix`` is ``alignment_matrix`` over the rows that predict</span>
+<span class="sd">    ``text_tokens`` plus the final row that predicts end-of-text</span>
+<span class="sd">    (``len(text_tokens) + 1`` rows); ``language`` is the transcript's</span>
+<span class="sd">    language code.</span>
 <span class="sd">    """</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">text_tokens</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">[]</span>
-    <span class="n">matrix</span> <span class="o">=</span> <span class="n">alignment_matrix</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">num_frames</span><span class="p">)</span>
     <span class="n">starts</span> <span class="o">=</span> <span class="n">token_start_frames</span><span class="p">(</span><span class="n">matrix</span><span class="p">)</span> <span class="o">/</span> <span class="n">FRAMES_PER_SECOND</span>  <span class="c1"># one per row</span>
     <span class="n">words</span> <span class="o">=</span> <span class="n">split_words</span><span class="p">(</span><span class="n">decode</span><span class="p">,</span> <span class="n">text_tokens</span><span class="p">,</span> <span class="n">language</span><span class="p">)</span>
     <span class="n">bounds</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">([[</span><span class="mi">0</span><span class="p">],</span> <span class="n">np</span><span class="o">.</span><span class="n">cumsum</span><span class="p">([</span><span class="nb">len</span><span class="p">(</span><span class="n">toks</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">toks</span> <span class="ow">in</span> <span class="n">words</span><span class="p">])])</span>

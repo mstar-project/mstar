@@ -241,6 +241,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
@@ -658,11 +659,13 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.alignment_matrix"><code class="docutils literal notranslate"><span class="pre">alignment_matrix()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.alignment_output"><code class="docutils literal notranslate"><span class="pre">alignment_output()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.dtw"><code class="docutils literal notranslate"><span class="pre">dtw()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.median_filter"><code class="docutils literal notranslate"><span class="pre">median_filter()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.merge_punctuation"><code class="docutils literal notranslate"><span class="pre">merge_punctuation()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.split_words"><code class="docutils literal notranslate"><span class="pre">split_words()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.token_start_frames"><code class="docutils literal notranslate"><span class="pre">token_start_frames()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.unpack_output"><code class="docutils literal notranslate"><span class="pre">unpack_output()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.warm_up"><code class="docutils literal notranslate"><span class="pre">warm_up()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.word_timings"><code class="docutils literal notranslate"><span class="pre">word_timings()</span></code></a></li>
 </ul>
@@ -698,34 +701,42 @@ punctuation mark, or at every run of tokens that decodes to whole
 characters in a language written without spaces); a word starts with its first token and ends where the next word
 starts, the last one where end-of-text is predicted.</p></li>
 </ol>
-<p>The functions here are pure tensor/numpy code with no engine dependencies,
-so the same math is unit-tested on the CPU and run by the decoder
-submodule’s <code class="docutils literal notranslate"><span class="pre">align</span></code> walk on the GPU.</p>
+<p>Steps 1 and 2 are GPU work: the decoder submodule’s <code class="docutils literal notranslate"><span class="pre">align</span></code> walk emits the
+matrix (<code class="docutils literal notranslate"><span class="pre">alignment_output</span></code>). Steps 3 and 4 run on the host in the API
+server, when <code class="docutils literal notranslate"><span class="pre">WhisperModel.postprocess</span></code> renders that output
+(<code class="docutils literal notranslate"><span class="pre">word_timings</span></code>). The functions here are pure tensor/numpy code with no
+engine dependencies, so the same math is unit-tested on the CPU.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.alignment_matrix" title="mstar.model.whisper.components.alignment.alignment_matrix"><code class="xref py py-obj docutils literal notranslate"><span class="pre">alignment_matrix</span></code></a>(weights, num_frames[, ...])</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">weights:</span> <span class="pre">(heads,</span> <span class="pre">rows,</span> <span class="pre">frames)</span></code> attention probabilities of the alignment heads -&gt; the <code class="docutils literal notranslate"><span class="pre">(rows,</span> <span class="pre">audio_frames)</span></code> matrix DTW walks.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.dtw" title="mstar.model.whisper.components.alignment.dtw"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dtw</span></code></a>(cost)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.alignment_output" title="mstar.model.whisper.components.alignment.alignment_output"><code class="xref py py-obj docutils literal notranslate"><span class="pre">alignment_output</span></code></a>(weights, tokens, num_frames)</p></td>
+<td><p>The align walk's one output tensor, from the alignment heads' <code class="docutils literal notranslate"><span class="pre">weights</span></code> over the whole teacher-forced <code class="docutils literal notranslate"><span class="pre">tokens</span></code> (<code class="docutils literal notranslate"><span class="pre">&lt;|sot|&gt;&lt;|lang|&gt;&lt;|task|&gt;&lt;|notimestamps|&gt;</span> <span class="pre">text</span> <span class="pre">&lt;|eot|&gt;</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.dtw" title="mstar.model.whisper.components.alignment.dtw"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dtw</span></code></a>(cost)</p></td>
 <td><p>Cheapest monotonic path from the top-left to the bottom-right of <code class="docutils literal notranslate"><span class="pre">cost</span></code> (rows x frames), moving right, down or diagonally.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.median_filter" title="mstar.model.whisper.components.alignment.median_filter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">median_filter</span></code></a>(x[, width])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.median_filter" title="mstar.model.whisper.components.alignment.median_filter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">median_filter</span></code></a>(x[, width])</p></td>
 <td><p>Sliding median over the last dim (odd <code class="docutils literal notranslate"><span class="pre">width</span></code>), edges reflected.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.merge_punctuation" title="mstar.model.whisper.components.alignment.merge_punctuation"><code class="xref py py-obj docutils literal notranslate"><span class="pre">merge_punctuation</span></code></a>(words)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.merge_punctuation" title="mstar.model.whisper.components.alignment.merge_punctuation"><code class="xref py py-obj docutils literal notranslate"><span class="pre">merge_punctuation</span></code></a>(words)</p></td>
 <td><p>openai-whisper's <code class="docutils literal notranslate"><span class="pre">merge_punctuations</span></code>: opening marks join the word after them (scanning right to left), then closing marks join the word before them.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.split_words" title="mstar.model.whisper.components.alignment.split_words"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_words</span></code></a>(decode, token_ids[, language])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.split_words" title="mstar.model.whisper.components.alignment.split_words"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_words</span></code></a>(decode, token_ids[, language])</p></td>
 <td><p>Group text tokens into words, as openai-whisper's <code class="docutils literal notranslate"><span class="pre">split_to_word_tokens</span></code>: first into pieces that decode to whole characters (a token ending inside a multi-byte character continues into the next), then, unless <code class="docutils literal notranslate"><span class="pre">language</span></code> is written without spaces, into words that begin at a leading space or a lone punctuation mark.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.token_start_frames" title="mstar.model.whisper.components.alignment.token_start_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">token_start_frames</span></code></a>(matrix)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.token_start_frames" title="mstar.model.whisper.components.alignment.token_start_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">token_start_frames</span></code></a>(matrix)</p></td>
 <td><p>The frame at which the DTW path first enters each row of <code class="docutils literal notranslate"><span class="pre">matrix</span></code> (a high value is a good alignment, so the path minimizes <code class="docutils literal notranslate"><span class="pre">-matrix</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.warm_up" title="mstar.model.whisper.components.alignment.warm_up"><code class="xref py py-obj docutils literal notranslate"><span class="pre">warm_up</span></code></a>()</p></td>
-<td><p>Compile the DTW now, at load, rather than inside the first word-timestamp request; fall back to plain Python, loudly, if numba cannot compile it.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.unpack_output" title="mstar.model.whisper.components.alignment.unpack_output"><code class="xref py py-obj docutils literal notranslate"><span class="pre">unpack_output</span></code></a>(output)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">alignment_output</span></code>'s tensor -&gt; (matrix, text token ids, language token id).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.word_timings" title="mstar.model.whisper.components.alignment.word_timings"><code class="xref py py-obj docutils literal notranslate"><span class="pre">word_timings</span></code></a>(weights, text_tokens, decode, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.warm_up" title="mstar.model.whisper.components.alignment.warm_up"><code class="xref py py-obj docutils literal notranslate"><span class="pre">warm_up</span></code></a>()</p></td>
+<td><p>Compile the DTW now, in the process that runs it (the API server's data worker, at model load), rather than inside the first word-timestamp request.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.alignment.word_timings" title="mstar.model.whisper.components.alignment.word_timings"><code class="xref py py-obj docutils literal notranslate"><span class="pre">word_timings</span></code></a>(matrix, text_tokens, decode[, ...])</p></td>
 <td><p>Words with <code class="docutils literal notranslate"><span class="pre">start</span></code> / <code class="docutils literal notranslate"><span class="pre">end</span></code> seconds for one window.</p></td>
 </tr>
 </tbody>
@@ -745,6 +756,31 @@ different sharpness weigh alike, smoothed along time, then averaged.</p>
 <li><p><strong>weights</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>num_frames</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>medfilt_width</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.whisper.components.alignment.alignment_output">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.whisper.components.alignment.</span></span><span class="sig-name descname"><span class="pre">alignment_output</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">weights</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_frames</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/alignment.html#alignment_output"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.alignment.alignment_output" title="Link to this definition">#</a></dt>
+<dd><p>The align walk’s one output tensor, from the alignment heads’
+<code class="docutils literal notranslate"><span class="pre">weights</span></code> over the whole teacher-forced <code class="docutils literal notranslate"><span class="pre">tokens</span></code>
+(<code class="docutils literal notranslate"><span class="pre">&lt;|sot|&gt;&lt;|lang|&gt;&lt;|task|&gt;&lt;|notimestamps|&gt;</span> <span class="pre">text</span> <span class="pre">&lt;|eot|&gt;</span></code>).</p>
+<p>Layout, float32 <code class="docutils literal notranslate"><span class="pre">[n_text</span> <span class="pre">+</span> <span class="pre">1,</span> <span class="pre">frames</span> <span class="pre">+</span> <span class="pre">1]</span></code>: <code class="docutils literal notranslate"><span class="pre">alignment_matrix</span></code> of the
+rows that predict each text token and end-of-text, then one column of
+token ids (exact in float32): row <code class="docutils literal notranslate"><span class="pre">i</span></code>’s text token, and on the last row
+the language token, which word splitting needs. Device ops only, so the
+walk never waits on the host.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>weights</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>tokens</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>num_frames</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -840,10 +876,25 @@ without clean-up, so the pieces’ texts add up to <code class="docutils literal
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.whisper.components.alignment.unpack_output">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.whisper.components.alignment.</span></span><span class="sig-name descname"><span class="pre">unpack_output</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">output</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/alignment.html#unpack_output"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.alignment.unpack_output" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">alignment_output</span></code>’s tensor -&gt; (matrix, text token ids, language token id).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>output</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>], <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.whisper.components.alignment.warm_up">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.whisper.components.alignment.</span></span><span class="sig-name descname"><span class="pre">warm_up</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/alignment.html#warm_up"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.alignment.warm_up" title="Link to this definition">#</a></dt>
-<dd><p>Compile the DTW now, at load, rather than inside the first word-timestamp
-request; fall back to plain Python, loudly, if numba cannot compile it.</p>
+<dd><p>Compile the DTW now, in the process that runs it (the API server’s data
+worker, at model load), rather than inside the first word-timestamp
+request.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>None</p>
@@ -853,18 +904,17 @@ request; fall back to plain Python, loudly, if numba cannot compile it.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.whisper.components.alignment.word_timings">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.whisper.components.alignment.</span></span><span class="sig-name descname"><span class="pre">word_timings</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">weights</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">text_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decode</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_frames</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">language</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/alignment.html#word_timings"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.alignment.word_timings" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.whisper.components.alignment.</span></span><span class="sig-name descname"><span class="pre">word_timings</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">matrix</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">text_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decode</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">language</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/alignment.html#word_timings"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.alignment.word_timings" title="Link to this definition">#</a></dt>
 <dd><p>Words with <code class="docutils literal notranslate"><span class="pre">start</span></code> / <code class="docutils literal notranslate"><span class="pre">end</span></code> seconds for one window.</p>
-<p><code class="docutils literal notranslate"><span class="pre">weights</span></code> holds the alignment heads’ attention for the rows that
-predict <code class="docutils literal notranslate"><span class="pre">text_tokens</span></code> plus the final row that predicts end-of-text
-(<code class="docutils literal notranslate"><span class="pre">len(text_tokens)</span> <span class="pre">+</span> <span class="pre">1</span></code> rows); <code class="docutils literal notranslate"><span class="pre">num_frames</span></code> is how many mel frames
-of the window carry audio; <code class="docutils literal notranslate"><span class="pre">language</span></code> is the transcript’s language code.</p>
+<p><code class="docutils literal notranslate"><span class="pre">matrix</span></code> is <code class="docutils literal notranslate"><span class="pre">alignment_matrix</span></code> over the rows that predict
+<code class="docutils literal notranslate"><span class="pre">text_tokens</span></code> plus the final row that predicts end-of-text
+(<code class="docutils literal notranslate"><span class="pre">len(text_tokens)</span> <span class="pre">+</span> <span class="pre">1</span></code> rows); <code class="docutils literal notranslate"><span class="pre">language</span></code> is the transcript’s
+language code.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>weights</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>matrix</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>text_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>num_frames</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>language</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
@@ -924,11 +974,13 @@ of the window carry audio; <code class="docutils literal notranslate"><span clas
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.alignment_matrix"><code class="docutils literal notranslate"><span class="pre">alignment_matrix()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.alignment_output"><code class="docutils literal notranslate"><span class="pre">alignment_output()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.dtw"><code class="docutils literal notranslate"><span class="pre">dtw()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.median_filter"><code class="docutils literal notranslate"><span class="pre">median_filter()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.merge_punctuation"><code class="docutils literal notranslate"><span class="pre">merge_punctuation()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.split_words"><code class="docutils literal notranslate"><span class="pre">split_words()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.token_start_frames"><code class="docutils literal notranslate"><span class="pre">token_start_frames()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.unpack_output"><code class="docutils literal notranslate"><span class="pre">unpack_output()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.warm_up"><code class="docutils literal notranslate"><span class="pre">warm_up()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.whisper.components.alignment.word_timings"><code class="docutils literal notranslate"><span class="pre">word_timings()</span></code></a></li>
 </ul>
