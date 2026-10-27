@@ -632,6 +632,11 @@ class BagelModel(Model):
         """
         result: NameToTensorList = {}
 
+        # Refused here, where it is a 400 before admission: with no text and no
+        # image the prefill schedule is empty and the request would open on a
+        # decode with no token, and blank text would generate from the template alone.
+        if (prompt is None or not prompt.strip()) and "image" not in input_modalities:
+            raise ValueError("BAGEL requires a text prompt or an image")
         if prompt is not None:
             target_output = output_modalities[0] if output_modalities else "text"
             is_understanding = target_output == "text"

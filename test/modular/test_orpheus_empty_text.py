@@ -51,10 +51,10 @@ def _orpheus() -> OrpheusModel:
 
 
 class _Server:
-    """The API server, its message thread and the data worker loop, wired to
-    a recording conductor socket."""
+    """The API server, its message thread and the data worker loop for
+    ``model`` (Orpheus by default), wired to a recording conductor socket."""
 
-    def __init__(self):
+    def __init__(self, model=None, model_name="orpheus"):
         self.socket = _Socket()
         self.stop = threading.Event()
         worker = PreprocessWorkerThread(
@@ -69,7 +69,7 @@ class _Server:
             stop_event=self.stop,
             communicator=self.socket,
             tensor_manager=_TensorManager(),
-            model=_orpheus(),
+            model=model if model is not None else _orpheus(),
         )
         facade = PreprocessWorker.__new__(PreprocessWorker)
         facade.request_input_queue = worker.in_queue
@@ -82,7 +82,7 @@ class _Server:
         facade.profile_queue = worker.profile_queue
         facade.received_chunk_counts = {}
         facade.per_request_reading_tensors = {}
-        self.api = make_test_api_server(preprocess_worker=facade, model=worker.model, model_name="orpheus")
+        self.api = make_test_api_server(preprocess_worker=facade, model=worker.model, model_name=model_name)
         self.api.communicator = SimpleNamespace(get_all_new_messages=lambda: [])
         self.api.conductor_proc = None
         self.api._liveness_interval_s = 0.5
