@@ -279,8 +279,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         video_noise = torch.randn((1, *refine_video.shape), generator=generator, dtype=refine_video.dtype)[0]
         audio_noise = torch.randn((1, *refine_audio.shape), generator=generator, dtype=refine_audio.dtype)[0]
         scale = STAGE_2_DISTILLED_SIGMA_VALUES[0]
-        video = scale * video_noise.to(device) + (1 - scale) * refine_video
-        audio = scale * audio_noise.to(device) + (1 - scale) * refine_audio
+        video = scale * self.stage_seed(video_noise, device) + (1 - scale) * refine_video
+        audio = scale * self.stage_seed(audio_noise, device) + (1 - scale) * refine_audio
         return {LATENTS: video.to(torch.float32), AUDIO_LATENTS: audio.to(torch.float32)}
 
     def seed_loop_back(self, fwd_info, bucket_key: LTXShape, generator: torch.Generator) -> dict[str, torch.Tensor]:
