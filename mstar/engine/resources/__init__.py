@@ -51,6 +51,7 @@ from mstar.engine.resources.position.config import (
 )
 from mstar.engine.resources.runner import StepRunner, topo_sort
 from mstar.engine.resources.sampler.config import (
+    LoopbackState,
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
@@ -120,6 +121,7 @@ __all__ = [
     "RingKVConfig",
     "RingKVLayerConfig",
     "RingKVStep",
+    "LoopbackState",
     "SamplerSpec",
     "SamplerStep",
     "SamplingReqConfig",

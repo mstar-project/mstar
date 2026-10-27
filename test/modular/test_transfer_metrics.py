@@ -35,6 +35,7 @@ from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.graph.loop_indices import NestedLoopIndices  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers  # noqa: E402
+from mstar.streaming.topology import PartitionTopology  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessageType,
     EnableMetrics,
@@ -55,6 +56,13 @@ class _Sink:
 
     def send(self, entity_id, msg):
         self.sent.append((entity_id, msg))
+
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
 
     def get_all_new_messages(self):
         return []
@@ -358,6 +366,9 @@ class _TextModel:
 
     def stop_token_ids(self):
         return None
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
 
 def test_the_data_worker_loop_publishes_the_results_it_reads(tmp_path, monkeypatch):

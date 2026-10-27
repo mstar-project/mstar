@@ -59,7 +59,7 @@ def test_a_per_slot_block_has_no_layer_axis():
         pool.block("count", 0)
     with pytest.raises(ValueError, match="per layer"):
         pool.block("state")
-    assert pool.config.slot_bytes == LAYERS * 2 * 4 * 4 + 4
+    assert sum(t.nbytes for t in pool._blocks.values()) == SLOTS * (LAYERS * 2 * 4 * 4 + 4)
 
 
 def test_released_slots_are_zeroed_and_forks_copy():

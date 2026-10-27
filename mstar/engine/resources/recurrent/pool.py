@@ -77,15 +77,18 @@ class RecurrentStatePool(Resource):
         config = spec.config
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
+        # resolved here, not written back: the config is the model's, shared by its specs
         return cls(
             device=info.device, config=config, comm_group=info.joint_comm_group,
-            name=spec.resource_key,
+            name=spec.resource_key, kv_dtype=info.kv_dtype,
         )
 
     def __init__(
         self, device: torch.device, config: RecurrentStateConfig,
         comm_group: JointGroups | None = None, name: str = "recurrent_state",
+        kv_dtype: torch.dtype | None = None,
     ):
+        """``kv_dtype`` (the engine's) stands in for a block's ``dtype=None``."""
         self._device = device
         self.config = config
         self._comm_group = comm_group
@@ -100,7 +103,7 @@ class RecurrentStatePool(Resource):
             name: torch.zeros(
                 (*((config.num_layers,) if block.per_layer else ()),
                  config.max_slots, *block.shape),
-                dtype=block.dtype,
+                dtype=block.resolved_dtype(kv_dtype),
                 device=device,
             )
             for name, block in config.blocks.items()
@@ -139,12 +142,14 @@ class RecurrentStatePool(Resource):
         self._preplanned = False
         self._cached_plan_output: dict[str, RecurrentAddressing] | None = None
 
+        # from the blocks, not the config: a dtype=None block is sized as resolved
+        total_bytes = sum(t.nbytes for t in self._blocks.values())
         logger.info(
             "recurrent state pool: %d usable slots (+%d sink) x %d layers, "
             "%.2f MiB (%.2f KiB/slot), blocks=%s",
             config.usable_slots, config.max_slots - config.usable_slots,
             config.num_layers,
-            config.total_bytes / 2**20, config.slot_bytes / 2**10,
+            total_bytes / 2**20, total_bytes / config.max_slots / 2**10,
             {n: tuple(b.shape) for n, b in config.blocks.items()},
         )
 
