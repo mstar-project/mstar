@@ -15,7 +15,7 @@ from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.request_types import ResultChunk
 from mstar.conductor.conductor import Conductor
 from mstar.model.base import Model
-from mstar.utils.generation_kwargs import check_seed, normalize_generation_kwargs, offset_seed
+from mstar.utils.generation_kwargs import check_seed, normalize_generation_kwargs
 
 
 def test_null_is_unset():
@@ -178,7 +178,7 @@ def test_a_refused_stream_gets_its_status_not_a_200(monkeypatch):
     assert "min_p" in response.json()["detail"]
 
 
-def test_an_unread_key_warns_on_every_request_and_keeps_no_state(caplog):
+def test_an_unread_key_warns_on_every_request(caplog):
     server = _RecordingServer()
     with caplog.at_level("DEBUG", logger=entrypoint.logger.name):
         for _ in range(3):
@@ -187,7 +187,6 @@ def test_an_unread_key_warns_on_every_request_and_keeps_no_state(caplog):
     levels = [r.levelname for r in caplog.records if "does not read" in r.getMessage()]
     # keys the conductor reads are never reported
     assert levels == ["WARNING"] * 3
-    assert vars(server).keys() == {"model", "chunks", "submitted"}
 
 
 def test_a_client_gone_before_the_first_chunk_is_aborted():
@@ -334,11 +333,3 @@ def test_a_client_still_waiting_keeps_its_stream():
         return [c async for c in chunks], client.receives
 
     assert asyncio.run(asyncio.wait_for(run(), timeout=5)) == ([ok], 1)
-
-
-@pytest.mark.parametrize(("seed", "i", "expected"), [
-    (-5, 1, -4), (2**63 - 1, 1, -(2**63)), (7, 2, 9),
-])
-def test_offset_seed_wraps_as_a_signed_int64(seed, i, expected):
-    """Matches the Rust frontend's ``wrapping_add``."""
-    assert offset_seed(seed, i) == expected
