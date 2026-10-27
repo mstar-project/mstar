@@ -506,6 +506,19 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
+- ``configs/qwen3omni_colocated_early_audio.yaml`` starts audio after 8 frames
+  and ramps up in smaller steps, ``codec_chunk_schedule: [8, 10, 13, 16, 20]``.
+  No chunk is more than 1.3x the one before, so each one arrives before the
+  previous one has played while the Talker gives a request about 16 frames/s.
+  The default's 13 to 25 frame step needs about 24, which one MI300X serving
+  32 requests doesn't always give a request over its first chunks. It's the
+  recommended deployment on AMD GPUs. Measured on one MI300X (a VM slice, one
+  run per cell), text prompts: TTFA p50 192 / 436 / 542 ms at c=1 / 16 / 32
+  against 250 / 529 / 684 ms with the default; at c=32 the harness counts
+  every chunk in time for text and image prompts (0.99 and 0.97 with the
+  default) at the same text throughput, with image throughput 3% lower in its
+  one pair of runs. Spoken questions at c=32 keep one GPU too busy for either
+  ramp (0.90 of chunks in time, 0.87 with the default).
 
 Qwen3-TTS notes
 ---------------
