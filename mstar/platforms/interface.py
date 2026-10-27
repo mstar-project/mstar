@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from mstar.platforms.ptxas import blackwell_ptxas_env
+
 
 class Platform:
     """One accelerator stack; ``current_platform`` is the one this process runs.
@@ -79,6 +81,9 @@ class CudaPlatform(Platform):
 
     def cuda_capability(self, device=None) -> tuple[int, int]:
         return torch.cuda.get_device_capability(device)
+
+    def process_env_defaults(self) -> dict[str, str]:
+        return blackwell_ptxas_env()
 
 
 class RocmPlatform(Platform):
