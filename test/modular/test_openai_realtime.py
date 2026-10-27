@@ -24,6 +24,7 @@ pytest.importorskip("httpx")
 from fastapi import FastAPI, HTTPException, WebSocketDisconnect  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from mstar.api_server import media_io  # noqa: E402
 from mstar.api_server.openai import adapters, serving_realtime  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs, Transcript  # noqa: E402
 
@@ -56,13 +57,14 @@ class _StubAPI:
         self.upload_dir = Path(tempfile.mkdtemp())
         self.submits: list = []
         self.answers: list[str] = []  # raw generations, one per step, in order
-        self.audio_sizes: list[int] = []
+        self.audio_samples: list[int] = []
         self._chunks: dict = {}
 
     def submit_request(self, **kw):
         self.submits.append(kw)
-        # the step's WAV is deleted once the step is done
-        self.audio_sizes.append(Path(kw["file_paths"]["audio"][0]).stat().st_size)
+        # a step's audio is its clip, never a file
+        assert not (kw.get("file_paths") or {}).get("audio")
+        self.audio_samples.append(kw["clip"].samples)
         answer = self.answers.pop(0) if self.answers else ""
         self._chunks[kw["request_id"]] = [_Chunk("text", answer.encode())]
         return kw["request_id"]
@@ -85,14 +87,15 @@ class _ContinuingAdapter(adapters.OpenAIAdapter):
     supports_realtime_transcription = True
 
     def transcription_to_request(self, req, audio_path):
-        return SubmitArgs(text="", file_paths={"audio": [audio_path]}, input_modalities=["audio", "text"],
-                          output_modalities=["text"], model_kwargs=adapters._transcription_kwargs(req))
-
-    def realtime_step_request(self, req, audio_path, prefix):
-        args = self.transcription_to_request(req, audio_path)
-        if prefix:
-            args.model_kwargs["assistant_prefix"] = prefix
+        args = self.realtime_step_request(req, "")
+        args.file_paths = {"audio": [audio_path]}
         return args
+
+    def realtime_step_request(self, req, prefix):
+        kwargs = adapters._transcription_kwargs(req)
+        if prefix:
+            kwargs["assistant_prefix"] = prefix
+        return SubmitArgs(text="", input_modalities=["audio", "text"], output_modalities=["text"], model_kwargs=kwargs)
 
     def parse_transcript(self, text, req):
         language = None
@@ -203,12 +206,18 @@ def test_session_streams_partials_deltas_and_completion(client_and_stub):
         assert events[-1]["transcript"] == "hello friend you today"
         # the tail flush (0.5 s) was a third step, and every step hears all audio so far
         assert len(stub.submits) == 3
-        durations = stub.audio_sizes
-        assert not list(stub.upload_dir.iterdir())
+        durations = stub.audio_samples
         assert durations == sorted(durations) and durations[0] < durations[-1]
+        # the steps of one item re-send one clip, which the prefix cache keys their audio by
+        assert len({id(submit["clip"]) for submit in stub.submits}) == 1
         # a committed utterance starts a fresh item
         ws.send_text(json.dumps({"type": "input_audio_buffer.clear"}))
         assert json.loads(ws.receive_text())["type"] == "input_audio_buffer.cleared"
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(1.0)}))
+        _recv_until(ws, "mstar.transcription.partial")
+        assert stub.submits[-1]["clip"].nonce != stub.submits[0]["clip"].nonce, (
+            "a new item re-used the last one's clip, so its audio would be keyed as the old item's"
+        )
 
 
 def test_revision_of_sent_text_is_not_resent():
@@ -273,8 +282,8 @@ def _step_samples(stub) -> list[np.ndarray]:
     submit = stub.submit_request
 
     def recording_submit(**kw):
-        with wave.open(kw["file_paths"]["audio"][0], "rb") as wf:
-            heard.append(np.frombuffer(wf.readframes(wf.getnframes()), dtype="<i2").astype(np.int32))
+        # as int16, the way the samples went out when a step sent a WAV
+        heard.append(media_io.to_pcm16(kw["clip"].audio().numpy()).astype(np.int32))
         return submit(**kw)
 
     stub.submit_request = recording_submit
@@ -385,8 +394,7 @@ def test_bad_session_update_is_an_error_and_changes_nothing(client_and_stub):
 
 
 def _step_seconds(stub) -> list[float]:
-    # 44-byte WAV header, 16-bit mono
-    return [(size - 44) / 2 / serving_realtime.SAMPLE_RATE for size in stub.audio_sizes]
+    return [samples / serving_realtime.SAMPLE_RATE for samples in stub.audio_samples]
 
 
 def _update(mstar=None, **session) -> str:
@@ -627,13 +635,20 @@ def test_item_length_is_capped(client_and_stub, monkeypatch):
     assert _step_seconds(stub) == [4.0, 5.0, 4.0]
 
 
-def test_item_cap_follows_a_shorter_model_limit(client_and_stub, monkeypatch):
+@pytest.mark.parametrize("model_cap, env_cap, cap", [(3.0, None, 3), (None, "3", 3), (None, "1", 1)])
+def test_item_cap_follows_a_shorter_model_or_env_limit(client_and_stub, monkeypatch, model_cap, env_cap, cap):
     client, stub = client_and_stub
-    monkeypatch.setattr(adapters.ADAPTER_REGISTRY["rt_test"], "max_audio_seconds", 3.0, raising=False)
+    if model_cap is not None:
+        monkeypatch.setattr(adapters.ADAPTER_REGISTRY["rt_test"], "max_audio_seconds", model_cap, raising=False)
+    if env_cap is not None:
+        monkeypatch.setenv("MSTAR_MAX_AUDIO_SECONDS", env_cap)
     with client.websocket_connect("/v1/realtime") as ws:
-        assert json.loads(ws.receive_text())["session"]["mstar"]["max_item_seconds"] == 3.0
-        ws.send_text(_update({"chunk_seconds": 4.0}))
-        assert "between 0.5 and 3" in json.loads(ws.receive_text())["error"]["message"]
+        assert json.loads(ws.receive_text())["session"]["mstar"]["max_item_seconds"] == cap
+        # the default chunk fits under a cap shorter than it
+        ws.send_text(_update(input_audio_transcription={"language": "en"}))
+        assert json.loads(ws.receive_text())["type"] == "transcription_session.updated"
+        ws.send_text(_update({"chunk_seconds": cap + 1}))
+        assert f"between 0.5 and {cap}" in json.loads(ws.receive_text())["error"]["message"]
 
 
 def test_failed_step_does_not_reuse_its_request_id(client_and_stub):
@@ -763,19 +778,19 @@ def test_failed_step_server_error_is_generic_with_an_error_id(client_and_stub, c
     assert "/dev/shm/mstar_arena_w0_4242_ab12.seg3" in caplog.text
 
 
-def test_request_error_raised_locally_does_not_name_the_upload_dir(client_and_stub, monkeypatch):
+def test_request_error_raised_locally_does_not_show_server_paths(client_and_stub, monkeypatch):
     client, stub = client_and_stub
     adapter = adapters.ADAPTER_REGISTRY["rt_test"]
 
-    def refuse(req, audio_path, prefix):
-        raise ValueError(f"cannot read {audio_path}")
+    def refuse(req, prefix):
+        raise ValueError("cannot read /srv/models/private/vocab.json")
 
     monkeypatch.setattr(adapter, "realtime_step_request", refuse)
     with client.websocket_connect("/v1/realtime") as ws:
         ws.receive_text()
         ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2.0)}))
         message = json.loads(ws.receive_text())["error"]["message"]
-    assert message.startswith("cannot read <upload>/") and str(stub.upload_dir) not in message
+    assert message == "cannot read vocab.json"
 
 
 @pytest.mark.parametrize("raw, scrubbed", [
@@ -1094,7 +1109,7 @@ def test_a_character_split_across_token_chunks_survives_a_step():
     api.answers = [text]
     session = types.SimpleNamespace(
         session_id="s", request=serving_realtime.TranscriptionRequest(model="rt_test"),
-        audio_so_far=lambda: np.zeros(1600, dtype=np.float32),
+        clip=serving_realtime.GrowingClip(),
     )
     out = asyncio.run(serving_realtime._run_step(api, _ContinuingAdapter(), session, "pre "))
     assert out == "pre " + text

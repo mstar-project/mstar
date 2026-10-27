@@ -144,24 +144,21 @@ def test_chat_stream_flushes_an_unfinished_character_before_stop():
 # /v1/realtime
 # ----------------------------------------------------------------------
 
-def test_realtime_step_joins_text_before_decoding(tmp_path):
+def test_realtime_step_joins_text_before_decoding():
     pytest.importorskip("fastapi")
     from mstar.api_server.openai.adapters import SubmitArgs
     from mstar.api_server.openai.protocol import TranscriptionRequest
     from mstar.api_server.openai.serving_realtime import RealtimeSession, _run_step
 
     class API:
-        upload_dir = str(tmp_path)
-
         def submit_request(self, **kwargs):
             pass
 
         async def collect_results(self, request_id):
             return [_chunk(p) for p in PIECES]
 
-    adapter = SimpleNamespace(realtime_step_request=lambda req, path, prefix: SubmitArgs(
-        text="", file_paths={"audio": [path]}, input_modalities=["audio"],
-        output_modalities=["text"], model_kwargs={},
+    adapter = SimpleNamespace(realtime_step_request=lambda req, prefix: SubmitArgs(
+        text="", input_modalities=["audio"], output_modalities=["text"], model_kwargs={},
     ))
     session = RealtimeSession(session_id="s", request=TranscriptionRequest(model="m"))
     assert asyncio.run(_run_step(API(), adapter, session, "prefix ")) == "prefix " + TEXT

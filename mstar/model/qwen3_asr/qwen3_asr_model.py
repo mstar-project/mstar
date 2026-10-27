@@ -51,8 +51,20 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import (
+    ForwardPassArgs,
+    GrowingClip,
+    KVLabel,
+    LabelLayout,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    TensorAndMetadata,
+    TensorRange,
+)
 from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
+from mstar.model.components.aut_encoder import aut_window_spans
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.qwen3_asr.config import (
     ASR_TEXT_TAG,
@@ -133,6 +145,9 @@ class Qwen3ASRModel(Model):
         )
         self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+
+    def checkpoint_path(self) -> str | None:
+        return str(self.local_dir)
 
     # -------------------------------------------------------------------
     # Model ABC: resources
@@ -387,6 +402,10 @@ class Qwen3ASRModel(Model):
             raise ValueError(
                 f"Qwen3-ASR expects one audio input per request, got {len(raw_audio_inputs)}."
             )
+        # a file is loaded at the model's rate; a request's clip must be at it too
+        rate = (kwargs.get("input_metadata") or {}).get("audio_inputs", [{}])[0].get("sample_rate")
+        if rate not in (None, self.config.sampling_rate):
+            raise ValueError(f"Qwen3-ASR takes {self.config.sampling_rate} Hz audio; got {rate} Hz")
         waveform = raw_audio_inputs[0].reshape(-1).to(torch.float32).cpu()
         if waveform.numel() == 0:
             raise ValueError("Qwen3-ASR received an empty audio input.")
@@ -403,7 +422,8 @@ class Qwen3ASRModel(Model):
 
         # The samples go to the encoder as they are. The log-mel is its first
         # step on the GPU (spectrograms on the data worker's CPU threads were
-        # the serving bottleneck). The prompt only needs the frame count.
+        # the serving bottleneck). The prompt only needs the frame count, and
+        # only a keyed request with a complete window takes a CPU spectrogram.
         num_frames = self.log_mel.num_frames(waveform.numel())
         num_audio_tokens = self.config.audio.tokens_for_frames(num_frames)
         kw = checked_request_kwargs(kwargs)
@@ -413,25 +433,51 @@ class Qwen3ASRModel(Model):
             num_audio_tokens, context=context, language=language,
             assistant_prefix=kwargs.get("assistant_prefix") or "",
         )
+        slot = ids.index(self.config.audio_token_id)
         return ProcessPromptOutput(
             new_input_tensors={
                 "audio": [waveform.contiguous()],
                 "text_inputs": [torch.tensor(ids, dtype=torch.long)],
             },
             metadata={
-                "audio_slot": ids.index(self.config.audio_token_id), "audio_tokens": num_audio_tokens,
+                "audio_slot": slot, "audio_tokens": num_audio_tokens,
                 "kv_layout": {KV_CACHE: {"main": LabelLayout(
-                    spans=(Span("rows", PREFILL_WALK, len(ids), len(ids), "text_inputs"),),
+                    spans=self.prefill_spans(
+                        waveform, slot, len(ids),
+                        clip=kwargs.get("growing_clip") if kwargs.get("prefix_cache") is not False else None,
+                    ),
                     growth=((DECODE_LOOP, 1),),
                 )}},
             },
+        )
+
+    def prefill_spans(
+        self, waveform: torch.Tensor, head: int, total: int, clip: GrowingClip | None,
+    ) -> tuple[Span, ...]:
+        """The prefill's ``total`` slots as the prefix cache keys them: the ``head`` ids
+        before the audio, one item per complete encoder window, then rows nothing keys.
+
+        A realtime re-decode sends its item's ``clip`` again, longer, and shares the
+        windows an earlier step completed (`aut_window_spans`). A request of no clip, or
+        one with the cache off, or with no complete window yet, is laid out unkeyed.
+        """
+        windows = aut_window_spans(waveform, self.log_mel, self.config.audio, PREFILL_WALK, "audio", clip)
+        if not windows:
+            return (Span("rows", PREFILL_WALK, total, total, "text_inputs"),)
+        rest = total - head - sum(span.length for span in windows)
+        return (
+            Span("ids", PREFILL_WALK, head, head, TensorRange("text_inputs", 0, 0, head)),
+            *windows,
+            Span("rows", PREFILL_WALK, rest, rest, "text_inputs"),
         )
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {DECODE_LOOP: self.get_max_output_tokens(**model_kwargs)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
+        return {KV_CACHE: {"main": KVLabel(
+            growth=((DECODE_WALK, DECODE_LOOP),), keys=PrefixKeys("text_inputs", (PREFILL_WALK,)),
+        )}}
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

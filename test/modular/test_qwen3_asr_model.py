@@ -9,6 +9,7 @@ registry/CLI/benchmark wiring.
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,9 +17,11 @@ import yaml
 
 sys.path.insert(0, ".")
 
+from mstar.api_server.data_worker import PreprocessWorkerThread, _kv_page_sizes  # noqa: E402
 from mstar.engine.resources import KVSpec, RaggedAttentionSpec  # noqa: E402
+from mstar.model.base import GrowingClip, TensorRange, keyed_labels  # noqa: E402
 from mstar.model.components.audio_features import LogMelSpectrogram  # noqa: E402
-from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
+from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig, aut_window_spans  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3LMConfig  # noqa: E402
 from mstar.model.qwen3_asr.config import (  # noqa: E402
     ASR_TEXT_TAG,
@@ -225,8 +228,8 @@ def test_process_prompt_builds_features_and_prompt():
     slot, count = result.metadata["audio_slot"], result.metadata["audio_tokens"]
     assert count == n_tokens and ids[slot:slot + count] == [AUDIO_PAD] * count
     assert set(result.metadata) <= {*model.INTERNAL_KWARGS, "kv_layout"}
-    # the prompt span is what the prefill writes: every id, audio run included
-    assert [span.length for span in result.metadata["kv_layout"][KV_CACHE]["main"].spans] == [len(ids)]
+    # the prompt spans are what the prefill writes: every id, audio run included
+    assert sum(span.length for span in result.metadata["kv_layout"][KV_CACHE]["main"].spans) == len(ids)
 
     free = model.process_prompt("hot words", ["audio", "text"], ["text"], {"audio_inputs": [wave]})
     free_ids = free.new_input_tensors["text_inputs"][0].tolist()
@@ -239,7 +242,7 @@ def test_process_prompt_builds_features_and_prompt():
         None, ["audio"], ["text"], {"audio_inputs": [wave]}, assistant_prefix="language English<asr_text> hi",
     )
     prefixed_ids = prefixed.new_input_tensors["text_inputs"][0].tolist()
-    assert [span.length for span in prefixed.metadata["kv_layout"][KV_CACHE]["main"].spans] == [len(prefixed_ids)]
+    assert sum(span.length for span in prefixed.metadata["kv_layout"][KV_CACHE]["main"].spans) == len(prefixed_ids)
     assert prefixed_ids[-3:] == model.tokenizer.encode("<asr_text> hi")[-3:]
     slot = prefixed.metadata["audio_slot"]
     assert prefixed_ids[slot:slot + n_tokens] == [AUDIO_PAD] * n_tokens
@@ -251,6 +254,115 @@ def test_process_prompt_builds_features_and_prompt():
                              {"audio_inputs": [torch.zeros(model.config.max_audio_samples + 16_000)]})
     with pytest.raises(ValueError, match="one audio input"):
         model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": []})
+    with pytest.raises(ValueError, match="24000 Hz"):
+        model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [wave]},
+                             input_metadata={"audio_inputs": [{"sample_rate": 24_000, "num_channels": 1}]})
+
+
+# A streaming session re-decodes its audio so far every chunk. In the tiny config a window is
+# 200 frames (2 s, 26 tokens) and a frame reads 200 samples either side of its 160-sample hop,
+# so window w is complete once the clip holds 32000 * (w + 1) + 40 samples.
+WINDOWS = [(0, 32040), (31800, 64040)]
+
+
+@pytest.mark.parametrize(("samples", "windows"), [
+    (32039, []),
+    (32040, WINDOWS[:1]),
+    (64039, WINDOWS[:1]),
+    (64040, WINDOWS),
+])
+def test_a_window_is_complete_once_the_clip_reaches_its_last_frames_half_window(samples, windows):
+    model = _make_model()
+    wave = torch.randn(samples)
+    spans = aut_window_spans(wave, model.log_mel, model.config.audio, PREFILL_WALK, "audio", GrowingClip())
+    assert [span.source[2:] for span in spans] == windows, (
+        "a window was keyed before the samples its last frames read had arrived, or not keyed "
+        "once they had, or by fewer samples than its frames read"
+    )
+    assert all(span.params == (pytest.approx(float(model.log_mel(wave).max()), rel=1e-6),) for span in spans), (
+        "the peak a window is keyed by, put together chunk by chunk, is not the whole clip's"
+    )
+
+
+@pytest.mark.parametrize(("samples", "kwargs", "windows"), [
+    (64040, {}, 2),
+    (32039, {}, 0),
+    (64040, {"prefix_cache": False}, 0),
+    (64040, {"growing_clip": None}, 0),
+], ids=["two windows", "no window", "cache off", "no clip"])
+def test_the_prefill_keys_the_ids_before_the_audio_and_each_complete_window(samples, kwargs, windows):
+    model = _make_model()
+    kwargs = {"growing_clip": GrowingClip(), **kwargs}
+    out = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [torch.randn(samples)]}, **kwargs)
+    ids = out.new_input_tensors["text_inputs"][0]
+    spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
+    slot, width = out.metadata["audio_slot"], model.config.audio.window_tokens
+
+    expect = [("rows", len(ids), "text_inputs")]
+    if windows:
+        expect = [
+            ("ids", slot, TensorRange("text_inputs", 0, 0, slot)),
+            *(("digest", width, TensorRange("audio", 0, *window)) for window in WINDOWS[:windows]),
+            ("rows", len(ids) - slot - windows * width, "text_inputs"),
+        ]
+    assert [(span.kind, span.length, span.source) for span in spans] == expect, (
+        "the prefill's keyed parts are not the ids before the audio and one item per complete window, "
+        "or a request with nothing to share paid for a spectrogram"
+    )
+
+
+PAGE = 16
+
+
+def test_a_deployment_that_leaves_the_cache_on_keys_the_prefill(tmp_path):
+    model = _make_model()
+    model.local_dir = tmp_path
+
+    assert set(_kv_page_sizes(model, {})) == {KV_CACHE}, (
+        "the cache stays shut for Qwen3-ASR, so its keys are never built and nothing is reused"
+    )
+
+
+def _prefill_keys(wave: torch.Tensor, clip: GrowingClip) -> list[bytes]:
+    """The page keys the preprocess worker sends for a request of ``wave``, a step of ``clip``."""
+    model = _make_model()
+    out = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [wave]}, language="en", growing_clip=clip)
+    layouts = out.metadata["kv_layout"]
+    rows = {key: {label: layout.row() for label, layout in by.items()} for key, by in layouts.items()}
+    worker = SimpleNamespace(_keyed_labels=keyed_labels(model), _prefix_page_sizes={KV_CACHE: PAGE}, model=model)
+    worker._digest = lambda *args: PreprocessWorkerThread._digest(worker, *args)
+    worker._page_layout = lambda *args: PreprocessWorkerThread._page_layout(worker, *args)
+    sent = PreprocessWorkerThread._prefix_keys(worker, out.new_input_tensors, layouts, rows, {}, {}, clip)
+    return sent["prefix_keys"][KV_CACHE]["main"]
+
+
+def _clip(samples: int) -> torch.Tensor:
+    torch.manual_seed(0)
+    wave = torch.randn(samples) * 0.01
+    wave[:4000] *= 50  # the clip's peak is in its first quarter second
+    return wave
+
+
+def test_a_longer_clip_shares_the_keys_of_the_windows_it_completed_and_a_louder_one_shares_none():
+    short, longer = _clip(70_000), _clip(100_000)  # two complete windows, then three
+    louder = longer.clone()
+    louder[90_000:91_000] *= 100  # raises the clamp floor of every frame, the earlier windows' too
+
+    item, other = GrowingClip(), GrowingClip()
+    keys, grown = _prefill_keys(short, item), _prefill_keys(longer, item)
+    again, loud = _prefill_keys(short, other), _prefill_keys(louder, other)
+    head = _make_model().prompt_ids(1, language="English").index(AUDIO_PAD)
+    whole = (head + 2 * _tiny_config().audio.window_tokens) // PAGE
+
+    def first_change(a, b):
+        return [page for page, (x, y) in enumerate(zip(a, b, strict=False)) if x != y][:1]
+
+    assert grown[:whole] == keys[:whole], "a re-decode with more audio missed the windows it had already heard"
+    assert first_change(again, loud) == [head // PAGE], (
+        "a louder chunk changed the earlier windows' features but not their keys, so a re-decode "
+        "would be served KV made under another clamp floor"
+    )
+    assert first_change(keys, again) == [head // PAGE], "another item was served this item's windows"
 
 
 def test_postprocess_keeps_asr_text_tag_and_drops_specials():
@@ -559,8 +671,10 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
     req = TranscriptionRequest(language="en", prompt="names: Ada")
     sa = ad.transcription_to_request(req, "/tmp/a.wav")
     assert sa.model_kwargs == {"language": "en", "initial_prompt": "names: Ada", "temperature": 0.0}
-    step = ad.realtime_step_request(req, "/tmp/a.wav", "language English<asr_text> so far")
+    assert sa.file_paths == {"audio": ["/tmp/a.wav"]}
+    step = ad.realtime_step_request(req, "language English<asr_text> so far")
     assert step.model_kwargs["assistant_prefix"] == "language English<asr_text> so far"
+    assert step.file_paths is None   # the step's audio is its clip
 
     free = TranscriptionRequest()
     t = ad.parse_transcript("language English<asr_text> Hello there.", free)

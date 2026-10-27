@@ -129,6 +129,38 @@ class LogMelSpectrogram(nn.Module):
     def num_frames(self, num_samples: int) -> int:
         return num_samples // self.hop_length
 
+    def frame_samples(self, start: int, end: int) -> tuple[int, int]:
+        """``[first, last)`` of the samples frames ``[start, end)`` read. A centred frame
+        reads ``n_fft // 2`` samples either side of its hop, and frame 0 reflects the clip's
+        first ``n_fft // 2 + 1``. A clip shorter than ``last`` reflects its end into them."""
+        half = self.n_fft // 2
+        last = (end - 1) * self.hop_length + half
+        return max(start * self.hop_length - half, 0), max(last, half + 1) if start == 0 else last
+
+    def max_power(self, waveform: torch.Tensor, start: int, frames: int) -> float:
+        """The largest mel power of frames ``[start, start + frames)`` of the clip ``waveform``
+        that ``forward`` makes (it leaves out frames past the clip's last), from only the samples
+        they read. The STFT and the mel always take one block of ``frames`` frames, padded, so a
+        frame computed again at the same place in a later block rounds the same."""
+        n = waveform.numel()
+        real = min(start + frames, self.num_frames(n)) - start
+        if real <= 0:
+            return 0.0
+        half = self.n_fft // 2
+        first, last = start * self.hop_length - half, (start + real - 1) * self.hop_length + half
+        x = waveform[max(first, 0): min(last, n)].to(torch.float32)[None, None]
+        # the reflections forward's centred STFT puts at the clip's two ends
+        x = F.pad(x, (max(-first, 0), max(last - n, 0)), mode="reflect")[0, 0]
+        x = F.pad(x, (0, (frames - real) * self.hop_length))
+        stft = torch.stft(x, self.n_fft, self.hop_length, window=self.window, center=False, return_complex=True)
+        return float((self.mel_filters @ (stft.abs() ** 2))[:, :real].max())
+
+    def peak(self, max_power: float) -> float:
+        """``forward``'s largest value for a clip whose largest mel power is ``max_power``,
+        rounded as ``forward`` rounds it."""
+        top = torch.tensor(max_power, dtype=torch.float32).clamp(min=1e-10).log10()
+        return float((top + 4.0) / 4.0)
+
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         squeeze = waveform.dim() == 1
         if squeeze:

@@ -463,14 +463,15 @@ Per-model notes:
   mark the text chunk where a reply starts or ends with ``metadata.turn`` (``["start"]``
   / ``["end"]``, every turn token's mark in order), and each text and audio chunk with
   ``metadata.step``, the model step it came from.
-- **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
-  session re-transcribes everything heard so far as one engine request whose assistant
+- **Realtime transcription** — every ``chunk_seconds`` (default 2 s, or the item cap if
+  that is shorter) of new audio the session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
   tokens (the Qwen3-ASR SDK's streaming algorithm), so only the tail is ever revised.
   Tune ``chunk_seconds`` / ``unfixed_chunks`` / ``unfixed_tokens`` under ``session.mstar``
   in ``transcription_session.update``; a smaller ``chunk_seconds`` is raised to 0.5. An item holds
   at most 300 s of audio (``max_item_seconds`` in the session, lower if the model hears
-  less): commit before then, since an append past it is refused with an ``error``.
+  less or ``MSTAR_MAX_AUDIO_SECONDS`` is lower): commit before then, since an append past
+  it is refused with an ``error``.
 - **Realtime turn detection** — by default the client ends each utterance with
   ``input_audio_buffer.commit``. With ``"turn_detection": {"type": "server_vad"}`` the
   server does it, as OpenAI's server VAD does: ``threshold`` (default 0.5),

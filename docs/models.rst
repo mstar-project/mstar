@@ -123,7 +123,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_asr_realtime``
      - ``Qwen/Qwen3-ASR-0.6B``
      - The 0.6B Qwen3-ASR checkpoint on the same class, sized in its config for the
-       short steps of ``/v1/realtime`` sessions.
+       short steps of ``/v1/realtime`` sessions. Each step re-decodes the item's audio so
+       far, and the prefix cache serves the LLM the complete 8 s windows an earlier step
+       heard, unless a louder chunk moved the clip's clamp floor. The encoder still runs
+       over all of it. Only ``/v1/realtime`` steps are keyed, by their item.
    * - ``higgs_audio`` *(Beta)*
      - ``bosonai/higgs-audio-v3-stt``
      - Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.

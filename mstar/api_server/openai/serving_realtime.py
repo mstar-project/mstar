@@ -37,8 +37,9 @@ turn that reaches the item cap is committed there instead of refused.
 ``{"type": "semantic_vad", "eagerness"}`` asks an end-of-turn model at each
 pause instead, and the update is refused when that model is unavailable.
 
-``chunk_seconds`` below ``MIN_CHUNK_SECONDS`` is raised to it and must not
-pass the item cap, and the unfixed counts are non-negative integers; numeric
+``chunk_seconds`` (``DEFAULT_CHUNK_SECONDS``, or the item cap if shorter)
+below ``MIN_CHUNK_SECONDS`` is raised to it and must not pass the item cap,
+and the unfixed counts are non-negative integers; numeric
 strings count as numbers. ``language`` and ``prompt`` are strings (or null),
 ``language`` at most ``MAX_LANGUAGE_CHARS`` characters. Any other value is an
 ``error`` and the update changes nothing.
@@ -63,13 +64,14 @@ hypothesis minus its last ``unfixed_tokens`` tokens (once ``unfixed_chunks``
 chunks are in), so the tail can still be revised while the head is fixed.
 The adapter decides how that prefix reaches its model
 (``realtime_step_request``). Each step is an ordinary request, so sessions
-batch on the engine like any other traffic.
+batch on the engine like any other traffic. Its audio is the item's
+``GrowingClip``, whose samples reach the model with no file between them.
 
 Since every step decodes the whole item again, an item's work grows with the
 square of its length. An item is capped at ``MAX_ITEM_SECONDS`` (or the
-adapter's ``max_audio_seconds`` if shorter): an append past the cap is an
-``error`` and the client commits or clears. An append that completes several
-chunks at once is decoded as one step.
+adapter's ``max_audio_seconds`` or ``MSTAR_MAX_AUDIO_SECONDS``, if shorter):
+an append past the cap is an ``error`` and the client commits or clears. An
+append that completes several chunks at once is decoded as one step.
 """
 
 from __future__ import annotations
@@ -96,12 +98,15 @@ from mstar.api_server import media_io
 from mstar.api_server.openai import realtime_vad
 from mstar.api_server.openai._util import error_type, now, rid
 from mstar.api_server.openai.protocol import TranscriptionRequest
+from mstar.model.base import GrowingClip
+from mstar.model.media_limits import max_audio_seconds
 from mstar.streaming.topology import Connection
 from mstar.utils.utf8_stream import Utf8Stream, decode_joined
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 16000
+# a transcription item is a GrowingClip, at its rate
+SAMPLE_RATE = GrowingClip.SAMPLE_RATE
 # OpenAI's PCM16 rate, and G.711's
 OPENAI_PCM_RATE = 24000
 G711_RATE = 8000
@@ -170,7 +175,8 @@ class RealtimeSession:
     max_item_seconds: float = MAX_ITEM_SECONDS
     pending: list[np.ndarray] = field(default_factory=list)   # audio not yet in a chunk
     pending_samples: int = 0
-    heard: list[np.ndarray] = field(default_factory=list)     # every chunk decoded so far
+    # every chunk decoded so far: what each step re-sends, longer; a new clip per item
+    clip: GrowingClip = field(default_factory=GrowingClip)
     chunk_id: int = 0
     raw_hypothesis: str = ""   # the model's raw output for the audio so far
     emitted: str = ""          # clean text already sent as deltas
@@ -254,7 +260,7 @@ class RealtimeSession:
         arrive, rounded once over the whole item (not per append), so the cap
         does not depend on how the audio was split."""
         held = self.resampler.held(extra) if self.resampler is not None else extra
-        return self.pending_samples + held + sum(int(a.size) for a in self.heard)
+        return self.pending_samples + held + self.clip.samples
 
     def take_chunk(self) -> np.ndarray | None:
         """Every full chunk of pending audio as one array, or None until
@@ -281,12 +287,11 @@ class RealtimeSession:
         self.pending, self.pending_samples = [], 0
         return buf
 
-    def audio_so_far(self) -> np.ndarray:
-        return np.concatenate(self.heard) if self.heard else np.zeros(0, dtype=np.float32)
-
     def clear(self) -> None:
         """Start a new item; the stream state (resampler, segmenter, odd byte) goes on."""
-        self.pending, self.pending_samples, self.heard, self.short = [], 0, [], 0
+        self.pending, self.pending_samples, self.short = [], 0, 0
+        # a new object, not this one emptied: a step of the old item may still be preprocessing
+        self.clip = GrowingClip()
         self.chunk_id, self.raw_hypothesis, self.emitted = 0, "", ""
         self.item_id = f"item_{uuid.uuid4().hex[:12]}"
 
@@ -527,31 +532,27 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
     # a fresh id per step: a failed step does not advance chunk_id, and its
     # id is still draining when the next step goes out
     request_id = rid(f"rt-{session.session_id}")
-    path = media_io.write_wav(
-        session.audio_so_far(), str(Path(api.upload_dir) / f"{request_id}.wav"), SAMPLE_RATE,
+    args = adapter.realtime_step_request(session.request, prefix)
+    # the audio is the clip itself: the data worker hands its samples to the model
+    api.submit_request(
+        text=args.text,
+        file_paths=args.file_paths,
+        input_modalities=args.input_modalities,
+        output_modalities=args.output_modalities,
+        model_kwargs=args.model_kwargs,
+        prompt_parts=args.prompt_parts,
+        streaming=False,
+        request_id=request_id,
+        clip=session.clip,
     )
     try:
-        args = adapter.realtime_step_request(session.request, path, prefix)
-        api.submit_request(
-            text=args.text,
-            file_paths=args.file_paths,
-            input_modalities=args.input_modalities,
-            output_modalities=args.output_modalities,
-            model_kwargs=args.model_kwargs,
-            prompt_parts=args.prompt_parts,
-            streaming=False,
-            request_id=request_id,
-        )
-        try:
-            chunks = await api.collect_results(request_id)
-        except asyncio.CancelledError:
-            api.release_request(request_id)
-            raise
-        except HTTPException as exc:
-            # a request the engine failed: the status says whose fault it was
-            raise StepError(str(exc.detail), exc.status_code) from exc
-    finally:
-        Path(path).unlink(missing_ok=True)
+        chunks = await api.collect_results(request_id)
+    except asyncio.CancelledError:
+        api.release_request(request_id)
+        raise
+    except HTTPException as exc:
+        # a request the engine failed: the status says whose fault it was
+        raise StepError(str(exc.detail), exc.status_code) from exc
     text = decode_joined(c.data for c in chunks if c.modality == "text")
     errors = [c for c in chunks if c.modality == "error"]
     if errors:
@@ -620,10 +621,14 @@ class RealtimeTranscription:
         self.model_name = model_name
         self.adapter = adapter
         self.ws = websocket
+        # capped by the model and MSTAR_MAX_AUDIO_SECONDS too: the clip reaches the model with no decode to charge it
+        max_item = min(MAX_ITEM_SECONDS, getattr(adapter, "max_audio_seconds", None) or math.inf, max_audio_seconds())
         self.session = RealtimeSession(
             session_id=uuid.uuid4().hex[:16],
             request=TranscriptionRequest(model=model_name),
-            max_item_seconds=min(MAX_ITEM_SECONDS, getattr(adapter, "max_audio_seconds", None) or math.inf),
+            # a chunk is at most an item, so a session update that leaves it alone passes
+            chunk_seconds=min(DEFAULT_CHUNK_SECONDS, max_item),
+            max_item_seconds=max_item,
         )
 
     async def send(self, event: dict) -> None:
@@ -794,7 +799,7 @@ class RealtimeTranscription:
         vad = end_of_turn = None
         if td != s.turn_detection:
             # with server_vad on, the resampler's lookahead is in no item between turns
-            in_item = (s.pending_samples or s.heard or s.segmenter.speaking) if s.segmenter is not None \
+            in_item = (s.pending_samples or s.clip.samples or s.segmenter.speaking) if s.segmenter is not None \
                 else s.item_samples()
             if in_item:
                 raise ValueError("commit or clear the input audio buffer before changing turn_detection")
@@ -848,7 +853,7 @@ class RealtimeTranscription:
         """Hear ``chunk``, re-decode everything so far from the stable prefix,
         then send the newly firm text and the whole hypothesis."""
         s = self.session
-        s.heard.append(chunk)
+        s.clip.append(chunk)
         tokenizer = self._tokenizer()
         prefix = "" if s.chunk_id < s.unfixed_chunks else stable_prefix(s.raw_hypothesis, tokenizer, s.unfixed_tokens)
         try:
@@ -872,7 +877,7 @@ class RealtimeTranscription:
         await self.emit(text, hold)
         await self.send(server_event(
             "mstar.transcription.partial", item_id=s.item_id, text=text, chunk_id=s.chunk_id,
-            audio_seconds=sum(a.size for a in s.heard) / SAMPLE_RATE, created=now(),
+            audio_seconds=s.clip.samples / SAMPLE_RATE, created=now(),
         ))
 
     async def _step_failed(self, exc: Exception) -> None:

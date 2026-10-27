@@ -334,11 +334,11 @@ class OpenAIAdapter:
         passes the text through."""
         return raw
 
-    def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:  # noqa: ARG002
-        """One streaming step: transcribe ``audio_path`` (everything heard so
-        far) continuing from ``prefix``, the stable part of the previous raw
-        hypothesis. Models that cannot continue a hypothesis leave this
-        unimplemented and stay off ``/v1/realtime``."""
+    def realtime_step_request(self, req: TranscriptionRequest, prefix: str) -> SubmitArgs:  # noqa: ARG002
+        """One streaming step: transcribe everything heard so far (the
+        request's clip, so no audio file) continuing from ``prefix``, the
+        stable part of the previous raw hypothesis. Models that cannot continue
+        a hypothesis leave this unimplemented and stay off ``/v1/realtime``."""
         raise NotImplementedError("realtime transcription is not supported by this model")
 
 
@@ -1130,23 +1130,19 @@ class Qwen3ASRAdapter(OpenAIAdapter):
     compression_ratio_threshold = None
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        args = self.realtime_step_request(req, "")
+        args.file_paths = {"audio": [audio_path]}
+        return args
+
+    def realtime_step_request(self, req: TranscriptionRequest, prefix: str) -> SubmitArgs:
         kwargs = _transcription_kwargs(req)
         # checked here too so a streaming request gets a 400 before it starts
         if "<|audio_pad|>" in str(kwargs.get("initial_prompt") or ""):
             raise ValueError("the prompt must not contain <|audio_pad|>")
-        return SubmitArgs(
-            text="",
-            file_paths={"audio": [audio_path]},
-            input_modalities=["audio", "text"],
-            output_modalities=["text"],
-            model_kwargs=kwargs,
-        )
-
-    def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:
-        args = self.transcription_to_request(req, audio_path)
         if prefix:
-            args.model_kwargs["assistant_prefix"] = prefix
-        return args
+            kwargs["assistant_prefix"] = prefix
+        # no file: a step's audio is the request's clip
+        return SubmitArgs(text="", input_modalities=["audio", "text"], output_modalities=["text"], model_kwargs=kwargs)
 
     def stream_text(self, raw: str) -> str:
         # A detected language opens the stream as ``language X<asr_text>``.

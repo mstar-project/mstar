@@ -444,7 +444,8 @@ so attaching more files does not multiply them.
        header before the model decodes it and again from the decoded clip (a
        file whose header gives no length, such as a FLAC with no sample count,
        is counted as it decodes, or from its size for a WAV with no data
-       length); over it, the request gets a 400.
+       length); over it, the request gets a 400. A ``/v1/realtime``
+       transcription item is capped at it too, at append time.
 
 Worker scheduling
 -----------------

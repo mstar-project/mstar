@@ -415,6 +415,22 @@ overrides** in :doc:`serving`.
    ``process_prompt`` with ``prefix_cache=False``, so work done only to key it can be
    skipped.
 
+   Qwen3-ASR keys one prefill step in parts, so a realtime re-decode of a longer clip
+   is served the encoder windows it already heard. The ``/v1/realtime`` session hands
+   each step its item's clip (``process_prompt`` gets it as ``growing_clip``, and its
+   samples as the one ``audio_inputs`` entry, with no file). The step
+   writes the ids before the audio, one item per complete 8 s window (keyed by the
+   clip and the sample range its mel frames read, and by the clip's peak feature, which
+   sets every frame's clamp floor; each 1 s chunk's peak is computed once and kept in the
+   clip's memo), then rows:
+
+   .. code-block:: python
+
+      Span("ids", PREFILL_WALK, head, head, TensorRange("text_inputs", 0, 0, head)),
+      *(Span("digest", PREFILL_WALK, 104, 104, TensorRange("audio", 0, start, end), (peak,))
+        for start, end in windows),
+      Span("rows", PREFILL_WALK, rest, rest, "text_inputs"),
+
    BAGEL keys its text and ViT walks and the decode that follows them:
 
    .. code-block:: python

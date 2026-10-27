@@ -28,7 +28,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.components.audio_features import sinusoid_positions
+from mstar.model.base import GrowingClip, Span, TensorRange
+from mstar.model.components.audio_features import LogMelSpectrogram, sinusoid_positions
 from mstar.model.components.linear import FusedColumnLinear
 
 
@@ -92,6 +93,41 @@ class AuTEncoderConfig:
         for _ in range(3):
             mel = (mel + 1) // 2
         return self.downsample_hidden_size * mel
+
+
+def aut_window_spans(
+    waveform: torch.Tensor, log_mel: LogMelSpectrogram, config: AuTEncoderConfig, walk: str, tensor: str,
+    clip: GrowingClip | None,
+) -> list[Span]:
+    """A digest span per complete attention window of ``waveform``, entry 0 of the request's
+    ``tensor`` and the request's growing ``clip``: what the prefix cache serves the clip's
+    next re-decode, longer. Without a clip there is nothing to share, so no span.
+
+    A window's tokens read its own mel frames and the clip's clamp floor, its peak log-mel
+    less 8, so each is keyed by the clip, the sample range its frames read, and that peak. A window is
+    complete once its frames read no reflected end. The peak is recomputed here, on the CPU,
+    to float32 rounding of the encoder's own: a frame reads only the samples around it, so
+    each conv chunk's largest mel power is computed once, when the chunk is complete, and
+    kept in the clip's memo; a step computes only the chunks after them.
+    """
+    frames = config.n_window_infer
+    if frames % config.chunk_frames:
+        raise ValueError(f"an attention window of {frames} frames cuts a {config.chunk_frames}-frame conv chunk")
+    n = waveform.numel()
+    if clip is None:
+        return []
+    windows = []
+    while (bounds := log_mel.frame_samples(len(windows) * frames, (len(windows) + 1) * frames))[1] <= n:
+        windows.append(bounds)
+    if not windows:
+        return []
+    block, peaks = config.chunk_frames, clip.memo.setdefault("aut_chunk_peaks", [])
+    while log_mel.frame_samples(len(peaks) * block, (len(peaks) + 1) * block)[1] <= n:
+        peaks.append(log_mel.max_power(waveform, len(peaks) * block, block))
+    tail = range(len(peaks) * block, log_mel.num_frames(n), block)
+    peak = (log_mel.peak(max([*peaks, *(log_mel.max_power(waveform, at, block) for at in tail)])),)
+    width = config.window_tokens
+    return [Span("digest", walk, width, width, TensorRange(tensor, 0, *bounds), peak) for bounds in windows]
 
 
 def _activation(name: str):
