@@ -6,8 +6,6 @@ is tested in ``test_sequence_parallel.py``.
 from __future__ import annotations
 
 import dataclasses
-import os
-import socket
 import sys
 
 import pytest
@@ -25,12 +23,6 @@ from mstar.model.ltx2_5.config import LTX25Config  # noqa: E402
 WORLD = 2
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _group(rank: int) -> CommGroup:
     group = CommGroup(rank, rank, list(range(WORLD)))
     group.device_group = dist.group.WORLD
@@ -38,13 +30,12 @@ def _group(rank: int) -> CommGroup:
     return group
 
 
-def _run(fn, *args):
-    mp.spawn(_entry, args=(fn, _free_port(), args), nprocs=WORLD)
+def _run(fn, store_path, *args):
+    mp.spawn(_entry, args=(fn, str(store_path), args), nprocs=WORLD)
 
 
-def _entry(rank, fn, port, args):
-    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
-    dist.init_process_group("gloo", rank=rank, world_size=WORLD)
+def _entry(rank, fn, store_path, args):
+    dist.init_process_group("gloo", init_method=f"file://{store_path}", rank=rank, world_size=WORLD)
     torch.set_num_threads(1)
     try:
         fn(rank, *args)
@@ -87,5 +78,5 @@ def _dit(rank, frames, height, width):
 
 
 @pytest.mark.parametrize("shape", [(2, 2, 3), (3, 1, 5)], ids=["even", "uneven"])
-def test_sequence_parallel_dit_matches_one_rank(shape):
-    _run(_dit, *shape)
+def test_sequence_parallel_dit_matches_one_rank(tmp_path, shape):
+    _run(_dit, tmp_path / "store", *shape)
