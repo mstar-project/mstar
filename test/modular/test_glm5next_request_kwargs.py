@@ -23,12 +23,13 @@ def test_a_null_kwarg_is_unset(kwargs):
     sampling = m.get_request_resource_configs({}, kwargs)[SAMPLER]
     assert sampling == m.get_request_resource_configs({}, {})[SAMPLER]
     assert m.get_max_output_tokens(**kwargs) == m.get_max_output_tokens()
-    assert m.process_prompt("Hi", ["text"], ["text"], **kwargs)["text_inputs"][0].tolist() == [72, 105]
+    out = m.process_prompt("Hi", ["text"], ["text"], **kwargs)
+    assert out.new_input_tensors["text_inputs"][0].tolist() == [72, 105]
 
 
 def test_a_null_temperature_under_mtp_is_greedy():
     m = _model(mtp_num_draft_tokens=3)
-    assert m.process_prompt("Hi", ["text"], ["text"], temperature=None)["text_inputs"][0].numel() == 2
+    assert m.process_prompt("Hi", ["text"], ["text"], temperature=None).new_input_tensors["text_inputs"][0].numel() == 2
     assert m.get_request_resource_configs({}, {"temperature": None})[SAMPLER].temperature == 0
 
 
@@ -49,7 +50,7 @@ def test_min_p_is_refused_in_process_prompt(k):
     assert not spec.enable_min_p
     with pytest.raises(ValueError, match="min_p"):
         m.process_prompt("Hi", ["text"], ["text"], min_p=0.2)
-    assert m.process_prompt("Hi", ["text"], ["text"], min_p=0)["text_inputs"][0].numel() == 2
+    assert m.process_prompt("Hi", ["text"], ["text"], min_p=0).new_input_tensors["text_inputs"][0].numel() == 2
 
 
 def test_a_request_without_max_tokens_runs_to_the_window():

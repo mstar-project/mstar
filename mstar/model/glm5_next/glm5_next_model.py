@@ -34,7 +34,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.glm5_next.config import (
     ATTN,
     KDA,
@@ -250,6 +250,9 @@ class Glm5NextModel(Model):
             ),
         ]
 
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
+
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
@@ -400,7 +403,7 @@ class Glm5NextModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         if prompt is None:
             return {}
         # the conductor reads these kwargs; read here first, a bad one is the
@@ -451,7 +454,14 @@ class Glm5NextModel(Model):
                 f"prompt is {input_ids.numel()} tokens; GLM-5.3-Flash is served "
                 f"with at most {limit}"
             )
-        return {"text_inputs": [input_ids.to(torch.long)]}
+        n = input_ids.numel()
+        # a decode step writes one row, or under MTP its whole verify block (the rejected
+        # drafts stay as holes), so the KV pool sizes a request at its worst case
+        block = self.config.mtp_num_draft_tokens + 1
+        layout = LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", block),))
+        return ProcessPromptOutput(
+            {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_CACHE: {"main": layout}}},
+        )
 
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before its context
@@ -461,9 +471,18 @@ class Glm5NextModel(Model):
         return min(cfg.index_topk - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
 
     def get_max_output_tokens(self, **model_kwargs):
-        # held to the window: a one-token prompt emits at most index_topk tokens
+        # held to the window: a one-token prompt emits at most index_topk tokens. A request
+        # that names none runs as far as the decode loop can (under MTP the cache rows bind
+        # first), and the conductor fits it to the room its prompt leaves.
         budget = normalize_generation_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
-        return self.config.index_topk if budget is None else min(budget, self.config.index_topk)
+        if budget is None:
+            return min(self.config.index_topk, self.max_decode_steps() + 1)
+        return min(budget, self.config.index_topk)
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the prefill emits the first of max_output_tokens, so decode runs one fewer; the
+        # conductor refuses a cap past the loop's max_iters
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
