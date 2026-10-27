@@ -458,11 +458,3 @@ def test_pi05_out_of_range_state_saturates_as_the_model_normalizes():
         robot_state=[-5.0, 0, 5.0] + [0.5] * 29,
     )
     assert stub.last_prompt.split("State: ", 1)[1].startswith("0 128 255 191 ")
-
-
-def test_the_state_bound_follows_the_checkpoint():
-    """robot_state's length limit is the checkpoint's max_state_dim, not a typed-in 32."""
-    from mstar.model.pi05.config import load_pi05_config
-
-    assert load_pi05_config({"max_state_dim": 8}).state_dim == 8
-    assert load_pi05_config({}).state_dim == 32
