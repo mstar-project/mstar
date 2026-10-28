@@ -11,7 +11,7 @@ import torch
 
 from mstar.engine.resources.kv.manager import KVManager, KVPlanState
 from mstar.engine.resources.kv.plan import SINK_PAGE, PagedIndptrs
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import H2DMirror, PinnedStager
 
 PAGE, CAPTURE = 16, 96
 
@@ -42,10 +42,26 @@ def _indptrs(rng):
 
 
 def _state():
+    """A captured state of CAPTURE tokens, as ``KVManager._static_plan_state``
+    lays it out: pages then offsets in one buffer."""
+    both = torch.full((2 * CAPTURE,), 7, dtype=torch.long)
     return KVPlanState(
-        token_to_cache=torch.full((128,), 7, dtype=torch.long),
-        token_to_page=torch.full((128,), 7, dtype=torch.long),
+        token_to_page=both[:CAPTURE], token_to_cache=both[CAPTURE:], staging=both, mirror=H2DMirror(),
     )
+
+
+def _device_unpacked(kv, indptrs) -> KVPlanState:
+    """The reference: the device unpacking, then copied into a captured state
+    with SINK_PAGE / 0 past the real tokens."""
+    total = int(indptrs.qo_indptr[-1])
+    plan = kv._compute_plan_state(indptrs, total_tokens=total)
+    ref = _state()
+    ref.token_to_page[:total].copy_(plan.token_to_page)
+    ref.token_to_cache[:total].copy_(plan.token_to_cache)
+    ref.token_to_page[total:].fill_(SINK_PAGE)
+    ref.token_to_cache[total:].fill_(0)
+    ref.total_tokens = total
+    return ref
 
 
 def test_host_addressing_matches_device_unpacking():
@@ -56,10 +72,7 @@ def test_host_addressing_matches_device_unpacking():
     rng = np.random.default_rng(0)
     for _ in range(20):
         indptrs = _indptrs(rng)
-        ref = _state()
-        ref.copy_(
-            kv._compute_plan_state(indptrs, total_tokens=int(indptrs.qo_indptr[-1])), CAPTURE,
-        )
+        ref = _device_unpacked(kv, indptrs)
         got = kv._stage_packed_plan_state(indptrs, _state(), CAPTURE)
         assert got.total_tokens == ref.total_tokens
         assert torch.equal(got.token_to_page[:CAPTURE], ref.token_to_page[:CAPTURE])
