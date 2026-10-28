@@ -567,13 +567,14 @@ class StepRunner:
         """Choose the requests to move off ``key``'s pool so that ``rid`` gets the ``pages_short`` pages its grant
         ran short of, and have the pool earmark the pages they free for ``rid``.
 
-        The victims are the newest requests that arrived after ``rid``, taken until their moves cover the shortage.
-        A victim the host can take whole moves there. Any other victim is dropped. When all the newer requests
-        free less than the shortage, return ``[rid]`` alone with no earmark if moving ``rid`` frees pages.
-        Otherwise return an empty list, and ``rid`` waits until the room grows. It also returns an empty list when
-        pages released since the grant ran short cover the shortage. None when the pool doesn't preempt or
-        ``rid`` has no arrival number. ``droppable`` returns whether a request can be dropped once every step
-        holding it has landed.
+        The victims are the newest requests that arrived after ``rid`` and aren't already victims, taken until
+        their moves cover the shortage. A victim the host can take whole moves there. Any other victim is dropped.
+        When the newer requests that aren't victims free less than the shortage, return ``[rid]`` alone with no
+        earmark if moving ``rid`` frees pages and no newer victim is still to move. Otherwise return an empty list,
+        and ``rid`` waits until the room grows. It also returns an empty list when pages released since the grant
+        ran short cover the shortage, and while ``rid`` or a victim chosen for it hasn't moved yet. None when the
+        pool doesn't preempt or ``rid`` has no arrival number. ``droppable`` returns whether a request can be
+        dropped once the steps it has launched land.
         """
         pool, arrival = self._resources[key], self._arrival.get(rid)
         if not pool.preempts or arrival is None or arrival[0]:
@@ -587,6 +588,9 @@ class StepRunner:
                  and pool.holds(other)),
                 key=self._arrival.__getitem__, reverse=True,
             )
+            # a victim not yet moved frees its pages for the request it was chosen for
+            moving = any(pool.is_victim(other) for other in newer)
+            newer = [other for other in newer if not pool.is_victim(other)]
             on_host = left = pool.host_room()
             hosted: set[str] = set()
             victims: list[str] = []
@@ -603,7 +607,7 @@ class StepRunner:
             else:
                 pages = pool.host_pages(rid)
                 to_host = pages is not None and pages <= on_host
-                if (to_host or droppable(rid)) and pool.frees([rid]) > 0:
+                if not moving and (to_host or droppable(rid)) and pool.frees([rid]) > 0:
                     pool.preempt_itself(rid, to_host)
                     return [rid]
                 pool.wait_for_room(rid)

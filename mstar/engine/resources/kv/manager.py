@@ -4111,8 +4111,11 @@ class KVManager(AttentionResource):
         return self._lock
 
     def still_short(self, rid: str, pages_short: int) -> int:
-        """``rid``'s shortage less the pages released since its grant ran short."""
+        """``rid``'s shortage less the pages released since its grant ran short. 0 while ``rid`` or a victim
+        chosen for it hasn't moved yet, since ``rid`` waits for those moves."""
         room, then = self._room(), self._ran_short.pop(rid, None)
+        if rid in self._earmarks or rid in self._victims:
+            return 0
         return pages_short if then is None else pages_short - max(0, room - then)
 
     def host_room(self) -> int:
