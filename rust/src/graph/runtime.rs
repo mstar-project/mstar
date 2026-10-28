@@ -307,7 +307,7 @@ pub struct GraphRuntime {
             return Ok(());
         }
         let comm = comm.clone();
-        py.allow_threads(move || -> Result<(), crate::communicator::CommError> {
+        py.detach(move || -> Result<(), crate::communicator::CommError> {
             for (peer, bytes) in &rest {
                 comm.send(peer, bytes)?;
             }
@@ -2545,6 +2545,7 @@ impl GraphRuntime {
             let completed = state.complete(&g, node, &out_tensors);
             let mut pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
+            let transferred = completed.transferred;
             // A loop that cached this node's outputs holds a reference on
             // each, as `Loop.maybe_cache_output` takes one. Applied before
             // `freed_inputs`, which can release the same tensors (an advance
@@ -2958,18 +2959,25 @@ impl GraphRuntime {
                     *contributed.entry(t.uuid).or_insert(0) += refs;
                 }
             }
-            // Settle from the safety hold of 1 to the real fanout. persist is
-            // excluded from the COUNT: those are held by the marker, and
+            // Exchange producer AND finished-loop cache holds for real fanout.
+            // Older accumulated tensors need settlement too, even if this pass
+            // produced none of them. Nested loops may hold the same UUID twice.
+            // The map stays empty, and allocates nothing, unless a loop finished.
+            let mut loop_holds: FxHashMap<u64, i64> = FxHashMap::default();
+            for uuid in transferred {
+                *loop_holds.entry(uuid).or_insert(0) += 1;
+            }
+            // Persist is excluded from the COUNT: those are held by the marker, and
             // counting them would double-count a signal whose destination is
             // EMPTY_DESTINATION.
             {
                 let mut bk = self.bookkeeping.lock().unwrap();
-                for uuid in owned {
+                let mut settle = |uuid: u64, held: i64| -> PyResult<()> {
                     let count = contributed.get(&uuid).copied().unwrap_or(0);
                     // Pre-fanout: a rank whose persist edge the fanout
                     // dropped still holds the tensor for the conductor, and
                     // an unmarked one would be dereferenced to zero right here.
-                    let delta = count - 1;
+                    let delta = count - held;
                     if delta > 0 {
                         bk.increment_ref(uuid, delta)?;
                     } else if delta < 0 {
@@ -2983,6 +2991,18 @@ impl GraphRuntime {
                         out.freed_input_uuids.extend(uuids);
                         out.freed_input_registered.extend(registered);
                     }
+                    Ok(())
+                };
+                for uuid in owned {
+                    let held = if loop_holds.is_empty() {
+                        1
+                    } else {
+                        1 + loop_holds.remove(&uuid).unwrap_or(0)
+                    };
+                    settle(uuid, held)?;
+                }
+                for (uuid, held) in loop_holds {
+                    settle(uuid, held)?;
                 }
             }
 
@@ -3175,11 +3195,13 @@ impl GraphRuntime {
     /// -- because that is the shape `ParallelList` already holds it in.
     /// Zipping them into tuples on the Python side just to unzip here is a
     /// per-rid interpreted loop per argument, every forward pass.
+    ///
+    /// `skip_rids` failed after routing: none of their frames go out.
     #[pyo3(signature = (
         completion_id, info_rids, request_infos,
         ntc_rids, new_token_counts,
         consumed_rids, stream_tokens_consumed, prof_rids, profiling,
-        publish_rids, publications,
+        publish_rids, publications, skip_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send_outputs(
@@ -3198,6 +3220,7 @@ impl GraphRuntime {
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
         publications: Vec<Option<Vec<u8>>>,
+        skip_rids: Vec<u32>,
     ) -> PyResult<Vec<u32>> {
         // Released for the whole frame phase rather than around each send.
         // Nothing below touches Python: the arguments arrive already
@@ -3242,6 +3265,14 @@ impl GraphRuntime {
                 .map(|c| c.speculative.clone())
                 .unwrap_or_default();
             let mut plan = self.take_send_plan(completion_id)?;
+            if !skip_rids.is_empty() {
+                let skip: FxHashSet<u32> = skip_rids.into_iter().collect();
+                plan.to_workers.retain(|w| !skip.contains(&w.rid));
+                plan.persist.retain(|(rid, ..)| !skip.contains(rid));
+                plan.emit.retain(|(rid, ..)| !skip.contains(rid));
+                plan.emit_inline.retain(|(rid, ..)| !skip.contains(rid));
+                plan.completed.retain(|(rid, ..)| !skip.contains(rid));
+            }
             let partition = plan.partition.clone();
             let encoded: FxHashMap<u32, Option<Vec<u8>>> =
                 request_infos.into_iter().collect();

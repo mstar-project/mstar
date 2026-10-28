@@ -93,7 +93,7 @@ def test_engine_falls_back_and_attributes_failures():
         # what both stop paths read: the iteration counts current for this batch
         per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
-        step_context=SimpleNamespace(graph_walk="decode"),
+        step_context=SimpleNamespace(graph_walk="decode", request_walks=None),
     )
     sub = LLMSubmodule.__new__(LLMSubmodule)
     sub.config = _sub().config

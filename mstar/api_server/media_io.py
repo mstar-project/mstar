@@ -449,7 +449,9 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             frames += len(data)
             if frames > limit:
                 raise AudioTooLongError(max_seconds)
-            parts.append(data.mean(axis=1))
+            # a mono block is its own mean, and numpy's reduction over the
+            # length-1 axis costs ~10x the copy
+            parts.append(data[:, 0] if data.shape[1] == 1 else data.mean(axis=1))
     return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
 
 
@@ -488,26 +490,13 @@ def decode_audio(path: str, sample_rate: int = 16000, max_seconds: float = MAX_A
     """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``,
     refused with :class:`AudioTooLongError` past ``max_seconds``.
 
-    libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —
-    then torchcodec for the rest (m4a, webm, ...).
+    The same decode as a model's own uploads (``load_speech_file``): a file
+    neither libsndfile nor FFmpeg reads raises ``ValueError`` (HTTP 400), while a
+    missing FFmpeg stays the server's error.
     """
-    try:
-        audio, sr = read_soundfile_capped(path, max_seconds)
-    except AudioRefusedError:
-        raise
-    except Exception:  # noqa: BLE001 — not a libsndfile container
-        return decode_torchcodec_capped(path, sample_rate, max_seconds).numpy().astype(np.float32)
-    check_resample_rate(sr, sample_rate)
-    if sr != sample_rate:
-        try:
-            import torch
-            import torchaudio
+    from mstar.model.components.audio_features import load_speech_file
 
-            audio = torchaudio.functional.resample(torch.from_numpy(audio), sr, sample_rate).numpy()
-        except ImportError:
-            idx = np.linspace(0, len(audio) - 1, int(round(len(audio) * sample_rate / sr)))
-            audio = np.interp(idx, np.arange(len(audio)), audio).astype(np.float32)
-    return audio
+    return load_speech_file(path, sample_rate, max_seconds).numpy()
 
 
 def window_stop(start: int, total: int, step: int, balanced: bool) -> int:
