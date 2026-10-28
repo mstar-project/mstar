@@ -972,20 +972,12 @@ class Cosmos3OmniTransformer(nn.Module):
     # ------------------------------------------------------------------
 
     def _rotary(self, position_ids: torch.Tensor, device, dtype):
-        """cos/sin of shape [N, head_dim] for a [3, N] block of 3D mRoPE ids."""
+        """cos/sin of shape [N, head_dim] for a [3, N] block of 3D mRoPE ids.
+        The generation tower's table is built once per request or window by
+        the DiT submodule (``_attach_rotary``) and passed into the denoise
+        steps."""
         cos, sin = self.rotary_emb(position_ids.unsqueeze(1), device=device, dtype=dtype)
         return cos.squeeze(0), sin.squeeze(0)
-
-    @torch.compiler.disable
-    def _gen_rotary(self, position_ids: torch.Tensor, device, dtype):
-        """``_rotary`` for the generation tower, kept eager inside the compiled
-        denoise step. Inductor fuses the interleaved mRoPE into one pointwise
-        kernel that Triton 3.7.1 miscompiles on sm_103 when a thread holds two
-        elements (wrong frequencies in odd slots), and pointwise autotuning
-        picks such a config at some token counts (121-frame 832x480 video).
-        The table depends only on positions, so eager costs a few small
-        kernels per step."""
-        return self._rotary(position_ids, device, dtype)
 
     def prefill_und(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor,
@@ -1029,7 +1021,7 @@ class Cosmos3OmniTransformer(nn.Module):
         return self.norm(x)
 
     def commit_window(
-        self, latents: torch.Tensor, position_ids_per_branch: list[torch.Tensor],
+        self, latents: torch.Tensor, rotary_per_branch: list[tuple[torch.Tensor, torch.Tensor]],
         label: str, attn,
     ) -> None:
         """Run the generation tower over a finished window's clean latents so
@@ -1037,24 +1029,21 @@ class Cosmos3OmniTransformer(nn.Module):
         of ``prefill_und`` for windowed (kv-mode) video. Clean conditioning
         frames receive no timestep embedding, so the committed K/V is
         denoise-step independent, exactly like i2v/v2v clean frames.
-        ``position_ids_per_branch`` carries one ``[3, N]`` mRoPE block per
-        guidance branch (the branches share content but their positions differ
-        with the prompt length); the sequence packs ``[cond | uncond]`` to
-        match the combined plan's label order. ``attn`` must be the paged
+        ``rotary_per_branch`` carries one ``(cos, sin)`` table ([N, head_dim])
+        per guidance branch (the branches share content but their positions
+        differ with the prompt length); the sequence packs ``[cond | uncond]``
+        to match the combined plan's label order. ``attn`` must be the paged
         resource (the dense one never writes pages). No velocity is decoded —
         the pass exists for its cache writes, which the step's commit makes
         permanent."""
         packed, _ = self._patchify_and_pack_latents([latents])
         gen_seq = self.proj_in(packed)
-        if len(position_ids_per_branch) > 1:
-            gen_seq = torch.cat([gen_seq] * len(position_ids_per_branch), dim=0)
-        cos_parts, sin_parts = [], []
-        for pos in position_ids_per_branch:
-            c, s = self._gen_rotary(pos, gen_seq.device, gen_seq.dtype)
-            cos_parts.append(c)
-            sin_parts.append(s)
-        cos = torch.cat(cos_parts, dim=0) if len(cos_parts) > 1 else cos_parts[0]
-        sin = torch.cat(sin_parts, dim=0) if len(sin_parts) > 1 else sin_parts[0]
+        if len(rotary_per_branch) > 1:
+            gen_seq = torch.cat([gen_seq] * len(rotary_per_branch), dim=0)
+            cos = torch.cat([c for c, _ in rotary_per_branch], dim=0)
+            sin = torch.cat([s for _, s in rotary_per_branch], dim=0)
+        else:
+            ((cos, sin),) = rotary_per_branch
         self._sp_run_gen_layers(gen_seq, cos, sin, label, attn)
 
     def _sp_run_gen_layers(self, gen_seq, cos, sin, label, attn):
@@ -1096,7 +1085,7 @@ class Cosmos3OmniTransformer(nn.Module):
         self,
         latents: torch.Tensor,
         vision_timesteps: torch.Tensor,
-        position_ids: torch.Tensor,
+        rotary: tuple[torch.Tensor, torch.Tensor],
         vision_token_shapes: list[tuple[int, int, int]],
         vision_noisy_frame_indexes: list[torch.Tensor],
         vision_mse_loss_indexes: torch.Tensor,
@@ -1119,9 +1108,9 @@ class Cosmos3OmniTransformer(nn.Module):
         Patchifies ``latents`` ([1, C, T, H, W]), scatter-adds the timestep
         embedding to the noisy tokens, runs the generation layers (each reading
         ``label``'s cached understanding K/V plus its own freshly written
-        K/V), and decodes the flow velocity. ``position_ids`` are the generation
-        segment's 3D mRoPE ids ([3, num_gen]) — the vision band, then the action
-        or sound band when present. ``vision_mse_loss_indexes`` /
+        K/V), and decodes the flow velocity. ``rotary`` is the generation
+        segment's mRoPE ``(cos, sin)`` table ([num_gen, head_dim]) — the vision
+        band, then the action or sound band when present. ``vision_mse_loss_indexes`` /
         ``action_mse_gen_indexes`` / ``sound_mse_gen_indexes`` index into the
         generation token block. With an extra band the generation sequence is
         ``[vision tokens | action or sound tokens]`` and the call returns
@@ -1157,7 +1146,7 @@ class Cosmos3OmniTransformer(nn.Module):
             )
             gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
 
-        cos, sin = self._gen_rotary(position_ids, gen_seq.device, gen_seq.dtype)
+        cos, sin = rotary
         gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, label, attn)
         gen_out = self.norm_moe_gen(gen_seq)
         preds_packed = self.proj_out(gen_out[vision_mse_loss_indexes])
@@ -1183,8 +1172,8 @@ class Cosmos3OmniTransformer(nn.Module):
         self,
         latents: torch.Tensor,
         vision_timesteps: torch.Tensor,
-        position_ids_cond: torch.Tensor,
-        position_ids_uncond: torch.Tensor,
+        rotary_cond: tuple[torch.Tensor, torch.Tensor],
+        rotary_uncond: tuple[torch.Tensor, torch.Tensor],
         vision_token_shapes: list[tuple[int, int, int]],
         vision_noisy_frame_indexes: list[torch.Tensor],
         vision_mse_loss_indexes: torch.Tensor,
@@ -1209,10 +1198,10 @@ class Cosmos3OmniTransformer(nn.Module):
         tokens — same latents, same timestep, so the patchified input and its
         timestep embedding are built once and repeated. They differ only in (a)
         the text-conditioning K/V they attend to (held under two cache labels)
-        and (b) their rotary positions: the media band starts just after each
+        and (b) their rotary tables: the media band starts just after each
         branch's text, and the two prompts have different lengths. So pack
         ``[cond tokens | uncond tokens]`` into one sequence carrying per-branch
-        positions, and let the handle's batched plan route each branch to its
+        ``(cos, sin)``, and let the handle's batched plan route each branch to its
         own label's pages. Returns the conditional and unconditional results in
         the same form as ``denoise_step`` (a velocity, or a (video, action) /
         (video, sound) pair when the extra band is present).
@@ -1254,10 +1243,8 @@ class Cosmos3OmniTransformer(nn.Module):
 
         n = gen_seq.shape[0]
         gen_seq = torch.cat([gen_seq, gen_seq], dim=0)
-        cos_c, sin_c = self._gen_rotary(position_ids_cond, gen_seq.device, gen_seq.dtype)
-        cos_u, sin_u = self._gen_rotary(position_ids_uncond, gen_seq.device, gen_seq.dtype)
-        cos = torch.cat([cos_c, cos_u], dim=0)
-        sin = torch.cat([sin_c, sin_u], dim=0)
+        cos = torch.cat([rotary_cond[0], rotary_uncond[0]], dim=0)
+        sin = torch.cat([rotary_cond[1], rotary_uncond[1]], dim=0)
 
         gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, label, attn)
         gen_out = self.norm_moe_gen(gen_seq)
@@ -1287,7 +1274,7 @@ class Cosmos3OmniTransformer(nn.Module):
     def denoise_step_batched(self, requests: list[dict], label: str, attn):
         """Denoise one step for several requests at once (image / video).
 
-        Each request carries its own latents, timestep, rotary positions (which
+        Each request carries its own latents, timestep, rotary tables (which
         differ per request, and per guidance branch) and token layout. Every
         request contributes a conditional and an unconditional sequence, packed
         as ``[cond r0 | cond r1 | ... | uncond r0 | uncond r1 | ...]`` to match
@@ -1298,7 +1285,7 @@ class Cosmos3OmniTransformer(nn.Module):
         a request with a sound band.
 
         Each ``requests`` entry is a dict with: ``latents``, ``vision_timesteps``,
-        ``position_ids_cond``, ``position_ids_uncond``, ``vision_token_shapes``,
+        ``rotary_cond``, ``rotary_uncond`` (``(cos, sin)`` each), ``vision_token_shapes``,
         ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``; sound-band
         requests additionally carry ``sound_latents``, ``sound_timesteps``,
         ``sound_token_shapes``, ``sound_noisy_frame_indexes``,
@@ -1328,8 +1315,8 @@ class Cosmos3OmniTransformer(nn.Module):
                 gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
             gen_seqs.append(gen_seq)
             shapes.append(original_latent_shapes)
-            cc, sc = self._gen_rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
-            cu, su = self._gen_rotary(req["position_ids_uncond"], gen_seq.device, gen_seq.dtype)
+            cc, sc = req["rotary_cond"]
+            cu, su = req["rotary_uncond"]
             cos_cond.append(cc)
             sin_cond.append(sc)
             cos_uncond.append(cu)
@@ -1377,7 +1364,7 @@ class Cosmos3OmniTransformer(nn.Module):
         """Joint ``[video | action]`` denoise for several action requests at once.
 
         The action analogue of ``denoise_step_batched``. Each request carries its
-        own video latents, action latents, per-band timesteps, rotary positions
+        own video latents, action latents, per-band timesteps, rotary tables
         (per guidance branch), token layout and embodiment domain id; its
         generation block is ``[vision tokens | action tokens]``. With classifier-
         free guidance every request contributes a conditional and an
@@ -1394,8 +1381,8 @@ class Cosmos3OmniTransformer(nn.Module):
         without guidance, ``(conditional, unconditional)`` with.
 
         Each ``requests`` entry is a dict with: ``latents``, ``action_latents``,
-        ``vision_timesteps``, ``action_timesteps``, ``position_ids_cond``
-        (plus ``position_ids_uncond`` when ``with_cfg``), ``vision_token_shapes``,
+        ``vision_timesteps``, ``action_timesteps``, ``rotary_cond``
+        (plus ``rotary_uncond`` when ``with_cfg``), ``vision_token_shapes``,
         ``vision_noisy_frame_indexes``, ``vision_mse_loss_indexes``,
         ``action_token_shapes``, ``action_noisy_frame_indexes``,
         ``action_mse_gen_indexes``, ``action_domain_id``."""
@@ -1420,11 +1407,11 @@ class Cosmos3OmniTransformer(nn.Module):
             gen_seq = torch.cat([gen_seq, action_seq], dim=0)
             gen_seqs.append(gen_seq)
             shapes.append(original_latent_shapes)
-            cc, sc = self._gen_rotary(req["position_ids_cond"], gen_seq.device, gen_seq.dtype)
+            cc, sc = req["rotary_cond"]
             cos_cond.append(cc)
             sin_cond.append(sc)
             if with_cfg:
-                cu, su = self._gen_rotary(req["position_ids_uncond"], gen_seq.device, gen_seq.dtype)
+                cu, su = req["rotary_uncond"]
                 cos_uncond.append(cu)
                 sin_uncond.append(su)
 
