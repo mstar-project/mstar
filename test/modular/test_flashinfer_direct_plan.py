@@ -20,11 +20,12 @@ from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper  # noqa
 PAGE, BS, QO, KV, HD, PAGES = 16, 8, 8, 2, 128, 512
 
 
-def _wrapper():
+def _wrapper(use_tensor_cores=True, qo=QO, kv=KV):
     ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     return FlashInferDecodeWrapper(
-        ws, num_qo_heads=QO, num_kv_heads=KV, head_dim=HD, page_size=PAGE,
+        ws, num_qo_heads=qo, num_kv_heads=kv, head_dim=HD, page_size=PAGE,
         batch_size=BS, max_num_pages=PAGES, device=torch.device("cuda"), accelerator_graph=True,
+        use_tensor_cores=use_tensor_cores,
     )
 
 
@@ -39,10 +40,16 @@ def _batch(rng):
                 paged_kv_last_page_len=t(last), kv_lens=t(lens.astype(np.int32)))
 
 
-def test_direct_plan_matches_flashinfer_plan():
+@pytest.mark.parametrize("use_tensor_cores,qo,kv", [
+    (True, QO, KV),
+    # CUDA-core decode: GQA, and MHA (Whisper), which keeps it for its kernel
+    (False, QO, KV),
+    (False, QO, QO),
+])
+def test_direct_plan_matches_flashinfer_plan(use_tensor_cores, qo, kv):
     rng = np.random.default_rng(0)
-    full, direct = _wrapper(), _wrapper()
-    cache = torch.randn(PAGES, 2, PAGE, KV, HD, dtype=torch.bfloat16, device="cuda")
+    full, direct = _wrapper(use_tensor_cores, qo, kv), _wrapper(use_tensor_cores, qo, kv)
+    cache = torch.randn(PAGES, 2, PAGE, kv, HD, dtype=torch.bfloat16, device="cuda")
     for step in range(12):
         batch = _batch(rng)
         full._planner_args = None  # forget the direct planner: a full FlashInfer plan
@@ -56,7 +63,7 @@ def test_direct_plan_matches_flashinfer_plan():
             assert torch.equal(getattr(a, name), getattr(b, name)), name
         n = batch["paged_kv_indices"].shape[0]
         assert torch.equal(a._paged_kv_indices_buf[:n], b._paged_kv_indices_buf[:n])
-        q = torch.randn(BS, QO, HD, dtype=torch.bfloat16, device="cuda")
+        q = torch.randn(BS, qo, HD, dtype=torch.bfloat16, device="cuda")
         assert torch.equal(full.run(q, cache), direct.run(q, cache))
 
 
