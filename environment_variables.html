@@ -1088,8 +1088,9 @@ refused. Never downloaded.</p></td>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>Path to the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary. Fallback order:
-<code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code>, this variable, <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, then the in-repo
-<code class="docutils literal notranslate"><span class="pre">rust/server/target/release</span></code> build.</p></td>
+<code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code>, this variable, the running environment’s
+scripts directory (where the Linux wheels install it), <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, then
+the in-repo <code class="docutils literal notranslate"><span class="pre">rust/server/target/release</span></code> build.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code></p></td>
 <td><p>unset</p></td>

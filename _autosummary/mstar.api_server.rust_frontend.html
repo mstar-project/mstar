@@ -756,7 +756,7 @@ bridge socket is private to the pair.</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.find_server_binary" title="mstar.api_server.rust_frontend.find_server_binary"><code class="xref py py-obj docutils literal notranslate"><span class="pre">find_server_binary</span></code></a>([explicit])</p></td>
-<td><p>Resolve the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary: explicit arg, <code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code>, <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, then the in-repo release build.</p></td>
+<td><p>Resolve the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary: explicit arg, <code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code>, the running environment's scripts directory (where a Linux wheel installs it, also when the venv is not activated), <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, then the in-repo release build.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.launch_rust_server" title="mstar.api_server.rust_frontend.launch_rust_server"><code class="xref py py-obj docutils literal notranslate"><span class="pre">launch_rust_server</span></code></a>(binary, model_name, port, ...)</p></td>
 <td><p></p></td>
@@ -828,7 +828,10 @@ its OpenAI translation by it (<code class="docutils literal notranslate"><span c
 <dt class="sig sig-object py" id="mstar.api_server.rust_frontend.find_server_binary">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">find_server_binary</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">explicit</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#find_server_binary"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.find_server_binary" title="Link to this definition">#</a></dt>
 <dd><p>Resolve the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary: explicit arg, <code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code>,
-<code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, then the in-repo release build.</p>
+the running environment’s scripts directory (where a Linux wheel installs
+it, also when the venv is not activated), <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, then the in-repo
+release build. The scripts directory goes before <code class="docutils literal notranslate"><span class="pre">$PATH</span></code> so another
+environment’s older binary never serves this one’s bridge.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>explicit</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p>

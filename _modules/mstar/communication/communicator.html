@@ -1288,16 +1288,20 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># A support bundle must be able to tell what a mesh was running,</span>
             <span class="c1"># and an old wheel left in an env must not silently take over</span>
             <span class="c1"># the whole mesh under AUTO after an upgrade.</span>
+            <span class="c1"># The path says which copy loaded: a maturin-built mstar-rust</span>
+            <span class="c1"># package shadows the module an mstar-ai Linux wheel ships.</span>
             <span class="n">version</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">mstar_rust</span><span class="p">,</span> <span class="s2">"__version__"</span><span class="p">,</span> <span class="s2">"&lt;pre-versioning&gt;"</span><span class="p">)</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                <span class="s2">"control mesh transport: rust </span><span class="si">%s</span><span class="s2"> (MSTAR_RUST_ZMQ=</span><span class="si">%s</span><span class="s2">)"</span><span class="p">,</span>
-                <span class="n">version</span><span class="p">,</span> <span class="n">choice</span><span class="p">)</span>
+                <span class="s2">"control mesh transport: rust </span><span class="si">%s</span><span class="s2"> from </span><span class="si">%s</span><span class="s2"> (MSTAR_RUST_ZMQ=</span><span class="si">%s</span><span class="s2">)"</span><span class="p">,</span>
+                <span class="n">version</span><span class="p">,</span> <span class="n">mstar_rust</span><span class="o">.</span><span class="vm">__file__</span><span class="p">,</span> <span class="n">choice</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">version</span> <span class="o">!=</span> <span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                    <span class="s2">"mstar_rust version </span><span class="si">%s</span><span class="s2"> does not match this tree's "</span>
-                    <span class="s2">"expected </span><span class="si">%s</span><span class="s2"> — a stale wheel may be shadowing the "</span>
-                    <span class="s2">"vendored rust/ build (rebuild with `maturin develop "</span>
-                    <span class="s2">"--release`)"</span><span class="p">,</span> <span class="n">version</span><span class="p">,</span> <span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="p">)</span>
+                    <span class="s2">"mstar_rust version </span><span class="si">%s</span><span class="s2"> at </span><span class="si">%s</span><span class="s2"> does not match the expected "</span>
+                    <span class="s2">"</span><span class="si">%s</span><span class="s2">: in a checkout, rebuild it with `maturin develop "</span>
+                    <span class="s2">"--release -m rust/Cargo.toml`; in a pip install, upgrade "</span>
+                    <span class="s2">"mstar-ai and `pip uninstall mstar-rust` if a leftover "</span>
+                    <span class="s2">"build is shadowing the wheel's copy"</span><span class="p">,</span>
+                    <span class="n">version</span><span class="p">,</span> <span class="n">mstar_rust</span><span class="o">.</span><span class="vm">__file__</span><span class="p">,</span> <span class="n">EXPECTED_MSTAR_RUST_VERSION</span><span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">nonblocking_send</span> <span class="ow">or</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mstar_rust</span><span class="o">.</span><span class="n">ZmqCommunicator</span><span class="p">,</span> <span class="s2">"try_send"</span><span class="p">):</span>
                 <span class="k">return</span> <span class="n">RustZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
             <span class="c1"># built before try_send: every send the outbox makes would fail.</span>

@@ -1013,6 +1013,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sysconfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.auth</span><span class="w"> </span><span class="kn">import</span> <span class="n">API_KEY_ENV</span>
@@ -1054,10 +1055,14 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.find_server_binary">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">find_server_binary</span><span class="p">(</span><span class="n">explicit</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Resolve the ``mstar-server`` binary: explicit arg, ``MSTAR_SERVER_BIN``,</span>
-<span class="sd">    ``$PATH``, then the in-repo release build."""</span>
+<span class="sd">    the running environment's scripts directory (where a Linux wheel installs</span>
+<span class="sd">    it, also when the venv is not activated), ``$PATH``, then the in-repo</span>
+<span class="sd">    release build. The scripts directory goes before ``$PATH`` so another</span>
+<span class="sd">    environment's older binary never serves this one's bridge."""</span>
     <span class="k">for</span> <span class="n">candidate</span> <span class="ow">in</span> <span class="p">(</span>
         <span class="n">explicit</span><span class="p">,</span>
         <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SERVER_BIN"</span><span class="p">),</span>
+        <span class="nb">str</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="n">sysconfig</span><span class="o">.</span><span class="n">get_path</span><span class="p">(</span><span class="s2">"scripts"</span><span class="p">))</span> <span class="o">/</span> <span class="s2">"mstar-server"</span><span class="p">),</span>
         <span class="n">shutil</span><span class="o">.</span><span class="n">which</span><span class="p">(</span><span class="s2">"mstar-server"</span><span class="p">),</span>
         <span class="nb">str</span><span class="p">(</span><span class="n">Path</span><span class="p">(</span><span class="vm">__file__</span><span class="p">)</span><span class="o">.</span><span class="n">resolve</span><span class="p">()</span><span class="o">.</span><span class="n">parents</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
             <span class="o">/</span> <span class="s2">"rust"</span> <span class="o">/</span> <span class="s2">"server"</span> <span class="o">/</span> <span class="s2">"target"</span> <span class="o">/</span> <span class="s2">"release"</span> <span class="o">/</span> <span class="s2">"mstar-server"</span><span class="p">),</span>

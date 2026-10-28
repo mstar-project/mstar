@@ -1168,28 +1168,40 @@ resolved to Rust and the msgpack codec is in use. <code class="docutils literal 
 wherever that holds, so on a machine with the extension built, installing
 it is what moves a worker onto the Rust runtime.</p></li>
 </ul>
-<p>Build the extension into your environment with <a class="reference external" href="https://www.maturin.rs">maturin</a> (needs a Rust toolchain; <code class="docutils literal notranslate"><span class="pre">rustup</span></code> works):</p>
+<p>The Linux wheels of <code class="docutils literal notranslate"><span class="pre">mstar-ai</span></code> on PyPI (x86_64 and aarch64, CPython 3.12 to
+3.14) carry the extension, so <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">mstar-ai</span></code> there gets it; other
+platforms get the pure-Python wheel. The extension statically links libzmq
+4.3.4, under LGPL-3.0-or-later with its static-linking exception; its source is
+the upstream <a class="reference external" href="https://github.com/zeromq/libzmq/releases/tag/v4.3.4">v4.3.4 release</a>.
+Elsewhere, or to build from a checkout, build the extension into your
+environment with <a class="reference external" href="https://www.maturin.rs">maturin</a> (needs <a class="reference external" href="https://rustup.rs">rustup</a>, which installs the compiler version pinned in
+<code class="docutils literal notranslate"><span class="pre">rust-toolchain.toml</span></code>):</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>maturin
 maturin<span class="w"> </span>develop<span class="w"> </span>--release<span class="w"> </span>-m<span class="w"> </span>rust/Cargo.toml
 </pre></div>
 </div>
 <p>Build with <code class="docutils literal notranslate"><span class="pre">--release</span></code> — an unoptimized debug build (maturin’s default)
-costs real latency on the hot receive path. Verify with:</p>
+costs real latency on the hot receive path. If <code class="docutils literal notranslate"><span class="pre">mstar-ai</span></code> came from a Linux
+wheel that carries the extension, this build (a separate <code class="docutils literal notranslate"><span class="pre">mstar-rust</span></code>
+distribution) takes precedence over the wheel’s copy in the same environment;
+<code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">uninstall</span> <span class="pre">mstar-rust</span></code> goes back to the wheel’s, and neither uninstall
+removes the other’s files. Verify with:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mstar_rust; print('mstar_rust OK')"</span>
 pytest<span class="w"> </span>test/rust
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">test/rust</span></code> is skipped wholesale when the extension is not importable, so
 a green run there without the build above proves nothing.</p>
-<p>The Rust-side tests need one extra flag. The crate’s default features turn on
-<code class="docutils literal notranslate"><span class="pre">pyo3/extension-module</span></code>, which tells pyo3 <em>not</em> to link libpython — right
+<p>The Rust-side tests need different features. The crate’s default features turn
+on <code class="docutils literal notranslate"><span class="pre">pyo3/extension-module</span></code>, which tells pyo3 <em>not</em> to link libpython — right
 for the cdylib, which resolves CPython symbols from the interpreter that
 imports it, wrong for <code class="docutils literal notranslate"><span class="pre">cargo</span> <span class="pre">test</span></code>, which is an executable and has to link
-it itself. Without this the link fails on <code class="docutils literal notranslate"><span class="pre">undefined</span> <span class="pre">symbol:</span>
-<span class="pre">PyEval_RestoreThread</span></code>:</p>
+it itself. Without <code class="docutils literal notranslate"><span class="pre">--no-default-features</span></code> the link fails on <code class="docutils literal notranslate"><span class="pre">undefined</span>
+<span class="pre">symbol:</span> <span class="pre">PyEval_RestoreThread</span></code>; <code class="docutils literal notranslate"><span class="pre">--features</span> <span class="pre">python</span></code> keeps the bindings and
+the graph runtime, whose tests need them:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s1">'import sysconfig</span>
 <span class="s1">print(sysconfig.get_config_var("LIBDIR"))'</span><span class="k">)</span><span class="s2">"</span>
-cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--release<span class="w"> </span>--no-default-features<span class="w"> </span>--manifest-path<span class="w"> </span>rust/Cargo.toml
+cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--release<span class="w"> </span>--no-default-features<span class="w"> </span>--features<span class="w"> </span>python<span class="w"> </span>--manifest-path<span class="w"> </span>rust/Cargo.toml
 </pre></div>
 </div>
 </section>
@@ -1197,15 +1209,17 @@ cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span
 <h2>Optional: the Rust HTTP frontend<a class="headerlink" href="#optional-the-rust-http-frontend" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> (<code class="docutils literal notranslate"><span class="pre">rust/server/</span></code>) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. Build and opt in:</p>
+keeping preprocessing and the conductor protocol. A Linux wheel that carries
+the extension also installs the binary next to <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>; otherwise build
+it. Then opt in:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--manifest-path<span class="w"> </span>rust/server/Cargo.toml
 mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni<span class="w"> </span>--rust-frontend
 <span class="c1"># or, with an explicit config: mstar-serve --config &lt;model.yaml&gt; --rust-frontend</span>
 </pre></div>
 </div>
 <p>The binary is resolved via <code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code> /
-<code class="docutils literal notranslate"><span class="pre">$PATH</span></code> / the in-repo build. Its knobs are listed in
-<a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>.</p>
+the environment’s scripts directory / <code class="docutils literal notranslate"><span class="pre">$PATH</span></code> / the in-repo build. Its knobs
+are listed in <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>.</p>
 <p>The OpenAI routes take the model’s adapter from the same registry as the Python
 frontend (<code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/api_server/openai/adapters.py</span></code>):
 <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> ports adapter classes, not model names, so every model of a
