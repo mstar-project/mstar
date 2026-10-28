@@ -1331,6 +1331,32 @@ is built with a ``comm_group`` and ``tp_world_size > 1``, the loader slices the 
 tensor along that parameter's shard dimension before copying it. For this reason, one
 ``load_weights`` path serves both single-GPU runs and tensor-parallel runs without change.
 
+Quantized checkpoints
+~~~~~~~~~~~~~~~~~~~~~
+
+A quantized checkpoint is read through a ``QuantMethod`` from
+``mstar.model.components.quantization``, not with format code in the model.
+``quant_method_for(hf_config["quantization_config"])`` picks it: fp8 block-scale (GLM-5.x,
+DeepSeek-V3's format; DeepSeek-V4.1's UE8M0 32 x 32 blocks and FP4 experts), and compressed-tensors
+int4 ``pack-quantized`` or ``mxfp4-pack-quantized``. The method knows each role's stored
+``WeightFormat`` (``linear``, ``routed_experts``, ``shared_expert``) and which roles stay quantized
+in memory; the rest load dequantized to bf16. The model supplies only the mapping from checkpoint
+names to roles:
+
+* ``quant.checkpoint_stream(weights, role_of)`` wraps the weight stream: resident parts pass
+  through as stored, other quantized weights arrive as one dequantized ``<base>.weight``, and a
+  quantized tensor no format claims is refused.
+* ``quant.routed_experts(num_experts, intermediate_size, hidden_size, comm_group, math=...)`` holds
+  the experts in their stored format, sharded on the intermediate dim, and returns this rank's
+  unreduced partial. ``ExpertMath`` states the activation and where the routing weight applies when
+  a checkpoint differs from ``silu(gate) * up`` scaled after the down projection.
+* ``quant.expert_rules(num_experts, source)`` and ``quant.expert_read_slice(...)`` give the
+  ``StackedParamRule`` list and the sliced-read specs for those experts.
+
+``kernels`` (``auto``, ``fused``, ``reference``) is the one switch: ``reference`` dequantizes per
+call (eager; the parity anchor), ``fused`` refuses to load where no fused kernel serves the format.
+GLM-5.2 (``mstar/model/glm52``) is the worked example.
+
 .. _step-5:
 
 Step 5 — Continuous batching and CUDA graphs

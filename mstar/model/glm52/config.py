@@ -1,11 +1,15 @@
 """GLM-5.2 architecture + generation config."""
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.utils.fp8_block import Fp8BlockQuantConfig
+
+if TYPE_CHECKING:
+    from mstar.model.components.quantization import QuantMethod
 
 # Engine resource labels for the one LLM node: the paged (latent) KV cache,
 # the attention resource planned over it, the token positions over it, the
@@ -294,3 +298,21 @@ class Glm52ModelConfig:
         cfg = cls.reduced()
         cfg.quantization_config = Fp8BlockQuantConfig(weight_block_size=block)
         return cfg
+
+
+def glm52_quant_method(
+    quant_config: Fp8BlockQuantConfig | None, fp8_resident: bool, moe_quant_kernel: str = "auto",
+) -> "QuantMethod | None":
+    """The fp8 checkpoint's quantization method: every role fp8 block-scale in the checkpoint, the
+    routed experts held fp8 when ``fp8_resident`` (``moe_fp8_resident``) and dispatched per
+    ``moe_quant_kernel``, the rest dequantized to bf16 at load. None for a bf16 checkpoint."""
+    if quant_config is None:
+        return None
+    from mstar.model.components.quantization import Fp8Block, QuantMethod
+
+    fmt = Fp8Block(quant_config.weight_block_size)
+    return QuantMethod(
+        {"linear": fmt, "shared_expert": fmt, "routed_experts": fmt},
+        resident=frozenset({"routed_experts"} if fp8_resident else ()),
+        kernels="fused" if moe_quant_kernel == "triton" else moe_quant_kernel,
+    )

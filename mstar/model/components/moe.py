@@ -75,7 +75,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.utils.fp8_block import FP8_DTYPE
+from mstar.model.components.quantization.formats import as_container
 
 logger = logging.getLogger(__name__)
 
@@ -507,16 +507,17 @@ def _gate_up_fp8_weight_loader(
     param: nn.Parameter, loaded_weight: torch.Tensor,
     loaded_shard_id: str | int | None = None,
 ):
-    """:func:`_gate_up_weight_loader` for an fp8 block-scale checkpoint's experts (a stacked
-    ``(E, 2 * rows, cols)`` uint8 param): one expert's gate or up weight, ``row_unit`` = 1, or its
-    ``weight_scale_inv``, ``row_unit`` = the scale block's rows. The full tensor or this rank's slice."""
+    """:func:`_gate_up_weight_loader` for a quantized checkpoint's experts (a stacked
+    ``(E, 2 * rows, cols)`` param per stored part, see ``quantization.QuantizedExperts``): one
+    expert's gate or up part, ``row_unit`` = the logical rows one stored row covers (1 for fp8
+    bytes, the block's rows for an fp8 scale). The full tensor or this rank's slice; 1-byte parts
+    are reinterpreted as the container's bytes, not converted."""
     assert loaded_shard_id is not None
     kind, expert_str = str(loaded_shard_id).split(":")
     expert_idx = int(expert_str)
     rows = divide(divide(full_inter, tp_size), row_unit)
     full_rows = divide(full_inter, row_unit)
-    if loaded_weight.dtype == FP8_DTYPE:
-        loaded_weight = loaded_weight.view(torch.uint8)
+    loaded_weight = as_container(loaded_weight, param.dtype)
     if loaded_weight.shape[0] == full_rows:
         start = tp_rank * rows
         loaded_weight = loaded_weight[start:start + rows, :]
@@ -541,8 +542,7 @@ def _down_proj_fp8_weight_loader(
     expert_idx = int(str(loaded_shard_id).split(":")[1])
     cols = divide(divide(full_inter, tp_size), col_unit)
     full_cols = divide(full_inter, col_unit)
-    if loaded_weight.dtype == FP8_DTYPE:
-        loaded_weight = loaded_weight.view(torch.uint8)
+    loaded_weight = as_container(loaded_weight, param.dtype)
     if loaded_weight.shape[1] == full_cols:
         start = tp_rank * cols
         loaded_weight = loaded_weight[:, start:start + cols]
