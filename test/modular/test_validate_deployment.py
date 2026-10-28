@@ -377,17 +377,19 @@ def test_lockstep_nodes_sharing_one_instance_are_accepted(groups, tmp_path, monk
 def test_lockstep_nodes_sharing_a_kv_resource_are_refused(offload, tmp_path):
     """Rank 0's page moves reach the followers with the next step of the node
     that made them, so two lockstep nodes over one pool could admit out of
-    step, with or without host offload."""
+    step. The layout is refused at any offload setting, ahead of the
+    shared-pool journal."""
     model = _Model(
         _a_then_b, specs=[_kv("kv", ["a", "b"])], kv_labels={"kv": {"main": KVLabel()}}, tp_enabled_nodes=["a", "b"],
     )
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources={"kv": {"cpu_offload_pages": offload}})
     assert _problems(model, cfg) == [
         f"KV resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_{rank}. Rank 0 "
-        "replicates its page moves (evictions, reloads) to the other ranks per node, with that "
-        "node's next step, so two lockstep nodes on one pool could admit out of step on a "
-        "follower. Journaling a shared pool across lockstep nodes is mstar PR #873's work, and "
-        "until then this layout is refused: place these nodes on different workers."
+        "replicates its page moves (host offloads and reloads, and the preemption drops of mstar "
+        "PR #873) to the other ranks per node, with that node's next step, so two lockstep nodes "
+        "on one pool could admit out of step on a follower. Journaling a shared pool across "
+        "lockstep nodes is that PR's work, and until then this layout is refused: place these "
+        "nodes on different workers."
         for rank in (0, 1)
     ]
 

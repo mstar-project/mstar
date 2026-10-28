@@ -461,8 +461,10 @@ SP groups; each must be TP- (or SP-) enabled by the model. Qwen3-Omni's ``Thinke
 ``Talker``, for example, can share one entry, ``{node_names: [Thinker, Talker], ranks: [0, 1],
 tp_size: 2}``, and the ranks then run both nodes' steps in one order. The conductor refuses
 lockstep nodes on one worker in different TP or SP groups, and two lockstep nodes on one
-worker that share a KV resource: rank 0 replicates its page moves per node, with that node's
-next step, and journaling a shared pool across lockstep nodes is mstar PR #873's work.
+worker that share a KV resource: rank 0 replicates its page moves (host offloads and reloads,
+and the preemption drops of mstar PR #873) per node, with that node's next step, so two nodes
+on one pool could admit out of step on a follower. Journaling a shared pool across lockstep
+nodes is that PR's work.
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
