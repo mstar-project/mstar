@@ -14,7 +14,6 @@ checked out:
         --out DIR --comment partial.md [--previous handoff.json] SOURCE...
 """
 import argparse
-import ast
 import json
 import os
 import re
@@ -30,6 +29,9 @@ PROGRESS = re.compile(r"[#*_\s]*progress[*_\s]*:", re.IGNORECASE)
 NOTE_CHARS = 6000
 RECENT_TEXT_CHARS = 3000
 ELIDED = " [...] "
+# The escapes git writes in a path it quotes: \" \\ \a \b \t \n \v \f \r, and other bytes in octal.
+C_ESCAPE = re.compile(rb"\\([0-3][0-7]{2}|.)", re.DOTALL)
+C_CHARS = dict(zip(b"abtnvfr", b"\a\b\t\n\v\f\r", strict=True))
 
 
 def load(paths):
@@ -229,13 +231,17 @@ def diff_paths(diff_text):
         path = line[len("+++ "):].rstrip("\t\r")
         if path.startswith('"'):
             # Git quotes a path with unusual characters, as a C string of its UTF-8 bytes.
-            try:
-                path = ast.literal_eval(path).encode("latin-1").decode("utf-8", "replace")
-            except (ValueError, SyntaxError):
+            if len(path) < 2 or not path.endswith('"'):
                 continue
+            path = C_ESCAPE.sub(c_byte, path[1:-1].encode()).decode("utf-8", "replace")
         if path.startswith("b/"):
             paths.append(path[len("b/"):])
     return paths
+
+
+def c_byte(m):
+    e = m[1]
+    return bytes([int(e, 8) if len(e) == 3 else C_CHARS.get(e[0], e[0])])
 
 
 def comment_lines(h, status):

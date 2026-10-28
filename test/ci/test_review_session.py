@@ -186,8 +186,10 @@ class TestHandoff(unittest.TestCase):
     def test_diff_paths_skip_deleted_files_and_hunk_lines(self):
         diff = ("diff --git a/x b/x\n--- a/x\n+++ /dev/null\ndiff --git a/y b/y\n--- a/y\n+++ b/y\n"
                 "@@ -1 +1,2 @@\n+++ b/not-a-file\n"
-                'diff --git "a/caf\\303\\251" "b/caf\\303\\251"\n--- "a/caf\\303\\251"\n+++ "b/caf\\303\\251"\n')
-        self.assertEqual(diff_paths(diff), ["y", "caf\u00e9"], "a path git quotes would be left out")
+                'diff --git "a/caf\\303\\251" "b/caf\\303\\251"\n--- "a/caf\\303\\251"\n+++ "b/caf\\303\\251\\t1"\n'
+                # A hunk the PR's author wrote to look like a quoted path.
+                '@@ -1 +1 @@\n--- a/x\n+++ "b/x" ' + "+" * 30000 + "\n")
+        self.assertEqual(diff_paths(diff), ["y", "caf\u00e9\t1"], "a path git quotes would be left out")
 
 
 class TestCli(unittest.TestCase):
