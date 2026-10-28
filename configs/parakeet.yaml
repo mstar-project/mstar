@@ -1,0 +1,15 @@
+model: "parakeet"
+max_seq_len: 8192
+# A request holds one decoder state slot from its first decode iteration until
+# it is torn down; the pool holds max_concurrent_requests of them plus its sink
+# slot, and the conductor queues the rest.
+max_concurrent_requests: 128
+resources:
+  transducer_state:
+    max_slots: 129
+node_groups:
+  - node_names: [audio_encoder, transducer]
+    ranks: [0]
+# Constructor options (forwarded to ParakeetModel.__init__):
+# model_kwargs:
+#   compile_step: false  # decode with eager kernels: start-up a few seconds faster, decoding ~2.5x slower

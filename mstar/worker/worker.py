@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import NamedTuple
 
 import torch
+from torch.distributed import ReduceOp
 
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
@@ -29,7 +30,6 @@ from mstar.communication.tensors import (
     create_tensor_communication_manager,
 )
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.all_reduce import flagged_on_any_rank
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
@@ -1559,16 +1559,14 @@ class Worker:
         failed the read reported it, and the others fail it here, so its outputs
         and its pages never exist on any rank.
 
-        One vote of a flag per row over TP, then SP (``flagged_on_any_rank``),
-        in the leader's row order, on the GPU thread where every rank prepares
-        the step."""
+        One vote of a flag per row over the TP x SP block (``JointGroups.agree``
+        with MAX), in the leader's row order, on the GPU thread where every rank
+        prepares the step."""
         rids = node_batch.read_check_rids
         failed = self.scheduler.read_failed_rids
-        node = node_batch.node_name
-        votes = flagged_on_any_rank([r in failed for r in rids], (
-            self.parallel_groups.get_tp_config_for_node(node),
-            self.parallel_groups.get_sp_config_for_node(node),
-        ))
+        votes = self.parallel_groups.get_joint_group_for_node(node_batch.node_name).agree(
+            [int(r in failed) for r in rids], ReduceOp.MAX,
+        )
         flagged = {r for r, f in zip(rids, votes, strict=True) if f}
         if not flagged:
             return
@@ -2673,22 +2671,15 @@ class Worker:
         """Refuse a per-rank flag mismatch at startup: a follower would wait for
         a decision the leader never sends, or get a head it cannot build."""
         for node in sorted(self.parallel_nodes):
-            local = torch.tensor(
-                [int(self._tp_async_for(node))], dtype=torch.int64, device=self.device,
-            )
-            for group in (
-                self.parallel_groups.get_tp_config_for_node(node),
-                self.parallel_groups.get_sp_config_for_node(node),
-            ):
-                if group.world_size == 1:
-                    continue
-                values = group.all_gather(local, dim=0).cpu().tolist()
-                if any(v != values[0] for v in values):
-                    raise RuntimeError(
-                        f"MSTAR_TP_ASYNC_SCHED disagrees across the ranks of {node!r} "
-                        f"(ranks {group.group_members}: async={values}); set it "
-                        "identically on every rank of the instance."
-                    )
+            on = int(self._tp_async_for(node))
+            joint = self.parallel_groups.get_joint_group_for_node(node)
+            lo, neg_hi = joint.agree([on, -on])
+            if lo != -neg_hi:
+                raise RuntimeError(
+                    f"MSTAR_TP_ASYNC_SCHED disagrees across the ranks of {node!r} "
+                    f"(async min {lo}, max {-neg_hi}); set it identically on every "
+                    "rank of the instance."
+                )
 
     def _is_tp_lead_pending(self, pending: PendingBatch) -> bool:
         """``pending`` is a parallel batch this worker leads under TP async."""
