@@ -997,7 +997,7 @@ methods are:
    The worker cuts each row to its span after the step's completion event, before the stop
    check, transport or a streaming edge reads it. The cut is a view, not a copy. Engine-side
    ``postprocess`` still sees the uncut output. A spanned output must not feed a node that
-   the same worker speculates into. Kokoro's ``AUDIO_CHUNK`` is the example.
+   the same worker speculates into.
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.
