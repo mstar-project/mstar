@@ -375,21 +375,21 @@ def test_lockstep_nodes_sharing_one_instance_are_accepted(groups, tmp_path, monk
 
 @pytest.mark.parametrize("offload", [0, 4])
 def test_lockstep_nodes_sharing_a_kv_resource_are_refused(offload, tmp_path):
-    """Rank 0's page moves reach the followers with the next step of the node
-    that made them, so two lockstep nodes over one pool could admit out of
-    step. The layout is refused at any offload setting until rank 0 journals
-    a shared pool in one stream."""
+    """Rank 0's page moves on a pool reach the followers per node, riding on
+    one node's next step, so two lockstep nodes over one pool could admit out
+    of step. The layout is refused at any offload setting until rank 0
+    journals a shared pool in one stream."""
     model = _Model(
         _a_then_b, specs=[_kv("kv", ["a", "b"])], kv_labels={"kv": {"main": KVLabel()}}, tp_enabled_nodes=["a", "b"],
     )
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources={"kv": {"cpu_offload_pages": offload}})
     assert _problems(model, cfg) == [
         f"KV resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_{rank}. Rank 0 "
-        "replicates its page moves (host offloads and reloads today; mstar PR #873 adds preemption "
-        "drops and reservations) to the other ranks per node, with that node's next step, so two "
-        "lockstep nodes on one pool could admit out of step on a follower. Journaling a shared "
-        "pool across lockstep nodes in one stream belongs with the journal rework of mstar PR "
-        "#873, and until then this layout is refused: place these nodes on different workers."
+        "replicates the page moves it makes on a pool (host offloads and reloads, for example) to "
+        "the other ranks per node, riding on one node's next step, so two lockstep nodes on one "
+        "pool could admit out of step on a follower. Journaling a shared pool across lockstep "
+        "nodes in one stream belongs with the journal rework of mstar PR #873, and until then "
+        "this layout is refused: place these nodes on different workers."
         for rank in (0, 1)
     ]
 
