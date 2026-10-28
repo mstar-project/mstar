@@ -379,9 +379,10 @@ class Cosmos3Config:
     # Run the streaming decode on channels-last weights and activations,
     # cuDNN's native conv3d layout: no per-conv layout conversion kernels.
     # Same math; bf16 output differs from the default layout only by rounding.
-    # The streaming node then loads its own copy of the VAE decoder instead of
-    # sharing the whole-clip decoder's, which keeps the default layout: a fixed
-    # ~1.03 GiB of bf16 weights (Wan2.2 VAE) in a process hosting both nodes.
+    # A decoder node that converts takes its own decoder-only copy of the VAE
+    # (~1.03 GiB of bf16 weights for Wan2.2): the streaming node here, the
+    # whole-clip decoder under ``vae_decode_fast``. A node with its switch off
+    # shares one default-layout instance instead.
     vae_decode_channels_last: bool = True
     # Decode a whole clip (the non-windowed video and image walks) with the
     # shared Wan VAE decoder: the same per-latent decoder calls as

@@ -1844,9 +1844,10 @@ class Cosmos3Model(Model):
             )
             return Cosmos3VAEDecoderSubmodule(vae=vae, config=self.config)
         if node_name == VAE_DECODER_AR_NODE:
-            # Shares the decoder VAE weights unless it decodes channels-last,
-            # which converts the VAE in place; only the streaming chunk state
-            # and compile wrapper are per-node.
+            # Channels-last converts the VAE in place, so the streaming node
+            # takes its own decoder-only copy too; with the switch off it
+            # shares the default-layout instance. The streaming chunk state
+            # and compile wrapper are per-node either way.
             vae = (
                 self._build_decoder_only_vae(device)
                 if self.config.vae_decode_channels_last
@@ -1938,8 +1939,8 @@ class Cosmos3Model(Model):
         return self._vae
 
     def _build_decoder_only_vae(self, device: str):
-        # A separate instance (the decode needs no encoder), so converting it
-        # leaves the instance the whole-clip decoder uses untouched.
+        # One decoder-only instance per node that converts its layout in
+        # place, so the instance ``_build_vae`` shares stays as loaded.
         if self.skip_weight_loading:
             return None
         from diffusers import AutoencoderKLWan
