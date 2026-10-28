@@ -28,6 +28,20 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
     wire_ids = {}
     track_request_ids(PythonGraphRuntime, wire_ids)
 
+    from mstar.api_server.entrypoint import APIServer
+
+    original_submit = APIServer.submit_request
+
+    def submitted(self, *args, **kwargs):
+        request_id = original_submit(self, *args, **kwargs)
+        row = {"event": "request_identity", "entity": "api_server", "time": time.time(),
+               "request_id": request_id, "submission_key": self.submission_key(request_id)}
+        with (root / ("ownership-events-" + str(os.getpid()) + ".jsonl")).open("a") as output:
+            output.write(json.dumps(row) + "\n")
+        return request_id
+
+    APIServer.submit_request = submitted
+
     def snapshot(manager, event, rid=None, **extra):
         store = manager.tensor_store
         rows = []

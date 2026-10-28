@@ -286,6 +286,7 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
     import types
     from pathlib import Path
 
+    from mstar.api_server.entrypoint import APIServer
     from mstar.communication.arena import ArenaShmCommunicationManager
     from mstar.communication.tensors import TensorCommunicationManager
     from mstar.engine.engine import Engine
@@ -308,6 +309,7 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
         (PythonGraphRuntime, "cleanup_consumed_inputs"),
         (PythonGraphRuntime, "add_request"),
         (Engine, "remove_request"),
+        (APIServer, "submit_request"),
     ):
         monkeypatch.setattr(cls, name, cls.__dict__[name])
     arena_calls = []
@@ -362,6 +364,28 @@ def test_engine_cleanup_gate_requires_wire_id_state_and_page_release():
         verify_engine_cleanup([{**row, "remaining_node_states": ["MimiDecoder"]}], ["http-id"])
     with pytest.raises(AssertionError, match="reclaimable KV"):
         verify_engine_cleanup([{**row, "reclaimable_pages": {"lm_kv": 1}}], ["http-id"])
+
+
+def test_worker_ids_resolve_through_observed_api_submission_keys():
+    from benchmark.personaplex.serving import correlate_request_ids
+
+    rows = [
+        {"event": "request_identity", "entity": "api_server", "request_id": "client#literal",
+         "submission_key": "opaque-key-one"},
+        {**_ownership("after_decoder_inputs_consumed", 0, 10), "request_id": "opaque-key-one"},
+        {**_ownership("before_hard_cleanup", 0, 11), "request_id": "opaque-key-one"},
+        {"event": "request_identity", "entity": "api_server", "request_id": "second",
+         "submission_key": "opaque-key-two"},
+        {**_ownership("after_decoder_inputs_consumed", 0, 20), "request_id": "opaque-key-two"},
+        {**_ownership("before_hard_cleanup", 0, 21), "request_id": "opaque-key-two"},
+    ]
+    correlated = correlate_request_ids(rows)
+    assert correlated[0]["request_id"] == "client#literal"
+    assert correlated[0]["internal_request_id"] == "opaque-key-one"
+    verify_ownership_observations(correlated, 2, ["client#literal", "second"])
+    # An unrelated lifetime cannot stand in for an HTTP completion when its mapping is absent.
+    with pytest.raises(AssertionError, match="Completed HTTP requests"):
+        verify_ownership_observations(correlate_request_ids(rows[1:]), 2, ["client#literal", "second"])
 
 
 def test_cancelled_stream_may_hold_inflight_frames_but_completed_stream_must_not():

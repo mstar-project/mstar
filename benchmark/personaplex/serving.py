@@ -44,6 +44,14 @@ def write_json(path, value):
 AGENT_FRAME_DIMS = [1, 8, 1]  # one frame of the 8 agent codebooks
 
 
+def correlate_request_ids(rows):
+    """Resolve worker submission keys through API observations, never by parsing their spelling."""
+    clients = {row["submission_key"]: row["request_id"] for row in rows if row["event"] == "request_identity"}
+    return [{**row, "internal_request_id": row.get("request_id"),
+             "request_id": clients.get(row.get("request_id"), row.get("request_id"))}
+            for row in rows if row.get("entity", "").startswith("worker")]
+
+
 def holds_agent_frame(tensor):
     """The observer usually cannot name a tensor, so an agent frame is also recognised by shape."""
     return tensor.get("name") == "agent_frame" or list(tensor.get("dims") or []) == AGENT_FRAME_DIMS
@@ -279,9 +287,9 @@ class Lifecycle:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue  # A concurrent writer can still be finishing its last line.
-                if row["entity"].startswith("worker"):
+                if row["entity"].startswith("worker") or row["event"] == "request_identity":
                     rows.append(row)
-        return rows
+        return correlate_request_ids(rows)
 
     def drain(self, previous_cleanups, additional):
         end = time.monotonic() + 90
@@ -405,7 +413,8 @@ class Lifecycle:
         self.drain(before, 1)
         cleanup = [r for r in self.events() if r["event"] == "before_hard_cleanup"
                    and r.get("request_id") == request_id]
-        assert cleanup and max(r["time"] for r in cleanup) >= disconnected, (
+        assert cleanup, f"Missing cleanup correlated with HTTP request {request_id}"
+        assert max(r["time"] for r in cleanup) >= disconnected, (
             "Request finished before disconnect; mid-stream cancellation not established")
 
     def group(self, entries, cancel_first=False):
