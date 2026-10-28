@@ -7,6 +7,9 @@ and ``Engine.finalize_stopped_requests`` then reads that rid's forward-pass
 info. A dropped row is no longer in the batch, so stopping it raised
 ``KeyError`` there and the main loop failed every request in the batch.
 
+Also: an ``END_PARTITION`` stop (a prefill that sampled a stop token) reports
+the partition done on the step and never reaches the runtime as a loop name.
+
 Drives the real ``Engine.prepare_inputs``, ``Worker._drop_failed_rids`` and
 ``Worker._postprocess_batch``; the graph runtime and tensor store are stubs
 that stop at output routing.
@@ -24,7 +27,7 @@ torch = pytest.importorskip("torch")
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.model.submodule_base import BatchedModelOutput  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
@@ -39,8 +42,9 @@ class _Sub:
     """A stream consumer; ``bad`` rows raise in the named stage, ``skip`` rows
     are declined by prepare_inputs."""
 
-    def __init__(self, bad=(), stage="prepare", skip=()):
+    def __init__(self, bad=(), stage="prepare", skip=(), stops=None):
         self.bad, self.stage, self.skip = set(bad), stage, set(skip)
+        self.stops = stops or {}
 
     def uniform_row_inputs(self, graph_walk, has_loopback=False):
         return None
@@ -59,7 +63,7 @@ class _Sub:
     def check_stop(self, rid, info, outputs):
         if self.stage == "check_stop" and rid in self.bad:
             raise RuntimeError("bad stop check")
-        return set()
+        return set(self.stops.get(rid, ()))
 
 
 class _Runtime:
@@ -68,6 +72,7 @@ class _Runtime:
 
     def __init__(self, pending_stops=()):
         self.stopped: list[int] = []
+        self.loop_names: dict[int, set[str]] = {}
         self.pending_stops = set(pending_stops)
 
     def pending_loop_stop_rids(self, graph_walk, loop_name):
@@ -82,6 +87,7 @@ class _Runtime:
     def stop_loops_batched(self, partition, graph_walk, last_node_run, loop_names):
         rids = [rid for rid, _ in loop_names]
         self.stopped.extend(rids)
+        self.loop_names.update((rid, set(names)) for rid, names in loop_names)
         return rids
 
 
@@ -94,7 +100,7 @@ def _engine(sub):
     return eng
 
 
-def _batch(rids):
+def _batch(rids, streams=True):
     info = {
         r: SimpleNamespace(rid=r, update_publish_info=lambda p: None) for r in rids
     }
@@ -104,12 +110,12 @@ def _batch(rids):
             request_ids=tuple(rids), graph_walk=WALK, slot=0, capture=False,
         ),
         # every row takes its stream's final chunk this step
-        final_stream_rids=set(rids),
-        stream_partition_done_rids=set(rids),
+        final_stream_rids=set(rids) if streams else set(),
+        stream_partition_done_rids=set(rids) if streams else set(),
     )
 
 
-def _worker(eng, runtime):
+def _worker(eng, runtime, in_loop=True):
     def _store(*a, **k):
         raise _ReachedRoutingError
 
@@ -126,25 +132,25 @@ def _worker(eng, runtime):
         store_and_return_tensor_info_batch=_store,
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda n: eng)
-    w._innermost_loop_by_node = {(WALK, NODE): LOOP}
+    w._innermost_loop_by_node = {(WALK, NODE): LOOP} if in_loop else {}
     w.reported: dict[int, str] = {}
     w._fail_requests = w.reported.update
     w.request_state = SimpleNamespace(buffer_publish_info=lambda *a: None)
     return w
 
 
-def _postprocess(sub, rids=(1, 2), pending_stops=()):
+def _postprocess(sub, rids=(1, 2), pending_stops=(), streams=True, in_loop=True):
     """What ``Worker.run`` does with a finished step: drop and report the rows
     a per-rid stage failed, then postprocess the rest. ``pending_stops`` makes
     the step a speculative new loop iteration whose rows in it already
     stopped a step earlier."""
     eng, runtime = _engine(sub), _Runtime(pending_stops)
-    batch = _batch(rids)
+    batch = _batch(rids, streams)
     eng.prepare_inputs(batch)
     outputs = BatchedModelOutput(per_rid_outputs={
         r: {"audio": [torch.zeros(1)]} for r in batch.request_ids
     })
-    w = _worker(eng, runtime)
+    w = _worker(eng, runtime, in_loop)
     pending = PendingBatch(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK,
@@ -197,3 +203,13 @@ def test_a_row_that_overstayed_its_loop_stop_is_not_stopped_again():
     assert not w.reported
     assert batch.final_stream_rids == {1}
     assert batch.stream_partition_done_rids == {1}
+
+
+@pytest.mark.parametrize("in_loop", [False, True], ids=["prefill", "in_loop"])
+def test_an_end_partition_stop_reports_the_partition_done(in_loop):
+    """END_PARTITION is never a loop name for the runtime; a row inside a loop
+    stops that loop, so its pass (and the report) can end."""
+    batch, runtime, w = _postprocess(_Sub(stops={1: {END_PARTITION}}), streams=False, in_loop=in_loop)
+    assert batch.stream_partition_done_rids == {1}
+    assert runtime.loop_names == ({1: {LOOP}} if in_loop else {})
+    assert not w.reported

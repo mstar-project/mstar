@@ -301,8 +301,8 @@ class ExecutingBatch:
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
-    # rids for which this step ends every finite stream into the partition;
-    # this step reports the partition done
+    # rids for which this step ends every finite stream into the partition, or
+    # whose stop check returned END_PARTITION; this step reports the partition done
     stream_partition_done_rids: set[int] = field(default_factory=set)
 
     # Populated on batch preparation

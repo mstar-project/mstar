@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 class GraphRuntimePartitionInfo:
     graph_walk: str
     graph_walk_worker_graph_ids: list[int] = field(default_factory=list) # for this worker
-    stream_partition_done: bool = False  # set True when last chunk pops with is_final
+    stream_partition_done: bool = False  # see GraphRuntime.mark_stream_partition_done
 
 @dataclass
 class _SpecRidPrep:

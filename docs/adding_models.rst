@@ -1019,7 +1019,15 @@ methods are:
 ``check_stop(...) -> set[str]`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
-   terminates.
+   terminates. A prefill samples the first token before its decode loop exists, so a stop
+   there is returned as ``END_PARTITION`` (from ``mstar.model.submodule_base``) instead:
+   the worker reports the partition done with that pass, and the conductor ends it rather
+   than start decode. ``TokenStepNode`` does this for its prompt walks; Qwen3.5 and
+   Command-A+ do it for their last prefill. It suits a partition with nothing left to run
+   once generation stops: a model that runs another walk after its loop (Whisper's
+   ``align``, BAGEL's image generation) or publishes final-only state at the loop's stop
+   needs its own transition instead. Keep ``check_stop_batched``, if you write one, in
+   agreement.
 
 ``cleanup_request(self, request_id)`` (optional)
    Free per-request state held inside the submodule when a request finishes: buffers,

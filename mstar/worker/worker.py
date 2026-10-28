@@ -56,7 +56,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
-from mstar.model.submodule_base import BatchedModelOutput, HostRows, InputMetadata
+from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows, InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils import knobs
@@ -712,11 +712,12 @@ class Worker:
         }
 
         # (graph_walk, node) -> innermost enclosing loop, for ending a
-        # stream-terminated loop in _postprocess_batch. Structural, so it is
-        # derived from the model here rather than asked of the graph runtime
-        # per step -- which also keeps it identical under both runtimes.
+        # stream-terminated loop or an END_PARTITION row's loop in
+        # _postprocess_batch. Structural, so it is derived from the model here
+        # rather than asked of the graph runtime per step -- which also keeps
+        # it identical under both runtimes.
         self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
-        if self._my_consumer_connections and model:
+        if model:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
                 model.get_graph_walk_graphs(),
             )
@@ -3627,8 +3628,22 @@ class Worker:
                     range_pop(synchronize=False)
                 return
 
+        # END_PARTITION (e.g. a prefill that sampled a stop token) ends the
+        # partition on this pass's report. It is no loop name: a row inside a
+        # loop stops its innermost one instead, so that the pass can end.
+        for rid in [rid for rid, loops in stops.items() if END_PARTITION in loops]:
+            batch_N.node_batch.stream_partition_done_rids.add(rid)
+            loops = stops.pop(rid) - {END_PARTITION}
+            loop_name = self._innermost_loop_by_node.get(
+                (batch_N.batch.walk_of(rid), batch_N.node_name)
+            )
+            if loop_name is not None:
+                loops.add(loop_name)
+            if loops:
+                stops[rid] = loops
+
         # the stop check itself is the direct window above; this stage is its
-        # tail (prefix chains, stream-terminated loops, failed rids)
+        # tail (prefix chains, stream-terminated loops, failed rids, partition ends)
         _pp_stage("check_stop_tail")
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -3720,7 +3735,8 @@ class Worker:
             range_push("worker.send_outputs", synchronize=False)
 
         # The consuming pass (not the earlier ingest) reports the partition
-        # done, so it rides the WGD that also counts this pass's last chunks.
+        # done, so it rides the WGD that also counts this pass's last chunks;
+        # an END_PARTITION stop rides this pass's WGD the same way.
         for rid in batch_N.node_batch.stream_partition_done_rids:
             self._graph_runtime.mark_stream_partition_done(rid, batch_N.partition)
 

@@ -124,6 +124,8 @@ class PartitionState:
     current_worker_graph_ids: set[int] = field(default_factory=set)
     # wg_id -> count of distinct TP ranks that have reported completion
     wg_rank_completions: dict[int, int] = field(default_factory=dict)
+    # a report of the current pass set `partition_done`
+    worker_reported_done: bool = False
     num_output_tokens: int = 0
     # resource label -> PublishedInfo, accumulated across all TP ranks and
     # handed back out on the next forward
