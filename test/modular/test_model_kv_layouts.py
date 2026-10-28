@@ -479,7 +479,7 @@ def test_glm52_caps_decode_where_its_stop_check_ends_it(max_tokens):
 
     model = Glm52Model(model_path_hf="", tokenizer_mode="byte")
     llm = object.__new__(Glm52LLMSubmodule)
-    llm.config, llm.request_states = model.config, {}
+    llm.config = model.config
 
     cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
 

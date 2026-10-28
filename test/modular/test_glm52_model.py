@@ -54,6 +54,7 @@ from mstar.model.glm52.config import (  # noqa: E402
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION  # noqa: E402
 from mstar.utils.h2d import PinnedStager  # noqa: E402
 
 
@@ -284,14 +285,13 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
     sub._index_stager = PinnedStager(torch.long)
-    sub.request_states = {}  # no prefill ran: check_stop falls back to the request's max_tokens
     return sub
 
 
-def _fwd_info(max_tokens=100, ignore_eos=False, iters=0) -> CurrentForwardPassInfo:
+def _fwd_info(max_tokens=100, ignore_eos=False, iters=0, walk="decode") -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id="r0",
-        graph_walk="decode",
+        graph_walk=walk,
         fwd_index=0,
         random_seed=0,
         max_tokens=max_tokens,
@@ -335,18 +335,18 @@ def test_glm52_check_stop_batched_agrees_with_check_stop():
     sub = _make_submodule(Glm52ModelConfig())
     infos = {
         "eos": _fwd_info(), "mid": _fwd_info(), "budget": _fwd_info(max_tokens=8, iters=6),
-        "ignored": _fwd_info(ignore_eos=True), "ended": _fwd_info(), "absent": _fwd_info(),
+        "ignored": _fwd_info(ignore_eos=True), "prefill": _fwd_info(walk="prefill"),
+        "absent": _fwd_info(),
     }
-    sub.request_state("ended").add("ended_at_prefill", True)
-    rows = ("eos", "mid", "budget", "ignored", "ended")
-    tokens = torch.tensor([154827, 42, 42, 154820, 7])
+    rows = ("eos", "mid", "budget", "ignored", "prefill")
+    tokens = torch.tensor([154827, 42, 42, 154820, 154820])
     batched = sub.check_stop_batched(list(infos), infos, HostRows(rows, {"new_token": tokens}))
     per_request = {
         rid: loops for rid, token in zip(rows, tokens, strict=True)
         if (loops := sub.check_stop(rid, infos[rid], {"new_token": [token[None]]}))
     }
     assert batched == per_request == {
-        "eos": {"decode_loop"}, "budget": {"decode_loop"}, "ended": {"decode_loop"},
+        "eos": {"decode_loop"}, "budget": {"decode_loop"}, "prefill": {END_PARTITION},
     }
 
 

@@ -10,6 +10,7 @@ from mstar.graph.base import GraphEdge, Loop
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import Model, WorkerGraph
+from mstar.model.submodule_base import END_PARTITION
 from mstar.utils.containers import ParallelList
 
 PARTITION = "default"
@@ -76,6 +77,9 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
                         counted += tokens[0].numel()
                 if edge.persist and tokens:
                     persisted[edge.name] = tokens
+            if END_PARTITION in stops:
+                # the worker reports the partition done, and the conductor ends it
+                return emitted
             runtime.clear_pending_loop_stops()
             stopped = runtime.stop_loops_batched(
                 partition=PARTITION, graph_walk=walk, last_node_run="LLM",

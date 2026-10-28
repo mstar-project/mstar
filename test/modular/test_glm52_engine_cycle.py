@@ -286,7 +286,7 @@ def _errors(caplog) -> list[str]:
 
 @pytest.mark.parametrize("ignore_eos", [False, True])
 def test_a_stop_token_from_the_prefill_ends_the_reply(ignore_eos, caplog):
-    # the prefill walk has no decode_loop: the runtime drops a stop named there
+    # the prefill walk has no decode_loop to stop: its stop ends the partition
     cfg = _cfg(True)
     eos = cfg.eos_token_ids[0]
     driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])

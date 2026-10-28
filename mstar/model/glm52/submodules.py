@@ -35,6 +35,7 @@ from mstar.model.glm52.config import (
     Glm52ModelConfig,
 )
 from mstar.model.submodule_base import (
+    END_PARTITION,
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
@@ -73,9 +74,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._capture_block_warned = False
         # the step's row ends, in one pinned H2D
         self._index_stager = PinnedStager(torch.long)
-        # Per request, in its request_state: "ended_at_prefill", the prefill sampled a stop
-        # token: the prefill walk has no loop to stop, so the first decode step stops
-        # decode_loop and emits nothing.
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
@@ -375,9 +373,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
-        if self.request_state(request_id).get("ended_at_prefill"):
-            # the reply already ended: this step only closes the decode loop
-            del outputs["new_token"]
 
     def check_stop(
         self, request_id: str,
@@ -414,19 +409,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self, request_id: str, request_info: CurrentForwardPassInfo, token: int | None,
     ) -> set[str]:
         """The loops the request's new ``token`` stops; None when the step emitted none."""
-        state = self.request_state(request_id)
-        if state.get("ended_at_prefill"):
-            return {"decode_loop"}
         if token is None:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
         is_eos = token in self.config.eos_token_ids
         if request_info.graph_walk == "prefill":
-            # no decode_loop on this walk to stop: a stop token ends the reply at the first
-            # decode step, and the conductor ends a max_tokens of 1 here
-            if not ignore_eos and is_eos:
-                state.add("ended_at_prefill", True)
-            return set()
+            # the reply's first token, before decode_loop exists; the conductor ends a
+            # max_tokens of 1 here
+            return {END_PARTITION} if is_eos and not ignore_eos else set()
         # max_tokens counts the token the prefill emits, so the total is
         # 1 + (iters + 1) decode tokens
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
