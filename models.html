@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 27, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 28, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -350,6 +350,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.parakeet.html">mstar.model.parakeet</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
@@ -661,7 +662,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-notes">OmniVoice notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnilingual-asr-notes">Omnilingual ASR notes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>) notes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-parakeet-nemotron-asr-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>, <code class="docutils literal notranslate"><span class="pre">parakeet</span></code>, <code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code>) notes</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>
@@ -871,6 +872,18 @@ windowed. No timestamps.</p></td>
 Qwen3-1.7B (LoRA merged at load). Clips up to 40 s; longer uploads are windowed. The
 OpenAI <code class="docutils literal notranslate"><span class="pre">prompt</span></code> is ignored. No timestamps.</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">parakeet</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvidia/parakeet-tdt-0.6b-v3</span></code></p></td>
+<td><p>FastConformer + token-and-duration transducer, 25 European languages, language detected
+from the speech. Clips up to 10 min; longer uploads are windowed. No timestamps.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvidia/nemotron-3.5-asr-streaming-0.6b</span></code></p></td>
+<td><p>Cache-aware streaming FastConformer + RNN-T with a language prompt (<code class="docutils literal notranslate"><span class="pre">language</span></code>: a locale
+such as <code class="docutils literal notranslate"><span class="pre">en-US</span></code>, a bare code, or <code class="docutils literal notranslate"><span class="pre">auto</span></code>); served over whole clips, with the streaming
+model’s chunked attention at its widest lookahead (<code class="docutils literal notranslate"><span class="pre">lookahead</span></code> in the YAML’s
+<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>). Clips up to 10 min; longer uploads are windowed. No timestamps.</p></td>
+</tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
 <td><p>Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.</p></td>
@@ -987,8 +1000,8 @@ characters nearly tie, as the reference’s own batched <code class="docutils li
 fairseq2).</p></li>
 </ul>
 </section>
-<section id="fastconformer-asr-canary-canary-qwen-notes">
-<h3>FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>) notes<a class="headerlink" href="#fastconformer-asr-canary-canary-qwen-notes" title="Link to this heading">#</a></h3>
+<section id="fastconformer-asr-canary-canary-qwen-parakeet-nemotron-asr-notes">
+<h3>FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>, <code class="docutils literal notranslate"><span class="pre">parakeet</span></code>, <code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code>) notes<a class="headerlink" href="#fastconformer-asr-canary-canary-qwen-parakeet-nemotron-asr-notes" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p>Install with <code class="docutils literal notranslate"><span class="pre">.[asr]</span></code>. Uploads that libsndfile can’t read (M4A, WebM) are decoded by
 torchcodec, which needs FFmpeg.</p></li>
@@ -996,18 +1009,28 @@ torchcodec, which needs FFmpeg.</p></li>
 <li><p>Request fields, the same on <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code> and in <code class="docutils literal notranslate"><span class="pre">/generate</span></code>’s
 <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>:</p>
 <ul>
-<li><p><code class="docutils literal notranslate"><span class="pre">canary</span></code>: <code class="docutils literal notranslate"><span class="pre">language</span></code> (the speech’s, default <code class="docutils literal notranslate"><span class="pre">en</span></code>; one of bg, hr, cs, da, nl, en,
-et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk),
+<li><p><code class="docutils literal notranslate"><span class="pre">parakeet</span></code>: detects the language from the speech. <code class="docutils literal notranslate"><span class="pre">language</span></code> may name one of the 25
+it knows (bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro,
+sk, sl, es, sv, ru, uk) and is then ignored; any other is refused.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code>: <code class="docutils literal notranslate"><span class="pre">language</span></code> is its prompt: a locale from the checkpoint’s
+<code class="docutils literal notranslate"><span class="pre">processor_config.json</span></code> (such as <code class="docutils literal notranslate"><span class="pre">en-US</span></code>), a bare code, or <code class="docutils literal notranslate"><span class="pre">auto</span></code> (the default).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">canary</span></code>: <code class="docutils literal notranslate"><span class="pre">language</span></code> (the speech’s, default <code class="docutils literal notranslate"><span class="pre">en</span></code>; one of Parakeet’s 25),
 <code class="docutils literal notranslate"><span class="pre">target_language</span></code> (a translation to or from English; the OpenAI route also takes
 <code class="docutils literal notranslate"><span class="pre">task=&quot;translate&quot;</span></code>) and <code class="docutils literal notranslate"><span class="pre">punctuation</span></code> (default on).</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>: English only (checked on the OpenAI route). <code class="docutils literal notranslate"><span class="pre">instruction</span></code>
 replaces the trained one, “Transcribe the following:”; <code class="docutils literal notranslate"><span class="pre">/generate</span></code>’s text is unused.</p></li>
 </ul>
 </li>
-<li><p>A request holds up to 40.96 s. <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code> cuts longer uploads (up to
-30 min) into windows at quiet moments and joins their text. Neither model emits
-timestamps.</p></li>
-<li><p>Their YAMLs size the KV caches for <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> (64),
+<li><p>A request holds up to 610 s on Parakeet and Nemotron, and 40.96 s on Canary and
+Canary-Qwen. <code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code> cuts longer uploads (up to 30 min) into windows
+at quiet moments and joins their text. None of the four emits timestamps.</p></li>
+<li><p>Parakeet and Nemotron hold no cache. Each clip’s decoder state (the LSTM’s, and the
+cursor) sits in a recurrent state slot from its first decode iteration until the request
+is torn down; the YAMLs size <code class="docutils literal notranslate"><span class="pre">resources.transducer_state.max_slots</span></code> (129) for
+<code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> (128) and the sink slot, and startup refuses a cap the pool
+can’t hold. A decode iteration is 64 greedy steps, and its tokens stream out as it ends. <code class="docutils literal notranslate"><span class="pre">compile_step:</span> <span class="pre">false</span></code> in
+their <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> decodes with eager kernels instead of the compiled step.</p></li>
+<li><p>Canary’s and Canary-Qwen’s YAMLs size the KV caches for <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> (64),
 and startup refuses a cap the caches can’t hold.</p></li>
 <li><p>Canary-Qwen’s default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
 smaller GPU, lower <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> and <code class="docutils literal notranslate"><span class="pre">resources.kv_cache.max_num_pages</span></code>
@@ -2156,7 +2179,7 @@ fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-notes">OmniVoice notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnilingual-asr-notes">Omnilingual ASR notes</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>) notes</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fastconformer-asr-canary-canary-qwen-parakeet-nemotron-asr-notes">FastConformer ASR (<code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>, <code class="docutils literal notranslate"><span class="pre">parakeet</span></code>, <code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code>) notes</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-5-qwen3-8-qwen3-5-qwen3-8-27b">Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">qwen3_5_*</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>)</a></li>
@@ -2207,7 +2230,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 27, 2026.
+  Last updated on Oct 28, 2026.
   <br/>
 </p>
   </div>

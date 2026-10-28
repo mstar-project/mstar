@@ -48,6 +48,7 @@
    omnilingual_asr
    omnivoice
    orpheus
+   parakeet
    pi05
    qwen3_5
    qwen3_asr
