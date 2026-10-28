@@ -4,7 +4,7 @@
 Launches ``mstar/api_server/entrypoint.py`` on ``configs/gr00t_n17.yaml``, sends recorded DROID
 observations through ``MStarClient`` exactly as ``mstar serve`` tells a client to (lossless
 frames time-major over the views, ``embodiment_tag`` and ``state`` in ``model_kwargs``), and
-holds the decoded actions to the T3 bar: per request, the worst joint group's mean abs error
+holds the decoded actions to the parity bar: per request, the worst joint group's mean abs error
 against NVIDIA's model in fp32 is at most 1.2x the worst group's bf16 floor (NVIDIA's model in
 bf16 against itself in fp32), all through the same decode, **each averaged over the seeds**.
 
@@ -12,8 +12,9 @@ One seed is one sample: the four-step loop turns a floor-sized rounding differen
 from 0.3x to 2.2x the floor depending on its direction, and NVIDIA's own autocast route misses a
 one-seed bar too. So every observation is served once per seed.
 
-The server draws its own noise from the request's ``seed``, so the oracle recordings must have
-been made on that draw (``--seed`` of the oracle script). Then, on the same server:
+The server draws its own noise from the request's ``seed``, so the recordings must be NVIDIA's
+reference run (its ``action_pred`` per request, fp32 and bf16) made with that same seed. Then, on
+the same server:
 
 * the same request twice returns identical bytes;
 * the streamed action, read off the binary frames, equals the non-streamed one;
@@ -49,7 +50,7 @@ from mstar.client import MStarClient  # noqa: E402
 from mstar.client.media import BINARY_STREAM_MEDIA_TYPE, iter_binary_frames  # noqa: E402
 from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor  # noqa: E402
 
-T3 = 1.2
+BAR = 1.2
 GR00T_REPO = "nvidia/GR00T-N1.7-3B"
 
 
@@ -97,8 +98,8 @@ def send_streamed(url: str, obs, seed: int) -> bytes:
 
 
 def errors(pre: Gr00tN17Preprocessor, got: dict, fp32: dict, bf16: dict, dump: dict) -> tuple[float, float]:
-    """R11 after the decode (``test_gr00t_n17_action_gen_gpu.py``): the worst joint group's
-    error and the worst group's floor, the two oracles through the same ``unapply``."""
+    """The served actions' parity after the decode: the worst joint group's error and the worst
+    group's floor, the two recordings through the same ``unapply``."""
     state = dump["raw_obs"]["state"]
     want = pre.unapply(dump["embodiment_tag"], fp32["action_pred"].float().numpy(), state)
     rounded = pre.unapply(dump["embodiment_tag"], bf16["action_pred"].float().numpy(), state)
@@ -160,7 +161,7 @@ def main() -> int:
     )
     url = f"http://127.0.0.1:{args.port}"
     client = MStarClient(url)
-    report: dict = {"seeds": args.seeds, "bar": T3, "ratios": {}, "per_seed": {}}
+    report: dict = {"seeds": args.seeds, "bar": BAR, "ratios": {}, "per_seed": {}}
     failures: list[str] = []
     try:
         deadline = time.time() + 900
@@ -184,15 +185,15 @@ def main() -> int:
             r = sum(e for e, _ in pairs) / sum(f for _, f in pairs)
             report["ratios"][name] = r
             report["per_seed"][name] = [e / f for e, f in pairs]
-            print(f"  {name}  worst-group ratio {r:.3f} over {len(pairs)} seeds  (bar {T3}; "
+            print(f"  {name}  worst-group ratio {r:.3f} over {len(pairs)} seeds  (bar {BAR}; "
                   f"per seed {', '.join(f'{e / f:.2f}' for e, f in pairs)})")
-            if not r <= T3:
-                failures.append(f"{name}: ratio {r:.3f} past the T3 bar {T3}")
+            if not r <= BAR:
+                failures.append(f"{name}: ratio {r:.3f} past the bar {BAR}")
             # every request, not one: the weakest observed (req_00) is 3.7x, the strongest 44x
             e, f = errors(pre, decode(send(client, obs, wrong)), oracle(args.oracle_fp32, seed, name),
                           oracle(args.oracle_bf16, seed, name), dump)
             report["other_seed_ratios"][name] = e / f
-            if not e / f > T3:
+            if not e / f > BAR:
                 failures.append(f"{name}: seed {wrong} against seed {seed}'s oracle meets the bar too "
                                 f"({e / f:.3f}): it measures nothing")
 
