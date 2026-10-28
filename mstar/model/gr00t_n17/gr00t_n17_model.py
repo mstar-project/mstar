@@ -147,6 +147,15 @@ class Gr00tN17Model(Model):
             backbone_path=self.backbone_path_hf,
             cache_dir=self.cache_dir,
         )
+        # Every request's embodiment id comes from this table, and it indexes the
+        # per-embodiment weights, where -1 reads the last robot's slice in silence.
+        # Checked once here so the step path never reads the id back to the host.
+        categories = self.config.max_num_embodiments
+        outside = {tag: i for tag, i in self.processor.embodiment_ids.items() if not 0 <= i < categories}
+        if outside:
+            raise ValueError(
+                f"embodiment_id.json maps {outside} outside the checkpoint's {categories} embodiments"
+            )
         self._submodules: dict[str, NodeSubmodule] = {}
 
     config_backbone_default = "nvidia/Cosmos-Reason2-2B"

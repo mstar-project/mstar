@@ -145,10 +145,12 @@ _MAX_VIEWS = 3
 
 
 class _Processor:
-    """Only the field ``max_views`` reads."""
+    """Only the fields ``max_views`` and ``__init__``'s embodiment check read."""
 
-    def __init__(self, video_keys: dict[str, list[str]]):
+    def __init__(self, video_keys: dict[str, list[str]], embodiment_ids: dict[str, int] | None = None):
         self.video_keys = video_keys
+        # the tiny config has 4 embodiments; both ends of the range are used
+        self.embodiment_ids = {"gr1": 0, "oxe": 1, "franka": 3} if embodiment_ids is None else embodiment_ids
 
 
 def _config(scale: int = 1) -> Gr00tN17Config:
@@ -1125,13 +1127,22 @@ def test_the_opted_out_bridge_hands_the_loop_bf16_spans(tmp_path):
 _SERVING = Path(__file__).resolve().parents[3] / "configs" / "gr00t_n17.yaml"
 
 
-def _constructed(path: Path, **model_kwargs) -> Gr00tN17Model:
+def _constructed(path: Path, embodiment_ids: dict[str, int] | None = None, **model_kwargs) -> Gr00tN17Model:
     """The real ``__init__`` over ``path`` with the two checkpoint reads stubbed: the
-    capture settings are parsed there and nowhere else."""
+    capture settings and the embodiment check run there and nowhere else."""
+    processor = _Processor(_VIDEO_KEYS, embodiment_ids)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(Gr00tN17Config, "from_hf", lambda *args: _config())
-        patch.setattr(Gr00tN17Preprocessor, "from_pretrained", lambda *args, **kwargs: _Processor(_VIDEO_KEYS))
+        patch.setattr(Gr00tN17Preprocessor, "from_pretrained", lambda *args, **kwargs: processor)
         return Gr00tN17Model(model_path_hf=str(path), backbone_path_hf=str(path), **model_kwargs)
+
+
+@pytest.mark.parametrize("bad", [-1, 4], ids=["negative", "one past the last"])
+def test_an_embodiment_table_outside_the_weights_is_refused_at_construction(tmp_path, bad):
+    """``W[-1]`` is the last robot's slice, a plausible wrong answer; torch's IndexError
+    covers only the top end, and only once a request reaches the GPU."""
+    with pytest.raises(ValueError, match=r"'oxe': %d\}.* 4 embodiments" % bad):
+        _constructed(tmp_path, embodiment_ids={"gr1": 0, "oxe": bad})
 
 
 def test_each_capture_shape_is_one_dt_graph_config_with_its_rows_and_batch_sizes(tmp_path):
