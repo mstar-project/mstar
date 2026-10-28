@@ -486,12 +486,12 @@ runs on the pure-Python paths as before. Migrated so far (see
   wherever that holds, so on a machine with the extension built, installing
   it is what moves a worker onto the Rust runtime.
 
-The PyPI wheels for Linux (x86_64 and aarch64, CPython 3.12 to 3.14) already
-carry the extension, so ``pip install mstar-ai`` there needs nothing more. Other
-platforms get the pure-Python wheel. In a source checkout, build the extension into
-your environment with `maturin <https://www.maturin.rs>`_ (needs `rustup
-<https://rustup.rs>`_, which installs the compiler version pinned in
-``rust-toolchain.toml``):
+The release workflow also builds Linux wheels of ``mstar-ai`` (x86_64 and
+aarch64, CPython 3.12 to 3.14) that carry the extension, but they are not on
+PyPI yet (``PACKAGING.md`` says why), so ``pip install mstar-ai`` gets the
+pure-Python wheel. Build the extension into your environment with `maturin
+<https://www.maturin.rs>`_ (needs `rustup <https://rustup.rs>`_, which installs
+the compiler version pinned in ``rust-toolchain.toml``):
 
 .. code-block:: bash
 
@@ -527,13 +527,13 @@ Optional: the Rust HTTP frontend
 
 ``mstar-server`` (``rust/server/``) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. The Linux wheels on PyPI
-install the binary next to ``mstar-serve``; in a source checkout, build it.
-Then opt in:
+keeping preprocessing and the conductor protocol. A Linux wheel that carries
+the extension also installs the binary next to ``mstar-serve``; otherwise build
+it. Then opt in:
 
 .. code-block:: bash
 
-   cargo build --release --manifest-path rust/server/Cargo.toml  # checkout only
+   cargo build --release --manifest-path rust/server/Cargo.toml
    mstar serve qwen3_omni --rust-frontend
    # or, with an explicit config: mstar-serve --config <model.yaml> --rust-frontend
 

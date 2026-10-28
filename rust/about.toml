@@ -25,10 +25,13 @@ workarounds = ["ring"]
 # The crate fields below cover only the Rust wrappers; these add the vendored
 # C/C++ sources that are compiled into the binaries.
 
-# libzmq 4.3.4: LGPL-3.0 plus a static-linking exception (appended to
-# COPYING.LESSER), and the BSD-3-Clause SHA-1 it compiles. LGPL-3.0-or-later
-# is left out of `accepted` on purpose, so the wheels do not ship until a
-# maintainer signs off on distributing libzmq under that exception.
+# libzmq 4.3.4: LGPL-3.0 plus a static-linking exception appended to
+# COPYING.LESSER, and the BSD-3-Clause SHA-1 it compiles. The exception is
+# libzmq's own Classpath-style text, which matches no SPDX exception id
+# (LGPL-3.0-linking-exception is different text). LGPL-3.0-or-later is left out
+# of `accepted` on purpose: until a maintainer signs off on distributing libzmq
+# under it, this step fails and the release publishes no Rust wheels (the sdist
+# and pure wheel still go up).
 [zeromq-src.clarify]
 license = "(MIT OR Apache-2.0) AND LGPL-3.0-or-later AND BSD-3-Clause"
 [[zeromq-src.clarify.files]]

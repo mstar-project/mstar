@@ -166,10 +166,10 @@ The ZeroMQ control mesh can run over a Rust transport (vendored in [`rust/`](rus
 pyzmq — wire-compatible, selectable per process with `MSTAR_RUST_ZMQ` (default `AUTO`).
 Note what AUTO-by-default means: on any machine where the extension is built, the whole
 mesh switches to the Rust transport with no configuration change — each process logs its
-choice at startup (`control mesh transport: ...`), and `MSTAR_RUST_ZMQ=0` pins pyzmq. The Linux
-wheels on PyPI (x86_64 and aarch64, CPython 3.12 to 3.14) ship the extension and the
-`mstar-server` HTTP frontend; in a source checkout,
-build it with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
+choice at startup (`control mesh transport: ...`), and `MSTAR_RUST_ZMQ=0` pins pyzmq. Build it
+with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
+The release workflow also builds Linux wheels that carry it; they are not on PyPI yet
+([PACKAGING.md](PACKAGING.md) says why).
 See the [installation docs](https://m-star.org/mstar/installation.html) and
 [environment variables](https://m-star.org/mstar/environment_variables.html).
 

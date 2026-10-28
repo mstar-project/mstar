@@ -102,9 +102,9 @@ def find_server_binary(explicit: str | None = None) -> str:
         if candidate and Path(candidate).is_file():
             return candidate
     raise FileNotFoundError(
-        "mstar-server binary not found: the Linux wheels on PyPI ship it; "
-        "otherwise build it with `cargo build --release` in rust/server/, "
-        "put it on $PATH, or set MSTAR_SERVER_BIN")
+        "mstar-server binary not found: build it with "
+        "`cargo build --release` in rust/server/, put it on $PATH, or set "
+        "MSTAR_SERVER_BIN")
 
 
 def launch_rust_server(binary: str, model_name: str, port: int,

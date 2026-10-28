@@ -51,13 +51,19 @@ Python transport and graph runtime.
   `rust/about.toml` over `rust/server` (whose dependency tree contains
   `rust/`'s) and writes `LICENSES-THIRD-PARTY.txt`, which ships in each Rust
   wheel's `dist-info/licenses/`. A crate under a license not in `accepted`
-  fails the release. The C/C++ that crates vendor is declared there by hand
-  (libzmq via zeromq-src, Oniguruma via onig_sys, esaxx via esaxx-rs); check
-  those entries when bumping those crates.
+  fails the `wheels` job. The C/C++ that crates vendor is declared there by
+  hand (libzmq via zeromq-src, Oniguruma via onig_sys, esaxx via esaxx-rs);
+  check those entries when bumping those crates.
+- **Not published yet.** libzmq 4.3.4 (vendored by zeromq-src, statically
+  linked into both binaries) is LGPL-3.0-or-later with its own static-linking
+  exception, and that license is not in `accepted` until a maintainer signs off
+  on distributing it. Until then the license step fails, so `wheels` fails and
+  `pypi-wheels` is skipped; `pypi` still publishes the sdist, the pure wheel
+  and the aliases.
 - **Checks.** Each wheel is installed without dependencies into a clean venv
   outside the build container and must import `mstar_rust`, run
-  `mstar-server --help` and list the license file. A failure there stops the
-  release before anything is published.
+  `mstar-server --help` and list the license file. A failure there keeps the
+  Rust wheels off PyPI.
 
 ## Cutting a release
 
@@ -68,9 +74,10 @@ release:
 1. Bump the version in all three pyproject files and land it on `main`.
 2. Publish a GitHub Release with a matching tag (e.g. `v0.2.1`). The workflow
    refuses a tag that does not match the version.
-3. The `Publish to PyPI` workflow builds the engine (including the Linux Rust
-   wheels above) and the alias packages and uploads them over Trusted Publishing (OIDC, no token stored in the repo).
-   The `pypi` environment asks one of its reviewers to approve the run first.
+3. The `Publish to PyPI` workflow builds the engine and the alias packages
+   and uploads them over Trusted Publishing (OIDC, no token stored in the
+   repo); the Linux Rust wheels above go up in a job of their own. The `pypi`
+   environment asks one of its reviewers to approve each publishing job first.
 
 One-time PyPI setup: each project needs a pending Trusted Publisher (owner
 `mstar-project`, repo `mstar`, workflow `release.yml`, environment `pypi`).

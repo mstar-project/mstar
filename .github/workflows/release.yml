@@ -17,7 +17,9 @@ name: Publish to PyPI
 # version and architecture that also carry the mstar_rust extension (setup.py
 # compiles rust/ only under cibuildwheel). pip prefers the Linux wheel where
 # one matches and falls back to the pure one elsewhere, which then runs on the
-# Python transport and graph runtime.
+# Python transport and graph runtime. The Linux wheels publish in their own
+# job, so a failure in `wheels` (the license check fails until libzmq is
+# accepted in rust/about.toml) holds back only them.
 
 on:
   release:
@@ -87,7 +89,6 @@ jobs:
           path: wheelhouse/*.whl
 
   pypi:
-    needs: wheels
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -108,11 +109,6 @@ jobs:
       - run: pip install build
       - name: Build mstar-ai
         run: python -m build
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
       - name: Build the alias packages
         run: |
           for alias in packaging/aliases/*/; do
@@ -131,4 +127,23 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-mstar-serve
+          skip-existing: true
+
+  # After pypi, which checked the tag, so these upload only for a release whose
+  # sdist and pure wheel went up.
+  pypi-wheels:
+    needs: [wheels, pypi]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Publish the mstar-ai Linux wheels
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
           skip-existing: true
