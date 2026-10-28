@@ -50,6 +50,13 @@ def _launch_token(monkeypatch):
     monkeypatch.setenv(TOKEN_ENV, "a1" * 8)
 
 
+def _shutdown(p) -> None:
+    """The real ``Conductor.shutdown``, on a conductor whose only worker is ``p``."""
+    c = Conductor.__new__(Conductor)
+    c._worker_processes, c._mps = [p], None
+    c.shutdown()
+
+
 class _DeploymentCommunicator(BaseCommunicator):
     """No mesh traffic; the protocol and prefix give the file namespace."""
 
@@ -179,7 +186,8 @@ def _state(pid: int) -> str | None:
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[0]
-    except FileNotFoundError:
+    # a process exiting mid-read can fail the read with ESRCH instead
+    except (FileNotFoundError, ProcessLookupError):
         return None
 
 
@@ -215,7 +223,7 @@ def test_a_worker_stopped_with_requests_in_flight_leaves_no_tensor_files(tmp_pat
             # SIGTERM follows at once.
             os.kill(p.pid, signal.SIGINT)
     finally:
-        Conductor.shutdown(SimpleNamespace(_worker_processes=[p]))
+        _shutdown(p)
         if arena:
             # its segments' namespace lock, which outlives the deployment until a later startup sweeps it
             ns = _deployment_namespace(_DeploymentCommunicator(prefix))
@@ -239,7 +247,7 @@ def test_without_a_launch_token_a_stopped_worker_leaves_its_files(tmp_path, monk
         held = _namespace_files(shm_dir, prefix)
         assert len(held) == N_IN_FLIGHT
     finally:
-        Conductor.shutdown(SimpleNamespace(_worker_processes=[p]))
+        _shutdown(p)
     assert _namespace_files(shm_dir, prefix) == held
 
 
@@ -508,7 +516,7 @@ def test_a_worker_killed_in_a_hung_teardown_leaves_no_arena_segments(tmp_path):
     try:
         assert ready.wait(120), "worker did not start"
         assert _segments(), "the arena grew no segment"
-        Conductor.shutdown(SimpleNamespace(_worker_processes=[p]))
+        _shutdown(p)
         assert p.exitcode == -signal.SIGKILL, "the teardown did not hang"
         left = _segments()
     finally:

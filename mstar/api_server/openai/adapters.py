@@ -32,7 +32,9 @@ from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
 from mstar.model.multimodal import PromptPart
+from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
+from mstar.model.whisper.config import WORDS_MARKER
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -319,6 +321,12 @@ class OpenAIAdapter:
         and timestamp tokens, an LLM decoder's tags) parses them here."""
         return Transcript(text=text.strip())
 
+    def final_text(self, text: str) -> str:
+        """The finished transcript's text as the client gets it (a response,
+        or the stream's ``transcript.text.done``); not applied to partial
+        text, which only grows. The default passes it through."""
+        return text
+
     def stream_text(self, raw: str) -> str:
         """The client-facing text of the raw stream so far. It must only
         grow as ``raw`` does, so a model with control tokens strips them and
@@ -526,7 +534,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="torchcodec")
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile+torchcodec")
             # Keyed by modality: the data worker iterates the dict and
             # loads each group through the matching loader.
             file_paths = {"audio": [path]}
@@ -649,8 +657,9 @@ class ChatterboxAdapter(OpenAIAdapter):
     ``voice`` is either ``"default"`` (the voice shipped with the checkpoint)
     or the name of a preset clip in the deployment's ``voices_dir``. A
     reference clip for cloning comes through ``ref_audio`` in ``extra_body``
-    (a data URL or, when the server allows it, an http(s) URL; paths on the
-    server are refused) and is loaded by the worker like an uploaded file.
+    (a data URL, bare base64 or, when the server allows it, an http(s) URL;
+    paths on the server are refused, and so is a clip over 60 s or below
+    8 kHz) and is loaded by the worker like an uploaded file.
     The model's own knobs --
     ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
     ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for
@@ -670,10 +679,7 @@ class ChatterboxAdapter(OpenAIAdapter):
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            if not isinstance(ref_audio, str):
-                raise ValueError(f"ref_audio must be a data URL, got {type(ref_audio).__name__}")
-            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
-            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir)
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile+torchcodec")
             file_paths = {"audio": [path]}
             input_modalities = ["text", "audio"]
         return SubmitArgs(
@@ -975,9 +981,6 @@ _CONTROL_TOKEN = re.compile(r"<\|([^|<>]*)\|>")
 _PARTIAL_CONTROL_TOKEN = re.compile(r"<(\|[^|<>]*\|?)?$")
 _TIMESTAMP = re.compile(r"^\d+\.\d{2}$")
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
-# Whisper's word timings follow the transcript after this marker, one
-# ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
-_WORDS_MARKER = "<|startoflm|>"
 
 
 # sampling knobs the engine reads as numbers; a string there fails every
@@ -1057,11 +1060,11 @@ class WhisperAdapter(OpenAIAdapter):
         )
 
     def stream_text(self, raw: str) -> str:
-        raw = raw.partition(_WORDS_MARKER)[0]  # word timings follow the transcript
+        raw = raw.partition(WORDS_MARKER)[0]  # word timings follow the transcript
         return _CONTROL_TOKEN.sub("", _PARTIAL_CONTROL_TOKEN.sub("", raw))
 
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
-        text, _, timed_words = text.partition(_WORDS_MARKER)
+        text, _, timed_words = text.partition(WORDS_MARKER)
         language, segments, parts, unfinished = _parse_timestamped(text)
         clean = " ".join(p.strip() for p in parts if p.strip())
         for idx, seg in enumerate(segments):
@@ -1113,6 +1116,210 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
     return language, segments, parts, start is not None
 
 
+class Qwen3ASRAdapter(OpenAIAdapter):
+    """Qwen3-ASR: an LLM decoder that writes ``language {Name}<asr_text>{text}``
+    (or the text alone when the language is forced). Hears up to 20 minutes
+    per request, longer uploads are windowed at that; continues a hypothesis through
+    ``assistant_prefix``, which is what the realtime session needs."""
+
+    supports_transcriptions = True
+    supports_realtime_transcription = True
+    max_audio_seconds = 1200.0
+    # 2.4 is Whisper's bound for a 30 s window. The ratio grows with length,
+    # so a 20 minute transcript of ordinary speech can pass it.
+    compression_ratio_threshold = None
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        kwargs = _transcription_kwargs(req)
+        # checked here too so a streaming request gets a 400 before it starts
+        if "<|audio_pad|>" in str(kwargs.get("initial_prompt") or ""):
+            raise ValueError("the prompt must not contain <|audio_pad|>")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=kwargs,
+        )
+
+    def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:
+        args = self.transcription_to_request(req, audio_path)
+        if prefix:
+            args.model_kwargs["assistant_prefix"] = prefix
+        return args
+
+    def stream_text(self, raw: str) -> str:
+        # A detected language opens the stream as ``language X<asr_text>``.
+        # Hold the text back until the tag has arrived and show what follows
+        # it. A forced language skips the line, so plain text streams as is.
+        if ASR_TEXT_TAG in raw:
+            return raw.split(ASR_TEXT_TAG, 1)[1]
+        head = raw.lstrip()
+        if head.startswith("language") and len(head) < 40 and "\n" not in head:
+            return ""
+        return raw
+
+    def final_text(self, text: str) -> str:
+        from mstar.model.qwen3_asr.repetition import fix_repetitions
+
+        # the reference SDK collapses repetition loops in every finished transcript
+        return fix_repetitions(text)
+
+    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
+        raw = text.strip()
+        if ASR_TEXT_TAG not in raw:
+            return Transcript(text=raw, language=req.language)
+        meta, body = raw.split(ASR_TEXT_TAG, 1)
+        language = None
+        for line in meta.splitlines():
+            line = line.strip()
+            if line.lower().startswith("language "):
+                language = line[len("language "):].strip() or None
+                break
+        if language and language.lower() == "none":
+            language = None
+        return Transcript(text=body.strip(), language=req.language or _qwen3_language_code(language))
+
+
+def _qwen3_language_code(name: str | None) -> str | None:
+    """The ISO code clients expect (what Whisper reports too) for a language
+    name Qwen3-ASR wrote; a name outside its list passes through."""
+    if not name:
+        return None
+    from mstar.model.qwen3_asr.config import LANGUAGE_CODES
+
+    for code, canonical in LANGUAGE_CODES.items():
+        if canonical.lower() == name.lower():
+            return code
+    return name
+
+
+def _untimed_transcription_kwargs(req: TranscriptionRequest, model: str, *, translates: bool = False) -> dict:
+    """``model_kwargs`` for a model that takes no conditioning text and emits
+    no timestamps: the OpenAI ``prompt`` is dropped, granularities refused.
+    Whisper's ``task`` is the caller's to read when the model ``translates``;
+    otherwise anything but ``transcribe`` is refused, not silently ignored."""
+    mk = _transcription_kwargs(req)
+    mk.pop("initial_prompt", None)
+    if req.timestamp_granularities:
+        raise ValueError(f"{model} does not produce timestamps; leave timestamp_granularities unset")
+    mk.pop("timestamps", None)
+    if not translates:
+        task = mk.pop("task", None)
+        if task not in (None, "transcribe"):
+            raise ValueError(f"{model} only transcribes; task must be 'transcribe'; got {task!r}")
+    return mk
+
+
+class _UntimedTranscriptionAdapter(OpenAIAdapter):
+    """The FastConformer ASR models' adapters: plain text, which a
+    SentencePiece vocabulary starts with a space."""
+
+    # greedy, unconditioned windows: a retry could only swap a correct
+    # transcript for a sampled one
+    compression_ratio_threshold = None
+
+    def stream_text(self, raw: str) -> str:
+        # parse_transcript strips the text, so the deltas drop the leading
+        # space too; lstrip keeps a growing stream growing
+        return raw.lstrip()
+
+
+class CanaryAdapter(_UntimedTranscriptionAdapter):
+    """NVIDIA Canary: speech recognition, and translation to or from English.
+
+    ``language`` is the speech's language (English by default); an
+    ``extra_body`` ``target_language`` other than it asks for a translation.
+    The decoder takes no free-text conditioning and emits no timestamps, so
+    ``prompt`` is dropped and timestamp granularities are refused.
+    """
+
+    supports_transcriptions = True
+    # Canary was trained on clips of up to 40 s; windows don't condition on
+    # each other, so they run in parallel
+    max_audio_seconds = 40.0
+    long_form = "parallel"
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        from mstar.model.canary.config import check_task
+
+        mk = _untimed_transcription_kwargs(req, "Canary", translates=True)
+        # Whisper's convention: translate means into English
+        task = mk.pop("task", None)
+        if task not in (None, "transcribe", "translate"):
+            raise ValueError(f"task must be 'transcribe' or 'translate'; got {task!r}")
+        source = mk.get("language") or "en"
+        target = mk.get("target_language") or ("en" if task == "translate" else source)
+        mk["language"], mk["target_language"] = check_task(source, target)
+        if not isinstance(mk.get("punctuation", True), bool):
+            raise ValueError(f"punctuation must be true or false; got {mk['punctuation']!r}")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
+class CanaryQwenAdapter(_UntimedTranscriptionAdapter):
+    """NVIDIA Canary-Qwen: English speech recognition by an LLM, under its
+    trained instruction. OpenAI's ``prompt`` is context for the transcript
+    (and carries the previous window in sequential long form), which this
+    model was not trained to take, so it is dropped; no timestamps."""
+
+    supports_transcriptions = True
+    max_audio_seconds = 40.0
+    long_form = "parallel"
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        from mstar.model.utils import base_language
+
+        mk = _untimed_transcription_kwargs(req, "Canary-Qwen")
+        if base_language(mk.get("language") or "en") != "en":
+            raise ValueError("Canary-Qwen transcribes English only")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
+class TransducerAdapter(_UntimedTranscriptionAdapter):
+    """NVIDIA Parakeet / Nemotron ASR: transducer speech recognition.
+
+    Parakeet-TDT (``detects_language``) detects the language from the speech
+    and refuses only a ``language`` it doesn't know; Nemotron takes it as its
+    prompt (a locale such as ``en-US``, a bare code, or ``auto``), checked
+    against the checkpoint's locales when the upload is preprocessed. Neither
+    takes free-text conditioning or emits timestamps here.
+    """
+
+    supports_transcriptions = True
+    # full attention over the clip; longer uploads run as independent windows
+    max_audio_seconds = 600.0
+    long_form = "parallel"
+
+    def __init__(self, detects_language: bool = False):
+        self.detects_language = detects_language
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        mk = _untimed_transcription_kwargs(req, "this model")
+        if self.detects_language:
+            from mstar.model.parakeet.config import check_detected_language
+
+            check_detected_language(mk.get("language"))
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 class HiggsAudioAdapter(OpenAIAdapter):
     """Higgs-Audio v3 STT: an instruction-following LLM decoder, so the OpenAI
     ``prompt`` is the transcription instruction (the model has a default)."""
@@ -1143,8 +1350,8 @@ class OmnilingualASRAdapter(OpenAIAdapter):
     ``window_seconds`` in extra_body (5 to 40) sets both lengths for one
     request. ``language``, ``prompt`` and ``temperature`` have no
     effect (argmax CTC decoding has nothing to condition or sample). There
-    are no timestamps: ``srt`` / ``vtt`` get one cue spanning the file and
-    ``verbose_json`` an empty segment list.
+    are no timestamps: each window with text is one segment spanning it, so
+    ``srt`` / ``vtt`` get one cue and ``verbose_json`` one segment per window.
     """
 
     supports_transcriptions = True
@@ -1197,6 +1404,13 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "wan22": Wan22Adapter(),
     "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
+    "whisper_large_v3_turbo": WhisperAdapter(),
+    "qwen3_asr": Qwen3ASRAdapter(),
+    "qwen3_asr_realtime": Qwen3ASRAdapter(),
+    "canary": CanaryAdapter(),
+    "canary_qwen": CanaryQwenAdapter(),
+    "parakeet": TransducerAdapter(detects_language=True),
+    "nemotron_asr": TransducerAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
     "omnilingual_asr_ctc_300m": OmnilingualASRAdapter(),
     "omnilingual_asr_ctc_1b": OmnilingualASRAdapter(),

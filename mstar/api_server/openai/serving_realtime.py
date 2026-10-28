@@ -81,6 +81,7 @@ from mstar.api_server import media_io
 from mstar.api_server.openai import realtime_vad
 from mstar.api_server.openai._util import now, rid
 from mstar.api_server.openai.protocol import TranscriptionRequest
+from mstar.utils.utf8_stream import decode_joined
 
 logger = logging.getLogger(__name__)
 
@@ -480,7 +481,7 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
             raise StepError(str(exc.detail), exc.status_code) from exc
     finally:
         Path(path).unlink(missing_ok=True)
-    text = "".join(c.data.decode("utf-8", "replace") for c in chunks if c.modality == "text")
+    text = decode_joined(c.data for c in chunks if c.modality == "text")
     errors = [c for c in chunks if c.modality == "error"]
     if errors:
         raise StepError(

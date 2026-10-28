@@ -9,7 +9,7 @@ import torch
 
 from mstar.engine.resources.attn.ragged.wrappers import (
     SUPPORTED_HEAD_DIMS,
-    RaggedPrefillWrapper,
+    FlashInferRaggedPrefillWrapper,
     padded_head_dim,
 )
 from mstar.engine.resources.attn.wrappers import (
@@ -43,7 +43,7 @@ def test_padded_head_dim_rejects_oversized():
             dict(page_size=16, batch_size=2, max_num_pages=4),
         ),
         (
-            RaggedPrefillWrapper, "BatchPrefillWithRaggedKVCacheWrapper",
+            FlashInferRaggedPrefillWrapper, "BatchPrefillWithRaggedKVCacheWrapper",
             dict(max_num_segments=2, max_total_tokens=16),
         ),
     ],

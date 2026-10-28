@@ -145,6 +145,7 @@ def _send(rt, completion_id, **aos):
         stream_tokens_consumed=[dict(c) for c in con],
         prof_rids=prof_rids, profiling=prof,
         publish_rids=publish_rids, publications=publications,
+        skip_rids=aos.get("skip_rids", []),
     )
 
 
@@ -232,6 +233,20 @@ def test_an_emitted_signal_reaches_the_api_server(tmp_path):
     # The WGD names one entry per emitted chunk, for the conductor to count.
     wgd = got["conductor"][0].body
     assert wgd.output_signal_names == ["out"]
+
+
+def test_a_skipped_rid_sends_nothing(tmp_path):
+    """A rid that failed after routing: no peer, client or conductor frame."""
+    mesh = _Mesh(
+        tmp_path, outs=[("out", "remote", False), ("txt", "emit_to_client", True)],
+        remote=[{"wg_id": 1, "graph_walks": [WALK],
+                 "nodes": ["remote"], "dyn_loops": []}],
+    )
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    _put(mesh, 1)
+    got = mesh.run(rid, uuids=[1], skip_rids=[rid])
+
+    assert got == {"conductor": [], "api_server": [], PEER: []}
 
 
 def test_a_remote_destination_gets_input_signals(tmp_path):
