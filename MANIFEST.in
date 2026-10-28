@@ -9,4 +9,6 @@ graft rust
 prune rust/target
 prune rust/server/target
 include rust-toolchain.toml
+# the cargo [env] that builds the vendored libzmq correctly (see the file)
+include .cargo/config.toml
 global-exclude __pycache__ *.py[cod]

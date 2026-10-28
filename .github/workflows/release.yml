@@ -31,6 +31,7 @@ on:
     paths:
       - "rust/**"
       - rust-toolchain.toml
+      - .cargo/config.toml
       - setup.py
       - pyproject.toml
       - MANIFEST.in
