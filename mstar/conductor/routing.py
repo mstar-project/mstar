@@ -45,7 +45,9 @@ Instance = tuple[int, ...]
 class RoutingWeights(NamedTuple):
     """The serving config's ``routing_weights``: one weight per term of the cost."""
     load: float = 1.0
-    prefix: float = 1.0
+    # the best weight in simulations of Qwen3.5 0.8B and 9B and of BAGEL; above 16
+    # a hot prefix piles onto one replica
+    prefix: float = 8.0
 
 
 def routing_cost(facts: RoutingFacts, weights: RoutingWeights) -> float:
@@ -53,8 +55,9 @@ def routing_cost(facts: RoutingFacts, weights: RoutingWeights) -> float:
     absent, so a resource with no mirror drops out.
 
     ``prefix`` is minus the share of the request's positions the replica's KV
-    caches are predicted to hold. The worker never matches a prompt's last page,
-    so at weight 1 a hit weighs less than one live request.
+    caches are predicted to hold: a prompt held whole is worth up to ``prefix``
+    live requests. A share, not a token count, so one weight fits models whose
+    prefill and decode costs differ.
     """
     return -weights.prefix * facts.kv_hit / facts.work if facts.work else 0.0
 

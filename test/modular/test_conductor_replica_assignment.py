@@ -3,6 +3,7 @@ is lowest, the live requests on the replica plus ``routing_cost`` of the facts
 the mirrors predict there (a KV cache: minus the share of the prompt it already
 holds). With no mirror that is the replica serving the fewest live requests, so
 concurrent requests spread over the replicas instead of landing on one at random."""
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -78,7 +79,9 @@ def _configs(model_kwargs: dict) -> dict:
     configs = {}
     for key, keys in model_kwargs.get("prefix_keys", {}).items():
         configs[key] = KVReqConfig(needed_labels=["main"])
-        configs[key].apply_conductor_config(prefix_keys=keys, kv_layout=model_kwargs["kv_layout"][key])
+        configs[key].apply_conductor_config(
+            prefix_keys=keys, kv_layout=model_kwargs["kv_layout"][key], prefix_cache=model_kwargs.get("prefix_cache"),
+        )
     return configs
 
 
@@ -192,14 +195,16 @@ def test_same_prefix_requests_co_locate_before_any_completion():
     )
 
 
-def test_a_hot_prefix_spreads_once_load_outweighs_its_hit():
+def test_a_hot_prefix_follows_its_hit_until_load_outweighs_it():
     conductor = _kv_conductor()
     a = _place_a(conductor)
     _replica(conductor, "b", _prompt("Q"))
-    assert _replica(conductor, "c", _prompt("P")) == a
-    # replica a now runs one more request than the other, which outweighs a
-    # hit on 3 of 4 pages at the default weights
-    assert _replica(conductor, "d", _prompt("P")) != a
+    # each request matches 4 of its 5 pages on replica a, worth 0.8 * prefix live requests
+    picks = [_replica(conductor, f"p{i}", _prompt("P", pages=5)) for i in range(16)]
+    stayed = picks.index(next(p for p in picks if p != a))
+    assert stayed == math.ceil(0.8 * RoutingWeights().prefix) > 1, (
+        f"a hot prefix took {stayed} more requests on its replica before one spread"
+    )
 
 
 def test_two_caches_on_one_replica_credit_a_hit_less_than_one_request():
@@ -209,7 +214,8 @@ def test_two_caches_on_one_replica_credit_a_hit_less_than_one_request():
         for key, node in (("kv", "llm"), ("kv2", "llm2"))
     ]
     model = _Model(keyed={"kv": {"main": ("prefill",)}, "kv2": {"main": ("prefill",)}})
-    conductor = _conductor({0: _wg(0, [0, 1], nodes=("llm", "llm2"))}, specs=specs, model=model)
+    conductor = _conductor({0: _wg(0, [0, 1], nodes=("llm", "llm2"))}, specs=specs, model=model,
+                           weights={"prefix": 1})
     both = ("kv", "kv2")
     _replica(conductor, "x", _prompt("X", keys=both))
     a = _replica(conductor, "a", _prompt("P", keys=both))
@@ -235,11 +241,11 @@ def test_a_request_that_ends_before_a_pass_comes_back_leaves_nothing_cached():
     )
 
 
-def test_concurrent_copies_of_one_prompt_spread_over_the_replicas():
-    # as the startup warmup sends one copy per replica, before any completes:
-    # a hit never outweighs a live request at the default weights
+def test_warmup_copies_of_one_prompt_spread_over_the_replicas():
+    # as the startup warmup sends one copy per replica, before any completes,
+    # with the prefix cache off so that no predicted hit gathers them
     conductor = _kv_conductor()
-    picks = [_replica(conductor, rid, _prompt("P")) for rid in "abcd"]
+    picks = [_replica(conductor, rid, {**_prompt("P"), "prefix_cache": False}) for rid in "abcd"]
     assert sorted(picks) == ["worker_0", "worker_0", "worker_1", "worker_1"]
 
 
@@ -253,10 +259,11 @@ def test_a_hit_is_priced_as_its_share_of_the_whole_prompt():
     # the worker matches one of the two keyed pages, which saves PAGE of 2 * PAGE + 4000 positions
     assert facts[a] == RoutingFacts(work=2 * PAGE + 4000, kv_hit=PAGE)
     assert facts[1 - a] == RoutingFacts(work=2 * PAGE + 4000, kv_hit=0)
-    assert routing_cost(facts[a], RoutingWeights()) == pytest.approx(-PAGE / (2 * PAGE + 4000))
-    assert routing_cost(facts[1 - a], RoutingWeights()) == 0
+    weights = RoutingWeights()
+    assert routing_cost(facts[a], weights) == pytest.approx(-weights.prefix * PAGE / (2 * PAGE + 4000))
+    assert routing_cost(facts[1 - a], weights) == 0
     # a node no mirror reports on prices at 0
-    assert routing_cost(RoutingFacts(), RoutingWeights()) == 0
+    assert routing_cost(RoutingFacts(), weights) == 0
 
 
 def test_a_prefix_weight_of_0_picks_by_load_alone():

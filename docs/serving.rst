@@ -251,11 +251,11 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``routing_weights``
      - *(optional)* The weights of the data-parallel replica pick (see below), one per
        term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
-       the prompt predicted in its KV prefix cache. Each is a finite number >= 0 and
-       defaults to 1.0; any other key, or ``load: 0`` while another weight is above 0, fails
-       loading. ``prefix: 0`` picks by load alone. A ``prefix`` weight above ``load``'s lets
-       a predicted hit outweigh a live request, so concurrent copies of one prompt can share
-       a replica. At data parallelism, warmup copies run with ``prefix_cache=False``, so
+       the prompt predicted in its KV prefix cache. Each is a finite number >= 0; ``load``
+       defaults to 1.0 and ``prefix`` to 8.0. Any other key, or ``load: 0`` while another
+       weight is above 0, fails loading. ``prefix: 0`` picks by load alone, and ``prefix: 1``
+       or less keeps a hit below one live request, so it only breaks ties. At data
+       parallelism, warmup copies run with ``prefix_cache=False``, so
        they still spread but do not warm the prefill that starts from cached pages; a
        warmup spec that sets ``prefix_cache`` keeps its own value.
    * - ``gpu_memory_fraction``
@@ -430,11 +430,11 @@ ranks, replica for replica, take one pick together.
 Today the one prediction is the KV prefix cache's, on the replicas that run a walk keying
 the cache (BAGEL's ``LLM``, also with CFG-parallel nodes): ``routing_weights.prefix``
 times minus the share of the request's prompt positions (every label's, keyed or not)
-the replica's caches are predicted to hold, all the caches on the replica together. The
-worker never matches a prompt's last page, so at the default weights a hit weighs less
-than one live request: a request follows its prefix to a replica no busier than the
-others, never to a busier one, and a hot prefix spreads once its replica runs one more
-request.
+the replica's caches are predicted to hold, all the caches on the replica together. At
+the default weights a prompt held whole is worth up to 8 live requests: a request
+follows its prefix to a busier replica, and a hot prefix spreads once its replica runs
+about 8 times its hit share more requests than another. The term is a share rather than
+a token count so that one weight fits models whose prefill and decode costs differ.
 
 The prediction runs the worker's own prefix index (``PrefixIndex``) per replica, over a
 count of each replica's pages, and takes a request's steps at dispatch: its lease of the
