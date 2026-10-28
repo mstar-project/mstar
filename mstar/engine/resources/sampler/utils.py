@@ -1055,7 +1055,8 @@ class Sampler(BaseSampler):
     def sample(
         self, request_ids: list[str], logits: torch.Tensor,
         apply_penalty: bool = True, apply_filters: bool = True,
-        kept_rids: "frozenset | None" = None, **kwargs
+        kept_rids: "frozenset | None" = None,
+        rand_offset: torch.Tensor | None = None, **kwargs
     ) -> torch.Tensor:
         """Return the sampled tokens as a single [B] int tensor.
 
@@ -1067,6 +1068,9 @@ class Sampler(BaseSampler):
         ``apply_penalty`` False skips the repetition penalty, as the captured
         sampler does for a node or step without it. Only ``kept_rids`` (None:
         all) advance their RNG offset and seen-token mask.
+
+        ``rand_offset`` ([B], on the device) draws at the caller's offsets
+        instead of ``_step_offset``, and leaves advancing them to the caller.
         """
         configs = [self._sampling_config[rid] for rid in request_ids]
         history, rows = self._gather_history(request_ids, configs)
@@ -1086,10 +1090,12 @@ class Sampler(BaseSampler):
             if any(c.min_p > 0 for c in configs) else None
         )
         seed = torch.tensor([c.seed for c in configs], device=logits.device, dtype=torch.long)
-        rand_offset = torch.tensor(
-            [self._step_offset.get(rid, 0) for rid in request_ids],
-            device=logits.device, dtype=torch.long,
-        )
+        own_offsets = rand_offset is None
+        if own_offsets:
+            rand_offset = torch.tensor(
+                [self._step_offset.get(rid, 0) for rid in request_ids],
+                device=logits.device, dtype=torch.long,
+            )
 
         any_rep_pen = apply_penalty and any(p != 1.0 for p in penalties)
         any_greedy = any(c.temperature == 0 for c in configs)
@@ -1153,6 +1159,8 @@ class Sampler(BaseSampler):
                 if kept_rids is None or rid in kept_rids:
                     self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
 
+        if not own_offsets:
+            return tokens
         # FlashInfer consumes one offset unit per sampled row. The XPU kernel
         # consumes one Philox region per logit in its row, so advancing by one
         # would make consecutive decode steps reuse overlapping RNG regions.
@@ -1968,7 +1976,9 @@ class SamplerBuffers:
     # Per-request RNG offset: gathered by slot, advanced in graph, scattered
     # back after replay (all on GPU). Not a config value, so it's kept out of
     # ``_scalar_buffers`` (never written from a SamplingConfig) and reset to 0
-    # on register instead.
+    # on register instead. The request's only counter: an eager step draws
+    # at it and advances it too (``eager_offsets``), so a request whose steps
+    # mix eager and captured never draws one offset twice.
     offset: Buffer
     # Per-request last sampled token, by slot: the captured sample writes the
     # per-step row (double-buffered, one row per cg slot), ``scatter_last_token``
@@ -2045,9 +2055,11 @@ class SamplerBuffers:
     # Slots awaiting init, consumed by the next gather so the rows are written
     # on the gathering thread rather than racing it from the main one.
     _pending_init: set[int] = field(default_factory=set, repr=False)
-    # Slots whose RNG offset must be zeroed before it is next gathered: a
-    # device write, so the plan thread queues it and ``gather_dynamic`` (GPU
-    # thread, default stream) drains it.
+    # Slots whose RNG offset must be zeroed before it is next read: a device
+    # write, so registration queues it and the first reader on the GPU thread
+    # (``gather_dynamic`` or ``eager_offsets``) drains it. Queued at
+    # registration, before the request's first draw, so no later drain can
+    # zero an offset the request has already drawn at.
     _pending_offset_reset: set[int] = field(default_factory=set, repr=False)
     _offset_reset_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Slots whose loop-back state rows go back to their defaults before they
@@ -2306,8 +2318,9 @@ class SamplerBuffers:
         self._rid_to_slot[rid] = slot
         # CPU-only; every GPU write for this slot is deferred to the next gather.
         self._pending_init.add(slot)
-        if self.loopback:
-            with self._offset_reset_lock:
+        with self._offset_reset_lock:
+            self._pending_offset_reset.add(slot)
+            if self.loopback:
                 self._pending_loopback_reset.add(slot)
         self._cached_config[rid] = (
             sampling_config if sampling_config is not None else SamplingConfig()
@@ -2387,10 +2400,9 @@ class SamplerBuffers:
 
     def _init_slot(self, slot: int, rid: str) -> None:
         """Init for a newly registered slot, on the gathering thread so rows are
-        written before the gather reads them. No device work (pre-plan): the
-        offset reset is queued for ``gather_dynamic``."""
-        with self._offset_reset_lock:
-            self._pending_offset_reset.add(slot)
+        written before the gather reads them. No device work (pre-plan); the
+        offset reset was queued at registration, since an eager step may have
+        drawn by now."""
         self._write_master_row(slot, self._cached_config[rid])
         # mask row not cleared: always staged fresh before gather, and clearing
         # here would race the default-stream stage from the plan stream
@@ -2489,16 +2501,40 @@ class SamplerBuffers:
         self._sync_device_capacity()
         if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
             self._stage_slot_idx(request_ids, padded_bs, cg_slot)
-        with self._offset_reset_lock:
-            resets, self._pending_offset_reset = self._pending_offset_reset, set()
-        for slot in resets:
-            self.offset.master[slot:slot + 1].zero_()
+        self._drain_offset_resets()
         idx_view = self._upload_slot_idx(padded_bs, cg_slot)
         if not self.ingraph_scatter:
             # with it on, the captured sample gathers off the master itself
             self.offset.gather(idx_view, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
+
+    def _drain_offset_resets(self) -> None:
+        """Zero the offsets of newly registered slots; GPU thread, before a read."""
+        with self._offset_reset_lock:
+            resets, self._pending_offset_reset = self._pending_offset_reset, set()
+        for slot in resets:
+            self.offset.master[slot:slot + 1].zero_()
+
+    def eager_offsets(self, request_ids: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(slots, offsets)`` of registered requests, for an eager step to
+        draw at the same counter a captured step does. Hand both back to
+        ``advance_eager_offsets`` after the draw."""
+        self._sync_device_capacity()
+        self._drain_offset_resets()
+        slots = self._slots_of(request_ids)
+        return slots, self.offset.master.index_select(0, slots)
+
+    def advance_eager_offsets(
+        self, slots: torch.Tensor, offsets: torch.Tensor, stride: int,
+        keep: torch.Tensor | None = None,
+    ) -> None:
+        """Advance the masters past an eager draw at ``offsets``; ``keep``
+        (from ``keep_mask``) leaves the False rows where they were."""
+        advanced = offsets + stride
+        if keep is not None:
+            advanced = torch.where(keep, advanced, offsets)
+        self.offset.master.index_copy_(0, slots, advanced)
 
     def sampler_for(self, padded_bs: int, cg_slot: int) -> "AcceleratorGraphableSampler":
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).

@@ -19,6 +19,7 @@ from mstar.engine.resources.sampler.utils import (
     Sampler,
     SamplerBuffers,
     SamplingConfig,
+    _rng_offset_stride,
 )
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
@@ -515,17 +516,28 @@ class SamplerResource(Resource):
                 apply_penalty=self._apply_penalty_this_step,
                 apply_filters=self._apply_filters_this_step,
             )
+        bufs = self._cg_buffers
+        by_slot = bufs is not None and all(bufs.has_slot(rid) for rid in request_ids)
+        slots = offsets = None
+        if by_slot:
+            # One RNG counter per request, shared with the captured steps: with
+            # a counter per path, both start at 0, and a request prefilled eagerly
+            # and decoded captured drew its first two tokens from one number.
+            slots, offsets = bufs.eager_offsets(request_ids)
         tokens = self._sampler.sample(
             request_ids, logits, apply_penalty=self._apply_penalty_this_step,
             apply_filters=self._apply_filters_this_step, kept_rids=self._kept_rids,
+            rand_offset=offsets,
         )
+        if by_slot:
+            kept = self._kept_rids
+            bufs.advance_eager_offsets(
+                slots, offsets, _rng_offset_stride(logits.device.type, logits.shape[-1]),
+                keep=None if kept is None else bufs.keep_mask([rid in kept for rid in request_ids]),
+            )
         # An eager step has no per-step row to scatter from: write the masters
         # by request, so the next step can still read its token on the device.
-        bufs = self._cg_buffers
-        if (
-            self._keep_last_token and bufs is not None
-            and all(bufs.has_slot(rid) for rid in request_ids)
-        ):
+        if self._keep_last_token and by_slot:
             bufs.write_last_tokens(request_ids, tokens)
         return tokens
 
