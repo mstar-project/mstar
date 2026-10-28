@@ -4,9 +4,10 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn.functional as F
+from huggingface_hub.constants import HF_HUB_CACHE
 from torch import nn
 
-_HUB = Path.home() / ".cache/huggingface/hub"
+_HUB = Path(HF_HUB_CACHE)  # honours HF_HUB_CACHE and HF_HOME
 GR00T = _HUB / "models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495"
 BACKBONE = next(iter(glob.glob(str(_HUB / "models--nvidia--Cosmos-Reason2-2B/snapshots/*"))), None)
 
