@@ -20,7 +20,19 @@ import test_kv_host_index as host
 import torch
 from test_kv_prefix_layout_lease import ASK, IMAGE, OTHER_ASK, RID, TEXT, _config, _walks
 from test_kv_prefix_layout_lease import _Node as _LayoutNode
-from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _grow, _keys, _layout, _manager, _seed, _StubTransfer
+from test_kv_prefix_lease import (
+    NODE,
+    PAGE_SIZE,
+    ROOT,
+    WALK,
+    _ctx,
+    _grow,
+    _keys,
+    _layout,
+    _manager,
+    _seed,
+    _StubTransfer,
+)
 
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
@@ -35,7 +47,7 @@ from mstar.engine.resources.kv.config import (
     RetentionPolicy,
     StreamLayout,
 )
-from mstar.engine.resources.kv.keys import chain
+from mstar.engine.resources.kv.keys import chain, fingerprint
 from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.recurrent.config import (
@@ -222,6 +234,29 @@ def test_a_hit_page_another_request_takes_lets_the_head_in():
     _probe(kv, "b", 80)
 
     assert kv._room() == room and _ready(kv, "a"), "the head waits for room it no longer needs"
+
+
+def test_a_hit_page_taken_while_another_page_turns_evictable_lets_the_head_in():
+    """The two changes leave the room and the evictable count where they were, but the head needs a
+    page less."""
+    kv = _manager(max_num_pages=12)
+    tokens, other = list(range(80)), list(range(300, 300 + PAGE_SIZE))
+    _cached(kv, tokens, held=False)
+    _laid_out(kv, "y", other, keyed=True)
+    assert _ready(kv, "y")
+    _grow(kv, "y", PAGE_SIZE)
+    # filed as at commit, while "y" holds it
+    kv._index.insert(fingerprint(ROOT, _keys(other)[0]), kv._streams["y"]["main"].page_indices[0])
+    _laid_out(kv, "b", tokens[:2 * PAGE_SIZE], keyed=True)
+    _laid_out(kv, "a", tokens + list(range(900, 900 + 4 * PAGE_SIZE)), keyed=True)
+    assert _ready(kv, "b") and not _ready(kv, "a")
+
+    # "b" takes one of the head's cached hits out of the evictable set
+    _probe(kv, "b", 2 * PAGE_SIZE)
+    # "y"'s page goes back to the index alone, and its allotment keeps the room
+    kv.reset_request("y")
+
+    assert _ready(kv, "a"), "the head waits for room it no longer needs"
 
 
 def test_a_request_with_no_recurrent_slot_keeps_no_kv_pages():

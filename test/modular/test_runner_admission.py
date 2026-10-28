@@ -10,21 +10,24 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
+from collections.abc import Collection
 
 sys.path.insert(0, ".")
 
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import Resource
-from mstar.engine.resources.step import ADMIT_OK, ASKS
+from mstar.engine.resources.step import ADMIT_OK, ASKS, AdmitOutcome, AdmitRuntimeError
 
 NODE, WALK = "llm", "prefill"
 
 
 class _StubPool(Resource):
-    """Hands out one unit of capacity per request, and counts the calls it gets."""
+    """Hands out one unit of capacity per request unless ``needs`` says more, refuses the requests in
+    ``refuses``, and counts the calls it gets."""
 
-    def __init__(self, units: int):
+    def __init__(self, units: int, needs: dict[str, int] | None = None, refuses: Collection[str] = ()):
         self.free, self.held, self.calls, self.retrieved = units, set(), Counter(), []
+        self.needs, self.refuses, self.published = needs or {}, refuses, []
 
     @classmethod
     def build(cls, spec, info):
@@ -32,18 +35,21 @@ class _StubPool(Resource):
 
     def ask(self, rid, node_name, graph_walk):
         self.calls["ask"] += 1
+        if rid in self.refuses:
+            return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(f"{rid} can never fit"))
         return None if rid in self.held else ASKS
 
     def reserve(self, rid, node_name, graph_walk, published):
         self.calls["reserve"] += 1
-        if not self.free:
+        self.published.append(published)
+        if self.needs.get(rid, 1) > self.free:
             return self.free
-        self.free -= 1
+        self.free -= self.needs.get(rid, 1)
         self.held.add(rid)
         return None
 
     def unreserve(self, rid):
-        self.free += 1
+        self.free += self.needs.get(rid, 1)
         self.held.discard(rid)
 
     def grew_since(self, mark):
@@ -132,3 +138,52 @@ def test_every_node_waiting_on_a_shared_pool_resumes_when_it_admits():
     pool.free = 1
 
     assert sorted(runner.admit_waiting(_nothing)) == [("cfg", "a"), (NODE, "a")], "a node stayed parked"
+
+
+def test_a_queue_whose_first_request_leaves_tries_the_next_while_another_node_waits():
+    encoder_pool, llm_pool = _StubPool(0), _StubPool(1, needs={"long": 2})
+    runner = _runner({"encoder": ["enc"], NODE: ["kv"]}, enc=encoder_pool, kv=llm_pool)
+    assert runner.admit_retrieve("a", "encoder", WALK).queued
+    for rid in ("long", "short"):
+        assert runner.admit_retrieve(rid, NODE, WALK).queued
+
+    runner.remove_request("long")
+
+    assert runner.admit_waiting(_nothing) == [(NODE, "short")], "the encoder's pool kept the LLM's queue waiting"
+
+
+def test_an_earlier_request_asking_a_second_node_goes_ahead_of_a_later_one():
+    # an encoder-decoder request asks the decoder's pool only once its encoder walk is done
+    encoder_pool, decoder_pool = _StubPool(2), _StubPool(1, needs={"late": 2})
+    runner = _runner({"encoder": ["enc"], "decoder": ["dec"]}, enc=encoder_pool, dec=decoder_pool)
+    for rid in ("early", "late"):
+        assert runner.admit_retrieve(rid, "encoder", WALK).ready
+    assert runner.admit_retrieve("late", "decoder", WALK).queued
+
+    assert runner.admit_retrieve("early", "decoder", WALK).ready, "an earlier request that fits waited on a later one"
+
+
+def test_a_shared_pool_reserves_with_what_the_request_published_for_the_node_that_asked():
+    pool = _StubPool(0)
+    runner = _runner({NODE: ["kv"], "cfg": ["kv"]}, kv=pool)
+    assert runner.admit_retrieve("a", NODE, WALK).queued
+    assert runner.admit_retrieve("b", NODE, WALK, {"kv": "b for the LLM"}).queued
+    pool.free = 1
+    runner.remove_request("a")
+    pool.published.clear()
+
+    assert runner.admit_retrieve("b", "cfg", WALK, {"kv": "b for guidance"}).ready
+    assert pool.published == ["b for the LLM"]
+
+
+def test_a_request_one_pool_refuses_keeps_no_place_in_another_pools_queue():
+    # Qwen3.5 asks its recurrent pool before its KV cache, which refuses a prompt that can never fit
+    slots, kv = _StubPool(0), _StubPool(10, refuses={"huge"})
+    runner = _runner(gdn=slots, kv=kv)
+    assert not runner.admit_retrieve("huge", NODE, WALK).ok
+    assert runner.admit_retrieve("next", NODE, WALK).queued
+
+    slots.free = 1
+
+    assert runner.admit_waiting(_nothing) == [(NODE, "next")], "a refused request kept the next one waiting"
+    assert slots.held == {"next"}

@@ -31,9 +31,10 @@ logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class _Waiting:
     """A waiting request: the node and walk that asked each resource it waits for, and every node
-    whose readiness check waits on it."""
+    whose readiness check waits on it, with what the request had published for that node then."""
     asked: dict[str, tuple[str, str]] = field(default_factory=dict)
     nodes: set[str] = field(default_factory=set)
+    published: dict[str, Mapping[str, PublishedInfo] | None] = field(default_factory=dict)
 
 
 def topo_sort(resources: Mapping[str, Resource | NodeResourceSpec]) -> tuple[str, ...]:
@@ -118,7 +119,9 @@ class StepRunner:
         # `_arrival` numbers each request in the order it first asked.
         # `_waiting` holds what each waiting request asked.
         # `_queues` holds, per resource, the requests waiting for it in arrival order.
-        # `_short` maps each resource whose first waiting request didn't fit to the mark it didn't fit against.
+        # `_short` maps each resource whose first waiting request didn't fit to the mark it didn't fit
+        # against, until that request leaves the front of the queue.
+        # `_untried` is set when a queue has a new first request that `admit_waiting` hasn't tried.
         # `_admitted` holds the nodes each request was admitted on.
         # `_started` holds, for a request admitted during one node's check, the other nodes waiting on
         # it, which `admit_waiting` reports so their parked checks resume.
@@ -127,6 +130,7 @@ class StepRunner:
         self._waiting: dict[str, _Waiting] = {}
         self._queues: dict[str, list[str]] = {key: [] for key in self._ask_order}
         self._short: dict[str, object] = {}
+        self._untried = False
         self._admitted: dict[str, set[str]] = {}
         self._started: dict[str, set[str]] = {}
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
@@ -373,10 +377,7 @@ class StepRunner:
     def remove_request(self, rid: str) -> None:
         entry = self._waiting.pop(rid, None)
         if entry is not None:
-            for key in entry.asked:
-                self._queues[key].remove(rid)
-                # the queue may have a new first request, which hasn't been tried
-                self._short.pop(key, None)
+            self._leave(rid, entry.asked)
         self._admitted.pop(rid, None)
         self._started.pop(rid, None)
         self._arrival.pop(rid, None)
@@ -433,19 +434,28 @@ class StepRunner:
                 continue
             if not asked.ok:
                 logger.warning("Admission for resource %s failed with error: %s", key, asked.reason.message)
+                if entry is not None:
+                    # a request a resource can't serve waits in no queue
+                    del self._waiting[rid]
+                    self._leave(rid, entry.asked)
                 return FullAdmitOutcome(asked, key)
             if entry is None:
                 entry = self._waiting[rid] = _Waiting()
                 self._arrival.setdefault(rid, next(self._arrivals))
             entry.asked[key] = (node_name, graph_walk)
-            bisect.insort(self._queues[key], rid, key=self._arrival.__getitem__)
+            queue = self._queues[key]
+            bisect.insort(queue, rid, key=self._arrival.__getitem__)
+            if queue[0] == rid:
+                # ahead of the request the mark measured, and tried below unless another queue holds it back
+                self._short.pop(key, None)
             waits = True
         if not waits:
             self._admitted.setdefault(rid, set()).add(node_name)
             return None
         entry.nodes.add(node_name)
+        entry.published[node_name] = published
         tried = all(self._queues[key][0] == rid and key not in self._short for key in entry.asked)
-        if tried and (nodes := self._reserve(rid, lambda node: published if node == node_name else None)):
+        if tried and (nodes := self._reserve(rid, entry.published.get)):
             if nodes - {node_name}:
                 self._started.setdefault(rid, set()).update(nodes - {node_name})
             return None
@@ -471,10 +481,20 @@ class StepRunner:
                 return None
             taken.append(key)
         del self._waiting[rid]
-        for key in entry.asked:
-            self._queues[key].pop(0)
+        self._leave(rid, entry.asked)
         self._admitted.setdefault(rid, set()).update(entry.nodes)
         return entry.nodes
+
+    def _leave(self, rid: str, keys: Collection[str]) -> None:
+        """Take ``rid`` out of the queues of ``keys``. A queue it was first in drops its mark,
+        which measured ``rid``, and its next request is left for `admit_waiting` to try."""
+        for key in keys:
+            queue = self._queues[key]
+            if queue[0] == rid:
+                self._short.pop(key, None)
+                if len(queue) > 1:
+                    self._untried = True
+            queue.remove(rid)
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
@@ -483,8 +503,9 @@ class StepRunner:
         the (node, rid) pairs that may start. ``published_of(rid, node)`` gives what the request
         published for that node's resources.
 
-        Nothing is tried until a resource whose first waiting request didn't fit has grown, so a pass
-        that freed nothing costs one `Resource.grew_since` for each such resource.
+        Nothing is tried until a resource whose first waiting request didn't fit has grown, or a
+        queue has a new first request, so a pass that changed neither costs one
+        `Resource.grew_since` for each such resource.
         """
         started = []
         if self._started:
@@ -492,13 +513,11 @@ class StepRunner:
             self._started.clear()
         if not self._waiting:
             return started
-        if self._short:
-            for key, mark in self._short.items():
-                if self._resources[key].grew_since(mark):
-                    break
-            else:
-                return started
-            self._short.clear()
+        grown = [key for key, mark in self._short.items() if self._resources[key].grew_since(mark)]
+        if not grown and not self._untried:
+            return started
+        for key in grown:
+            del self._short[key]
         admitted = True
         while admitted:
             admitted = False
@@ -513,6 +532,8 @@ class StepRunner:
                 if nodes:
                     started.extend((node, rid) for node in nodes)
                     admitted = True
+        # the last sweep admitted nothing, so it tried every queue's first request
+        self._untried = False
         return started
 
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────
