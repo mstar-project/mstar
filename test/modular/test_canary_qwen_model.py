@@ -16,6 +16,7 @@ from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel, merge_lor
 from mstar.model.canary_qwen.config import CanaryQwenModelConfig
 from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
 from mstar.model.components.fastconformer import FastConformerConfig, FastConformerEncoder, nemo_to_hf_name
+from mstar.validation.resources import pool_problems
 
 
 def test_merge_lora():
@@ -186,9 +187,9 @@ def test_output_and_request_limits():
     # the request's max_output_tokens caps the loop, not the graph's max_iters
     assert model.get_loop_caps(max_output_tokens=5) == {"decode_loop": 5}
     # the shipped pool holds 64 requests at MAX_SEQ_LEN and the sink, no more
-    model.validate_config_yaml({"max_concurrent_requests": 64}, "canary_qwen.yaml")
-    with pytest.raises(ValueError, match=r"resources\.kv_cache"):
-        model.validate_config_yaml({"max_concurrent_requests": 65}, "canary_qwen.yaml")
+    assert pool_problems(model, {"max_concurrent_requests": 64}) == []
+    [problem] = pool_problems(model, {"max_concurrent_requests": 65})
+    assert "resources.kv_cache" in problem
 
 
 def test_splice_puts_frame_k_on_placeholder_k():

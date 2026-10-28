@@ -1751,6 +1751,35 @@ example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
    with a message describing the migration. Move the block under ``resources:``, keyed by
    the resource name.
 
+Pool sizing
+~~~~~~~~~~~
+
+A paged KV cache, a recurrent or bounded pool and a ring allocate their storage up front as
+equal units (pages, slots, sessions). Their configs implement ``PoolConfig``
+(``mstar/engine/resources/sizing.py``): ``unit_bytes`` is one unit's device bytes on one
+rank, ``units_per_request`` what one stream of a request holds at ``max_seq_len``, and
+``reserved_units`` the sink page, sink slot or padding session no request is given. A
+request holds one stream per label ``kv_labels`` declares for a paged pool, so CFG's two
+labels count twice. A new resource kind that allocates per unit implements ``PoolConfig``
+on its config.
+
+Where the model knows a tighter bound than that, it returns it from
+``Model.pool_units_per_request(spec)``: Chatterbox's T3 pool holds the text and
+``max_new_tokens_limit`` speech tokens per CFG stream (one stream on Turbo), and
+Nemotron's duplex pools hold a session's prompt and every frame of ``max_session_s``.
+
+Startup uses these in two places:
+
+- ``validate_deployment`` refuses a ``max_concurrent_requests`` that a pool cannot hold at
+  that bound, since a request past the pool waits on the worker rather than in the
+  conductor's queue, and requests that each need one more page can wait on each other
+  until they time out. A pool with ``cpu_offload_pages`` can make room, so it gets a
+  warning instead. A config without a cap gets a warning naming what each pool holds.
+- After capture, each worker logs every pool (units, bytes, what a request takes, how many
+  requests fit) and what the memory still free past the largest eager step would hold if it
+  went to the pools as well, split so one request count fits every pool. Search the log
+  for ``Pools[``.
+
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -2139,10 +2168,9 @@ window is ``max_source_positions`` (1500) tokens, which is 12 pages per request 
 prefill to the last token, so the context cache has 64 * 12 + 1 = 769 pages, about 15 GiB.
 Sizing the caches is only half of it: ``configs/whisper_large.yaml`` also sets
 ``max_concurrent_requests: 64``, so the conductor queues further requests instead of the
-worker offloading decoding requests to admit them. ``WhisperModel.validate_config_yaml``
-refuses at startup a cap that either cache cannot hold after the YAML's ``resources:``
-overrides, through ``mstar.model.utils.check_kv_pools_fit``, which any model with KV caches
-can call the same way.
+worker offloading decoding requests to admit them. Startup refuses a cap that either cache
+cannot hold after the YAML's ``resources:`` overrides, for every model (see
+`Pool sizing`_).
 
 The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
 Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``);

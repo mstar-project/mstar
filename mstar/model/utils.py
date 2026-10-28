@@ -532,47 +532,6 @@ def kv_pages(tokens: int, page_size: int, requests: int) -> int:
     return 1 + requests * -(-tokens // page_size)
 
 
-def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logger) -> None:
-    """Refuse a ``max_concurrent_requests`` the model's KV caches cannot hold.
-
-    A request keeps its pages from prefill to its last token. Past a pool, a
-    prefill batch is refused and the worker offloads decoding requests to
-    admit it, which costs far more than queueing would. So the cap's requests
-    at full length must fit each cache next to its sink page; the conductor
-    queues the rest. Warnings go to the model's ``log``.
-    """
-    from mstar.engine.resources import KVSpec, PagedKVConfig
-
-    cap = config.get("max_concurrent_requests")
-    if cap is None:
-        log.warning(
-            "%s sets no max_concurrent_requests: past the requests the KV caches "
-            "hold, the worker offloads decoding requests to admit new ones instead "
-            "of queueing them", config_path,
-        )
-        return
-    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-        raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-    overrides = config.get("resources") or {}
-    for spec in model.get_node_resources():
-        # paged caches only: a ring buffer is sized by its window, not by requests
-        if not isinstance(spec, KVSpec) or not isinstance(spec.config, PagedKVConfig):
-            continue
-        kv, override = spec.config, overrides.get(spec.resource_key) or {}
-        page_size = int(override.get("page_size", kv.page_size))
-        max_seq_len = int(override.get("max_seq_len", kv.max_seq_len))
-        max_num_pages = int(override.get("max_num_pages", kv.max_num_pages))
-        need = kv_pages(max_seq_len, page_size, cap)
-        if need > max_num_pages:
-            raise ValueError(
-                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
-                f"need {need} pages of resources.{spec.resource_key} "
-                f"({-(-max_seq_len // page_size)} per request and the sink page), "
-                f"which has {max_num_pages}; raise max_num_pages or lower "
-                "max_concurrent_requests"
-            )
-
-
 class SentencePieceDetokenizer:
     """Per-token detokenization for SentencePiece-style vocabularies (``▁``
     marks a word start, ``<0xNN>`` pieces are byte fallback), read from an HF

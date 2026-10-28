@@ -261,33 +261,12 @@ class ChatterboxModel(Model):
     # Resources
     # -----------------------------------------------------------------------
 
-    def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a request cap the T3 KV pool cannot hold.
-
-        Nothing preempts a stream once the pool is full: the requests wait on
-        each other until they time out. So ``max_concurrent_requests`` requests
-        at full text and ``max_new_tokens_limit`` speech tokens must fit, next to
-        the sink page (which a captured decode's padding rows also run against).
-        """
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning(
-                "%s sets no max_concurrent_requests: a burst of long requests can fill "
-                "the T3 KV cache and stall until the requests time out", config_path,
-            )
-            return
-        kv = next(s for s in self.get_node_resources() if s.resource_key == T3_KV).config
-        overrides = (config.get("resources") or {}).get(T3_KV) or {}
-        page_size = int(overrides.get("page_size", kv.page_size))
-        max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
-        need = 1 + int(cap) * self._request_kv_pages(page_size)
-        if need > max_num_pages:
-            raise ValueError(
-                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) at "
-                f"max_new_tokens_limit={self.config.max_new_tokens_limit or self.config.t3.max_speech_tokens} "
-                f"need {need} pages of resources.{T3_KV}, which has {max_num_pages}; "
-                "raise max_num_pages or lower one of the other two"
-            )
+    def pool_units_per_request(self, spec: NodeResourceSpec) -> int | None:
+        """The T3 pool at full text and ``max_new_tokens_limit`` speech tokens, rather than
+        both CFG streams at ``max_seq_len`` (Turbo opens one)."""
+        if spec.resource_key != T3_KV:
+            return None
+        return self._request_kv_pages(spec.config.page_size)
 
     def _request_kv_pages(self, page_size: int) -> int:
         """Pages one request can hold at full text and the token limit, per

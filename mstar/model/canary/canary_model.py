@@ -54,7 +54,7 @@ from mstar.model.canary.config import (
 )
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import SentencePieceDetokenizer, check_kv_pools_fit, check_loaded, kv_pages
+from mstar.model.utils import SentencePieceDetokenizer, check_loaded, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
@@ -139,9 +139,6 @@ class CanaryModel(Model):
                 enable_repetion_penalty=False,
             ),
         ]
-
-    def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        check_kv_pools_fit(self, config, config_path, logger)
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],

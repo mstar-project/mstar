@@ -247,7 +247,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``max_concurrent_requests``
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue, except a live call (open client input), which is refused with
-       a 503.
+       a 503. Startup refuses a cap that a KV cache or state pool cannot hold at its
+       per-request bound, and each worker logs what its pools hold (``Pools[`` lines;
+       see "Pool sizing" in :doc:`adding_models`).
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against

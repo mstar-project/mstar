@@ -99,37 +99,6 @@ class ParakeetModel(Model):
             ),
         ]
 
-    def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a ``max_concurrent_requests`` the state pool can't hold. A
-        request holds its slot from its first decode iteration until it is torn down;
-        past the pool, a decode step's admit waits for a slot while the
-        request's frames sit on the GPU, where the conductor would have
-        queued the request."""
-        slots = ((config.get("resources") or {}).get(TRANSDUCER_STATE) or {}).get(
-            "max_slots", self.MAX_CONCURRENT_REQUESTS + 1,
-        )
-        # the pool's own check runs before YAML overrides land, so it can't see this
-        if not isinstance(slots, int) or isinstance(slots, bool) or slots < 2:
-            raise ValueError(
-                f"{config_path}: resources.{TRANSDUCER_STATE}.max_slots must be an int >= 2 "
-                f"(slot 0 is the sink); got {slots!r}"
-            )
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning(
-                "%s sets no max_concurrent_requests: past the %d requests resources.%s holds, "
-                "decode steps wait for a slot", config_path, slots - 1, TRANSDUCER_STATE,
-            )
-            return
-        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-            raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-        if cap > slots - 1:
-            raise ValueError(
-                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need "
-                f"{cap + 1} slots of resources.{TRANSDUCER_STATE} (one each and the sink), which has "
-                f"{slots}; raise max_slots or lower max_concurrent_requests"
-            )
-
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         decode = Loop(
             name=DECODE_LOOP,

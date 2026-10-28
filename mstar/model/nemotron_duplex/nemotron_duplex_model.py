@@ -67,7 +67,6 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
-    apply_yaml_overrides,
 )
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
@@ -429,7 +428,7 @@ class NemotronDuplexModel(Model):
     # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
     # Nemotron-H, and in encoder_state / encoder_front / codec_state / encoder_kv;
     # pages in nano_kv and talker_kv). A deployment raising it raises all seven
-    # (see validate_config_yaml). 32 is the most one-shot calls that keep up with real
+    # (the startup check refuses a cap one of them can't hold). 32 is the most one-shot calls that keep up with real
     # time on one H100 (a tick takes ~62 ms at 32, and 40+ miss the 80 ms budget).
     # Live calls paced over /generate/ws cost more per tick: 16 keep up on one
     # H200, and 32 sit at the edge (all finish, but audio can fall behind).
@@ -480,45 +479,14 @@ class NemotronDuplexModel(Model):
         # + 1 for the pool's sink page
         return sessions * streams * -(-positions // page_size) + 1
 
-    def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a session cap that a per-session resource cannot hold.
-
-        A session holds a slot in each recurrent pool (``mamba_state``,
-        ``encoder_state``, ``encoder_front``, ``codec_state``) and in
-        ``encoder_kv``, and its nano and talker pages from its first step to its
-        last, so a session past any of them waits on admit until
-        another ends, and its frames with it. So ``max_concurrent_requests``
-        sessions must fit each; the conductor queues the rest.
-        """
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning(
-                "%s sets no max_concurrent_requests: a session past the per-session "
-                "resources waits on admit until another ends", config_path,
-            )
-            return
-        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-            raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-        specs = self.get_node_resources()
-        apply_yaml_overrides(specs, config)
-        for spec in specs:
-            if isinstance(spec, RecurrentStateSpec):
-                held, knob = spec.config.usable_slots, "max_slots"
-            elif isinstance(spec, BoundedKVSpec):
-                held, knob = spec.config.max_slots, "max_slots"
-            elif spec.resource_key in (TALKER_KV, NANO_KV):
-                kv = spec.config
-                pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages
-                per_session = pages(kv.page_size, sessions=1) - 1
-                held, knob = (kv.max_num_pages - 1) // per_session, "max_num_pages"
-            else:
-                continue
-            if held < cap:
-                raise ValueError(
-                    f"{config_path}: {cap} concurrent sessions (max_concurrent_requests) need as "
-                    f"many in resources.{spec.resource_key}, which holds {held}; raise its {knob} "
-                    "or lower max_concurrent_requests"
-                )
+    def pool_units_per_request(self, spec: NodeResourceSpec) -> int | None:
+        """A session's nano and talker pages: its prompt or warm-up and every frame of
+        ``max_session_s`` (both CFG streams for the talker), not ``max_seq_len``. A
+        session holds them from its first step to its last."""
+        pages = {TALKER_KV: self.talker_kv_pages, NANO_KV: self.nano_kv_pages}.get(spec.resource_key)
+        if pages is None:
+            return None
+        return pages(spec.config.page_size, sessions=1) - 1  # without the sink page
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
         # One text token per audio frame, so the audio fixes the length, within

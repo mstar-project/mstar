@@ -38,6 +38,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sizing import PoolDemand, concurrency, describe, memory_allows, pool_demands
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -479,6 +480,10 @@ class Engine:
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
+        # the pools among them, and the device's free bytes before any resource was built,
+        # for the startup report
+        self._pools: list[PoolDemand] = []
+        self._free_before_resources: int | None = None
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
@@ -519,6 +524,10 @@ class Engine:
 
         self._classify_tp_roles(node_names, parallel_groups)
 
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            self._free_before_resources = torch.cuda.mem_get_info(device)[0]
+        shards: dict[str, int] = {}
         for spec in specs:
             relevant_nodes = spec.nodes & node_names
             if len(relevant_nodes) == 0:
@@ -531,6 +540,7 @@ class Engine:
             joint_comm_group = parallel_groups.get_joint_group_for_node(
                 next(iter(relevant_nodes))
             )
+            shards[spec.resource_key] = 1 if joint_comm_group is None else joint_comm_group.world_size
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
@@ -555,6 +565,10 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
+        self._pools = pool_demands(
+            [spec for spec in specs if spec.resource_key in shards],
+            kv_cache_type or torch.get_default_dtype(), lambda spec: shards[spec.resource_key], model,
+        )
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -735,6 +749,36 @@ class Engine:
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
+        self._log_pools(plan)
+
+    def _log_pools(self, plan: CapturePlan | None) -> None:
+        """Each pool's size, what a request takes of it and how many fit at once, and,
+        on CUDA, what the memory still free after capture would hold if it went to the
+        pools too, the largest eager step's share kept back."""
+        if not self._pools:
+            return
+        for demand in self._pools:
+            logger.info("Pools[%s] %s", self._device, describe(demand))
+        held = concurrency(self._pools)
+        if plan is None:
+            logger.info("Pools[%s]: %s requests at once", self._device, held)
+            return
+        free, total = torch.cuda.mem_get_info(self._device)
+        if self._free_before_resources is not None:
+            # what a pool sized from memory has to leave: everything but the pools that the
+            # boot allocated after the weights, and the largest eager step's room
+            beside = self._free_before_resources - free - sum(d.nbytes for d in self._pools)
+            logger.info(
+                "Pools[%s]: %.2f GiB free after the weights; capture, buffers and workspaces took "
+                "%.2f GiB beside the pools, %.2f GiB with the largest eager step", self._device,
+                self._free_before_resources / 2**30, beside / 2**30, (beside + plan.floor) / 2**30,
+            )
+        if self._gpu_memory_fraction is not None:
+            free = min(free, int(self._gpu_memory_fraction * total) - torch.cuda.memory_reserved(self._device))
+        logger.info(
+            "Pools[%s]: %s requests at once; %s", self._device, held,
+            memory_allows(self._pools, free - plan.floor),
+        )
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],

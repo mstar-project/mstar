@@ -209,9 +209,17 @@ class Glm52Model(Model):
         ]
         if self.config.dsa_long_context:
             # past index_topk each query attends its indexer's top index_topk latents
+            from mstar.model.glm52.components.indexer import is_full_indexer_layer
+
             specs.append(DSASpec(
                 resource_key=DSA_RESOURCE, nodes=nodes,
-                config=DSAConfig(kv_cache=KV_RESOURCE, topk=self.config.index_topk),
+                config=DSAConfig(
+                    kv_cache=KV_RESOURCE, topk=self.config.index_topk,
+                    key_layers=sum(
+                        is_full_indexer_layer(self.config, i) for i in range(num_kv_layers)
+                    ),
+                    key_dim=self.config.index_head_dim,
+                ),
             ))
         return specs
 

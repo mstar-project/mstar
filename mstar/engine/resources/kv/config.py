@@ -8,8 +8,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
+import torch
+
+from mstar.engine.resources.sizing import PoolConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
@@ -59,12 +62,17 @@ class KVConfig(ABC):
         """
         from mstar.distributed.utils import divide
 
+        self.num_kv_heads = self.sharded_kv_heads(num_shards)
+        self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
+
+    def sharded_kv_heads(self, num_shards: int) -> int:
+        """One rank's KV heads at ``num_shards``, what ``shard`` narrows to."""
+        from mstar.distributed.utils import divide
+
         if num_shards >= self._unsharded_kv_heads:
             # fewer KV heads than ranks — every rank holds a replicated head
-            self.num_kv_heads = 1
-        else:
-            self.num_kv_heads = divide(self._unsharded_kv_heads, num_shards)
-        self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
+            return 1
+        return divide(self._unsharded_kv_heads, num_shards)
 
     @abstractmethod
     def apply_yaml_overrides(self, **kwargs) -> None:
@@ -77,8 +85,11 @@ class KVConfig(ABC):
 
 
 @dataclass(kw_only=True)
-class PagedKVConfig(KVConfig):
+class PagedKVConfig(KVConfig, PoolConfig):
     """Fixed-size pages, appended to as a sequence grows. The default."""
+
+    pool_unit: ClassVar[str] = "page"
+    size_key: ClassVar[str] = "max_num_pages"
 
     max_seq_len: int
     max_num_pages: int = 2048
@@ -114,6 +125,29 @@ class PagedKVConfig(KVConfig):
         assert self.layout == KVLayout.MLA
         return self.kv_lora_rank + self.qk_rope_head_dim
 
+    @property
+    def pool_units(self) -> int:
+        return self.max_num_pages
+
+    @property
+    def reserved_units(self) -> int:
+        return 1  # SINK_PAGE
+
+    @property
+    def host_units(self) -> int:
+        return self.cpu_offload_pages
+
+    def unit_bytes(self, kv_dtype: torch.dtype, num_shards: int = 1) -> int:
+        """A page across every layer: K and V per head under NHD, one latent under MLA."""
+        if self.layout == KVLayout.MLA:
+            width = self.latent_dim
+        else:
+            width = 2 * self.sharded_kv_heads(num_shards) * self.head_dim
+        return self.num_layers * self.page_size * width * kv_dtype.itemsize
+
+    def units_per_request(self, max_seq_len: int | None) -> int:
+        return -(-(max_seq_len or self.max_seq_len) // self.page_size)
+
     def apply_yaml_overrides(
         self,
         max_num_pages: int | None = None,
@@ -148,12 +182,15 @@ class RingKVLayerConfig:
 
 
 @dataclass(kw_only=True)
-class RingKVConfig(KVConfig):
+class RingKVConfig(KVConfig, PoolConfig):
     """A fixed horizon of frame slots per layer, overwritten in place.
 
     Every layer's storage is allocated once and reused for the life of the process,
     and a write to an occupied slot is the intended behaviour.
     """
+
+    pool_unit: ClassVar[str] = "session"
+    size_key: ClassVar[str] = "num_sessions"
 
     tokens_per_frame: int
     layers: tuple[RingKVLayerConfig, ...]
@@ -171,6 +208,21 @@ class RingKVConfig(KVConfig):
         padding session is a real, addressable span.
         """
         return self.num_sessions + 1
+
+    @property
+    def pool_units(self) -> int:
+        return self.total_sessions
+
+    @property
+    def reserved_units(self) -> int:
+        return 1  # the padding session
+
+    def unit_bytes(self, kv_dtype: torch.dtype, num_shards: int = 1) -> int:
+        """One session's K and V in every layer's ring, its scratch frame included."""
+        per_token = 2 * self.sharded_kv_heads(num_shards) * self.head_dim * kv_dtype.itemsize
+        return sum(
+            (layer.ring_frames + 1) * self.tokens_per_frame * per_token for layer in self.layers
+        )
 
     def __post_init__(self):
         super().__post_init__()

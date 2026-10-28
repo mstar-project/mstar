@@ -5,12 +5,14 @@ pool is ignorant of what the state means: a slot is a fixed number of bytes per
 layer, so capacity is a slot count and a fork is a fixed-size copy.
 """
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
+from mstar.engine.resources.sizing import PoolConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
@@ -41,12 +43,16 @@ class RecurrentBlockConfig:
         return self.dtype or kv_dtype or torch.get_default_dtype()
 
     def shard(self, num_shards: int) -> None:
+        self.shape = self.sharded_shape(num_shards)
+
+    def sharded_shape(self, num_shards: int) -> tuple[int, ...]:
+        """One rank's shape at ``num_shards``, what ``shard`` narrows to."""
         from mstar.distributed.utils import divide
 
         shape = list(self._unsharded_shape)
         for dim in self.shard_dims:
             shape[dim] = divide(self._unsharded_shape[dim], num_shards)
-        self.shape = tuple(shape)
+        return tuple(shape)
 
 
 class RecurrentGeometry(ABC):
@@ -234,7 +240,10 @@ class Mamba2Geometry(RecurrentGeometry):
 
 
 @dataclass
-class RecurrentStateConfig:
+class RecurrentStateConfig(PoolConfig):
+    pool_unit: ClassVar[str] = "slot"
+    size_key: ClassVar[str] = "max_slots"
+
     # The total number of recurrent layers, not total transformer layers
     num_layers: int
     # Named blocks, e.g. what `DeltaNetGeometry.to_blocks` returns; the pool
@@ -267,6 +276,21 @@ class RecurrentStateConfig:
         """Slots requests can hold; the sink is not one of them."""
         return self.max_slots - (0 if self.disable_sink_slot else 1)
 
+    @property
+    def pool_units(self) -> int:
+        return self.max_slots
+
+    @property
+    def reserved_units(self) -> int:
+        return self.max_slots - self.usable_slots
+
+    def unit_bytes(self, kv_dtype: torch.dtype, num_shards: int = 1) -> int:
+        """One slot of every block in every layer."""
+        return self.num_layers * sum(
+            math.prod(block.sharded_shape(num_shards)) * block.resolved_dtype(kv_dtype).itemsize
+            for block in self.blocks.values()
+        )
+
     def shard(self, num_shards: int) -> None:
         """Narrow every block's sharded axes. Idempotent, so the pool and its
         resource can both shard the shared config."""
@@ -294,6 +318,13 @@ class RecurrentStateSpec(NodeResourceSpec):
         backend can reach.
         """
         if max_slots is not None:
+            # the pool's own check ran on the declared count, before this
+            low = 1 if self.config.disable_sink_slot else 2
+            if not isinstance(max_slots, int) or isinstance(max_slots, bool) or max_slots < low:
+                raise ValueError(
+                    f"max_slots must be an int >= {low}"
+                    f"{'' if self.config.disable_sink_slot else ' (slot 0 is the sink)'}; got {max_slots!r}"
+                )
             self.config.max_slots = max_slots
         if state_dtype is not None:
             try:

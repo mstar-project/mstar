@@ -4,7 +4,7 @@ A request keeps its 1500-token encoder context (12 cross-attention pages) from
 prefill to its last token. When more requests are in flight than the cache
 holds, a prefill batch is refused and the worker offloads decoding requests to
 admit it, over and over. The shipped configs cap ``max_concurrent_requests``
-at what both caches hold, ``validate_config_yaml`` checks the two agree, and
+at what both caches hold, startup validation checks the two agree, and
 the conductor queues the rest. These tests drive the real conductor gate and
 the real page allocator on the CPU; no weights are loaded.
 """
@@ -32,6 +32,7 @@ from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.whisper.config import CONTEXT_LABEL, CROSS_KV_CACHE, KV_CACHE, WhisperModelConfig
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule
 from mstar.model.whisper.whisper_model import WhisperModel
+from mstar.validation.resources import pool_problems
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 PROMPT_TOKENS = 4
@@ -173,7 +174,7 @@ def test_shipped_yaml_caps_requests_at_what_the_caches_hold(name):
     cfg = yaml.safe_load(path.read_text())
     model = _make_model()
     assert cfg["max_concurrent_requests"] == WhisperModel.MAX_CONCURRENT_REQUESTS
-    model.validate_config_yaml(cfg, str(path))
+    assert pool_problems(model, cfg) == []
     # the YAML tunes host offload only; the pools validated are the pools built
     specs = model.get_node_resources()
     apply_yaml_overrides(specs, cfg)
@@ -186,32 +187,29 @@ def test_shipped_yaml_caps_requests_at_what_the_caches_hold(name):
 def test_a_cap_past_either_cache_is_refused():
     model = _make_model()
     cap = WhisperModel.MAX_CONCURRENT_REQUESTS
-    with pytest.raises(ValueError, match=f"resources.{KV_CACHE} "):
-        model.validate_config_yaml({"max_concurrent_requests": cap + 1}, "x.yaml")
+    assert any(f"resources.{KV_CACHE} " in p for p in pool_problems(model, {"max_concurrent_requests": cap + 1}))
     roomy_self_kv = {"resources": {KV_CACHE: {"max_num_pages": 4096}}}
-    with pytest.raises(ValueError, match=CROSS_KV_CACHE):
-        model.validate_config_yaml({"max_concurrent_requests": cap + 1, **roomy_self_kv}, "x.yaml")
+    [problem] = pool_problems(model, {"max_concurrent_requests": cap + 1, **roomy_self_kv})
+    assert CROSS_KV_CACHE in problem
     # the old 192-page context cache: 16 requests need 16 x 12 pages and the sink
     old = {"resources": {CROSS_KV_CACHE: {"max_num_pages": 192}}}
-    with pytest.raises(ValueError, match="need 193 pages"):
-        model.validate_config_yaml({"max_concurrent_requests": 16, **old}, "x.yaml")
-    model.validate_config_yaml({"max_concurrent_requests": 15, **old}, "x.yaml")
+    [problem] = pool_problems(model, {"max_concurrent_requests": 16, **old})
+    assert "need 193 pages" in problem
+    assert pool_problems(model, {"max_concurrent_requests": 15, **old}) == []
     # smaller pages: more of them per request
-    with pytest.raises(ValueError, match=f"resources.{KV_CACHE} "):
-        model.validate_config_yaml(
-            {"max_concurrent_requests": cap, "resources": {KV_CACHE: {"page_size": 64}}}, "x.yaml",
-        )
+    [problem] = pool_problems(model, {"max_concurrent_requests": cap, "resources": {KV_CACHE: {"page_size": 64}}})
+    assert f"resources.{KV_CACHE} " in problem
 
 
 @pytest.mark.parametrize("cap", [0, -1, True, "64", 8.0])
 def test_a_cap_that_is_not_a_positive_int_is_refused(cap):
-    with pytest.raises(ValueError, match="positive int"):
-        _make_model().validate_config_yaml({"max_concurrent_requests": cap}, "x.yaml")
+    [problem] = pool_problems(_make_model(), {"max_concurrent_requests": cap})
+    assert "positive int" in problem
 
 
 def test_no_cap_starts_with_a_warning(caplog):
-    with caplog.at_level(logging.WARNING, logger="mstar.model.whisper.whisper_model"):
-        _make_model().validate_config_yaml({}, "x.yaml")
+    with caplog.at_level(logging.WARNING, logger="mstar.validation.resources"):
+        assert pool_problems(_make_model(), {}) == []
     assert "sets no max_concurrent_requests" in caplog.text
 
 

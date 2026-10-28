@@ -11,10 +11,11 @@ entries are read where they live.
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import torch
 
+from mstar.engine.resources.sizing import PoolConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
@@ -33,7 +34,10 @@ class SinkWindow(NamedTuple):
 
 
 @dataclass
-class BoundedKVConfig:
+class BoundedKVConfig(PoolConfig):
+    pool_unit: ClassVar[str] = "slot"
+    size_key: ClassVar[str] = "max_slots"
+
     num_layers: int
     num_heads: int
     head_dim: int
@@ -105,6 +109,19 @@ class BoundedKVConfig:
     @property
     def slot_tokens(self) -> int:
         return self.sink_capacity + self.window_capacity
+
+    @property
+    def pool_units(self) -> int:
+        return self.max_slots
+
+    def unit_bytes(self, kv_dtype: torch.dtype, num_shards: int = 1) -> int:
+        """One slot's K and V rows in every layer. Bounded KV does not shard."""
+        del num_shards
+        dtype = self.dtype or kv_dtype
+        return (
+            self.num_layers * self.rows_per_request * self.num_heads * max(self.slot_tokens, 1)
+            * 2 * self.head_dim * dtype.itemsize
+        )
 
 
 @dataclass

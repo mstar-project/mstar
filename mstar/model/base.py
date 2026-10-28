@@ -633,6 +633,19 @@ class Model(ABC):
         """
         return {}
 
+    def pool_units_per_request(self, spec: NodeResourceSpec) -> int | None:
+        """Units of ``spec``'s pool one request holds at most, after the
+        deployment's ``resources:`` overrides, where the model knows a tighter
+        bound than the engine's: one stream per label ``kv_labels`` declares for
+        the pool, at the pool's ``max_seq_len``, and one slot or session
+        otherwise. A token cap below ``max_seq_len`` or a label not every request
+        opens, say. None keeps the engine's bound.
+
+        Startup reports and checks pool sizes against this.
+        """
+        del spec
+        return None
+
     def get_request_resource_configs(
         self,
         partition_fwd_args: dict[str, ForwardPassArgs],

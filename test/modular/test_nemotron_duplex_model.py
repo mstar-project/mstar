@@ -47,6 +47,7 @@ from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import client_stream_limits
 from mstar.validation.client_streams import check_client_streams
+from mstar.validation.resources import pool_problems
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "nemotron_duplex.yaml"
 
@@ -155,7 +156,7 @@ def test_duplex_shipped_configs_hold_their_session_cap():
     model = _make_model()
     for name in ("nemotron_duplex.yaml", "nemotron_duplex_disagg.yaml"):
         path = CONFIG_PATH.parent / name
-        model.validate_config_yaml(yaml.safe_load(path.read_text()), str(path))
+        assert pool_problems(model, yaml.safe_load(path.read_text())) == []
 
 
 def test_duplex_shipped_configs_turn_websocket_deflate_off():
@@ -180,10 +181,10 @@ def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
                  ENCODER_KV: {"max_slots": 48},
                  TALKER_KV: {"max_num_pages": model.talker_kv_pages(128, 48)},
                  NANO_KV: {"max_num_pages": model.nano_kv_pages(128, 48)}}
-    model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
+    assert pool_problems(model, {"max_concurrent_requests": 48, "resources": resources}) == []
     del resources[key]
-    with pytest.raises(ValueError, match=f"resources.{key}"):
-        model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
+    [problem] = pool_problems(model, {"max_concurrent_requests": 48, "resources": resources})
+    assert f"resources.{key} " in problem
 
 
 @pytest.mark.parametrize("kwargs", [{"max_session_s": 640.0}, {"max_prompt_tokens": 8192}])
@@ -194,10 +195,9 @@ def test_duplex_kv_pools_hold_the_session_cap_at_the_calls_it_serves(kwargs):
     model = _make_model()
     for name, value in kwargs.items():
         setattr(model, name, value)
-    model.validate_config_yaml({"max_concurrent_requests": 32}, "c.yaml")
-    with pytest.raises(ValueError, match=f"resources.{NANO_KV}"):
-        model.validate_config_yaml({"max_concurrent_requests": 32, "resources": {NANO_KV: {"max_num_pages": 2}}},
-                                   "c.yaml")
+    assert pool_problems(model, {"max_concurrent_requests": 32}) == []
+    [problem] = pool_problems(model, {"max_concurrent_requests": 32, "resources": {NANO_KV: {"max_num_pages": 2}}})
+    assert f"resources.{NANO_KV} " in problem
 
 
 @pytest.mark.parametrize("autocast_dtype", [torch.bfloat16, torch.float16, None])

@@ -50,6 +50,7 @@ from mstar.model.chatterbox.submodules import (
 )
 from mstar.model.registry import HF_MODELS, get_model_class, model_init_kwargs
 from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.validation.resources import pool_problems
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 
@@ -567,13 +568,13 @@ def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(name, caplog):
     cfg = yaml.safe_load(path.read_text())
     model = _make_model(name)
     model.config.max_new_tokens_limit = cfg["model_kwargs"]["max_new_tokens_limit"]
-    model.validate_config_yaml(cfg, str(path))
+    assert pool_problems(model, cfg) == []
     # every request at the T3 table's 4096 tokens would not fit
     model.config.max_new_tokens_limit = None
-    with pytest.raises(ValueError, match="raise max_num_pages"):
-        model.validate_config_yaml(cfg, str(path))
+    [problem] = pool_problems(model, cfg)
+    assert "raise its max_num_pages" in problem
     # without a cap nothing bounds the pool: started, with a warning
-    model.validate_config_yaml({k: v for k, v in cfg.items() if k != "max_concurrent_requests"}, str(path))
+    assert pool_problems(model, {k: v for k, v in cfg.items() if k != "max_concurrent_requests"}) == []
     assert "sets no max_concurrent_requests" in caplog.text
 
 
@@ -582,10 +583,10 @@ def test_kv_fit_counts_the_requests_and_the_sink_page():
     model.config.max_new_tokens_limit = 1000
     assert model._request_kv_pages(64) == 50  # 25 pages for each of the two CFG streams
     cfg = {"max_concurrent_requests": 30, "resources": {"t3_kv": {"page_size": 64, "max_num_pages": 1501}}}
-    model.validate_config_yaml(cfg, "x.yaml")
+    assert pool_problems(model, cfg) == []
     cfg["resources"]["t3_kv"]["max_num_pages"] = 1500
-    with pytest.raises(ValueError, match="need 1501 pages"):
-        model.validate_config_yaml(cfg, "x.yaml")
+    [problem] = pool_problems(model, cfg)
+    assert "need 1501 pages" in problem
     turbo = _make_model("turbo")
     turbo.config.max_new_tokens_limit = 1000
     assert turbo._request_kv_pages(64) == 30

@@ -14,6 +14,7 @@ from mstar.api_server.openai.protocol import TranscriptionRequest
 from mstar.model.canary.canary_model import CanaryModel
 from mstar.model.canary.config import LANGUAGES, MEL_SETTINGS, PROMPT_LENGTH, CanaryModelConfig, check_task
 from mstar.model.canary.decoder import CanaryDecoderModel, sinusoid_positions
+from mstar.validation.resources import pool_problems
 
 SPECIALS = [
     "<unk>", "<|nospeech|>", "<pad>", "<|endoftext|>", "<|startoftranscript|>", "<|pnc|>", "<|nopnc|>",
@@ -129,12 +130,11 @@ def test_request_cap_must_fit_the_kv_pools(snapshot):
     # the default caches hold MAX_CONCURRENT_REQUESTS at full length: one
     # self-attention page per request here, and 4 context pages per 40.96 s clip
     cap = CanaryModel.MAX_CONCURRENT_REQUESTS
-    model.validate_config_yaml({"max_concurrent_requests": cap}, "canary.yaml")
-    with pytest.raises(ValueError, match=r"resources\.kv_cache "):
-        model.validate_config_yaml({"max_concurrent_requests": cap + 1}, "canary.yaml")
+    assert pool_problems(model, {"max_concurrent_requests": cap}) == []
+    assert any("resources.kv_cache " in p for p in pool_problems(model, {"max_concurrent_requests": cap + 1}))
     roomy = {"resources": {"kv_cache": {"max_num_pages": 4096}}}
-    with pytest.raises(ValueError, match=r"resources\.cross_kv_cache"):
-        model.validate_config_yaml({"max_concurrent_requests": cap + 1, **roomy}, "canary.yaml")
+    [problem] = pool_problems(model, {"max_concurrent_requests": cap + 1, **roomy})
+    assert "resources.cross_kv_cache" in problem
 
 
 def test_detokenizes_pieces_and_byte_fallback(snapshot):

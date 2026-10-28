@@ -21,6 +21,7 @@ from mstar.model.parakeet.config import (
     ParakeetModelConfig,
 )
 from mstar.model.parakeet.parakeet_model import ParakeetModel
+from mstar.validation.resources import pool_problems
 
 ENCODER = dict(
     hidden_size=32, num_hidden_layers=1, num_attention_heads=4, intermediate_size=64, conv_kernel_size=9,
@@ -194,18 +195,18 @@ def test_one_walk_the_encoder_then_a_decode_loop(tmp_path, nemotron):
 
 def test_startup_refuses_more_requests_than_slots(tmp_path):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron=False)))
-    model.validate_config_yaml({"max_concurrent_requests": 128}, "a.yaml")
-    model.validate_config_yaml(
-        {"max_concurrent_requests": 128, "resources": {TRANSDUCER_STATE: {"max_slots": 129}}}, "a.yaml",
+    assert pool_problems(model, {"max_concurrent_requests": 128}) == []
+    assert pool_problems(
+        model, {"max_concurrent_requests": 128, "resources": {TRANSDUCER_STATE: {"max_slots": 129}}},
+    ) == []
+    [problem] = pool_problems(
+        model, {"max_concurrent_requests": 128, "resources": {TRANSDUCER_STATE: {"max_slots": 128}}},
     )
-    with pytest.raises(ValueError, match="need 129 slots"):
-        model.validate_config_yaml(
-            {"max_concurrent_requests": 128, "resources": {TRANSDUCER_STATE: {"max_slots": 128}}}, "a.yaml",
-        )
-    with pytest.raises(ValueError, match="need 130 slots"):
-        model.validate_config_yaml({"max_concurrent_requests": 129}, "a.yaml")
-    with pytest.raises(ValueError, match="positive int"):
-        model.validate_config_yaml({"max_concurrent_requests": 0}, "a.yaml")
+    assert "need 129 slots" in problem
+    [problem] = pool_problems(model, {"max_concurrent_requests": 129})
+    assert "need 130 slots" in problem
+    [problem] = pool_problems(model, {"max_concurrent_requests": 0})
+    assert "positive int" in problem
     # slot 0 is the sink, so one slot leaves none to admit into, with or without a cap
-    with pytest.raises(ValueError, match="max_slots must be an int >= 2"):
-        model.validate_config_yaml({"resources": {TRANSDUCER_STATE: {"max_slots": 1}}}, "a.yaml")
+    [problem] = pool_problems(model, {"resources": {TRANSDUCER_STATE: {"max_slots": 1}}})
+    assert "max_slots must be an int >= 2" in problem

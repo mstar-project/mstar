@@ -1,12 +1,16 @@
 """Resource checks: the model's declarations and the deployment's ``resources:``
 overrides, as every worker's engine would build them."""
 
+import logging
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
+
+import torch
 
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.engine.resources.runner import topo_sort
+from mstar.engine.resources.sizing import pool_demands, units_for
 from mstar.engine.resources.spec import (
     TOP_LEVEL_KV_CACHE,
     NodeResourceSpec,
@@ -16,6 +20,8 @@ from mstar.engine.resources.spec import (
 from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
 from mstar.model.base import Model, keyed_labels
 from mstar.streaming.topology import StreamingGraphEdge
+
+logger = logging.getLogger(__name__)
 
 
 def check_resources(
@@ -34,6 +40,7 @@ def check_resources(
         except ValueError as e:
             problems.append(str(e))
     problems += _apply_overrides(specs, config)
+    problems += pools_hold_concurrency(specs, model, config)
     problems += _uncacheable_positions(specs, model)
     problems += _unskippable_resources(specs, model)
     problems += _unknown_prefix_walks(model)
@@ -72,6 +79,57 @@ def _apply_overrides(
             by_key[key].apply_yaml_overrides(**kwargs)
         except (TypeError, ValueError) as e:
             yield f"resources.{key}: {e}"
+
+
+def pools_hold_concurrency(
+    specs: Sequence[NodeResourceSpec], model: Model, config: Mapping[str, Any],
+) -> list[str]:
+    """Refuse a ``max_concurrent_requests`` a pool cannot hold at the model's
+    per-request bound (``Model.pool_units_per_request``).
+
+    A request keeps its pages or slot from its first step to its last, and a
+    request past the pool waits on the worker, holding its inputs, instead of in
+    the conductor's queue. Where nothing preempts, requests that each need one
+    more page wait on each other until they time out. A pool that offloads to the
+    host (``cpu_offload_pages``) can make room, slowly, so it gets a warning.
+    """
+    cap = config.get("max_concurrent_requests")
+    if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap < 1):
+        return [f"max_concurrent_requests must be a positive int; got {cap!r}"]
+    # the byte sizes don't matter here
+    demands = [d for d in pool_demands(specs, torch.bfloat16, model=model) if d.units is not None]
+    if not demands:
+        return []
+    if cap is None:
+        logger.warning(
+            "the config sets no max_concurrent_requests: past what %s hold, requests wait on "
+            "the worker instead of in the conductor's queue",
+            ", ".join(f"{d.key} ({d.requests} at once)" for d in demands),
+        )
+        return []
+    problems = []
+    for d in demands:
+        need = units_for(d, cap)
+        if need <= d.units:
+            continue
+        length = "" if d.max_seq_len is None else f" at {d.max_seq_len} tokens"
+        message = (
+            f"{cap} concurrent requests (max_concurrent_requests) need {need} {d.unit}s of "
+            f"resources.{d.key} ({d.per_request} per request{length}, {d.reserved} reserved), "
+            f"which has {d.units}; raise its {d.size_key} or lower max_concurrent_requests"
+        )
+        if d.can_evict:
+            logger.warning("%s; past %d at once the worker offloads requests to the host", message, d.requests)
+        else:
+            problems.append(message)
+    return problems
+
+
+def pool_problems(model: Model, config: Mapping[str, Any]) -> list[str]:
+    """What ``validate_deployment`` reports about ``model``'s pools under ``config``:
+    the ``resources:`` overrides, then ``pools_hold_concurrency``."""
+    specs = model.get_node_resources()
+    return [*_apply_overrides(specs, config), *pools_hold_concurrency(specs, model, config)]
 
 
 def _uncacheable_positions(

@@ -67,7 +67,7 @@ from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, Proce
 from mstar.model.components.audio_features import LogMelSpectrogram, load_speech_file
 from mstar.model.components.request_kwargs import checked_request_kwargs
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import ByteLevelDetokenizer, check_kv_pools_fit, kv_pages
+from mstar.model.utils import ByteLevelDetokenizer, kv_pages
 from mstar.model.whisper.components import alignment
 from mstar.model.whisper.components.timestamps import inactive_state
 from mstar.model.whisper.config import (
@@ -281,11 +281,8 @@ class WhisperModel(Model):
         }
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a request cap the decoder caches cannot hold: a request keeps
-        its encoder context from prefill to its last token, so nothing frees
-        cross-attention pages but a finished request. Also note the decoder's
-        tensor-parallel size, which word timestamps need to be 1, and refuse a
-        placement that splits the decoder's walks across ranks."""
+        """Note the decoder's tensor-parallel size, which word timestamps need to
+        be 1, and refuse a placement that splits the decoder's walks across ranks."""
         decoder_groups = [
             group for group in config.get("node_groups") or []
             if DECODER_NODE in (group.get("node_names") or [])
@@ -309,7 +306,6 @@ class WhisperModel(Model):
                 f"run on the same ranks (word timestamps align the tokens those walks kept on their "
                 f"worker); got " + ", ".join(f"{walk}: {list(ranks)}" for walk, ranks in served.items())
             )
-        check_kv_pools_fit(self, config, config_path, logger)
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
