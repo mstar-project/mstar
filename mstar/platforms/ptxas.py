@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -62,7 +63,7 @@ def _version_str(version: tuple[int, int, int] | None) -> str:
 
 
 @functools.cache
-def blackwell_ptxas_env() -> dict[str, str]:
+def blackwell_ptxas_env() -> dict[str, str | Callable[[str | None], str]]:
     """``TRITON_PTXAS_BLACKWELL_PATH`` set to torch's ptxas, and a matching
     Inductor cache tag, when a Blackwell GPU is present and Triton's bundled
     ptxas for it predates the fix; empty otherwise, or when the variable is
@@ -76,7 +77,7 @@ def blackwell_ptxas_env() -> dict[str, str]:
             _version_str(version), path, BLACKWELL_PTXAS_ENV,
         )
         # A cache the bundled ptxas wrote would keep serving its kernels, so the
-        # tag names this ptxas too. A tag the user set themselves is kept as is.
+        # tag names this ptxas too.
         return _cache_tag(version)
     bundled = _triton_blackwell_ptxas()
     bundled_version = ptxas_version(bundled) if bundled else None
@@ -103,10 +104,18 @@ def blackwell_ptxas_env() -> dict[str, str]:
     return {BLACKWELL_PTXAS_ENV: torch_ptxas, **_cache_tag(torch_version)}
 
 
-def _cache_tag(version: tuple[int, int, int] | None) -> dict[str, str]:
+def _cache_tag(version: tuple[int, int, int] | None) -> dict[str, Callable[[str | None], str]]:
     """Inductor's graph cache key ignores the ptxas, so untagged it keeps serving
     kernels another ptxas compiled. torch reads the tag at import, so it takes
-    effect in the processes spawned after it is set."""
+    effect in the processes spawned after it is set. A tag the user set keeps
+    its own split of the cache, with the ptxas appended."""
     if version is None:
         return {}
-    return {CACHE_TAG_ENV: f"ptxas-blackwell-{_version_str(version)}"}
+    suffix = f"ptxas-blackwell-{_version_str(version)}"
+
+    def tag(current: str | None) -> str:
+        if not current:
+            return suffix
+        return current if current.endswith(suffix) else f"{current}-{suffix}"
+
+    return {CACHE_TAG_ENV: tag}

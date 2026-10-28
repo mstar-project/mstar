@@ -64,8 +64,21 @@ def test_torch_ptxas_only_on_blackwell_with_an_older_triton_ptxas(
     want = {ptxas.BLACKWELL_PTXAS_ENV: TORCH_PTXAS, TAG: "ptxas-blackwell-13.2.78"} if want_torch_ptxas else {}
     if user:
         want = {TAG: "ptxas-blackwell-13.2.51"}  # the tag names the ptxas the user chose
-    defaults = CudaPlatform().process_env_defaults()
+    defaults = {k: v(None) if callable(v) else v for k, v in CudaPlatform().process_env_defaults().items()}
     assert {k: v for k, v in defaults.items() if k in (ptxas.BLACKWELL_PTXAS_ENV, TAG)} == want
+
+
+@pytest.mark.parametrize(
+    ("current", "want"),
+    [
+        (None, "ptxas-blackwell-13.2.78"),
+        ("mine", "mine-ptxas-blackwell-13.2.78"),
+        ("mine-ptxas-blackwell-13.2.78", "mine-ptxas-blackwell-13.2.78"),  # a worker applies it again
+    ],
+)
+def test_the_ptxas_is_appended_once_to_a_tag_the_user_set(current, want):
+    (tag,) = ptxas._cache_tag((13, 2, 78)).values()
+    assert tag(current) == want
 
 
 def test_ptxas_version_reads_the_build(tmp_path):

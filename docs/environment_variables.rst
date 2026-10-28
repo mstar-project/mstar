@@ -654,7 +654,8 @@ Compilation
        otherwise reuse kernels compiled by the bundled ptxas (decided by
        :func:`mstar.platforms.ptxas.blackwell_ptxas_env`). A value you set
        is kept, and the cache tag then names the ptxas you chose, so a cache
-       another ptxas wrote is not reused.
+       another ptxas wrote is not reused. A ``TORCH_COMPILE_CACHE_KEY_TAG``
+       you set gets ``-ptxas-blackwell-<version>`` appended.
    * - ``TORCHINDUCTOR_CACHE_DIR``
      - ``$XDG_CACHE_HOME/mstar/torchinductor`` (``~/.cache/mstar/torchinductor`` when unset)
      - torch's own variable; M* sets this default when importing
