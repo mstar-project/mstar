@@ -62,9 +62,13 @@ class SamplerSpec(NodeResourceSpec):
     min_tokens_stop_ids: tuple[int, ...] = ()
     # Allows ``top_p_first`` / ``top_p_min_keep``.
     enable_top_p_first: bool = False
-    # The node's decode verifies drafts (``NodeSubmodule.get_draft_policy``), greedily for
-    # now, so a request whose sampling a greedy verify would change is refused.
+    # The node's decode verifies drafts (``NodeSubmodule.get_draft_policy``).
     draft_verify: bool = False
+    # Capability: the verify samples (temperature, top-k, top-p, min-p), by rejection
+    # sampling. It filters the target's distribution at every row of a verify block each step,
+    # so a node that serves greedy requests only leaves it off: its verify is then an argmax
+    # and a request with a temperature is refused.
+    enable_sampled_verify: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -133,6 +137,7 @@ class SamplingReqConfig(ResourceReqConfig):
         if spec.draft_verify:
             problem = draft_verify_problem(
                 self.temperature or 0, self.repetition_penalty or 1, self.min_tokens or 0,
+                sampled=spec.enable_sampled_verify,
             )
             if problem is not None:
                 raise ValueError(problem)
@@ -147,13 +152,15 @@ class SamplingReqConfig(ResourceReqConfig):
             )
 
 
-def draft_verify_problem(temperature: float, repetition_penalty: float, min_tokens: int) -> str | None:
-    """Why a greedy draft verify can't serve these settings, if it can't. The verify keeps a
-    draft only where it is the target's argmax, so temperature must be 0; a penalty or a
-    min-tokens floor would move that argmax by the tokens before each draft, which the verify
-    does not see."""
+def draft_verify_problem(
+    temperature: float, repetition_penalty: float, min_tokens: int, sampled: bool = False,
+) -> str | None:
+    """Why the node's draft verify can't serve these settings, if it can't. A penalty or a
+    min-tokens floor depends on the tokens before each row of a verify block, which the
+    verify does not track; a greedy verify (``sampled`` False) keeps a draft only where it is
+    the target's argmax, so it serves temperature 0 alone."""
     asked = []
-    if temperature != 0:
+    if temperature != 0 and not sampled:
         asked.append(f"temperature={temperature}")
     if repetition_penalty != 1:
         asked.append(f"repetition_penalty={repetition_penalty}")
@@ -161,10 +168,15 @@ def draft_verify_problem(temperature: float, repetition_penalty: float, min_toke
         asked.append(f"min_tokens={min_tokens}")
     if not asked:
         return None
+    if sampled:
+        return (
+            "this model decodes with draft verification (speculative decoding), which can't "
+            f"apply {', '.join(asked)} yet; send no repetition_penalty or min_tokens"
+        )
     return (
         f"this model decodes with draft verification (speculative decoding), which is greedy-only "
-        f"so far, but the request asks for {', '.join(asked)}; send temperature=0 with no "
-        "repetition_penalty or min_tokens"
+        f"on this deployment, but the request asks for {', '.join(asked)}; send temperature=0 "
+        "with no repetition_penalty or min_tokens"
     )
 
 
@@ -202,3 +214,6 @@ class SamplerStep(ResourceStep):
     # The spec's loop-back states this step's forward stores
     # (``store_loopback_state``); commit persists them by slot.
     loopback_writes: frozenset[str] = frozenset()
+    # A verify step's (``with_draft_verify``). Its draws are the verify's, and a node whose
+    # verify is greedy draws nothing, so its sampler skips the step.
+    verify: bool = False

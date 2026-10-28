@@ -12,6 +12,7 @@ from mstar.engine.resources import (
     KVStep,
     PositionConfig,
     PositionStep,
+    SamplerStep,
     Segment,
     StepContext,
     SubmoduleStep,
@@ -41,7 +42,7 @@ class _Sampler:
     def __init__(self):
         self.next = None
 
-    def verify(self, request_ids, block, logits):
+    def verify(self, request_ids, block, logits, draft_probs=None):
         return self.next
 
 
@@ -316,7 +317,10 @@ def _runner():
     dv, sampler = _resource()
     kv = _kv()
     pos = RopeManager(config=PositionConfig(kv_cache="kv"), device=CPU)
-    runner = StepRunner({"kv": kv, "pos": pos, "dv": dv}, node_resources={"llm": ["kv", "pos", "dv"]})
+    # the node's sampler, whose step with_draft_verify adds; a greedy verify's skips it
+    greedy = SamplerResource(vocab_size=8, enable_repetion_penalty=False, device=CPU, draft_verify=True)
+    resources = {"kv": kv, "pos": pos, "dv": dv, "sampler": greedy}
+    runner = StepRunner(resources, node_resources={"llm": list(resources)})
     for res in (kv, pos, dv):
         res.ingest_request(1)
     return runner, kv, pos, dv, sampler
@@ -399,9 +403,24 @@ def test_with_draft_verify_adds_the_verify_step_to_rows_of_one_block():
     out = with_draft_verify(step, POLICY, "dv")
     assert isinstance(out.get("dv"), VerifyStep) and out.get("dv").drafts == K
     assert out.get("dv").segments == out.get("kv").segments
+    # and the sampler's step, which a sampled verify draws with
+    sampler_step = out.get("sampler")
+    assert isinstance(sampler_step, SamplerStep) and sampler_step.verify and not sampler_step.apply_penalty
+    assert out.get("dv").sampler == "sampler"
+    assert with_draft_verify(step, POLICY, "dv", sampler="s2").get("s2").verify
     short = SubmoduleStep(steps={"kv": KVStep()}, segments=[Segment(1, "main", 1)])
     with pytest.raises(ValueError, match="set input_seq_len to policy.block"):
         with_draft_verify(short, POLICY, "dv")
+    own = SubmoduleStep(steps={"kv": KVStep(), "sampler": SamplerStep()}, segments=step.segments)
+    with pytest.raises(ValueError, match="declare none"):
+        with_draft_verify(own, POLICY, "dv")
+
+
+def test_a_verify_step_names_the_sampler_its_resource_verifies_with():
+    res, _ = _resource()
+    step = VerifyStep(segments=(Segment(1, "main", K + 1),), drafts=K, sampler="other")
+    with pytest.raises(ValueError, match="pass it to with_draft_verify"):
+        res.plan(step, _ctx([1]))
 
 
 def test_a_walk_the_prefix_cache_keys_cannot_verify():

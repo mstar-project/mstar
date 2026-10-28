@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
+from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep, SubmoduleStep
 
@@ -81,17 +82,25 @@ class DraftVerifySpec(NodeResourceSpec):
 class VerifyStep(ResourceStep):
     """A verify step: each segment is a row of ``drafts + 1`` tokens."""
     drafts: int = 0
+    # the key of the sampler step ``with_draft_verify`` added beside it
+    sampler: str = "sampler"
 
 
 def with_draft_verify(
-    step: SubmoduleStep, policy: DraftPolicy, key: str = DRAFT_VERIFY,
+    step: SubmoduleStep, policy: DraftPolicy, key: str = DRAFT_VERIFY, sampler: str = "sampler",
 ) -> SubmoduleStep:
     """``step``, a decode step of a walk with ``policy``, as a verify step: ``VerifyStep``
-    added under ``key``. Every row, padding rows included, spans ``policy.block``. The
-    submodule calls this in ``declare_step``."""
+    added under ``key``, and a ``SamplerStep`` under ``sampler`` (the ``DraftVerifySpec``'s),
+    which a sampled verify draws with. Every row, padding rows included, spans
+    ``policy.block``. The submodule calls this in ``declare_step``, on a step that declares no
+    sampler step of its own."""
     segments = step.segments
     if segments is None:
         raise ValueError("with_draft_verify needs the step's segments on the SubmoduleStep")
+    if sampler in step.steps:
+        raise ValueError(
+            f"a verify step's sampler step is with_draft_verify's; declare none under {sampler!r}"
+        )
     for segment in segments:
         if segment.span != policy.block:
             raise ValueError(
@@ -101,7 +110,8 @@ def with_draft_verify(
             )
     steps = dict(step.steps)
     # the step's own segments, as every resource that names none gets them
-    steps[key] = VerifyStep(drafts=policy.max_drafts)
+    steps[key] = VerifyStep(drafts=policy.max_drafts, sampler=sampler)
+    steps[sampler] = SamplerStep(apply_penalty=False, verify=True)
     return SubmoduleStep(steps=steps, segments=segments, cg_key_info=step.cg_key_info)
 
 

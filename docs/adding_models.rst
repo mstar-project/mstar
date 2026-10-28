@@ -605,8 +605,8 @@ The spec types are:
        ``SamplingReqConfig`` above. ``loopback_state`` declares per-request state a
        decode loop keeps on the device beside its last sampled token. See
        `Device loop-back`_. ``draft_verify`` marks the sampler of a node that verifies
-       drafts, which refuses a request a greedy verify can't serve. See
-       `Draft-verify decoding`_.
+       drafts, and ``enable_sampled_verify`` is the capability to verify at temperature > 0.
+       See `Draft-verify decoding`_.
    * - ``DraftVerifySpec(sampler=...)``
      - Carries a verify step's verdict from the forward to the host, for a node whose
        decode walk verifies drafts (speculative decoding). ``sampler`` names the node's
@@ -1335,11 +1335,16 @@ out of every resource, the tokens each request emits, and the stop.
   one input id, the last emitted token. The capture config does the same, so a decode
   bucket holds ``block`` tokens per row.
 - ``declare_step`` wraps the decode step in ``with_draft_verify(step, policy)``, which adds
-  the ``VerifyStep``. A verify step declares no ``SamplerStep``.
+  the ``VerifyStep`` and the sampler's step (``sampler=`` names the sampler, ``"sampler"``
+  by default). The model declares no ``SamplerStep`` on a verify step.
 - The forward drafts ``[n, k]`` tokens and hands them to the node's
   ``DraftVerifyResource``: ``agree`` (rank 0's drafts on a lockstep instance), then
   ``block_ids`` (``[n, k + 1]``), the target over those rows, and ``verify(request_ids,
   block, logits)``. Its ``next_inputs`` are the loop-back edge, produced for every row.
+  A drafter that samples draws each draft with ``draft_sample(request_ids, logits)``, which
+  returns the token and the distribution it came from, and passes the distributions
+  stacked as ``verify(..., draft_probs=...)``. Drafts given without them are taken as
+  certain (a point mass), which is exact for any drafter.
 - The model's ``get_node_resources`` declares a ``DraftVerifySpec`` on the node and
   ``SamplerSpec(draft_verify=True)``. Its layout for the label the walk grows declares
   ``lookahead=policy.lookahead`` (``2k + 1``, see `Paged KV layouts`_).
@@ -1348,9 +1353,22 @@ Each verify step commits its whole block. Before the request's next step admits,
 runner takes the rejected rows back from every resource of the node that declares
 ``rewind_kind = RewindKind.HOST`` (paged KV and positions so far). A resource that
 declares no ``rewind_kind`` keeps the node from loading, as does a combined walk over the
-verifying walk or a prefix-cache key on its labels. Verification is greedy for now:
-``temperature``, ``repetition_penalty`` and ``min_tokens`` are refused. The tiny model in
-``test/modular/draft_verify_toy.py`` is the reference consumer.
+verifying walk or a prefix-cache key on its labels.
+
+Verification is greedy unless the sampler declares ``enable_sampled_verify=True``: a
+greedy verify keeps the drafts that equal the target's argmax, and refuses a request with a
+``temperature``. A sampled verify runs rejection sampling against the target filtered as the
+request samples (temperature, ``min_p``, ``top_k`` and ``top_p``): draft ``i`` stays with
+probability ``min(1, p_i(d_i) / q_i(d_i))``, the first one refused is replaced by a draw
+from ``max(0, p_i - q_i)``, and a row that keeps every draft draws one more token from the
+target. The tokens it emits are distributed as sampling the target one token at a time;
+greedy requests come out as under the greedy verify. It filters every row of a verify block
+each step, which a node serving greedy requests only doesn't need. It runs FlashInfer's
+chain kernel and reads each request's seed and RNG offset as the sampler does, so a seed
+reproduces a request's stream in the same batch layout. Either way ``repetition_penalty``
+and ``min_tokens`` are refused: they depend on the tokens before each draft, which the
+verify doesn't track. The tiny model in ``test/modular/draft_verify_toy.py`` is the
+reference consumer.
 
 Loading weights
 ~~~~~~~~~~~~~~~

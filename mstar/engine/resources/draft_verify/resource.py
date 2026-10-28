@@ -187,6 +187,11 @@ class DraftVerifyResource(Resource):
     # ── step ──
 
     def plan(self, step: VerifyStep, ctx: StepContext) -> None:
+        if step.sampler != self.sampler_key:
+            raise ValueError(
+                f"a verify step's sampler step is under {step.sampler!r}, but the node's "
+                f"DraftVerifySpec names {self.sampler_key!r}; pass it to with_draft_verify"
+            )
         lease = ctx.slot_lease
         slot = None if lease is None else lease.slot
         # this step's forward writes the slot's mirror: read the rows still pending there first
@@ -240,12 +245,29 @@ class DraftVerifyResource(Resource):
         return torch.cat([inputs.reshape(-1, 1).to(drafts.dtype), drafts], 1)
 
     @torch.compiler.disable
+    def draft_sample(
+        self, request_ids: list[int], logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """For a drafter that samples: one draft per row of ``logits`` ``[n, V]``, drawn as the
+        request samples (temperature, top-k, top-p), and the distribution it came from, which
+        ``verify`` takes stacked as ``draft_probs``. A node whose verify is greedy drafts the
+        argmax and returns no distribution. Capturable; call it in a verify step's forward."""
+        if self._planned is None:
+            raise RuntimeError("DraftVerifyResource.draft_sample outside a planned verify step")
+        if self._sampler is None:
+            raise RuntimeError("DraftVerifyResource has no sampler bound; the engine binds it at load")
+        return self._sampler.draft_sample(request_ids, logits)
+
+    @torch.compiler.disable
     def verify(
         self, request_ids: list[int], block: torch.Tensor, logits: torch.Tensor,
+        draft_probs: torch.Tensor | None = None,
     ) -> VerdictTensors:
         """Verify ``block`` (``block_ids``) against the target's ``logits`` over its rows,
         ``[n * (k + 1), V]``, and stage the verdict for the host. ``request_ids`` are the rows
-        the forward ran, padding rows included."""
+        the forward ran, padding rows included. ``draft_probs`` ``[n, k, V]``: the
+        distributions a sampling drafter drew the drafts from (``draft_sample``); None takes
+        each draft as certain."""
         if self._planned is None:
             raise RuntimeError("DraftVerifyResource.verify outside a planned verify step")
         if self._sampler is None:
@@ -253,7 +275,7 @@ class DraftVerifyResource(Resource):
         seq, slot, drafts = self._planned
         if block.shape[1] != drafts + 1:
             raise ValueError(f"a verify block of {block.shape[1]} tokens where the step declared {drafts} drafts")
-        tokens, accepted = self._sampler.verify(request_ids, block, logits)
+        tokens, accepted = self._sampler.verify(request_ids, block, logits, draft_probs)
         n = tokens.shape[0]
         mirror = self._mirrors[slot]
         mirror.dev[:n].copy_(torch.cat([accepted[:, None], block[:, :1], tokens], 1))

@@ -5,7 +5,9 @@ Rank 1 drafts differently at some positions and reads its logits slightly differ
 drafter or a reduction that isn't bitwise alike across ranks would. Both ranks must still
 emit the same tokens, rewind to the same lengths at every step, and hold the same KV, because
 they keep rank 0's drafts (``agree``) and rank 0's verdict (the sampler's ``verify``). Without
-either, the ranks come apart, which shows the test can tell.
+either, the ranks come apart, which shows the test can tell. The same holds at temperature
+> 0, with drafts sampled from distributions rank 1 reads differently: each rank draws its own
+verdict, and rank 0's is the one kept.
 """
 
 from __future__ import annotations
@@ -50,20 +52,27 @@ def _entry(rank, store, out, mode):
 
 def _run(rank: int, mode: str) -> dict:
     cpu = torch.device("cpu")
-    sub = toy.ToySubmodule(k=3, corrupt=4, skew=2)
+    sampled = mode.startswith("sampled")
+    if sampled:
+        # rank 1 reads both the draft head's logits and the target's differently, so it draws
+        # other drafts from other distributions, and verifies them differently
+        sub = toy.ToySubmodule(k=3, sampled_drafts=True)
+    else:
+        sub = toy.ToySubmodule(k=3, corrupt=4, skew=2)
     sub.rank = rank
     sub.logit_skew = 0.5
-    eng = toy.engine(sub, cpu, comm=_comm(rank), kv_heads=toy.HEADS * WORLD)
+    eng = toy.engine(sub, cpu, comm=_comm(rank), kv_heads=toy.HEADS * WORLD, sampled_verify=sampled)
     kv, pos, dv = (eng._resources[key] for key in (toy.KV, toy.POS, toy.DV))
     if mode == "no_agree":
         dv._group = None
-    elif mode == "no_verdict_broadcast":
+    elif mode in ("no_verdict_broadcast", "sampled_no_verdict_broadcast"):
         eng._resources[toy.SAMPLER]._comm_group = None
     drv = toy.Driver(eng, sub)
     rids = list(range(len(PROMPTS)))
-    stopping = mode == "both"
+    stopping = mode in ("both", "sampled")
+    sampling = {"temperature": 0.9, "top_k": 12} if sampled else {}
     for rid, prompt in enumerate(PROMPTS):
-        drv.add(rid, prompt, 16, ignore_eos=not stopping)
+        drv.add(rid, prompt, 16, ignore_eos=not stopping, seed=7 + rid, **sampling)
     lengths = []
     if stopping:
         # the stops come from the verdicts, so both ranks run the same steps
@@ -114,7 +123,17 @@ def test_the_ranks_keep_rank_zeros_drafts_and_verdicts(tmp_path):
     assert r0["accepted"] == r1["accepted"] > 0
 
 
-@pytest.mark.parametrize("mode", ["no_agree", "no_verdict_broadcast"])
+def test_at_temperature_the_ranks_keep_rank_zeros_sampled_verdicts(tmp_path):
+    r0, r1 = _both(tmp_path, "sampled")
+    assert r0["emitted"] == r1["emitted"]
+    assert r0["lengths"] == r1["lengths"]
+    assert _rows_equal(r0["rows"], r1["rows"])
+    assert r0["accepted"] == r1["accepted"] > 0
+    # sampled, not the greedy stream
+    assert r0["emitted"] != {rid: toy.reference(prompt, 16) for rid, prompt in enumerate(PROMPTS)}
+
+
+@pytest.mark.parametrize("mode", ["no_agree", "no_verdict_broadcast", "sampled_no_verdict_broadcast"])
 def test_without_the_broadcasts_the_ranks_come_apart(tmp_path, mode):
     r0, r1 = _both(tmp_path, mode)
     if mode == "no_agree":

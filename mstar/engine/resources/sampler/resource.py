@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import asdict
+from typing import NamedTuple
 
 import torch
 
@@ -16,21 +17,54 @@ from mstar.engine.resources.sampler.config import (
 )
 from mstar.engine.resources.sampler.utils import (
     AcceleratorGraphableSampler,
+    FilterOrder,
     GenerationHistory,
     Sampler,
     SamplerBuffers,
     SamplingConfig,
 )
+from mstar.engine.resources.sampler.verify import chain_verify, draw, filtered_probs, verify_stride
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
 from mstar.utils.profiler import PhaseLaps
 
+# A verify's draws (and a sampling drafter's) come from their own stream of the request's
+# seed. An eager sample and a captured replay each start a request's RNG offset at 0, and
+# FlashInfer keys a row's numbers off the seed, the offset and the row's index, so the
+# prefill's draw and the first captured verify's could otherwise read the same numbers.
+_DRAW_SALT = 0x2B7E151628AED2A6
+
+
+class _DrawParams(NamedTuple):
+    """Per-row sampling settings and RNG state for a draw (``SamplerResource._draw_params``)."""
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    min_p: torch.Tensor | None
+    order: FilterOrder | None
+    seed: torch.Tensor
+    offset: torch.Tensor
+
+    def repeat(self, times: int) -> "_DrawParams":
+        """Each row's settings for ``times`` consecutive rows (a verify block's); the RNG
+        state stays per row."""
+        def rep(t):
+            return None if t is None else t.repeat_interleave(times)
+
+        order = self.order
+        if order is not None:
+            order = FilterOrder(rep(order.top_p_first), rep(order.min_keep))
+        return _DrawParams(
+            rep(self.temperature), rep(self.top_k), rep(self.top_p), rep(self.min_p), order,
+            self.seed, self.offset,
+        )
+
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
-    # a greedy verify draws nothing and marks no token seen
+    # a verify marks no token seen, and the numbers it drew are spent whatever it keeps
     rewind_kind = RewindKind.NONE
 
     def can_capture(self) -> bool:
@@ -50,9 +84,20 @@ class SamplerResource(Resource):
         min_tokens_stop_ids: tuple[int, ...] = (),
         enable_top_p_first: bool = False,
         draft_verify: bool = False,
+        enable_sampled_verify: bool = False,
     ):
         self._track_seen_tokens = enable_repetion_penalty
         self._draft_verify = draft_verify
+        if enable_sampled_verify and not draft_verify:
+            raise ValueError("SamplerSpec.enable_sampled_verify needs draft_verify=True")
+        if enable_sampled_verify and torch.device(device).type not in ("cuda", "cpu"):
+            raise ValueError(
+                "SamplerSpec.enable_sampled_verify runs FlashInfer's chain kernel on CUDA (and a "
+                f"torch version on CPU, for tests); not on {torch.device(device).type}"
+            )
+        self._sampled_verify = enable_sampled_verify
+        # a verify's per-row seeds and RNG offsets, H2D on an eager step
+        self._draw_stager: PinnedStager | None = None
         self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
         self._vocab_size = vocab_size if self._track_seen_tokens else None
@@ -155,6 +200,7 @@ class SamplerResource(Resource):
             min_tokens_stop_ids=tuple(spec.min_tokens_stop_ids),
             enable_top_p_first=spec.enable_top_p_first,
             draft_verify=spec.draft_verify,
+            enable_sampled_verify=spec.enable_sampled_verify,
         )
 
     @property
@@ -211,6 +257,7 @@ class SamplerResource(Resource):
         if self._draft_verify:
             problem = draft_verify_problem(
                 resolved.temperature, resolved.repetition_penalty, resolved.min_tokens,
+                sampled=self._sampled_verify,
             )
             if problem is not None:
                 self._sampler.remove_request(rid)
@@ -376,6 +423,8 @@ class SamplerResource(Resource):
         return (tuple(ctx.padded_request_ids), lease.slot if lease is not None else None)
 
     def plan(self, step: SamplerStep, ctx: StepContext):
+        if step.verify and not self._sampled_verify:
+            return
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan:
             self._kept_rids = step.kept_rids
@@ -466,6 +515,8 @@ class SamplerResource(Resource):
             self._history.gather_step(ctx.request_ids, padded_bs)
 
     def commit(self, step: SamplerStep, ctx: StepContext):
+        if step.verify and not self._sampled_verify:
+            return
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
@@ -550,25 +601,107 @@ class SamplerResource(Resource):
     @torch.compiler.disable
     def verify(
         self, request_ids: list[int], block: torch.Tensor, logits: torch.Tensor,
+        draft_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Greedy verification of a draft block. ``block`` is ``[n, k + 1]``, each row the
-        last emitted token and its ``k`` drafts, and ``logits`` the target's ``[n * (k + 1), V]``
-        over those rows. Returns the target's token at every row, ``[n, k + 1]``, and how many
-        leading drafts equal it, ``[n]``: a row emits ``tokens[:accepted + 1]``.
+        """Verification of a draft block. ``block`` is ``[n, k + 1]``, each row the last
+        emitted token and its ``k`` drafts, and ``logits`` the target's ``[n * (k + 1), V]``
+        over those rows. Returns the tokens ``[n, k + 1]`` and the drafts kept per row ``[n]``:
+        a row emits ``tokens[:accepted + 1]``.
+
+        A greedy verify keeps the drafts that equal the target's argmax and returns the argmax
+        at every row. With ``enable_sampled_verify`` the drafts go through rejection sampling
+        (``sampler.verify.chain_verify``) against the target filtered as each request samples;
+        ``draft_probs`` ``[n, k, V]`` are the distributions the drafts were drawn from
+        (``draft_sample``), and None takes each draft as certain. A greedy row comes out as
+        under the greedy verify.
 
         On a lockstep instance every rank keeps rank 0's: each rank rewinds its cache and feeds
-        its next step by the verdict, so an argmax near-tie read apart on two ranks would leave
-        their streams apart. ``request_ids`` names the rows, for a verify that samples (later);
-        the requests were refused at ingest unless greedy."""
-        del request_ids
+        its next step by the verdict, so a draw or an argmax near-tie read apart on two ranks
+        would leave their streams apart."""
         n, width = block.shape
-        target = logits.argmax(-1).view(n, width)
-        accepted = (block[:, 1:] == target[:, :-1]).long().cumprod(1).sum(1)
+        if self._sampled_verify:
+            stride = verify_stride(width - 1)
+            params = self._draw_params(request_ids, logits.device, stride)
+            rows = params.repeat(width)
+            probs = filtered_probs(
+                logits.reshape(n * width, -1), rows.temperature, rows.top_k, rows.top_p,
+                rows.min_p, rows.order,
+            )
+            target, accepted = chain_verify(
+                probs.view(n, width, -1), block[:, 1:], draft_probs, params.seed, params.offset,
+            )
+            self._advance_in_graph(stride)
+        else:
+            target = logits.argmax(-1).view(n, width)
+            accepted = (block[:, 1:] == target[:, :-1]).long().cumprod(1).sum(1)
         verdict = torch.cat([target, accepted[:, None]], 1)
         group = self._comm_group
         if group is not None and group.world_size > 1:
             verdict = group.broadcast(verdict, src=0)
         return verdict[:, :width], verdict[:, width]
+
+    @torch.compiler.disable
+    def draft_sample(
+        self, request_ids: list[int], logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """One draft per row of ``logits`` ``[n, V]``, drawn as the request samples, and the
+        distribution it came from: a drafter that samples stacks these into ``verify``'s
+        ``draft_probs``. Each call draws one number from the request's RNG stream. A node
+        whose verify is greedy drafts the argmax, with no distribution (None). Capturable;
+        inside a verify step, as ``verify``."""
+        if not self._sampled_verify:
+            return logits.argmax(-1), None
+        params = self._draw_params(request_ids, logits.device, 1)
+        probs = filtered_probs(
+            logits, params.temperature, params.top_k, params.top_p, params.min_p, params.order,
+        )
+        tokens = draw(probs, params.seed, params.offset)
+        self._advance_in_graph(1)
+        return tokens, probs
+
+    def _draw_params(self, request_ids: list[int], device: torch.device, stride: int) -> "_DrawParams":
+        """Each row's sampling settings and its RNG seed and offset, for a draw that takes
+        ``stride`` numbers. Under a graph, the slot's gathered buffers, whose offsets the draw
+        moves in graph (``_advance_in_graph``); on an eager step the requests' own, whose host
+        offsets move here, staged in two pinned copies."""
+        cg = self._cg_sampler
+        if cg is not None:
+            if cg.ingraph_scatter:
+                # a verifying node keeps its tokens on the host (no device loop-back)
+                raise RuntimeError("a verify step's draws don't run beside the in-graph sampler scatter")
+            top_k, top_p = cg.top_k_buf, cg.top_p_buf
+            if not self._apply_filters_this_step:
+                top_k, top_p = torch.zeros_like(top_k), torch.ones_like(top_p)
+            seed = torch.bitwise_xor(cg.seed_buf, _DRAW_SALT)
+            return _DrawParams(cg.temperature_buf, top_k, top_p, cg.min_p_buf, cg.order, seed, cg.offset_buf)
+        sampler = self._sampler
+        configs = [sampler._sampling_config[rid] for rid in request_ids]
+        filters = self._apply_filters_this_step
+        settings = sampler._stage([
+            [c.temperature for c in configs],
+            # any k past the vocabulary keeps it all; float32 holds this one exactly
+            [min(c.top_k, 1 << 24) if filters else 0 for c in configs],
+            [c.top_p if filters else 1.0 for c in configs],
+            [c.min_p for c in configs],
+        ]).to(device)
+        offsets = sampler._step_offset
+        drawn = []
+        for rid in request_ids:
+            drawn.append(offsets.get(rid, 0))
+            offsets[rid] = drawn[-1] + stride
+        if self._draw_stager is None:
+            self._draw_stager = PinnedStager(torch.int64)
+        seeds = self._draw_stager.to_device([[c.seed ^ _DRAW_SALT for c in configs], drawn], device)
+        order = sampler._gather_filter(configs) if device.type == "cuda" else None
+        return _DrawParams(
+            settings[0], settings[1].to(torch.int32), settings[2],
+            settings[3] if self._enable_min_p else None, order, seeds[0], seeds[1],
+        )
+
+    def _advance_in_graph(self, stride: int) -> None:
+        """Move the captured step's RNG offsets past a draw; commit persists them by slot."""
+        if self._cg_sampler is not None:
+            self._cg_sampler.offset_buf.add_(stride)
 
     def enable_device_loopback_reader(self) -> None:
         """A node of this sampler declares it reads its last sampled tokens
