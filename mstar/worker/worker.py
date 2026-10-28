@@ -4113,6 +4113,8 @@ class Worker:
             return
         slot = self._host_rows_slot = (self._host_rows_slot + 1) % _HOST_ROWS_RING
         host: dict[str, torch.Tensor] = {}
+        # a tensor under two names is copied once
+        landed: dict[int, torch.Tensor] = {}
         for index, (name, tensor) in enumerate(buffers.items()):
             if not (
                 torch.is_tensor(tensor)
@@ -4121,11 +4123,14 @@ class Worker:
             ):
                 host[name] = tensor
                 continue
+            if id(tensor) in landed:
+                host[name] = landed[id(tensor)]
+                continue
             buf = self._get_pinned_d2h_buffer(
                 f"host_rows{slot}", tensor.shape, tensor.dtype, index,
             )
             buf.copy_(tensor, non_blocking=True)
-            host[name] = buf
+            host[name] = landed[id(tensor)] = buf
         outputs.host_rows = HostRows(tuple(outputs.row_request_ids), host)
 
     def _get_pinned_d2h_buffer(
@@ -4162,6 +4167,8 @@ class Worker:
         reused by the next step.
         """
         host: dict[str, torch.Tensor] = {}
+        # a tensor under two names is copied once
+        landed: dict[int, torch.Tensor] = {}
         with side:
             for index, (name, tensor) in enumerate(buffers.items()):
                 if not (
@@ -4170,11 +4177,14 @@ class Worker:
                 ):
                     host[name] = tensor
                     continue
+                if id(tensor) in landed:
+                    host[name] = landed[id(tensor)]
+                    continue
                 buf = self._get_pinned_d2h_buffer(
                     "check_stop_batched", tensor.shape, tensor.dtype, index,
                 )
                 buf.copy_(tensor, non_blocking=True)
-                host[name] = buf
+                host[name] = landed[id(tensor)] = buf
         side.synchronize()
         return host
 

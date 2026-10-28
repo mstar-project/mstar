@@ -14,7 +14,7 @@ from collections.abc import Mapping
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.linear_attn.wrappers import (
@@ -24,7 +24,13 @@ from mstar.engine.resources.linear_attn.wrappers import (
     GDNWrapper,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
-from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentAddressing, checkpoint_rows
+from mstar.engine.resources.recurrent.pool import (
+    NO_SLOT,
+    SINK_SLOT,
+    RecurrentAddressing,
+    RecurrentStatePool,
+    checkpoint_rows,
+)
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
@@ -81,10 +87,12 @@ class GDNManager(LinearAttnManager):
         self._cg_max_bs = 0
         self._cg_max_tokens = 0
         self._cg_wrappers: dict[CGSlotKey, GDNWrapper] = {}
-        # The captured prefills' state checkpoints, sized once to the largest
-        # bucket and shared: one forward runs at a time, and each graph holds
-        # the address.
+        # The prefills' state checkpoints, sized once to the largest bucket and
+        # shared: one forward runs at a time, and each graph holds the address.
+        # An eager step fits it (`RecurrentStatePool._checkpoint_every`), and
+        # without graphs it grows to the largest step.
         self._checkpoints: torch.Tensor | None = None
+        self._pool: RecurrentStatePool | None = None
 
         # (label, is_decode) -> wrapper
         self._eager_wrappers: dict[tuple[str, bool], GDNWrapper] = {}
@@ -132,6 +140,9 @@ class GDNManager(LinearAttnManager):
     def depends_on(self) -> set[str]:
         # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
+
+    def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
+        self._pool = resources.get(self._pool_key)
 
     # Step lifecycle
 
@@ -257,9 +268,18 @@ class GDNManager(LinearAttnManager):
         walk = ctx.slot_lease.bucket.graph_walk if ctx.slot_lease is not None else ctx.graph_walk
         split = self._splits.get(walk)
         every = addressing.snapshot_every
-        checkpoints = (
-            self._checkpoint_buffer(every) if every and ctx.slot_lease is not None else None
+        walks = split.prefill_walks if split is not None else (walk,)
+        if every and self._pool.keyed_walks(label).isdisjoint(walks):
+            # a walk the KV cache doesn't key keeps no snapshots, so its graphs skip the checkpoints too
+            every = 0
+        assert every or not addressing.snapshots, (
+            f"gdn: a {walk!r} step keeps snapshots for {label!r}, which its KV cache doesn't key there"
         )
+        checkpoints = None
+        if every and ctx.slot_lease is not None:
+            checkpoints = self._checkpoint_buffer(checkpoint_rows(self._cg_max_tokens, self._cg_max_bs, every))
+        elif every and addressing.snapshots:
+            checkpoints = self._checkpoint_buffer(sum(max(span, 1) // every for span in spans))
         if split is not None and addressing.host_slot_indices is not None:
             wrapper = self._get_wrapper(label, False, ctx.slot_lease, split=split)
             wrapper.plan(
@@ -278,12 +298,11 @@ class GDNManager(LinearAttnManager):
             )
         return wrapper
 
-    def _checkpoint_buffer(self, every: int) -> torch.Tensor:
-        if self._checkpoints is None:
+    def _checkpoint_buffer(self, rows: int) -> torch.Tensor:
+        if self._checkpoints is None or self._checkpoints.shape[0] < rows:
             geometry = self.geometry
             self._checkpoints = torch.empty(
-                (checkpoint_rows(self._cg_max_tokens, self._cg_max_bs, every), geometry.num_v_heads,
-                 geometry.head_v_dim, geometry.head_k_dim),
+                (rows, geometry.num_v_heads, geometry.head_v_dim, geometry.head_k_dim),
                 dtype=torch.float32, device=self._device,
             )
         return self._checkpoints

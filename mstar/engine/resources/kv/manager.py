@@ -1188,6 +1188,10 @@ class KVManager(AttentionResource):
         with self._lock:
             return self._keyed_label(rid, node_name, graph_walk)
 
+    def keyed_walks(self, label: str) -> frozenset[str]:
+        """The walks whose writes under ``label`` the prefix cache keys."""
+        return self._keyed_walks.get(label, frozenset())
+
     def chain_key(self, rid: str, label: str, pages: int) -> bytes | None:
         """The index key of the stream's first ``pages`` pages, or None until
         its chain keys that many whole pages."""

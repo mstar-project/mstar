@@ -597,6 +597,10 @@ class RecurrentStatePool(Resource):
         if self.config.kv_cache in resources:
             self.bind_kv(resources[self.config.kv_cache])
 
+    def keyed_walks(self, label: str) -> frozenset[str]:
+        """The walks the KV cache keys under ``label``, none while snapshots are off."""
+        return self._kv.keyed_walks(label) if self._kv is not None else frozenset()
+
     def bind_kv(self, kv: "KVManager") -> None:
         """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names."""
         self._kv = kv
@@ -697,8 +701,7 @@ class RecurrentStatePool(Resource):
     def _checkpoint_every(self, segments: list[Segment], ctx: StepContext) -> int:
         """The checkpoint interval of a step over ``segments``: a page, or for a
         step past the largest captured bucket the smallest page multiple whose
-        checkpoints fit that bucket's shared buffer, so an eager step never
-        allocates more for them than a captured one holds."""
+        checkpoints fit that bucket's buffer, which an eager step writes too."""
         page = self._kv.config.page_size
         if not self._cg_max_tokens:
             return page

@@ -12,6 +12,7 @@ CPU-only: nothing here launches a kernel.
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,15 +24,17 @@ from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+from mstar.engine.resources.linear_attn.gdn import GDNManager
 from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
     RecurrentBlockConfig,
     RecurrentStateConfig,
     RecurrentStateSpec,
     RecurrentStep,
 )
-from mstar.engine.resources.recurrent.pool import RecurrentStatePool, SnapshotTarget
+from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool, SnapshotTarget
 from mstar.engine.resources.runner import StepRunner
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
@@ -403,8 +406,8 @@ def test_a_prefill_whose_kv_hit_runs_past_its_snapshot_keeps_the_hit_end_too(hit
 
 
 def test_a_prefill_past_the_largest_bucket_keeps_its_boundaries_on_a_wider_checkpoint_interval():
-    """An eager step allocates its own checkpoints, and one per page would outgrow the buffer a
-    captured step shares (512 MiB per GDN layer call at 32K tokens on Qwen3.5-9B)."""
+    """An eager step writes the checkpoint buffer the captured steps share, and one checkpoint per
+    page would outgrow it (512 MiB at 32K tokens on Qwen3.5-9B)."""
     pool = _pool(prefix_slots=3)
     pool.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=8)
     _snapshot(pool, "a", list(range(30)), 4, 1.0)
@@ -573,3 +576,64 @@ def test_a_decode_never_evicts_the_snapshot_a_prompt_restored_in_the_same_step()
     pool.plan(step, ctx)
     pool.commit(step, ctx)
     assert pool._snap_meta.get(restored) == pool._kv.chain_key("a", "main", 2), "r's decode evicted b's restore"
+
+
+class _StubKeyedWalks:
+    """The pool's answer for the walks its KV cache keys."""
+
+    def __init__(self, walks):
+        self.walks = frozenset(walks)
+
+    def keyed_walks(self, label):
+        return self.walks
+
+
+def _gdn() -> tuple[GDNManager, list[tuple]]:
+    """A GDN backend over a pool whose KV cache keys `WALK`, recording each wrapper plan."""
+    gdn = GDNManager(
+        config=LinearAttnConfig(
+            recurrent_state="state", variant=LinearAttnVariant.GDN, splits=(CombinedSplit("mixed", (WALK,)),),
+        ),
+        geometry=DeltaNetGeometry(num_k_heads=1, num_v_heads=1, head_k_dim=2, head_v_dim=2, conv_kernel_size=2),
+        num_layers=1, state_dtype=torch.float32, has_sink=True, device=torch.device("cpu"),
+    )
+    gdn.bind_dependencies({"state": _StubKeyedWalks({WALK})})
+    gdn.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=8 * PAGE)
+    plans: list[tuple] = []
+    gdn._get_wrapper = lambda *args, **kwargs: SimpleNamespace(plan=lambda *plan: plans.append(plan))
+    return gdn, plans
+
+
+def _plan_gdn(gdn: GDNManager, walk: str, span: int, snapshots=(), captured: bool = False) -> None:
+    addressing = RecurrentAddressing(
+        slot_indices=torch.zeros(1, dtype=torch.int32), has_state=torch.zeros(1, dtype=torch.bool), num_rows=1,
+        host_slot_indices=(0,), host_has_state=(False,), snapshots=snapshots, snapshot_every=PAGE,
+    )
+    lease = SimpleNamespace(bucket=SimpleNamespace(graph_walk=walk)) if captured else None
+    ctx = SimpleNamespace(force_prefill=False, slot_lease=lease, graph_walk=walk)
+    gdn._build_plan("main", [Segment("a", "main", span)], addressing, ctx)
+
+
+def test_a_graph_for_a_walk_the_kv_cache_doesnt_key_writes_no_checkpoints():
+    """Such a walk keeps no snapshots (Qwen3.5's `prefill_vision`), so checkpointing every row's
+    state there writes a buffer nothing reads."""
+    gdn, plans = _gdn()
+    _plan_gdn(gdn, "vision", 2 * PAGE, captured=True)
+    (_, _, _, _, every, checkpoints), = plans
+    assert every == 0 and checkpoints is None, "the graph checkpoints states nothing restores"
+
+
+@pytest.mark.parametrize("walk", [WALK, "mixed"])
+def test_a_graph_for_a_keyed_walk_writes_checkpoints(walk):
+    gdn, plans = _gdn()
+    _plan_gdn(gdn, walk, 2 * PAGE, captured=True)
+    (_, _, _, _, every, checkpoints), = plans
+    assert every == PAGE and checkpoints is not None, "the graph can never save a snapshot of this walk"
+
+
+def test_an_eager_prefill_writes_the_checkpoint_buffer_the_graphs_share():
+    """A buffer of its own per GDN layer would allocate the step's checkpoints again on every layer."""
+    gdn, plans = _gdn()
+    _plan_gdn(gdn, WALK, 2 * PAGE, captured=True)
+    _plan_gdn(gdn, WALK, 6 * PAGE, snapshots=(SnapshotTarget(0, 5 * PAGE, 1),))
+    assert plans[1][5] is plans[0][5], "the eager step allocated checkpoints of its own"

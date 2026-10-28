@@ -38,6 +38,9 @@ class _StubChains:
     def keyed_label(self, rid, node_name, graph_walk):
         return "main"
 
+    def keyed_walks(self, label):
+        return frozenset({"prefill"})
+
     def chain_key(self, rid, label, pages):
         return f"{rid}/{pages}".encode()
 
@@ -59,6 +62,7 @@ def _build(device):
         LinearAttnSpec(GDN, {"llm"}, LinearAttnConfig(recurrent_state=POOL, variant=LinearAttnVariant.GDN)),
         EngineResourceInfo(device=device, dependencies={POOL: spec}),
     )
+    manager.bind_dependencies({POOL: pool})
     return pool, manager
 
 

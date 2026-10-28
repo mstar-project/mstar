@@ -154,22 +154,23 @@ class BatchedModelOutput:
 
         ``reuse`` holds clones already taken of the row outputs (see
         ``clone_row_outputs``); a stop buffer that is the very same tensor as a
-        row output takes that clone instead of a second copy. The row clone is
-        narrowed to the real rows, which is every row the stop check reads.
+        row output takes that clone instead of a second copy, and a tensor under
+        two names is cloned once. The row clone is narrowed to the real rows,
+        which is every row the stop check reads.
         """
         if self.check_stop_buffers is None:
             return None
         rows = self.row_outputs or {}
+        clones = {
+            id(rows[name]): clone for name, clone in (reuse or {}).items()
+            if name in rows and isinstance(clone, torch.Tensor)
+        }
 
-        def _clone(value, name=None):
+        def _clone(value):
             if isinstance(value, torch.Tensor):
-                if (
-                    reuse is not None and name is not None
-                    and value is rows.get(name)
-                    and isinstance(reuse.get(name), torch.Tensor)
-                ):
-                    return reuse[name]
-                return value.clone()
+                if id(value) not in clones:
+                    clones[id(value)] = value.clone()
+                return clones[id(value)]
             if isinstance(value, list):
                 return [
                     x.clone() if isinstance(x, torch.Tensor) else x for x in value
@@ -179,7 +180,7 @@ class BatchedModelOutput:
             # pass anything else through: dropping it could lose a stop signal
             return value
 
-        return {k: _clone(v, k) for k, v in self.check_stop_buffers.items()}
+        return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
 
     def clone_row_outputs(self, num_rows: int) -> dict[str, torch.Tensor]:
         """One clone per row-addressed batch tensor, narrowed to the real rows

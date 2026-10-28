@@ -335,10 +335,14 @@ class GDNPrefillWrapper(GDNWrapper):
         )
         self._num_snapshots = capacity
         self._num_checkpoints = checkpoint_cu[-1]
-        self._checkpoints = checkpoints
-        assert checkpoints is None or self._num_checkpoints <= checkpoints.shape[0], (
-            f"{self._num_checkpoints} checkpoints in a step captured for {checkpoints.shape[0]}"
+        assert checkpoints is not None, "a step that keeps snapshots was planned without a checkpoint buffer"
+        assert self._num_checkpoints <= checkpoints.shape[0], (
+            f"{self._num_checkpoints} checkpoints in a buffer of {checkpoints.shape[0]}"
         )
+        assert not self._accelerator_graph or self._checkpoints is None or checkpoints is self._checkpoints, (
+            "a larger eager step replaced the checkpoint buffer this graph was captured with"
+        )
+        self._checkpoints = checkpoints
 
     def run_conv(
         self,
@@ -455,10 +459,6 @@ class GDNPrefillWrapper(GDNWrapper):
         snapshot_args = {}
         if self._every:
             checkpoints = self._checkpoints
-            if checkpoints is None:
-                checkpoints = torch.empty(
-                    (self._num_checkpoints, *initial.shape[1:]), dtype=torch.float32, device=q.device,
-                )
             snapshot_args = dict(
                 state_checkpoints=checkpoints,
                 checkpoint_cu_starts=self._checkpoint_cu[: self._plan_state.num_rows + 1],
