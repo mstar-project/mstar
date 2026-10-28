@@ -2,6 +2,7 @@ import gc
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -351,6 +352,13 @@ class _LazyPerRid:
 
     def values(self):
         return self._dict().values()
+
+
+
+def _step_key(node_name: str, graph_walk: str) -> str:
+    """``step.<node>.<walk>``, as a phase name (``benchmark/worker_phases``
+    reads names of word characters and dots)."""
+    return "step." + re.sub(r"\W", "_", node_name) + "." + re.sub(r"\W", "_", graph_walk)
 
 
 class Worker:
@@ -2102,12 +2110,14 @@ class Worker:
         """Record the GPU times whose events have landed, leaving the rest:
         reading a pair still in flight would block the host on the GPU."""
         while self._gpu_spans:
-            start, end = self._gpu_spans[0]
+            start, end, key = self._gpu_spans[0]
             if not end.query():
                 return
             self._gpu_spans.popleft()
             # elapsed_time is ms; the phase buffer holds seconds
-            self._phase_record("gpu_exec", start.elapsed_time(end) / 1000)
+            elapsed = start.elapsed_time(end) / 1000
+            self._phase_record("gpu_exec", elapsed)
+            self._phase_record(f"{key}.gpu_exec", elapsed)
 
     def _execute_on_gpu_thread(
         self,
@@ -2218,7 +2228,7 @@ class Worker:
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
                     gpu_end.record(execution_stream)
-                    self._gpu_spans.append((gpu_start, gpu_end))
+                    self._gpu_spans.append((gpu_start, gpu_end, _step_key(batch.node_name, batch.graph_walk)))
                     self._drain_gpu_spans()
                     laps.lap("gpu_exec_events")
             return outputs
@@ -2239,12 +2249,14 @@ class Worker:
             )
             laps.lap("finalize_batch")
             if timed:
-                self._phase_record(
-                    "worker.gpu_thread.total", _time.perf_counter() - t_start,
-                )
-                self._phase_record(
-                    "worker.gpu_thread.total.cpu", _time.thread_time() - c_start,
-                )
+                wall, cpu = _time.perf_counter() - t_start, _time.thread_time() - c_start
+                self._phase_record("worker.gpu_thread.total", wall)
+                self._phase_record("worker.gpu_thread.total.cpu", cpu)
+                # per node and walk: a worker that runs several (an encoder and
+                # a decoder, prefill and decode) pools them in every other phase
+                key = _step_key(batch.node_name, batch.graph_walk)
+                self._phase_record(f"{key}.gpu_thread", wall)
+                self._phase_record(f"{key}.gpu_thread.cpu", cpu)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -4918,11 +4930,17 @@ class Worker:
                             len(pending.batch.request_to_worker_graph),
                             walks=pending.batch.rids_by_walk(),
                         )
+                        _t_pp = _time.perf_counter() if phase_period else 0.0
                         with self._span(
                             "worker.postprocess_batch",
                             cpu="worker.postprocess_batch.cpu",
                         ):
                             self._postprocess_batch(pending, outputs)
+                        if phase_period:
+                            self._phase_record(
+                                f"{_step_key(pending.node_name, pending.graph_walk)}.postprocess",
+                                _time.perf_counter() - _t_pp,
+                            )
                         laps.skip()
                         if metrics is not None:
                             metrics.step_done(
