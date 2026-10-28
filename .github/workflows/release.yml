@@ -77,10 +77,11 @@ jobs:
             3.13
             3.14
       # Outside the build container, with no dependencies installed: the
-      # extension imports at the version mstar expects, the frontend binary runs from the scripts directory
-      # find_server_binary looks in without any libpython (setup-python puts
-      # its libdir on LD_LIBRARY_PATH, which would hide a link to one), and
-      # the licenses, where the step above wrote them, are in the metadata.
+      # extension imports at the version mstar expects, the frontend binary
+      # runs from the scripts directory find_server_binary looks in without
+      # any libpython (setup-python puts its libdir on LD_LIBRARY_PATH, which
+      # would hide a link to one), and the licenses, where the step above
+      # wrote them, are in the metadata.
       - name: Check each wheel in a clean venv
         shell: python
         run: |

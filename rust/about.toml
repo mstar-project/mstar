@@ -31,8 +31,8 @@ workarounds = ["ring"]
 # libzmq's own Classpath-style text, which matches no SPDX exception id
 # (LGPL-3.0-linking-exception is different text). LGPL-3.0-or-later is left out
 # of `accepted` on purpose: until a maintainer signs off on distributing libzmq
-# under it, this step fails and the release publishes no Rust wheels (the sdist
-# and pure wheel still go up).
+# under it, cargo-about fails here and the release publishes no Rust wheels
+# (the sdist and pure wheel still go up).
 [zeromq-src.clarify]
 license = "(MIT OR Apache-2.0) AND LGPL-3.0-or-later AND BSD-3-Clause"
 [[zeromq-src.clarify.files]]
