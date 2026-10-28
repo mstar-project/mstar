@@ -299,7 +299,7 @@ def test_vjepa2_samples_frames_uniformly(tmp_path):
     out = model.load_video(_clip(tmp_path / "a.mp4"), "cpu")
     assert out.metadata["sampled_indices"] == [0, 2, 4, 6]
     assert out.metadata["original_num_frames"] == 8
-    widths = _bar_widths((out.data * 255).round().to(torch.uint8))
+    widths = _bar_widths(out.data)
     assert all(abs(n - 8 * (t + 1)) <= 2 for t, n in zip([0, 2, 4, 6], widths, strict=True))
 
 

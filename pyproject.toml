@@ -293,6 +293,8 @@ vjepa2 = [
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "torchcodec",
+    # the checkpoint's video processor (AutoVideoProcessor)
+    "transformers",
 ]
 
 wan22 = [
