@@ -173,6 +173,11 @@ def test_snapshots_stay_off_and_unallocated_where_the_cache_cant_open(closed):
     assert _pool().enable_prefix_cache(b"a root")
 
 
+def test_a_negative_prefix_slots_override_is_refused():
+    with pytest.raises(ValueError, match="prefix_slots=-1"):
+        _specs(0)["state"].apply_yaml_overrides(prefix_slots=-1)
+
+
 @pytest.mark.parametrize("admitted", [False, True])
 def test_removal_gives_back_the_lease_or_the_restore_its_plan_never_ran(admitted):
     pool = _pool()

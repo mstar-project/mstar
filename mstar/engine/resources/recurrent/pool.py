@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -417,7 +417,7 @@ class RecurrentStatePool(Resource):
                     every[label] = self._checkpoint_every(
                         [seg for seg in step.segments if seg.label == label], ctx,
                     )
-                self._admit_prefix(segment.request_id, label, segment.span, every[label])
+                self._admit_prefix(segment.request_id, label, segment.span, every[label], ctx.is_preplan)
 
         for rid in self._fork_rids(step):
             if ctx.is_padding_row(rid):
@@ -593,7 +593,7 @@ class RecurrentStatePool(Resource):
 
     # Prefix reuse: a hit restores the state a snapshot holds at the agreed length
 
-    def bind_dependencies(self, resources: dict[str, Resource]) -> None:
+    def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         if self.config.kv_cache in resources:
             self.bind_kv(resources[self.config.kv_cache])
 
@@ -709,17 +709,20 @@ class RecurrentStatePool(Resource):
             every += page
         return every
 
-    def _admit_prefix(self, rid: str, label: str, span: int, every: int) -> None:
+    def _admit_prefix(self, rid: str, label: str, span: int, every: int, preplan: bool) -> None:
         """Turn a hit's lease into a restore for plan to copy in, and reserve
         snapshot slots for the boundaries a prefill row keeps: the row's last
         boundary, and the KV hit's last boundary when the hit runs past the
         restored length, both on the step's checkpoint interval ``every``. A row
-        that starts past token 0 and restores nothing keeps none."""
+        that starts past token 0 and restores nothing keeps none. A pre-plan
+        stages only an unprepared speculative step, which takes neither, and
+        `clear_preplan` gives nothing back."""
         page = self._kv.config.page_size
         with self._lock:
             start = hit = 0
             lease = self._leases.get(rid)
             if lease is not None and lease.label == label:
+                assert not preplan, "a pre-plan took a prefix lease"
                 del self._leases[rid]
                 hit = lease.hit
                 if lease.slot is not None:
@@ -732,6 +735,7 @@ class RecurrentStatePool(Resource):
                 return
             for boundary in sorted({start + (span - 1) // every * every, start + (hit - start) // every * every}):
                 if start < boundary <= start + span:
+                    assert not preplan, "a pre-plan reserved a snapshot write"
                     self._reserve_write(rid, label, boundary, boundary - start)
 
     def _reserve_write(self, rid: str, label: str, boundary: int, offset: int) -> None:
