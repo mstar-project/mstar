@@ -1049,8 +1049,9 @@ window.runMermaid = runMermaid;</script>
             <span class="n">kv_config</span><span class="o">.</span><span class="n">shard</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">DENSE</span><span class="p">:</span>
             <span class="c1"># A dense backend needs the FlashAttention-3 kernel; where the</span>
-            <span class="c1"># wheel does not match the installed torch/CUDA build, degrade to</span>
-            <span class="c1"># the paged backend AUTO picks rather than failing to serve.</span>
+            <span class="c1"># wheel does not match the installed torch/CUDA build or has no</span>
+            <span class="c1"># kernel for the GPU, degrade to the paged backend AUTO picks</span>
+            <span class="c1"># rather than failing to serve.</span>
             <span class="c1"># The two are drop-in for each other: the step declaration is</span>
             <span class="c1"># identical (see DenseAttentionManager) and `requires_kv_write`</span>
             <span class="c1"># tells the layer which one it is talking to.</span>
@@ -1060,7 +1061,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">_warn_dense_fallback</span><span class="p">,</span>
             <span class="p">)</span>
 
-            <span class="n">reason</span> <span class="o">=</span> <span class="n">_fa3_unavailable_reason</span><span class="p">()</span>
+            <span class="n">reason</span> <span class="o">=</span> <span class="n">_fa3_unavailable_reason</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">reason</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">return</span> <span class="n">DenseAttentionManager</span><span class="p">(</span>
                     <span class="n">kv_cache</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">,</span>

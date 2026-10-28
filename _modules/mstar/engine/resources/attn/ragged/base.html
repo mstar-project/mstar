@@ -1009,7 +1009,7 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.dense</span><span class="w"> </span><span class="kn">import</span> <span class="n">_fa3_unavailable_reason</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.dense</span><span class="w"> </span><span class="kn">import</span> <span class="n">_warn_ragged_dense_fallback</span>
 
-    <span class="n">reason</span> <span class="o">=</span> <span class="n">_fa3_unavailable_reason</span><span class="p">()</span>
+    <span class="n">reason</span> <span class="o">=</span> <span class="n">_fa3_unavailable_reason</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">reason</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">_build_ragged</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">,</span> <span class="n">dense_cls</span><span class="p">)</span>
     <span class="n">_warn_ragged_dense_fallback</span><span class="p">(</span><span class="sa">f</span><span class="s2">"no varlen kernel is available (</span><span class="si">{</span><span class="n">reason</span><span class="si">}</span><span class="s2">)"</span><span class="p">,</span> <span class="n">RaggedAttnBackend</span><span class="o">.</span><span class="n">FLASHINFER</span><span class="p">)</span>

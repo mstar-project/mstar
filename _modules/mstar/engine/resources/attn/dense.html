@@ -987,10 +987,24 @@ window.runMermaid = runMermaid;</script>
         <span class="n">_VARLEN_IMPORT_ERROR</span> <span class="o">=</span> <span class="kc">None</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_fa3_has_kernel</span><span class="p">(</span><span class="n">capability</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="c1"># fa3-fwd ships sm_90a and sm_80 kernels and no PTX, so a GPU of any other</span>
+    <span class="c1"># architecture, Blackwell's among them, has no image to launch</span>
+    <span class="k">return</span> <span class="n">capability</span> <span class="o">==</span> <span class="p">(</span><span class="mi">9</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="ow">or</span> <span class="n">capability</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mi">8</span>
+
+
 <span class="nd">@functools</span><span class="o">.</span><span class="n">cache</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">_fa3_unavailable_reason</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""why no varlen kernel imported: fa3-fwd, and AITER on ROCm"""</span>
-    <span class="k">return</span> <span class="n">_VARLEN_IMPORT_ERROR</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_fa3_unavailable_reason</span><span class="p">(</span><span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""why no varlen kernel can run on ``device`` (the current GPU if None): none</span>
+<span class="sd">    imported (fa3-fwd, and AITER on ROCm), or fa3-fwd has none for its capability"""</span>
+    <span class="k">if</span> <span class="n">_VARLEN_IMPORT_ERROR</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">_VARLEN_IMPORT_ERROR</span>
+    <span class="k">if</span> <span class="n">device</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="n">capability</span> <span class="o">=</span> <span class="n">current_platform</span><span class="o">.</span><span class="n">cuda_capability</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">capability</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">_fa3_has_kernel</span><span class="p">(</span><span class="n">capability</span><span class="p">):</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"fa3-fwd has no kernel for compute capability </span><span class="si">{</span><span class="n">capability</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2">.</span><span class="si">{</span><span class="n">capability</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span>
+    <span class="k">return</span> <span class="kc">None</span>
 
 
 <span class="nd">@functools</span><span class="o">.</span><span class="n">cache</span>
