@@ -290,7 +290,8 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
   is torn down; the YAMLs size ``resources.transducer_state.max_slots`` (129) for
   ``max_concurrent_requests`` (128) and the sink slot, and startup refuses a cap the pool
   can't hold. A decode iteration is 64 greedy steps, and its tokens stream out as it ends. ``compile_step: false`` in
-  their ``model_kwargs`` decodes with eager kernels instead of the compiled step.
+  their ``model_kwargs`` decodes with eager kernels instead of the compiled step, which
+  compiles at the server's ``-O`` level.
 - Canary's and Canary-Qwen's YAMLs size the KV caches for ``max_concurrent_requests`` (64),
   and startup refuses a cap the caches can't hold.
 - Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a

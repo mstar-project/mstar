@@ -17,6 +17,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_runner import compile_kwargs
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.fp32_precision import fp32_precision_scope, node_fp32_precision
 from mstar.engine.resources import Segment, SlotLease, SubmoduleStep
@@ -30,6 +31,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.platforms.compile import with_inductor_overrides
 from mstar.utils.h2d import to_device_nonblocking
 
 # Encoder frames a decode iteration is captured over: 41 s and 164 s of audio,
@@ -84,10 +86,13 @@ class TransducerSubmodule(NodeSubmodule):
         self._pad: torch.Tensor | None = None
         # One compile for every capture rather than each config's own, which
         # would autotune each shape: fixed shapes first, then the dims that
-        # change go symbolic. fullgraph: a graph break would otherwise fall
-        # back to eager kernels without a word.
+        # change go symbolic. It tunes as the compile level (``-O``) says.
+        # fullgraph: a graph break would otherwise fall back to eager kernels
+        # without a word.
         compile_step = compile_step and next(head.parameters()).is_cuda
-        self._step = torch.compile(head.step, fullgraph=True) if compile_step else head.step
+        self._step = with_inductor_overrides(torch.compile(
+            head.step, **{**compile_kwargs(None), "fullgraph": True, "dynamic": None},
+        )) if compile_step else head.step
 
     def _bucket(self, num_frames: int | None) -> int | None:
         """The narrowest capture that holds ``num_frames``; None past the widest."""
