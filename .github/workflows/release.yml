@@ -36,6 +36,10 @@ on:
       - MANIFEST.in
       - .github/workflows/release.yml
 
+# Read-only by default: PR runs build PR code. The publish jobs add id-token.
+permissions:
+  contents: read
+
 # A newer push supersedes a PR or manual run; a release run is never cancelled.
 concurrency:
   group: release-${{ github.ref }}
@@ -54,6 +58,8 @@ jobs:
       CIBW_BUILD: ${{ github.event_name == 'release' && 'cp312-manylinux_* cp313-manylinux_* cp314-manylinux_*' || 'cp312-manylinux_*' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - uses: taiki-e/install-action@v2
@@ -155,9 +161,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
