@@ -521,12 +521,14 @@ client instead — see :doc:`clients`.
 Restarts and the compile cache
 ------------------------------
 
-Most of a first start is compiling: Inductor compiles every capture bucket and autotunes
-its GEMMs, and FlashInfer JIT-builds its kernels. Both cache the results, and a start that
-finds them skips that work. In one measurement, Qwen3.5-0.8B on an H200 took about 22 minutes
-to start with an empty Inductor cache and about 1.5 minutes reusing the previous start's cache.
+On a first start Inductor compiles every capture bucket (tuning it at ``-O1`` and
+``-O2``), and FlashInfer JIT-builds its kernels. Both cache the results, and a
+start that finds them skips that work. Qwen3.5-0.8B on an H200 took 320 s to start with an
+empty cache at the default ``-O1`` (1,294 s at ``-O2``); a warm start skips the compile.
+torch's default cache in ``/tmp`` already survives a process restart on the same host; M*'s
+default keeps it across a new container or a reboot that clears ``/tmp``.
 
-To keep that across restarts, persist ``~/.cache`` (``$XDG_CACHE_HOME`` if you set it), which
+To keep it, persist ``~/.cache`` (``$XDG_CACHE_HOME`` if you set it), which
 holds all of it:
 
 - ``~/.cache/mstar/torchinductor``: Inductor's compiled graphs, autotune picks and Triton
