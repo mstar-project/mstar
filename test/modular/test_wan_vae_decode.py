@@ -192,8 +192,8 @@ def test_compact_feat_cache_replaces_only_views() -> None:
 
 
 @pytest.mark.parametrize("before", [False, True])
-def test_cudnn_benchmark_is_scoped(before, monkeypatch) -> None:
-    monkeypatch.setattr(torch.backends.cudnn, "benchmark", before)
+def test_cudnn_benchmark_is_scoped(before, torch_flag) -> None:
+    torch_flag(torch.backends.cudnn, "benchmark", before)
     with wan_vae.cudnn_benchmark(True):
         assert torch.backends.cudnn.benchmark
     assert torch.backends.cudnn.benchmark is before
