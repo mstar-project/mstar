@@ -537,10 +537,12 @@ holds all of it:
 - ``~/.triton/cache``: Triton kernels compiled outside Inductor
 - ``~/.cache/huggingface``: the weights
 
-In a container, mount these from a volume rather than only ``~/.cache/huggingface``. The
-cache is keyed by torch and Triton version, so an upgrade recompiles rather than reusing
-stale kernels. Autotune picks are measured on the GPU that made them, so give each GPU model
-its own cache if one home serves several. If home is on a network filesystem shared by
+In a container, mount these from a volume rather than only ``~/.cache/huggingface``.
+Inductor keys its entries on the torch and Triton builds and, on CUDA and ROCm, the GPU
+model and CUDA or HIP version, so changing any of those recompiles. It doesn't key on the
+``ptxas`` that built a kernel or on the driver: after changing either, delete the cache or
+set torch's ``TORCH_COMPILE_CACHE_KEY_TAG`` to a new value. On other backends (XPU) the key
+has no GPU model, so give each GPU model its own cache there. If home is on a network filesystem shared by
 concurrent jobs, export ``TORCHINDUCTOR_CACHE_DIR`` to a node-local path and copy a warm
 cache in at job start.
 
