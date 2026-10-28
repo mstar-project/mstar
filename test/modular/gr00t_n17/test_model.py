@@ -11,6 +11,7 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import msgpack
 import numpy as np
@@ -998,6 +999,18 @@ def test_every_submodule_comes_back_in_eval_mode(tmp_path):
         submodule = model.get_submodule(name)
         assert submodule.training is False
         assert all(not child.training for child in submodule.modules())
+
+
+def test_tensor_parallelism_is_refused_before_anything_is_built(tmp_path):
+    """No node shards its weights, so a TP group would run whole copies; a group of one
+    is no parallelism and builds as usual."""
+    model, _ = _served(tmp_path)
+    group = SimpleNamespace(world_size=2)
+    with pytest.raises(ValueError, match="tensor parallelism"):
+        model.get_submodule(VISION_ENCODER, tp_group=group)
+    assert model._submodules == {}
+    group.world_size = 1
+    assert model.get_submodule(VISION_ENCODER, tp_group=group) is not None
 
 
 def test_an_unknown_node_is_none_and_is_not_cached(tmp_path):
