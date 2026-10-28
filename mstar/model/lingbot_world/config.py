@@ -76,6 +76,9 @@ class LingBotWorldConfig:
     # ragged attention resource, whose backend the deployment picks (AUTO is
     # FlashInfer's prefill, the cutlass FMHA on Blackwell).
     reference_attention: bool = False
+    # Compile each DiT block (Inductor's defaults in its deterministic mode,
+    # eager rounding); the attentions and the cache writes stay eager.
+    dit_compile: bool = True
 
     # The decode's precision, layout and compile; each settable in model_kwargs.
     # The reference decodes fp32, contiguous and eager: 291 ms per 16-frame chunk

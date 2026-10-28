@@ -79,16 +79,22 @@ def compile_transformer_forward(
     )
 
 
-def with_inductor_rounding(compiled, *, eager_rounding: bool):
+def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: bool = False):
     """Wrap a compiled callable so ``emulate_precision_casts`` is in effect for the
     traces it builds, and only for those. This works with torch.compile's lazy
     compilation, and post-torch 2.12 per-thread config behavior, without introducing
-    a global config change.
+    a global config change. ``deterministic`` also builds them in Inductor's
+    deterministic mode, where this torch has it: no on-device benchmarking that
+    changes numerics, so every process compiles the same kernels.
     """
     import torch._inductor.config as inductor_config
 
+    options = {"emulate_precision_casts": eager_rounding}
+    if deterministic and hasattr(inductor_config, "deterministic"):
+        options["deterministic"] = True
+
     def forward(*args, **kwargs):
-        with inductor_config.patch(emulate_precision_casts=eager_rounding):
+        with inductor_config.patch(**options):
             return compiled(*args, **kwargs)
 
     return forward

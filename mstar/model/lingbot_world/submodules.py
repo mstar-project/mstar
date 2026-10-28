@@ -39,7 +39,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import RaggedCrossAttentionStep, Segment, SubmoduleStep, cross_label
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components import wan_vae
-from mstar.model.components.diffusion.attention import joint_attention
+from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.lingbot_world.components.camera import plucker_embedding
 from mstar.model.lingbot_world.components.dit import (
     REFERENCE_ATTENTION,
@@ -60,6 +60,13 @@ ROLLOUT_WALK = "rollout"
 DIT_ATTN = "dit_attn"
 CHUNK_SPAN, WINDOW_SPAN, TEXT_SPAN = "chunk", "window", "text"
 DIT_ATTN_PAIRS = ((CHUNK_SPAN, WINDOW_SPAN), (CHUNK_SPAN, TEXT_SPAN))
+
+
+@torch.compiler.disable
+def _warmup_ragged(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """SDPA over one packed ``[L, H, D]`` sequence, standing in for the
+    ragged callable at load: compiled blocks trace the same graphs around it."""
+    return sdpa_attention(q[None], k[None], v[None])[0]
 
 
 class ChunkSpans(NamedTuple):
@@ -206,6 +213,10 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         if vae is not None and config.vae_decode_compile:
             for lat_hw in warmup_latent_sizes:
                 self.warmup_decode(lat_hw)
+        if dit is not None and config.dit_compile:
+            dit.compile_blocks()
+            for lat_hw in warmup_latent_sizes:
+                self.warmup_dit(lat_hw)
         self._attention: DitAttention | None = None
         # Debug hook for the parity harness: keep the last chunk's latents and
         # float frames in the request state.
@@ -347,6 +358,31 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             "clock": [torch.full((1,), chunk + 1, dtype=torch.int64, device=device)],
             "video_output": [frames_u8],
         }
+
+    def warmup_dit(self, lat_hw: tuple[int, int]) -> None:
+        """One chunk's DiT forward on zeros at ``lat_hw`` against a scratch
+        cache, so the compiled blocks are traced and tuned before a request at
+        that size. The window and chunk index never reach a compiled graph, so
+        one chunk covers a rollout; the attention has the bound one's call
+        structure, which decides where the graphs split."""
+        cfg = self.config
+        device = self.dit.patch_embedding.weight.device
+        lat_h, lat_w = lat_hw
+        frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
+        cache = self.dit.new_cache(frame_seqlen, cfg.chunk_size, device)
+        zeros = functools.partial(torch.zeros, device=device)
+        with torch.inference_mode():
+            conditioning = self.dit.chunk_conditioning(
+                zeros(1, cfg.control_dim * 64, cfg.chunk_size, lat_h, lat_w, dtype=torch.bfloat16), 0)
+            latents = zeros(cfg.out_dim, cfg.chunk_size, lat_h, lat_w)
+            text = zeros(cfg.text_len, cfg.text_dim, dtype=torch.bfloat16)
+            condition = zeros(cfg.in_dim - cfg.out_dim, cfg.chunk_size, lat_h, lat_w)
+            if cfg.reference_attention:
+                attention = REFERENCE_ATTENTION
+            else:
+                attend = functools.partial(joint_attention, ragged=_warmup_ragged)
+                attention = DitAttention(window=attend, text=attend)
+            self.dit(latents, zeros(1), text, condition, conditioning, cache, 0, attention)
 
     def warmup_decode(self, lat_hw: tuple[int, int]) -> None:
         """Decode two chunks of zero latents through a fresh stream at

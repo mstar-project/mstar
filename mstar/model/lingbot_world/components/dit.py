@@ -224,7 +224,11 @@ class RollingKVCache:
     def write(self, layer: int, k: torch.Tensor, v: torch.Tensor, plan: "_WritePlan") -> None:
         """Apply ``plan`` to one layer: shift the tokens behind the sink left by
         the eviction, then write the chunk's ``[1, L, H, D]`` K/V."""
-        k_cache, v_cache = self.k[layer], self.v[layer]
+        self.write_layer(self.k[layer], self.v[layer], k, v, plan)
+
+    def write_layer(
+        self, k_cache: torch.Tensor, v_cache: torch.Tensor, k: torch.Tensor, v: torch.Tensor, plan: "_WritePlan",
+    ) -> None:
         if plan.evicted:
             src = slice(self.sink_tokens + plan.evicted, self.sink_tokens + plan.evicted + plan.rolled)
             dst = slice(self.sink_tokens, self.sink_tokens + plan.rolled)
@@ -250,6 +254,19 @@ def attended_frames(config: LingBotWorldConfig, chunk: int) -> int:
     return min(frames, config.local_attn_size) if config.local_attn_size > -1 else frames
 
 
+@torch.compiler.disable
+def _window_attention(
+    attend: Attend, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cache: "RollingKVCache",
+    kv: tuple[torch.Tensor, torch.Tensor], plan: "_WritePlan",
+) -> torch.Tensor:
+    """Write the chunk's K/V into the layer's rolling cache ``kv``, then attend
+    over the window. Eager inside a compiled block: the cache offsets change
+    chunk to chunk, so traced they would recompile it every chunk."""
+    cache.write_layer(*kv, k, v, plan)
+    window = cache.window(plan)
+    return attend(q, kv[0][:, window], kv[1][:, window])
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, eps: float):
         super().__init__()
@@ -263,8 +280,8 @@ class CausalSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps)
 
     def forward(
-        self, x: torch.Tensor, rope: torch.Tensor, cache: RollingKVCache, layer: int, plan: _WritePlan,
-        attend: Attend,
+        self, x: torch.Tensor, rope: torch.Tensor, cache: RollingKVCache, kv: tuple[torch.Tensor, torch.Tensor],
+        plan: _WritePlan, attend: Attend,
     ) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -272,9 +289,7 @@ class CausalSelfAttention(nn.Module):
         v = self.v(x).view(b, s, n, d)
         roped_query = causal_rope_apply(q, rope).type_as(v)
         roped_key = causal_rope_apply(k, rope).type_as(v)
-        cache.write(layer, roped_key, v, plan)
-        window = cache.window(plan)
-        x = attend(roped_query, cache.k[layer][:, window], cache.v[layer][:, window])
+        x = _window_attention(attend, roped_query, roped_key, v, cache, kv, plan)
         return self.o(x.flatten(2))
 
 
@@ -393,6 +408,22 @@ class LingBotCausalDiT(nn.Module):
         ], dim=1)
         self._freqs: dict[torch.device, torch.Tensor] = {}
 
+    def compile_blocks(self, **compile_kwargs) -> None:
+        """Compile each block's forward in place: Inductor's defaults in its
+        deterministic mode, rounding every intermediate where eager does
+        (``emulate_precision_casts``). Not the -O level's autotuning: on a B300
+        it was no faster here, and it picked kernels per process, so one seed
+        gave a different rollout per server. The cache write and both
+        attentions stay eager (``_window_attention``, the ragged callables), so
+        a block traces once for every chunk."""
+        from mstar.model.components.diffusion.compile_utils import with_inductor_rounding
+
+        compile_kwargs = {"fullgraph": False, "dynamic": False, **compile_kwargs}
+        for block in self.blocks:
+            block.forward = with_inductor_rounding(
+                torch.compile(block.forward, **compile_kwargs), eager_rounding=True, deterministic=True,
+            )
+
     def freqs(self, device: torch.device) -> torch.Tensor:
         if device not in self._freqs:
             self._freqs[device] = self._freqs_cpu.to(device)
@@ -473,7 +504,9 @@ class LingBotCausalDiT(nn.Module):
 
         plan = cache.plan(current_start, seq_len)
         for i, block in enumerate(self.blocks):
-            attn_args = dict(rope=chunk.rope, cache=cache, layer=i, plan=plan, attend=attention.window)
+            # the layer's buffers, not its index: a compiled block would guard on the int
+            attn_args = dict(rope=chunk.rope, cache=cache, kv=(cache.k[i], cache.v[i]), plan=plan,
+                             attend=attention.window)
             x = block(x, e0, chunk.cam[i], cache.cross_k[i], cache.cross_v[i], attn_args, attention.text)
         cache.global_end = plan.current_end
         cache.local_end = plan.local_end

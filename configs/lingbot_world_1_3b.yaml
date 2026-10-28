@@ -6,10 +6,12 @@ model: "lingbot_world_1_3b"
 max_seq_len: 512
 
 # Numerics switches (model_kwargs), shown at their defaults. The reference's are
-# reference_attention: true (FA2, needs flash-attn) and the fp32, contiguous,
-# eager decode; with all four the rollout is bit-identical to the reference's.
+# reference_attention: true (FA2, needs flash-attn), an eager DiT and the fp32,
+# contiguous, eager decode; with all of them the rollout is bit-identical to the
+# reference's. The compiled DiT and decode are compiled at load for 480x832.
 # model_kwargs:
 #   reference_attention: false
+#   dit_compile: true
 #   vae_decode_fp32: false
 #   vae_decode_channels_last: true
 #   vae_decode_compile: true

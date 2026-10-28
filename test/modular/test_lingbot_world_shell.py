@@ -479,7 +479,7 @@ def test_the_dit_declares_one_ragged_cross_attention(model):
     assert LingBotWorldModel(skip_weight_loading=True, reference_attention=True).get_node_resources() == []
 
 
-SWITCHES = ("reference_attention", "vae_decode_fp32", "vae_decode_channels_last", "vae_decode_compile")
+SWITCHES = ("reference_attention", "dit_compile", "vae_decode_fp32", "vae_decode_channels_last", "vae_decode_compile")
 
 
 @pytest.mark.parametrize("name", SWITCHES)
@@ -492,15 +492,13 @@ def test_a_model_kwargs_switch_must_be_a_bool(name, value):
 
 def test_model_kwargs_switches_set_the_config():
     default = LingBotWorldModel(skip_weight_loading=True).config
-    assert (default.reference_attention, default.vae_decode_fp32, default.vae_decode_channels_last,
-            default.vae_decode_compile) == (False, False, True, True)
+    assert [getattr(default, n) for n in SWITCHES] == [False, True, False, True, True]
     for name in SWITCHES:
         flipped = LingBotWorldModel(skip_weight_loading=True, **{name: not getattr(default, name)}).config
         assert getattr(flipped, name) is not getattr(default, name)
         assert all(getattr(flipped, n) is getattr(default, n) for n in SWITCHES if n != name)
     reference = LingBotWorldModel(skip_weight_loading=True, **REFERENCE_MODEL_KWARGS).config
-    assert (reference.reference_attention, reference.vae_decode_fp32, reference.vae_decode_channels_last,
-            reference.vae_decode_compile) == (True, True, False, False)
+    assert [getattr(reference, n) for n in SWITCHES] == [True, False, True, False, False]
 
 
 def _bare_dit_submodule(model, resources):
@@ -571,3 +569,41 @@ def test_the_shipped_config_serves_one_rollout_at_a_time(model):
         with pytest.raises(ValueError, match="max_concurrent_requests: 1") as err:
             model.validate_config_yaml(config, "lingbot.yaml")
     assert "4.7 GiB at 480x832" in str(err.value) and "up to 11.2 GiB" in str(err.value)
+
+
+def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
+    from mstar.model.lingbot_world.components.dit import DitAttention, LingBotCausalDiT
+    from mstar.model.lingbot_world.config import LingBotWorldConfig
+
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    cfg = LingBotWorldConfig(dim=32, ffn_dim=64, num_heads=2, num_layers=num_layers, freq_dim=16, text_dim=8,
+                             text_len=8, rope_max_frames=64, local_attn_size=8, sink_size=2)
+    dit = LingBotCausalDiT(cfg).eval()
+    dit.compile_blocks(backend="eager", fullgraph=False, dynamic=False)
+
+    @torch.compiler.disable
+    def attend(q, k, v):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+
+    attention = DitAttention(window=attend, text=attend)
+    frame_seqlen, cs = 4, cfg.chunk_size
+    cache = dit.new_cache(frame_seqlen, chunks * cs, "cpu")
+    cache.k = [t.float() for t in cache.k]
+    cache.v = [t.float() for t in cache.v]
+    for chunk in range(chunks):
+        conditioning = dit.chunk_conditioning(torch.zeros(1, 384, cs, 4, 4), chunk * cs)
+        for _ in range(2):
+            dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), torch.randn(3, 8), torch.randn(20, cs, 4, 4),
+                conditioning, cache, chunk * cs * frame_seqlen, attention)
+    return torch._dynamo.utils.counters["stats"]["unique_graphs"]
+
+
+def test_compiled_blocks_trace_once_for_every_layer_and_chunk():
+    """The cache offsets and the layer index stay out of the compiled blocks,
+    so a rollout compiles them once, not once per layer or per chunk (five
+    chunks run past the first eviction)."""
+    one_chunk = _compiled_rollout_graphs(num_layers=2, chunks=1)
+    assert one_chunk > 0
+    assert _compiled_rollout_graphs(num_layers=4, chunks=5) == one_chunk

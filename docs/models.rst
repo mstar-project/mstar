@@ -173,8 +173,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT's attention runs
        through the engine's ragged attention resource; ``model_kwargs: {reference_attention: true}``
        runs the reference's FlashAttention-2 instead (bit-identical to the reference, needs ``flash-attn``).
-       The VAE decode is bf16, channels-last and compiled by default (frames 51 dB from the fp32
-       decode); ``vae_decode_fp32``, ``vae_decode_channels_last`` and ``vae_decode_compile`` set it.
+       The DiT blocks are compiled (``dit_compile``) and the VAE decode is bf16, channels-last and
+       compiled by default (frames 51 dB from the fp32 decode); ``vae_decode_fp32``,
+       ``vae_decode_channels_last`` and ``vae_decode_compile`` set it.
        The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
        before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (``Robbyant/lingbot-world``).
    * - ``flux2_klein``
