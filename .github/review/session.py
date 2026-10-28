@@ -203,8 +203,10 @@ def handoff_md(h, pr, head, mode):
             parts.append(f"## {title}\n\n" + "\n".join(lines))
     if h["note"]:
         parts.append("## Latest progress note\n\n" + quote(h["note"]))
-    elif h["last_text"]:
-        parts.append("## Latest notes (no progress note was written)\n\n" + quote(h["last_text"]))
+    # Text written after the note, by its run or by a later one that wrote no note.
+    if h["last_text"] and h["last_text"] != h["note"]:
+        parts.append(("## Latest notes, after that progress note" if h["note"] else
+                      "## Latest notes (no progress note was written)") + "\n\n" + quote(h["last_text"]))
     if h["reads"]:
         parts.append("## Files read, in whole or in part\n\n" + "\n".join(f"- `{p}`" for p in h["reads"]))
     if h["not_opened"]:

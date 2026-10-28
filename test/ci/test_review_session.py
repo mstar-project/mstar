@@ -140,6 +140,8 @@ class TestHandoff(unittest.TestCase):
         self.assertEqual(second["not_opened"], [])
         self.assertTrue(second["note"].startswith("Progress:"), "the last progress note would be lost")
         self.assertEqual(second["last_text"], "No note here")
+        self.assertIn("No note here", SESSION["handoff_md"](second, "568", "abc", "light"),
+                      "the first run's note would hide what the second run said last")
 
     def test_an_api_error_is_not_the_reviewer_s_output(self):
         msg = assistant("m1", text("API Error: 529 Overloaded"))
