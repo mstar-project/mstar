@@ -240,12 +240,15 @@ class KVPlanOutput:
     Output of KVManager.plan for a single label
     """
 
-    __slots__ = ("cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows")
+    __slots__ = (
+        "cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets",
+        "rows", "_decode",
+    )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
         cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
-        rows=None, view_builder=None,
+        rows=None, view_builder=None, decode: bool | None = None,
     ):
         self.cpu_indptrs = cpu_indptrs
         # packing in plan order w/h 1 view per segment covered by plan; a plan
@@ -263,6 +266,9 @@ class KVPlanOutput:
         # (request_id, label, to_compute) per view, for consumers that need no
         # pages or lengths (the position resource); None means read the views
         self.rows = rows
+        # whether every row computes one token, when the plan already knows;
+        # None reads the views
+        self._decode = decode
 
     @property
     def views(self) -> "list[SequenceView]":
@@ -281,6 +287,8 @@ class KVPlanOutput:
     def is_decode(self) -> bool:
         if self.decode_pages is not None:
             return True
+        if self._decode is not None:
+            return self._decode
         return all(view.to_compute == 1 for view in self.views)
 
 

@@ -33,6 +33,7 @@ from mstar.engine.resources.kv.config import (
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
+from mstar.engine.resources.kv.page_table import PageTable, StreamPages
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,
@@ -240,7 +241,9 @@ class SpanCursor:
 @dataclass
 class CacheStream:
     """(request, label) cache stream metadata"""
-    page_indices: list[int] = field(default_factory=list)
+    # an extent of the manager's `PageTable`, read like a list; replace it
+    # with `.assign`, never by assigning a list
+    page_indices: StreamPages = field(default_factory=StreamPages)
     stored_len: int = 0
     position: int = 0
     # tokens compacted out of the front by `release_oldest` so far; the
@@ -635,6 +638,10 @@ class KVManager(AttentionResource):
         # copy-only H2D into those, see `_stage_decode_plan_state`
         self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
+        # every stream's page list (`StreamPages`), and the SINK_PAGE run a
+        # plan points its sink rows at
+        self._page_table = PageTable()
+        self._sink_pages = self._page_table.new()
         # the plan cache (`_fast_decode_plan`): bumped by everything that
         # changes a stream's pages or length other than a step's commit
         self._plan_epoch = 0
@@ -1543,7 +1550,8 @@ class KVManager(AttentionResource):
 
         Any pages the stream already holds are empty ones a refused admit left, so they are released.
         """
-        empty, stream.page_indices = stream.page_indices, list(pages)
+        empty = stream.page_indices.tolist()
+        stream.page_indices.assign(pages)
         self._release(rid, stream, empty)
         self._plan_epoch += 1
         stream.stored_len = len(pages) * self.config.page_size
@@ -1582,7 +1590,8 @@ class KVManager(AttentionResource):
             # twice. Replacing the streams here reset `stored_len` under a node
             # that had already filled them, and the request's publish info then
             # named more tokens than the stream held.
-            self._streams.setdefault(rid, {"main": CacheStream()})
+            if rid not in self._streams:
+                self._streams[rid] = {"main": self._new_stream()}
             self._overrides.setdefault(rid, overrides)
             for label, stream in self._streams[rid].items():
                 if stream.span_cursor is None:
@@ -1677,7 +1686,8 @@ class KVManager(AttentionResource):
                     self._release_lease(rid, stream)
                     drop = self._arena.any_sealed(stream.page_indices)
                     if drop:
-                        pages, stream.page_indices = stream.page_indices, []
+                        pages = stream.page_indices.tolist()
+                        stream.page_indices.clear()
                         self._release(rid, stream, pages)
                     stream.reset(freed=drop)
                     stream.forget_chain()
@@ -1936,7 +1946,7 @@ class KVManager(AttentionResource):
                 # appends, so there is nothing to acquire and nothing to record
                 if (
                     not stream.offloaded
-                    and len(stream.page_indices) * page_size >= seq_len
+                    and stream.page_indices.n * page_size >= seq_len
                 ):
                     continue
                 alloc_res = self._alloc(rid, segment.label, seq_len)
@@ -2197,7 +2207,9 @@ class KVManager(AttentionResource):
             empty = self._empty_locations = torch.empty(0, dtype=torch.long, device=self._device)
         return KVPlanState(token_to_page=empty, token_to_cache=empty, total_tokens=0)
 
-    def _decode_plan_state(self, views: list[SequenceView]) -> KVPlanState:
+    def _decode_plan_state(
+        self, views: list[SequenceView] | None, pages=None, offsets=None,
+    ) -> KVPlanState:
         """Write addressing for a step appending one token per request.
 
         The packed path needs the indptrs on device and ~a dozen kernels to
@@ -2205,14 +2217,15 @@ class KVManager(AttentionResource):
         stream, so build it in the same CPU pass the views came from and send
         it over as one H2D.
         """
-        pages, offsets = self._decode_locations(views)
+        if pages is None or offsets is None:
+            pages, offsets = self._decode_locations(views)
         locations = torch.tensor(
-            [pages, offsets], dtype=torch.long
+            np.array([pages, offsets], np.int64)
         ).to(self._device, non_blocking=True)
         return KVPlanState(
             token_to_page=locations[0],
             token_to_cache=locations[1],
-            total_tokens=len(views),
+            total_tokens=len(pages),
         )
 
     def _decode_locations(
@@ -2318,7 +2331,10 @@ class KVManager(AttentionResource):
                     self._current_plan_states[label] = plan_state
                 continue
             if indptrs.is_decode:
-                plan_state = self._decode_plan_state(indptrs.views)
+                plan_state = self._decode_plan_state(
+                    None if indptrs.decode_pages is not None else indptrs.views,
+                    indptrs.decode_pages, indptrs.decode_offsets,
+                )
             elif total_tokens == 0:
                 # every segment span 0 (a decoder reading the encoder context
                 # it wrote at prefill): nothing is written, so there is no
@@ -2350,6 +2366,107 @@ class KVManager(AttentionResource):
                 views, self.kv_cache.page_size, ring=self._indptr_ring,
             ),
             views=views,
+        )
+
+    def _plan_label(
+        self, segments: list[Segment], pending: dict, ctx: StepContext,
+        sink: frozenset[tuple[str, str]],
+    ) -> KVPlanOutput:
+        """One plan label's output: ``_plan_output(_sequence_views(...))``,
+        built from columns. One pass over the rows reads each stream's extent,
+        length and generation; the page indices are then one gather from the
+        page table, and the views are built only if a consumer asks. A step
+        whose pre-forks are pending plans from the views."""
+        if pending:
+            return self._plan_output(self._sequence_views(segments, pending, ctx, sink))
+        page_size = self.kv_cache.page_size
+        streams = self._streams
+        capture = ctx.capture
+        is_pad = ctx.is_padding_row
+        offs, held, lens, spans, gens = [], [], [], [], []
+        sink_rows = []
+        decode = bool(segments)
+        for i, s in enumerate(segments):
+            span = s.span
+            spans.append(span)
+            if span != 1:
+                decode = False
+            if capture or is_pad(s.request_id) or (sink and (s.request_id, s.label) in sink):
+                # a padding row reads and writes SINK_PAGE, a page per page of
+                # span; see `_sequence_views`
+                sink_rows.append(i)
+                offs.append(0)
+                held.append(0)
+                lens.append(span)
+                gens.append(0)
+                continue
+            stream = streams[s.request_id][s.label]
+            pages = stream.page_indices
+            offs.append(pages.off)
+            held.append(pages.n)
+            lens.append(span + stream.stored_len)
+            gens.append(stream.generation)
+        n = len(segments)
+        # int32 throughout: what FlashInfer takes, so the tensors wrap these arrays
+        offs_a, held_a, lens_a = np.array((offs, held, lens), np.int32)
+        if sink_rows:
+            sink_pages = self._sink_pages
+            need = -(-max(spans[i] for i in sink_rows) // page_size)
+            if len(sink_pages) < need:
+                sink_pages.extend([SINK_PAGE] * (need - len(sink_pages)))
+            offs_a[sink_rows] = sink_pages.off
+            held_a[sink_rows] = len(sink_pages)
+        # a stream can hold more pages than its length needs (a high-water
+        # mark), and the slice in `_sequence_views` takes no more than it holds
+        npages = lens_a + (page_size - 1)
+        npages //= page_size
+        np.minimum(npages, held_a, out=npages)
+        kv_indptr = np.zeros(n + 1, np.int32)
+        np.cumsum(npages, out=kv_indptr[1:])
+        indices = self._page_table.gather(offs_a, npages, kv_indptr)
+        # `SequenceView.last_page_len(page_size) or page_size`
+        last = lens_a - 1
+        last %= page_size
+        last += 1
+        # FlashInfer's `get_seq_lens`: (pages - 1) * page_size + last
+        kv_lens = np.maximum(npages, 1)
+        kv_lens -= 1
+        kv_lens *= page_size
+        kv_lens += last
+        if decode:
+            qo_indptr = np.arange(n + 1, dtype=np.int32)
+        else:
+            qo_indptr = np.zeros(n + 1, np.int32)
+            np.cumsum(spans, out=qo_indptr[1:])
+        ring = self._indptr_ring
+        make = ring.take if ring is not None else torch.from_numpy
+        # a decode row writes the token after its last: the last page, at its
+        # last slot (`_decode_locations`); none without a page to write
+        write_at = decode and bool(npages.all())
+
+        def build_views(segments=segments, indices=indices, kv_indptr=kv_indptr, lens=lens, gens=gens):
+            bounds = kv_indptr.tolist()
+            return [
+                SequenceView(
+                    s.request_id, s.label, indices[bounds[i]:bounds[i + 1]].tolist(),
+                    lens[i], s.span, 0, gens[i],
+                )
+                for i, s in enumerate(segments)
+            ]
+
+        return KVPlanOutput(
+            cpu_indptrs=PagedIndptrs(
+                qo_indptr=make(qo_indptr),
+                paged_kv_indptr=make(kv_indptr),
+                paged_kv_indices=make(indices),
+                paged_kv_last_page_len=make(last),
+                kv_lens=torch.from_numpy(kv_lens).as_subclass(HostLens),
+            ),
+            decode_pages=indices[kv_indptr[1:] - 1] if write_at else None,
+            decode_offsets=last - 1 if write_at else None,
+            decode=decode,
+            rows=segments,
+            view_builder=build_views,
         )
 
     @staticmethod
@@ -2753,9 +2870,7 @@ class KVManager(AttentionResource):
         if res is None or self._plan_cache_mode == 2:
             full = KVPlanOutputs(
                 {
-                    plan_label: self._plan_output(
-                        self._sequence_views(segments, pending, ctx, step.sink)
-                    )
+                    plan_label: self._plan_label(segments, pending, ctx, step.sink)
                     for plan_label, segments in group_by_plan_label(
                         step.segments, step.combined_labels
                     ).items()
@@ -2846,6 +2961,7 @@ class KVManager(AttentionResource):
                 stream = self._streams.get(rid, {}).pop(label, None)
                 if stream is not None:
                     self._release(rid, stream, stream.page_indices)
+                    stream.page_indices.free()
                     self._recount(rid)
             self._preplan_new_labels = []
             for rid, label in self._preplan_marked:
@@ -3254,7 +3370,7 @@ class KVManager(AttentionResource):
                 return 0, set()
             for claim in moved:
                 stream = streams[claim.label]
-                stream.page_indices = []
+                stream.page_indices.clear()
                 # the offload takes its pages off the allotment too, so every page it frees is room
                 self._release(rid, stream, claim.pages, refund=False)
                 # Offload changes residency, not logical stream contents.
@@ -3343,7 +3459,7 @@ class KVManager(AttentionResource):
                 run = runs[label]
                 stream = self._ensure_label(rid, label)
                 at = len(copies.cpu)
-                stream.page_indices = run + pages[at:at + len(state.cpu_page_indices) - len(run)]
+                stream.page_indices.assign(run + pages[at:at + len(state.cpu_page_indices) - len(run)])
                 if allotment is not None:
                     # the offload took them off the allotment
                     allotment.pages += len(stream.page_indices)
@@ -3636,7 +3752,8 @@ class KVManager(AttentionResource):
                 stream.converted = False
                 drop = free or self._arena.any_sealed(stream.page_indices)
                 if drop:
-                    pages, stream.page_indices = stream.page_indices, []
+                    pages = stream.page_indices.tolist()
+                    stream.page_indices.clear()
                     self._release(rid, stream, pages)
                 stream.reset(freed=drop)
                 # a stale cursor or generated key would misfile what the rerun writes
@@ -3672,6 +3789,7 @@ class KVManager(AttentionResource):
                     self._release_lease(rid, stream)
                     self._release_hold(rid, stream)
                     self._arena.release(stream.page_indices)
+                    stream.page_indices.free()
             if self._cpu_pool is not None:
                 self._cpu_pool.remove_request(rid)
             # handle-keyed, and this releases the handle: a survivor would be
@@ -3832,9 +3950,12 @@ class KVManager(AttentionResource):
     def cleanup(self):
         self._transfer.cleanup()
 
+    def _new_stream(self) -> CacheStream:
+        return CacheStream(page_indices=self._page_table.new())
+
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:
-                stream = self._streams[rid][label] = CacheStream()
+                stream = self._streams[rid][label] = self._new_stream()
                 self._lay_out(rid, label, stream)
                 self._seed_keys(rid, label, stream)
             return self._streams[rid][label]
@@ -4157,7 +4278,7 @@ class KVManager(AttentionResource):
                     success=False, error=self._offloading_message(request_id, label)
                 )
             num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
-            num_new_pages = num_pages_needed - len(stream.page_indices)
+            num_new_pages = num_pages_needed - stream.page_indices.n
             # a stream that already holds enough pages acquires none, and has
             # nothing for ``rollback_admit`` to give back
             new_pages: list[int] = []
