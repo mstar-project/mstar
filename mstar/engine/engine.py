@@ -2287,7 +2287,7 @@ class Engine:
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
     ) -> list[tuple[str, str]]:
         """The (node, rid) pairs admitted since `check_ready` answered them ``queued``; see
-        `StepRunner.admit_waiting`."""
+        `Admission.admit_waiting`."""
         return self._runner.admit_waiting(published_of)
 
     def reserve_replay_slot(self, batch: ExecutingBatch) -> SlotLease | None:

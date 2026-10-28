@@ -162,7 +162,7 @@ def test_a_prompt_bigger_than_the_pool_fails_as_it_joins():
     outcome = _runner(kv).admit_retrieve("a", NODE, WALK)
 
     assert isinstance(outcome.reason, AdmitRuntimeError), "a request that can never fit holds the queue"
-    assert not _runner(kv)._waiting and not kv._asks
+    assert not _runner(kv)._admission._waiting and not kv._asks
 
 
 def _cached(kv, tokens: list[int], held: bool) -> None:
@@ -455,7 +455,7 @@ def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node
         assert not runner.admit_retrieve(rid, NODE, WALK).ready
 
     assert self_kv._allotments.keys() == {"r"}, "a request the cross pool holds back kept its self pool allotment"
-    assert runner._queues["kv_cache"][0] == "c", "\"d\" passed \"c\" in the self pool's queue"
+    assert runner._admission._queues["kv_cache"][0] == "c", "\"d\" passed \"c\" in the self pool's queue"
     decode = self_kv.admit(KVStep(segments=(Segment("r", "main", 1),)), _ctx("r"))
     assert decode.ok, "requests waiting on the cross pool kept the room the running request decodes into"
 
