@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from mstar.model.components.quantization import Fp8Block, expert_param_rules
 from mstar.model.loader.base import StackedParamRule
-from mstar.utils.fp8_block import dequant_fp8_block_stream
 
 if TYPE_CHECKING:
     from mstar.utils.fp8_block import Fp8BlockQuantConfig
@@ -31,6 +31,11 @@ _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.")
 
 def _is_routed_expert_base(base: str) -> bool:
     return _EXPERT_BASE_RE.search(base) is not None
+
+
+def _role_of(base: str) -> str:
+    """A quantized checkpoint weight's role: routed experts or everything else."""
+    return "routed_experts" if _is_routed_expert_base(base) else "linear"
 
 
 def glm52_name_remapper(name: str) -> str | None:
@@ -72,33 +77,12 @@ def build_glm52_stacked_params(
     n_routed_experts: int, fp8_experts: bool = False,
 ) -> list[StackedParamRule]:
     rules: list[StackedParamRule] = []
+    if fp8_experts:
+        # the rules don't depend on the scale block
+        rules += expert_param_rules(
+            Fp8Block(), n_routed_experts, lambda proj, i: f".experts.{proj}.__expert{i}__")
     for i in range(n_routed_experts):
-        if fp8_experts:
-            # scale_inv rules MUST precede weight rules: matching is
-            # first-win substring, and ".weight" is a prefix of
-            # ".weight_scale_inv".
-            for proj, sid in (("gate_proj", f"gate:{i}"), ("up_proj", f"up:{i}")):
-                rules.append(StackedParamRule(
-                    target_suffix=".experts.gate_up_proj_scale_inv",
-                    source_suffix=f".experts.{proj}.__expert{i}__.weight_scale_inv",
-                    shard_id=sid,
-                ))
-                rules.append(StackedParamRule(
-                    target_suffix=".experts.gate_up_proj_fp8",
-                    source_suffix=f".experts.{proj}.__expert{i}__.weight",
-                    shard_id=sid,
-                ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.down_proj_scale_inv",
-                source_suffix=f".experts.down_proj.__expert{i}__.weight_scale_inv",
-                shard_id=f"down:{i}",
-            ))
-            rules.append(StackedParamRule(
-                target_suffix=".experts.down_proj_fp8",
-                source_suffix=f".experts.down_proj.__expert{i}__.weight",
-                shard_id=f"down:{i}",
-            ))
-        else:
+        if not fp8_experts:
             rules.append(StackedParamRule(
                 target_suffix=".experts.gate_up_proj",
                 source_suffix=f".experts.gate_proj.__expert{i}__.weight",
@@ -141,6 +125,7 @@ def build_glm52_read_plan(
     model builds no indexer to fill, so its keys are never read.
     """
     from mstar.model.glm52.components.indexer import is_full_indexer_layer
+    from mstar.model.glm52.config import glm52_quant_method
 
     if load_indexer is None:
         load_indexer = bool(config.dsa_long_context)
@@ -149,6 +134,7 @@ def build_glm52_read_plan(
     keys: set[str] = set()
     specs: dict[str, tuple[int, int, int]] = {}
     if fp8_experts:
+        quant = glm52_quant_method(config.quantization_config, fp8_resident=True)
         bo, bi = config.quantization_config.weight_block_size
         assert shard_inter % bo == 0 and shard_inter % bi == 0, (
             f"per-rank intermediate {shard_inter} must be a multiple of the "
@@ -174,15 +160,9 @@ def build_glm52_read_plan(
         if not m:
             continue
         _, _, proj, suffix = m.groups()
-        is_scale = suffix == "weight_scale_inv"
-        if proj in ("gate_proj", "up_proj"):
-            unit = bo if is_scale else 1
-            rows = shard_inter // unit
-            specs[key] = (0, tp_rank * rows, (tp_rank + 1) * rows)
-        else:  # down_proj: contraction dim is sharded -> column slice
-            unit = bi if is_scale else 1
-            cols = shard_inter // unit
-            specs[key] = (1, tp_rank * cols, (tp_rank + 1) * cols)
+        # gate / up rows, down's contraction columns
+        specs[key] = quant.expert_read_slice(
+            suffix, proj, config.moe_intermediate_size, tp_rank, tp_size)
 
     return keys, specs
 
@@ -200,8 +180,10 @@ def load_glm52_hf_weights(
 
     weights = skip_phase_b_keys(weights, num_hidden_layers, load_indexer=load_indexer)
     if quant_config is not None:
-        keep = _is_routed_expert_base if fp8_experts else None
-        weights = dequant_fp8_block_stream(weights, quant_config, keep_fp8=keep)
+        from mstar.model.glm52.config import glm52_quant_method
+
+        quant = glm52_quant_method(quant_config, fp8_experts)
+        weights = quant.checkpoint_stream(weights, _role_of)
     elif fp8_experts:
         raise ValueError("fp8_experts=True requires a quant_config")
     else:

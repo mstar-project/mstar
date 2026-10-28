@@ -286,12 +286,12 @@ def test_default_dispatch_is_fused_where_the_kernel_runs(monkeypatch):
     """The default resolves to the fused kernel when it can run and to the
     reference loop when it cannot; blocks that never see the load hook stay
     on reference."""
-    import mstar.model.glm52.components.moe as moe_mod
+    from mstar.model.components.quantization import formats
 
     cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
     assert Glm52SparseMoeBlock(cfg)._use_fused is False
     for available in (True, False):
-        monkeypatch.setattr(moe_mod, "fused_fp8_available", lambda dev, block, a=available: a)
+        monkeypatch.setattr(formats, "fused_fp8_available", lambda dev, block, a=available: a)
         block = Glm52SparseMoeBlock(cfg)
         block.process_weights_after_loading("cpu")
         assert block._use_fused is available
@@ -299,7 +299,7 @@ def test_default_dispatch_is_fused_where_the_kernel_runs(monkeypatch):
 
 def test_fused_kernel_needs_its_scale_block():
     cpu, cuda = torch.device("cpu"), torch.device("cuda")
-    from mstar.model.glm52.components.moe import fused_fp8_available
+    from mstar.model.components.quantization.formats import fused_fp8_available
 
     assert not fused_fp8_available(cpu, (128, 128))
     assert not fused_fp8_available(cuda, BLOCK)
