@@ -134,8 +134,11 @@ def handoff(messages, root, diff_paths, previous=None):
             kind, inp = b.get("type"), b.get("input")
             inp = inp if isinstance(inp, dict) else {}
             if kind == "tool_use" and str(b.get("name", "")).endswith("create_inline_comment"):
-                res = results.get(b.get("id"))
-                status = "unknown" if res is None else "failed" if res.get("is_error") else "posted"
+                res = results.get(b.get("id")) or {}
+                # The tool reports a posted comment's id. A call without `confirmed: true` is only
+                # buffered, to be posted or dropped after the session, so it stays unknown.
+                status = ("failed" if res.get("is_error")
+                          else "posted" if '"comment_id"' in result_text(res.get("content")) else "unknown")
                 key = b.get("id") or f"no-id-{len(comments)}"
                 comments[key] = {
                     "id": key, "path": inp.get("path"), "line": inp.get("line") or inp.get("startLine"),
@@ -162,10 +165,14 @@ def handoff(messages, root, diff_paths, previous=None):
     }
 
 
-def first_line(content):
+def result_text(content):
     if isinstance(content, list):
         content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
-    return str(content or "").strip().split("\n")[0]
+    return str(content or "")
+
+
+def first_line(content):
+    return result_text(content).strip().split("\n")[0]
 
 
 def diff_paths(diff_text):

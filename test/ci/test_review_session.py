@@ -28,8 +28,8 @@ def tool(tid, name, **inp):
     return {"type": "tool_use", "id": tid, "name": name, "input": inp}
 
 
-def result(tid, error=None):
-    block = {"type": "tool_result", "tool_use_id": tid, "content": error or "ok"}
+def result(tid, error=None, out='{"success": true, "comment_id": 1}'):
+    block = {"type": "tool_result", "tool_use_id": tid, "content": error or [{"type": "text", "text": out}]}
     if error:
         block["is_error"] = True
     return {"type": "user", "message": {"content": [block]}}
@@ -113,12 +113,15 @@ class TestHandoff(unittest.TestCase):
             assistant("m4", tool("c2", COMMENT, path="mstar/b.py", line=5, body="**[P2]** stale comment")),
             result("c2", error="line 5 is not in the diff"),
             assistant("m5", text("subagent text"), parent="task1"),
+            assistant("m6", tool("c3", COMMENT, path="mstar/c.py", line=1, body="**[P2]** buffered")),
+            result("c3", out='{"success": true, "buffered": true}'),
         ]
 
     def test_records_comments_reads_and_the_latest_progress_note(self):
         h = handoff(self.run_messages(), ROOT, ["mstar/a.py", "mstar/b.py", "mstar/c.py"])
         status = {c["path"]: c["status"] for c in h["comments"]}
-        self.assertEqual(status, {"mstar/a.py": "posted", "mstar/b.py": "failed"})
+        self.assertEqual(status, {"mstar/a.py": "posted", "mstar/b.py": "failed", "mstar/c.py": "unknown"},
+                         "a buffered comment, which may never post, would be listed as on the PR")
         self.assertEqual(h["reads"], ["pr-head/mstar/a.py", "pr-head/mstar/b.py"])
         self.assertEqual(h["not_opened"], ["mstar/c.py"])
         self.assertTrue(h["note"].startswith("Progress:"))
@@ -133,7 +136,7 @@ class TestHandoff(unittest.TestCase):
                                     tool("r3", "Read", file_path=f"{ROOT}/pr-head/mstar/c.py"))],
                          ROOT, ["mstar/a.py", "mstar/c.py"], first)
         self.assertEqual(second["runs"], 2)
-        self.assertEqual(len(second["comments"]), 2, "the first run's inline comments would be forgotten")
+        self.assertEqual(len(second["comments"]), 3, "the first run's inline comments would be forgotten")
         self.assertEqual(second["not_opened"], [])
         self.assertTrue(second["note"].startswith("Progress:"), "the last progress note would be lost")
         self.assertEqual(second["last_text"], "No note here")
