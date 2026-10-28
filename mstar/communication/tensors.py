@@ -240,6 +240,11 @@ def _warn_if_mooncake_unpatched() -> None:
         )
 
 
+class MemoryRegistrationError(RuntimeError):
+    """The transfer engine refused to register a tensor for remote reads, or a
+    buffer for a read into it."""
+
+
 # ---------------------------------------------------------------------------
 # TensorTransferEngine abstraction
 # ---------------------------------------------------------------------------
@@ -313,7 +318,8 @@ def _may_be_reading(future) -> bool:
     if not future.done():
         return True
     error = _read_error(future)
-    return error is not None and not isinstance(error, CancelledError)
+    # a refused registration fails the read before it starts
+    return error is not None and not isinstance(error, (CancelledError, MemoryRegistrationError))
 
 
 def _submit_failed(batch_id: int) -> bool:
@@ -1338,28 +1344,37 @@ class TensorCommunicationManager(ABC):
         self,
         safety_hold_uuids: set[int],
         routed_edges: list[GraphEdge],
+        transferred_refs: list[int] | tuple[int, ...] = (),
     ):
-        """Adjust ref counts from the safety hold (1) to the actual fanout.
+        """Replace producer and completed-loop cache holds with actual fanout.
 
         Called after ``process_node_outputs`` determines the real routing.
         ``safety_hold_uuids`` is the set of UUIDs that were given ref=1 by
         ``increment_ref_batch_uniform`` after
         ``store_and_return_tensor_info_batch``.
         ``routed_edges`` is the flat list of all edges that will actually be
-        consumed (local ingestion, remote send, persist, emit, streaming).
+        consumed (local ingestion, remote send, emit, streaming). Persist
+        markers must already be set; persistence itself is not a counted read.
+        ``transferred_refs`` lists cache holds relinquished by finished loops,
+        including repeated UUIDs held by multiple nested loops. Keep these
+        holds alive until routing and persist marking have finished.
         """
-        actual_counts: dict[int, int] = {uuid: 0 for uuid in safety_hold_uuids}
+        # Each tensor's change: minus its holds (the producer's safety hold,
+        # plus every loop hold handed over), plus one per routed reader. Older
+        # accumulated tensors are included even if this pass minted none.
+        deltas: dict[int, int] = dict.fromkeys(safety_hold_uuids, -1)
+        for uuid in transferred_refs:
+            deltas[uuid] = deltas.get(uuid, 0) - 1
         for edge in routed_edges:
             for info in edge.tensor_info:
-                if info.uuid in actual_counts:
-                    actual_counts[info.uuid] += 1
+                if info.uuid in deltas:
+                    deltas[info.uuid] += 1
 
         up_uuids: list[int] = []
         up_counts: list[int] = []
         down_uuids: list[int] = []
         down_counts: list[int] = []
-        for uuid, count in actual_counts.items():
-            delta = count - 1  # subtract the safety hold of 1
+        for uuid, delta in deltas.items():
             if delta > 0:
                 up_uuids.append(uuid)
                 up_counts.append(delta)
@@ -1429,6 +1444,10 @@ class TensorCommunicationManager(ABC):
         rebuilding a descriptor so the callee can read its uuid costs ~2.2us
         each (15 attribute crossings plus the dataclass), and the caller
         already has the uuids. ``skip_cuda_sync`` as for ``register_for_send``.
+
+        Returns ``{request_id: error}`` for the requests whose tensors the
+        transfer engine refused to register, or None if there were none; the
+        other requests' tensors are registered all the same.
         """
         ...
 
@@ -1689,7 +1708,7 @@ class TensorCommunicationManager(ABC):
         """Adopt the batch ids a finished read handed over for ``kept``. False
         if whether its transfers stopped cannot be learned: then its buffers
         are never freed."""
-        if error is None or isinstance(error, CancelledError):
+        if error is None or isinstance(error, (CancelledError, MemoryRegistrationError)):
             return True  # completed after all, or never started
         if self._transfer_status is None or not isinstance(error, AsyncReadError):
             why = f"its {type(error).__name__} does not say whether the transfer stopped"
@@ -2139,9 +2158,14 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         uuids avoids rebuilding one per tensor."""
         if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
+        failed: dict[Rid, str] = {}
         for request_id, uuids in per_request:
-            for uuid in uuids:
-                self._register_one(request_id, uuid)
+            try:
+                for uuid in uuids:
+                    self._register_one(request_id, uuid)
+            except MemoryRegistrationError as exc:
+                failed[request_id] = str(exc)
+        return failed or None
 
     def _register_one(self, request_id: Rid, uuid: int) -> None:
         """Pin one tensor for remote reads. The caller owns the CUDA sync."""
@@ -2163,9 +2187,9 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     "tensors.register_memory", time.perf_counter() - t0,
                 )
             if ret_value != 0:
-                raise RuntimeError(
+                raise MemoryRegistrationError(
                     f"Mooncake memory registration failed for request id "
-                    f"{request_id}, uuid {uuid}."
+                    f"{self.rid_to_str(request_id)}, uuid {uuid}: {ret_value}"
                 )
             if self.enable_prof:
                 # RDMA: the receiver does the actual read, so the sender-side
@@ -2192,7 +2216,19 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             if tensor.nbytes:
                 ret_value = self.transfer_engine.unregister_memory(tensor.data_ptr())
                 if ret_value != 0:
-                    raise RuntimeError("Mooncake memory unregistration failed.")
+                    # Logged, not raised: a raise would abort the rest of a
+                    # request's teardown (from REMOVE_REQUEST, in the worker's
+                    # main loop). The engine may still hold the region, so the
+                    # tensor is kept for the life of the process: freed, its
+                    # address goes back to the allocator, and a later request's
+                    # tensor there is refused as an overlap (-7).
+                    self._unreleasable_buffers.append(tensor)
+                    logger.error(
+                        "Mooncake memory unregistration failed for uuid %s: %s; "
+                        "keeping its %d bytes allocated so the address is not "
+                        "reused while it may still be registered",
+                        uuid, ret_value, tensor.nbytes,
+                    )
         self.tensor_store.remove_tensor(uuid)
 
     def start_read_tensors(
@@ -2220,6 +2256,8 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 future=None, graph_edges=[graph_edge], request_id=request_id,
                 transfer_uuids=transfer_uuids,
             )
+            # why the engine refused to pin a buffer of this edge, if it did
+            refused: str | None = None
             for info in graph_edge.tensor_info:
                 if info.source_entity == self.my_entity_id:
                     self._slice_existing_tensor(
@@ -2237,8 +2275,6 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 self.tensor_store.put_tensor(
                     request_id=request_id, uuid=info.uuid, tensor=buffer, info=info,
                 )
-                self.tensor_store.set_metadata(info.uuid, mem_registered=True
-                )
                 # +1 for transit (released by get_ready_tensors)
                 # +1 for graph-node usage (released by _cleanup_consumed_inputs)
                 self.tensor_store.increment_ref(info.uuid, 2
@@ -2251,8 +2287,28 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 if info.nbytes == 0:
                     continue
 
-                if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
-                    self.transfer_engine.register_memory(buffer.data_ptr(), info.nbytes)
+                # the edge's buffers go with the read, so teardown waits for it
+                transfer_uuids.append(info.uuid)
+                if refused is not None:
+                    continue  # the read will not run: nothing more to pin
+
+                # Marked only once registered: teardown unregisters what is
+                # marked.
+                ret_value = (
+                    self.transfer_engine.register_memory(
+                        buffer.data_ptr(), info.nbytes,
+                    )
+                    if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP)
+                    else 0
+                )
+                if ret_value != 0:
+                    refused = (
+                        "Mooncake refused to register the read buffer for "
+                        f"request {self.rid_to_str(request_id)}, uuid "
+                        f"{info.uuid}: {ret_value}"
+                    )
+                    continue
+                self.tensor_store.set_metadata(info.uuid, mem_registered=True)
 
                 read_info.append(TransferReadInfo(
                     source_session_id=info.source_session_id,
@@ -2260,12 +2316,18 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     remote_ptr=info.address + info.offset,
                     nbytes=info.nbytes,
                 ))
-                transfer_uuids.append(info.uuid)
                 logger.debug("Started transfer read for uuid %s", info.uuid)
             if self.enable_prof or fp.read_src is not None:
                 for ri in read_info:
                     ri.fp = fp
-            fut = self._async_reader.submit(read_info)
+            if refused is not None:
+                # Reading into an unpinned buffer fails or lands nowhere, so the
+                # request fails here, as on a failed read: get_ready_tensors
+                # drops the edge and take_failed_reads names the request.
+                fut = Future()
+                fut.set_exception(MemoryRegistrationError(refused))
+            else:
+                fut = self._async_reader.submit(read_info)
             fp.future = fut
             if fut is not None:
                 futures.append(fut)
