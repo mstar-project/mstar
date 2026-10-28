@@ -40,6 +40,9 @@ def text(t):
 
 
 COMMENT = "mcp__github_inline_comment__create_inline_comment"
+# As Claude Code writes it: this system message's "message" is a string, not an object.
+DENIED = {"type": "system", "subtype": "permission_denied", "tool_name": "Glob",
+          "message": "Claude requested permissions to read from /tmp/x, but you haven't granted it yet."}
 
 
 def run_main(*argv):
@@ -70,6 +73,11 @@ class TestUsage(unittest.TestCase):
         msg["message"]["model"] = "<synthetic>"
         self.assertEqual(usage([msg])["api_calls"], 0)
 
+    def test_a_message_that_is_a_string_is_skipped(self):
+        msgs = [assistant("msg_a", text("x")), DENIED]
+        self.assertEqual(usage(msgs)["api_calls"], 1)
+        self.assertEqual(handoff(msgs, ROOT, [])["last_text"], "x")
+
     def test_execution_file_and_transcript_together_count_once(self):
         msgs = [assistant("msg_a", text("x")), assistant("msg_b", text("y"))]
         with tempfile.TemporaryDirectory() as d:
@@ -83,17 +91,14 @@ class TestUsage(unittest.TestCase):
 
     def test_a_corrupt_or_missing_execution_file_still_records(self):
         with tempfile.TemporaryDirectory() as d:
-            truncated, odd = Path(d, "truncated.json"), Path(d, "odd.json")
+            truncated = Path(d, "truncated.json")
             truncated.write_text('[{"type": "assistant", "message": ')
-            odd.write_text('[{"type": "assistant", "message": "not an object"}]')
             quiet = io.StringIO()
             with contextlib.redirect_stdout(quiet):
-                for source in (truncated, Path(d, "missing.json"), odd):
+                for source in (truncated, Path(d, "missing.json")):
                     self.assertEqual(SESSION["record_usage"](usage_args(d, str(source))), 0, source.name)
-            record = json.loads(Path(d, "u.json").read_text())
             summary = Path(d, "summary.md").read_text()
-        self.assertIn("error", record, "a message of the wrong shape should be reported, not raised")
-        self.assertEqual(summary.count("### Review usage"), 3)
+        self.assertEqual(summary.count("### Review usage"), 2)
         self.assertIn("| API calls | 0 |", summary)
 
 

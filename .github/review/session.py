@@ -53,7 +53,9 @@ def load(paths):
 
 
 def blocks(message):
-    content = (message.get("message") or {}).get("content")
+    # Not every message's "message" is an object: a permission_denied system message's is a string.
+    msg = message.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
     return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
 
 
@@ -61,9 +63,11 @@ def usage(messages):
     """API calls and token counts, one entry per API response, plus the run's result fields."""
     calls = {}
     for m in messages:
-        msg = m.get("message") or {}
+        msg = m.get("message")
+        if m.get("type") != "assistant" or not isinstance(msg, dict):
+            continue
         u, mid = msg.get("usage"), msg.get("id")
-        if m.get("type") != "assistant" or not isinstance(u, dict) or not mid or msg.get("model") == "<synthetic>":
+        if not isinstance(u, dict) or not mid or msg.get("model") == "<synthetic>":
             continue
         seen = calls.setdefault(mid, dict.fromkeys(TOKENS, 0))
         for k in TOKENS:
@@ -121,7 +125,8 @@ def handoff(messages, root, diff_paths, previous=None):
         if m.get("type") != "assistant":
             continue
         for b in blocks(m):
-            kind, inp = b.get("type"), b.get("input") or {}
+            kind, inp = b.get("type"), b.get("input")
+            inp = inp if isinstance(inp, dict) else {}
             if kind == "tool_use" and str(b.get("name", "")).endswith("create_inline_comment"):
                 res = results.get(b.get("id"))
                 status = "unknown" if res is None else "failed" if res.get("is_error") else "posted"
