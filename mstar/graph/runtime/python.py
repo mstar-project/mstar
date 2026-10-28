@@ -161,6 +161,9 @@ class PythonGraphRuntime(GraphRuntime):
 
         # Loop stops from this iteration's check_stop; cleared every iteration.
         self._pending_loop_stops: set[PendingLoopStop] = set()
+        # (rid, walk, loop) whose scheduled iteration is its last; see
+        # mark_last_loop_iters
+        self._last_loop_iters: set[tuple[int, str, str]] = set()
 
         # Routing parked between complete_and_route_batch and send_outputs.
         self._completions: dict[int, CompletionState] = {}
@@ -307,6 +310,10 @@ class PythonGraphRuntime(GraphRuntime):
         self._pending_loop_stops = {
             stop for stop in self._pending_loop_stops if stop.rid != rid
         }
+        if self._last_loop_iters:
+            self._last_loop_iters = {
+                mark for mark in self._last_loop_iters if mark[0] != rid
+            }
         # Recycling means a stale handle held anywhere else now points at a
         # DIFFERENT request; see GraphRuntime.remove_request for what has to be
         # purged alongside this.
@@ -673,19 +680,28 @@ class PythonGraphRuntime(GraphRuntime):
     def speculate_node(
         self, node_name: str,
         graph_walks: list[str],
-        sample_rids: list[int],
+        rids: list[int],
+        walk_counts: list[int] | None = None,
     ) -> list[SpeculationOutput]:
-        return [
-            target
-            for walk, rid in zip(graph_walks, sample_rids, strict=True)
-            for target in self._speculate_walk(node_name, walk, rid)
-        ]
+        if walk_counts is None:
+            walk_counts = [1] * len(graph_walks)
+        if len(walk_counts) != len(graph_walks) or sum(walk_counts) != len(rids):
+            raise ValueError(
+                "speculate_node: walk_counts must give each walk's share of rids"
+            )
+        out: list[SpeculationOutput] = []
+        start = 0
+        for walk, count in zip(graph_walks, walk_counts, strict=True):
+            out.extend(self._speculate_walk(node_name, walk, rids[start:start + count]))
+            start += count
+        return out
 
     def _speculate_walk(
-        self, node_name: str, graph_walk: str, sample_rid: int,
+        self, node_name: str, graph_walk: str, rids: list[int],
     ) -> list[SpeculationOutput]:
         wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
-        wgio = self._queues[wg_id].per_request_queues.get(sample_rid)
+        queues = self._queues[wg_id].per_request_queues
+        wgio = queues.get(rids[0]) if rids else None
         if wgio is None:
             return []
         node = wgio.nodes[node_name]
@@ -715,6 +731,12 @@ class PythonGraphRuntime(GraphRuntime):
                     and info.node_name == node_name
                 ):
                     continue
+            if info.is_new_loop_iter and not any(
+                (r_wgio := queues.get(r)) is not None
+                and self._can_continue_loop(r, r_wgio, info, graph_walk)
+                for r in rids
+            ):
+                continue  # every row's loop ends with this iteration
             out.append(SpeculationOutput(
                 node_name=info.node_name, graph_walk=graph_walk,
                 is_new_loop_iter=info.is_new_loop_iter,
@@ -924,6 +946,8 @@ class PythonGraphRuntime(GraphRuntime):
         if not spec_info.is_new_loop_iter:
             return True
         if self.has_pending_loop_stop(rid, graph_walk, spec_info.loop_name):
+            return False
+        if (rid, graph_walk, spec_info.loop_name) in self._last_loop_iters:
             return False
         loop = wgio.loops.get(spec_info.loop_name)
         if loop is not None and (
@@ -1208,6 +1232,10 @@ class PythonGraphRuntime(GraphRuntime):
             self._pending_loop_stops.update(
                 PendingLoopStop(rid, graph_walk, name) for name in wanted
             )
+            if self._last_loop_iters:
+                self._last_loop_iters.difference_update(
+                    (rid, graph_walk, name) for name in wanted
+                )
             self._fan_out_loop_stops(rid, partition, wanted)
             stopped_rids.append(rid)
         return stopped_rids
@@ -1311,6 +1339,18 @@ class PythonGraphRuntime(GraphRuntime):
 
     def clear_pending_loop_stops(self):
         self._pending_loop_stops.clear()
+
+    def mark_last_loop_iters(
+        self, rids: list[int], graph_walks: list[str], loop_names: list[str],
+    ) -> None:
+        self._last_loop_iters.update(zip(rids, graph_walks, loop_names, strict=True))
+
+    def clear_last_loop_iters(self, rids: list[int]) -> None:
+        if self._last_loop_iters:
+            drop = set(rids)
+            self._last_loop_iters = {
+                mark for mark in self._last_loop_iters if mark[0] not in drop
+            }
 
     def complete_and_route_batch(
         self, input: RouteInput,

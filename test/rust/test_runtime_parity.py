@@ -2400,13 +2400,13 @@ def _chunk_runtime(which):
     return rt, book
 
 
-def _enter_chunk_walk(rt, seed_tick=True):
+def _enter_chunk_walk(rt, seed_tick=True, request_id="r1"):
     """What the conductor sends on entering the walk: the prompt, and the
     chunk Loop's loop-back seed."""
     from mstar.model.submodule_base import chunk_tick_name
 
     rid = rt.add_request(
-        request_id="r1", partition="default", graph_walk=CHUNK_WALK,
+        request_id=request_id, partition="default", graph_walk=CHUNK_WALK,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
         loop_caps={},
@@ -2509,6 +2509,98 @@ def test_re_entering_a_chunk_walk_needs_another_seed(which):
         [_spec("text_inputs", "llm"), _spec(chunk_tick_name("llm", CHUNK_WALK), "llm")],
     ))
     assert _ready(rt) == [("llm", CHUNK_WALK, [rid])]
+
+
+# --- last-iteration marks ----------------------------------------------------
+#
+# A row whose scheduled chunk is its last runs a loop iteration nothing follows,
+# so the step after it must not be speculated into another. The mark says so
+# before the stop that ends the loop exists.
+
+CHUNK_LOOP = "chunk_loop:llm:prefill_text"
+
+
+def _chunk_spec_targets(rt, rids):
+    return [
+        (t.node_name, t.is_new_loop_iter)
+        for t in rt.speculate_node("llm", [CHUNK_WALK], rids, [len(rids)])
+    ]
+
+
+def _chunk_prep(rt, rids):
+    return rt.prep_spec_rids(SpeculationPrepInput(
+        spec_node_name="llm", curr_node_name="llm", graph_walk=CHUNK_WALK,
+        rids=rids, room_for_continuing=None,
+        streaming_edges=[], streaming_edges_per_rid=[0] * len(rids),
+    )).ready_rids
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_row_on_its_last_iteration_offers_no_loop_back_target(which):
+    rt, _book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    rt.pop_rids("llm", CHUNK_WALK, [rid])
+    assert _chunk_spec_targets(rt, [rid]) == [("llm", True)]
+
+    rt.mark_last_loop_iters([rid], [CHUNK_WALK], [CHUNK_LOOP])
+    assert _chunk_spec_targets(rt, [rid]) == []
+    assert _chunk_prep(rt, [rid]) == []
+
+    rt.clear_last_loop_iters([rid])
+    assert _chunk_spec_targets(rt, [rid]) == [("llm", True)]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_speculation_searches_past_a_first_row_on_its_last_iteration(which):
+    """The first row ending its loop does not end the walk's speculation: the
+    target stays for the row that continues, and only that row is prepped."""
+    rt, _book = _chunk_runtime(which)
+    done = _enter_chunk_walk(rt, request_id="r1")
+    going = _enter_chunk_walk(rt, request_id="r2")
+    rt.pop_rids("llm", CHUNK_WALK, [done, going])
+    rt.mark_last_loop_iters([done], [CHUNK_WALK], [CHUNK_LOOP])
+
+    assert _chunk_spec_targets(rt, [done, going]) == [("llm", True)]
+    assert _chunk_prep(rt, [done, going]) == [going]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_mark_does_not_outlive_its_loop(which):
+    """Applying the loop's stop takes the mark with it, so a re-entered walk
+    speculates its chunks again."""
+    from mstar.model.submodule_base import chunk_tick_name
+
+    rt, book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt)
+    rt.mark_last_loop_iters([rid], [CHUNK_WALK], [CHUNK_LOOP])
+    rt.stop_loops_batched(
+        partition="default", graph_walk=CHUNK_WALK, last_node_run="llm",
+        loop_names=ParallelList([rid], [[CHUNK_LOOP]]),
+    )
+    _run_chunk(rt, book, rid, 1)
+    rt.clear_pending_loop_stops()
+
+    rt.ingest_inputs_batch(_ingest_block(
+        [rid, rid],
+        [_spec("text_inputs", "llm"), _spec(chunk_tick_name("llm", CHUNK_WALK), "llm")],
+    ))
+    rt.pop_rids("llm", CHUNK_WALK, [rid])
+    assert _chunk_spec_targets(rt, [rid]) == [("llm", True)]
+
+
+@pytest.mark.parametrize("which", ["python", "rust"])
+def test_a_mark_is_purged_with_its_request(which):
+    """Handles are recycled: a mark left behind would attach to the next
+    request given this handle."""
+    rt, _book = _chunk_runtime(which)
+    rid = _enter_chunk_walk(rt, request_id="r1")
+    rt.mark_last_loop_iters([rid], [CHUNK_WALK], [CHUNK_LOOP])
+    rt.remove_request(rid)
+
+    again = _enter_chunk_walk(rt, request_id="r2")
+    assert again == rid, "the case needs the handle recycled"
+    rt.pop_rids("llm", CHUNK_WALK, [again])
+    assert _chunk_spec_targets(rt, [again]) == [("llm", True)]
 
 
 def _chunk_loop(which, remote=True):

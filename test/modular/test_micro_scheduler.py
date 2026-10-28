@@ -1797,6 +1797,56 @@ def test_a_refused_chunk_waits_out_its_hold_and_runs_the_same_range():
     assert retry.chunk_ranges == {"p0": (0, 2, 10)}
 
 
+def _recording_marks(sched, manager):
+    """Bind ``manager``'s runtime and record the last-iteration marks the
+    scheduler hands it: ``marked`` as (rid, walk, loop), ``cleared`` as rids."""
+    marked, cleared = [], []
+    manager.runtime.mark_last_loop_iters = (
+        lambda rids, walks, loops: marked.extend(zip(rids, walks, loops, strict=True))
+    )
+    manager.runtime.clear_last_loop_iters = cleared.extend
+    sched.chunk_loop_walks = {NODE: frozenset({"prefill"})}
+    return marked, cleared
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_only_a_final_chunk_marks_its_loop_iteration_the_last():
+    """A row cut short of its prompt runs another chunk, so speculation may
+    follow it; one that finishes it does not. Decode rows are no chunk Loop's."""
+    from mstar.model.submodule_base import chunk_loop_name
+
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+    marked, _ = _recording_marks(sched, manager)
+
+    assert _next_batch(sched, manager).chunk_ranges == {"p0": (0, 2, 10)}
+    assert marked == []
+
+    whole = _combined_scheduler(_ChunkingEngine(max_bs=8, budget=64))
+    whole.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+    marked, _ = _recording_marks(whole, manager)
+
+    batch = _next_batch(whole, manager)
+    assert "p0" in batch.request_to_worker_graph and not batch.chunk_ranges, "it ran whole"
+    assert marked == [("p0", "prefill", chunk_loop_name(NODE, "prefill"))]
+
+
+@pytest.mark.usefixtures("no_chunk_floor")
+def test_a_refused_step_clears_its_last_iteration_marks():
+    """The marked iteration did not run; its retry is marked when scheduled."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, budget=64))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["p0"], walks={"p0": "prefill"})
+    marked, cleared = _recording_marks(sched, manager)
+    _next_batch(sched, manager)
+    assert [rid for rid, *_ in marked] == ["p0"]
+
+    sched.hold_requests(["p0"])
+    assert cleared == ["p0"]
+
+
 def test_a_request_removed_mid_prompt_leaves_no_chunk_state():
     sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p1": 4}))
     sched.get_tensor = lambda uuid: uuid

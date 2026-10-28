@@ -391,6 +391,14 @@ class RustGraphRuntime(GraphRuntime):
     def clear_pending_loop_stops(self):
         self._rust.clear_pending_loop_stops()
 
+    def mark_last_loop_iters(
+        self, rids: list[int], graph_walks: list[str], loop_names: list[str],
+    ) -> None:
+        self._rust.mark_last_loop_iters(rids, graph_walks, loop_names)
+
+    def clear_last_loop_iters(self, rids: list[int]) -> None:
+        self._rust.clear_last_loop_iters(rids)
+
     # --------- Inputs ----------
 
     def ingest_inputs_batch(
@@ -498,7 +506,8 @@ class RustGraphRuntime(GraphRuntime):
     # --------- Speculation ----------
 
     def speculate_node(
-        self, node_name: str, graph_walks: list[str], sample_rids: list[int],
+        self, node_name: str, graph_walks: list[str], rids: list[int],
+        walk_counts: list[int] | None = None,
     ) -> list[SpeculationOutput]:
         return [
             SpeculationOutput(
@@ -507,7 +516,7 @@ class RustGraphRuntime(GraphRuntime):
                 output_signals=tuple(signals),
             )
             for n, w, new_iter, loop_name, signals in self._rust.speculate_node(
-                node_name, graph_walks, sample_rids,
+                node_name, graph_walks, rids, walk_counts,
             )
         ]
 

@@ -10,7 +10,7 @@ from typing import Any, NamedTuple
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import min_chunk_tokens
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, RequestWalks
-from mstar.model.submodule_base import InputMetadata
+from mstar.model.submodule_base import InputMetadata, chunk_loop_name
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
     BatchBuilderType,
@@ -233,6 +233,12 @@ class PopReadyResult(NamedTuple):
 
 
 
+def runs_final_chunk(chunk: tuple[int, int, int] | None) -> bool:
+    """Whether a row with this ``(start, end, total)`` range ends its prompt.
+    No range means the row runs whole, which is also its last chunk."""
+    return chunk is None or chunk[1] >= chunk[2]
+
+
 class ChunkCursor(NamedTuple):
     """A scheduled chunk: where it starts, and where the one after it does."""
     start: int
@@ -308,6 +314,9 @@ class MicroScheduler:
         # The graph runtime, installed by the worker. Interning and the
         # (walk, node) -> worker graph index both live there.
         self.runtime: "GraphRuntime | None" = None
+        # node -> the walks whose prefill runs as a chunk Loop there; the
+        # worker installs the ones its graphs build
+        self.chunk_loop_walks: dict[str, frozenset[str]] = {}
         # Looks up the handle for a wire request id; the worker installs the
         # runtime's. Only the TP-follow messages need it -- everything else
         # here already holds handles. Defaults to the identity so a scheduler
@@ -1397,6 +1406,7 @@ class MicroScheduler:
                 result.scheduled, result.chunk_tokens or {}, request.row_tokens,
                 mid_prefill_starts or {}, speculative,
             )
+            self._mark_final_chunks(result.scheduled)
             result.scheduled.relabel_if_uniform()
         return result.scheduled
 
@@ -1461,6 +1471,23 @@ class MicroScheduler:
             if end < total:
                 batch.incomplete_node_rids.add(rid)
 
+    def _mark_final_chunks(self, batch: ScheduledBatch) -> None:
+        """Tell the runtime which rows run their chunk Loop's last iteration,
+        so the step after this one is not speculated into another."""
+        walks = self.chunk_loop_walks.get(batch.node_name)
+        if not walks or (not batch.request_walks and batch.graph_walk not in walks):
+            return
+        rids, row_walks = [], []
+        for rid in batch.request_to_worker_graph:
+            walk = batch.walk_of(rid)
+            if walk in walks and runs_final_chunk(batch.chunk_ranges.get(rid)):
+                rids.append(rid)
+                row_walks.append(walk)
+        if rids:
+            self.runtime.mark_last_loop_iters(
+                rids, row_walks, [chunk_loop_name(batch.node_name, w) for w in row_walks],
+            )
+
     def advance_chunk(self, rid: int, node_name: str, end: int) -> None:
         """A chunk ending at ``end`` landed; the last one ends the row's progress.
 
@@ -1492,6 +1519,9 @@ class MicroScheduler:
             for key, progress in self.chunk_progress.items():
                 if key[0] == rid and node_name in (None, key[1]):
                     progress.cursor = progress.cursor_spec = None
+        # a last-iteration mark is a lookahead too; the retry is marked again
+        if self.chunk_loop_walks:
+            self.runtime.clear_last_loop_iters(list(rids))
 
     def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
         """Park ``batch``, folding it into whatever already waits under this key.

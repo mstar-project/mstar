@@ -569,7 +569,8 @@ class GraphRuntime(ABC):
         state. Known handle-keyed maps: MicroScheduler.{failed_rids,
         admit_errors, held_until, backlog, pending_tp_follow_count} (purged by
         clear_rid), Worker.{_last_active, _pending_removes}, the runtime's
-        pending loop stops, and the tensor manager's per-request maps.
+        pending loop stops and last-iteration marks, and the tensor manager's
+        per-request maps.
         """
         pass
 
@@ -808,13 +809,20 @@ class GraphRuntime(ABC):
     def speculate_node(
         self, node_name: str,
         graph_walks: list[str],
-        sample_rids: list[int],
+        rids: list[int],
+        walk_counts: list[int] | None = None,
     ) -> list[SpeculationOutput]:
         """
         The nodes ready for speculation, checking against whether the node is
         async enabled (known internally, per walk) and TP async compatible,
-        construction. Takes one sample rid per walk; returns every walk's
-        targets, each naming its walk, for the caller to pick from.
+        construction. Returns every walk's targets, each naming its walk, for
+        the caller to pick from.
+
+        ``rids`` are the step's rows grouped by walk, ``walk_counts[i]`` of
+        them for ``graph_walks[i]`` (None: one per walk). The first sets the
+        targets; a loop-back target is kept only if some row of the walk can
+        run another iteration of that loop, so a walk whose first row is on
+        its last iteration still speculates for the rest.
         """
         pass
 
@@ -928,6 +936,27 @@ class GraphRuntime(ABC):
     @abstractmethod
     def clear_pending_loop_stops(self):
         """Pending stops are good for one iteration only."""
+        pass
+
+    @abstractmethod
+    def mark_last_loop_iters(
+        self, rids: list[int], graph_walks: list[str], loop_names: list[str],
+    ) -> None:
+        """Row ``i``'s most recently scheduled iteration of ``loop_names[i]``
+        (under ``graph_walks[i]``) is its last: speculation offers no iteration
+        after it.
+
+        Only speculation reads this. The loop still ends by its stop, so a
+        mark left on an iteration that never ran cannot end a loop early; it
+        costs at most a step that is not speculated. A mark goes when that
+        loop's stop is applied, on ``clear_last_loop_iters`` and on removal.
+        """
+        pass
+
+    @abstractmethod
+    def clear_last_loop_iters(self, rids: list[int]) -> None:
+        """Drop every mark of ``rids``: the iteration marked did not run, and
+        its retry is marked again when scheduled."""
         pass
 
     @abstractmethod

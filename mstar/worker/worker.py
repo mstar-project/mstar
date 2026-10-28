@@ -96,7 +96,12 @@ from mstar.utils.profiler import (
     range_push,
 )
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
-from mstar.worker.micro_scheduler import MicroScheduler, MidPrefillRow, ScheduledBatch
+from mstar.worker.micro_scheduler import (
+    MicroScheduler,
+    MidPrefillRow,
+    ScheduledBatch,
+    runs_final_chunk,
+)
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.worker_metrics import WorkerMetrics
 
@@ -631,6 +636,10 @@ class Worker:
         # Request ids are strings on the wire and ints (handles) inside this
         # worker; the runtime holds the table where the two meet.
         self.scheduler.runtime = self._graph_runtime
+        self.scheduler.chunk_loop_walks = {
+            node: frozenset(w for n, w in self._chunk_loop_walks if n == node)
+            for node, _ in self._chunk_loop_walks
+        }
         self.scheduler.rid_of = self._rid
         self.scheduler.get_tensor = self.tensor_manager.get_tensor
         self.tensor_manager.rid_to_str = self._rid_str
@@ -2919,11 +2928,18 @@ class Worker:
     def _choose_spec_target(self, batch: ScheduledBatch) -> SpeculationTarget | None:
         """The (node, walk) the step after ``batch`` speculates into, with the
         rids of ``batch`` on that walk; None when nothing can be speculated."""
-        # One sample rid per real walk; the runtime filters eligibility per walk,
-        # prep_spec_rids the loop completion per rid.
+        # Every row, grouped by real walk: the runtime filters eligibility per
+        # walk and drops a loop-back no row can take; prep_spec_rids the loop
+        # completion per rid.
         groups = batch.rids_by_walk()
+        if len(groups) == 1:
+            rows = next(iter(groups.values()))
+            counts = None if len(rows) == 1 else [len(rows)]
+        else:
+            rows = [rid for walk_rids in groups.values() for rid in walk_rids]
+            counts = [len(walk_rids) for walk_rids in groups.values()]
         ready_for_spec = self._graph_runtime.speculate_node(
-            batch.node_name, list(groups), [rids[0] for rids in groups.values()],
+            batch.node_name, list(groups), rows, counts,
         )
         if not ready_for_spec:
             return None
@@ -3875,8 +3891,7 @@ class Worker:
             if (node, walk) not in self._chunk_loop_walks:
                 continue
             loop_name = chunk_loop_name(node, walk)
-            chunk = batch_N.batch.chunk_ranges.get(rid)
-            if chunk is None or chunk[1] >= chunk[2]:
+            if runs_final_chunk(batch_N.batch.chunk_ranges.get(rid)):
                 stops.setdefault(rid, set()).add(loop_name)
             else:
                 stops.pop(rid, None)
