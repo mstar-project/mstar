@@ -31,9 +31,29 @@ TINY = dict(
 )
 
 
-def _checkpoint(tmp_path):
+FP8_BLOCK = (128, 128)
+FP8_CONFIG = {"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+              "weight_block_size": list(FP8_BLOCK)}
+
+
+def _fp8(w):
+    """e4m3 values and a bf16 scale per 128 x 128 block (Qwen's FP8 checkpoints), and the weight
+    they mean."""
+    from mstar.utils.fp8_block import dequantize_fp8_block_weight
+
+    bo, bi = FP8_BLOCK
+    rows, cols = w.shape
+    blocks = w.float().view(rows // bo, bo, cols // bi, bi)
+    scale = (blocks.abs().amax(dim=(1, 3)) / 448.0).clamp(min=1e-8).to(torch.bfloat16)
+    q = (blocks / scale.float()[:, None, :, None]).to(torch.float8_e4m3fn).view(rows, cols)
+    return q, scale, dequantize_fp8_block_weight(q, scale, FP8_BLOCK, torch.float32)
+
+
+def _checkpoint(tmp_path, fp8=False):
     """HF's model at random weights, its lm_head scaled so greedy choices are not near-ties,
-    saved under the checkpoint's own key names (one tensor per expert)."""
+    saved under the checkpoint's own key names (one tensor per expert). With ``fp8`` every
+    projection is stored as Qwen's FP8 checkpoints store it, and the reference holds the weights
+    that checkpoint means."""
     from safetensors.torch import save_file
     from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
@@ -52,11 +72,33 @@ def _checkpoint(tmp_path):
                 state[key.replace("down_proj", f"{e}.down_proj.weight")] = value[e]
         else:
             state[key] = value
-    save_file({k: v.detach().to(DTYPE).contiguous() for k, v in state.items()}, str(tmp_path / "model.safetensors"))
-    (tmp_path / "config.json").write_text(json.dumps({**TINY, "model_type": "qwen3_moe"}))
+    state = {k: v.detach().to(DTYPE) for k, v in state.items()}
+    config = {**TINY, "model_type": "qwen3_moe"}
+    meant = {}
+    if fp8:
+        config["quantization_config"] = FP8_CONFIG
+        for key in [k for k in state if k.endswith("_proj.weight")]:
+            q, scale, meant[key] = _fp8(state[key])
+            state[key] = q
+            state[key.removesuffix("weight") + "weight_scale_inv"] = scale
+    save_file({k: v.contiguous() for k, v in state.items()}, str(tmp_path / "model.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps(config))
     (tmp_path / "generation_config.json").write_text(json.dumps({"do_sample": False, "eos_token_id": [7]}))
-    # the reference runs in fp32 from the same bf16-rounded weights
-    return hf.to(DTYPE).float().to(DEVICE)
+    # the reference runs in fp32 from the weights the checkpoint holds: bf16-rounded, and the
+    # fp8 projections dequantized
+    reference = {}
+    for key, value in hf.state_dict().items():
+        if key.endswith(".experts.gate_up_proj") and meant:  # transformers 5 stacks the experts
+            reference[key] = torch.stack([torch.cat([
+                meant[key.replace("gate_up_proj", f"{e}.gate_proj.weight")],
+                meant[key.replace("gate_up_proj", f"{e}.up_proj.weight")]]) for e in range(value.shape[0])])
+        elif key.endswith(".experts.down_proj") and meant:
+            reference[key] = torch.stack([meant[key.replace("down_proj", f"{e}.down_proj.weight")]
+                                          for e in range(value.shape[0])])
+        else:
+            reference[key] = meant.get(key, value.detach().to(DTYPE).float())
+    hf.load_state_dict(reference)
+    return hf.float().to(DEVICE)
 
 
 class _Node:
@@ -119,15 +161,11 @@ class _Node:
             resource.cleanup()
 
 
-def test_packed_prefill_and_batched_decode_match_hf(tmp_path):
-    from mstar.model.text_lm.text_lm_model import TextLMModel
-
-    hf = _checkpoint(tmp_path)
-    model = TextLMModel(model_path_hf=str(tmp_path), max_seq_len=1024, accelerator_graph=False)
-    sub = model.get_submodule(LLM_NODE, device="cuda", autocast_dtype=DTYPE)
-    assert model.stop_token_ids == frozenset({7})  # no tokenizer files: the configs alone
+def _step_against_hf(model, sub, hf) -> float:
+    """Two prompts of different lengths (one spanning several 16-token pages) packed in one
+    prefill, then 6 batched decode steps; each step's greedy tokens must be HF's. Returns the
+    worst logit error relative to the row's largest."""
     torch.manual_seed(1)
-    # two prompts of different lengths, one spanning several 16-token pages
     prompts = [torch.randint(0, TINY["vocab_size"], (n,), device=DEVICE) for n in (37, 5)]
     node = _Node(model, sub, ["a", "b"])
     seqs = [p.clone() for p in prompts]
@@ -143,7 +181,39 @@ def test_packed_prefill_and_batched_decode_match_hf(tmp_path):
                     assert int(tokens[i]) == int(ref.argmax()), (step, i)
             seqs = [torch.cat([s, t.view(1)]) for s, t in zip(seqs, tokens, strict=True)]
             logits, tokens = node.step(DECODE_WALK, [t.view(1) for t in tokens])
-        # bf16 weights and activations against an fp32 reference from the same weights
-        assert worst < 0.03, worst
+        return worst
     finally:
         node.close()
+
+
+def test_packed_prefill_and_batched_decode_match_hf(tmp_path):
+    from mstar.model.text_lm.text_lm_model import TextLMModel
+
+    hf = _checkpoint(tmp_path)
+    model = TextLMModel(model_path_hf=str(tmp_path), max_seq_len=1024, accelerator_graph=False)
+    sub = model.get_submodule(LLM_NODE, device="cuda", autocast_dtype=DTYPE)
+    assert model.stop_token_ids == frozenset({7})  # no tokenizer files: the configs alone
+    # bf16 weights and activations against an fp32 reference from the same weights
+    worst = _step_against_hf(model, sub, hf)
+    assert worst < 0.03, worst
+
+
+@pytest.mark.parametrize("quant_kernels", ["auto", "reference"])
+def test_an_fp8_checkpoint_steps_like_hf_on_the_weights_it_means(tmp_path, quant_kernels):
+    """The same model in Qwen's FP8 format (e4m3 projections, bf16 scales per 128 x 128 block),
+    loaded through its quantization method and cast as the worker casts a submodule: the routed
+    experts stay fp8, through the fused W8A8 kernel (``auto``) or the dequantizing reference loop,
+    and the attention projections load dequantized. The reference is HF in fp32 on the weights the
+    checkpoint means; the fused kernel adds its activations' fp8 rounding (worst 0.0135 of the
+    row's largest logit on an H100, the reference loop 0.0112, bf16 above 0.0064)."""
+    from mstar.model.text_lm.text_lm_model import TextLMModel
+
+    hf = _checkpoint(tmp_path, fp8=True)
+    model = TextLMModel(model_path_hf=str(tmp_path), max_seq_len=1024, accelerator_graph=False,
+                        quant_kernels=quant_kernels)
+    sub = model.get_submodule(LLM_NODE, device="cuda", autocast_dtype=DTYPE).to(device=DEVICE, dtype=DTYPE)
+    experts = sub.lm.layers[0].mlp.experts
+    assert experts.fused == (quant_kernels == "auto")
+    assert experts.gate_up_proj_scale_inv.dtype == torch.float32  # the cast left the scales alone
+    worst = _step_against_hf(model, sub, hf)
+    assert worst < 0.03, worst

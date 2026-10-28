@@ -1,0 +1,16 @@
+model: "qwen3_coder_30b_a3b_fp8"
+# Qwen3-Coder-30B-A3B-Instruct-FP8 on one 80 GB GPU: ~30 GiB of weights (the routed experts
+# fp8 with 128 x 128 block scales, the attention projections dequantized to bf16 at load).
+# The model takes 256k positions; this deployment serves 32k per request
+# (model_kwargs.max_seq_len is the bound the model enforces).
+max_seq_len: 32768
+model_kwargs:
+  max_seq_len: 32768
+resources:
+  kv_cache:
+    # 96 KiB a token (48 layers x 4 KV heads x 128 dims x K and V x bf16):
+    # 3072 pages of 128 tokens = 393k tokens, 36 GiB, three times the bf16 deployment's.
+    max_num_pages: 3072
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]

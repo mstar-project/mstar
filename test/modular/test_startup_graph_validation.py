@@ -842,12 +842,14 @@ def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
 
 def _text_lm(name, model_kwargs, tmp_path, monkeypatch):
     # the checkpoint's config.json alone: the graph and resources read only its geometry
-    from test_text_lm_model import CODER
+    from test_text_lm_model import CODER, FP8_QUANT
     config = CODER if "coder" in name else {
         **{k: v for k, v in CODER.items() if k not in ("num_experts", "num_experts_per_tok",
                                                      "moe_intermediate_size", "decoder_sparse_step")},
         "model_type": "qwen3",
     }
+    if name.endswith("_fp8"):
+        config = {**config, "quantization_config": FP8_QUANT}
     (tmp_path / "config.json").write_text(json.dumps(config))
     return _constructed(name, model_kwargs, checkpoint_path=str(tmp_path))
 

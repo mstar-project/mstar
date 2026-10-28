@@ -1514,7 +1514,13 @@ names to roles:
 
 ``kernels`` (``auto``, ``fused``, ``reference``) is the one switch: ``reference`` dequantizes per
 call (eager; the parity anchor), ``fused`` refuses to load where no fused kernel serves the format.
-GLM-5.2 (``mstar/model/glm52``) is the worked example.
+GLM-5.2 (``mstar/model/glm52``) is the worked example. The generic text LM
+(``mstar/model/text_lm``) does all of this for any checkpoint it serves: its family names a
+weight's role from its checkpoint name (``LMFamily.quant_role``), and a softmax top-k MoE takes
+its experts from ``instantiate_moe_block(..., quant=...)``, so Qwen3-Coder-30B-A3B-Instruct-FP8
+is a registry line and a config (``model_kwargs.quant_kernels`` is the switch above). The fp8
+experts' tiles come from the ``moe_gemm`` kernel table under dtype ``float8_e4m3fn`` (see
+"Tuned kernel configs").
 
 .. _step-5:
 

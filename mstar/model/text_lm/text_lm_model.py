@@ -3,7 +3,10 @@
 The checkpoint's ``model_type`` picks the language-model family (``config.LM_FAMILIES``):
 its config, its module and its weight names are all that differ between models here. The
 graph (a prefill, then a decode loop), the resources (paged KV, attention, RoPE positions,
-sampler), the chat template, stop handling and prefix-cache keys are shared.
+sampler), the chat template, stop handling and prefix-cache keys are shared. So is reading a
+quantized checkpoint: its ``quantization_config`` picks the quantization method
+(``mstar.model.components.quantization``), which the family's module builds its quantized
+layers from, and which reads the stored weights.
 """
 from __future__ import annotations
 
@@ -38,6 +41,7 @@ from mstar.model.base import (
     ProcessPromptOutput,
     Span,
 )
+from mstar.model.components.quantization import quant_method_for
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.text_lm.config import (
@@ -78,6 +82,7 @@ class TextLMModel(Model):
         max_output_tokens: int = 4096,
         accelerator_graph: bool = True,
         prefill_token_buckets: list[int] | None = None,
+        quant_kernels: str = "auto",
         **kwargs,
     ):
         self.cache_dir = cache_dir
@@ -88,6 +93,9 @@ class TextLMModel(Model):
             raise ValueError(f"no text LM family serves model_type {model_type!r}; known: {sorted(LM_FAMILIES)}")
         self.family = LM_FAMILIES[model_type]
         self.config = self.family.config(hf)
+        # None for an unquantized checkpoint; quant_kernels is QuantMethod.kernels (auto, fused,
+        # reference), the same switch for every model
+        self.quant = quant_method_for(hf.get("quantization_config"), kernels=quant_kernels)
         if not 0 < max_seq_len <= self.config.max_position_embeddings:
             raise ValueError(
                 f"max_seq_len {max_seq_len} must be in 1..{self.config.max_position_embeddings}"
@@ -353,20 +361,38 @@ class TextLMModel(Model):
             return None
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.text_lm.submodules import TextLMSubmodule
+        from mstar.model.utils import process_weights_after_loading
 
         with torch.device("meta"):
-            lm = self.family.build(self.config, comm_group=tp_group, moe_parallel=moe_parallel)
+            lm = self.family.build(self.config, comm_group=tp_group, moe_parallel=moe_parallel, quant=self.quant)
         if autocast_dtype is not None:
             lm = lm.to(autocast_dtype)
         lm.to_empty(device=device)
         weights = iter_safetensors_shards(self.local_dir, device=device)
+        if self.quant is not None:
+            # held parts pass through as stored, the rest arrive dequantized as one <base>.weight
+            weights = self.quant.checkpoint_stream(
+                weights, self.family.quant_role, out_dtype=autocast_dtype or torch.float32)
+        else:
+            weights = _refuse_quantized(weights)
         lm.load_weights(
             (name, tensor) for key, tensor in weights
             if (name := self.family.weight_name(key)) is not None
         )
+        process_weights_after_loading(lm, torch.device(device))
         lm.eval()
         return TextLMSubmodule(
             lm, stop_token_ids=self.stop_token_ids, accelerator_graph=self.accelerator_graph,
             prefill_token_buckets=self.prefill_token_buckets,
         )
 
+
+def _refuse_quantized(weights):
+    """Without a ``quantization_config`` an fp8 checkpoint would load its bytes unscaled and drop
+    its scales as unmatched keys: refuse it instead."""
+    from mstar.model.components.quantization.formats import is_quantized_dtype
+
+    for name, tensor in weights:
+        if is_quantized_dtype(tensor.dtype) or name.endswith("_scale_inv"):
+            raise ValueError(f"{name} is stored {tensor.dtype}, but config.json has no quantization_config")
+        yield name, tensor

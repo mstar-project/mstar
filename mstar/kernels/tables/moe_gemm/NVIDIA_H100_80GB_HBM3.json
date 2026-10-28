@@ -127,6 +127,48 @@
         "2048": {"us": 534.9, "default_us": 860.6},
         "4096": {"us": 728.2, "default_us": 1469.4}
       }
+    },
+    {
+      "dtype": "float8_e4m3fn",
+      "shape": {"E": 128, "K": 2048, "N": 1536, "top_k": 8},
+      "backend": "triton",
+      "provenance": {"device": "NVIDIA H100 80GB HBM3", "arch": "sm_90", "date": "2026-10-28", "harness": "python -m benchmark.kernels.sweep moe_gemm --dtype float8_e4m3fn --shape E=128,N=1536,K=2048,top_k=8", "torch": "2.12.1+cu129", "triton": "3.7.1", "mstar": "c4e779090", "note": "Qwen3-Coder-30B-A3B-Instruct-FP8 routed experts, TP1; buckets within 2% of the default keep it (--min-gain)"},
+      "rows": {
+        "1": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5, "down": {"num_stages": 4}},
+        "2": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 4, "down": {"num_stages": 3}},
+        "4": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 3, "down": {"BLOCK_SIZE_N": 128, "num_stages": 2}},
+        "8": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5, "down": {"BLOCK_SIZE_N": 128, "num_stages": 3}},
+        "16": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5, "down": {"BLOCK_SIZE_N": 128, "num_stages": 3}},
+        "24": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5, "down": {"BLOCK_SIZE_N": 128, "num_stages": 3}},
+        "32": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 4, "num_stages": 3, "down": {}},
+        "48": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 4, "num_stages": 3, "down": {}},
+        "64": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 4, "num_stages": 3, "down": {}},
+        "96": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 4, "num_stages": 3, "down": {}},
+        "128": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 4, "num_stages": 3, "down": {}},
+        "256": {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 3, "down": {"num_stages": 4}},
+        "512": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 4, "num_stages": 3, "down": {}},
+        "1024": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 4, "down": {"GROUP_SIZE_M": 8}},
+        "2048": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 8, "num_warps": 4, "num_stages": 4, "down": {"num_stages": 3}},
+        "4096": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 4, "num_stages": 3, "down": {}}
+      },
+      "measured": {
+        "1": {"us": 19.7, "default_us": 23.1},
+        "2": {"us": 31.9, "default_us": 34.3},
+        "4": {"us": 55.8, "default_us": 59.8},
+        "8": {"us": 92.6, "default_us": 94.7},
+        "16": {"us": 141.0, "default_us": 144.0},
+        "24": {"us": 169.6, "default_us": 173.2},
+        "32": {"us": 187.8, "default_us": 187.7},
+        "48": {"us": 207.5, "default_us": 207.2},
+        "64": {"us": 213.3, "default_us": 213.3},
+        "96": {"us": 218.9, "default_us": 219.0},
+        "128": {"us": 220.8, "default_us": 220.8},
+        "256": {"us": 235.9, "default_us": 243.3},
+        "512": {"us": 249.9, "default_us": 249.9},
+        "1024": {"us": 281.4, "default_us": 289.0},
+        "2048": {"us": 397.5, "default_us": 413.7},
+        "4096": {"us": 682.4, "default_us": 681.7}
+      }
     }
   ]
 }

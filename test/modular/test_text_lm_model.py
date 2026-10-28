@@ -48,6 +48,11 @@ def test_registry_cli_and_adapter_agree():
     assert HF_MODELS["qwen3_coder_30b_a3b"]["model_path_hf"] == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
     assert DEFAULT_CONFIGS["qwen3_coder_30b_a3b"] == "qwen3_coder_30b_a3b.yaml"
     assert isinstance(get_adapter("qwen3_coder_30b_a3b"), TextChatAdapter)
+    # the FP8 checkpoint: the same model class, its own repo and config
+    assert get_model_class("qwen3_coder_30b_a3b_fp8") is TextLMModel
+    assert HF_MODELS["qwen3_coder_30b_a3b_fp8"]["model_path_hf"] == "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+    assert DEFAULT_CONFIGS["qwen3_coder_30b_a3b_fp8"] == "qwen3_coder_30b_a3b_fp8.yaml"
+    assert isinstance(get_adapter("qwen3_coder_30b_a3b_fp8"), TextChatAdapter)
     # Qwen3 dense, on the same model
     for size in ("0.6", "1.7", "4", "8"):
         name = f"qwen3_{size}b"
@@ -77,6 +82,85 @@ def test_a_dense_qwen3_checkpoint_is_served_too(tmp_path):
     model = TextLMModel(model_path_hf=_checkpoint(tmp_path, {**dense, "model_type": "qwen3"}))
     assert model.config.num_experts == 0 and not model.prebuild_fused_moe
     assert _model(tmp_path).prebuild_fused_moe
+
+
+# Qwen3-Coder-30B-A3B-Instruct-FP8's quantization_config (its modules_to_not_convert, which names
+# only the router, norms and head, cut)
+FP8_QUANT = {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8", "weight_block_size": [128, 128]}
+
+
+def test_a_quantized_checkpoint_picks_its_method(tmp_path):
+    from mstar.model.components.quantization import Fp8Block
+
+    assert _model(tmp_path).quant is None
+    fp8 = TextLMModel(model_path_hf=_checkpoint(tmp_path, {**CODER, "quantization_config": FP8_QUANT}))
+    fmt = fp8.quant.format_for("routed_experts")
+    assert isinstance(fmt, Fp8Block) and fmt.block == (128, 128) and fmt.scale_name == "weight_scale_inv"
+    assert fp8.quant.keeps_quantized("routed_experts") and not fp8.quant.keeps_quantized("linear")
+    assert fp8.quant.kernels == "auto"
+    ref = TextLMModel(model_path_hf=_checkpoint(tmp_path, {**CODER, "quantization_config": FP8_QUANT}),
+                      quant_kernels="reference")
+    assert ref.quant.kernels == "reference"
+    with pytest.raises(ValueError, match="quant kernels"):
+        TextLMModel(model_path_hf=_checkpoint(tmp_path, {**CODER, "quantization_config": FP8_QUANT}),
+                    quant_kernels="fast")
+    with pytest.raises(ValueError, match="awq"):
+        TextLMModel(model_path_hf=_checkpoint(tmp_path, {**CODER, "quantization_config": {"quant_method": "awq"}}))
+
+
+def test_fp8_bytes_without_a_quantization_config_are_refused():
+    from mstar.model.text_lm.text_lm_model import _refuse_quantized
+
+    plain = [("model.norm.weight", torch.ones(4, dtype=torch.bfloat16))]
+    assert list(_refuse_quantized(iter(plain))) == plain
+    fp8 = plain + [("model.layers.0.self_attn.q_proj.weight", torch.zeros(4, 4, dtype=torch.float8_e4m3fn))]
+    with pytest.raises(ValueError, match="quantization_config"):
+        list(_refuse_quantized(iter(fp8)))
+
+
+def test_an_fp8_checkpoint_loads_through_its_method(tmp_path):
+    """A tiny Qwen3-MoE in Qwen's FP8 format on disk, through TextLMModel: the experts held fp8
+    in the quantized block, the rest dequantized at load, and the logits HF's on the weights the
+    checkpoint means. The engine's post-load dtype cast leaves the stored parts alone."""
+    pytest.importorskip("transformers")
+    from safetensors.torch import save_file
+    from test_qwen3_lm import (
+        FP8_CONFIG,
+        TINY_MOE,
+        _check_prefill_and_decode,
+        _FakeKVAttention,
+        _FakeRope,
+        _fp8_checkpoint,
+        _load_meant,
+        _moe_pair,
+    )
+
+    from mstar.model.text_lm.config import ATTN, KV_CACHE, ROPE
+
+    hf, _ = _moe_pair()
+    keys, meant = _fp8_checkpoint(hf.state_dict())
+    _load_meant(hf, meant)
+    save_file({("model." + k if not k.startswith("lm_head") else k): v.contiguous() for k, v in keys},
+              str(tmp_path / "model.safetensors"))
+    (tmp_path / "config.json").write_text(json.dumps(
+        {**TINY_MOE, "model_type": "qwen3_moe", "quantization_config": FP8_CONFIG}))
+    model = TextLMModel(model_path_hf=str(tmp_path), max_seq_len=64, accelerator_graph=False)
+    sub = model.get_submodule(LLM_NODE, device="cpu")
+    lm = sub.lm
+    moe = lm.layers[0].mlp
+    assert type(moe).__name__ == "QuantizedSparseMoeBlock" and moe.experts.fused is False
+    assert moe.experts.gate_up_proj_fp8.dtype == torch.uint8
+    assert lm.layers[0].self_attn.qkv_proj.weight.dtype == torch.float32  # dequantized at load
+    fake, rope = _FakeKVAttention(), _FakeRope()
+    for module in lm.modules():
+        if hasattr(module, "bind_resources") and module is not lm:
+            module.bind_resources({ATTN: fake, KV_CACHE: fake, ROPE: rope})
+    _check_prefill_and_decode(hf, lm, rope, TINY_MOE["vocab_size"], atol=1e-4)
+    scales = moe.experts.down_proj_scale_inv.detach().clone()
+    sub.to(dtype=torch.bfloat16)  # as the engine's worker does after loading
+    assert lm.layers[0].self_attn.qkv_proj.weight.dtype == torch.bfloat16
+    assert moe.experts.down_proj_scale_inv.dtype == torch.float32
+    assert torch.equal(moe.experts.down_proj_scale_inv, scales)
 
 
 @pytest.mark.parametrize("change,match", [

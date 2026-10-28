@@ -36,6 +36,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "parakeet": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_coder_30b_a3b": ("mstar.model.text_lm.text_lm_model", "TextLMModel"),
+    "qwen3_coder_30b_a3b_fp8": ("mstar.model.text_lm.text_lm_model", "TextLMModel"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_asr": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
     "qwen3_asr_realtime": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
@@ -145,6 +146,9 @@ HF_MODELS: dict[str, dict] = {
     # Qwen3-Coder-30B-A3B-Instruct: the Qwen3-MoE decoder (48 layers, 128 experts, top-8,
     # GQA 32/4), bf16 (~61 GB), served by the generic text LM on one 80 GB GPU.
     "qwen3_coder_30b_a3b": {"model_path_hf": "Qwen/Qwen3-Coder-30B-A3B-Instruct"},
+    # The same model, fp8 with 128 x 128 block scales (~31 GB): the routed experts stay fp8,
+    # the attention projections load dequantized to bf16.
+    "qwen3_coder_30b_a3b_fp8": {"model_path_hf": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
     # Qwen3-ASR: AuT audio encoder + dense Qwen3 decoder. ``qwen3_asr`` is
     # the 1.7B transcription model, ``qwen3_asr_realtime`` the 0.6B variant

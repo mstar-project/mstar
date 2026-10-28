@@ -34,6 +34,7 @@ from mstar.model.components.norm import RMSNorm
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
+    from mstar.model.components.quantization import QuantMethod
 
 
 class Qwen3Attention(ParallelAttention):
@@ -241,7 +242,9 @@ class Qwen3DenseLM(nn.Module):
 class Qwen3MoeLM(Qwen3DenseLM):
     """HF's ``Qwen3MoeForCausalLM``: the dense decoder with a softmax top-k routed-expert block
     (no shared expert) in place of the MLP on every layer ``is_moe_layer`` names. The experts
-    split by ``moe_parallel`` (TP by default, or EP)."""
+    split by ``moe_parallel`` (TP by default, or EP). ``quant`` is a quantized checkpoint's
+    method: the experts it keeps quantized stay in their stored format (Qwen's FP8 checkpoints:
+    fp8 with 128 x 128 block scales)."""
 
     def __init__(
         self,
@@ -252,6 +255,7 @@ class Qwen3MoeLM(Qwen3DenseLM):
         pos_key: str,
         comm_group: CommGroup | None = None,
         moe_parallel: MoeParallelConfig | None = None,
+        quant: QuantMethod | None = None,
     ):
         from mstar.model.components.moe_parallel import MoeParallelConfig
 
@@ -260,8 +264,10 @@ class Qwen3MoeLM(Qwen3DenseLM):
         moe_parallel = moe_parallel or MoeParallelConfig()
         if moe_parallel.mask_padding or moe_parallel.log_expert_load_every:
             raise ValueError("Qwen3MoeLM does not mask padding rows or log expert load")
-        # a plain attribute, set first: the base __init__ builds the layers through _make_mlp
+        # plain attributes, set first: the base __init__ builds the layers through _make_mlp
         self.moe_parallel = moe_parallel
+        self.quant = quant
+        self._quantized_experts = quant is not None and quant.keeps_quantized("routed_experts")
         super().__init__(config, attn_key=attn_key, kv_key=kv_key, pos_key=pos_key, comm_group=comm_group)
 
     def _make_mlp(self, layer_idx: int, comm_group: CommGroup) -> nn.Module:
@@ -277,19 +283,29 @@ class Qwen3MoeLM(Qwen3DenseLM):
             norm_topk_prob=self.config.norm_topk_prob,
             comm_group=comm_group,
             moe_parallel=self.moe_parallel,
+            quant=self.quant,
         )
 
     def _stacked_params(self) -> list:
         from mstar.model.loader import LLAMA_STACKED_PARAMS, hf_expert_stacked_params
 
-        return hf_expert_stacked_params(self.config.num_experts) + LLAMA_STACKED_PARAMS
+        if self._quantized_experts:
+            experts = self.quant.expert_rules(self.config.num_experts, lambda proj, i: f".experts.{i}.{proj}")
+        else:
+            experts = hf_expert_stacked_params(self.config.num_experts)
+        return experts + LLAMA_STACKED_PARAMS
 
     def load_weights(self, weights) -> set[str]:
-        """As the dense LM's, and every expert's three projections must arrive: one of them
-        fills a slice of a stacked parameter, which counts as loaded after its first."""
+        """As the dense LM's, and every stored tensor of every expert's three projections must
+        arrive: one of them fills a slice of a stacked parameter, which counts as loaded after
+        its first."""
         import re
 
-        expert_key = re.compile(r"^layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$")
+        parts = ["weight"]
+        if self._quantized_experts:
+            parts = [p.checkpoint for p in self.quant.format_for("routed_experts").parts]
+        expert_key = re.compile(
+            r"^layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.(" + "|".join(parts) + r")$")
         seen: set[str] = set()
 
         def tally(pairs):
@@ -300,7 +316,7 @@ class Qwen3MoeLM(Qwen3DenseLM):
 
         loaded = super().load_weights(tally(weights))
         moe_layers = sum(self.config.is_moe_layer(i) for i in range(self.config.num_hidden_layers))
-        missing = 3 * self.config.num_experts * moe_layers - len(seen)
+        missing = 3 * len(parts) * self.config.num_experts * moe_layers - len(seen)
         if missing:
             raise RuntimeError(f"Qwen3-MoE checkpoint left {missing} expert weight(s) unloaded")
         return loaded

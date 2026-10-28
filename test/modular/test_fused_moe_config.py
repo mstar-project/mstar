@@ -110,6 +110,17 @@ def test_the_triton_backend_takes_fp8_experts_in_whole_scale_blocks():
     assert triton.unavailable(torch.device("cpu"), FP8_DTYPE, FP8_SHAPE) is not None
 
 
+def test_the_h100_table_holds_qwen3_coder_fp8_experts():
+    """Qwen3-Coder-30B-A3B-Instruct-FP8's experts at TP1, swept for fused_experts_fp8: every row
+    keeps the scale block's BLOCK_SIZE_K."""
+    path = table.TABLE_DIR / "moe_gemm" / "NVIDIA_H100_80GB_HBM3.json"
+    (entry,) = [e for e in table.load_table(path, "moe_gemm") if e.dtype == "float8_e4m3fn"]
+    assert dict(entry.shape) == {"E": 128, "N": 1536, "K": 2048, "top_k": 8}
+    assert entry.buckets() == (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 2048, 4096)
+    for _, row in entry.rows:
+        assert row["BLOCK_SIZE_K"] == 128 and row["down"].get("BLOCK_SIZE_K", 128) == 128
+
+
 def test_command_a_plus_keeps_its_gb200_tiles():
     """The GB200 table moved into the registry's format with the same rows (#377's file)."""
     path = table.TABLE_DIR / "moe_gemm" / "NVIDIA_GB200.json"

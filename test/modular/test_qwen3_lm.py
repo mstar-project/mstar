@@ -290,3 +290,129 @@ def test_the_position_resource_says_when_a_layer_may_fuse_its_rope(overrides, he
         device=torch.device("cpu"), head_dim=head_dim,
     )
     assert rope.fusable_rope_theta(head_dim) == (1e6 if fusable else None)
+
+
+# ---- fp8 block-scale checkpoints: Qwen's FP8 format (e4m3 projections, a bf16 weight_scale_inv
+# per block; router, norms, embedding and head unquantized), at blocks the tiny dims divide
+
+FP8_BLOCK = (8, 8)
+FP8_CONFIG = {"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+              "weight_block_size": list(FP8_BLOCK)}
+
+
+def _fp8_quantize(w: torch.Tensor, block=FP8_BLOCK) -> tuple[torch.Tensor, torch.Tensor]:
+    """e4m3 values and the bf16 per-block scale, ``w ~ fp8 * scale``, as the checkpoints store them."""
+    bo, bi = block
+    rows, cols = w.shape
+    blocks = w.float().view(rows // bo, bo, cols // bi, bi)
+    scale = (blocks.abs().amax(dim=(1, 3)) / 448.0).clamp(min=1e-8).to(torch.bfloat16)
+    q = (blocks / scale.float()[:, None, :, None]).to(torch.float8_e4m3fn).view(rows, cols)
+    return q, scale
+
+
+def _fp8_checkpoint(state: dict) -> tuple[list, dict]:
+    """``_checkpoint_keys`` as an FP8 checkpoint stores them, and the fp32 weights it means."""
+    from mstar.utils.fp8_block import dequantize_fp8_block_weight
+
+    keys, meant = [], {}
+    for key, value in _checkpoint_keys(state):
+        if key.endswith("_proj.weight"):
+            q, s = _fp8_quantize(value)
+            keys += [(key, q), (key.removesuffix("weight") + "weight_scale_inv", s)]
+            meant[key] = dequantize_fp8_block_weight(q, s, FP8_BLOCK, torch.float32)
+        else:
+            keys.append((key, value))
+            meant[key] = value.float()
+    return keys, meant
+
+
+def _load_meant(hf, meant: dict) -> None:
+    """HF's model on the weights an fp8 checkpoint means (transformers 5 stacks the experts)."""
+    state = {}
+    for key, value in hf.state_dict().items():
+        name = key.removeprefix("model.")
+        if name.endswith(".experts.gate_up_proj"):
+            state[key] = torch.stack([torch.cat([
+                meant[name.replace("gate_up_proj", f"{e}.gate_proj.weight")],
+                meant[name.replace("gate_up_proj", f"{e}.up_proj.weight")]]) for e in range(value.shape[0])])
+        elif name.endswith(".experts.down_proj"):
+            state[key] = torch.stack([meant[name.replace("down_proj", f"{e}.down_proj.weight")]
+                                      for e in range(value.shape[0])])
+        else:
+            state[key] = meant[name]
+    hf.load_state_dict(state)
+
+
+def _fp8_role(base: str) -> str:
+    return "routed_experts" if ".experts." in base else "linear"
+
+
+def _fp8_moe(comm_group=None, **changes):
+    from mstar.model.components.quantization import quant_method_for
+
+    quant = quant_method_for(FP8_CONFIG)
+    config = Qwen3LMConfig.from_hf(dict(TINY_MOE, **changes))
+    ours = Qwen3MoeLM(config, attn_key=ATTN, kv_key=KV, pos_key=POS, comm_group=comm_group, quant=quant).eval()
+    return ours, quant
+
+
+def test_fp8_moe_matches_hf_on_the_weights_the_checkpoint_means():
+    """Experts held fp8 (the reference dispatch on the host), linears dequantized at load: the
+    logits are HF's on the dequantized weights, prefill and decode."""
+    hf, _ = _moe_pair()
+    keys, meant = _fp8_checkpoint(hf.state_dict())
+    _load_meant(hf, meant)
+    ours, quant = _fp8_moe()
+    ours.load_weights(quant.checkpoint_stream(keys, _fp8_role, out_dtype=torch.float32))
+    assert type(ours.layers[0].mlp).__name__ == "QuantizedSparseMoeBlock"
+    assert type(ours.layers[1].mlp).__name__ == "ParallelGatedMLP"  # mlp_only_layers: dequantized
+    _check_prefill_and_decode(hf, ours, _bind(ours), TINY_MOE["vocab_size"], atol=1e-4)
+
+
+def test_fp8_experts_load_as_stored_and_completely():
+    hf, _ = _moe_pair()
+    keys, _ = _fp8_checkpoint(hf.state_dict())
+    ours, quant = _fp8_moe()
+    ours.load_weights(quant.checkpoint_stream(keys, _fp8_role, out_dtype=torch.float32))
+    w = dict(keys)
+    experts = ours.layers[2].mlp.experts
+    gate = w["layers.2.mlp.experts.4.gate_proj.weight"]
+    assert torch.equal(experts.gate_up_proj_fp8[4, :24], gate.view(torch.uint8))
+    assert torch.equal(experts.gate_up_proj_scale_inv[4, 3:],
+                       w["layers.2.mlp.experts.4.up_proj.weight_scale_inv"].float())
+    assert torch.equal(experts.down_proj_scale_inv[4], w["layers.2.mlp.experts.4.down_proj.weight_scale_inv"].float())
+    # a missing expert scale is an unloaded weight, not a silent zero
+    fresh, quant = _fp8_moe()
+    with pytest.raises(RuntimeError, match="unloaded"):
+        fresh.load_weights(quant.checkpoint_stream(
+            [(k, v) for k, v in keys if k != "layers.0.mlp.experts.3.down_proj.weight_scale_inv"],
+            _fp8_role, out_dtype=torch.float32))
+
+
+def test_fp8_tp2_rank_holds_its_expert_and_scale_slices():
+    # 32 intermediate rows split two ways: 16 per rank, two 8-row scale blocks each
+    hf, _ = _moe_pair(moe_intermediate_size=32, vocab_size=96)
+    keys, _ = _fp8_checkpoint(hf.state_dict())
+    rank1 = CommGroup(my_global_rank=1, my_group_rank=1, group_members=[0, 1])
+    ours, quant = _fp8_moe(comm_group=rank1, moe_intermediate_size=32, vocab_size=96)
+    ours.load_weights(quant.checkpoint_stream(keys, _fp8_role, out_dtype=torch.float32))
+    w = dict(keys)
+    experts = ours.layers[0].mlp.experts
+    assert torch.equal(experts.gate_up_proj_fp8[2, 16:],
+                       w["layers.0.mlp.experts.2.up_proj.weight"][16:].view(torch.uint8))
+    assert torch.equal(experts.gate_up_proj_scale_inv[2, :2],
+                       w["layers.0.mlp.experts.2.gate_proj.weight_scale_inv"][2:].float())
+    assert torch.equal(experts.down_proj_fp8[2], w["layers.0.mlp.experts.2.down_proj.weight"][:, 16:].view(torch.uint8))
+    assert torch.equal(experts.down_proj_scale_inv[2],
+                       w["layers.0.mlp.experts.2.down_proj.weight_scale_inv"][:, 2:].float())
+    # a shard that would cut a scale block is refused at build
+    with pytest.raises(ValueError, match="whole number"):
+        _fp8_moe(comm_group=rank1, moe_intermediate_size=24, vocab_size=96)
+
+
+def test_quantized_experts_take_no_expert_parallelism_yet():
+    from mstar.model.components.moe_parallel import MoeParallelConfig
+
+    with pytest.raises(NotImplementedError, match="expert parallelism"):
+        Qwen3MoeLM(Qwen3LMConfig.from_hf(TINY_MOE), attn_key=ATTN, kv_key=KV, pos_key=POS,
+                   moe_parallel=MoeParallelConfig(parallel="ep"), quant=_fp8_moe()[1])

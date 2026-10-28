@@ -75,6 +75,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "z_image_turbo": "z_image_turbo.yaml",
     "glm52": "glm52_tp8.yaml",
     "qwen3_coder_30b_a3b": "qwen3_coder_30b_a3b.yaml",
+    "qwen3_coder_30b_a3b_fp8": "qwen3_coder_30b_a3b_fp8.yaml",
 }
 
 # qwen 3.5 series (dense)
@@ -90,7 +91,8 @@ DEFAULT_CONFIGS["qwen3_8_27b"] = "qwen3_8_27b_tp4.yaml"
 # Qwen3 dense, on the generic text LM
 DEFAULT_CONFIGS.update({f"qwen3_{size}b": f"qwen3_{size}b.yaml" for size in ("0.6", "1.7", "4", "8")})
 # text in, text out on the generic text LM: the chat snippets apply
-_TEXT_LM_MODELS = ("qwen3_coder_30b_a3b", "qwen3_0.6b", "qwen3_1.7b", "qwen3_4b", "qwen3_8b")
+_TEXT_LM_MODELS = ("qwen3_coder_30b_a3b", "qwen3_coder_30b_a3b_fp8", "qwen3_0.6b", "qwen3_1.7b", "qwen3_4b",
+                   "qwen3_8b")
 
 
 def _repo_root() -> Path:

@@ -75,6 +75,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Qwen3-Coder (30B/3B active): Qwen3-MoE causal LM (GQA, 128 experts, top-8),
        bf16 on one 80 GB GPU. Served by the generic text LM (``mstar/model/text_lm``),
        which takes any ``qwen3`` / ``qwen3_moe`` checkpoint. Tool calls are refused for now.
+   * - ``qwen3_coder_30b_a3b_fp8``
+     - ``Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8``
+     - The same model from its fp8 block-scale checkpoint (~31 GB), on the same text LM: the
+       routed experts stay fp8 (fused W8A8 MoE), the attention projections load as bf16.
+       Three times the bf16 deployment's KV cache on one 80 GB GPU.
    * - ``qwen3_{0.6,1.7,4,8}b``
      - ``Qwen/Qwen3-8B``
      - Qwen3 dense causal LM, text chat, on the same generic text LM.

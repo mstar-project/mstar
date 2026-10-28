@@ -1471,6 +1471,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "z_image_turbo": DiffusionImageAdapter(),
     "glm52": TextChatAdapter(),
     "qwen3_coder_30b_a3b": TextChatAdapter(),
+    "qwen3_coder_30b_a3b_fp8": TextChatAdapter(),
 }
 
 # One key per size; every size takes the same adapter.
