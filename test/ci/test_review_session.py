@@ -87,7 +87,7 @@ class TestUsage(unittest.TestCase):
     def test_a_message_that_is_a_string_is_skipped(self):
         msgs = [assistant("msg_a", text("x")), DENIED]
         self.assertEqual(usage(msgs)["api_calls"], 1)
-        self.assertEqual(handoff(msgs, ROOT, [])["last_text"], "x")
+        self.assertEqual(handoff(msgs, ROOT, [])["recent_text"], "x")
 
     def test_execution_file_and_transcript_together_count_once(self):
         msgs = [assistant("msg_a", text("x")), assistant("msg_b", text("y"))]
@@ -136,7 +136,7 @@ class TestHandoff(unittest.TestCase):
         self.assertEqual(h["reads"], ["pr-head/mstar/a.py", "pr-head/mstar/b.py"])
         self.assertEqual(h["not_opened"], ["mstar/c.py"])
         self.assertTrue(h["note"].startswith("Progress:"))
-        self.assertEqual(h["last_text"], h["note"], "a subagent's text would replace the reviewer's notes")
+        self.assertEqual(h["recent_text"], "", "a subagent's text would read as the reviewer's own")
         md = SESSION["handoff_md"](h, "568", "abc", "light")
         self.assertIn("## Inline comments already posted\n\n- `mstar/a.py:10` **[P1]** drops a token", md)
 
@@ -149,7 +149,7 @@ class TestHandoff(unittest.TestCase):
         self.assertEqual(len(second["comments"]), 3, "the first run's inline comments would be forgotten")
         self.assertEqual(second["not_opened"], [])
         self.assertTrue(second["note"].startswith("Progress:"), "the last progress note would be lost")
-        self.assertEqual(second["last_text"], "No note here")
+        self.assertEqual(second["recent_text"], "No note here")
         self.assertIn("No note here", SESSION["handoff_md"](second, "568", "abc", "light"),
                       "the first run's note would hide what the second run said last")
 
@@ -158,7 +158,15 @@ class TestHandoff(unittest.TestCase):
         msg["message"]["model"] = "<synthetic>"
         h = handoff([msg], ROOT, [])
         self.assertFalse(h["seen_assistant"], "a run that only hit an API error would leave a handoff")
-        self.assertEqual(h["last_text"], "")
+        self.assertEqual(h["recent_text"], "")
+
+    def test_without_a_note_the_recent_texts_are_handed_on_newest_last(self):
+        h = handoff([assistant(f"m{i}", text(f"Checking file {i}.")) for i in range(5)], ROOT, [])
+        self.assertEqual(h["recent_text"], "\n".join(f"Checking file {i}." for i in range(5)),
+                         "only the run's last status line would be handed on")
+        long = handoff([assistant(f"m{i}", text(f"{i} " + "x" * 900)) for i in range(5)], ROOT, [])
+        self.assertEqual([t.split()[0] for t in long["recent_text"].split("\n")], ["2", "3", "4"],
+                         "the bound would cut the newest texts, which say where the run stopped")
 
     def test_only_a_note_that_starts_with_progress_colon_counts(self):
         h = handoff([assistant("m1", text("**Progress:** P1 `a.py:3`, verified")),
@@ -170,9 +178,8 @@ class TestHandoff(unittest.TestCase):
         note = "Progress: " + " ".join([token] * 400) + " left: b.py"
         h = handoff([assistant("m1", text(note))], ROOT, [])
         self.assertTrue(h["note"].endswith("left: b.py"), "what is left would be cut off")
-        for kept in (h["note"], h["last_text"]):
-            self.assertLessEqual(set(kept.split()), {"Progress:", token, "[...]", "left:", "b.py"},
-                                 "a cut inside a credential leaves a fragment the redaction misses")
+        self.assertLessEqual(set(h["note"].split()), {"Progress:", token, "[...]", "left:", "b.py"},
+                             "a cut inside a credential leaves a fragment the redaction misses")
 
     def test_diff_paths_skip_deleted_files_and_hunk_lines(self):
         diff = ("diff --git a/x b/x\n--- a/x\n+++ /dev/null\ndiff --git a/y b/y\n--- a/y\n+++ b/y\n"
@@ -192,7 +199,7 @@ class TestCli(unittest.TestCase):
                           tool("c2", COMMENT, path="b.py", line=7, body="**[P1]** unknown one")),
             ]))
             prev.write_text(json.dumps({"runs": 1, "comments": [], "reads": ["pr-head/z.py"], "note": "",
-                                        "last_text": ""}))
+                                        "recent_text": ""}))
             code = run_main("handoff", "--pr", "7", "--head", "abc", "--mode", "light", "--out", str(out),
                             "--comment", str(partial), "--previous", str(prev), str(ex))
             h = json.loads(Path(out, "handoff.json").read_text())
@@ -212,7 +219,7 @@ class TestCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             prev, out = Path(d, "prev.json"), Path(d, "out")
             prev.write_text(json.dumps({"runs": 1, "comments": [], "reads": [], "note": "Progress: a.py done",
-                                        "last_text": ""}))
+                                        "recent_text": ""}))
             code = run_main("handoff", "--pr", "7", "--head", "abc", "--mode", "light", "--out", str(out),
                             "--previous", str(prev), str(Path(d, "missing.json")))
             self.assertEqual(code, 0, "the earlier handoff would no longer be offered to /review continue")
