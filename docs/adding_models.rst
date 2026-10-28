@@ -1074,7 +1074,9 @@ methods are:
    routed, and a streaming edge gets no item for it, so a frame that is not data (one
    sampled with a stop token, say) never reaches the consumer. Engine-side ``postprocess``
    still sees the uncut output. A spanned output must not feed a node that the same worker
-   speculates into.
+   speculates into. Qwen3-TTS's ``TalkerSubmodule`` is the example: its EOS frame's span is
+   empty, so the codec stream only carries frames and the codec needs no device read to
+   find the end.
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.
