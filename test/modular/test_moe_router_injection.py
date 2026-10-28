@@ -5,7 +5,8 @@ These exercise the CPU naive-dispatch path (no CUDA required), covering:
 * the stateless :class:`TopKRouter` 3-tuple contract,
 * injecting a custom *stateful* router into a block,
 * the opt-in ``return_router_states`` flag threading state in and out,
-* the default bare-tensor return staying backward compatible.
+* the default bare-tensor return staying backward compatible,
+* :class:`NoAuxTcRouter`'s routing, logit scale and split fp32 weight.
 """
 
 from __future__ import annotations
@@ -14,11 +15,13 @@ import sys
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components import SparseMoeBlock, TopKRouter
+from mstar.model.loader.base import load_weights_into
 
 
 class _StatefulRouter(nn.Module):
@@ -109,3 +112,97 @@ def test_default_return_is_bare_tensor():
     out = block(x)
     assert isinstance(out, torch.Tensor)
     assert out.shape == x.shape
+
+
+# ---------------------------------------------------------------------------
+# NoAuxTcRouter
+# ---------------------------------------------------------------------------
+
+
+def _noaux(logit_scale=1.0, scale=1.0, dtype=torch.float32, fp32_weight=True):
+    from mstar.model.components.moe import NoAuxTcRouter
+
+    torch.manual_seed(0)
+    router = NoAuxTcRouter(
+        16, 8, 2, routed_scaling_factor=scale, logit_scale=logit_scale, fp32_weight=fp32_weight,
+    )
+    w = torch.randn(8, 16).to(dtype)
+    load_weights_into(router, [("weight", w)])
+    with torch.no_grad():
+        router.e_score_correction_bias.copy_(torch.linspace(-0.2, 0.2, 8))
+    return router, w
+
+
+@pytest.mark.parametrize("fp32_weight", [False, True])
+def test_noaux_router_picks_by_biased_score_and_weighs_by_the_unbiased_one(fp32_weight):
+    router, w = _noaux(logit_scale=0.25, scale=2.0, fp32_weight=fp32_weight)
+    x = torch.randn(5, 16).bfloat16()
+    weights, ids, state = router(x)
+    assert state is None and ids.dtype == torch.int64 and weights.dtype == torch.float32
+    # the logit scale applies after the fp32 GEMM
+    scores = (x.float() @ w.T * 0.25).sigmoid()
+    ref_ids = (scores + router.e_score_correction_bias).topk(2, dim=-1).indices
+    assert torch.equal(ids.sort(-1).values, ref_ids.sort(-1).values)
+    picked = scores.gather(1, ids)
+    torch.testing.assert_close(weights, picked / picked.sum(-1, keepdim=True) * 2.0)
+
+
+@pytest.mark.parametrize(("dtype", "parts"), [(torch.float32, 3), (torch.bfloat16, 1)])
+def test_noaux_router_keeps_its_checkpoint_weight_through_a_cast(dtype, parts):
+    """Under ``fp32_weight``, an fp32 checkpoint weight loads as three bf16
+    parts that sum to it to fp32's 24 bits, a bf16 one as itself, and a cast
+    leaves the parts and the fp32 bias as they are."""
+    router, w = _noaux(dtype=dtype)
+    router.to(torch.float64)
+    assert router.weight.dtype == torch.bfloat16 and router.e_score_correction_bias.dtype == torch.float32
+    assert router.weight.shape == (parts, 8, 16)
+    assert ((router.weight.double().sum(0) - w.double()).abs() <= w.double().abs() * 2.0 ** -24).all()
+    # the forward reads however many parts there are
+    scores = (torch.ones(1, 16).double() @ w.double().T).sigmoid()
+    weights, ids, _ = router(torch.ones(1, 16).bfloat16())
+    torch.testing.assert_close(weights.double(), scores.gather(1, ids) / scores.gather(1, ids).sum())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("tokens", [1, 64, 300])
+def test_noaux_router_keeps_the_fp32_weight_s_precision_on_cuda(tokens):
+    """The parts' bf16 GEMM on CUDA, with the engine's TF32 setting, routes as
+    the fp32 weight does in fp64 (TF32 or bf16 would round the weight to 11 or
+    8 bits, moving the routing weights ~1e-4)."""
+    from mstar.model.components.moe import NoAuxTcRouter
+
+    torch.manual_seed(tokens)
+    x = torch.randn(tokens, 6144, device="cuda").bfloat16()
+    # every mantissa bit set, as the checkpoint's fp32 router weights
+    w = torch.randn(32, 6144) * 0.02
+    router = NoAuxTcRouter(6144, 32, 8, routed_scaling_factor=2.5, logit_scale=0.25, fp32_weight=True)
+    load_weights_into(router, [("weight", w)])
+    with torch.no_grad():
+        router.e_score_correction_bias.normal_(0, 0.5)
+    router.cuda()
+    scores = (x.double() @ w.double().cuda().T * 0.25).float().sigmoid()
+    ref_ids = (scores + router.e_score_correction_bias).topk(8, dim=-1).indices
+    prev = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        weights, ids, _ = router(x)
+    finally:
+        torch.set_float32_matmul_precision(prev)
+    ids, order = ids.sort(-1)
+    assert torch.equal(ids, ref_ids.sort(-1).values)
+    picked = scores.gather(1, ids)
+    torch.testing.assert_close(weights.gather(1, order), picked / picked.sum(-1, keepdim=True) * 2.5,
+                               rtol=1e-5, atol=1e-6)
+
+
+def test_noaux_router_refuses_a_weight_of_another_shape():
+    from mstar.model.components.moe import NoAuxTcRouter
+
+    router = NoAuxTcRouter(16, 8, 2, routed_scaling_factor=1.0, fp32_weight=True)
+    with pytest.raises(ValueError, match="router weight"):
+        load_weights_into(router, [("weight", torch.randn(1, 16))])
+
+
+def test_noaux_router_plugs_into_a_block():
+    block = SparseMoeBlock(16, 8, 2, 32, router=_noaux()[0]).bfloat16()
+    assert block(torch.randn(3, 16).bfloat16()).shape == (3, 16)

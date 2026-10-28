@@ -59,6 +59,7 @@ def fused_experts(
     reduce_results: bool = True,
     skip_invalid: bool = False,
     alignment: MoeAlignment | None = None,
+    zero_skipped: bool = True,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -94,6 +95,10 @@ def fused_experts(
     alignment : MoeAlignment, optional
         Precomputed alignment of ``topk_ids``. Its ``block_m`` must be
         :func:`moe_block_m` for this shape. Computed here when omitted.
+    zero_skipped : bool
+        With ``reduce_results=False``, False leaves the skipped slots' rows
+        unwritten, for a caller whose reduce reads only the live slots; it
+        saves the memset.
 
     Returns
     -------
@@ -143,7 +148,8 @@ def fused_experts(
         dtype=hidden_states.dtype,
     )
     # Skipped slots are never written by GEMM 2, so they must start at zero.
-    cache3 = (torch.zeros if skip_invalid else torch.empty)(
+    zero = skip_invalid and (zero_skipped or reduce_results)
+    cache3 = (torch.zeros if zero else torch.empty)(
         (num_tokens, top_k, hidden),
         device=hidden_states.device,
         dtype=hidden_states.dtype,

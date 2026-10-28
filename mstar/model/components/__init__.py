@@ -16,19 +16,21 @@ from mstar.model.components.linear_attn import GatedDeltaNet, GDNProjLayout
 from mstar.model.components.mlp import MLP, FusedGatedMLP, GatedMLP
 from mstar.model.components.moe import (
     ExpertParallelSparseMoeBlock,
+    NoAuxTcRouter,
     ParallelSparseMoeBlock,
     ParallelSparseMoeBlockWithSharedExpert,
     SparseMoeBlock,
     SparseMoeBlockWithSharedExpert,
     TopKRouter,
     dispatch_experts_fused,
+    ep_expert_slice_spec,
 )
 from mstar.model.components.moe_parallel import (
     MoeParallelConfig,
     MoeParallelMixin,
     instantiate_moe_block,
 )
-from mstar.model.components.norm import AdaRMSNorm, RMSNorm, RMSNormGated
+from mstar.model.components.norm import AdaRMSNorm, InputScaledRMSNorm, RMSNorm, RMSNormGated
 
 __all__ = [
         "Attention",
@@ -43,6 +45,8 @@ __all__ = [
     "MoeParallelConfig",
     "MoeParallelMixin",
     "instantiate_moe_block",
+    "ep_expert_slice_spec",
+    "NoAuxTcRouter",
     "ParallelSparseMoeBlock",
     "ParallelSparseMoeBlockWithSharedExpert",
     "SparseMoeBlock",
@@ -50,6 +54,7 @@ __all__ = [
     "TopKRouter",
     "dispatch_experts_fused",
     "AdaRMSNorm",
+    "InputScaledRMSNorm",
     "GDNProjLayout",
     "GatedDeltaNet",
     "RMSNormGated",

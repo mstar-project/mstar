@@ -19,7 +19,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components import ExpertParallelSparseMoeBlock, ParallelSparseMoeBlock, SparseMoeBlock
+from mstar.model.components import (
+    ExpertParallelSparseMoeBlock,
+    InputScaledRMSNorm,
+    ParallelSparseMoeBlock,
+    SparseMoeBlock,
+    ep_expert_slice_spec,
+)
 
 HIDDEN, INTER, NUM_EXPERTS, TOP_K = 64, 32, 16, 4
 
@@ -248,6 +254,33 @@ def test_ep_loader_keeps_only_local_experts(world_size):
             torch.testing.assert_close(block.experts.down_proj[local], ckpt[f"down:{e}"])
 
 
+@pytest.mark.parametrize("world_size", [1, 2, 4])
+@pytest.mark.parametrize("read", ["whole", "sliced"])
+def test_ep_loader_takes_packed_experts(world_size, read):
+    """A packed ``(E, ...)`` tensor loads this rank's rows, read whole or cut
+    to them by ``ep_expert_slice_spec``."""
+    ckpt = _checkpoint()
+    packed = {
+        "experts.gate_up_proj": torch.stack(
+            [torch.cat([ckpt[f"gate:{e}"], ckpt[f"up:{e}"]]) for e in range(NUM_EXPERTS)]),
+        "experts.down_proj": torch.stack([ckpt[f"down:{e}"] for e in range(NUM_EXPERTS)]),
+    }
+    e_local = NUM_EXPERTS // world_size
+    for rank in range(world_size):
+        block = ExpertParallelSparseMoeBlock(
+            HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(rank, world_size),
+        )
+        spec = ep_expert_slice_spec(block)
+        assert spec("model.layers.3.mlp.gate.weight") is None
+        for name, w in packed.items():
+            key = f"model.layers.3.mlp.{name}"
+            _, start, stop = spec(key)
+            assert (start, stop) == (rank * e_local, (rank + 1) * e_local)
+            param = block.get_parameter(name)
+            param.weight_loader(param, w if read == "whole" else w[start:stop])
+            torch.testing.assert_close(param.data, w[start:stop])
+
+
 def test_ep_loaders_survive_module_apply():
     block = ExpertParallelSparseMoeBlock(
         HIDDEN, NUM_EXPERTS, TOP_K, INTER, comm_group=_FakeCommGroup(1, 2),
@@ -356,3 +389,70 @@ def test_ep_expert_load_ignores_padding():
         ids = _routing(block, x[:4])
     expected = torch.bincount(ids.flatten(), minlength=NUM_EXPERTS)
     assert torch.equal(block.pop_expert_load(), expected)
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.parametrize("dev", _DEVICES)
+def test_ep_expert_norm_normalizes_each_expert_row_before_its_weight(world_size, dev):
+    """``expert_norm`` (Muse Spark's): each slot's expert output is scaled by
+    ``1 + w``, rounded, RMS-normalized and rounded, then weighted, the sum in
+    fp32; split over ranks, each rank sums its own experts' rows. Against the
+    formula in fp32 on the same routing."""
+    device, dtype = dev
+    ckpt = _checkpoint()
+    router_w = torch.randn(NUM_EXPERTS, HIDDEN)
+    norm_w = 0.1 * torch.randn(HIDDEN)
+    blocks = []
+    for block in _rank_blocks(
+        ExpertParallelSparseMoeBlock, world_size, ckpt, router_w, "cpu", torch.float32,
+        expert_norm=InputScaledRMSNorm(HIDDEN, eps=1e-6),
+    ):
+        with torch.no_grad():
+            block.expert_norm.weight.copy_(norm_w)
+        blocks.append(block.to(device, dtype))
+    x = torch.randn(9, HIDDEN, device=device, dtype=dtype)
+    with torch.no_grad():
+        total = torch.stack([b(x).float() for b in blocks]).sum(0)
+        weights, ids, _ = blocks[0].gate(x)
+
+    def norm(row):
+        row = (row * (1 + norm_w.to(dtype).float())).to(dtype).float()
+        return (row * torch.rsqrt(row.pow(2).mean(-1, keepdim=True) + 1e-6)).to(dtype).float()
+
+    expected = torch.zeros(9, HIDDEN)
+    for t in range(9):
+        for k in range(TOP_K):
+            e = int(ids[t, k])
+            gate = x[t].float().cpu() @ ckpt[f"gate:{e}"].T
+            up = x[t].float().cpu() @ ckpt[f"up:{e}"].T
+            out = (F.silu(gate) * up) @ ckpt[f"down:{e}"].T
+            expected[t] += float(weights[t, k]) * norm(out.to(dtype).float())
+    torch.testing.assert_close(total.cpu(), expected, **_tol(dtype))
+    with pytest.raises(ValueError, match="expert_norm must be an InputScaledRMSNorm"):
+        ExpertParallelSparseMoeBlock(HIDDEN, NUM_EXPERTS, 2, 8, expert_norm=nn.RMSNorm(HIDDEN))
+
+
+def test_ep_chunk_tokens_runs_the_experts_in_even_chunks(monkeypatch):
+    """Past ``chunk_tokens`` the experts take a step's tokens in the fewest
+    chunks that fit, of near-equal size, to the same result."""
+    from mstar.model.components import moe
+
+    ckpt, router_w = _checkpoint(), torch.randn(NUM_EXPERTS, HIDDEN)
+    (block,) = _rank_blocks(ExpertParallelSparseMoeBlock, 1, ckpt, router_w, "cpu", torch.float64)
+    (chunked,) = _rank_blocks(
+        ExpertParallelSparseMoeBlock, 1, ckpt, router_w, "cpu", torch.float64, chunk_tokens=4,
+    )
+    calls = []
+    dispatch = moe._dispatch
+
+    def counted(x, *args, **kwargs):
+        calls.append(x.shape[0])
+        return dispatch(x, *args, **kwargs)
+
+    monkeypatch.setattr(moe, "_dispatch", counted)
+    x = torch.randn(13, HIDDEN, dtype=torch.float64)
+    with torch.no_grad():
+        torch.testing.assert_close(chunked(x), block(x))
+    assert calls == [3, 3, 3, 4, 13]
+    with pytest.raises(ValueError, match="chunk_tokens must be >= 1"):
+        ExpertParallelSparseMoeBlock(HIDDEN, NUM_EXPERTS, 2, 8, chunk_tokens=0)

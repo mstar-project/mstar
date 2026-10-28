@@ -1882,18 +1882,35 @@ To support it in a model:
 3. **Optionally, mix in** ``MoeParallelMixin`` on the model's top-level module, and call
    ``self.init_moe_parallel(moe_parallel)`` at the end of its ``__init__``. It provides:
 
-   - ``maybe_log_expert_load(synthetic)``, which implements ``log_expert_load_every``.
-     Call it from eager code before each forward, usually from ``preprocess``, with
-     ``synthetic=engine_inputs.synthetic`` so capture and warmup routing are discarded.
+   - ``moe_step_inputs(engine_inputs, num_tokens, device)``, to call from
+     ``preprocess``: it implements ``log_expert_load_every`` (capture and warmup routing
+     are discarded) and returns the forward's ``num_valid_tokens`` under
+     ``mask_padding``, a ``(1,)`` device tensor that a replay updates as a static input.
    - ``moe_token_valid(hidden_states, num_valid_tokens)``, which implements
-     ``mask_padding``. It returns the ``token_valid`` mask for the MoE blocks, or
-     ``None`` when masking is off. Pass the mask only to MoE layers, not dense MLPs.
-     ``num_valid_tokens`` must be a ``(1,)`` device tensor that ``preprocess`` returns
-     as a static input, so a replay can update it; fill it from
-     ``engine_inputs.real_seq_len``. ``ThinkerSubmodule.preprocess`` shows the wiring.
+     ``mask_padding`` in the forward. It returns the ``token_valid`` mask for the MoE
+     blocks, or ``None`` when masking is off. Pass the mask only to MoE layers, not dense
+     MLPs. ``ThinkerSubmodule.preprocess`` shows the wiring.
 
 The shared-expert block (``ParallelSparseMoeBlockWithSharedExpert``) has no EP variant, so
 a node built from it stays TP-only.
+
+The EP block has options the TP block lacks, which a model passes through
+``instantiate_moe_block`` (it refuses them under ``parallel: tp``):
+
+- ``pre_experts`` and ``post_experts`` run the experts in a latent: the router reads the
+  block's input, the experts read ``pre_experts`` of it, and ``post_experts`` maps the
+  all-reduced output back.
+- ``expert_norm``, an ``InputScaledRMSNorm``, normalizes each expert's output before its
+  routing weight applies, fused into the weighted sum on CUDA.
+- ``chunk_tokens`` caps the tokens of one expert call, bounding the experts' scratch on
+  long prompts until engine chunked prefill (#916) does.
+
+Its loaders take per-expert checkpoint tensors or packed ones: ``gate_up_proj`` as
+``(E, 2 * inter, hidden)`` with each expert's gate rows before its up rows, and
+``down_proj`` as ``(E, hidden, inter)``. A checkpoint that interleaves gate and up rows
+has the same shape and would load wrong; it is not supported. For packed tensors, pass
+``slice_spec=ep_expert_slice_spec(model)`` to the safetensors iterator so each rank reads
+only its own experts' rows.
 
 Worked example: Orpheus
 -----------------------

@@ -7,12 +7,16 @@
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.moe import ExpertParallelSparseMoeBlock, ParallelSparseMoeBlock
+
+if TYPE_CHECKING:
+    from mstar.model.submodule_base import ModelInputsFromEngine
 
 logger = logging.getLogger(__name__)
 
@@ -67,13 +71,21 @@ def instantiate_moe_block(
     router: nn.Module | None = None,
     comm_group: CommGroup | None = None,
     moe_parallel: MoeParallelConfig | None = None,
+    **ep_options: Any,
 ) -> ParallelSparseMoeBlock | ExpertParallelSparseMoeBlock:
     """The routed-expert block ``moe_parallel`` asks for; TP when None.
 
     ``comm_group`` is the node's TP group; EP picks its group from it.
+    ``ep_options`` are options only the EP block has (``pre_experts``,
+    ``expert_norm``, ...); a model that passes any needs ``parallel: ep``.
     """
     moe_parallel = moe_parallel or MoeParallelConfig()
     if moe_parallel.parallel == "tp":
+        if ep_options:
+            raise ValueError(
+                f"the MoE block's {sorted(ep_options)} run on whole experts only: "
+                "set `ep_config: {parallel: ep}` on the node group"
+            )
         return ParallelSparseMoeBlock(
             hidden_size=hidden_size,
             num_experts=num_experts,
@@ -97,6 +109,7 @@ def instantiate_moe_block(
             moe_parallel.log_expert_load_every > 0
             and (ep_group is None or ep_group.rank == 0)
         ),
+        **ep_options,
     )
 
 
@@ -127,6 +140,21 @@ class MoeParallelMixin:
             return None
         positions = torch.arange(hidden_states.shape[0], device=hidden_states.device)
         return positions < num_valid_tokens
+
+    def moe_step_inputs(
+        self, engine_inputs: "ModelInputsFromEngine", num_tokens: int, device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Call from the node's ``preprocess``: logs the EP load when due, and
+        returns the forward's ``num_valid_tokens`` under ``mask_padding``
+        (else nothing). Real rows lead a replay's bucket; a fill kernel, so no
+        H2D copy."""
+        self.maybe_log_expert_load(synthetic=engine_inputs.synthetic)
+        if not self.mask_padding:
+            return {}
+        n = engine_inputs.real_seq_len
+        return {"num_valid_tokens": torch.full(
+            (1,), num_tokens if n is None else n, dtype=torch.int64, device=device,
+        )}
 
     def _tracked_moe_blocks(self) -> list[tuple[str, ExpertParallelSparseMoeBlock]]:
         return [

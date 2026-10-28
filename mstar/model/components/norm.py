@@ -30,6 +30,20 @@ def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
     return (x * torch.rsqrt(variance + eps)).to(x.dtype)
 
 
+class InputScaledRMSNorm(nn.Module):
+    """Scale by ``(1 + weight)`` first, round to the input dtype, then
+    RMS-normalize without a weight (Muse Spark's post-expert and post-FFN
+    norms). The MoE blocks fuse it into their finalize as ``expert_norm``."""
+
+    def __init__(self, hidden_size: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return rms_norm_no_weight((x.float() * (1.0 + self.weight.float())).to(x.dtype), self.eps)
+
+
 class RMSNorm(nn.Module):
     """RMSNorm with optional Gemma-style ``(1 + weight)`` scaling.
 

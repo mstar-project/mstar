@@ -616,6 +616,53 @@ def moe_sum_reduce_triton(
     )
 
 
+@triton.jit
+def moe_input_scaled_rms_sum_reduce_kernel(
+    rows_ptr, ids_ptr, weights_ptr, norm_w_ptr, out_ptr, sentinel, eps,
+    K: tl.constexpr, H: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    """One program per token. Each live slot's row (``id < sentinel``) is scaled
+    by ``1 + norm_w`` and rounded, RMS-normalized and rounded, then weighted and
+    summed in fp32. A dead slot's row is never read."""
+    t = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+    scale = 1.0 + tl.load(norm_w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(K):
+        if tl.load(ids_ptr + t * K + k) < sentinel:
+            x = tl.load(rows_ptr + (t * K + k) * H + offs, mask=mask, other=0.0).to(tl.float32)
+            x = (x * scale).to(rows_ptr.dtype.element_ty).to(tl.float32)
+            y = (x * tl.rsqrt(tl.sum(x * x, axis=0) / H + eps)).to(rows_ptr.dtype.element_ty)
+            acc += y.to(tl.float32) * tl.load(weights_ptr + t * K + k).to(tl.float32)
+    tl.store(out_ptr + t * H + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def moe_input_scaled_rms_sum_reduce_triton(
+    rows: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    sentinel: int,
+) -> torch.Tensor:
+    """``(tokens, hidden)`` in ``rows``' dtype: each token's sum, over its slots
+    with ``ids < sentinel``, of ``weights[:, k] * rms(round(rows[:, k] * (1 +
+    norm_weight)))``, the finalize of a ``(tokens, top_k, hidden)`` down-GEMM
+    output under a per-expert input-scaled RMSNorm. Only live rows are read, so
+    the GEMM need not zero the others."""
+    assert rows.is_contiguous() and ids.is_contiguous() and weights.is_contiguous()
+    tokens, top_k, hidden = rows.shape
+    out = torch.empty(tokens, hidden, dtype=rows.dtype, device=rows.device)
+    if tokens:
+        block_h = triton.next_power_of_2(hidden)
+        moe_input_scaled_rms_sum_reduce_kernel[(tokens,)](
+            rows, ids, weights, norm_weight, out, sentinel, eps,
+            K=top_k, H=hidden, BLOCK_H=block_h, num_warps=8 if block_h >= 4096 else 4,
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Block-size / warp-count configuration (shape-only; the fp8 runner overrides
 # BLOCK_SIZE_K and the decode tiles on top of it)

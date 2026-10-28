@@ -12,7 +12,8 @@ vendored CUDA kernel (JIT-built on first use) with a torch fallback.
 """
 from __future__ import annotations
 
-from mstar.utils.fused_moe.kernels import moe_sum_reduce_triton
+from mstar.utils.fused_moe.kernels import moe_input_scaled_rms_sum_reduce_triton, moe_sum_reduce_triton
 from mstar.utils.fused_moe.runner import MoeAlignment, fused_experts, fused_experts_fp8, moe_block_m
 
-__all__ = ["MoeAlignment", "fused_experts", "fused_experts_fp8", "moe_block_m", "moe_sum_reduce_triton"]
+__all__ = ["MoeAlignment", "fused_experts", "fused_experts_fp8", "moe_block_m",
+           "moe_input_scaled_rms_sum_reduce_triton", "moe_sum_reduce_triton"]
