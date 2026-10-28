@@ -195,6 +195,16 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     assert kv._unused == sum(allotment.remaining for allotment in kv._allotments.values())
 
 
+def test_a_request_that_holds_nothing_in_the_short_pool_is_never_a_victim():
+    kv = _pool()
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    # a newer request the runner orders that holds its pages in another pool
+    _runner(kv)._arrival["elsewhere"] = (False, 3)
+
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True) == ["v"]
+
+
 def test_victims_that_share_pages_are_preempted_together():
     kv = _pool()
     shared, tokens = list(range(3 * PAGE_SIZE)), {"a": range(100, 116), "b": range(200, 216)}
