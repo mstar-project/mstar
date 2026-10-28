@@ -20,12 +20,12 @@ from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper  # noqa
 PAGE, BS, QO, KV, HD, PAGES = 16, 8, 8, 2, 128, 512
 
 
-def _wrapper(use_tensor_cores=True, qo=QO, kv=KV):
+def _wrapper(use_tensor_cores=True, qo=QO, kv=KV, backend="auto"):
     ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     return FlashInferDecodeWrapper(
         ws, num_qo_heads=qo, num_kv_heads=kv, head_dim=HD, page_size=PAGE,
         batch_size=BS, max_num_pages=PAGES, device=torch.device("cuda"), accelerator_graph=True,
-        use_tensor_cores=use_tensor_cores,
+        use_tensor_cores=use_tensor_cores, backend=backend,
     )
 
 
@@ -40,15 +40,18 @@ def _batch(rng):
                 paged_kv_last_page_len=t(last), kv_lens=t(lens.astype(np.int32)))
 
 
-@pytest.mark.parametrize("use_tensor_cores,qo,kv", [
-    (True, QO, KV),
-    # CUDA-core decode: GQA, and MHA (Whisper), which keeps it for its kernel
-    (False, QO, KV),
-    (False, QO, QO),
+@pytest.mark.parametrize("use_tensor_cores,qo,kv,backend", [
+    (True, QO, KV, "auto"),
+    # CUDA-core decode: GQA, and MHA (Whisper), which keeps it for its kernel,
+    # under "auto" and under "fa2" (a model that picks fa2 for its prefills)
+    (False, QO, KV, "auto"),
+    (False, QO, QO, "auto"),
+    (False, QO, QO, "fa2"),
 ])
-def test_direct_plan_matches_flashinfer_plan(use_tensor_cores, qo, kv):
+def test_direct_plan_matches_flashinfer_plan(use_tensor_cores, qo, kv, backend):
     rng = np.random.default_rng(0)
-    full, direct = _wrapper(use_tensor_cores, qo, kv), _wrapper(use_tensor_cores, qo, kv)
+    full = _wrapper(use_tensor_cores, qo, kv, backend)
+    direct = _wrapper(use_tensor_cores, qo, kv, backend)
     cache = torch.randn(PAGES, 2, PAGE, kv, HD, dtype=torch.bfloat16, device="cuda")
     for step in range(12):
         batch = _batch(rng)
