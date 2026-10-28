@@ -119,7 +119,7 @@ def test_a_loop_is_ended_even_where_the_deployment_chunks_nothing():
     assert stops == {1: {chunk_loop_name(NODE, "prefill")}} and not mid
 
 
-def _wrapped_walk(chunkable: bool):
+def _wrapped_walk(chunkable: bool, policy=None):
     """A walk's graph as ``apply_chunking`` leaves it, wrapped or not."""
     from mstar.model.base import _wrap_node_in_loop
     from mstar.model.submodule_base import ChunkingPolicy
@@ -132,8 +132,18 @@ def _wrapped_walk(chunkable: bool):
         return node
     return _wrap_node_in_loop(
         node, NODE, "prefill", chunk_loop_name(NODE, "prefill"),
-        ChunkingPolicy(walks=("prefill",), chunkable=True, max_chunks=8),
+        policy or ChunkingPolicy(walks=("prefill",), chunkable=True, max_chunks=8),
     )
+
+
+def test_a_default_chunk_loop_runs_a_long_prompt_to_its_end():
+    """A policy that leaves ``max_chunks`` unset must not cap its Loop: a
+    capped Loop reports the prompt done after its last allowed chunk, and the
+    next walk starts with the rest of the prompt still to run."""
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    loop = _wrapped_walk(True, ChunkingPolicy(walks=("prefill",), chunkable=True))
+    assert loop.max_iters >= 1 << 20
 
 
 def _wg(section):

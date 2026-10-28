@@ -322,10 +322,10 @@ class ChunkingPolicy:
     accumulated_outputs: frozenset[str] = frozenset()
     # most chunks one prompt may take, as the chunk Loop's `max_iters`. A
     # runaway guard, not the real count: the engine ends the loop on the final
-    # chunk, and the count is not known until the budget cuts each step. A
-    # prompt cannot have more chunks than tokens, so the model's longest
-    # prompt is always a safe value.
-    max_chunks: int = 1
+    # chunk, and the count is not known until the budget cuts each step. Too
+    # small a cap reports a longer prompt done early, so the default is
+    # effectively none (the runtimes hold `max_iters` as a u32).
+    max_chunks: int = 2**31 - 1
     # most tokens a step of this walk runs; a combined walk that carries chunks sets one too
     max_batch_tokens: int | None = None
     # whether a row may start past its cached prefix, asked before prepare; None is always
