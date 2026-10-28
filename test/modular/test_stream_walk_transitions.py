@@ -4,7 +4,6 @@ A connection with ``consumer_walk`` lets the producer decide its consumer
 partition's walk: the producer worker assigns each emitting pass's streamed
 items a consumer walk, a chunk never spans two assigned walks, and the consumer
 switches walk before popping a chunk, but only when the partition is idle.
-Conductor inputs for a walk the stream has not reached yet wait on the worker.
 """
 from types import SimpleNamespace
 
@@ -23,7 +22,8 @@ from mstar.graph.graph_io import WorkerGraphIO
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.streaming.topology import Connection, PartitionTopology, ProducerWalkCtx
-from mstar.utils.ipc_format import InputSignals, WorkerGraphsDone
+from mstar.utils.ipc_format import WorkerGraphsDone
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.worker import Worker
 
@@ -164,7 +164,6 @@ def _worker(idle=True):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
     w._draining_rids = set()
-    w._producer_triggered_partitions = {"Talker"}
     w._walk_driven_edges = {"thinker_states": "Talker"}
     w.request_state = RequestStateManager(node_to_partition={"Talker": "Talker"})
     w.request_state.add_request(0, _fwd("talker_prefill"))
@@ -175,57 +174,6 @@ def _worker(idle=True):
         set_walk=lambda rid, partition, walk: w.walks.append(walk),
     )
     return w
-
-
-def _conductor_input(walk):
-    return InputSignals(
-        request_id="r",
-        inputs=[GraphEdge(next_node="Talker", name="talker_input_embeds")],
-        request_info=_fwd(walk), partition_name="Talker",
-    )
-
-
-def test_a_conductor_input_for_a_later_walk_waits_for_the_stream():
-    w = _worker()
-    body = _conductor_input("talker_decode")
-    w._process_new_inputs(body)
-    assert w.request_state.per_request_info[0].parked_inputs == [body]
-
-    replayed = []
-    w._process_new_inputs = replayed.append
-    w._switch_partition_walk(0, "Talker", "talker_last_prefill")
-    assert replayed == []  # still not its walk
-    w._switch_partition_walk(0, "Talker", "talker_decode")
-    assert replayed == [body]
-    assert w.request_state.per_request_info[0].parked_inputs == []
-    assert w.walks == ["talker_last_prefill", "talker_decode"]
-
-
-@pytest.mark.parametrize("queued, idle, released", [
-    (False, True, True),
-    (True, True, False),    # the stream decides first
-    (False, False, False),  # mid-pass
-])
-def test_a_parked_input_applies_once_the_stream_has_nothing_queued(queued, idle, released):
-    """A one-token reply: the Thinker's only decode pass ran talker_last_prefill
-    and nothing will assign talker_decode, so the conductor's input moves it."""
-    w = _worker(idle=idle)
-    w._switch_partition_walk(0, "Talker", "talker_last_prefill")
-    req_info = w.request_state.per_request_info[0]
-    sbuf = _buffer()
-    req_info.stream_buffers["thinker_states"] = sbuf
-    if queued:
-        _feed(sbuf, ["talker_decode"])
-    body = _conductor_input("talker_decode")
-    w._process_new_inputs(body)
-    assert req_info.parked_inputs == [body]
-
-    replayed = []
-    w._process_new_inputs = replayed.append
-    w._release_parked_inputs(0, req_info)
-    assert (replayed == [body]) is released
-    walk = w.request_state.get_fwd_info(0, "Talker").graph_walk
-    assert walk == ("talker_decode" if released else "talker_last_prefill")
 
 
 @pytest.mark.parametrize("idle, allow, switched", [
@@ -280,16 +228,29 @@ def _producer():
     return w
 
 
+def _batch(node, rows):
+    """A Thinker step of ``rows``: rid -> (its walk, its loop iterations)."""
+    walks = {rid: walk for rid, (walk, _) in rows.items()}
+    graph_walk = next(iter(walks.values())) if len(set(walks.values())) == 1 else "thinker_mixed"
+    return SimpleNamespace(
+        node_name=node, graph_walk=graph_walk, partition="Thinker",
+        batch=ScheduledBatch(
+            node_name=node, graph_walk=graph_walk,
+            request_to_worker_graph=dict.fromkeys(rows, 0),
+            request_walks=walks if graph_walk == "thinker_mixed" else {},
+        ),
+        node_batch=SimpleNamespace(per_request_input_metadata={
+            rid: SimpleNamespace(dynamic_loop_iter_counts=iters or {})
+            for rid, (_, iters) in rows.items()
+        }),
+    )
+
+
 def _pass(w, node, walk, loop_iters=None):
     """The Talker walk this pass's states were assigned, or None if it emitted none."""
-    meta = SimpleNamespace(dynamic_loop_iter_counts=loop_iters or {})
-    batch = SimpleNamespace(
-        node_name=node, graph_walk=walk, partition="Thinker",
-        node_batch=SimpleNamespace(per_request_input_metadata={0: meta}),
-    )
     fwd = w.request_state.get_fwd_info(0, "Thinker")
     fwd.stream_consumer_walks.clear()
-    w._assign_consumer_walks(batch, [0])
+    w._assign_consumer_walks(_batch(node, {0: (walk, loop_iters)}))
     return fwd.stream_consumer_walks.get("Talker")
 
 
@@ -314,6 +275,31 @@ def test_the_thinker_walks_the_talker_through_its_prefill():
         "talker_prefill", None, "talker_prefill", "talker_prefill",
         "talker_last_prefill", "talker_decode", "talker_decode",
     ]
+
+
+def test_a_mixed_step_asks_each_row_under_its_own_walk():
+    """Chunked prefill batches prefill and decode rows as ``thinker_mixed``,
+    which no worker graph declares: each row's states take the walk it ran."""
+    w = _producer()
+    w.request_state.add_request(1, _fwd("thinker_decode", partition="Thinker"))
+    asked = []
+    get_output_signals = w._graph_runtime.get_output_signals
+
+    def signals(node, walk):
+        assert walk != "thinker_mixed", "the combined label is no walk of the graph's"
+        asked.append(walk)
+        return get_output_signals(node, walk)
+
+    w._graph_runtime.get_output_signals = signals
+    w._assign_consumer_walks(_batch("Thinker", {
+        0: ("prefill_text", None), 1: ("thinker_decode", _decode(4)),
+    }))
+    assert sorted(asked) == ["prefill_text", "thinker_decode"]
+    walks = [
+        w.request_state.get_fwd_info(rid, "Thinker").stream_consumer_walks["Talker"]
+        for rid in (0, 1)
+    ]
+    assert walks == ["talker_prefill", "talker_decode"]
 
 
 def test_the_hook_sees_the_pass_and_not_a_count_of_emissions():

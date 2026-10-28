@@ -17,7 +17,8 @@ forward) and then hangs in the collective. So:
   marker; N's verdict — ``admit_error`` / ``failed_requests`` on its
   ``ExecutingBatch``, written by the GPU thread before N's future resolves —
   drops a head without building it (the verdicts on which the leader clears
-  its own speculation before threading);
+  its own speculation before threading), unless the prefix cache is open,
+  where the leader pre-planned the head and the follower builds it too;
 * a step whose forward raised is closed (``_close_tp_follow_step``): its head
   is dropped, queued or arriving.
 
@@ -39,15 +40,25 @@ from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
-from mstar.worker.worker import Worker, _parse_tp_async_sched  # noqa: E402
+from mstar.worker.worker import (  # noqa: E402
+    Worker,
+    _parse_tp_async_sched,
+    _tp_async_sched_setting,
+)
 
 NODE = "LLM"
 WALK = "decode"
 
 
 class _FakeEngineManager:
+    def __init__(self, cache_open: bool = False):
+        self.cache_open = cache_open
+
     def get_engine(self, node_name):
-        return types.SimpleNamespace(check_ready=lambda *a: FULL_ADMIT_OK)
+        return types.SimpleNamespace(
+            check_ready=lambda *a: FULL_ADMIT_OK, drop_cached_prefix=lambda head: None,
+            prefix_cache_open=lambda node: self.cache_open,
+        )
 
 
 class _Communicator:
@@ -71,7 +82,7 @@ class _Communicator:
         self.inbox.extend(self.deliveries.pop(self.waits, []))
 
 
-def _stub():
+def _stub(cache_open: bool = False):
     stub = types.SimpleNamespace()
     stub.worker_id = "w1"
     stub.tp_async_sched = True
@@ -79,8 +90,9 @@ def _stub():
     stub._tp_async_for = lambda n: Worker._tp_async_for(stub, n)
     stub._tp_nospec = RecentSet(Worker._TP_NOSPEC_KEEP)
     stub._tp_leader_gap_warned = False
+    stub.engine_manager = _FakeEngineManager(cache_open)
     stub.scheduler = MicroScheduler(
-        engine_manager=_FakeEngineManager(), parallel_leader_nodes=set(),
+        engine_manager=stub.engine_manager, parallel_leader_nodes=set(),
     )
     stub.communicator = _Communicator(stub)
     stub._check_ready_tensors = lambda: None
@@ -113,6 +125,7 @@ def _stub():
         lambda p, arm: Worker._await_tp_follow_step(stub, p, arm)
     )
     stub._step_voids_head = Worker._step_voids_head
+    stub._prefix_cache_open = lambda node: Worker._prefix_cache_open(stub, node)
     return stub
 
 
@@ -176,6 +189,33 @@ def test_env_parses_master_switch_and_node_list():
     assert _parse_tp_async_sched("thinker, talker") == (
         True, frozenset({"thinker", "talker"}),
     )
+
+
+@pytest.mark.parametrize("env, config, want", [
+    (None, None, (False, None)),
+    (None, True, (True, None)),
+    (None, False, (False, None)),
+    (None, ["thinker", "talker"], (True, frozenset({"thinker", "talker"}))),
+    (None, "LLM", (True, frozenset({"LLM"}))),
+    ("0", True, (False, None)),  # the env var overrides the config
+    ("1", ["talker"], (True, None)),
+    ("", True, (True, None)),  # empty env falls through to the config
+])
+def test_config_key_and_env_override(env, config, want):
+    assert _tp_async_sched_setting(env, config) == want
+
+
+@pytest.mark.parametrize("env, config, want", [
+    # a quoted yaml boolean is a string, not a node named "true"
+    (None, "true", (True, None)),
+    (None, "yes", (True, None)),
+    (None, "false", (False, None)),
+    (None, "No", (False, None)),
+    ("off", True, (False, None)),
+    ("True", None, (True, None)),
+])
+def test_boolean_words_are_the_switch_not_node_names(env, config, want):
+    assert _tp_async_sched_setting(env, config) == want
 
 
 def test_node_list_narrows_which_parallel_nodes_take_part():
@@ -388,6 +428,20 @@ def test_await_has_no_verdict_to_apply_while_N_still_runs():
         4, _future(s, _output(), done_after=10), admit_error="kv cache: out of pages",
     )
     assert _await(s, pending) == (None, spec)
+
+
+@pytest.mark.parametrize("verdict", [
+    {"admit_error": "kv cache: out of pages"}, {"failed_requests": ["r0"]},
+])
+def test_with_the_prefix_cache_open_await_builds_and_arms_a_head_its_step_voids(verdict):
+    s = _stub(cache_open=True)
+    spec = object()
+    s.build_results = [spec]
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    armed = []
+    out = _output()
+    assert _await(s, _pending(4, _future(s, out), **verdict), armed.append) == (out, spec)
+    assert armed == [spec], "the leader pre-planned this head, and this rank did not"
 
 
 def test_await_retries_until_the_head_is_buildable():

@@ -26,6 +26,7 @@ from mstar.graph.runtime.base import (
     ColumnarEdgeSpecs,
     EdgeSpec,
     PendingLoopStop,
+    RequestWalks,
     RouteInput,
     SendInput,
     SpeculationPrepInput,
@@ -167,6 +168,7 @@ def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
         graph_walk=walk,
         partition_worker_graph_ids=[wg_id],
         worker_graph_to_workers=ParallelList([wg_id], [[worker_id]]),
+        loop_caps={},
     )
     mgr.add_request(rid, fwd_info)
     return mgr, runtime, rid
@@ -428,9 +430,9 @@ def test_pending_loop_stops_are_recorded_and_live_one_iteration():
     )
     assert stopped_rids == [rid]
     assert runtime.has_pending_loop_stop(rid, walk, "ar_loop")
-    assert runtime.pending_loop_stop_rids(walk, "ar_loop") == {rid}
+    assert runtime.pending_loop_stop_rids([walk], "ar_loop") == {rid}
     # A different walk must not match.
-    assert runtime.pending_loop_stop_rids("other_walk", "ar_loop") == set()
+    assert runtime.pending_loop_stop_rids(["other_walk"], "ar_loop") == set()
 
     runtime.clear_pending_loop_stops()
     assert not runtime.has_pending_loop_stop(rid, walk, "ar_loop")
@@ -445,7 +447,7 @@ def test_stop_for_a_loop_not_in_the_walk_is_dropped():
         loop_names=ParallelList([rid], [["not_a_real_loop"]]),
     )
     assert stopped_rids == []
-    assert runtime.pending_loop_stop_rids(walk, "not_a_real_loop") == set()
+    assert runtime.pending_loop_stop_rids([walk], "not_a_real_loop") == set()
 
 
 def test_peer_loop_stop_compares_enclosing_loop_indices():
@@ -523,6 +525,7 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         request_id="rid_b", partition="default", graph_walk="decode",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker0"]]),
+        loop_caps={},
     )
     mgr.add_request(rid_b, _fwd_info("decode"))
     for rid in (rid_a, rid_b):
@@ -718,6 +721,65 @@ def test_worker_graphs_done_carries_every_persisted_tensor_of_a_name():
     assert [i.uuid for i in wgd.body.persist_signals["token"]] == [-1, uuids[0]]
 
 
+def test_worker_graphs_done_names_each_rows_own_walk():
+    """A mixed step routes rows of two walks under one combined label. The
+    conductor follows a producer-triggered partition's walk off each
+    WORKER_GRAPHS_DONE, so it must name the row's own walk."""
+    import torch
+
+    def wg(wg_id, walk):
+        return WorkerGraph(
+            section=GraphNode(
+                name="only", input_names={"prompt"},
+                outputs=[GraphEdge(name="token", next_node=EMPTY_DESTINATION, persist=True)],
+            ),
+            graph_walks={walk}, ranks=[0], worker_graph_id=wg_id,
+        )
+    runtime = PythonGraphRuntime(
+        my_worker_id="worker0", my_worker_graphs=[wg(0, "prefill"), wg(1, "decode")],
+        all_wg_ids_to_graph_walks={0: {"prefill"}, 1: {"decode"}},
+        all_wg_ids_to_dyn_loops={0: set(), 1: set()},
+        all_wg_ids_to_nodes={0: {"only"}, 1: {"only"}},
+        node_to_partition={"only": "default"},
+        sharding_config=_sharding_config(), tensor_manager=StubTensorManager(),
+    )
+    comm = _RecordingCommunicator()
+    runtime._communicator = comm
+    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
+    rids = [
+        runtime.add_request(
+            request_id=f"r_{walk}", partition="default", graph_walk=walk,
+            partition_worker_graph_ids=[0, 1],
+            worker_graph_to_workers=ParallelList([0, 1], [["worker0"], ["worker0"]]),
+            loop_caps={},
+        )
+        for walk in ("prefill", "decode")
+    ]
+    for rid in rids:
+        _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="only")])
+    runtime.pop_walk_rids("only", RequestWalks(rids, ["prefill", "decode"], [0, 1]))
+    uuids = [_store_outputs(store, minter, rid, {"token": [torch.ones(2)]})["token"][0] for rid in rids]
+
+    out = runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="mixed", node_name="only",
+        output_signals=["token"], wg_ids=ParallelList(rids, [0, 1]),
+        tensors=uuids, num_tensors=[1, 1],
+        walks=["prefill", "decode"], rid_walk_idx=[0, 1],
+    ))
+    runtime.send_outputs(SendInput(
+        completion_id=out.completion_id,
+        per_request_info=ParallelList(rids, [_fwd_info("mixed"), _fwd_info("mixed")]),
+        new_token_counts=ParallelList(rids, [{}, {}]),
+    ))
+
+    done = {
+        m.body.request_id: (m.body.worker_graph_ids, m.body.graph_walk)
+        for e, m in comm.sent
+        if e == "conductor" and m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE
+    }
+    assert done == {"r_prefill": ([0], "prefill"), "r_decode": ([1], "decode")}
+
+
 def test_an_unread_loop_back_is_not_routed():
     """The token loops back only to feed the loop's accumulated output. The
     node never reads it, so routing it would send this worker an edge it
@@ -759,6 +821,10 @@ def test_an_unread_loop_back_is_not_routed():
     assert [e.name for e in routing.persist] == ["new_token"]
 
 
+def _spec_targets(runtime, node, walk, rid):
+    return runtime.speculate_node(node, [walk], [rid])
+
+
 # --- speculate_node -----------------------------------------------------------
 
 def test_speculate_node_finds_the_downstream_target():
@@ -770,7 +836,7 @@ def test_speculate_node_finds_the_downstream_target():
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
 
-    out = runtime.speculate_node("prefill", "decode", rid)
+    out = _spec_targets(runtime, "prefill", "decode", rid)
     assert [o.node_name for o in out] == ["ar_decode"]
     assert out[0].graph_walk == "decode"
 
@@ -784,7 +850,20 @@ def test_speculate_node_skips_a_target_that_opted_out_of_async():
     wgio = runtime._queues[0].per_request_queues[rid]
     wgio.nodes["ar_decode"].enable_async_scheduling = False
 
-    assert runtime.speculate_node("prefill", "decode", rid) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
+
+
+def test_speculate_node_skips_a_walk_whose_source_opted_out_of_async():
+    """Checked per walk, so a mixed batch can still speculate its other walks."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+    wgio = runtime._queues[0].per_request_queues[rid]
+    wgio.nodes["prefill"].enable_async_scheduling = False
+
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
 
 def test_speculate_node_refuses_a_parallel_target_without_tp_async():
@@ -802,7 +881,7 @@ def test_speculate_node_refuses_a_parallel_target_without_tp_async():
         parallel_leader_nodes={"ar_decode"},
         tp_async_nodes=set(),  # feature off
     )
-    assert runtime.speculate_node("prefill", "decode", rid) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
 
     # Even with TP async on, a TRANSITION into the parallel node is refused:
     # only a same-node loop-back qualifies.
@@ -811,7 +890,20 @@ def test_speculate_node_refuses_a_parallel_target_without_tp_async():
         parallel_leader_nodes={"ar_decode"},
         tp_async_nodes={"ar_decode"},
     )
-    assert runtime.speculate_node("prefill", "decode", rid) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid) == []
+
+
+def test_speculate_node_returns_every_walks_targets():
+    """A walk whose sample rid has no target adds nothing; each target names
+    its walk, and the caller picks."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+
+    out = runtime.speculate_node("prefill", ["decode", "decode"], [rid + 999, rid])
+    assert [(o.node_name, o.graph_walk) for o in out] == [("ar_decode", "decode")]
 
 
 def test_speculate_node_returns_nothing_for_an_unknown_rid():
@@ -819,7 +911,7 @@ def test_speculate_node_returns_nothing_for_an_unknown_rid():
         _make_ar_walk_graph(), 0, "decode",
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
-    assert runtime.speculate_node("prefill", "decode", rid + 999) == []
+    assert _spec_targets(runtime, "prefill", "decode", rid + 999) == []
 
 
 # --- prep_spec_rids -----------------------------------------------------------
@@ -981,6 +1073,7 @@ def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset()):
         request_id="r", partition="default", graph_walk="w",
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker_0"]]),
+        loop_caps={},
     )
     tm.register_request(rid, runtime.get_sharding_config(rid))
     return tm, runtime, rid

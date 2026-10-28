@@ -13,7 +13,6 @@ encoding is a codec change, never a transport change.
 """
 import logging
 import os
-import pickle
 from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
@@ -27,14 +26,6 @@ class Codec:
     @staticmethod
     def decode(data: bytes):
         raise NotImplementedError
-
-
-class PickleCodec(Codec):
-    """The old wire. Python-only, so an edge using it cannot terminate in a
-    Rust process; kept for bisecting a wire problem."""
-
-    encode = staticmethod(pickle.dumps)
-    decode = staticmethod(pickle.loads)
 
 
 class MsgpackCodec(Codec):
@@ -94,13 +85,14 @@ def decode_each(codec: type[Codec], frames: Iterable[bytes], who: str) -> list:
 
 
 def default_codec() -> type[Codec]:
-    """``MSTAR_WIRE_CODEC=pickle`` falls back to pickle.
+    """Select typed msgpack; reject the removed pickle codec at startup.
 
     Both ends of an edge must agree, so this is all-or-nothing for a mesh —
     a single process set differently will not be able to talk to its peers.
     """
-    if os.getenv("MSTAR_WIRE_CODEC", "msgpack").lower() == "pickle":
-        return PickleCodec
+    choice = os.getenv("MSTAR_WIRE_CODEC", "msgpack").lower()
+    if choice != "msgpack":
+        raise ValueError(f"MSTAR_WIRE_CODEC must be msgpack; got {choice!r}")
     import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 
     return WireCodec

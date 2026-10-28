@@ -1,10 +1,10 @@
-"""Capture-time padding rows don't keep their pages after warmup.
+"""Capture-time padding rows don't keep pages after warmup.
 
 A capture hands its padding rows real spans — a packed bucket splits its whole
-token budget across them — so they take pages proportional to the largest
-bucket. A replay pads with zero-length rows (`pad_inputs` asks the config for
-0 tokens), so none of that storage is ever read again; left resident it is
-just cache the traffic can't have.
+token budget across them — and runs them on SINK_PAGE, as a replay runs its
+padding rows, so they take no pages. A replay pads with zero-length rows
+(`pad_inputs` asks the config for 0 tokens). `release_all` still frees every
+row it opened, so nothing a capture did stays resident.
 """
 
 from __future__ import annotations
@@ -17,11 +17,11 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
 )
-from mstar.engine.cuda_graph_runner import DummyRowPool
+from mstar.engine.accelerator_graph_runner import DummyRowPool
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
@@ -65,7 +65,7 @@ class _RecordingResource:
 def _pool(resource, rids_per_key):
     pool = DummyRowPool(
         prefix="node",
-        step_runner=SimpleNamespace(ingest_request=lambda rid: None),
+        step_runner=SimpleNamespace(ingest_capture_row=lambda rid: None),
         resources={"kv": resource},
     )
     for key, bs in rids_per_key.items():
@@ -118,9 +118,10 @@ def _admit(kv: KVManager, rids, spans):
     assert kv.admit(step, ctx).ok
 
 
-def test_capture_spans_come_back_to_the_arena():
-    """The whole point: a packed capture's padding rows take pages by the
-    bucket's token budget, and warmup hands them back."""
+def test_capture_spans_take_no_pages_and_leave_the_arena_whole():
+    """A packed capture's padding rows carry the bucket's token budget but run
+    on SINK_PAGE, so no bucket depends on the pool's size, and warmup leaves
+    every page free."""
     kv = _kv_manager()
     free_before = kv._arena.num_free
     rids = ["__cg_a_0__", "__cg_a_1__"]
@@ -128,13 +129,13 @@ def test_capture_spans_come_back_to_the_arena():
         kv.ingest_request(rid)
     pool = DummyRowPool(
         prefix="a",
-        step_runner=SimpleNamespace(ingest_request=lambda rid: None),
+        step_runner=SimpleNamespace(ingest_capture_row=lambda rid: None),
         resources={"kv": kv},
     )
     pool._held["0_slot0"] = list(rids)
 
     _admit(kv, rids, [512, 256])
-    assert kv._arena.num_free < free_before, "capture must actually take pages"
+    assert kv._arena.num_free == free_before, "a capture's rows must take no pages"
 
     pool.release_all()
 
@@ -157,14 +158,14 @@ def test_a_batched_padding_row_still_declares_its_token():
     """The other half: a decode-shaped config ignores the token argument, so
     its padding rows re-take one page each on first replay rather than none."""
     device = torch.device("cpu")
-    batched = BatchedCudaGraphConfig(
+    batched = BatchedAcceleratorGraphConfig(
         capture_graph_walk="decode",
         single_request_inputs=ARNodeInputs(
             input_ids=torch.zeros(1, dtype=torch.long, device=device),
             input_seq_len=1,
         ),
     )
-    packed = PackedCudaGraphConfig(
+    packed = PackedAcceleratorGraphConfig(
         capture_graph_walk="prefill",
         capture_token_lengths=[64],
         make_node_input=lambda n: ARNodeInputs(input_seq_len=n),
@@ -181,7 +182,7 @@ def test_freed_pages_are_reusable_by_a_real_request(page_size):
     _admit(kv, ["__cg_a_0__"], [page_size * 6])
     pool = DummyRowPool(
         prefix="a",
-        step_runner=SimpleNamespace(ingest_request=lambda rid: None),
+        step_runner=SimpleNamespace(ingest_capture_row=lambda rid: None),
         resources={"kv": kv},
     )
     pool._held["0_slot0"] = ["__cg_a_0__"]

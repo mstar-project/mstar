@@ -24,6 +24,7 @@ import torch
 from mstar.model.cosmos3.components.packing import (
     action_condition_frame_indexes,
     build_action_static_inputs,
+    build_static_inputs,
     get_3d_mrope_ids_action_tokens,
     vision_condition_frame_indexes,
 )
@@ -116,6 +117,32 @@ def test_action_static_layout() -> None:
         exp_act_noisy = action_chunk - len(_ref_action_condition_indexes(mode, action_chunk))
         assert s["num_noisy_action_tokens"] == exp_act_noisy
         assert s["action_mse_loss_indexes"].numel() == exp_act_noisy
+
+
+def test_gen_position_ids_do_not_depend_on_prompt_length() -> None:
+    """The denoise step is compiled with dynamic=False, which guards on sizes
+    and strides, so the generation band's position ids must have the same
+    layout for every prompt length."""
+    cfg = _cfg()
+    latent_shape = (1, cfg.latent_channel, 3, 4, 4)
+    builds = {
+        "action": lambda ids: build_action_static_inputs(
+            ids, latent_shape, 8, "policy", cfg, cfg.vae.scale_factor_temporal,
+            fps=10.0, action_fps=10.0, action_start_offset=1, device="cpu",
+        ),
+        "sound": lambda ids: build_static_inputs(
+            ids, latent_shape, cfg, cfg.vae.scale_factor_temporal, fps=10.0, device="cpu",
+            sound_latent_frames=4,
+        ),
+    }
+    for build in builds.values():
+        layouts = set()
+        for n in (4, 9, 23):
+            s = build(list(range(1, n + 1)))
+            gen = s["gen_position_ids"]
+            assert torch.equal(gen, s["position_ids"][:, s["und_len"]:])
+            layouts.add((tuple(gen.shape), gen.stride(), gen.storage_offset()))
+        assert len(layouts) == 1
 
 
 def _run_mode(model, cfg, mode, latent_shape, action_chunk, ids):
@@ -333,12 +360,14 @@ def test_action_engine_matches_fused() -> None:
     a_noise[..., raw:] = 0
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
-    cond_ids, _ = tokenize_prompt(model.tokenizer, prompt, "", num_frames=nf, height=h, width=w, fps=fps)
+    cond_ids, _ = tokenize_prompt(model.tokenizer, prompt, "", num_frames=nf, height=h, width=w, fps=fps,
+                                  use_system_prompt=False, add_resolution_template=False,
+                                  add_duration_template=False)
     rid = "ra"
     md = {"height": h, "width": w, "num_frames": nf, "fps": fps, "action_fps": fps, "guidance_scale": 1.0,
           "num_inference_steps": steps, "action_mode": "inverse_dynamics", "action_chunk_size": chunk,
           "raw_action_dim": raw, "domain_id": dom, "flow_shift": fshift}
-    fwd = CurrentForwardPassInfo(request_id=rid, graph_walk="prefill", fwd_index=0,
+    fwd = CurrentForwardPassInfo(request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
                                  random_seed=0, max_tokens=0, step_metadata=md)
     resources = _SdpaResources().as_dict()
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": [torch.tensor(cond_ids, dtype=torch.long, device=device)]})
@@ -360,6 +389,16 @@ def test_action_engine_matches_fused() -> None:
     print(f"  action engine cache-once (sdpa) abs-max diff = {diff:.3e}")
 
 
+def _read_mp4_rgb(path: str) -> torch.Tensor:
+    """[T, H, W, 3] uint8 frames via PyAV (torchvision 0.27 dropped io.read_video)."""
+    import av
+
+    with av.open(path) as container:
+        return torch.stack([
+            torch.from_numpy(frame.to_ndarray(format="rgb24")) for frame in container.decode(video=0)
+        ])
+
+
 def test_action_id_golden_gate() -> None:
     """Inverse-dynamics on av_0 reproduces NVIDIA's reference action output
     ([60, 9]) within MSE <= 0.05 / PSNR >= 14 (NVIDIA's own thresholds)."""
@@ -369,7 +408,6 @@ def test_action_id_golden_gate() -> None:
         return
     import json
 
-    import torchvision
     from PIL import Image
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
@@ -383,7 +421,7 @@ def test_action_id_golden_gate() -> None:
         return
     prompt, chunk, raw, dom, fps = "You are an autonomous vehicle planning system.", 60, 9, 1, 10.0
     nf = chunk + 1
-    frames, _, _ = torchvision.io.read_video(inp, pts_unit="sec")
+    frames = _read_mp4_rgb(inp)
     frames = frames[:nf]
     h, w = int(frames.shape[1]), int(frames.shape[2])
     procs = [mpipe.video_processor.preprocess(Image.fromarray(frames[i].numpy()), height=h, width=w).squeeze(0)
@@ -419,7 +457,6 @@ def test_action_fd_agibotworld_golden_gate() -> None:
         return
     import json
 
-    import torchvision
     from PIL import Image
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
@@ -455,7 +492,7 @@ def test_action_fd_agibotworld_golden_gate() -> None:
         out.append(pred.cpu())
         cond_frame = (pred[:, -1].clamp(0, 1) * 2 - 1).to(device=device, dtype=dtype)
     pred_video = torch.cat(out, dim=1)
-    g, _, _ = torchvision.io.read_video(gold_mp4, pts_unit="sec")
+    g = _read_mp4_rgb(gold_mp4)
     gold = (g.permute(3, 0, 1, 2).float() / 255.0)
     n = min(pred_video.shape[1], gold.shape[1])
     mse = (pred_video[:, :n] - gold[:, :n]).pow(2).mean().item()
@@ -511,7 +548,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
         # its output to the first denoise iteration as the ``cond_latents`` edge.
         enc = model.get_submodule("vae_encoder", device=device)
         fwd = CurrentForwardPassInfo(
-            request_id=rid, graph_walk="prefill_cond_video", fwd_index=0,
+            request_id=rid, rid_handle=rid, graph_walk="prefill_cond_video", fwd_index=0,
             random_seed=seeds[0], max_tokens=0, step_metadata=_md())
         ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd})
         ni = enc.prepare_inputs("prefill_cond_video", fwd, {"video_inputs": [cond_videos[rid].to(device)]})
@@ -522,7 +559,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
 
     def _prefill(rid, idx, resources):
         fwd = CurrentForwardPassInfo(
-            request_id=rid, graph_walk="prefill", fwd_index=0,
+            request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
             random_seed=seeds[idx], max_tokens=0, step_metadata=_md())
         ni = dit.prepare_inputs("prefill", fwd, {
             "text_inputs": [torch.tensor(conds[idx], dtype=torch.long, device=device)],

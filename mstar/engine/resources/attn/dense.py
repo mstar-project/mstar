@@ -1,4 +1,4 @@
-"""Attention as one dense FlashAttention-3 varlen pass."""
+"""Attention as one dense varlen pass: FlashAttention-3, or AITER on ROCm."""
 
 import functools
 import logging
@@ -7,10 +7,11 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
+from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -19,23 +20,47 @@ try:
     from fa3_fwd_interface import flash_attn_varlen_func
 except Exception as _fa3_exc:  # noqa: BLE001
     flash_attn_varlen_func = None
-    _FA3_IMPORT_ERROR: str | None = f"{type(_fa3_exc).__name__}: {_fa3_exc}"
+    _VARLEN_IMPORT_ERROR: str | None = f"{type(_fa3_exc).__name__}: {_fa3_exc}"
 else:
-    _FA3_IMPORT_ERROR = None
+    _VARLEN_IMPORT_ERROR = None
+
+# ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
+# there instead of degrading to the paged backend
+if flash_attn_varlen_func is None and current_platform.is_rocm():
+    try:
+        from aiter import flash_attn_varlen_func
+    except Exception as _aiter_exc:  # noqa: BLE001
+        _VARLEN_IMPORT_ERROR = f"{_VARLEN_IMPORT_ERROR}; aiter: {type(_aiter_exc).__name__}: {_aiter_exc}"
+    else:
+        _VARLEN_IMPORT_ERROR = None
+
+
+def _fa3_has_kernel(capability: tuple[int, int]) -> bool:
+    # fa3-fwd ships sm_90a and sm_80 kernels and no PTX, so a GPU of any other
+    # architecture, Blackwell's among them, has no image to launch
+    return capability == (9, 0) or capability[0] == 8
 
 
 @functools.cache
-def _fa3_unavailable_reason() -> str | None:
-    """verify flash attention 3 fwd kernel imports"""
-    return _FA3_IMPORT_ERROR
+def _fa3_unavailable_reason(device: torch.device | None = None) -> str | None:
+    """why no varlen kernel can run on ``device`` (the current GPU if None): none
+    imported (fa3-fwd, and AITER on ROCm), or fa3-fwd has none for its capability"""
+    if _VARLEN_IMPORT_ERROR is not None:
+        return _VARLEN_IMPORT_ERROR
+    if device is not None and torch.device(device).type != "cuda":
+        return None
+    capability = current_platform.cuda_capability(device)
+    if capability is not None and not _fa3_has_kernel(capability):
+        return f"fa3-fwd has no kernel for compute capability {capability[0]}.{capability[1]}"
+    return None
 
 
 @functools.cache
-def _warn_dense_fallback(reason: str) -> None:
+def _warn_dense_fallback(reason: str, fallback: AttnBackend) -> None:
     logger.warning(
-        "Attention backend 'dense' requested but the fa3-fwd kernel is "
-        "unavailable (%s); using the paged 'flashinfer' backend instead.",
-        reason,
+        "Attention backend 'dense' requested but no varlen kernel is "
+        "available (%s); using the paged %r backend instead.",
+        reason, fallback.value,
     )
 
 
@@ -72,7 +97,7 @@ class _GatheredPrefix:
 
 
 class DenseAttentionManager(AttentionManager):
-    """Attention as one dense FlashAttention-3 varlen pass over a contiguous
+    """Attention as one dense varlen pass (FA3, AITER on ROCm) over a contiguous
     [frozen prefix | fresh tokens] sequence.
 
     For a workload that recomputes every one of its K/V every step and only
@@ -126,6 +151,9 @@ class DenseAttentionManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
+    def can_capture(self) -> bool:
+        return False
+
     @property
     def requires_kv_write(self) -> bool:
         return False
@@ -148,6 +176,7 @@ class DenseAttentionManager(AttentionManager):
             del self._prefix_cache[key]
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         if ctx.slot_lease is not None or ctx.is_preplan:
             raise RuntimeError(

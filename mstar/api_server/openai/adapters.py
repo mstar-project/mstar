@@ -26,13 +26,15 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
 from mstar.model.multimodal import PromptPart
+from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
+from mstar.model.whisper.config import WORDS_MARKER
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -76,73 +78,88 @@ class Transcript:
 
 
 def flatten_messages(
-    messages: list, upload_dir: Path, allow_remote: bool = True
+    messages: list, upload_dir: Path, allow_remote: bool = False
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
     """Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities, parts).
 
     ``parts`` is the ordered sequence as written; the other three derive from
     it — text newline-joined, attachments persisted under ``upload_dir`` and
     grouped by modality, ``input_modalities`` the per-part modality sequence.
-    So an attachment's position and a repeated modality both survive.
-    (Multi-turn role structure is flattened — a v1 simplification; the models
-    apply their own prompt formatting in ``process_prompt``.)
+    So an attachment's position and a repeated modality both survive. Each
+    text part carries its message's role, so a reply stays its own turn.
     """
     parts: list[PromptPart] = []
     file_paths: dict[str, list[str]] = {}
 
     def add_file(modality: str, path: str) -> None:
+        # shortcut: always a user turn, so the model can't tell an image it made from one it was
+        # sent, and a reply that is only an image leaves no assistant turn; a feature like
+        # multi-turn editing would give the turn break between two attachments a text slot
         paths = file_paths.setdefault(modality, [])
-        parts.append(PromptPart(modality=modality, index=len(paths)))
+        parts.append(PromptPart(modality=modality, index=len(paths), role="user"))
         paths.append(path)
 
-    def add_text(text: str) -> None:
+    def add_text(text: str, role: str) -> None:
         # Adjacent text parts were newline-joined before ordering was kept;
-        # merge them here so only text an attachment separates gets its own
-        # part, and the rendered prompt keeps the separator it used to have.
-        if parts and parts[-1].modality == "text":
-            parts[-1] = PromptPart(
-                modality="text", text=f"{parts[-1].text}\n{text}"
-            )
+        # merge them here, across messages of one role too (the layout has no
+        # slot for the boundary between them), so only text an attachment or a
+        # role change separates gets its own part, and the rendered prompt
+        # keeps the separator it used to have.
+        if parts and parts[-1].modality == "text" and parts[-1].role == role:
+            parts[-1] = replace(parts[-1], text=f"{parts[-1].text}\n{text}")
             return
-        parts.append(PromptPart(modality="text", text=text))
+        parts.append(PromptPart(modality="text", text=text, role=role))
 
-    for msg in messages or []:
-        # Messages may be pydantic ChatMessage objects or plain dicts.
-        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
-        if content is None:
-            continue
-        if isinstance(content, str):
-            if content:
-                add_text(content)
-            continue
-        for part in content:
-            if not isinstance(part, dict):
+    try:
+        for msg in messages or []:
+            # Messages may be pydantic ChatMessage objects or plain dicts.
+            if isinstance(msg, dict):
+                role, content = msg.get("role"), msg.get("content")
+            else:
+                role, content = getattr(msg, "role", None), getattr(msg, "content", None)
+            if role == "developer":  # OpenAI's newer name for system
+                role = "system"
+            elif role not in ("system", "user", "assistant"):
+                raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
+            if content is None:
                 continue
-            ptype = part.get("type")
-            if ptype == "text":
-                if part.get("text"):
-                    add_text(part["text"])
-            elif ptype == "image_url":
-                url = (part.get("image_url") or {}).get("url", "")
-                if url:
-                    mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "image", path)
-            elif ptype == "video_url":  # extension for video-capable models
-                url = (part.get("video_url") or {}).get("url", "")
-                if url:
-                    mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "video", path)
-            elif ptype == "audio_url":  # data:/http audio input (vllm-omni content style)
-                url = (part.get("audio_url") or {}).get("url", "")
-                if url:
-                    mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "audio", path)
-            elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
-                ia = part.get("input_audio") or {}
-                data, fmt = ia.get("data"), ia.get("format", "wav")
-                if data:
-                    mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
-                    add_file(mod, path)
+            if isinstance(content, str):
+                if content:
+                    add_text(content, role)
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    if part.get("text"):
+                        add_text(part["text"], role)
+                elif ptype == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    if url:
+                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
+                        add_file(mod or "image", path)
+                elif ptype == "video_url":  # extension for video-capable models
+                    url = (part.get("video_url") or {}).get("url", "")
+                    if url:
+                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
+                        add_file(mod or "video", path)
+                elif ptype == "audio_url":  # data:/http audio input in an ``audio_url`` content part
+                    url = (part.get("audio_url") or {}).get("url", "")
+                    if url:
+                        mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
+                        add_file(mod or "audio", path)
+                elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
+                    ia = part.get("input_audio") or {}
+                    data, fmt = ia.get("data"), ia.get("format", "wav")
+                    if data:
+                        mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
+                        add_file(mod, path)
+    except BaseException:
+        # A refused chat is never submitted, so no deferred cleanup covers
+        # the attachments saved before the refusal.
+        media_io.remove_uploads(file_paths, upload_dir)
+        raise
 
     text_parts = [p.text for p in parts if p.modality == "text"]
     text = "\n".join(text_parts) if text_parts else None
@@ -154,6 +171,29 @@ def _passthrough(req) -> dict:
     flow through verbatim as model_kwargs."""
     extra = getattr(req, "model_extra", None) or {}
     return dict(extra)
+
+
+def _refuse_tool_calls(req) -> None:
+    """Refuse a chat that asks the model to call a tool.
+
+    No adapter here parses a tool call out of a reply, so a client sent plain
+    text takes it for the model declining every tool. An empty ``tools`` and a
+    ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
+    by default. A ``tool_choice`` of ``none`` asks for no call even when
+    ``tools`` lists some. Their older names, ``functions`` and
+    ``function_call``, follow the same rules.
+    """
+    extra = req.model_extra or {}
+    choice = extra.get("tool_choice")
+    function_call = extra.get("function_call")
+    if (
+        (extra.get("tools") not in (None, []) and choice != "none")
+        or (extra.get("functions") not in (None, []) and function_call != "none")
+        or choice == "required"
+        or isinstance(choice, dict)
+        or function_call not in (None, "none", "auto")
+    ):
+        raise ValueError("tool calling is not supported for this model")
 
 
 def _apply_sampling(
@@ -211,6 +251,20 @@ class OpenAIAdapter:
     # Longest clip the model transcribes in one request. Longer uploads are cut
     # into windows of this length by the transcription route (None means unlimited).
     max_audio_seconds: float | None = None
+    # Window length for long uploads when shorter than the clip bound (None:
+    # the bound); a request can override it with ``window_seconds`` in extra_body.
+    window_seconds: float | None = None
+    # Cut a long upload into the fewest windows of at most the window length,
+    # of about equal length, instead of full windows and a remainder.
+    balanced_windows: bool = False
+    # Uploads up to this length run as one window even when longer than the
+    # window length (None: the window length). A request's ``window_seconds``
+    # sets both.
+    whole_seconds: float | None = None
+    # How far back from its nominal boundary a cut may move to the quietest
+    # frame, and the frame length compared (None: the route's defaults).
+    window_search_seconds: float | None = None
+    window_frame_seconds: float | None = None
     # How the windows of a long upload run: "sequential" feeds each window the
     # previous transcript as ``initial_prompt`` (openai-whisper's carry-over),
     # "parallel" submits them all at once. A request can override with
@@ -267,6 +321,12 @@ class OpenAIAdapter:
         and timestamp tokens, an LLM decoder's tags) parses them here."""
         return Transcript(text=text.strip())
 
+    def final_text(self, text: str) -> str:
+        """The finished transcript's text as the client gets it (a response,
+        or the stream's ``transcript.text.done``); not applied to partial
+        text, which only grows. The default passes it through."""
+        return text
+
     def stream_text(self, raw: str) -> str:
         """The client-facing text of the raw stream so far. It must only
         grow as ``raw`` does, so a model with control tokens strips them and
@@ -294,6 +354,7 @@ class BagelAdapter(OpenAIAdapter):
     supports_images = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -351,6 +412,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         return getattr(req, "voice", None)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         # Speech output also emits text, so request both modalities when audio is asked for.
@@ -386,7 +448,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 
 
 class Qwen3_5Adapter(OpenAIAdapter):
-    """Qwen3.5: text-and-image chat, text out.
+    """Qwen3.5: text, image and video chat (``image_url`` / ``video_url`` parts), text out.
 
     Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
     ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
@@ -401,6 +463,7 @@ class Qwen3_5Adapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -471,10 +534,7 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            # A data URL, a base64 blob, a local path or (when allowed) a URL.
-            path, _mime = media_io.resolve_media_ref(
-                ref_audio, upload_dir, allow_remote=True
-            )
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile+torchcodec")
             # Keyed by modality: the data worker iterates the dict and
             # loads each group through the matching loader.
             file_paths = {"audio": [path]}
@@ -518,17 +578,14 @@ class Qwen3TTSAdapter(OpenAIAdapter):
         if instructions:
             mk.setdefault("instruct", instructions)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
-        # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL, a
-        # local path or bare base64 (vLLM-Omni's field). It becomes the
+        # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL (when
+        # the server allows it) or bare base64. It becomes the
         # request's audio input for one request; ``ref_text`` and
         # ``x_vector_only_mode`` ride along as model kwargs. Named, persisted
         # voices come with the shared voice registry (engine/voice-registry).
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            if ref_audio.startswith(("data:", "http://", "https://")) or Path(ref_audio).suffix:
-                _, path = media_io.resolve_media_ref(ref_audio, upload_dir)
-            else:
-                _, path = media_io.save_base64(ref_audio, "wav", "audio", upload_dir)
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")
             return SubmitArgs(
                 text=req.input,
                 file_paths={"audio": [path]},
@@ -573,17 +630,25 @@ class KokoroAdapter(OpenAIAdapter):
         )
 
 
-def _refuse_server_path(ref: str, upload_dir: Path) -> None:
-    """A plain path must name a file the server stored itself, under
-    ``upload_dir``; checked before anything is opened, so it cannot probe the disk."""
+def _resolve_ref_audio(ref: str, upload_dir: Path, decoder: str) -> str:
+    """A reference voice clip from the request: a data URL, an http(s) URL (only
+    when the server allows remote fetch), or bare base64 that ``decoder`` (the
+    model's audio loader) can open. Returns its path. Every form gets the same
+    ``check_ref_audio``, so a clip the data worker would fail on, or one longer
+    than ``MAX_REF_AUDIO_SECONDS``, is a 400 here."""
     if not isinstance(ref, str):
-        raise ValueError(f"ref_audio must be a data URL or an http(s) URL, got {type(ref).__name__}")
+        raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
     if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
-        return
-    if not Path(ref).resolve().is_relative_to(Path(upload_dir).resolve()):
-        raise ValueError(
-            "ref_audio must be a data URL or an http(s) URL; paths on the server are refused"
-        )
+        path = media_io.resolve_media_ref(ref, upload_dir)[1]
+        media_io.check_ref_audio(path, decoder)
+        return path
+    path = media_io.save_base64_audio(ref, upload_dir, decoder)
+    if path:
+        return path
+    raise ValueError(
+        "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
+        "or base64 audio the model can decode"
+    )
 
 
 class ChatterboxAdapter(OpenAIAdapter):
@@ -592,8 +657,9 @@ class ChatterboxAdapter(OpenAIAdapter):
     ``voice`` is either ``"default"`` (the voice shipped with the checkpoint)
     or the name of a preset clip in the deployment's ``voices_dir``. A
     reference clip for cloning comes through ``ref_audio`` in ``extra_body``
-    (a data URL or, when the server allows it, an http(s) URL; paths on the
-    server are refused) and is loaded by the worker like an uploaded file.
+    (a data URL, bare base64 or, when the server allows it, an http(s) URL;
+    paths on the server are refused, and so is a clip over 60 s or below
+    8 kHz) and is loaded by the worker like an uploaded file.
     The model's own knobs --
     ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
     ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for
@@ -613,15 +679,53 @@ class ChatterboxAdapter(OpenAIAdapter):
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            _refuse_server_path(ref_audio, upload_dir)
-            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
-            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=False)
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile+torchcodec")
             file_paths = {"audio": [path]}
             input_modalities = ["text", "audio"]
         return SubmitArgs(
             text=req.input,
             file_paths=file_paths,
             input_modalities=input_modalities,
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
+class FishS2ProAdapter(OpenAIAdapter):
+    """Fish Audio S2-Pro: text-to-speech with optional reference-audio voice cloning.
+
+    The voice comes from a reference clip: ``ref_audio`` in ``extra_body`` (a
+    data URL, bare base64, or, when the server allows remote fetch, an http(s)
+    URL; paths on the server are refused) with its transcript in ``ref_text``. Without
+    one the model picks a voice. ``voice`` and ``speed`` are not S2-Pro
+    controls and are dropped; inline ``[tag]`` prosody control is part of
+    the input text. ``temperature`` / ``top_p`` / ``seed`` are the standard
+    fields; ``top_k``, ``repetition_penalty``, ``do_sample`` and
+    ``max_new_tokens`` pass through ``extra_body``. Long inputs are
+    synthesized as ordered sentence chunks, as for Qwen3-TTS.
+    """
+
+    supports_speech = True
+    speech_chunk_min_chars = 600
+    speech_chunk_max_chars = 400
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")
+            return SubmitArgs(
+                text=req.input,
+                file_paths={"audio": [path]},
+                input_modalities=["text", "audio"],
+                output_modalities=["audio"],
+                model_kwargs=mk,
+            )
+        mk.pop("ref_text", None)
+        return SubmitArgs(
+            text=req.input,
+            input_modalities=["text"],
             output_modalities=["audio"],
             model_kwargs=mk,
         )
@@ -712,14 +816,17 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        _refuse_tool_calls(req)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
-        # ``chat_template_kwargs`` is how the vLLM recipe toggles thinking;
-        # accept it alongside a flat ``enable_thinking``.
+        # Clients written for the Edge model's serving recipe toggle thinking
+        # through ``chat_template_kwargs``; accept it alongside a flat
+        # ``enable_thinking``. Read before the attachments are saved, since a
+        # malformed value refuses the request.
         template_kwargs = mk.pop("chat_template_kwargs", None) or {}
         if "enable_thinking" in template_kwargs:
             mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,
             file_paths=file_paths or None,
@@ -783,6 +890,41 @@ class Wan22Adapter(OpenAIAdapter):
         )
 
 
+class LTX25Adapter(OpenAIAdapter):
+    """LTX-2.5: text-to-audio+video generation.
+
+    Returns one mp4 with the generated audio muxed in as an AAC track by default;
+    ``audio: false`` in ``extra_body`` asks for video alone. ``size`` ("WxH") maps to
+    the model's ``width`` / ``height``; ``seed``, ``num_frames`` and ``fps`` are
+    first-class fields, and any other knobs pass through via
+    ``extra_body``. No image or video conditioning yet.
+    """
+
+    supports_videos = True
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        if getattr(req, "image", None) or getattr(req, "video", None):
+            raise ValueError("LTX-2.5 (this port) is text-to-video only; omit 'image' and 'video'.")
+        mk = _passthrough(req)
+        with_audio = mk.pop("audio", True)
+        if getattr(req, "size", None):
+            try:
+                width, height = (int(v) for v in req.size.lower().split("x"))
+            except ValueError:
+                raise ValueError(f"size must be 'WxH' (e.g. '960x544'); got {req.size!r}") from None
+            mk.setdefault("width", width)
+            mk.setdefault("height", height)
+        for name in ("seed", "num_frames", "fps"):
+            if getattr(req, name, None) is not None:
+                mk.setdefault(name, getattr(req, name))
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["video", "audio"] if with_audio else ["video"],
+            model_kwargs=mk,
+        )
+
+
 class DiffusionImageAdapter(OpenAIAdapter):
     """Generic adapter for the DiT-scaffold image models (FLUX.2 klein, Z-Image, ...):
     text-to-image and reference-image editing.
@@ -839,9 +981,6 @@ _CONTROL_TOKEN = re.compile(r"<\|([^|<>]*)\|>")
 _PARTIAL_CONTROL_TOKEN = re.compile(r"<(\|[^|<>]*\|?)?$")
 _TIMESTAMP = re.compile(r"^\d+\.\d{2}$")
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
-# Whisper's word timings follow the transcript after this marker, one
-# ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
-_WORDS_MARKER = "<|startoflm|>"
 
 
 # sampling knobs the engine reads as numbers; a string there fails every
@@ -921,11 +1060,11 @@ class WhisperAdapter(OpenAIAdapter):
         )
 
     def stream_text(self, raw: str) -> str:
-        raw = raw.partition(_WORDS_MARKER)[0]  # word timings follow the transcript
+        raw = raw.partition(WORDS_MARKER)[0]  # word timings follow the transcript
         return _CONTROL_TOKEN.sub("", _PARTIAL_CONTROL_TOKEN.sub("", raw))
 
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
-        text, _, timed_words = text.partition(_WORDS_MARKER)
+        text, _, timed_words = text.partition(WORDS_MARKER)
         language, segments, parts, unfinished = _parse_timestamped(text)
         clean = " ".join(p.strip() for p in parts if p.strip())
         for idx, seg in enumerate(segments):
@@ -977,6 +1116,210 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
     return language, segments, parts, start is not None
 
 
+class Qwen3ASRAdapter(OpenAIAdapter):
+    """Qwen3-ASR: an LLM decoder that writes ``language {Name}<asr_text>{text}``
+    (or the text alone when the language is forced). Hears up to 20 minutes
+    per request, longer uploads are windowed at that; continues a hypothesis through
+    ``assistant_prefix``, which is what the realtime session needs."""
+
+    supports_transcriptions = True
+    supports_realtime_transcription = True
+    max_audio_seconds = 1200.0
+    # 2.4 is Whisper's bound for a 30 s window. The ratio grows with length,
+    # so a 20 minute transcript of ordinary speech can pass it.
+    compression_ratio_threshold = None
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        kwargs = _transcription_kwargs(req)
+        # checked here too so a streaming request gets a 400 before it starts
+        if "<|audio_pad|>" in str(kwargs.get("initial_prompt") or ""):
+            raise ValueError("the prompt must not contain <|audio_pad|>")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=kwargs,
+        )
+
+    def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:
+        args = self.transcription_to_request(req, audio_path)
+        if prefix:
+            args.model_kwargs["assistant_prefix"] = prefix
+        return args
+
+    def stream_text(self, raw: str) -> str:
+        # A detected language opens the stream as ``language X<asr_text>``.
+        # Hold the text back until the tag has arrived and show what follows
+        # it. A forced language skips the line, so plain text streams as is.
+        if ASR_TEXT_TAG in raw:
+            return raw.split(ASR_TEXT_TAG, 1)[1]
+        head = raw.lstrip()
+        if head.startswith("language") and len(head) < 40 and "\n" not in head:
+            return ""
+        return raw
+
+    def final_text(self, text: str) -> str:
+        from mstar.model.qwen3_asr.repetition import fix_repetitions
+
+        # the reference SDK collapses repetition loops in every finished transcript
+        return fix_repetitions(text)
+
+    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
+        raw = text.strip()
+        if ASR_TEXT_TAG not in raw:
+            return Transcript(text=raw, language=req.language)
+        meta, body = raw.split(ASR_TEXT_TAG, 1)
+        language = None
+        for line in meta.splitlines():
+            line = line.strip()
+            if line.lower().startswith("language "):
+                language = line[len("language "):].strip() or None
+                break
+        if language and language.lower() == "none":
+            language = None
+        return Transcript(text=body.strip(), language=req.language or _qwen3_language_code(language))
+
+
+def _qwen3_language_code(name: str | None) -> str | None:
+    """The ISO code clients expect (what Whisper reports too) for a language
+    name Qwen3-ASR wrote; a name outside its list passes through."""
+    if not name:
+        return None
+    from mstar.model.qwen3_asr.config import LANGUAGE_CODES
+
+    for code, canonical in LANGUAGE_CODES.items():
+        if canonical.lower() == name.lower():
+            return code
+    return name
+
+
+def _untimed_transcription_kwargs(req: TranscriptionRequest, model: str, *, translates: bool = False) -> dict:
+    """``model_kwargs`` for a model that takes no conditioning text and emits
+    no timestamps: the OpenAI ``prompt`` is dropped, granularities refused.
+    Whisper's ``task`` is the caller's to read when the model ``translates``;
+    otherwise anything but ``transcribe`` is refused, not silently ignored."""
+    mk = _transcription_kwargs(req)
+    mk.pop("initial_prompt", None)
+    if req.timestamp_granularities:
+        raise ValueError(f"{model} does not produce timestamps; leave timestamp_granularities unset")
+    mk.pop("timestamps", None)
+    if not translates:
+        task = mk.pop("task", None)
+        if task not in (None, "transcribe"):
+            raise ValueError(f"{model} only transcribes; task must be 'transcribe'; got {task!r}")
+    return mk
+
+
+class _UntimedTranscriptionAdapter(OpenAIAdapter):
+    """The FastConformer ASR models' adapters: plain text, which a
+    SentencePiece vocabulary starts with a space."""
+
+    # greedy, unconditioned windows: a retry could only swap a correct
+    # transcript for a sampled one
+    compression_ratio_threshold = None
+
+    def stream_text(self, raw: str) -> str:
+        # parse_transcript strips the text, so the deltas drop the leading
+        # space too; lstrip keeps a growing stream growing
+        return raw.lstrip()
+
+
+class CanaryAdapter(_UntimedTranscriptionAdapter):
+    """NVIDIA Canary: speech recognition, and translation to or from English.
+
+    ``language`` is the speech's language (English by default); an
+    ``extra_body`` ``target_language`` other than it asks for a translation.
+    The decoder takes no free-text conditioning and emits no timestamps, so
+    ``prompt`` is dropped and timestamp granularities are refused.
+    """
+
+    supports_transcriptions = True
+    # Canary was trained on clips of up to 40 s; windows don't condition on
+    # each other, so they run in parallel
+    max_audio_seconds = 40.0
+    long_form = "parallel"
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        from mstar.model.canary.config import check_task
+
+        mk = _untimed_transcription_kwargs(req, "Canary", translates=True)
+        # Whisper's convention: translate means into English
+        task = mk.pop("task", None)
+        if task not in (None, "transcribe", "translate"):
+            raise ValueError(f"task must be 'transcribe' or 'translate'; got {task!r}")
+        source = mk.get("language") or "en"
+        target = mk.get("target_language") or ("en" if task == "translate" else source)
+        mk["language"], mk["target_language"] = check_task(source, target)
+        if not isinstance(mk.get("punctuation", True), bool):
+            raise ValueError(f"punctuation must be true or false; got {mk['punctuation']!r}")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
+class CanaryQwenAdapter(_UntimedTranscriptionAdapter):
+    """NVIDIA Canary-Qwen: English speech recognition by an LLM, under its
+    trained instruction. OpenAI's ``prompt`` is context for the transcript
+    (and carries the previous window in sequential long form), which this
+    model was not trained to take, so it is dropped; no timestamps."""
+
+    supports_transcriptions = True
+    max_audio_seconds = 40.0
+    long_form = "parallel"
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        from mstar.model.utils import base_language
+
+        mk = _untimed_transcription_kwargs(req, "Canary-Qwen")
+        if base_language(mk.get("language") or "en") != "en":
+            raise ValueError("Canary-Qwen transcribes English only")
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
+class TransducerAdapter(_UntimedTranscriptionAdapter):
+    """NVIDIA Parakeet / Nemotron ASR: transducer speech recognition.
+
+    Parakeet-TDT (``detects_language``) detects the language from the speech
+    and refuses only a ``language`` it doesn't know; Nemotron takes it as its
+    prompt (a locale such as ``en-US``, a bare code, or ``auto``), checked
+    against the checkpoint's locales when the upload is preprocessed. Neither
+    takes free-text conditioning or emits timestamps here.
+    """
+
+    supports_transcriptions = True
+    # full attention over the clip; longer uploads run as independent windows
+    max_audio_seconds = 600.0
+    long_form = "parallel"
+
+    def __init__(self, detects_language: bool = False):
+        self.detects_language = detects_language
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        mk = _untimed_transcription_kwargs(req, "this model")
+        if self.detects_language:
+            from mstar.model.parakeet.config import check_detected_language
+
+            check_detected_language(mk.get("language"))
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 class HiggsAudioAdapter(OpenAIAdapter):
     """Higgs-Audio v3 STT: an instruction-following LLM decoder, so the OpenAI
     ``prompt`` is the transcription instruction (the model has a default)."""
@@ -995,6 +1338,46 @@ class HiggsAudioAdapter(OpenAIAdapter):
         )
 
 
+class OmnilingualASRAdapter(OpenAIAdapter):
+    """Omnilingual ASR CTC: speech-to-text in 1,600+ languages, no language code.
+
+    The model hears at most 40 s (the reference rejects longer clips) and is
+    most accurate on shorter ones, so a clip of up to 20 s is transcribed
+    whole, exactly as the reference does, and a longer upload is cut into the
+    fewest windows of at most 16 s, of about equal length, each ending at the
+    quietest 0.1 s within 5 s of its boundary. The windows run in parallel: a
+    CTC model takes no conditioning text, so they are independent.
+    ``window_seconds`` in extra_body (5 to 40) sets both lengths for one
+    request. ``language``, ``prompt`` and ``temperature`` have no
+    effect (argmax CTC decoding has nothing to condition or sample). There
+    are no timestamps: each window with text is one segment spanning it, so
+    ``srt`` / ``vtt`` get one cue and ``verbose_json`` one segment per window.
+    """
+
+    supports_transcriptions = True
+    max_audio_seconds = 40.0
+    # CER on FLEURS concatenations is lowest with clips up to 20 s heard whole
+    # and longer ones cut into balanced windows of at most 16 s at a pause (40 s
+    # windows more than double it)
+    window_seconds = 16.0
+    whole_seconds = 20.0
+    balanced_windows = True
+    window_search_seconds = 5.0
+    window_frame_seconds = 0.1
+    long_form = "parallel"
+    # argmax decoding has no temperature to fall back to
+    compression_ratio_threshold = None
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio"],
+            output_modalities=["text"],
+            model_kwargs=_transcription_kwargs(req),
+        )
+
+
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
@@ -1002,6 +1385,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "chatterbox": ChatterboxAdapter(),
     "chatterbox_multilingual": ChatterboxAdapter(),
     "chatterbox_turbo": ChatterboxAdapter(),
+    "fish_s2_pro": FishS2ProAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
@@ -1018,8 +1402,20 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super_i2v_4step": Cosmos3Adapter(),
     "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
+    "ltx2_5": LTX25Adapter(),
     "whisper_large": WhisperAdapter(),
+    "whisper_large_v3_turbo": WhisperAdapter(),
+    "qwen3_asr": Qwen3ASRAdapter(),
+    "qwen3_asr_realtime": Qwen3ASRAdapter(),
+    "canary": CanaryAdapter(),
+    "canary_qwen": CanaryQwenAdapter(),
+    "parakeet": TransducerAdapter(detects_language=True),
+    "nemotron_asr": TransducerAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
+    "omnilingual_asr_ctc_300m": OmnilingualASRAdapter(),
+    "omnilingual_asr_ctc_1b": OmnilingualASRAdapter(),
+    "omnilingual_asr_ctc_3b": OmnilingualASRAdapter(),
+    "omnilingual_asr_ctc_7b": OmnilingualASRAdapter(),
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
@@ -1029,6 +1425,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
 ADAPTER_REGISTRY.update({
     f"qwen3_5_{size}b": Qwen3_5Adapter() for size in QWEN_3_5_DENSE_SIZES
 })
+# Qwen3.8-27B is the Qwen3.5 architecture and chat template family.
+ADAPTER_REGISTRY["qwen3_8_27b"] = Qwen3_5Adapter()
 
 
 def get_adapter(model_name: str) -> OpenAIAdapter | None:

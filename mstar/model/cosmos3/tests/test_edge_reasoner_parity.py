@@ -266,7 +266,7 @@ def test_reasoner_submodule_batched_path_matches_reference() -> None:
     n_ref = len(rec["greedy_tokens"])
 
     def step(walk, per_request_inputs):
-        fwd = {rid: types.SimpleNamespace(request_id=rid, step_metadata={}) for rid in rids}
+        fwd = {rid: types.SimpleNamespace(request_id=rid, rid_handle=rid, step_metadata={}) for rid in rids}
         inputs = [sub.prepare_inputs(walk, fwd[rid], per_request_inputs[rid]) for rid in rids]
         declared = sub.declare_step(walk, rids, inputs)
         spans = [seg.span for seg in declared.segments]

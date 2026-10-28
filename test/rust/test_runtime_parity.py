@@ -17,7 +17,8 @@ from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStor
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
-from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, RouteInput, SpeculationPrepInput
+from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, RequestWalks, RouteInput, SpeculationPrepInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
@@ -29,6 +30,10 @@ pytest.importorskip(
 )
 from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.graph.runtime import rust as rust_runtime
+
+
+def _spec_targets(runtime, node, walk, rid):
+    return runtime.speculate_node(node, [walk], [rid])
 
 
 def _ingest_block(rids, specs) -> ColumnarEdgeSpecs:
@@ -166,11 +171,12 @@ def _info(uuid):
     )
 
 
-def _admit(rt, rid="r1"):
+def _admit(rt, rid="r1", loop_caps=None):
     return rt.add_request(
         request_id=rid, partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        loop_caps=loop_caps or {},
     )
 
 
@@ -235,6 +241,32 @@ def test_structural_lookups_agree(pair):
     assert rt.is_async_schedulable("prefill", WALK)
 
 
+@pytest.mark.parametrize(
+    ("node", "walk"),
+    [("no_such_node", WALK), ("prefill", "no_such_walk")],
+    ids=["unknown_node", "unknown_walk"],
+)
+def test_popping_a_pair_no_worker_graph_runs_raises_in_both(pair, node, walk):
+    """A (node, walk) nothing in the deployment runs is a structural error.
+
+    Rust used to fold it into the same None that means "not ready yet", so the
+    scheduler read a bad pair as a row to retry and came back forever instead
+    of failing. Python raised here all along; AUTO prefers Rust, so the silent
+    side was the one that actually ran.
+    """
+    rt, _book, _store = pair
+    with pytest.raises(RuntimeError):
+        rt.pop_rids(node, walk, [])
+
+
+def test_popping_an_unready_rid_is_still_not_an_error(pair):
+    """The other half of the split: not-ready stays None, so the all-or-nothing
+    retry that check_ready exists for keeps working."""
+    rt, _book, _store = pair
+    rid = _admit(rt)  # admitted, but no input has landed
+    assert rt.pop_rids("prefill", WALK, [rid], check_ready=True) is None
+
+
 def test_refusals_agree(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
@@ -265,6 +297,7 @@ def test_one_handle_per_request_across_partitions(pair):
             request_id="r", partition=p, graph_walk=WALK,
             partition_worker_graph_ids=[WG_ID],
             worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+            loop_caps={},
         )
         for p in ("Thinker", "Talker", "Code2Wav")
     ]
@@ -279,6 +312,7 @@ def test_one_handle_per_request_across_partitions(pair):
         request_id="r2", partition="Thinker", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        loop_caps={},
     ) == handles[0]
 
 
@@ -295,11 +329,11 @@ def test_handle_recycling_agrees(pair):
 def test_speculation_agrees(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
-    out = rt.speculate_node("prefill", WALK, rid)
+    out = _spec_targets(rt, "prefill", WALK, rid)
     assert [(o.node_name, o.is_new_loop_iter, o.loop_name) for o in out] == [
         ("ar_decode", False, "ar_loop")
     ]
-    back = rt.speculate_node("ar_decode", WALK, rid)
+    back = _spec_targets(rt, "ar_decode", WALK, rid)
     assert [(o.node_name, o.is_new_loop_iter) for o in back] == [
         ("ar_decode", True)
     ]
@@ -313,6 +347,113 @@ def test_loop_iters_agree(pair):
     got = rt.get_dynamic_loop_iters([rid], "default")
     assert got.keys == [rid]
     assert got.values == [{"ar_loop": 0}]
+
+
+def _decode_graph():
+    return Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[GraphEdge(name="token", next_node="ar_decode")],
+        ),
+        Loop(
+            name="ar_loop",
+            section=GraphNode(
+                name="ar_decode", input_names={"token"},
+                outputs=[GraphEdge(name="token", next_node="ar_decode")],
+            ),
+            outputs=[GraphEdge(name="token", next_node=EMIT_TO_CLIENT, output_modality="text")],
+            max_iters=4,
+        ),
+    ])
+
+
+@pytest.fixture(params=["python", "rust"])
+def decode(request):
+    wg = WorkerGraph(
+        section=_decode_graph(), graph_walks={WALK}, ranks=[0],
+        worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"ar_loop"}},
+        all_wg_ids_to_nodes={WG_ID: NODES},
+        node_to_partition=dict.fromkeys(NODES, "default"),
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        rt = PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None, **common,
+        )
+        return rt, book
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book
+
+
+def _run_pass(rt, book, rid, uuids, on_decode=None) -> list[str]:
+    def fresh():
+        u = next(uuids)
+        book.put_tensor(u, _info(u))
+        book.increment_ref(u, 1)  # the safety hold
+        return u
+
+    rt.ingest_inputs_batch(
+        _ingest_block([rid], [_spec("prompt", "prefill", uuids=[fresh()])])
+    )
+    log = []
+    for _ in range(40):
+        ready = [r.node_name for r in rt.get_ready_nodes(set()) if rid in r.rids]
+        if not ready:
+            break
+        node = ready[0]
+        rt.pop_rids(node, WALK, [rid])
+        log.append(node)
+        if node == "ar_decode" and on_decode is not None:
+            on_decode()
+        signals = rt.get_output_signals(node, WALK)
+        rt.complete_and_route_batch(
+            RouteInput(
+                partition="default", graph_walk=WALK, node_name=node,
+                output_signals=signals,
+                wg_ids=ParallelList([rid], [WG_ID]),
+                tensors=[fresh() for _ in signals],
+                num_tensors=[1] * len(signals),
+            ),
+        )
+    return log
+
+
+def test_a_capped_loop_ends_at_its_cap_on_every_pass(decode):
+    rt, book = decode
+    uuids = iter(range(1, 500))
+    capped = _admit(rt, "r1", loop_caps={"ar_loop": 2})
+    free = _admit(rt, "r2")
+
+    first = _run_pass(rt, book, capped, uuids)
+    second = _run_pass(rt, book, capped, uuids)
+    other = _run_pass(rt, book, free, uuids)
+
+    assert first.count("ar_decode") == second.count("ar_decode") == 2
+    assert other.count("ar_decode") == 4, "the cap leaked to the next request"
+
+
+def test_speculation_stops_at_the_cap(decode):
+    rt, book = decode
+    rid = _admit(rt, loop_caps={"ar_loop": 2})
+    speculated = []
+
+    def prep():
+        out = rt.prep_spec_rids(SpeculationPrepInput(
+            spec_node_name="ar_decode", curr_node_name="ar_decode",
+            graph_walk=WALK, rids=[rid], room_for_continuing=None,
+            streaming_edges=[], streaming_edges_per_rid=[0],
+        ))
+        speculated.append(out.ready_rids == [rid])
+
+    _run_pass(rt, book, rid, iter(range(1, 500)), on_decode=prep)
+
+    assert speculated == [True, False]
 
 
 def test_routing_agrees(pair):
@@ -400,6 +541,27 @@ def test_prep_agrees(pair):
     assert capped.ready_rids == []
 
 
+def test_a_loop_a_peer_stopped_is_not_speculated(pair):
+    """A peer's stop sets the loop's finish signal and records no pending stop,
+    so the finish signal alone has to keep the loop out of speculation."""
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
+    rt.pop_rids("prefill", WALK, [rid])
+    rt.ingest_inputs_batch(_ingest_block(
+        [rid, rid],
+        [_spec("token", "ar_decode"), _spec("kv_cache", "ar_decode")],
+    ))
+    rt.apply_peer_loop_stops(rid, "default", {"ar_loop": NestedLoopIndices(["ar_loop"], {"ar_loop": 0}, 0)})
+
+    out = rt.prep_spec_rids(SpeculationPrepInput(
+        spec_node_name="ar_decode", curr_node_name="ar_decode",
+        graph_walk=WALK, rids=[rid], room_for_continuing=None,
+        streaming_edges=[], streaming_edges_per_rid=[0],
+    ))
+    assert out.ready_rids == [], "the runtime would speculate an iteration of a loop a peer stopped"
+
+
 def test_cleanup_agrees(pair):
     rt, book, store = pair
     rid = _admit(rt)
@@ -474,7 +636,7 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
 
     assert _admit(rt, "r2") == rid, "the handle was recycled, as intended"
     assert not rt.has_pending_loop_stop(rid, WALK, "ar_loop")
-    assert rt.pending_loop_stop_rids(WALK, "ar_loop") == set()
+    assert rt.pending_loop_stop_rids([WALK], "ar_loop") == set()
 
 
 # --- stale handles -----------------------------------------------------------
@@ -499,8 +661,7 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
         lambda rt, r: rt.push_back_node("prefill", [r], [WG_ID]),
         id="push_back_node"),
     pytest.param(
-        lambda rt, r: rt.set_in_flight(
-            "prefill", WG_ID, [r], True),
+        lambda rt, r: rt.set_in_flight("prefill", [r], [WG_ID], True),
         id="set_in_flight"),
     pytest.param(
         lambda rt, r: rt.pop_rids("prefill", WALK, [r]), id="pop_rids"),
@@ -508,7 +669,7 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
         lambda rt, r: rt.pop_rids("prefill", WALK, [r], check_ready=True),
         id="pop_rids_checked"),
     pytest.param(
-        lambda rt, r: rt.speculate_node("prefill", WALK, r),
+        lambda rt, r: _spec_targets(rt, "prefill", WALK, r),
         id="speculate_node"),
     pytest.param(
         lambda rt, r: rt.get_spec_target("prefill", "ar_decode", WALK, r),
@@ -666,8 +827,8 @@ def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
     assert parked == 0, f"{parked} completions left parked"
 
 
-def _graph_target_opts_out():
-    """Same shape, but the speculation TARGET refuses async scheduling.
+def _graph_opts_out(node_name: str):
+    """Same shape, but ``node_name`` refuses async scheduling.
 
     The main fixture has every node async-enabled, so it cannot tell the
     source-side check from the destination-side one -- they agree on every
@@ -676,6 +837,7 @@ def _graph_target_opts_out():
     return Sequential(sections=[
         GraphNode(
             name="prefill", input_names={"prompt"},
+            enable_async_scheduling=node_name != "prefill",
             outputs=[
                 GraphEdge(name="token", next_node="ar_decode"),
                 GraphEdge(name="kv_cache", next_node="ar_decode"),
@@ -685,7 +847,7 @@ def _graph_target_opts_out():
             name="ar_loop",
             section=GraphNode(
                 name="ar_decode", input_names={"token", "kv_cache"},
-                enable_async_scheduling=False,
+                enable_async_scheduling=node_name != "ar_decode",
                 outputs=[
                     GraphEdge(name="token", next_node="ar_decode"),
                     GraphEdge(name="kv_cache", next_node="ar_decode"),
@@ -697,10 +859,9 @@ def _graph_target_opts_out():
     ])
 
 
-@pytest.fixture(params=["python", "rust"])
-def opted_out(request):
+def _opted_out(runtime_type: str, node_name: str):
     wg = WorkerGraph(
-        section=_graph_target_opts_out(), graph_walks={WALK}, ranks=[0],
+        section=_graph_opts_out(node_name), graph_walks={WALK}, ranks=[0],
         worker_graph_id=WG_ID,
     )
     common = dict(
@@ -711,7 +872,7 @@ def opted_out(request):
         node_to_partition=dict.fromkeys(NODES, "default"),
         sharding_config=_sharding(),
     )
-    if request.param == "python":
+    if runtime_type == "python":
         book = PythonTensorBookkeeping()
         return PythonGraphRuntime(
             tensor_manager=_StubTensorManager(book), communicator=None,
@@ -722,6 +883,23 @@ def opted_out(request):
     )
 
 
+@pytest.fixture(params=["python", "rust"])
+def opted_out(request):
+    return _opted_out(request.param, "ar_decode")
+
+
+@pytest.fixture(params=["python", "rust"])
+def source_opted_out(request):
+    return _opted_out(request.param, "prefill")
+
+
+def test_a_source_that_refuses_async_speculates_nothing(source_opted_out):
+    """Checked by the runtime per walk, so a mixed batch's caller only needs
+    one of its walks to be async."""
+    rid = _admit(source_opted_out)
+    assert _spec_targets(source_opted_out, "prefill", WALK, rid) == []
+
+
 def test_a_target_that_refuses_async_is_never_speculated(opted_out):
     """``enable_async_scheduling=False`` on the DESTINATION.
 
@@ -730,7 +908,7 @@ def test_a_target_that_refuses_async_is_never_speculated(opted_out):
     got speculated into, to be dropped again per rid.
     """
     rid = _admit(opted_out)
-    assert opted_out.speculate_node("prefill", WALK, rid) == []
+    assert _spec_targets(opted_out, "prefill", WALK, rid) == []
 
 
 def test_the_per_request_sharding_config_agrees(pair):
@@ -892,6 +1070,7 @@ def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
         worker_graph_to_workers=ParallelList(
             [WG_ID, 1], [[WORKER], ["worker1", "worker2"]],
         ),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "only")]))
     rt.pop_rids("only", WALK, [rid])
@@ -999,6 +1178,18 @@ def test_a_batch_completes_every_request_not_just_the_first(pair):
 
 @pytest.fixture(params=["python", "rust"])
 def two_walks(request):
+    return _two_walks(request.param)
+
+
+@pytest.fixture(params=["python", "rust"])
+def combined_two_walks(request):
+    return _two_walks(
+        request.param,
+        combined_walk_of={("LLM", "prefill"): "mixed", ("LLM", "decode"): "mixed"},
+    )
+
+
+def _two_walks(kind, **extra):
     """Two worker graphs, one per walk, both holding the same node.
 
     This is the t2t shape: prefill runs, the conductor advances the partition
@@ -1022,8 +1213,9 @@ def two_walks(request):
         all_wg_ids_to_nodes={0: {"LLM"}, 1: {"LLM"}},
         node_to_partition={"LLM": "default"},
         sharding_config=_sharding(),
+        **extra,
     )
-    if request.param == "python":
+    if kind == "python":
         book = PythonTensorBookkeeping()
         tm = _StubTensorManager(book)
         return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
@@ -1060,6 +1252,7 @@ def test_the_node_becomes_ready_again_in_the_next_walk(two_walks):
         request_id="r1", partition="default", graph_walk="prefill",
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     assert _run_walk(rt, book, store, rid, "prefill", 0, uuid=1) == [
         ("LLM", "prefill", [rid])
@@ -1072,6 +1265,83 @@ def test_the_node_becomes_ready_again_in_the_next_walk(two_walks):
     ], "the node never became ready in the new walk"
 
 
+def _one_rid_per_walk(rt):
+    return [
+        rt.add_request(
+            request_id=f"r{walk}", partition="default", graph_walk=walk,
+            partition_worker_graph_ids=[0, 1],
+            worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
+        )
+        for walk in ("prefill", "decode")
+    ]
+
+
+def test_one_pop_takes_rows_of_both_walks(two_walks):
+    """A combined walk's step pops each row under its own walk, in one call."""
+    rt, _, _ = two_walks
+    rids = _one_rid_per_walk(rt)
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM") for _ in rids]))
+
+    out = rt.pop_walk_rids(
+        "LLM", RequestWalks(rids, ["prefill", "decode"], [0, 1]), check_ready=True,
+    )
+
+    assert (list(out.wg_ids.keys), list(out.wg_ids.values)) == (rids, [0, 1])
+    assert list(out.rid_walk_idx) == [0, 1]
+    assert out.walk_output_signals == (("new_token",), ("new_token",))
+    assert sorted(out.input_edges.rids) == sorted(rids)
+    assert _ready(rt) == []
+
+
+def test_a_multi_walk_pop_is_all_or_none(two_walks):
+    rt, _, _ = two_walks
+    rids = _one_rid_per_walk(rt)
+    rt.ingest_inputs_batch(_ingest_block(rids[:1], [_spec("text_inputs", "LLM")]))
+
+    assert rt.pop_walk_rids(
+        "LLM", RequestWalks(rids, ["prefill", "decode"], [0, 1]), check_ready=True,
+    ) is None
+    assert _ready(rt) == [("LLM", "prefill", rids[:1])]
+
+
+def test_a_scan_target_may_name_the_combined_walk(combined_two_walks):
+    """The scheduler keys a combined walk's rows by the combined walk; the
+    runtime matches it to each row's real walk, as target and as exclusion."""
+    rt, _, _ = combined_two_walks
+    rids = _one_rid_per_walk(rt)
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM") for _ in rids]))
+
+    found = rt.get_ready_nodes(set(), target=("LLM", "mixed"))
+    assert sorted((s.graph_walk, s.rids) for s in found) == [("decode", rids[1:]), ("prefill", rids[:1])]
+    assert rt.get_ready_nodes(set(), exclude_target=("LLM", "mixed")) == []
+    assert not rt.has_ready_excluding(set(), ("LLM", "mixed"))
+    assert [s.graph_walk for s in rt.get_ready_nodes(set(), target=("LLM", "decode"))] == ["decode"]
+
+
+def test_one_route_takes_rows_of_both_walks(two_walks):
+    """A mixed step routes in one call, each row in its own walk: every row
+    completes and resets its own walk's graph, so it can run again there."""
+    rt, book, _ = two_walks
+    rids = _one_rid_per_walk(rt)
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM") for _ in rids]))
+    rt.pop_walk_rids("LLM", RequestWalks(rids, ["prefill", "decode"], [0, 1]))
+    for uuid in (11, 12):
+        book.put_tensor(uuid, _info(uuid))
+        book.increment_ref(uuid, 1)
+
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk="prefill", node_name="LLM",
+        output_signals=["new_token"], wg_ids=ParallelList(rids, [0, 1]),
+        tensors=[11, 12], num_tensors=[1, 1],
+        walks=["prefill", "decode"], rid_walk_idx=[0, 1],
+    ))
+
+    assert sorted(out.register_uuids) == [11, 12]
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM") for _ in rids]))
+    assert _ready(rt) == [("LLM", "decode", rids[1:]), ("LLM", "prefill", rids[:1])]
+
+
 def test_a_batch_transitions_together(two_walks):
     """Same handover with three requests, which is how it actually runs."""
     rt, book, store = two_walks
@@ -1080,6 +1350,7 @@ def test_a_batch_transitions_together(two_walks):
             request_id=f"r{i}", partition="default", graph_walk="prefill",
             partition_worker_graph_ids=[0, 1],
             worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
         )
         for i in range(3)
     ]
@@ -1166,6 +1437,7 @@ def test_an_edge_into_a_sibling_local_graph_is_ingested_not_only_sent(
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("image_inputs", "encoder")]))
     assert _ready(rt) == [("encoder", WALK, [rid])]
@@ -1242,6 +1514,7 @@ def test_a_stream_to_a_sibling_graph_is_reported_local(streams_to_sibling):
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     rt.pop_rids("LLM", WALK, [rid])
@@ -1278,6 +1551,7 @@ def test_a_sibling_graph_chunk_is_held_once_not_twice(streams_to_sibling):
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     rt.pop_rids("LLM", WALK, [rid])
@@ -1301,7 +1575,7 @@ def test_the_speculation_target_reports_its_output_signals(pair):
     outputs, and decode is almost entirely speculated."""
     rt, _book, _store = pair
     rid = _admit(rt)
-    out = rt.speculate_node("prefill", WALK, rid)
+    out = _spec_targets(rt, "prefill", WALK, rid)
     assert [o.node_name for o in out] == ["ar_decode"]
     # ar_decode's own edges, sorted and deduped -- it sends `token` to itself
     # and to the loop output, so a raw edge list would repeat it.
@@ -1333,10 +1607,10 @@ def test_marking_in_flight_does_not_unready_the_node(pair):
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     assert _ready(rt) == [("prefill", WALK, [rid])]
 
-    rt.set_in_flight("prefill", WG_ID, [rid], True)
+    rt.set_in_flight("prefill", [rid], [WG_ID], True)
     assert _ready(rt) == [("prefill", WALK, [rid])], "marking withdrew it"
 
-    rt.set_in_flight("prefill", WG_ID, [rid], False)
+    rt.set_in_flight("prefill", [rid], [WG_ID], False)
     assert _ready(rt) == [("prefill", WALK, [rid])]
 
 
@@ -1402,6 +1676,7 @@ def test_a_finished_worker_graph_asks_for_request_info(streams_to_sibling):
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     rt.pop_rids("LLM", WALK, [rid])
@@ -1607,7 +1882,7 @@ def test_speculation_names_the_innermost_enclosing_loop(nested):
     outer one reads the wrong counters."""
     rt, _book, _store = nested
     rid = _admit(rt)
-    out = rt.speculate_node("denoiser", WALK, rid)
+    out = _spec_targets(rt, "denoiser", WALK, rid)
     assert [(o.node_name, o.loop_name) for o in out] == [
         ("denoiser", "denoise_loop")
     ]
@@ -1740,6 +2015,7 @@ def _drive_tp(rt, book, store, steps=8):
         request_id="r1", partition="default", graph_walk=TP_WALK,
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER, PEER]]),
+        loop_caps={},
     )
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "src")]))
 
@@ -1892,6 +2168,7 @@ def _admit_with_remote(rt, remote):
         request_id="r1", partition="default", graph_walk=WALK,
         partition_worker_graph_ids=[WG_ID, 1],
         worker_graph_to_workers=ParallelList([WG_ID, 1], [[WORKER], ["worker1"]]),
+        loop_caps={},
     )
 
 

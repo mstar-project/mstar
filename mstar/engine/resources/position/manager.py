@@ -6,10 +6,16 @@ from dataclasses import dataclass, field, fields
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, PublishedInfo, Resource
+from mstar.engine.resources.base import (
+    CachedPrefix,
+    CGSlotKey,
+    EngineResourceInfo,
+    PublishedInfo,
+    Resource,
+)
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.engine.resources.kv.plan import KVPlanOutputs, SequenceView
+from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import (
     PosBackend,
     PositionConfig,
@@ -59,6 +65,13 @@ class PositionManager(Resource):
             )
         raise ValueError(f"Unknown position backend {spec.config.backend!r}")
 
+    def fusable_rope_theta(self, head_dim: int) -> float | None:
+        """The theta of the RoPE ``apply_qk`` applies, when that is plain
+        rotate-half RoPE over the whole ``head_dim`` (not interleaved, no
+        scaling, no RoPE dtype), which a layer may apply in a fused kernel of
+        its own instead; None otherwise."""
+        return None
+
 
 class RopeManager(PositionManager):
     """rotary position on top flashinfer in-place kernels"""
@@ -89,6 +102,13 @@ class RopeManager(PositionManager):
                     "dependent KV cache's head_dim"
                 )
             cache_dtype = config.rope_dtype or dtype
+            # XPU always rotates from this cache, so it already rounds the
+            # table to cache_dtype; another rope_table_dtype has no kernel here.
+            if config.rope_table_dtype not in (None, cache_dtype):
+                raise NotImplementedError(
+                    f"rope_table_dtype={config.rope_table_dtype} is not implemented for XPU, "
+                    f"which rotates from a {cache_dtype} cos/sin table (rope_dtype or the KV dtype)"
+                )
             self._rope_cache_key = (
                 rotary_dim,
                 config.rope_scale,
@@ -101,11 +121,24 @@ class RopeManager(PositionManager):
                 config.rope_theta,
                 cache_dtype,
             )
+        # CUDA rotates from this table instead of in-kernel angles when set.
+        self._rope_table: torch.Tensor | None = None
+        if config.rope_table_dtype is not None and device.type != "xpu":
+            if config.llama31_params:
+                raise NotImplementedError("rope_table_dtype does not support Llama 3.1 RoPE scaling")
+            rotary_dim = config.rotary_dim or head_dim
+            if rotary_dim is None:
+                raise ValueError("rope_table_dtype needs PositionConfig.rotary_dim or the KV cache's head_dim")
+            self._rope_table = self._build_rope_cache(
+                rotary_dim,
+                config.rope_scale,
+                config.rope_theta,
+                config.rope_table_dtype,
+            ).float()
+            self._rope_table_key = (rotary_dim, config.rope_scale, config.rope_theta)
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
-        # rid -> tokens the prefix cache matched, until `admit`
-        self._matched: dict[str, int] = {}
 
         self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
         # Host side of the same addressing, keyed the same way; see
@@ -121,6 +154,14 @@ class RopeManager(PositionManager):
         # `clear_preplan` can put the targets back. Unlike KV's, these forks are
         # staged: a counter is host-only, so copying it early races nothing.
         self._preplan_fork_undo: list[tuple[str, str, int | None]] = []
+
+    def fusable_rope_theta(self, head_dim: int) -> float | None:
+        cfg = self._config
+        plain = (
+            cfg.rope_scale == 1.0 and not cfg.interleave and cfg.rope_dtype is None
+            and not cfg.llama31_params and cfg.rotary_dim in (None, head_dim)
+        )
+        return float(cfg.rope_theta) if plain else None
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -149,51 +190,53 @@ class RopeManager(PositionManager):
 
     def ingest_request(self, rid: str, overrides=None):
         del overrides
-        self._counters[rid] = {}
+        # setdefault: a worker serving two partitions ingests the rid twice
+        self._counters.setdefault(rid, {})
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
-        self._matched.pop(rid, None)
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
-        self._matched.pop(rid, None)
 
     def apply_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+        prefix: CachedPrefix | None,
     ) -> None:
-        """Hold what the cache matched, until an admit seeds a counter with it."""
-        del node_name, graph_walk, inputs
-        if matched_len:
-            self._matched[rid] = matched_len
+        """Move the stream's counter past what the cache holds of this walk.
 
-    def admit(self, step: "PositionStep", ctx: StepContext) -> AdmitOutcome:
-        """Start a matched prefix's counter past it, as a retrieved one does.
-
-        The skipped tokens sit at 0 through n-1, so a counter left at 0 would write over them.
+        The counter moves here and not at admit. A walk the cache serves never
+        admits, and the walk after it can place its positions in `prepare_inputs`,
+        before its own admit, so a counter seeded at admit would put that walk on
+        top of the served ones. The position is absolute, so a repeated probe
+        moves nothing.
         """
-        del ctx
-        # taken by the step it was held for: a label the request writes later
-        # has no cached prefix of its own
-        seeds = {
-            segment.request_id: self._matched.pop(segment.request_id)
-            for segment in step.segments or ()
-            if segment.request_id in self._matched
-        }
-        for segment in step.segments or ():
-            matched = seeds.get(segment.request_id)
-            if matched is None:
-                continue
-            counters = self._counters.setdefault(segment.request_id, {})
-            if matched > counters.get(segment.label, 0):
-                counters[segment.label] = matched
-        return ADMIT_OK
+        del node_name, graph_walk, inputs
+        if prefix is None:
+            return
+        counters = self._counters.setdefault(rid, {})
+        if prefix.position > counters.get(prefix.label, 0):
+            counters[prefix.label] = prefix.position
 
     def publish(self, request_id: str) -> "PublishedPositionInfo | None":
         counters = self._counters.get(request_id)
         if not counters:
             return None
         return PublishedPositionInfo(counters=dict(counters))
+
+    def publish_snapshot_for_step(
+        self, request_id: str, node_name: str | None, graph_walk: str | None,
+    ):
+        del node_name, graph_walk
+        counters = self._counters.get(request_id)
+        return tuple(counters.items()) if counters else None
+
+    def publish_from_snapshot(
+        self, request_id: str, snapshot, node_name: str | None,
+        graph_walk: str | None,
+    ):
+        del request_id, node_name, graph_walk
+        return PublishedPositionInfo(counters=dict(snapshot)) if snapshot else None
 
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,
@@ -264,7 +307,7 @@ class RopeManager(PositionManager):
 
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a cuda graph step: the eager path hands back a "
+            "preplan requires an accelerator graph step: the eager path hands back a "
             "fresh tensor rather than writing a slot's buffer"
         )
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(
@@ -288,7 +331,10 @@ class RopeManager(PositionManager):
         for plan_label, kv_out in plan_outputs.items():
             pos_ids = self._explicit_pos_ids(step, plan_label, len(plan_outputs))
             if pos_ids is None:
-                pos_ids = self._build_pos_ids(kv_out.views, plan_label, lease)
+                rows = kv_out.rows
+                if rows is None:
+                    rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
+                pos_ids = self._build_pos_ids(rows, plan_label, lease)
             pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
         self._preplanned = ctx.is_preplan
         return pos_ids_out
@@ -360,9 +406,10 @@ class RopeManager(PositionManager):
         return buffer
 
     def _build_pos_ids(
-        self, views: list[SequenceView], plan_label: str, lease,
+        self, rows, plan_label: str, lease,
     ) -> torch.Tensor:
-        """step positions in KV plan order from stream counters
+        """step positions in KV plan order from stream counters; ``rows`` is
+        ``(request_id, label, to_compute)`` per view in plan order
 
         Under a lease these go into pinned memory so `_place`'s `non_blocking`
         copy is really asynchronous; from pageable memory the host waits. The
@@ -370,12 +417,12 @@ class RopeManager(PositionManager):
         """
         block = self._config.scheme == PosScheme.BLOCK
         pos_ids: list[int] = []
-        for view in views:
-            start = self.position(view.request_id, view.label)
+        for rid, label, to_compute in rows:
+            start = self.position(rid, label)
             if block:
-                pos_ids.extend([start] * view.to_compute)
+                pos_ids.extend([start] * to_compute)
             else:
-                pos_ids.extend(range(start, start + view.to_compute))
+                pos_ids.extend(range(start, start + to_compute))
         if lease is None:
             return torch.tensor(pos_ids, dtype=torch.long)
         key = CGSlotKey(
@@ -419,6 +466,34 @@ class RopeManager(PositionManager):
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
+
+    def _check_rope_table_args(
+        self,
+        rotary_dim: int,
+        rope_scale: float,
+        rope_theta: float,
+        llama31_params: dict,
+    ) -> None:
+        """Refuse per-call RoPE arguments the ``rope_table_dtype`` table
+        does not encode: the CUDA kernel reads only the table."""
+        runtime = (rotary_dim, rope_scale, rope_theta)
+        if runtime != self._rope_table_key:
+            raise RuntimeError(
+                "RoPE runtime arguments do not match the rope_table_dtype "
+                "table built from PositionConfig: "
+                f"runtime (rotary_dim, rope_scale, rope_theta)={runtime}, "
+                f"configured={self._rope_table_key}"
+            )
+        # Llama 3.1 scaling at rope_scale 1 leaves every frequency unchanged,
+        # which is what Attention passes by default.
+        llama31 = all(
+            llama31_params.get(key) is not None
+            for key in ("low_freq_factor", "high_freq_factor", "old_context_len")
+        )
+        if llama31 and rope_scale != 1.0:
+            raise NotImplementedError(
+                "rope_table_dtype does not support Llama 3.1 RoPE scaling"
+            )
 
     def _build_rope_cache(
         self,
@@ -492,7 +567,11 @@ class RopeManager(PositionManager):
             rope_theta if rope_theta is not None else config.rope_theta
         )
 
-        cos_sin_cache = None
+        cos_sin_cache = self._rope_table
+        if cos_sin_cache is not None:
+            self._check_rope_table_args(
+                rotary_dim or q.shape[-1], rope_scale, rope_theta, llama31_params,
+            )
         kernel_pos_ids = pos_ids[:q.shape[0]]
         if q.device.type == "xpu":
             rotary_dim = rotary_dim or q.shape[-1]

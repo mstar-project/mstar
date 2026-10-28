@@ -10,6 +10,7 @@ import asyncio
 import sys
 import tempfile
 import types
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -56,7 +57,7 @@ def test_sentences_are_grouped_up_to_max_chars_and_never_cut():
 
 def test_cjk_terminators_and_paragraph_breaks_split():
     text = "今天天气很好。我们去公园散步吧！你觉得怎么样？\n\nSecond paragraph here."
-    chunks = split_sentences(text, max_chars=8, min_chars=1)
+    chunks = split_sentences(text, max_chars=9, min_chars=1)
     assert chunks[:3] == ["今天天气很好。", "我们去公园散步吧！", "你觉得怎么样？"]
     assert " ".join(chunks[3:]) == "Second paragraph here."
 
@@ -340,6 +341,46 @@ def test_mid_stream_error_closes_the_stream_and_releases_the_pieces_ahead():
     assert ids[1] in stub.read_to_end and stub.released == ids[2:]
 
 
+@pytest.mark.parametrize("how", ["error", "closed"])
+def test_a_failed_release_still_releases_the_rest_and_keeps_the_original_exit(how, caplog):
+    """One release raising must not stop the others, nor replace the piece's
+    error (or turn the client's close into an error)."""
+    from fastapi import HTTPException
+
+    stub = _RecordingAPI()
+    if how == "error":
+        stub.fail(1)
+    ids, start = _stream(stub, 4)
+    attempted = []
+
+    def release(request_id):
+        attempted.append(request_id)
+        if len(attempted) == 1:
+            raise RuntimeError("release failed")
+        stub.released.append(request_id)
+
+    stub.release_request = release
+
+    async def run():
+        gen = await start()
+        if how == "error":
+            with pytest.raises(HTTPException) as exc:
+                async for _ in gen:
+                    pass
+            assert exc.value.detail == "piece failed"
+        else:
+            await anext(gen)
+            await anext(gen)
+            await gen.aclose()  # the client went away: no error
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(run())
+    unread = ids[2:] if how == "error" else ids[:3]
+    assert attempted == unread and stub.released == unread[1:]
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and unread[0] in r.getMessage()]
+    assert len(warnings) == 1
+
+
 def test_non_streaming_disconnect_stops_submitting_and_releases_the_pieces_ahead(client_and_stub):
     _, stub = client_and_stub
     from mstar.api_server.openai.protocol import SpeechRequest
@@ -371,6 +412,26 @@ def test_a_client_seed_advances_per_chunk_and_wraps_at_int64():
     # the first piece keeps the client's value
     assert _chunk_kwargs({"seed": -5}, 0)["seed"] == -5
     assert "seed" not in _chunk_kwargs({"sentence_chunking": True}, 1)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "你好" * 300,
+        "สวัสดี" * 200,
+        "x" * 1000,
+        "x" * 410,
+        "x" * 401 + ". " + "y" * 399 + ".",
+    ],
+    ids=["cjk-600", "thai-1200", "latin-1000", "latin-410-short-leftover", "latin-401-then-sentence"],
+)
+def test_text_with_no_break_points_is_still_cut_to_max_chars(text):
+    chunks = split_sentences(text, max_chars=400)
+    assert len(chunks) > 1
+    assert max(len(c) for c in chunks) <= 400
+    assert min(len(c) for c in chunks) >= 24
+    assert not any(unicodedata.category(c[0]).startswith("M") for c in chunks)
+    assert "".join(chunks).replace(" ", "") == text.replace(" ", "")
 
 
 def test_the_adapter_maps_the_request_off_the_event_loop():
@@ -418,10 +479,13 @@ def test_release_request_aborts_only_requests_still_running():
     done.set()
     server = types.SimpleNamespace(
         request_lock=threading.Lock(),
-        pending_requests={"done": types.SimpleNamespace(event=done),
-                          "running": types.SimpleNamespace(event=running)},
-        abort_request=aborted.append,
+        _live={"done": "done#1", "running": "running#2"},
+        pending_requests={"done#1": types.SimpleNamespace(event=done),
+                          "running#2": types.SimpleNamespace(event=running)},
+        _retire=lambda key: None,
+        _record_end=lambda req, outcome: None,
+        abort_submission=aborted.append,
     )
     APIServer.release_request(server, "done")
     APIServer.release_request(server, "running")
-    assert aborted == ["running"] and "done" not in server.pending_requests
+    assert aborted == ["running#2"] and "done#1" not in server.pending_requests

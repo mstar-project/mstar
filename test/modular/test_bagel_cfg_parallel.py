@@ -26,6 +26,7 @@ from mstar.engine.resources.kv.transfer import (
     make_deployment_kv_shm_dir,
 )
 from mstar.model.bagel.bagel_model import BagelModel
+from mstar.model.bagel.components.modeling_utils import TimestepEmbedder
 from mstar.model.bagel.submodules import CombineCFGSubmodule
 
 
@@ -40,7 +41,7 @@ def test_offload_reset_preserves_remote_content_epoch():
 def _bare_model() -> BagelModel:
     model = BagelModel.__new__(BagelModel)
     model.config = SimpleNamespace(
-        num_timesteps=50,
+        num_timesteps=50, max_position_embeddings=32768,
         temperature=1.0,
         top_k=0,
         top_p=1.0,
@@ -91,7 +92,7 @@ def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     model._has_llm_disaggregation = True
     args = {
         "default": SimpleNamespace(
-            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True})
+            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True, "target_output": "image"})
         )
     }
 
@@ -135,6 +136,40 @@ def test_bagel_configs_detect_only_graph_walk_split_llm_as_disaggregated():
     image_gen = model.get_graph_walk_graphs()["image_gen"]
     assert not image_gen.sections[0].section.enable_async_scheduling
 
+
+def test_timestep_embedding_preserves_fp32_frequencies_after_bf16_cast():
+    module = TimestepEmbedder(64, frequency_embedding_size=256).to(
+        dtype=torch.bfloat16
+    )
+    expected = torch.exp(
+        -torch.log(torch.tensor(10000.0))
+        * torch.arange(128, dtype=torch.float32)
+        / 128
+    )
+
+    assert module.timestep_freqs.dtype == torch.float32
+    torch.testing.assert_close(module.timestep_freqs, expected, rtol=0, atol=0)
+
+
+def test_timestep_embedding_survives_meta_to_empty_round_trip():
+    module = TimestepEmbedder(64, frequency_embedding_size=256).to("meta")
+    module.to_empty(device="cpu")
+    expected = torch.exp(
+        -torch.log(torch.tensor(10000.0))
+        * torch.arange(128, dtype=torch.float32)
+        / 128
+    )
+    torch.testing.assert_close(module.timestep_freqs, expected, rtol=0, atol=0)
+
+
+def test_timestep_embedding_buffer_matches_reference_formula():
+    module = TimestepEmbedder(64, frequency_embedding_size=256)
+    timesteps = torch.tensor([0.0, 0.25, 0.5, 1.0])
+    buffered = module(timesteps)
+    reference = module.mlp(
+        module.timestep_embedding(timesteps, module.frequency_embedding_size)
+    )
+    torch.testing.assert_close(buffered, reference, rtol=0, atol=0)
 
 def test_combine_cfg_is_parameterless():
     module = CombineCFGSubmodule(SimpleNamespace())
@@ -182,6 +217,34 @@ def test_shm_kv_transfer_copies_only_requested_page_ranges(tmp_path):
         source[:, 3, :, :2],
     )
     assert torch.count_nonzero(destination_cache.tensor[:, 1]) == 0
+
+
+def test_shm_kv_transfer_reads_an_mla_cache_by_token(tmp_path):
+    """MLA is [layers, pages, page_size, latent]: the reader took NHD's K/V axis
+    first and sliced latent columns, not tokens."""
+    from mstar.engine.resources.kv.cache import KVLayout
+
+    def mla_cache():
+        config = PagedKVConfig(max_num_pages=4, page_size=4, num_layers=2, num_kv_heads=1,
+                               head_dim=12, max_seq_len=16, num_qo_heads=2,
+                               layout=KVLayout.MLA, kv_lora_rank=8, qk_rope_head_dim=4)
+        return KVCache(config, torch.device("cpu"), torch.float32)
+
+    source_cache, destination_cache = mla_cache(), mla_cache()
+    source_cache.tensor.copy_(torch.arange(source_cache.tensor.numel(), dtype=torch.float32)
+                              .reshape(source_cache.tensor.shape))
+    producer = ShmKVTransferEngine(source_cache, "producer", str(tmp_path))
+    consumer = ShmKVTransferEngine(destination_cache, "consumer", str(tmp_path))
+    info = producer.get_kv_transfer_info(
+        request_id="request", label="main", page_indices=[1, 3], seq_len=6,
+    )
+    consumer.read_batched_async(
+        info, [r for layer in range(2)
+               for r in (KVReadInfo(layer, 0, 1, 0, 4), KVReadInfo(layer, 2, 3, 0, 2))])
+    src, dst = source_cache.tensor, destination_cache.tensor
+    torch.testing.assert_close(dst[:, 0], src[:, 1])
+    torch.testing.assert_close(dst[:, 2, :2], src[:, 3, :2])
+    assert torch.count_nonzero(dst[:, 2, 2:]) == 0
 
 
 def test_shm_kv_transfer_requires_deployment_directory():
@@ -519,10 +582,12 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
 
     healthy_page = manager._streams["healthy"]["main"].page_indices[0]
 
+    # the refusal reaches clients: an error id, the file error itself only in the log
     assert not broken.ok
-    assert "FileNotFoundError" in broken.reason.message
+    assert "internal error (error id" in broken.reason.message
+    assert "missing.pt" not in broken.reason.message
     assert not broken_again.ok
-    assert "FileNotFoundError" in broken_again.reason.message
+    assert broken_again.reason.message == broken.reason.message
     assert healthy.ok and healthy.ready
     torch.testing.assert_close(
         manager.kv_cache.tensor[:, healthy_page, :, :1],

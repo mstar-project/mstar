@@ -25,9 +25,21 @@ logger = logging.getLogger(__name__)
 _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
     AttnBackend.DENSE: PagedKVConfig,
     AttnBackend.FLASHINFER: PagedKVConfig,
+    AttnBackend.FLASHINFER_MLA: PagedKVConfig,
     AttnBackend.FLEX: RingKVConfig,
     AttnBackend.XPU_PAGED: PagedKVConfig,
 }
+
+
+def resolve_attn_backend(backend: AttnBackend, device: torch.device) -> AttnBackend:
+    """The concrete backend for ``backend`` on ``device``.
+
+    ``AUTO`` becomes the platform's default, FlashInfer on every platform for
+    now. A backend named in the spec or YAML is returned as is.
+    """
+    if backend is AttnBackend.AUTO:
+        return AttnBackend.FLASHINFER
+    return backend
 
 
 class AttentionManager(AttentionResource):
@@ -45,10 +57,15 @@ class AttentionManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
+        backend = resolve_attn_backend(spec.config.backend, info.device)
+        if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
+            raise ValueError(
+                f"sliding_window is unsupported for attention backend {backend!r}; "
+                "use the flashinfer backend"
+            )
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
-        backend = spec.config.backend
         # Before `shard`, so a mismatch is reported rather than half-applied to
         # a config the KV resource also holds.
         if backend not in _BACKEND_KV_CONFIG:
@@ -60,23 +77,29 @@ class AttentionManager(AttentionResource):
                 f"{required.__name__}, but KV resource {spec.config.kv_cache!r} "
                 f"holds a {type(kv_config).__name__}. "
             )
+        if spec.config.sm_scale is not None and backend != AttnBackend.FLASHINFER_MLA:
+            raise ValueError(
+                f"attention backend {backend.value!r} ignores sm_scale; only "
+                f"{AttnBackend.FLASHINFER_MLA.value!r} reads it"
+            )
         # `shard` lives on the KVConfig base, so this is unchanged for both.
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
         if backend == AttnBackend.DENSE:
             # A dense backend needs the FlashAttention-3 kernel; where the
-            # wheel does not match the installed torch/CUDA build, degrade to
-            # the paged backend rather than failing to serve. The two are
-            # drop-in for each other: the step declaration is identical
-            # (see DenseAttentionManager) and `requires_kv_write` tells the
-            # layer which one it is talking to.
+            # wheel does not match the installed torch/CUDA build or has no
+            # kernel for the GPU, degrade to the paged backend AUTO picks
+            # rather than failing to serve.
+            # The two are drop-in for each other: the step declaration is
+            # identical (see DenseAttentionManager) and `requires_kv_write`
+            # tells the layer which one it is talking to.
             from mstar.engine.resources.attn.dense import (
                 DenseAttentionManager,
                 _fa3_unavailable_reason,
                 _warn_dense_fallback,
             )
 
-            reason = _fa3_unavailable_reason()
+            reason = _fa3_unavailable_reason(info.device)
             if reason is None:
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,
@@ -84,9 +107,20 @@ class AttentionManager(AttentionResource):
                     dtype=info.kv_dtype,
                     kv_config=kv_config,
                 )
-            _warn_dense_fallback(reason)
-            backend = AttnBackend.FLASHINFER
+            backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
+            _warn_dense_fallback(reason, backend)
 
+        if backend == AttnBackend.FLASHINFER_MLA:
+            from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+
+            return FlashInferMLAManager(
+                kv_cache=spec.config.kv_cache,
+                device=info.device,
+                dtype=info.kv_dtype,
+                kv_config=kv_config,
+                backend=spec.config.flashinfer_backend,
+                sm_scale=spec.config.sm_scale,
+            )
         if backend == AttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.flashinfer import FlashInferManager
 
@@ -96,6 +130,10 @@ class AttentionManager(AttentionResource):
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
+                splits=spec.config.splits,
+                max_rows_in_combined=info.max_rows_in_combined,
+                decode_tensor_cores=spec.config.decode_tensor_cores,
+                sliding_window=spec.config.sliding_window,
             )
 
         if backend == AttnBackend.FLEX:
@@ -128,6 +166,7 @@ class AttentionManager(AttentionResource):
             return XPUPagedAttentionManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
+                kv_config=kv_config,
             )
         raise ValueError(f"Unknown attention backend {backend!r}")
 
@@ -161,12 +200,25 @@ class EagerSlotKey(NamedTuple):
     same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""
     label: str
     slot: int
-    # decode and prefill take different wrapper classes; cross-attention plans
-    # one wrapper per label either way and leaves this False
+    # decode and prefill take different wrapper classes
     is_decode: bool = False
 
 
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
+
+
+def captured_page_capacity(num_rows: int, num_tokens: int, kv_config: KVConfig) -> int:
+    """Page ids a captured wrapper's index buffer holds for a bucket of
+    ``num_rows`` rows and ``num_tokens`` tokens.
+
+    Per row, not per pool: rows that matched one cached prefix all name its
+    pages, so a step can name more page ids than the pool holds. And at least
+    the bucket's own pages: a capture's rows name a SINK_PAGE per page of span,
+    whatever the pool's size."""
+    return max(
+        num_rows * kv_config.max_num_pages,
+        -(-num_tokens // kv_config.page_size) + num_rows,
+    )
 
 
 class WorkspacePool:

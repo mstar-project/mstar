@@ -72,20 +72,36 @@ from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
 from mstar.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
-from mstar.model.bagel.config import load_bagel_config
+from mstar.model.bagel.config import MIXED_TEXT, load_bagel_config
 from mstar.model.bagel.submodules import (
+    IMAGE_ADVANCE,
+    IMAGE_SENTINELS,
     CombineCFGSubmodule,
     LLMSubmodule,
     VAEDecoderSubmodule,
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
+    vae_latents,
+    vit_patches,
+    vit_preprocess,
 )
-from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream
+from mstar.model.base import (
+    DECODE,
+    ForwardPassArgs,
+    KVLabel,
+    LabelLayout,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    prompt_spans,
+)
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
+    chat_turns,
     check_attachments,
     check_plan,
     find_media_spans,
@@ -94,6 +110,7 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -256,12 +273,17 @@ class BagelModel(Model):
     through interleaved text and image inputs.
     """
 
+    _text_detokenizer: TextChunkDetokenizer | None = None
+
     def __init__(
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        accelerator_graph: bool | None = None,
         **kwargs
     ):
+        if accelerator_graph is not None and not isinstance(accelerator_graph, bool):
+            raise ValueError("accelerator_graph must be a boolean")
         self.cache_dir = cache_dir
 
         config_path = hf_hub_download(
@@ -270,6 +292,8 @@ class BagelModel(Model):
         )
         with open(config_path) as f:
             self.config = load_bagel_config(json.load(f))
+        if accelerator_graph is not None:
+            self.config.accelerator_graph = accelerator_graph
 
         self.model_path_hf = model_path_hf
 
@@ -454,7 +478,8 @@ class BagelModel(Model):
                 connector=self.connector,
                 vit_pos_embed=self.vit_pos_embed,
                 vit_patch_size=self.config.vit_config.patch_size,
-                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side
+                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side,
+                accelerator_graph=self.config.accelerator_graph,
             )
         elif node_name == "vae_encoder":
             self._init_vae_components(device, autocast_dtype=autocast_dtype)
@@ -492,10 +517,6 @@ class BagelModel(Model):
     )
     VLM_UNDERSTANDING_SUFFIX = "\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
-    # For text-to-text, BAGEL doesn't seem to do as well with the "user... assistant..." format
-    VLM_UNDERSTANDING_TEMPLATE = "<|im_start|>{system_prompt}<|im_end|>" + \
-        "<|im_start|>{prompt}<|im_end|><|im_start|>"
-
     # Image generation (T2I/I2I): bare wrapping, no system prompt or roles. Input
     # image (I2I) is positioned before this by the prefill_vae/vit walks.
     GEN_TEMPLATE = "<|im_start|>{prompt}<|im_end|><|im_start|>"
@@ -505,9 +526,10 @@ class BagelModel(Model):
     # embeddings, so only the pad interior is dropped from the text spans.
     IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 
-    # VLM_UNDERSTANDING_SUFFIX minus the text it used to interpolate, which is
-    # now written at its own place in the prompt.
-    UNDERSTANDING_TAIL = "<|im_end|>\n<|im_start|>assistant\n"
+    # One understanding turn, its attachments inside it: the system prompt's
+    # comes first, and the reply opens after the last.
+    VLM_TURN = "<|im_start|>{role}\n{content}<|im_end|>\n"
+    VLM_REPLY = "<|im_start|>assistant\n"
 
     def _placeholder_specs(self) -> dict[str, tuple[int, int, int]]:
         """``(start, pad, end)`` sentinel ids, read off the tokenizer.
@@ -528,38 +550,56 @@ class BagelModel(Model):
     ) -> str:
         """Write the request out in order, attachments as placeholders.
 
-        Understanding opens the user turn before the attachments and closes it
-        after the last; a text run following an attachment carries the newline
-        the old suffix supplied, so every layout that template could express
-        renders to the same string. Generation leaves attachments outside the
-        turn — the prefill_vae/vit walks put the input image ahead of the
-        prompt — and wraps what follows.
+        Understanding writes each turn in its own role block. A text run
+        following an attachment carries the newline the old suffix supplied,
+        and a turn ending on one closes after a newline too, so every image
+        layout a single user turn could express renders to the string that
+        template gave. Generation leaves attachments outside the turn — the
+        prefill_vae/vit walks put the input image ahead of the prompt — and
+        wraps what follows.
         """
-        # Understanding's old suffix supplied this newline; generation's did not.
-        sep = "\n" if is_understanding else ""
-        body: list[str] = []
-        after_attachment = False
-        for part in parts:
-            if part.modality == TEXT:
-                if part.text:
-                    body.append((sep if after_attachment else "") + part.text)
-                    after_attachment = False
-                continue
-            body.append(self.IMAGE_PLACEHOLDER)
-            after_attachment = True
-
         if is_understanding:
-            head = self.VLM_UNDERSTANDING_PREFIX.format(system_prompt=system_prompt)
-            tail = "\n" + self.UNDERSTANDING_TAIL if after_attachment else self.UNDERSTANDING_TAIL
-            return head + "".join(body) + tail
+            blocks = [self.VLM_TURN.format(role="system", content=system_prompt)]
+            for turn in chat_turns(parts):
+                body, after_attachment = self._render_body(turn.parts, sep="\n")
+                if after_attachment:
+                    body.append("\n")
+                blocks.append(self.VLM_TURN.format(role=turn.role, content="".join(body)))
+            return "".join(blocks) + self.VLM_REPLY
 
         # Generation: attachments written before any text stay outside the turn.
+        body, _ = self._render_body(parts, sep="")
         lead = 0
         while lead < len(body) and body[lead] == self.IMAGE_PLACEHOLDER:
             lead += 1
         return "".join(body[:lead]) + self.GEN_TEMPLATE.format(
             prompt="".join(body[lead:])
         )
+
+    def _render_body(self, parts: list[PromptPart], sep: str) -> tuple[list[str], bool]:
+        """Write ``parts`` out in order, and say whether the last is an attachment.
+
+        ``sep`` opens a text run that follows an attachment: understanding's old
+        suffix supplied that newline, generation's did not. Text that follows
+        another role's text starts on a new line.
+        """
+        body: list[str] = []
+        after_attachment = False
+        role = None
+        for part in parts:
+            if part.modality == TEXT:
+                if part.text:
+                    if after_attachment:
+                        body.append(sep + part.text)
+                    elif body and part.role != role:
+                        body.append("\n" + part.text)
+                    else:
+                        body.append(part.text)
+                    after_attachment, role = False, part.role
+                continue
+            body.append(self.IMAGE_PLACEHOLDER)
+            after_attachment = True
+        return body, after_attachment
 
     def _encode_text(self, text: str) -> torch.Tensor:
         """Tokenize a text segment, falling back to raw bytes when no tokenizer
@@ -576,7 +616,7 @@ class BagelModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the prompt into one text span per prefill step.
 
         Returns model-specific keys matching get_forward_pass_inputs:
@@ -588,8 +628,7 @@ class BagelModel(Model):
         attachments gets its own span and no seam is re-tokenized. The schedule
         builder walks the same :func:`prefill_plan`.
 
-        Bagel doesn't need the raw multimodal tensors here; images are loaded
-        as ``image_inputs`` by the data worker.
+        Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
         """
         result: NameToTensorList = {}
 
@@ -600,11 +639,12 @@ class BagelModel(Model):
             think_mode = kwargs.get("think_mode", self.config.think_mode)
             system_prompt = self.BAGEL_DEFAULT_SYSTEM_PROMPT
 
-            parts = parts_from_modalities(
-                input_modalities,
-                [p.text or "" for p in prompt_parts if p.modality == TEXT]
-                if prompt_parts is not None else prompt,
-            )
+            texts, roles = prompt, None
+            if prompt_parts is not None:
+                texts = [p.text or "" for p in prompt_parts if p.modality == TEXT]
+                roles = [p.role for p in prompt_parts]
+            # a legacy layout can lack a text slot, and its prompt still needs one
+            parts = parts_from_modalities(input_modalities or [TEXT], texts, roles)
             unsupported = {p.modality for p in parts} - {TEXT, "image"}
             if unsupported:
                 raise ValueError(
@@ -616,22 +656,23 @@ class BagelModel(Model):
                     parts, {"image": len(tensors.get("image_inputs", []))},
                 )
 
+            body = parts
+            if is_understanding and len(parts) > 1 and parts[0].role == "system":
+                # a leading system message takes the default's place; a lone
+                # one stays the turn it was, not an empty one after the default
+                system_prompt, body = parts[0].text, parts[1:]
             if think_mode and is_understanding:
                 system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
 
+            text = self._render_prompt(
+                body,
+                is_understanding=is_understanding,
+                system_prompt=system_prompt,
+            )
             if is_understanding and not has_image:
                 # No attachment: one span, one walk, nothing to scan.
-                segments = [self._encode_text(
-                    self.VLM_UNDERSTANDING_TEMPLATE.format(
-                        system_prompt=system_prompt, prompt=prompt
-                    )
-                )]
+                segments = [self._encode_text(text)]
             else:
-                text = self._render_prompt(
-                    parts,
-                    is_understanding=is_understanding,
-                    system_prompt=system_prompt,
-                )
                 input_ids = self._encode_text(text)
                 spans = find_media_spans(input_ids, self._placeholder_specs())
                 segments = split_around_spans(input_ids, spans)
@@ -667,7 +708,76 @@ class BagelModel(Model):
                 for img in tensors["image_inputs"]
             ]
 
-        return result
+        if tensors is None:
+            return result
+        if prompt is None:
+            parts, segments = parts_from_modalities(input_modalities), []
+        images = result.get("image_inputs") or tensors.get("image_inputs", [])
+        params = self._request_params(input_modalities, output_modalities, kwargs)
+        layout = self._kv_layout(parts, segments, images, output_modalities, params)
+        return ProcessPromptOutput(result, {"kv_layout": {"kv": layout}})
+
+    def _kv_layout(
+        self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
+        output_modalities: list[str], params: dict,
+    ) -> dict[str, LabelLayout]:
+        """Each label's writes, in the order `_build_prefill_schedule` runs them.
+
+        ``main`` holds every span. A generation keys only its first span, if that is
+        text: its images are resized before their walks see them, and a file's digest
+        doesn't cover the resize. Under guidance, ``cfg_img`` holds the text alone.
+        ``cfg_text`` forks before a text walk and after an image walk, so it holds all
+        but the last span when the last span is text, and every span when the prompt
+        ends on an image. Without guidance a generation still denoises on all three
+        labels on a CFG-parallel deployment, which isn't known here.
+        """
+        cfg = self.config
+        target_output = (output_modalities or ["text"])[0]
+        understanding = target_output == "text"
+        think_mode, image_preprocess = params["think_mode"], vit_preprocess(params["image_preprocess"])
+        spans = []
+        if think_mode and not understanding and segments:
+            spans.append(Span("ids", "prefill_text", segments[0].numel(), segments[0].numel(), "text_inputs"))
+
+        def image(step: PromptPart) -> list[Span]:
+            _, height, width = images[step.index].shape
+            item = (("image", step.index), (image_preprocess,))
+            patches = vit_patches(
+                height, width, image_preprocess, cfg.vit_config.patch_size, cfg.vit_max_num_patch_per_side,
+            )
+            vit = Span("digest", "prefill_vit", patches + IMAGE_SENTINELS, IMAGE_ADVANCE, *item)
+            if understanding:
+                return [vit]
+            latents = vae_latents(height, width, image_preprocess, cfg.latent_downsample, cfg.max_latent_size)
+            return [Span("digest", "prefill_vae", latents + IMAGE_SENTINELS, IMAGE_ADVANCE, *item), vit]
+
+        texts = segments[len(spans):]
+        # skip a text step the prompt has no tensor for, as `_build_prefill_schedule` does
+        plan = prefill_plan(parts, leading_text=understanding)
+        plan = [step for step in plan if step.modality != TEXT or step.index < len(texts)]
+        spans += prompt_spans(plan, texts, "prefill_text", image)
+        keyed = int(bool(spans) and spans[0].kind == "ids")
+        if understanding:
+            main = LabelLayout(
+                spans=tuple(spans), growth=(("decode_loop", 1),),
+                keyed_spans=None if "image" not in output_modalities else keyed,
+            )
+            return {"main": main}
+        height, width = images[0].shape[-2:] if images else (params["height"], params["width"])
+        scratch = (height // cfg.latent_downsample) * (width // cfg.latent_downsample) + IMAGE_SENTINELS
+        growth = (("decode_loop", 1),) if think_mode else ()
+        main = LabelLayout(spans=tuple(spans), growth=growth, scratch=scratch, keyed_spans=keyed)
+        if not self._requires_cfg(target_output=target_output, **params):
+            return {"main": main, "cfg_text": LabelLayout(scratch=scratch), "cfg_img": LabelLayout(scratch=scratch)}
+        return {
+            "main": main,
+            "cfg_text": LabelLayout(
+                spans=tuple(spans[:-1] if spans and spans[-1].walk == "prefill_text" else spans), scratch=scratch,
+            ),
+            "cfg_img": LabelLayout(
+                spans=tuple(span for span in spans if span.walk == "prefill_text"), growth=growth, scratch=scratch,
+            ),
+        }
 
     @staticmethod
     def _resize_to_fit(
@@ -710,9 +820,10 @@ class BagelModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            detok = self.tokenizer.decode(output)
-            logger.debug("OUTPUT TEXT %s", detok)
-            return detok.encode("utf-8")
+            ids = drop_stop_tokens(output, (self.eos_token_id,), request_kwargs)
+            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
+                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
+            return self._text_detokenizer.to_bytes(ids)
         if modality == "image":
             output = output[0].permute(1, 2, 0) * 255
             img = Image.fromarray((output).to(torch.uint8).cpu().numpy())
@@ -735,15 +846,26 @@ class BagelModel(Model):
             num_qo_heads=self.config.num_attention_heads,
         )
 
-    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """The text walk's prompt is its token ids.
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        """The text walk's prompt is its token ids, and so is every step it takes.
 
-        The image walks write into this stream too, and an edit's picture lands
-        at the positions its keyed text would have; only the text walk is named.
-        Generated pages are not keyed: the chat API sends a reply back inside
-        the next user turn, so their keys never match.
+        An image in an understanding prompt is keyed by its file. An edit's VAE
+        walk writes ``main`` too, but the keys of ``main`` leave that walk out. A
+        chat sends a reply back as its own assistant turn, so its pages match.
         """
-        return {"kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text")}}
+        decode = ((DECODE, "decode_loop"),)
+        return {"kv": {
+            "main": KVLabel(
+                growth=decode, keys=PrefixKeys("text_inputs", ("prefill_text", "prefill_vit"), growth=True),
+            ),
+            # forks from main fill cfg_text, so it declares no growth
+            "cfg_text": KVLabel(),
+            "cfg_img": KVLabel(growth=decode),
+        }}
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # The stop check allows max_tokens - 1 iterations, and a loop runs at least one.
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def checkpoint_path(self) -> str:
         return snapshot_download(
@@ -809,7 +931,10 @@ class BagelModel(Model):
         from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
 
         model_kwargs = model_kwargs or {}
-        cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs["requires_cfg"]
+        request = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs
+        cfg = request["requires_cfg"]
+        # only a generation's image_gen_cfg runs the CFG nodes
+        nodes = self._LLM_NODES if self._has_cfg_parallel and request["target_output"] == "image" else {"LLM"}
         sampling = self.get_sampling_config("LLM", model_kwargs)
         publish_labels: dict[tuple[str, str], list[str]] = {}
         final_publish_labels: dict[tuple[str, str], list[str]] = {}
@@ -839,7 +964,7 @@ class BagelModel(Model):
             "kv": KVReqConfig(
                 needed_labels_per_node_walk={
                     (node, walk): active_labels(walk, cfg, node)
-                    for node in self._LLM_NODES
+                    for node in nodes
                     for walk in LLM_GRAPH_WALKS
                 },
                 # Only the main LLM instance creates cache branches consumed
@@ -911,6 +1036,9 @@ class BagelModel(Model):
             and image_ranks.isdisjoint(llm_ranks("decode"))
         )
         return super().get_worker_graphs(config_path)
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"LLM": {MIXED_TEXT: {"prefill_text", DECODE}}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- prefill_text: just the LLM node (text embedding is internal) --
@@ -985,7 +1113,7 @@ class BagelModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.max_position_embeddings,
             outputs=[],
         )
 
@@ -1151,6 +1279,30 @@ class BagelModel(Model):
                 schedule.append(("prefill_vit", images[step.index]))
         return schedule
 
+    def _request_params(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict | None,
+    ) -> dict:
+        overridable_keys = [
+            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
+            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
+        ]
+        params = {k: getattr(self.config, k) for k in overridable_keys}
+        params["width"] = 1024
+        params["height"] = 1024
+        params["image_preprocess"] = "default"
+        overridable_keys += ["width", "height", "image_preprocess"]
+
+        if "image" in input_modalities and "image" in output_modalities:
+            params["cfg_img_scale"] = 2.0
+            params["cfg_interval"] = [0.0, 1.0]
+            params["cfg_renorm_type"] = "text_channel"
+
+        if model_kwargs:
+            for key in overridable_keys:
+                if key in model_kwargs:
+                    params[key] = model_kwargs[key]
+        return params
+
     def _requires_cfg(
         self, **kwargs,
     ):
@@ -1273,27 +1425,7 @@ class BagelModel(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         target_output = output_modalities[0]  # "text" or "image"
-
-        # Per-request overrides with config defaults
-        overridable_keys = [
-            "cfg_text_scale", "cfg_img_scale", "cfg_interval",
-            "cfg_renorm_type", "cfg_renorm_min", "think_mode",
-        ]
-        params = {k: getattr(self.config, k) for k in overridable_keys}
-        params["width"] = 1024
-        params["height"] = 1024
-        params["image_preprocess"] = "default"
-        overridable_keys += ["width", "height", "image_preprocess"]
-
-        if "image" in input_modalities and "image" in output_modalities:
-            params["cfg_img_scale"] = 2.0
-            params["cfg_interval"] = [0.0, 1.0]
-            params["cfg_renorm_type"] = "text_channel"
-
-        if model_kwargs:
-            for key in overridable_keys:
-                if key in model_kwargs:
-                    params[key] = model_kwargs[key]
+        params = self._request_params(input_modalities, output_modalities, model_kwargs)
 
         if "image" in output_modalities and input_signals.get("image_inputs"):
             image = input_signals["image_inputs"][0]

@@ -28,6 +28,7 @@ lazy worker-side construction. Heavy weights are not loaded in ``__init__``.
 """
 
 import contextlib
+import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
@@ -66,11 +67,16 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
     CODE_PRED_SAMPLER,
+    LANGUAGE_ID_KEY,
+    PROMPT_LAYOUT_KEY,
+    REF_CLIP_KEY,
+    SPEAKER_ID_KEY,
     TALKER_ATTN,
     TALKER_KV,
     TALKER_POS,
@@ -80,6 +86,13 @@ from mstar.model.qwen3_tts.config import (
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+
+
+def clip_digest(clip: torch.Tensor) -> str:
+    """Content key of a reference clip (its float32 samples), under which its conditioning is memoised."""
+    samples = clip.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    return hashlib.blake2b(samples.numpy().tobytes(), digest_size=16).hexdigest()
+
 
 # ---------------------------------------------------------------------------
 # Checkpoint discovery
@@ -171,6 +184,11 @@ def _adapt_tokenizer_module(module) -> None:
         setattr(module, name, adapted)
 
 
+#: qwen-tts pins transformers==4.57.3, which most environments with other
+#: extras cannot satisfy; only its source files are used, so its pins are skipped.
+QWEN_TTS_INSTALL = 'uv pip install --no-deps "qwen-tts==0.1.1"'
+
+
 @lru_cache(maxsize=1)
 def _load_qwen3_tts_codec_classes() -> tuple[type, type, type]:
     """Load only qwen-tts' 12 Hz speech-tokenizer modules.
@@ -190,8 +208,9 @@ def _load_qwen3_tts_codec_classes() -> tuple[type, type, type]:
         distribution = importlib.metadata.distribution("qwen-tts")
     except importlib.metadata.PackageNotFoundError as exc:
         raise ImportError(
-            "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
-            "M* with the qwen3_tts optional dependency"
+            "Qwen3-TTS Codec requires the 'qwen-tts' package, installed "
+            f"without its dependencies: {QWEN_TTS_INSTALL} (see "
+            "docs/installation.rst)"
         ) from exc
 
     source_root = Path(distribution.locate_file(
@@ -383,6 +402,12 @@ class Qwen3TTSModel(Model):
         # codec decoder's dtype. float32 reproduces the reference decoder
         # bit for bit; bfloat16 roughly halves the codec's GPU time.
         self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
+        # Server-init knob: opt-in AudioSeal watermark on the codec's output
+        # (``mstar.model.audio_watermark``). Checked here so a missing package
+        # fails the server at startup, not at the first request.
+        self.audio_watermark = AudioWatermarkConfig.parse(kwargs.get("audio_watermark"))
+        if self.audio_watermark.enabled:
+            import_audioseal()
 
         # The lightweight API-side object needs config and tokenizer only.
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
@@ -524,7 +549,7 @@ class Qwen3TTSModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.talker.max_position_embeddings,
             outputs=[],
         )
         walks = {
@@ -604,28 +629,44 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
 
     # Prompt templates of the reference ``qwen_tts`` inference wrapper. The
-    # assistant wrapper is fixed at 3 + 5 tokens (see ``_validate_chatml``),
-    # which is how the text span is located inside the tokenized turn.
+    # assistant wrapper is fixed at 3 + 5 tokens (``_check_chatml`` verifies it
+    # on the host), which is how the text span is located inside the tokenized turn.
     ASSISTANT_TEMPLATE = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
     INSTRUCT_TEMPLATE = "<|im_start|>user\n{instruct}<|im_end|>\n"
     REFERENCE_TEMPLATE = "<|im_start|>assistant\n{text}<|im_end|>\n"
     # API tensors the Talker prefill consumes; the clone prefill adds the
-    # RefEncoder's ``speaker_embed`` and ``ref_codes`` to them.
-    PREFILL_INPUTS = ("text_inputs", "prompt_layout", "speaker_id", "language_id")
-    # API tensors the RefEncoder consumes (reference clip + layout).
-    REF_ENCODER_INPUTS = ("audio_inputs", "prompt_layout")
+    # RefEncoder's ``speaker_embed`` and ``ref_codes`` to them. The layout and
+    # the speaker and language tags ride in step metadata.
+    PREFILL_INPUTS = ("text_inputs",)
+    # API tensors the RefEncoder consumes (the reference clip).
+    REF_ENCODER_INPUTS = ("audio_inputs",)
+
+    def max_input_files(self) -> dict[str, int]:
+        return {"audio": 1}
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 24 kHz mono float32 (speaker encoder + codec rate)."""
         import soundfile
         import torchaudio.functional as audio_functional
 
+        from mstar.api_server.media_io import check_resample_rate, read_soundfile_capped
+        from mstar.model.media_limits import read_sound_file, sound_file_seconds
+
         # Bound the clip before decoding it: a small compressed file can hold hours of audio.
         info = soundfile.info(filepath)
-        self._check_reference_duration(info.frames / info.samplerate if info.samplerate else 0.0)
-        waveform, sample_rate = soundfile.read(filepath, dtype="float32", always_2d=True)
-        audio = torch.from_numpy(waveform).mean(dim=1)
         target_rate = self.config.codec.input_sample_rate
+        check_resample_rate(info.samplerate, target_rate)
+        seconds = sound_file_seconds(info.frames, info.samplerate)
+        if seconds is not None:
+            self._check_reference_duration(seconds)
+            # the header can understate the length, so the decode stops at the bound too
+            waveform, sample_rate = read_soundfile_capped(filepath, self.config.reference_max_seconds)
+            audio = torch.from_numpy(waveform)
+        else:
+            # no sample count in the header (a FLAC written to a pipe): count it as it decodes
+            waveform, sample_rate = read_sound_file(filepath, self.config.reference_max_seconds)
+            self._check_reference_duration(len(waveform) / sample_rate)
+            audio = torch.from_numpy(waveform).mean(dim=1)
         if sample_rate != target_rate:
             audio = audio_functional.resample(audio, sample_rate, target_rate)
         return TensorAndMetadata(
@@ -753,6 +794,10 @@ class Qwen3TTSModel(Model):
 
     # model_kwargs key: reference frames leading an in-context clone's codec stream
     CODEC_STREAM_LEAD_KEY = "codec_stream_lead_frames"
+    INTERNAL_KWARGS = (
+        PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY, CODEC_STREAM_LEAD_KEY,
+    )
+    LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def process_prompt(
         self,
@@ -761,19 +806,21 @@ class Qwen3TTSModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs: Any,
-    ) -> NameToTensorList | ProcessPromptOutput:
+    ) -> ProcessPromptOutput:
         """Validate a request against the checkpoint variant and tokenize it.
 
         Produces the ``PREFILL_INPUTS`` tensors. ``text_inputs`` is the
         optional instruction turn, the assistant turn and (in-context clone)
-        the reference transcript turn, all in the reference ChatML templates;
-        ``prompt_layout`` is ``[instruct_len, text_len, stream_text,
-        ref_text_len, ref_frames]``. ``stream_text`` follows the reference
-        default per variant (whole text in the prefill for CustomVoice and
-        VoiceDesign, one token per frame for Base) unless the request sets
-        ``non_streaming_mode``. An in-context clone also reports, as
-        ``CODEC_STREAM_LEAD_KEY`` metadata, how many reference frames lead the
-        codec stream (context only; see ``get_initial_forward_pass_args``).
+        the reference transcript turn, all in the reference ChatML templates.
+        The metadata carries, as host values for the prefill's step metadata,
+        ``PROMPT_LAYOUT_KEY`` ``[instruct_len, text_len, stream_text,
+        ref_text_len, ref_frames]``, the codec speaker and language tags, and
+        a clone's ``REF_CLIP_KEY`` digest. ``stream_text`` follows the
+        reference default per variant (whole text in the prefill for
+        CustomVoice and VoiceDesign, one token per frame for Base) unless the
+        request sets ``non_streaming_mode``. ``CODEC_STREAM_LEAD_KEY`` reports
+        how many reference frames lead the codec stream (context only, 0
+        without an in-context clone; see ``get_initial_forward_pass_args``).
         """
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
@@ -806,6 +853,7 @@ class Qwen3TTSModel(Model):
         text_len = assistant_ids.numel() - wrapper_len
         if text_len < 1:
             raise ValueError("Qwen3-TTS prompt tokenized to no text tokens")
+        self._check_chatml(assistant_ids)
         instruct_ids = (
             self._tokenize(self.INSTRUCT_TEMPLATE.format(instruct=instruct))
             if instruct
@@ -816,19 +864,44 @@ class Qwen3TTSModel(Model):
             if ref_frames
             else assistant_ids.new_empty(0)
         )
-        outputs = {
-            "text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])],
-            "prompt_layout": [torch.tensor(
-                [instruct_ids.numel(), text_len, int(stream_text), ref_ids.numel(), ref_frames],
-                dtype=torch.long,
-            )],
-            "speaker_id": [torch.tensor([speaker_id], dtype=torch.long)],
-            "language_id": [torch.tensor([language_id], dtype=torch.long)],
+        metadata: dict[str, Any] = {
+            PROMPT_LAYOUT_KEY: [instruct_ids.numel(), text_len, int(stream_text), ref_ids.numel(), ref_frames],
+            SPEAKER_ID_KEY: speaker_id,
+            LANGUAGE_ID_KEY: language_id,
+            # set in every mode (0 without an in-context clone): the data worker
+            # lays this over the request's own kwargs
+            self.CODEC_STREAM_LEAD_KEY: min(ref_frames, self.config.codec.left_context_frames),
         }
-        lead = min(ref_frames, self.config.codec.left_context_frames)
-        if lead:
-            return ProcessPromptOutput(outputs, {self.CODEC_STREAM_LEAD_KEY: lead})
-        return outputs
+        clips = (tensors or {}).get("audio_inputs", [])
+        if clips:
+            metadata[REF_CLIP_KEY] = clip_digest(clips[0])
+        from mstar.model.qwen3_tts.submodules import prefill_rows
+
+        # a clone's x-vector takes the speaker row
+        clone = "audio" in input_modalities
+        rows = prefill_rows(metadata[PROMPT_LAYOUT_KEY], language_id, speaker_id >= 0 or clone)
+        metadata["kv_layout"] = {TALKER_KV: {"main": LabelLayout(
+            spans=(Span("rows", "talker_prefill_clone" if clone else "talker_prefill", rows, rows, "text_inputs"),),
+            growth=(("talker_decode_loop", 1),),
+        )}}
+        return ProcessPromptOutput(
+            {"text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])]}, metadata
+        )
+
+    @staticmethod
+    def _check_chatml(assistant_ids: torch.Tensor) -> None:
+        """Check the fixed assistant-turn wrapper the text span is sized from."""
+        ids = assistant_ids.tolist()
+        prefix = list(CHATML_ASSISTANT_PREFIX_TOKEN_IDS)
+        suffix = list(CHATML_ASSISTANT_SUFFIX_TOKEN_IDS)
+        if ids[:len(prefix)] != prefix:
+            raise ValueError(
+                f"Qwen3-TTS ChatML assistant prefix changed; expected token IDs {prefix}, got {ids[:len(prefix)]}"
+            )
+        if ids[-len(suffix):] != suffix:
+            raise ValueError(
+                f"Qwen3-TTS ChatML assistant suffix changed; expected token IDs {suffix}, got {ids[-len(suffix):]}"
+            )
 
     # -----------------------------------------------------------------------
     # Conductor partition state machine
@@ -858,13 +931,14 @@ class Qwen3TTSModel(Model):
                 output_modalities=output_modalities,
                 graph_walk=walk,
                 is_prefill=True,
-                kwargs={
-                    "talker_max_tokens": self.get_max_output_tokens(**model_kwargs),
-                },
             )
             routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
+            step_metadata = self._talker_step_metadata(metadata)
+            for key in (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY):
+                step_metadata[key] = model_kwargs[key]
             if clone:
                 routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
+                step_metadata[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
             inputs = []
             for name, node in routes:
                 edge = GraphEdge(next_node=node, name=name)
@@ -877,7 +951,7 @@ class Qwen3TTSModel(Model):
                     [edge.tensor_info for edge in inputs], start=[]
                 ),
                 request_done="audio" not in output_modalities,
-                step_metadata=self._talker_step_metadata(metadata),
+                step_metadata=step_metadata,
             )
 
         if partition_name == "Codec":
@@ -1011,6 +1085,13 @@ class Qwen3TTSModel(Model):
             "max_output_tokens",
             model_kwargs.get("max_new_tokens", self.config.generation.max_new_tokens),
         )
+
+    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
+        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
+        return {"talker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {TALKER_KV: {"main": KVLabel(growth=(("talker_decode", "talker_decode_loop"),))}}
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.codec.output_sample_rate
@@ -1149,8 +1230,7 @@ class Qwen3TTSModel(Model):
             decoder_config_cls, decoder_cls, _ = _load_qwen3_tts_codec_classes()
         except ImportError as exc:
             raise ImportError(
-                "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
-                "M* with the qwen3_tts optional dependency"
+                f"Qwen3-TTS Codec could not load qwen-tts' speech tokenizer: {exc}"
             ) from exc
 
         from mstar.model.loader import load_hf_weights
@@ -1179,7 +1259,9 @@ class Qwen3TTSModel(Model):
         decoder.eval()
         if self.codec_dtype != torch.float32:
             decoder.to(dtype=self.codec_dtype)
-        return CodecSubmodule(decoder, self.config)
+        watermark = getattr(self, "audio_watermark", AudioWatermarkConfig())
+        watermarker = AudioSealWatermarker.build(watermark, device) if watermark.enabled else None
+        return CodecSubmodule(decoder, self.config, watermarker=watermarker)
 
     def _create_ref_encoder_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
@@ -1245,8 +1327,4 @@ class Qwen3TTSModel(Model):
     def _talker_step_metadata(
         metadata: CurrentForwardConductorMetadata,
     ) -> dict[str, Any]:
-        """Copy conductor-owned generation controls into worker step metadata."""
-        return {
-            "is_prefill": metadata.is_prefill,
-            "talker_max_tokens": metadata.kwargs["talker_max_tokens"],
-        }
+        return {"is_prefill": metadata.is_prefill}

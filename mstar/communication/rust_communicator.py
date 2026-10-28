@@ -26,7 +26,6 @@ except ModuleNotFoundError:
 from mstar.communication.codec import (  # noqa: F401  (re-exported)
     Codec,
     MsgpackCodec,
-    PickleCodec,
     WireCodec,
     decode_each,
     default_codec,
@@ -130,6 +129,11 @@ class RustZMQCommunicator(BaseCommunicator):
         if self.protocol == CommProtocol.TCP:
             self._register(entity_id)
         self._inner.send(entity_id, self.codec.encode(msg))
+
+    def try_send_bytes(self, entity_id: str, data: bytes) -> bool:
+        if self.protocol == CommProtocol.TCP:
+            self._register(entity_id)
+        return self._inner.try_send(entity_id, data)
 
     def get_all_new_messages(
         self, blocking: bool = False, timeout_s: float | None = None,

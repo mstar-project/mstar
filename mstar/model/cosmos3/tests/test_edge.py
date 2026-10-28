@@ -299,34 +299,6 @@ def test_text_forward_keeps_raw_k() -> None:
     assert torch.allclose(res.committed[0][0], k_raw, atol=1e-6)
 
 
-def test_conditioning_frame_recipes() -> None:
-    from mstar.model.cosmos3.components.conditioning import prepare_conditioning_frames
-
-    torch.manual_seed(0)
-    img = torch.rand(3, 90, 160)  # 16:9 source
-    # Stretch: plain resize to a square target, aspect not preserved.
-    out = prepare_conditioning_frames(img, 64, 64, "stretch")
-    assert out.shape == (1, 3, 1, 64, 64) and out.min() >= -1 and out.max() <= 1
-    ref = torch.nn.functional.interpolate(img.unsqueeze(0), size=(64, 64), mode="bilinear", align_corners=False)
-    assert torch.allclose(out[:, :, 0], ref * 2 - 1, atol=1e-6)
-    # Aspect crop: cover-scale (90x160 -> 64x114), center crop to 64x64,
-    # values quantized to 8-bit steps.
-    out = prepare_conditioning_frames(img, 64, 64, "aspect_crop")
-    assert out.shape == (1, 3, 1, 64, 64)
-    steps = (out + 1.0) * 127.5
-    assert torch.allclose(steps, steps.round(), atol=1e-4)
-    full = torch.nn.functional.interpolate(img.unsqueeze(0) * 255, size=(64, 114), mode="bilinear",
-                                           align_corners=False, antialias=True)
-    crop = full[:, :, :, 25:89].round().clamp(0, 255) / 127.5 - 1
-    assert torch.allclose(out[:, :, 0], crop, atol=1e-6)
-    # Same-aspect targets crop nothing; 8-bit inputs and video stacks work too.
-    vid = (torch.rand(4, 3, 45, 80) * 255).to(torch.uint8)
-    out = prepare_conditioning_frames(vid, 90, 160, "aspect_crop")
-    assert out.shape == (1, 3, 4, 90, 160)
-    with pytest.raises(ValueError, match="conditioning_resize"):
-        prepare_conditioning_frames(img, 64, 64, "pad")
-
-
 def test_native_flow_sigmas() -> None:
     from mstar.model.cosmos3.submodules import native_flow_sigmas
 
@@ -559,6 +531,25 @@ def test_edge_prompt_rendering_matches_reference_layout() -> None:
 
 
 @needs_edge
+def test_edge_system_prompt_leads_a_chat_with_no_system_message(tmp_path) -> None:
+    """The request's ``system_prompt`` leads a chat whose client sent no system message of its own."""
+    from transformers import AutoTokenizer
+
+    from mstar.api_server.openai.adapters import flatten_messages
+    from mstar.model.cosmos3.components.reasoner import render_chat
+
+    cfg = Cosmos3Config.from_pretrained(EDGE_DIR)
+    tok = AutoTokenizer.from_pretrained(str(EDGE_DIR))
+    question = {"role": "user", "content": "What is ahead?"}
+    *_, parts = flatten_messages([question], tmp_path)
+    rendered = render_chat(tok, parts, cfg.reasoner, enable_thinking=False, system_prompt="Drive carefully.")
+    assert rendered == tok.apply_chat_template(
+        [{"role": "system", "content": "Drive carefully."}, question],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False,
+    ), "the request's system_prompt did not lead a chat that sent none"
+
+
+@needs_edge
 def test_edge_reasoner_video_prompt() -> None:
     """A video attachment renders one timestamped span per sampled frame, the
     packed patches cover every frame, and the positions advance per frame."""
@@ -576,7 +567,7 @@ def test_edge_reasoner_video_prompt() -> None:
         prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
         input_metadata={"video_inputs": [{"average_fps": 10.0, "num_frames": 30}]},
         enable_thinking=False,
-    )
+    ).new_input_tensors
     ids = out["text_inputs"][0]
     grid = out["vision_grid_thw"][0]
     assert grid.shape == (1, 3) and int(grid[0, 0]) == 6
@@ -597,7 +588,7 @@ def test_edge_reasoner_video_prompt() -> None:
         None, ["video", "text"], ["text"], tensors={"video_inputs": [video]},
         prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
         input_metadata={"video_inputs": [{"average_fps": 10.0}]}, video_num_frames=4,
-    )
+    ).new_input_tensors
     assert int(out2["vision_grid_thw"][0][0, 0]) == 4
 
 

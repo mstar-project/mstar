@@ -42,6 +42,12 @@ class KVReadInfo:
     token_end: int
 
 
+class KVTransferInfo:
+    """Base of the descriptors a transfer engine publishes for its KV cache.
+    The wire carries a subclass as ``[tag, fields]``, so the descriptor the
+    conductor re-sends every pass takes the typed path."""
+
+
 class KVTransferEngine(ABC):
     @abstractmethod
     def read_batched_async(
@@ -80,7 +86,7 @@ class KVTransferEngine(ABC):
 
 
 @dataclass
-class MooncakeKVTransferInfo:
+class MooncakeKVTransferInfo(KVTransferInfo):
     entity_id: str
     session_id: str
     data_ptr: int
@@ -180,10 +186,10 @@ class MooncakeKVTransferEngine(KVTransferEngine):
 
 
 @dataclass
-class CudaIpcKVTransferInfo:
-    cuda_share: tuple
-    size: tuple
-    stride: tuple
+class CudaIpcKVTransferInfo(KVTransferInfo):
+    cuda_share: tuple[Any, ...]
+    size: tuple[int, ...]
+    stride: tuple[int, ...]
     offset: int
     dtype: str
     requires_grad: bool
@@ -367,7 +373,7 @@ class ShmKVSnapshotChunk:
 
 
 @dataclass(frozen=True)
-class ShmKVTransferInfo:
+class ShmKVTransferInfo(KVTransferInfo):
     path: str
     page_indices: tuple[int, ...]
     layout: KVLayout
@@ -582,9 +588,12 @@ class ShmKVTransferEngine(KVTransferEngine):
                 weights_only=True,
             )
             for layer, packed_page, local_page, token_start, token_end in chunk_copies:
-                source = packed[
-                    layer, packed_page, :, token_start:token_end,
-                ].to(self._kv_cache.device)
+                if self._kv_cache.layout == KVLayout.MLA:
+                    # one latent row per token: [layers, pages, page_size, latent]
+                    source = packed[layer, packed_page, token_start:token_end]
+                else:
+                    source = packed[layer, packed_page, :, token_start:token_end]
+                source = source.to(self._kv_cache.device)
                 destination = self._kv_cache.chunk_view(
                     layer_idx=layer,
                     page_idx=local_page,

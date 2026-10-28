@@ -52,7 +52,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.loader import LLAMA_STACKED_PARAMS, load_hf_weights
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
@@ -136,6 +136,8 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
 
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
+
+    PREPROCESS_ONLY_KWARGS = ("robot_state",)
 
     PREFILL_WALK = "prefill"
     ACTION_GEN_WALK = "action_gen"
@@ -360,15 +362,28 @@ class Pi05Model(Model):
         return None
 
     @staticmethod
+    def _siglip_tower_prefix(encoder: nn.Module) -> str:
+        """Where ``encoder`` keeps SigLIP's embeddings/encoder/post_layernorm:
+        ``vision_model.vision_model.`` where SiglipVisionModel wraps a
+        SiglipVisionTransformer (transformers 4.x), ``vision_model.`` where it
+        holds them itself (5.20)."""
+        suffix = "embeddings.patch_embedding.weight"
+        for name, _ in encoder.named_parameters():
+            if name.endswith(suffix):
+                return name.removesuffix(suffix)
+        raise ValueError("no SigLIP patch embedding in the vision encoder")
+
+    @staticmethod
     def _extract_siglip_state_dict(
-        flat: dict[str, torch.Tensor],
+        flat: dict[str, torch.Tensor], tower_prefix: str,
     ) -> dict[str, torch.Tensor]:
         """Bucket the SigLIP-relevant subset of the lerobot flat dict
         into a ``Pi05SiglipEncoder.state_dict()``-compatible mapping.
 
         The renamed entries are fed straight into ``load_hf_weights`` —
         no stacked-param routing is needed for SigLIP, just the flat
-        key rename and the surrounding prefix filter.
+        key rename and the surrounding prefix filter. ``tower_prefix`` is
+        :meth:`_siglip_tower_prefix` of the encoder being loaded.
         """
         out: dict[str, torch.Tensor] = {}
         for key, tensor in flat.items():
@@ -376,14 +391,7 @@ class Pi05Model(Model):
                 continue
             inner = key.removeprefix(_PALIGEMMA_PREFIX)
             if inner.startswith("vision_tower.vision_model."):
-                # The lerobot key is
-                #   paligemma.model.vision_tower.vision_model.<rest>
-                # Pi05SiglipEncoder owns ``self.vision_model = SiglipVisionModel(...)``,
-                # and HF's SiglipVisionModel has its own inner ``.vision_model``
-                # attribute, so the corresponding key is
-                # ``vision_model.vision_model.<rest>``. We replace
-                # ``vision_tower`` with ``vision_model`` to make that explicit.
-                out["vision_model." + inner.removeprefix("vision_tower.")] = tensor
+                out[tower_prefix + inner.removeprefix("vision_tower.vision_model.")] = tensor
             elif inner.startswith("multi_modal_projector.linear."):
                 sub = inner.removeprefix("multi_modal_projector.linear.")
                 out[f"connector.{sub}"] = tensor
@@ -487,7 +495,7 @@ class Pi05Model(Model):
         input_modalities: list[str],
         output_modalities: list[str],
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the Pi0.5 prompt + robot state into a single token stream.
 
         Pi0.5's production preprocessor (lerobot's
@@ -530,7 +538,20 @@ class Pi05Model(Model):
             full_prompt = cleaned
 
         text_ids = self.tokenizer.encode_prompt(full_prompt)
-        return {"text_inputs": [text_ids]}
+        cfg = self.config
+        # a captured SigLIP step encodes all num_cameras slots, however many images the request has
+        images = cfg.num_cameras * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
+        layout = LabelLayout(
+            spans=(
+                Span("rows", self.PREFILL_WALK, images, images, "img_emb"),
+                Span("ids", self.PREFILL_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
+            ),
+            scratch=cfg.action_horizon,
+        )
+        return ProcessPromptOutput({"text_inputs": [text_ids]}, {"kv_layout": {LLM_KV: {"main": layout}}})
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {LLM_KV: {"main": KVLabel()}}
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":
@@ -687,13 +708,17 @@ class Pi05Model(Model):
         # non-persistent ``position_ids`` buffer with the canonical
         # ``arange`` values before running the forward.
         _reset_non_persistent_buffers(self.siglip, device)
-        # The extracted bucket may contain stray pooling-head keys that
-        # Pi05SiglipEncoder doesn't model (``vision_use_head=False``);
-        # ``load_hf_weights`` silently ignores any key that has no matching
-        # parameter in the target module, so the leftover keys are dropped
-        # without needing an explicit ``strict=False`` switch.
-        siglip_sd = self._extract_siglip_state_dict(flat)
-        load_hf_weights(self.siglip, siglip_sd.items())
+        # ``load_hf_weights`` drops keys with no matching parameter (stray
+        # pooling-head keys, since ``vision_use_head=False``). The reverse,
+        # a parameter no key reached, would keep to_empty's garbage, so check.
+        siglip_sd = self._extract_siglip_state_dict(flat, self._siglip_tower_prefix(self.siglip))
+        loaded = load_hf_weights(self.siglip, siglip_sd.items())
+        missing = sorted(set(dict(self.siglip.named_parameters())) - loaded)
+        if missing:
+            raise KeyError(
+                f"Pi0.5 SigLIP: {len(missing)} parameters not in the checkpoint, "
+                f"e.g. {missing[:3]}"
+            )
 
     def _init_llm_components(self, device: str):
         if self.embed_tokens is not None:

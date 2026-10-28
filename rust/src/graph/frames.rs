@@ -240,7 +240,8 @@ pub struct WorkerGraphsDone<'a> {
     pub partition_done: bool,
     pub graph_walk: &'a str,
     pub stream_tokens_consumed: &'a [(String, i64)],
-    pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
+    /// `dict[str, dict[str, int]]`: stream edge -> destination worker -> items.
+    pub stream_items_sent: Vec<(Sym, Vec<(Sym, i64)>)>,
     /// `dict[str, PublishedInfo]` -- abstract, so it stays Python's. Read
     /// encoded by Python and forwarded without interpreting resource types.
     pub resource_publish_info: Option<Value>,
@@ -277,13 +278,14 @@ impl WorkerGraphsDone<'_> {
             str_counts(
                 m.key("stream_tokens_consumed"), self.stream_tokens_consumed,
             );
-            w_map(
-                m.key("output_loop_indices"),
-                self.output_loop_indices.len() as u32,
-            );
-            for (sig, (order, idxs, fwd)) in &self.output_loop_indices {
-                w_str(m.buf(), it.name(*sig));
-                nested_loop_indices(m.buf(), it, order, idxs, *fwd);
+            w_map(m.key("stream_items_sent"), self.stream_items_sent.len() as u32);
+            for (edge, per_worker) in &self.stream_items_sent {
+                w_str(m.buf(), it.name(*edge));
+                w_map(m.buf(), per_worker.len() as u32);
+                for (worker, n) in per_worker {
+                    w_str(m.buf(), it.name(*worker));
+                    w_i64(m.buf(), *n);
+                }
             }
             // Omitted when absent, so the decoder's default stands.
             if let Some(v) = &self.resource_publish_info {
@@ -432,6 +434,47 @@ impl ResultTensors<'_> {
                 }
                 None => w_nil(m.key("loop_indices")),
             }
+            w_map(m.key("metadata"), 0);
+        });
+        out
+    }
+}
+
+/// One step's inline emits to the api server: every request's value in one
+/// frame, where ResultTensors was one frame (and one tensor) per request.
+pub struct ResultTokens<'a> {
+    pub request_ids: &'a [String],
+    pub values: &'a [i64],
+    pub loop_indices: &'a [Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>],
+    pub signal: &'a str,
+    pub modality: &'a str,
+}
+
+impl ResultTokens<'_> {
+    pub fn encode(&self, it: &StrToId) -> Vec<u8> {
+        let mut out = Vec::with_capacity(96 + 48 * self.request_ids.len());
+        // Untagged like ResultTensors: a declared body type of APIServerMessage.
+        open_frame(&mut out, "api_msg", "result_tokens", None);
+        w_map_counted(&mut out, |m| {
+            w_arr(m.key("request_ids"), self.request_ids.len() as u32);
+            for r in self.request_ids {
+                w_str(m.buf(), r);
+            }
+            w_arr(m.key("values"), self.values.len() as u32);
+            for &v in self.values {
+                w_i64(m.buf(), v);
+            }
+            w_arr(m.key("loop_indices"), self.loop_indices.len() as u32);
+            for li in self.loop_indices {
+                match li {
+                    Some((order, idxs, fwd)) => {
+                        nested_loop_indices(m.buf(), it, order, idxs, *fwd)
+                    }
+                    None => w_nil(m.buf()),
+                }
+            }
+            w_str(m.key("signal"), self.signal);
+            w_str(m.key("modality"), self.modality);
             w_map(m.key("metadata"), 0);
         });
         out

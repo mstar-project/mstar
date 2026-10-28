@@ -1,0 +1,594 @@
+# A/A noise floors and correctness swings per GPU type (benchmark/eval/e2e/calibrate.py); written by
+# `python -m benchmark.eval calibrate`.
+_runs: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main, 576-slice-35d1d599,
+  577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8, run-aa4]
+_runs_correct: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main,
+  576-slice-35d1d599, 577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8,
+  run-aa4]
+_runs_quality: [576-slice-35d1d599]
+b200:bagel/image_in/correct:
+  kind: text_match
+  swings: [0.0]
+b200:bagel/image_in/lat_p50_s@c1:
+  deltas: [-0.879]
+b200:bagel/image_in/req_per_s@c8:
+  deltas: [-0.482]
+b200:bagel/image_in/ttft_p50_s@c1:
+  deltas: [-2.269]
+b200:bagel/t2i/lat_p50_s@c1:
+  deltas: [0.003]
+b200:bagel/t2i/req_per_s@c1:
+  deltas: [0.006]
+b200:bagel/text/correct:
+  kind: text_match
+  swings: [0.0]
+b200:bagel/text/lat_p50_s@c1:
+  deltas: [0.257]
+b200:bagel/text/tok_per_s@c8:
+  deltas: [-1.328]
+b200:bagel/text/ttft_p50_s@c1:
+  deltas: [1.912]
+b200:chatterbox/clone/audio_s_per_s@c8:
+  deltas: [0.342]
+b200:chatterbox/clone/correct:
+  kind: wer
+  swings: [0.0]
+b200:chatterbox/clone/e2e_s_p50@c1:
+  deltas: [0.917]
+b200:chatterbox/clone/sim_mean@c1:
+  deltas: [-0.0]
+b200:chatterbox/clone/ttfa_ms_p50@c1:
+  deltas: [0.266]
+b200:chatterbox/tts/audio_s_per_s@c8:
+  deltas: [-2.356]
+b200:chatterbox/tts/correct:
+  kind: wer
+  swings: [0.2415]
+b200:chatterbox/tts/e2e_s_p50@c1:
+  deltas: [0.383]
+b200:chatterbox/tts/rtf_mean@c1:
+  deltas: [0.774]
+b200:chatterbox/tts/ttfa_ms_p50@c1:
+  deltas: [1.137]
+b200:cosmos3_edge/chat_image/correct:
+  kind: text_match
+  swings: [0.25]
+b200:cosmos3_edge/chat_image/lat_p50_s@c1:
+  deltas: [-4.201]
+b200:cosmos3_edge/chat_image/req_per_s@c8:
+  deltas: [-0.733]
+b200:cosmos3_edge/chat_image/ttft_p50_s@c1:
+  deltas: [3.367]
+b200:cosmos3_edge/t2i/lat_p50_s@c1:
+  deltas: [-1.194]
+b200:cosmos3_edge/t2i/req_per_s@c8:
+  deltas: [0.096]
+b200:kokoro/tts/audio_s_per_s@c8:
+  deltas: [2.536]
+b200:kokoro/tts/correct:
+  kind: wer
+  swings: [0.2415]
+b200:kokoro/tts/e2e_s_p50@c1:
+  deltas: [-1.213]
+b200:kokoro/tts/req_per_s@c1:
+  deltas: [-0.566]
+b200:kokoro/tts/rtf_mean@c1:
+  deltas: [-0.409]
+b200:kokoro/tts/ttfa_ms_p50@c1:
+  deltas: [-1.383]
+b200:nemotron_duplex/duplex/correct:
+  kind: duplex
+  swings: [0.0]
+b200:nemotron_duplex/duplex/frames_per_s@c8:
+  deltas: [-0.222]
+b200:nemotron_duplex/duplex/response_latency_s_p50@c1:
+  deltas: [-0.0]
+b200:nemotron_duplex/duplex/take_turn_rate@c1:
+  deltas: [0.0]
+b200:nemotron_duplex/duplex/wall_ms_per_frame_p50@c1:
+  deltas: [0.044]
+b200:omnivoice/clone_upload/correct:
+  kind: audio_len
+  swings: [0.0, 0.0]
+b200:omnivoice/clone_upload/lat_p50_s@c1:
+  deltas: [-1.489, -0.702]
+b200:omnivoice/clone_upload/req_per_s@c8:
+  deltas: [-0.534, 0.634]
+b200:omnivoice/clone_upload/ttft_p50_s@c1:
+  deltas: [-1.527, -0.587]
+b200:omnivoice/tts/audio_s_per_s@c8:
+  deltas: [-1.481, -0.844]
+b200:omnivoice/tts/correct:
+  kind: wer
+  swings: [0.0, 0.0]
+b200:omnivoice/tts/e2e_s_p50@c1:
+  deltas: [-1.064, -0.443]
+b200:omnivoice/tts/ttfa_ms_p50@c1:
+  deltas: [-1.041, -0.612]
+b200:orpheus_mooncake/tts/audio_s_per_s@c8:
+  deltas: [2.028, -5.365]
+b200:orpheus_mooncake/tts/correct:
+  kind: wer
+  swings: [0.1208, 0.0, 0.1208]
+b200:orpheus_mooncake/tts/e2e_s_p50@c1:
+  deltas: [-6.114, -0.349]
+b200:orpheus_mooncake/tts/rtf_mean@c1:
+  deltas: [-6.124, 0.052]
+b200:orpheus_mooncake/tts/ttfa_ms_p50@c1:
+  deltas: [-4.963, 0.356]
+b200:pi05/act/correct:
+  kind: action_diff
+  swings: [0.0082]
+b200:pi05/act/lat_p50_s@c1:
+  deltas: [-1.919]
+b200:pi05/act/req_per_s@c8:
+  deltas: [-2.936]
+b200:qwen3_omni/audio_in/correct:
+  kind: text_match
+  swings: [0.0, 0.0]
+b200:qwen3_omni/audio_in/lat_p50_s@c1:
+  deltas: [0.74, 1.327]
+b200:qwen3_omni/audio_in/req_per_s@c8:
+  deltas: [0.204]
+b200:qwen3_omni/audio_in/tok_per_s@c8:
+  deltas: [0.754]
+b200:qwen3_omni/audio_in/ttft_p50_s@c1:
+  deltas: [1.64, 3.01]
+b200:qwen3_omni/audio_out/audio_s_per_s@c8:
+  deltas: [8.07]
+b200:qwen3_omni/audio_out/correct:
+  kind: audio_len
+  swings: [2.7508, 14.296]
+b200:qwen3_omni/audio_out/lat_p50_s@c1:
+  deltas: [6.488]
+b200:qwen3_omni/audio_out/req_per_s@c8:
+  deltas: [-7.544]
+b200:qwen3_omni/audio_out/s_per_audio_s_p50@c1:
+  deltas: [-2.555]
+b200:qwen3_omni/audio_out/ttft_p50_s@c1:
+  deltas: [-1.096, 0.482]
+b200:qwen3_omni/decode_fixed/correct:
+  kind: text_match
+  swings: [0.0, 0.0]
+b200:qwen3_omni/decode_fixed/lat_p50_s@c1:
+  deltas: [0.181, 0.537]
+b200:qwen3_omni/decode_fixed/req_per_s@c8:
+  deltas: [5.082, 1.644]
+b200:qwen3_omni/decode_fixed/ttft_p50_s@c1:
+  deltas: [-1.189, -1.16]
+b200:qwen3_omni/image_in/correct:
+  kind: text_match
+  swings: [0.0, 0.75]
+b200:qwen3_omni/image_in/lat_p50_s@c1:
+  deltas: [0.216, 2.125]
+b200:qwen3_omni/image_in/req_per_s@c8:
+  deltas: [0.189, -0.25]
+b200:qwen3_omni/image_in/ttft_p50_s@c1:
+  deltas: [-0.142, 2.238]
+b200:qwen3_omni/text/correct:
+  kind: text_match
+  swings: [0.0, 0.25]
+b200:qwen3_omni/text/lat_p50_s@c1:
+  deltas: [0.364, 0.418]
+b200:qwen3_omni/text/req_per_s@c8:
+  deltas: [-4.523, -3.306]
+b200:qwen3_omni/text/ttft_p50_s@c1:
+  deltas: [-0.31, -0.652]
+b200:qwen3_omni/video_in/correct:
+  kind: text_match
+  swings: [0.0, 0.5]
+b200:qwen3_omni/video_in/lat_p50_s@c1:
+  deltas: [1.99, 2.694]
+b200:qwen3_omni/video_in/req_per_s@c8:
+  deltas: [0.826, -2.946]
+b200:qwen3_omni/video_in/ttft_p50_s@c1:
+  deltas: [2.056, 2.218]
+b200:qwen3_omni_mooncake/image_in/correct:
+  kind: text_match
+  swings: [0.5]
+b200:qwen3_omni_mooncake/image_in/lat_p50_s@c1:
+  deltas: [1.624]
+b200:qwen3_omni_mooncake/image_in/tok_per_s@c8:
+  deltas: [0.592]
+b200:qwen3_omni_mooncake/image_in/ttft_p50_s@c1:
+  deltas: [0.569]
+b200:qwen3_omni_mooncake/text/correct:
+  kind: text_match
+  swings: [0.25]
+b200:qwen3_omni_mooncake/text/lat_p50_s@c1:
+  deltas: [1.536]
+b200:qwen3_omni_mooncake/text/tok_per_s@c8:
+  deltas: [5.327]
+b200:qwen3_omni_mooncake/text/ttft_p50_s@c1:
+  deltas: [0.896]
+b200:qwen3_omni_rustfe/image_in/correct:
+  kind: text_match
+  swings: [0.0, 0.5]
+b200:qwen3_omni_rustfe/image_in/lat_p50_s@c1:
+  deltas: [-0.421, 0.725]
+b200:qwen3_omni_rustfe/image_in/req_per_s@c8:
+  deltas: [-0.75]
+b200:qwen3_omni_rustfe/image_in/tok_per_s@c8:
+  deltas: [0.12]
+b200:qwen3_omni_rustfe/image_in/ttft_p50_s@c1:
+  deltas: [-0.531, 0.406]
+b200:qwen3_omni_rustfe/text/correct:
+  kind: text_match
+  swings: [0.0, 0.5]
+b200:qwen3_omni_rustfe/text/lat_p50_s@c1:
+  deltas: [-0.725, 0.594]
+b200:qwen3_omni_rustfe/text/req_per_s@c8:
+  deltas: [5.987]
+b200:qwen3_omni_rustfe/text/tok_per_s@c8:
+  deltas: [1.633]
+b200:qwen3_omni_rustfe/text/ttft_p50_s@c1:
+  deltas: [0.499, -3.849]
+b200:qwen3_tts/tts/audio_s_per_s@c8:
+  deltas: [-1.548]
+b200:qwen3_tts/tts/correct:
+  kind: wer
+  swings: [0.3623]
+b200:qwen3_tts/tts/rtf_mean@c1:
+  deltas: [2.286]
+b200:qwen3_tts/tts/s_per_audio_s_p50@c1:
+  deltas: [2.246]
+b200:qwen3_tts/tts/ttfa_ms_p50@c1:
+  deltas: [2.517]
+b200:wan22/i2v/correct:
+  kind: psnr
+  swings: [40.3782, 39.725]
+b200:wan22/i2v/lat_p50_s@c1:
+  deltas: [-0.467, 0.301]
+b200:wan22/i2v/req_per_s@c1:
+  deltas: [-0.465, 0.303]
+b200:wan22/t2v/correct:
+  kind: psnr
+  swings: [42.1919, 42.3328]
+b200:wan22/t2v/lat_p50_s@c1:
+  deltas: [-0.089, -0.053]
+b200:wan22/t2v/req_per_s@c8:
+  deltas: [-0.001, 0.037]
+b200:waypoint_360p/frames/lat_p50_s@c1:
+  deltas: [4.466, 0.45]
+b200:waypoint_360p/frames/req_per_s@c1:
+  deltas: [4.342, 0.775]
+b200:waypoint_360p/frames/ttft_p50_s@c1:
+  deltas: [4.014, 1.122]
+b200:whisper_large/sse/correct:
+  kind: wer
+  swings: [0.0]
+b200:whisper_large/sse/e2e_s_p50@c1:
+  deltas: [-0.036]
+b200:whisper_large/sse/first_text_s_p50@c1:
+  deltas: [1.627]
+b200:whisper_large/sse/req_per_s@c8:
+  deltas: [-3.289]
+b200:whisper_large/upload/correct:
+  kind: wer
+  swings: [0.0]
+b200:whisper_large/upload/e2e_s_p50@c1:
+  deltas: [-2.048]
+b200:whisper_large/upload/req_per_s@c8:
+  deltas: [-1.564]
+b200:whisper_large/upload/rtfx@c1:
+  deltas: [-0.422]
+b200:z_image_turbo/t2i/correct:
+  kind: psnr
+  swings: [75.0578]
+b200:z_image_turbo/t2i/lat_p50_s@c1:
+  deltas: [0.196]
+b200:z_image_turbo/t2i/req_per_s@c8:
+  deltas: [-0.462]
+h200:bagel/image_in/correct:
+  kind: text_match
+  swings: [0.0]
+h200:bagel/image_in/lat_p50_s@c1:
+  deltas: [0.568]
+h200:bagel/image_in/req_per_s@c8:
+  deltas: [1.898]
+h200:bagel/image_in/ttft_p50_s@c1:
+  deltas: [1.475]
+h200:bagel/t2i/lat_p50_s@c1:
+  deltas: [0.026]
+h200:bagel/t2i/req_per_s@c1:
+  deltas: [0.038]
+h200:bagel/text/correct:
+  kind: text_match
+  swings: [0.0]
+h200:bagel/text/lat_p50_s@c1:
+  deltas: [0.522]
+h200:bagel/text/req_per_s@c8:
+  deltas: [0.15]
+h200:bagel/text/ttft_p50_s@c1:
+  deltas: [-0.612]
+h200:chatterbox/clone/audio_s_per_s@c8:
+  deltas: [2.371]
+h200:chatterbox/clone/correct:
+  kind: wer
+  swings: [0.0]
+h200:chatterbox/clone/e2e_s_p50@c1:
+  deltas: [1.309]
+h200:chatterbox/clone/sim_mean@c1:
+  deltas: [0.0]
+h200:chatterbox/clone/ttfa_ms_p50@c1:
+  deltas: [-0.582]
+h200:chatterbox/tts/audio_s_per_s@c8:
+  deltas: [-6.18]
+h200:chatterbox/tts/correct:
+  kind: wer
+  swings: [0.0]
+h200:chatterbox/tts/e2e_s_p50@c1:
+  deltas: [0.828]
+h200:chatterbox/tts/rtf_mean@c1:
+  deltas: [0.132]
+h200:chatterbox/tts/ttfa_ms_p50@c1:
+  deltas: [0.189]
+h200:cosmos3_edge/chat_image/correct:
+  kind: text_match
+  swings: [0.0]
+h200:cosmos3_edge/chat_image/lat_p50_s@c1:
+  deltas: [-0.832]
+h200:cosmos3_edge/chat_image/req_per_s@c8:
+  deltas: [-1.031]
+h200:cosmos3_edge/chat_image/ttft_p50_s@c1:
+  deltas: [-0.701]
+h200:cosmos3_edge/t2i/lat_p50_s@c1:
+  deltas: [-2.754]
+h200:cosmos3_edge/t2i/req_per_s@c8:
+  deltas: [-0.943]
+h200:cosyvoice3/clone/audio_s_per_s@c8:
+  deltas: [0.242]
+h200:cosyvoice3/clone/correct:
+  kind: wer
+  swings: [0.0]
+h200:cosyvoice3/clone/e2e_s_p50@c1:
+  deltas: [-1.688]
+h200:cosyvoice3/clone/rtf_mean@c1:
+  deltas: [-2.052]
+h200:cosyvoice3/clone/sim_mean@c1:
+  deltas: [0.0]
+h200:cosyvoice3/clone/ttfa_ms_p50@c1:
+  deltas: [-2.885]
+h200:kokoro/tts/audio_s_per_s@c8:
+  deltas: [-4.001, -1.166, 6.504, -0.03]
+h200:kokoro/tts/correct:
+  kind: wer
+  swings: [0.2415, 0.0, 0.2415, 0.2415]
+h200:kokoro/tts/e2e_s_p50@c1:
+  deltas: [0.031, -0.455, -0.178, -0.048]
+h200:kokoro/tts/mos:
+  kind: mos
+  swings: [0.0016]
+h200:kokoro/tts/req_per_s@c1:
+  deltas: [-0.086, 1.421, -1.366, 0.856]
+h200:kokoro/tts/rtf_mean@c1:
+  deltas: [0.128, 0.838, -1.288, 0.918]
+h200:kokoro/tts/ttfa_ms_p50@c1:
+  deltas: [0.029, 0.604, -0.043, -0.032]
+h200:lingbot_world_1_3b/world/lat_p50_s@c1:
+  deltas: [0.09]
+h200:lingbot_world_1_3b/world/req_per_s@c1:
+  deltas: [0.152]
+h200:lingbot_world_1_3b/world/ttft_p50_s@c1:
+  deltas: [0.466]
+h200:nemotron_duplex/duplex/correct:
+  kind: duplex
+  swings: [0.0]
+h200:nemotron_duplex/duplex/frames_per_s@c8:
+  deltas: [0.354]
+h200:nemotron_duplex/duplex/response_latency_s_p50@c1:
+  deltas: [-0.0]
+h200:nemotron_duplex/duplex/take_turn_rate@c1:
+  deltas: [0.0]
+h200:nemotron_duplex/duplex/wall_ms_per_frame_p50@c1:
+  deltas: [2.643]
+h200:omnilingual_asr_ctc_300m/upload/correct:
+  kind: wer
+  swings: [0.0]
+h200:omnilingual_asr_ctc_300m/upload/e2e_s_p50@c1:
+  deltas: [-0.136]
+h200:omnilingual_asr_ctc_300m/upload/req_per_s@c16:
+  deltas: [-5.825]
+h200:omnilingual_asr_ctc_300m/upload/rtfx@c1:
+  deltas: [-0.194]
+h200:omnivoice/clone_upload/correct:
+  kind: audio_len
+  swings: [0.0, 0.0]
+h200:omnivoice/clone_upload/lat_p50_s@c1:
+  deltas: [-2.616, 1.646]
+h200:omnivoice/clone_upload/mos:
+  kind: mos
+  swings: [0.0]
+h200:omnivoice/clone_upload/req_per_s@c8:
+  deltas: [0.252, -0.998]
+h200:omnivoice/clone_upload/speaker_sim:
+  kind: speaker_sim
+  swings: [0.0]
+h200:omnivoice/clone_upload/ttft_p50_s@c1:
+  deltas: [-2.626, 1.646]
+h200:omnivoice/tts/audio_s_per_s@c8:
+  deltas: [-2.145, 2.349, 2.879]
+h200:omnivoice/tts/correct:
+  kind: wer
+  swings: [0.0, 0.0, 0.0]
+h200:omnivoice/tts/e2e_s_p50@c1:
+  deltas: [-0.37, 3.7, -1.892]
+h200:omnivoice/tts/mos:
+  kind: mos
+  swings: [0.0]
+h200:omnivoice/tts/ttfa_ms_p50@c1:
+  deltas: [-0.477, 3.741, -1.869]
+h200:orpheus/tts/audio_s_per_s@c8:
+  deltas: [3.392, -3.611]
+h200:orpheus/tts/correct:
+  kind: wer
+  swings: [1.087, 0.1208]
+h200:orpheus/tts/e2e_s_p50@c1:
+  deltas: [-0.169, 0.215]
+h200:orpheus/tts/rtf_mean@c1:
+  deltas: [0.68, 0.156]
+h200:orpheus/tts/ttfa_ms_p50@c1:
+  deltas: [1.015, -0.141]
+h200:orpheus_mooncake/tts/audio_s_per_s@c8:
+  deltas: [-0.427]
+h200:orpheus_mooncake/tts/correct:
+  kind: wer
+  swings: [0.0]
+h200:orpheus_mooncake/tts/e2e_s_p50@c1:
+  deltas: [0.152]
+h200:orpheus_mooncake/tts/rtf_mean@c1:
+  deltas: [-0.033]
+h200:orpheus_mooncake/tts/ttfa_ms_p50@c1:
+  deltas: [-0.326]
+h200:pi05/act/correct:
+  kind: action_diff
+  swings: [0.0068, 0.0]
+h200:pi05/act/lat_p50_s@c1:
+  deltas: [-0.8, -1.871]
+h200:pi05/act/req_per_s@c8:
+  deltas: [-0.24, 0.333]
+h200:qwen3_5_2b/image_in/correct:
+  kind: text_match
+  swings: [0.25, 0.0]
+h200:qwen3_5_2b/image_in/lat_p50_s@c1:
+  deltas: [-0.681, -5.193]
+h200:qwen3_5_2b/image_in/req_per_s@c8:
+  deltas: [1.643, -1.131]
+h200:qwen3_5_2b/image_in/ttft_p50_s@c1:
+  deltas: [0.327, -3.197]
+h200:qwen3_5_2b/text/correct:
+  kind: text_match
+  swings: [0.0, 0.5, 0.0, 0.0, 0.0]
+h200:qwen3_5_2b/text/lat_p50_s@c1:
+  deltas: [0.364, -5.852, -3.876]
+h200:qwen3_5_2b/text/req_per_s@c8:
+  deltas: [6.134]
+h200:qwen3_5_2b/text/tok_per_s@c8:
+  deltas: [-7.131, -4.838]
+h200:qwen3_5_2b/text/ttft_p50_s@c1:
+  deltas: [4.559, -2.306, -1.152]
+h200:qwen3_omni/audio_in/correct:
+  kind: text_match
+  swings: [0.0, 1.0, 0.25]
+h200:qwen3_omni/audio_in/lat_p50_s@c1:
+  deltas: [0.804, 0.979, -0.367]
+h200:qwen3_omni/audio_in/req_per_s@c8:
+  deltas: [1.317, 1.462, -0.525]
+h200:qwen3_omni/audio_in/ttft_p50_s@c1:
+  deltas: [0.226, 3.897, -1.296]
+h200:qwen3_omni/audio_out/audio_s_per_s@c8:
+  deltas: [-7.444]
+h200:qwen3_omni/audio_out/correct:
+  kind: audio_len
+  swings: [4.5592, 10.2721]
+h200:qwen3_omni/audio_out/lat_p50_s@c1:
+  deltas: [-0.948, 3.587]
+h200:qwen3_omni/audio_out/req_per_s@c8:
+  deltas: [-2.375, 3.874]
+h200:qwen3_omni/audio_out/s_per_audio_s_p50@c1:
+  deltas: [-1.285]
+h200:qwen3_omni/audio_out/ttft_p50_s@c1:
+  deltas: [-1.128, 0.621]
+h200:qwen3_omni/decode_fixed/correct:
+  kind: text_match
+  swings: [0.0, 0.0, 0.0]
+h200:qwen3_omni/decode_fixed/lat_p50_s@c1:
+  deltas: [0.858, 0.167, -0.299]
+h200:qwen3_omni/decode_fixed/req_per_s@c8:
+  deltas: [2.092, 3.184, -1.97]
+h200:qwen3_omni/decode_fixed/ttft_p50_s@c1:
+  deltas: [-0.713, 0.354, 0.485]
+h200:qwen3_omni/image_in/correct:
+  kind: text_match
+  swings: [0.0, 0.5, 0.25]
+h200:qwen3_omni/image_in/lat_p50_s@c1:
+  deltas: [0.295, 2.2, -1.204]
+h200:qwen3_omni/image_in/req_per_s@c8:
+  deltas: [0.143, -0.314, -0.73]
+h200:qwen3_omni/image_in/ttft_p50_s@c1:
+  deltas: [-0.471, 3.386, -0.295]
+h200:qwen3_omni/text/correct:
+  kind: text_match
+  swings: [0.0, 0.0, 0.0]
+h200:qwen3_omni/text/lat_p50_s@c1:
+  deltas: [0.818, 0.148, -0.123]
+h200:qwen3_omni/text/req_per_s@c8:
+  deltas: [-1.42, 7.714, 0.298]
+h200:qwen3_omni/text/ttft_p50_s@c1:
+  deltas: [0.236, 0.427, -1.186]
+h200:qwen3_omni/video_in/correct:
+  kind: text_match
+  swings: [0.0, 0.5, 0.5]
+h200:qwen3_omni/video_in/lat_p50_s@c1:
+  deltas: [1.414, 0.591, 0.236]
+h200:qwen3_omni/video_in/req_per_s@c8:
+  deltas: [0.296, 0.061, 0.642]
+h200:qwen3_omni/video_in/ttft_p50_s@c1:
+  deltas: [0.86, 0.574, 0.368]
+h200:qwen3_tts/tts/audio_s_per_s@c8:
+  deltas: [-1.429, -2.562]
+h200:qwen3_tts/tts/correct:
+  kind: wer
+  swings: [2.5362, 1.087]
+h200:qwen3_tts/tts/e2e_s_p50@c1:
+  deltas: [-3.455, 1.522]
+h200:qwen3_tts/tts/rtf_mean@c1:
+  deltas: [-0.454, 0.555]
+h200:qwen3_tts/tts/ttfa_ms_p50@c1:
+  deltas: [-0.58, -2.351]
+h200:voxcpm2/clone/audio_s_per_s@c8:
+  deltas: [-1.136]
+h200:voxcpm2/clone/correct:
+  kind: wer
+  swings: [0.0]
+h200:voxcpm2/clone/e2e_s_p50@c1:
+  deltas: [-0.754]
+h200:voxcpm2/clone/sim_mean@c1:
+  deltas: [-0.004]
+h200:voxcpm2/clone/ttfa_ms_p50@c1:
+  deltas: [-1.655]
+h200:voxcpm2/design/audio_s_per_s@c8:
+  deltas: [-0.779]
+h200:voxcpm2/design/correct:
+  kind: wer
+  swings: [0.0]
+h200:voxcpm2/design/e2e_s_p50@c1:
+  deltas: [-1.381]
+h200:voxcpm2/design/ttfa_ms_p50@c1:
+  deltas: [-1.973]
+h200:voxcpm2/tts/audio_s_per_s@c8:
+  deltas: [-1.067]
+h200:voxcpm2/tts/correct:
+  kind: wer
+  swings: [0.0]
+h200:voxcpm2/tts/e2e_s_p50@c1:
+  deltas: [0.013]
+h200:voxcpm2/tts/rtf_mean@c1:
+  deltas: [-0.105]
+h200:voxcpm2/tts/ttfa_ms_p50@c1:
+  deltas: [-0.385]
+h200:whisper_large/sse/correct:
+  kind: wer
+  swings: [0.0, 0.0]
+h200:whisper_large/sse/e2e_s_p50@c1:
+  deltas: [0.967, -1.791]
+h200:whisper_large/sse/first_text_s_p50@c1:
+  deltas: [1.738, -3.426]
+h200:whisper_large/sse/req_per_s@c8:
+  deltas: [0.118, 3.236]
+h200:whisper_large/upload/correct:
+  kind: wer
+  swings: [0.0, 0.0]
+h200:whisper_large/upload/e2e_s_p50@c1:
+  deltas: [-0.018, -1.611]
+h200:whisper_large/upload/req_per_s@c8:
+  deltas: [-3.709, -2.181]
+h200:whisper_large/upload/rtfx@c1:
+  deltas: [-0.068, -0.088]
+h200:z_image_turbo/t2i/correct:
+  kind: psnr
+  swings: [64.096, 59.9749]
+h200:z_image_turbo/t2i/lat_p50_s@c1:
+  deltas: [-0.38, 0.21]
+h200:z_image_turbo/t2i/req_per_s@c8:
+  deltas: [-0.998, 0.088]

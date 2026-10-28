@@ -1,8 +1,57 @@
+import socket
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 import torch
 import torch.distributed as dist
+from torch.distributed.constants import default_pg_nccl_timeout, default_pg_timeout
+from torch.distributed.distributed_c10d import _set_pg_timeout
+
+from mstar.distributed.all_reduce import AllReduce
+from mstar.distributed.utils import resolve_dist_timeout
+
+
+def default_group_timeout(backend: str) -> timedelta:
+    """The timeout ``init_process_group`` gives ``backend``'s group when none is passed.
+
+    With ``init_method`` it also sets the store to it; with ``store=`` it
+    leaves the store alone, so the caller passes this to both.
+    """
+    if dist.Backend(backend) == dist.Backend.NCCL and default_pg_nccl_timeout is not None:
+        return default_pg_nccl_timeout
+    return default_pg_timeout
+
+
+def rendezvous_store(init_method: str, rank: int, world_size: int, timeout: timedelta) -> dist.TCPStore:
+    """The ``tcp://host:port`` store every rank meets at, listening on ``host`` only.
+
+    ``init_process_group(init_method="tcp://...")`` has rank 0 serve its
+    TCPStore on every interface whatever the host, so rank 0 binds the
+    listener itself and hands it over.
+    """
+    url = urlparse(init_method)
+    if url.scheme != "tcp" or not url.hostname or not url.port:
+        raise ValueError(f"init_method must be tcp://host:port; got {init_method!r}")
+    if rank != 0:
+        return dist.TCPStore(url.hostname, url.port, world_size, is_master=False, timeout=timeout)
+    listener = socket.create_server((url.hostname, url.port), backlog=max(world_size, 128))
+    # the store owns the descriptor from here
+    return dist.TCPStore(
+        url.hostname, url.port, world_size, is_master=True, timeout=timeout,
+        wait_for_workers=False, master_listen_fd=listener.detach(),
+    )
+
+
+@torch.compiler.disable
+def _all_to_all_single(
+    group: dist.ProcessGroup, send: torch.Tensor, recv: torch.Tensor,
+    recv_splits: list[int] | None = None, send_splits: list[int] | None = None,
+) -> torch.Tensor:
+    dist.all_to_all_single(recv, send, recv_splits, send_splits, group=group)
+    return recv
 
 
 class CommGroup:
@@ -33,6 +82,15 @@ class CommGroup:
         # see ``init_allreduce_fusion``
         self._ar_fusion_ws: int | None = None
         self._ar_fusion_max_tokens = 0
+        # NCCL until ``init_all_reduce`` sets up the deployment's backend
+        self._all_reduce = AllReduce(self.device_group)
+
+    def init_all_reduce(self, mode: str | None = None, max_kb: int | None = None) -> None:
+        """Set up the all-reduce backend the deployment config's ``tp_allreduce``
+        (``mode``) and ``tp_allreduce_max_kb`` (``max_kb``) ask for (see
+        ``AllReduce.new``). Collective across the group — every member calls
+        this from ``init_dist`` at the same point."""
+        self._all_reduce = AllReduce.new(self, mode, max_kb)
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -70,11 +128,19 @@ class CommGroup:
             return
         dist.barrier(group=self.device_group)
 
+    def all_reduce_buffer(
+        self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """Where to write the partial that the next ``all_reduce`` sums. On
+        the symmetric-memory path this is the symm buffer, so ``all_reduce``
+        skips its copy in and returns the sum in a new tensor: use its return
+        value, and all-reduce nothing else on this group in between."""
+        return self._all_reduce.buffer(shape, dtype, device)
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
             return input_
-        dist.all_reduce(input_, group=self.device_group)
-        return input_
+        return self._all_reduce.all_reduce(input_)
 
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
@@ -154,12 +220,12 @@ class CommGroup:
 
     def all_to_all(
         self,
-        input_: torch.Tensor,
+        input_: torch.Tensor | Sequence[torch.Tensor],
         scatter_dim: int,
         gather_dim: int,
         scatter_sizes: list[int] | None = None,
         gather_sizes: list[int] | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Redistribute ``input_`` across the group: split it into
         ``world_size`` pieces along ``scatter_dim`` (piece i goes to rank i)
         and concatenate the pieces received from every rank along
@@ -174,34 +240,80 @@ class CommGroup:
         uneven split / gather (e.g. a sequence length not divisible by the
         group size); when ``None`` the respective dimension is split evenly
         (and ``scatter_dim`` must then be divisible by ``world_size``).
+
+        ``input_`` may be several tensors that differ only in the extent of
+        ``scatter_dim``, split evenly (q, k and v with their own head counts):
+        they go in one exchange and come back as a tuple. Each exchange is one
+        ``all_to_all_single`` over a buffer packed in a single copy, which
+        replays from a CUDA graph. The collective is hidden from torch.compile,
+        so a compiled caller breaks around this call; tracing it as a
+        functional collective instead gave an illegal memory access in
+        Cosmos3's batched capture.
         """
+        tensors = (input_,) if isinstance(input_, torch.Tensor) else tuple(input_)
         if self.world_size == 1:
-            return input_
+            return input_ if isinstance(input_, torch.Tensor) else tensors
         world_size = self.world_size
-        if scatter_sizes is None:
-            assert input_.size(scatter_dim) % world_size == 0, (
-                f"all_to_all: scatter_dim {scatter_dim} size "
-                f"{input_.size(scatter_dim)} not divisible by world_size "
-                f"{world_size}; pass scatter_sizes for an uneven split"
+        # positive dims: unflatten below adds a dim, which would shift a negative one
+        scatter_dim %= tensors[0].dim()
+        gather_dim %= tensors[0].dim()
+        if scatter_sizes is not None and len(set(scatter_sizes)) > 1:
+            assert len(tensors) == 1, "all_to_all: several tensors need an even scatter"
+            out = self._all_to_all_uneven_scatter(tensors[0], scatter_dim, gather_dim, scatter_sizes, gather_sizes)
+            return out if isinstance(input_, torch.Tensor) else (out,)
+        # per tensor [.., N, ..] -> [P, .., N/P, ..]; rank r's block of the send buffer holds
+        # its piece of each tensor one after another, so each tensor unpacks contiguous
+        blocks = [x.unflatten(scatter_dim, (world_size, -1)).movedim(scatter_dim, 0) for x in tensors]
+        numels = [blk[0].numel() for blk in blocks]
+        send = blocks[0].new_empty(world_size, sum(numels))
+        for blk, piece in zip(blocks, send.split(numels, dim=1), strict=True):
+            piece.view(blk.shape).copy_(blk)
+        if gather_sizes is None or len(set(gather_sizes)) == 1:
+            # the block received from rank r has this rank's own block's layout
+            recv = _all_to_all_single(self.device_group, send, torch.empty_like(send))
+            outs = [
+                piece.view(blk.shape).movedim(0, gather_dim).flatten(gather_dim, gather_dim + 1)
+                for blk, piece in zip(blocks, recv.split(numels, dim=1), strict=True)
+            ]
+        else:
+            # rank r's block: each tensor's piece with the gathered dim at rank r's extent
+            shapes = [
+                [blk.shape[1:gather_dim + 1] + (n,) + blk.shape[gather_dim + 2:] for blk in blocks]
+                for n in gather_sizes
+            ]
+            rank_numels = [[int(torch.Size(shape).numel()) for shape in row] for row in shapes]
+            recv = _all_to_all_single(
+                self.device_group, send.flatten(), send.new_empty(sum(map(sum, rank_numels))),
+                [sum(row) for row in rank_numels], [sum(numels)] * world_size,
             )
-            chunk = input_.size(scatter_dim) // world_size
-            scatter_sizes = [chunk] * world_size
-        send = [
-            t.contiguous()
-            for t in torch.split(input_, scatter_sizes, dim=scatter_dim)
-        ]
+            per_rank = [
+                [piece.view(shape) for piece, shape in zip(block.split(row), shape_row, strict=True)]
+                for block, row, shape_row in zip(recv.split([sum(row) for row in rank_numels]), rank_numels, shapes,
+                                                 strict=True)
+            ]
+            outs = [torch.cat([pieces[i] for pieces in per_rank], dim=gather_dim) for i in range(len(tensors))]
+        return outs[0] if isinstance(input_, torch.Tensor) else tuple(outs)
+
+    def _all_to_all_uneven_scatter(
+        self, input_: torch.Tensor, scatter_dim: int, gather_dim: int,
+        scatter_sizes: list[int], gather_sizes: list[int] | None,
+    ) -> torch.Tensor:
+        chunks = input_.split(scatter_sizes, dim=scatter_dim)
+        send = torch.cat([chunk.contiguous().flatten() for chunk in chunks])
+        mine = list(chunks[self.rank].shape)
         if gather_sizes is None:
-            gather_sizes = [send[self.rank].size(gather_dim)] * world_size
-        base_shape = list(send[self.rank].shape)
-        recv = []
-        for r in range(world_size):
-            shape = list(base_shape)
-            shape[gather_dim] = gather_sizes[r]
-            recv.append(
-                torch.empty(shape, dtype=input_.dtype, device=input_.device)
-            )
-        dist.all_to_all(recv, send, group=self.device_group)
-        return torch.cat(recv, dim=gather_dim).contiguous()
+            gather_sizes = [mine[gather_dim]] * self.world_size
+        shapes = [mine[:gather_dim] + [n] + mine[gather_dim + 1:] for n in gather_sizes]
+        numels = [int(torch.Size(shape).numel()) for shape in shapes]
+        recv = _all_to_all_single(
+            self.device_group, send, input_.new_empty(sum(numels)),
+            numels, [chunk.numel() for chunk in chunks],
+        )
+        pieces = [
+            piece.view(shape)
+            for piece, shape in zip(recv.split(numels), shapes, strict=True)
+        ]
+        return torch.cat(pieces, dim=gather_dim)
 
 
 @dataclass
@@ -282,6 +394,14 @@ class WorkerParallelGroups:
     _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
+    # Process-group timeout in seconds for load and warmup, from the config's
+    # ``dist_timeout_s``. None = torch default.
+    dist_timeout_s: float | None = None
+    # Small-message all-reduce path from the deployment config's
+    # ``tp_allreduce``. None = NCCL.
+    tp_allreduce: str | None = None
+    # Largest message it takes, from ``tp_allreduce_max_kb``; None = 512.
+    tp_allreduce_max_kb: int | None = None
 
     def add(self, node: str, comm_group: CommGroup):
         # disallow colocation of multiple comm groups on the same node
@@ -327,13 +447,19 @@ class WorkerParallelGroups:
         backend = dist.get_default_backend_for_device(device.type)
         if not self.any_parallelism:
             return
+        if device.type == "xpu":
+            backend = f"cpu:gloo,xpu:{backend}"
 
+        timeout_kwargs = resolve_dist_timeout(self.dist_timeout_s)
+        # a configured dist_timeout_s covers the rendezvous store too
+        timeout = timeout_kwargs.get("timeout", default_group_timeout(backend))
         dist.init_process_group(
             backend=backend,
-            init_method=init_method,
+            store=rendezvous_store(init_method, self.global_rank, self.num_workers, timeout),
             world_size=self.num_workers,
             rank=self.global_rank,
             device_id=device,
+            timeout=timeout,
         )
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
@@ -344,14 +470,19 @@ class WorkerParallelGroups:
         rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         rank_tuple_to_cpu_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
-            rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
-            # Members only: with the default group bound to a device, a
-            # non-member's subgroup creation joins an ncclCommSplit that
-            # members never call for a gloo group, and blocks forever.
-            rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
-                ranks=list(rank_tuple), backend="gloo",
-                use_local_synchronization=True,
+            rank_tuple_to_pg[rank_tuple] = dist.new_group(
+                ranks=list(rank_tuple), **timeout_kwargs
             )
+            if device.type == "xpu":
+                rank_tuple_to_cpu_pg[rank_tuple] = rank_tuple_to_pg[rank_tuple]
+            else:
+                # Members only: with the default group bound to a device, a
+                # non-member's subgroup creation joins an ncclCommSplit that
+                # members never call for a gloo group, and blocks forever.
+                rank_tuple_to_cpu_pg[rank_tuple] = dist.new_group(
+                    ranks=list(rank_tuple), backend="gloo",
+                    use_local_synchronization=True, **timeout_kwargs,
+                )
 
         seen: set[int] = set()
         for comm_group in (
@@ -366,6 +497,10 @@ class WorkerParallelGroups:
             comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
             comm_group.cpu_group = rank_tuple_to_cpu_pg[tuple(comm_group.group_members)]
             comm_group.initialized = True
+            # Collective rendezvous within the group. Members visit shared
+            # groups in the same relative order: GlobalParallelConfig fills
+            # every worker's dicts in one global iteration order.
+            comm_group.init_all_reduce(self.tp_allreduce, self.tp_allreduce_max_kb)
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:
         if node not in self.node_to_tp_group:
@@ -460,12 +595,28 @@ class WorkerParallelGroups:
             return
         dist.barrier()
 
+    def restore_default_timeout(self) -> None:
+        """Give every group this rank holds torch's default timeout back."""
+        # the long timeout is for load and warmup; in serving a wedged rank
+        # must abort the others, not leave them waiting for hours
+        if not self.any_parallelism or not resolve_dist_timeout(self.dist_timeout_s):
+            return
+        groups = [dist.group.WORLD]
+        for comm_group in (*self.node_to_tp_group.values(), *self.node_to_sp_group.values()):
+            groups += [comm_group.device_group, comm_group.cpu_group]
+        for pg in {id(g): g for g in groups if g is not None}.values():
+            nccl = dist.get_backend(pg) == dist.Backend.NCCL
+            _set_pg_timeout(default_pg_nccl_timeout if nccl else default_pg_timeout, pg)
+
 
 class GlobalParallelConfig:
     def __init__(
         # leaving type annotation as Any due to circular import
         self, worker_graphs: dict[str, Any],
-        worker_ids: list[str]
+        worker_ids: list[str],
+        dist_timeout_s: float | None = None,
+        tp_allreduce: str | None = None,
+        tp_allreduce_max_kb: int | None = None,
     ):
         self.num_workers = len(worker_ids)
         any_parallelism = any(
@@ -513,6 +664,9 @@ class GlobalParallelConfig:
                 global_rank=i, num_workers=self.num_workers,
                 any_parallelism=any_parallelism,
                 world_parallel_groups=world_parallel_groups,
+                dist_timeout_s=dist_timeout_s,
+                tp_allreduce=tp_allreduce,
+                tp_allreduce_max_kb=tp_allreduce_max_kb,
                 node_to_parallel_shapes=frozen_parallel_shapes,
                 node_to_instance_groups=frozen_instance_groups,
             ) for i, wid in enumerate(worker_ids)

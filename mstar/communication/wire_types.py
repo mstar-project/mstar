@@ -9,6 +9,7 @@ breaks compatibility with a peer running the old build.
 """
 from mstar.api_server.request_types import (
     APIServerMessage,
+    ConductorStatus,
     DataWorkerProfile,
     PreprocessInput,
     PromptPart,
@@ -16,20 +17,28 @@ from mstar.api_server.request_types import (
     RequestFailed,
     ResultChunk,
     ResultTensors,
+    ResultTokens,
 )
 from mstar.communication.wire import _set_polymorphic, register
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.base import PublishedInfo
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.manager import PublishedKVInfo
-from mstar.engine.resources.kv.transfer import CudaIpcKVTransferInfo
+from mstar.engine.resources.kv.transfer import (
+    CudaIpcKVTransferInfo,
+    KVTransferInfo,
+    MooncakeKVTransferInfo,
+    ShmKVTransferInfo,
+)
 from mstar.engine.resources.position.manager import PublishedPositionInfo
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.utils.ipc_format import (
     AbortRequest,
+    ClientStreamInput,
     ConductorMessage,
     DrainRequest,
+    EnableMetrics,
     FailRequests,
     InputSignals,
     MessageBody,
@@ -45,10 +54,11 @@ from mstar.utils.ipc_format import (
     UnpersistTensors,
     WorkerGraphsDone,
     WorkerMessage,
+    WorkerStatus,
 )
 
-# The three abstract field types; a value of one of these carries [tag, body].
-_set_polymorphic(MessageBody, PublishedInfo, ResourceReqConfig)
+# The abstract field types; a value of one of these carries [tag, body].
+_set_polymorphic(MessageBody, PublishedInfo, ResourceReqConfig, KVTransferInfo)
 
 _TYPES: dict[str, type] = {
     # top-level envelopes
@@ -72,10 +82,15 @@ _TYPES: dict[str, type] = {
     "new_request_conductor": NewRequestConductor,
     "reads_done": ReadsDone,
     "fail_requests": FailRequests,
+    "worker_status": WorkerStatus,
+    "enable_metrics": EnableMetrics,
+    "client_stream_input": ClientStreamInput,
     # api-server bodies
     "result_tensors": ResultTensors,
+    "result_tokens": ResultTokens,
     "request_complete": RequestComplete,
     "request_failed": RequestFailed,
+    "conductor_status": ConductorStatus,
     "result_chunk": ResultChunk,
     "preprocess_input": PreprocessInput,
     "data_worker_profile": DataWorkerProfile,
@@ -84,6 +99,8 @@ _TYPES: dict[str, type] = {
     "fwd_pass_info": CurrentForwardPassInfo,
     "published_kv": PublishedKVInfo,
     "cuda_ipc_kv_transfer": CudaIpcKVTransferInfo,
+    "shm_kv_transfer": ShmKVTransferInfo,
+    "mooncake_kv_transfer": MooncakeKVTransferInfo,
     "published_position": PublishedPositionInfo,
     "kv_req_config": KVReqConfig,
     "sampling_req_config": SamplingReqConfig,

@@ -121,6 +121,7 @@ def _admit(runtime, request_id="r1", walk=WALK):
         request_id=request_id, partition="default", graph_walk=walk,
         partition_worker_graph_ids=[WG_ID],
         worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        loop_caps={},
     )
 
 
@@ -197,7 +198,7 @@ def test_set_walk_and_stream_done_reach_the_request(runtime):
 def test_pending_loop_stops_live_one_iteration(runtime):
     rid = _admit(runtime)
     assert not runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
-    assert runtime.pending_loop_stop_rids(WALK, "ar_loop") == set()
+    assert runtime.pending_loop_stop_rids([WALK], "ar_loop") == set()
     runtime.clear_pending_loop_stops()
 
 
@@ -211,9 +212,9 @@ def test_node_metadata_is_accepted(runtime):
 
 def test_speculative_flag_rejects_an_unknown_node(runtime):
     rid = _admit(runtime)
-    runtime.set_in_flight("prefill", WG_ID, [rid], True)
+    runtime.set_in_flight("prefill", [rid], [WG_ID], True)
     with pytest.raises((RuntimeError, ValueError)):
-        runtime.set_in_flight("nope", WG_ID, [rid], True)
+        runtime.set_in_flight("nope", [rid], [WG_ID], True)
 
 
 # --- coverage of the ABC -----------------------------------------------------
@@ -459,6 +460,20 @@ def test_dynamic_loop_iters_for_an_unknown_partition_are_empty(runtime):
     assert runtime.get_dynamic_loop_iters([rid], "nope").values == [{}]
 
 
+def test_update_dynamic_loop_iters_matches_the_per_rid_form(runtime):
+    from types import SimpleNamespace
+    rid = _admit(runtime)
+    infos = {rid: SimpleNamespace(dynamic_loop_iter_counts={"stale": 7})}
+    runtime.update_dynamic_loop_iters(infos, "default")
+    expect = dict(runtime.get_dynamic_loop_iters([rid], "default").values[0])
+    expect["stale"] = 7
+    assert infos[rid].dynamic_loop_iter_counts == expect
+    infos = {rid: SimpleNamespace(dynamic_loop_iter_counts={})}
+    runtime.update_dynamic_loop_iters(infos, "nope")
+    assert infos[rid].dynamic_loop_iter_counts == {}
+    runtime.update_dynamic_loop_iters({}, "default")
+
+
 # --- scheduling --------------------------------------------------------------
 
 def test_a_ready_node_is_reported(runtime):
@@ -521,8 +536,12 @@ def test_pop_with_check_ready_is_all_or_nothing(runtime):
     assert out.wg_ids.keys == [a]
 
 
-def test_pop_of_an_unknown_node_returns_none(runtime):
-    assert runtime.pop_rids("nope", WALK, []) is None
+def test_pop_of_an_unknown_node_raises(runtime):
+    """Not None: nothing in the deployment runs this pair, and returning None
+    would have the scheduler read a structural error as "not ready yet" and
+    retry the row forever. PythonGraphRuntime has always raised here."""
+    with pytest.raises(RuntimeError):
+        runtime.pop_rids("nope", WALK, [])
 
 
 def test_push_back_makes_a_popped_node_ready_again(runtime):
@@ -534,11 +553,15 @@ def test_push_back_makes_a_popped_node_ready_again(runtime):
     assert len(runtime.get_ready_nodes(set())) == 1
 
 
+def _spec_targets(runtime, node, walk, rid):
+    return runtime.speculate_node(node, [walk], [rid])
+
+
 # --- speculation -------------------------------------------------------------
 
 def test_speculate_finds_the_downstream_target(runtime):
     rid = _admit(runtime)
-    out = runtime.speculate_node("prefill", WALK, rid)
+    out = _spec_targets(runtime, "prefill", WALK, rid)
     assert [o.node_name for o in out] == ["ar_decode"]
     assert out[0].graph_walk == WALK
     # prefill -> ar_decode ENTERS the loop, so it is not a new iteration.
@@ -550,7 +573,7 @@ def test_a_loop_back_is_reported_as_a_new_iteration(runtime):
     # ar_decode -> ar_decode is the loop-back; the per-rid loop filters key off
     # exactly this flag, so getting it wrong disables them silently.
     rid = _admit(runtime)
-    out = runtime.speculate_node("ar_decode", WALK, rid)
+    out = _spec_targets(runtime, "ar_decode", WALK, rid)
     assert [o.node_name for o in out] == ["ar_decode"]
     assert out[0].is_new_loop_iter is True
 
@@ -559,7 +582,7 @@ def test_speculation_leaves_no_state_behind(runtime):
     # ingest_for_speculation fills the speculative slots; they must be cleared
     # or the node reads as ready when nothing actually arrived.
     rid = _admit(runtime)
-    runtime.speculate_node("prefill", WALK, rid)
+    _spec_targets(runtime, "prefill", WALK, rid)
     assert runtime.get_ready_nodes(set()) == []
 
 
@@ -570,7 +593,7 @@ def test_speculate_refuses_a_node_that_opted_out(runtime):
         tp_async_nodes=set(),
     )
     # A parallel target is only valid as a leader-side same-node loop-back.
-    assert runtime.speculate_node("prefill", WALK, rid) == []
+    assert _spec_targets(runtime, "prefill", WALK, rid) == []
 
 
 def test_get_spec_target_reports_a_target_chosen_elsewhere(runtime):
@@ -581,7 +604,7 @@ def test_get_spec_target_reports_a_target_chosen_elsewhere(runtime):
         parallel_nodes={"ar_decode"}, parallel_leader_nodes=set(),
         tp_async_nodes=set(),
     )
-    assert runtime.speculate_node("ar_decode", WALK, rid) == []
+    assert _spec_targets(runtime, "ar_decode", WALK, rid) == []
     got = runtime.get_spec_target("ar_decode", "ar_decode", WALK, rid)
     assert got is not None and got.node_name == "ar_decode"
     assert got.is_new_loop_iter is True
@@ -816,7 +839,7 @@ def test_a_stop_records_a_pending_stop(runtime):
     )
     assert stopped_rids == [rid]
     assert runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
-    assert runtime.pending_loop_stop_rids(WALK, "ar_loop") == {rid}
+    assert runtime.pending_loop_stop_rids([WALK], "ar_loop") == {rid}
     runtime.clear_pending_loop_stops()
     assert not runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
 
@@ -829,7 +852,7 @@ def test_a_stop_for_a_loop_not_in_the_walk_is_dropped(runtime):
         loop_names=ParallelList([rid], [["not_a_loop"]]),
     )
     assert stopped_rids == []
-    assert runtime.pending_loop_stop_rids(WALK, "not_a_loop") == set()
+    assert runtime.pending_loop_stop_rids([WALK], "not_a_loop") == set()
 
 
 def test_a_peer_stop_applies_only_when_newer(runtime):
@@ -904,3 +927,145 @@ def test_a_local_only_batch_sends_nothing_to_peers(runtime):
 
     peers = [e for e, _ in rec.sent if e not in ("conductor", "api_server")]
     assert peers == []
+
+
+# --- inline emit -------------------------------------------------------------
+
+def _client_loop_runtime():
+    """A decode node whose token goes back to itself AND to the client."""
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT
+    section = Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[GraphEdge(name="token", next_node="dec")],
+        ),
+        Loop(
+            name="loop",
+            section=GraphNode(
+                name="dec", input_names={"token"},
+                outputs=[
+                    GraphEdge(name="token", next_node="dec"),
+                    GraphEdge(name="token", next_node=EMIT_TO_CLIENT, output_modality="text"),
+                ],
+            ),
+            outputs=[],
+            max_iters=50,
+        ),
+    ])
+    wg = WorkerGraph(section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID)
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"loop"}},
+        all_wg_ids_to_nodes={WG_ID: {"prefill", "dec"}},
+        node_to_partition={"prefill": "default", "dec": "default"},
+        sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
+        bookkeeping=book,
+    )
+    rt._bookkeeping_for_test = book
+    return rt
+
+
+def _run_dec_step(rt, rid, uuid, inline_value=None):
+    bk = rt._bookkeeping_for_test
+    bk.put_tensor(uuid, _tensor_info(uuid))
+    bk.increment_ref(uuid, 1)  # the worker's safety hold
+    kwargs = {}
+    if inline_value is not None:
+        kwargs = dict(inline_signal="token", inline_values=[inline_value])
+    return rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"],
+        wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[uuid], num_tensors=[1], **kwargs,
+    ))
+
+
+def _reach_dec(rt, rid, uuid):
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
+    rt.pop_rids("prefill", WALK, [rid])
+    bk = rt._bookkeeping_for_test
+    bk.put_tensor(uuid, _tensor_info(uuid))
+    bk.increment_ref(uuid, 1)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="prefill",
+        output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[uuid], num_tensors=[1],
+    ))
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    rt.pop_rids("dec", WALK, [rid])
+
+
+def test_the_rust_runtime_offers_inline_emit():
+    assert rust_runtime.RustGraphRuntime.supports_inline_emit is True
+    assert rust_runtime_base.GraphRuntime.supports_inline_emit is False
+
+
+def test_an_inline_emit_is_not_staged_for_the_client():
+    rt = _client_loop_runtime()
+    rid = _admit(rt)
+    rt._communicator = _Recorder()
+    _reach_dec(rt, rid, 100)
+    # the tensor path stages the client's copy
+    out = _run_dec_step(rt, rid, 101)
+    assert 101 in out.register_uuids
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    rt.pop_rids("dec", WALK, [rid])
+    # the inline path does not: the value rides in the frame
+    out = _run_dec_step(rt, rid, 102, inline_value=151645)
+    assert 102 not in out.register_uuids
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    # the loop-back still fed the node, so the next step is ready
+    assert rt.pop_rids("dec", WALK, [rid]) is not None
+
+
+def test_inline_values_must_cover_every_rid_or_are_ignored():
+    rt = _client_loop_runtime()
+    rid = _admit(rt)
+    _reach_dec(rt, rid, 200)
+    bk = rt._bookkeeping_for_test
+    bk.put_tensor(201, _tensor_info(201))
+    bk.increment_ref(201, 1)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[201], num_tensors=[1], inline_signal="token", inline_values=[],
+    ))
+    assert 201 in out.register_uuids, "no values, so the tensor path"
+    rt.send_outputs(_send_input(rid, out.completion_id))
+
+
+def test_a_loop_back_routed_with_no_tensor_keeps_the_loop_going():
+    """The device-side loop-back: the worker routes the decode signal with
+    zero tensors per request (the token stays on the device) and the client
+    copy rides inline. The node stays ready, the loop counter advances, the
+    next pop reports the signal with no uuids, and cleanup frees nothing."""
+    rt = _client_loop_runtime()
+    rid = _admit(rt)
+    rt._communicator = _Recorder()
+    _reach_dec(rt, rid, 300)
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[], num_tensors=[0], inline_signal="token", inline_values=[7],
+    ))
+    assert out.register_uuids == [], "nothing to stage for the client"
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    popped = rt.pop_rids("dec", WALK, [rid])
+    assert popped is not None, "the loop-back with no tensor still fed the node"
+    inputs = popped.input_edges.to_input_tensors(lambda u: (_ for _ in ()).throw(KeyError(u)))
+    assert inputs.by_rid[rid] == {"token": []}
+    before = dict(rt.get_dynamic_loop_iters([rid], "default").values[0])
+    # another zero-tensor step: still ready, nothing freed by the cleanup, the
+    # loop counter moved
+    out = rt.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=WALK, node_name="dec",
+        output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
+        tensors=[], num_tensors=[0], inline_signal="token", inline_values=[8],
+    ))
+    assert out.freed_inputs.uuids == []
+    rt.send_outputs(_send_input(rid, out.completion_id))
+    assert rt.pop_rids("dec", WALK, [rid]) is not None
+    after = dict(rt.get_dynamic_loop_iters([rid], "default").values[0])
+    assert after["loop"] == before["loop"] + 1

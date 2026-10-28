@@ -36,16 +36,18 @@ class _RecordingSampler:
         self.synced = 0
         self.sampled_with: list[bool] = []
 
-    def sync_seen_token_masks(self, seen_masks):
+    def sync_seen_token_masks(self, seen_masks, keep=None):
         self.synced += 1
 
-    def sample(self, request_ids, logits, apply_penalty=False):
+    def sample(self, request_ids, logits, apply_penalty=False, apply_filters=True):
         self.sampled_with.append(apply_penalty)
         return torch.zeros(len(request_ids), dtype=torch.long)
 
 
 class _RecordingBuffers:
     """Stands in for SamplerBuffers, recording just what the gate controls."""
+
+    ingraph_scatter = False
 
     def __init__(self):
         self.sampler = _RecordingSampler()
@@ -67,8 +69,11 @@ class _RecordingBuffers:
     def sampler_for(self, padded_bs, cg_slot):
         return self.sampler
 
-    def scatter_offset(self, cg_slot=0):
+    def scatter_offset(self, cg_slot=0, keep=None):
         self.offset_scatters += 1
+
+    def keep_mask(self, keep):
+        return None if keep is None else torch.tensor(keep, dtype=torch.bool)
 
     def register_request(self, rid, sampling_config):
         pass

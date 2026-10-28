@@ -90,6 +90,13 @@ impl PyZmqCommunicator {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// `send` that never blocks: false when the peer is at its high-water
+    /// mark, with nothing sent.
+    fn try_send(&self, peer_id: &str, data: &[u8]) -> PyResult<bool> {
+        self.inner.try_send(peer_id, data)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     fn try_recv<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
         self.inner.try_recv().map(|b| PyBytes::new(py, &b))
     }
@@ -273,8 +280,9 @@ impl PySegmentedShmArena {
     /// -> (segment_idx, offset); grows by one segment when full (dedicated
     /// segment for oversized allocations), errors at the max_segments cap.
     /// GIL released: the growth path creates + maps a new shm segment
-    /// (file create, ftruncate, mmap — milliseconds), which must not stall
-    /// other Python threads (the serve loop, stream relays).
+    /// (file create, preallocate, mmap: on the order of 0.1 s per 256 MiB),
+    /// which must not stall other Python threads (the serve loop, stream
+    /// relays).
     fn reserve(&self, py: Python<'_>, nbytes: usize) -> PyResult<(usize, usize)> {
         py.allow_threads(|| self.arena.reserve(nbytes))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))

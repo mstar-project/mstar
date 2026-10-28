@@ -9,6 +9,9 @@
 // not needed.  Registered under the ``_mstar_moe_C`` op namespace so it never
 // collides with a real vLLM ``_moe_C`` in the same process.
 //
+// Local change: the small-batch kernel skips ids >= num_experts, as the
+// large-batch kernels already do, so every path treats them as skipped slots.
+//
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -147,8 +150,13 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     tokens_cnts[(threadIdx.x + 1) * num_experts + i] = 0;
   }
 
+  // Ids >= num_experts mark skipped slots (EP sentinel); never count them.
   for (size_t i = tid; i < numel; i += stride) {
-    ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i]];
+    int32_t expert_id = topk_ids[i];
+    if (expert_id >= num_experts) {
+      continue;
+    }
+    ++tokens_cnts[(threadIdx.x + 1) * num_experts + expert_id];
   }
 
   __syncthreads();
@@ -192,6 +200,9 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
+    if (expert_id >= num_experts) {
+      continue;
+    }
     int32_t rank_post_pad =
         tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;

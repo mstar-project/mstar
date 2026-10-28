@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.graph.runtime.base import SpeculationOutput  # noqa: E402
+from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 LOOP = "denoise"
@@ -31,17 +32,34 @@ def _info(rid: int, k: int) -> CurrentForwardPassInfo:
     )
 
 
+def _scheduler():
+    """The real ``label_for`` over an empty combined-walk map: these batches
+    are uniform, so it labels each with its own walk and carries no
+    per-row walks."""
+    scheduler = SimpleNamespace(combined_walk_of={})
+    for name in ("label_for", "_key"):
+        setattr(scheduler, name, getattr(MicroScheduler, name).__get__(scheduler))
+    return scheduler
+
+
 def _worker(shared: dict[int, CurrentForwardPassInfo]):
     """A bare worker: the request state answers with the shared info (which the
     worker refreshes to the loop's index when a step's outputs are routed); the
     assembly path is the real one."""
     worker = SimpleNamespace(
         request_state=SimpleNamespace(get_fwd_info=lambda rid, partition: shared[rid]),
-        _graph_runtime=SimpleNamespace(get_consumed_edges=lambda *a: []),
+        _graph_runtime=SimpleNamespace(
+            get_consumed_edges=lambda *a: [],
+        ),
         _stream_chunks_for=lambda rid, node_name, inputs: None,
+        _streams_possible=lambda: False,
         _settle_final_streams=lambda node_name, final_edges: (set(), set()),
+        scheduler=_scheduler(),
     )
-    for name in ("_make_executing_batch", "_build_input_metadata_and_fwd_info", "_assemble_speculation"):
+    for name in (
+        "_make_executing_batch", "_build_input_metadata_and_fwd_info",
+        "_assemble_speculation", "_streams_possible",
+    ):
         setattr(worker, name, getattr(Worker, name).__get__(worker))
     return worker
 
@@ -56,6 +74,7 @@ def _assemble(worker, spec_target, rids, continuing):
         {rid: {} for rid in rids},         # per_request_inputs
         {},                                # consumed_streaming_edges
         continuing,
+        {},                                # fresh_final_edges
         is_same_node=spec_target.node_name == "dit",
     )
 
@@ -67,15 +86,24 @@ def _target(**kwargs) -> SpeculationOutput:
 def test_a_continuing_rid_runs_one_iteration_past_the_in_flight_one():
     shared = {1: _info(1, 2)}
     worker = _worker(shared)  # iteration 2 in flight: the shared counter reads 2
+    in_flight = _assemble(worker, _target(is_new_loop_iter=False), [1], [])
     spec = _assemble(worker, _target(is_new_loop_iter=True), [1], [1])
 
-    counters = spec.node_batch.per_request_input_metadata[1].dynamic_loop_iter_counts
-    assert counters == {LOOP: 3}
+    view = spec.node_batch.per_request_info_wrapped[1]
+    assert view.dynamic_loop_iter_counts == {LOOP: 3}
+    assert spec.node_batch.per_request_input_metadata[1].dynamic_loop_iter_counts == {LOOP: 3}
     # the shared info is untouched: the in-flight batch's stop check reads 2
     assert shared[1].dynamic_loop_iter_counts == {LOOP: 2}
     # the speculative batch still carries the shared info itself, so what an
     # engine records on it is seen by later steps
     assert spec.node_batch.per_request_info[1] is shared[1]
+    assert view is not shared[1]
+    assert view.step_metadata is shared[1].step_metadata
+    assert view.resource_publish_info is shared[1].resource_publish_info
+    assert view.resource_configs is shared[1].resource_configs
+    shared[1].dynamic_loop_iter_counts[LOOP] = 4
+    assert in_flight.node_batch.per_request_info_wrapped[1].dynamic_loop_iter_counts == {LOOP: 2}
+    assert view.dynamic_loop_iter_counts == {LOOP: 3}
 
 
 def test_a_fresh_rid_runs_at_its_loops_current_index():
@@ -86,8 +114,8 @@ def test_a_fresh_rid_runs_at_its_loops_current_index():
     spec = _assemble(worker, _target(is_new_loop_iter=True), [1, 2], [1])
 
     counts = {
-        rid: meta.dynamic_loop_iter_counts
-        for rid, meta in spec.node_batch.per_request_input_metadata.items()
+        rid: info.dynamic_loop_iter_counts
+        for rid, info in spec.node_batch.per_request_info_wrapped.items()
     }
     assert counts == {1: {LOOP: 3}, 2: {LOOP: 1}}
 
@@ -98,5 +126,5 @@ def test_a_transition_into_the_loop_starts_at_its_first_iteration():
     worker = _worker(shared)
     spec = _assemble(worker, _target(is_new_loop_iter=False), [1], [1])
 
-    assert spec.node_batch.per_request_input_metadata[1].dynamic_loop_iter_counts == {LOOP: 0}
+    assert spec.node_batch.per_request_info_wrapped[1].dynamic_loop_iter_counts == {LOOP: 0}
     assert spec.is_new_iter is False

@@ -1,0 +1,19 @@
+# A KV pool far smaller than the load in load.py needs, so most admissions
+# evict a request to the host. Text traffic never reaches the ViT or the VAE.
+model: "bagel"
+max_seq_len: 32768
+max_concurrent_requests: 16
+
+resources:
+  kv:
+    max_num_pages: 64
+    cpu_offload_pages: 256
+
+node_groups:
+  - node_names: [vit_encoder]
+    ranks: [0]
+  - node_names: [vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2

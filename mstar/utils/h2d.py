@@ -15,6 +15,8 @@ from collections.abc import Sequence
 import numpy as np
 import torch
 
+from mstar.utils.device import DeviceCapability
+
 
 class H2DMirror:
     """What the stager last copied into one device destination.
@@ -63,10 +65,10 @@ class PinnedStager:
         self._numel = 0
         self._bufs: list[torch.Tensor] = []
         self._views: list[np.ndarray] = []
-        self._events: list[torch.cuda.Event | None] = [None] * depth
+        self._events: list[torch.Event | None] = [None] * depth
         self._next = 0
         self._lock = threading.Lock()
-        self._pinned = torch.cuda.is_available()
+        self._pinned = torch.accelerator.is_available()
         self._grow(numel)
 
     def _grow(self, numel: int) -> None:
@@ -107,7 +109,8 @@ class PinnedStager:
         if mirror is not None:
             values = np.asarray(values, dtype=self._np_dtype)
             key = (total, pad_value)
-        if dst.device.type != "cuda":
+        capability = DeviceCapability.of(dst.device)
+        if not capability.is_accelerator or not self._pinned:
             host = np.asarray(values)
             dst.view(-1)[:n].copy_(torch.as_tensor(host, dtype=self.dtype))
             if pad_value is not None:
@@ -129,7 +132,17 @@ class PinnedStager:
                 view[n:total] = pad_value
             dst.view(-1)[:total].copy_(self._bufs[i][:total], non_blocking=True)
             if ev is None:
-                ev = self._events[i] = torch.cuda.Event()
-            ev.record(torch.cuda.current_stream(dst.device))
+                ev = self._events[i] = torch.Event(device=dst.device)
+            ev.record(torch.accelerator.current_stream(dst.device))
             if mirror is not None:
                 mirror.record(key, values)
+
+
+def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """``tensor`` on ``device`` without the host waiting: a CPU source goes
+    through pinned memory, so the copy queues behind the work already on the
+    stream instead of draining it first (a pageable copy blocks until then)."""
+    device = torch.device(device)
+    if device.type != "cuda" or tensor.device.type != "cpu":
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)

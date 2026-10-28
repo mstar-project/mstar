@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=78.1.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -25,20 +25,28 @@ classifiers = [
 ]
 dependencies = [
     "fastapi",
+    # floors for the HTTP stack: the first releases with the published
+    # parser and form-limit fixes
+    "starlette>=1.3.1",
+    "h11>=0.16.0",
     "numpy",
     "PyYAML",
     "pyzmq",
     "msgpack",
-    "python-multipart",
+    "python-multipart>=0.0.31",
     "requests",
-    "torch>=2.9.1,<2.13.0",
-    "torchvision>=0.24.1",
-    "torchaudio>=2.9.1",
+    "torch>=2.10.0,<2.13.0",
+    "torchvision>=0.25.0",
+    "torchaudio>=2.10.0",
     "uvicorn",
     # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed
     "websockets",
     "gdown",
-    "datasets",
+    # Floor only: every release from 2.14.5 caps fsspec, so once a newer fsspec
+    # is picked, an unbounded datasets backtracks to 1.2.1, whose tqdm<4.50 pulls
+    # transformers back to 5.10, which then fails to import GenerationMixin.
+    # 3.0 also needs tqdm>=4.66.3.
+    "datasets>=3",
 ]
 
 [project.urls]
@@ -61,16 +69,63 @@ mstar-serve = "mstar.api_server.entrypoint:main"
 # PyPI reject the mstar upload, so it is an install step instead — see
 # docs/installation.rst, same as flash-attn.
 omnivoice = []
+command_a_plus = [
+    "flashinfer-python>=0.6.18",
+    "huggingface-hub>=1.5",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "ninja",
+    "safetensors",
+    "transformers>=5.17",
+]
 
 dev = [
     "ruff<=0.16",
-    "pytest>=8.2",
+    "pytest>=9.0.3",
 ]
 
 # Optional: non-WAV audio containers (mp3/flac/...) for the OpenAI audio API
 # and SDK. WAV/PCM work without this.
 audio = [
     "soundfile",
+]
+
+# Optional: Prometheus metrics at /metrics (``mstar serve --enable-metrics``).
+metrics = [
+    "prometheus-client>=0.20",
+]
+
+# Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
+# The runner, metrics and reports need only aiohttp and numpy; the judges
+# (Whisper, WavLM speaker similarity, UTMOS via torch.hub), the dataset
+# builders, compare's media inputs and PSNR checks (PyAV, Pillow) and the
+# charts import the rest lazily. Install it in a separate client environment
+# if the server's should stay lean.
+eval = [
+    "aiohttp",
+    "av",
+    "datasets",
+    "huggingface-hub",
+    "matplotlib",
+    "Pillow>=12.3.0",
+    "soundfile",
+    "transformers",
+]
+
+# Optional: the opt-in AudioSeal watermark on generated speech
+# (``audio_watermark`` in a deployment's model_kwargs; MIT code and weights).
+# 0.3 may change the streaming layers mstar.model.audio_watermark drives.
+audioseal = [
+    "audioseal>=0.2,<0.3",
+]
+
+# Optional: server_vad turn detection on /v1/realtime. Silero VAD (MIT) ships
+# its 2 MB ONNX weights in the wheel; onnxruntime (MIT) runs them on one thread.
+# semantic_vad also runs Pipecat's Smart Turn v3 (BSD-2 weights, fetched
+# separately) with onnxruntime on Whisper features from transformers (Apache-2.0).
+vad = [
+    "silero-vad>=5.1",
+    "onnxruntime>=1.17",
+    "transformers",
 ]
 
 # Optional: serve a deployment as a NVIDIA Dynamo backend
@@ -85,8 +140,8 @@ bagel = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
-    "Pillow",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "Pillow>=12.3.0",
     "regex",
     "safetensors",
     "torchvision",
@@ -98,8 +153,8 @@ bagel = [
 bagel_xpu = [
     "einops",
     "huggingface-hub",
-    "mooncake-transfer-engine",
-    "Pillow",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "Pillow>=12.3.0",
     "regex",
     "safetensors",
     "torchvision",
@@ -122,8 +177,8 @@ cosmos3 = [
     "fa3-fwd",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
-    "Pillow",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "Pillow>=12.3.0",
     "safetensors",
     "torchvision",
     "torchcodec",
@@ -137,28 +192,45 @@ qwen3_omni = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
-    "Pillow",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "Pillow>=12.3.0",
     "regex",
     "qwen-omni-utils",
+    # qwen-omni-utils imports audioread for a video's audio track but does not
+    # declare it, and librosa no longer pulls it in
+    "audioread",
     "numba>=0.61",
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "transformers",
+    # the vision encoder builds its grid inputs with transformers.vision_utils
+    "transformers>=5.18",
     "datasets",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
 ]
 
+# qwen-tts is an install step with --no-deps, not a dependency: mstar loads only
+# its 12 Hz speech-tokenizer modules (under transformers 4.57.3 or 5.x), but its
+# metadata pins transformers==4.57.3 and accelerate==1.12.0. No environment that
+# also has diffusers>=0.40 or OmniVoice can satisfy that pin, and installing it
+# into one downgrades huggingface-hub under them. See docs/installation.rst.
 qwen3_tts = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
-    "qwen-tts==0.1.1",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "soundfile",  # reference-audio decoding for Base voice cloning
     "transformers>=4.57.3",
+]
+
+fish_s2_pro = [
+    "flashinfer-python>=0.6.14",
+    "huggingface-hub",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "safetensors",
+    "soundfile",  # reference-audio decoding for voice cloning
+    "transformers",
 ]
 
 kokoro = [
@@ -175,14 +247,17 @@ kokoro = [
 # Chatterbox / Chatterbox-Turbo: resemble-perth (MIT) carries the PerTh
 # watermark network applied to every output; pyloudnorm normalises Turbo's
 # reference clip like the reference package. Both are imported lazily.
+# resemble-perth 1.0.1 (the latest) imports pkg_resources, which setuptools 82
+# removed; without it the package hides its watermarker.
 chatterbox = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "librosa",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "pyloudnorm",
     "resemble-perth",
     "safetensors",
+    "setuptools<82",
     "tokenizers",
     "torchcodec",
     "transformers",
@@ -197,7 +272,7 @@ orpheus = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "transformers",
 ]
@@ -205,7 +280,7 @@ orpheus = [
 pi05 = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "transformers",
     "triton",
@@ -213,7 +288,7 @@ pi05 = [
 
 vjepa2 = [
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "torchcodec",
 ]
@@ -248,13 +323,30 @@ waypoint = [
     # on PyPI; install it separately, see docs/installation.rst.
 ]
 
+lingbot_world = [
+    # UMT5 and the Wan2.1 VAE load through transformers / diffusers (see [wan22]);
+    # scipy resamples the camera trajectory (Slerp) as the reference does;
+    # ftfy and regex clean the prompt as the reference's T5 tokenizer does.
+    # flash-attn (FA2 varlen, what the reference attends with) is installed
+    # separately, see docs/installation.rst.
+    "accelerate",
+    "diffusers>=0.39",
+    "einops",
+    "ftfy",
+    "huggingface-hub",
+    "regex",
+    "safetensors",
+    "scipy",
+    "transformers",
+]
+
 flux2_klein = [
     # FLUX.2 [klein] 4B/9B: diffusers is the parity oracle in the tests only; serving
     # runs the native ports. transformers provides the Qwen3 tokenizer (chat template).
     "diffusers>=0.39",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
-    "Pillow",
+    "Pillow>=12.3.0",
     "safetensors",
     "torchvision",
     "transformers",
@@ -263,7 +355,7 @@ flux2_klein = [
 vjepa2_ac = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "torchcodec",
 ]
@@ -273,36 +365,47 @@ asr = [
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
-    "torchcodec==0.8.*",
+    # decodes WAV / FLAC / OGG / MP3 uploads without FFmpeg (torchcodec takes the rest)
+    "soundfile",
+    # torchcodec doesn't declare its torch requirement and loads only next to the torch
+    # it was built for, so the extra pins the pair the Dockerfiles ship (torch 2.10 with 0.10)
+    "torch>=2.10.0,<2.11",
+    "torchcodec==0.10.*",
     "transformers",
     "datasets",
     "jiwer",  # WER computation for asr_eval.py
+    "numba>=0.61",  # Whisper word timestamps' DTW (components/alignment.py)
 ]
 
 all = [
     "ruff",
-    "pytest>=8.2",
+    "pytest>=9.0.3",
     "soundfile",
+    "silero-vad>=5.1",
+    "onnxruntime>=1.17",
     "av",
     "diffusers>=0.39",
     "fa3-fwd",
     "einops",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine",
-    "Pillow",
+    "mooncake-transfer-engine>=0.3.13.post1",
+    "Pillow>=12.3.0",
     "regex",
     "safetensors",
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "transformers",
+    # Qwen3-TTS's speech tokenizer (qwen-tts, installed --no-deps) needs check_model_inputs,
+    # and Qwen3-Omni's vision encoder needs transformers.vision_utils
+    "transformers>=5.18",
     "safetensors",
     "triton",
     "qwen-omni-utils",
-    "qwen-tts==0.1.1",
+    "audioread",  # see the qwen3_omni extra
+    # qwen-tts is installed separately with --no-deps; see the [qwen3_tts] extra.
     "numba>=0.61",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
     # wan22 (see the [wan22] extra for the rationale; av / diffusers already above)
@@ -310,11 +413,20 @@ all = [
     # waypoint. TAEHV is intentionally installed separately because PyPI rejects
     # direct-URL dependencies in project metadata; see docs/installation.rst.
     "tensordict==0.10.0",
+    # lingbot_world: camera trajectory resampling and prompt cleaning
+    "scipy",
+    "ftfy",
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
     # separately, see docs/installation.rst.
     # flash-attn-4 (waypoint's default flex attention backend) is also installed
     # separately, see docs/installation.rst.
     "jiwer",
+    # kokoro's G2P (see the [kokoro] extra). The Docker images also install the
+    # spaCy tagger it loads, en_core_web_sm.
+    "misaki>=0.9.4",
+    "spacy>=3.8",
+    "num2words",
+    "audioseal>=0.2,<0.3",  # see the audioseal extra
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
     # has to come from git, which PyPI will not accept in requires_dist.
     # See docs/installation.rst.
@@ -330,7 +442,7 @@ exclude = ["tests*", "benchmark*", "examples*"]
 # mstar/default_configs/ at build time; see setup.py) so `mstar serve <model>`
 # works from a pip install.
 [tool.setuptools.package-data]
-"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp", "configs/*.json"]
 "mstar.default_configs" = ["*.yaml"]
 
 [tool.ruff]

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -38,6 +39,7 @@ from mstar.client.types import (
     TextChunk,
     VideoFrameChunk,
 )
+from mstar.utils.utf8_stream import Utf8Stream, decode_joined
 
 # When attaching raw bytes we need a filename whose extension lets the server
 # infer the modality (it keys off the extension).
@@ -60,6 +62,19 @@ def _load_nvtx():
     return (range_push, range_pop) if nvtx_enabled(True) else None
 
 
+class _BearerAuth(requests.auth.AuthBase):
+    """``Authorization: Bearer <key>``, the key as UTF-8 bytes as both servers
+    compare it. As ``auth``, not a header: requests replaces an explicit
+    Authorization header with ``.netrc`` credentials when no auth is given."""
+
+    def __init__(self, key: str):
+        self.value = b"Bearer " + key.encode("utf-8")
+
+    def __call__(self, r):
+        r.headers["Authorization"] = self.value
+        return r
+
+
 class MStarClient:
     def __init__(
         self,
@@ -68,10 +83,16 @@ class MStarClient:
         session: requests.Session | None = None,
         enable_nvtx: bool = False,
         prefer_binary: bool = False,
+        api_key: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._session = session or requests.Session()
+        # The server's key (``--api-key`` / ``MSTAR_API_KEY``), sent as a bearer
+        # token on every request. Per request rather than on the session, so a
+        # caller's own session is left as it was passed in.
+        api_key = api_key if api_key is not None else os.environ.get("MSTAR_API_KEY")
+        self._auth = _BearerAuth(api_key) if api_key else None
         # Ask for length-framed binary payloads. ``video_frame`` requests ask
         # by default (base64 NDJSON is not realtime at 720p); other modalities
         # opt in here. How to parse is decided from the response's
@@ -138,7 +159,8 @@ class MStarClient:
         url = f"{self.base_url}/generate"
         if stream:
             return self._stream(url, data, files, output_modalities=output_modalities)
-        resp = self._session.post(url, data=data, files=files or None, timeout=self.timeout)
+        resp = self._session.post(url, data=data, files=files or None, timeout=self.timeout,
+                                  auth=self._auth)
         resp.raise_for_status()
         return self._parse_result(resp.json())
 
@@ -241,7 +263,8 @@ class MStarClient:
 
     def voices(self) -> list[str]:
         """The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``)."""
-        r = self._session.get(f"{self.base_url}/v1/audio/voices", timeout=self.timeout)
+        r = self._session.get(f"{self.base_url}/v1/audio/voices", timeout=self.timeout,
+                              auth=self._auth)
         r.raise_for_status()
         return [v["id"] for v in r.json().get("voices", [])]
 
@@ -296,7 +319,7 @@ class MStarClient:
             "Accept-Encoding": "identity",
         }
 
-    def _stream_binary(self, resp) -> Iterator[StreamEvent]:
+    def _stream_binary(self, resp, text: Utf8Stream) -> Iterator[StreamEvent]:
         """Consume a length-framed response body off the raw socket."""
         encoding = resp.headers.get("content-encoding", "").lower()
         if encoding and encoding != "identity":
@@ -309,7 +332,7 @@ class MStarClient:
         frames = iter_binary_frames(resp.raw)
         if self._nvtx is None:
             for parsed in frames:
-                yield self._to_event(parsed)
+                yield self._to_event(parsed, text)
             return
 
         range_push, range_pop = self._nvtx
@@ -325,11 +348,18 @@ class MStarClient:
                 break
             range_pop()
             range_push("client.to_event")
-            event = self._to_event(parsed)
+            event = self._to_event(parsed, text)
             range_pop()
             yield event
 
     def _stream(self, url, data, files, output_modalities=()) -> Iterator[StreamEvent]:
+        # One decoder per stream, so a TextChunk never ends mid-character.
+        text = Utf8Stream()
+        yield from self._stream_events(url, data, files, output_modalities, text)
+        if tail := text.flush():
+            yield TextChunk(tail, {})
+
+    def _stream_events(self, url, data, files, output_modalities, text: Utf8Stream) -> Iterator[StreamEvent]:
         with self._session.post(
             url,
             data=data,
@@ -337,13 +367,14 @@ class MStarClient:
             stream=True,
             timeout=self.timeout,
             headers=self._stream_headers(output_modalities),
+            auth=self._auth,
         ) as resp:
             resp.raise_for_status()
             # Branch on what the server actually sent, not on what was asked
             # for: that is what makes the negotiation safe against servers that
             # ignore ``Accept`` entirely.
             if resp.headers.get("content-type", "").startswith(BINARY_STREAM_MEDIA_TYPE):
-                yield from self._stream_binary(resp)
+                yield from self._stream_binary(resp, text)
                 return
             # ``decode_unicode=True`` only yields ``str`` when ``resp.encoding``
             # is set, and that is derived from the Content-Type charset. The
@@ -365,7 +396,7 @@ class MStarClient:
                     parsed = parse_ndjson_line(line)
                     if parsed is None:
                         continue
-                    yield self._to_event(parsed)
+                    yield self._to_event(parsed, text)
                 return
 
             range_push, range_pop = self._nvtx
@@ -390,12 +421,12 @@ class MStarClient:
                 if parsed is None:
                     continue
                 range_push("client.to_event")
-                event = self._to_event(parsed)
+                event = self._to_event(parsed, text)
                 range_pop()
                 yield event
 
     @staticmethod
-    def _to_event(parsed: dict) -> StreamEvent:
+    def _to_event(parsed: dict, text: Utf8Stream | None = None) -> StreamEvent:
         modality = parsed["modality"]
         raw = parsed["bytes"]
         meta = parsed["metadata"]
@@ -407,7 +438,7 @@ class MStarClient:
                 f"{raw.decode('utf-8', 'replace')}"
             )
         if modality == "text":
-            return TextChunk(raw.decode("utf-8", "replace"), meta)
+            return TextChunk(text.feed(raw) if text is not None else raw.decode("utf-8", "replace"), meta)
         if modality == "image":
             return ImageChunk(raw, meta)
         if modality == "audio":
@@ -421,10 +452,10 @@ class MStarClient:
     @staticmethod
     def _parse_result(payload: dict) -> GenerateResult:
         outputs = payload.get("outputs", {})
-        text_parts: list[str] = []
+        text_parts: list[bytes] = []
         images: list[bytes] = []
         audio_pcm: list[bytes] = []
-        sample_rate = 24000
+        sample_rate, num_channels = 24000, 1
         raw: list[dict] = []
         for modality, entries in outputs.items():
             for e in entries:
@@ -432,16 +463,17 @@ class MStarClient:
                 meta = e.get("metadata") or {}
                 raw.append({"modality": modality, "bytes": b, "metadata": meta})
                 if modality == "text":
-                    text_parts.append(b.decode("utf-8", "replace"))
+                    text_parts.append(b)
                 elif modality == "image":
                     images.append(b)
                 elif modality == "audio":
                     audio_pcm.append(b)
                     sample_rate = int(meta.get("sample_rate", sample_rate))
-        audio = AudioBuffer(b"".join(audio_pcm), sample_rate) if audio_pcm else None
+                    num_channels = int(meta.get("num_channels", num_channels))
+        audio = AudioBuffer(b"".join(audio_pcm), sample_rate, num_channels) if audio_pcm else None
         return GenerateResult(
             request_id=payload.get("request_id"),
-            text="".join(text_parts) if text_parts else None,
+            text=decode_joined(text_parts) if text_parts else None,
             images=images,
             audio=audio,
             raw=raw,

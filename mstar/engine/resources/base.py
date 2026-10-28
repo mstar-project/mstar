@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -14,9 +14,9 @@ from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, Resou
 if TYPE_CHECKING:
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
-    from mstar.engine.cuda_graph_config import (
-        CudaGraphConfig,
-        PiecewiseCudaGraphConfig,
+    from mstar.engine.accelerator_graph_config import (
+        AcceleratorGraphConfig,
+        PiecewiseAcceleratorGraphConfig,
     )
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
@@ -26,7 +26,7 @@ class CGSlotSpec:
     bucket: BucketKey
     slot: int
     # a whole forward's capture, or one piecewise region's
-    config: CudaGraphConfig | PiecewiseCudaGraphConfig
+    config: AcceleratorGraphConfig | PiecewiseAcceleratorGraphConfig
     config_idx: int | None = None
 
     @property
@@ -66,6 +66,11 @@ class EngineResourceInfo:
     dependencies: "Mapping[str, NodeResourceSpec]" = field(
         default_factory=dict
     )
+    # walk -> rows of it a step of its combined walk may hold (None uncapped),
+    # for every walk of this resource's local nodes
+    max_rows_in_combined: "Mapping[str, int | None]" = field(
+        default_factory=dict
+    )
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)
@@ -75,6 +80,24 @@ class EngineResourceInfo:
                 "spec's `depends_on`"
             )
         return spec
+
+
+class CachedPrefix(NamedTuple):
+    """How much of a walk's input a resource already holds for ``label``.
+
+    ``tokens`` counts the walk's leading inputs held, and ``position`` is the
+    stream's position counter once they are skipped.
+    """
+    label: str
+    tokens: int
+    position: int
+
+
+class KeyedWalks(NamedTuple):
+    """A keyed label's walks, as a resource's prefix cache takes them: the walks whose
+    writes are keyed, and the growth walks whose sampled ids extend the keys."""
+    writes: tuple[str, ...]
+    growth: tuple[str, ...] = ()
 
 
 class Resource(ABC):
@@ -88,34 +111,31 @@ class Resource(ABC):
     def depends_on(self) -> set[str]:
         return set()
 
+    def can_capture(self) -> bool:
+        return True
+
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
-    def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
-    ) -> bool:
+    def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
         """Open whatever this resource keeps across requests, under ``root``;
-        True if anything opened.
-
-        ``walks`` names, per label, the walk that writes the keyed span and the
-        one that decodes after it.
-        """
+        True if anything opened."""
         return False
 
     def resolve_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str,
-    ) -> int | None:
-        """How many of this request's leading tokens this resource already holds.
+        self, rid: str, node_name: str, graph_walk: str, inputs: Any,
+    ) -> CachedPrefix | None:
+        """How much of this walk's leading inputs this resource already holds.
 
-        None leaves the length to other resources; 0 means nothing can be skipped.
+        None leaves the answer to other resources; 0 tokens means nothing can be skipped.
         """
         return None
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-        inputs: Any, matched_len: int,
+        inputs: Any, prefix: CachedPrefix | None,
     ) -> None:
-        """Take on the length every resource agreed to skip.
+        """Take on the prefix every resource agreed to skip, or None if there is none.
 
         The inputs are untrimmed, so a resource that needs the tokens being
         skipped can still read them.
@@ -127,6 +147,39 @@ class Resource(ABC):
     ) -> None:
         """Take this step's sampled tokens, so what was generated can be keyed."""
         return
+
+    @property
+    def keys_prefix_chains(self) -> bool:
+        """Whether ``extend_prefix_chain`` can do anything right now (a prefix
+        cache is open). The runner skips the per-request sweep otherwise. A
+        resource that overrides ``extend_prefix_chain`` but not this is swept
+        every step."""
+        return False
+
+    def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Called for a walk the cache served whole, since that walk never admits or commits."""
+        return
+
+    def lease_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> list[int] | None:
+        """On rank 0 of a TP node, lease the request's cached prefix as its step is sent and
+        return the pages, or None."""
+        return None
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, pages: list[int], caught_up: bool,
+    ) -> bool:
+        """On a TP follower, lease ``pages`` as rank 0 did. False until this rank holds them too, and
+        raises if it still lacks them once ``caught_up``."""
+        return True
+
+    def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Give back what `lease_cached_prefix` or `adopt_cached_prefix` took, for a step that will not run."""
+        return
+
+    def page_trail(self) -> tuple[int, int] | None:
+        """How many page allocations this resource has made and a hash of their pages in
+        order, for a TP follower to check against rank 0's. None where it keeps no trail."""
+        return None
 
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
@@ -140,7 +193,14 @@ class Resource(ABC):
     # Request lifecycle
 
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None):
+        """Must be idempotent: the conductor sends one NewRequest per partition,
+        so a worker serving several partitions of a request ingests it once
+        for each, possibly after a node has already run a step for it."""
         return
+
+    def ingest_capture_row(self, rid: str):
+        """Open a CUDA graph capture padding row; by default, as a request."""
+        self.ingest_request(rid, None)
 
     def remove_request(self, rid: str):
         return
@@ -213,6 +273,52 @@ class Resource(ABC):
         """Publish state that is useful only when a dynamic loop stops."""
         del request_id, node_name, graph_walk
         return None
+
+    def publish_snapshot_batch(
+        self,
+        request_ids: list[str],
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> list:
+        """``publish_snapshot_for_step`` for every request of a step, one
+        entry per request in order (None for nothing to publish). A resource
+        with per-request locking or lookups overrides this to do them once."""
+        return [
+            self.publish_snapshot_for_step(
+                rid, node_name=node_name, graph_walk=graph_walk,
+            )
+            for rid in request_ids
+        ]
+
+    def publish_snapshot_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> Any:
+        """A cheap record of what ``publish_for_step`` would export right now.
+
+        The worker finishes it with ``publish_from_snapshot`` only for the
+        requests whose frame or completion carries the publication, which in a
+        steady decode loop is none of them. The default takes the eager
+        publication itself, so a resource is correct without overriding; one
+        whose publish builds something per request (a page list, a transfer
+        descriptor) overrides both to record a few scalars here instead.
+        """
+        return self.publish_for_step(
+            request_id, node_name=node_name, graph_walk=graph_walk,
+        )
+
+    def publish_from_snapshot(
+        self,
+        request_id: str,
+        snapshot: Any,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> "PublishedInfo | None":
+        """Finish a ``publish_snapshot_for_step`` record into the published info."""
+        del request_id, node_name, graph_walk
+        return snapshot
 
     def reset_request(self, rid: str, free: bool=False):
         """For clearing dummy RIDs during cuda graph capture"""
@@ -293,7 +399,7 @@ class Resource(ABC):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec],
         max_bs: int, max_seq_len: int
     ) -> None:
