@@ -90,13 +90,15 @@ class TestUsage(unittest.TestCase):
         self.assertEqual(handoff(msgs, ROOT, [])["recent_text"], "x")
 
     def test_execution_file_and_transcript_together_count_once(self):
-        msgs = [assistant("msg_a", text("x")), assistant("msg_b", text("y"))]
+        msgs = [{**assistant("msg_a", text("x")), "uuid": "u1"}, {**assistant("msg_b", text("y")), "uuid": "u2"}]
         with tempfile.TemporaryDirectory() as d:
             Path(d, "exec.json").write_text(json.dumps(msgs))
             proj = Path(d, "projects", "-home-runner")
             proj.mkdir(parents=True)
             Path(proj, "sid.jsonl").write_text("\n".join(map(json.dumps, msgs)) + "\nnot json\n")
-            u = usage(load([str(Path(d, "exec.json")), str(Path(d, "projects")), str(Path(d, "missing.json"))]))
+            loaded = load([str(Path(d, "exec.json")), str(Path(d, "projects")), str(Path(d, "missing.json"))])
+        u = usage(loaded)
+        self.assertEqual(handoff(loaded, ROOT, [])["recent_text"], "x\ny", "each text would be handed on twice")
         self.assertEqual(u["api_calls"], 2)
         self.assertIsNone(u["num_turns"], "a run without a result message has no turn count")
         self.assertEqual((u["tokens_from"], u["output_tokens"]), ("messages", 20))

@@ -35,7 +35,9 @@ C_CHARS = dict(zip(b"abtnvfr", b"\a\b\t\n\v\f\r", strict=True))
 
 
 def load(paths):
-    """Every message in ``paths``, in file order. Missing files and unparsable lines are skipped."""
+    """Every message in ``paths``, in file order. Missing files and unparsable lines are skipped,
+    and so is a message whose ``uuid`` came earlier: the execution file and a transcript hold the
+    same messages."""
     files = []
     for p in map(Path, paths):
         if p.is_dir():
@@ -56,7 +58,17 @@ def load(paths):
                 messages.append(json.loads(line))
             except ValueError:
                 pass
-    return [m for m in messages if isinstance(m, dict)]
+    kept, seen = [], set()
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        uid = m.get("uuid")
+        if isinstance(uid, str):
+            if uid in seen:
+                continue
+            seen.add(uid)
+        kept.append(m)
+    return kept
 
 
 def blocks(message):
