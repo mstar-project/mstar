@@ -538,8 +538,8 @@ it. Then opt in:
    # or, with an explicit config: mstar-serve --config <model.yaml> --rust-frontend
 
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
-``$PATH`` / the environment's scripts directory / the in-repo build. Its knobs are listed in
-:doc:`environment_variables`.
+the environment's scripts directory / ``$PATH`` / the in-repo build. Its knobs
+are listed in :doc:`environment_variables`.
 
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):

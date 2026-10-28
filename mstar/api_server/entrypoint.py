@@ -2482,7 +2482,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--rust-frontend-bin", type=str, default=None,
         help="Path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
-             "$PATH, the environment's scripts dir, then "
+             "the environment's scripts dir, $PATH, then "
              "rust/server/target/release)",
     )
     args = parser.parse_args(argv)
