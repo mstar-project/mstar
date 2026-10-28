@@ -213,10 +213,12 @@ class _SegmentSdpa(SegmentAttention):
     """The ragged attention resource's stand-in (trap 3), planned from the node's declared step."""
 
     def __init__(self, step: SubmoduleStep, key: str):
-        super().__init__(tuple(segment.span for segment in step.segments), causal=step.steps[key].causal, gqa=True)
+        super().__init__(tuple(segment.span for segment in step.segments), causal=step.steps[key].causal)
 
     def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         assert q.shape[0] == sum(self.seq_lengths), (q.shape[0], self.seq_lengths)
+        # `enable_gqa` only where KV heads are grouped, as transformers passes it
+        self.gqa = q.shape[1] != k.shape[1]
         return super().run(q, k, v)
 
 
