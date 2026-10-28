@@ -242,13 +242,13 @@ class KVPlanOutput:
 
     __slots__ = (
         "cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets",
-        "rows", "_decode",
+        "rows", "_decode", "columns",
     )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
         cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
-        rows=None, view_builder=None, decode: bool | None = None,
+        rows=None, view_builder=None, decode: bool | None = None, columns=None,
     ):
         self.cpu_indptrs = cpu_indptrs
         # packing in plan order w/h 1 view per segment covered by plan; a plan
@@ -269,6 +269,10 @@ class KVPlanOutput:
         # whether every row computes one token, when the plan already knows;
         # None reads the views
         self._decode = decode
+        # the plan's host arrays (``PlanColumns``), when it was built from
+        # columns. Unlike ``cpu_indptrs``, which may sit in a pinned ring a
+        # later plan rewrites, they stay valid as long as the output does.
+        self.columns = columns
 
     @property
     def views(self) -> "list[SequenceView]":

@@ -28,6 +28,7 @@ from mstar.engine.resources.base import (
     EngineResourceInfo,
 )
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.page_table import PlanColumns
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,
@@ -36,6 +37,7 @@ from mstar.engine.resources.kv.plan import (
     SequenceView,
 )
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.utils.profiler import PhaseLaps
 
 
 class _LastPlan(NamedTuple):
@@ -177,14 +179,18 @@ class FlashInferCrossManager(CrossAttentionManager):
             self._preplanned = False
             return
 
+        laps = PhaseLaps(f"{ctx.plan_phase}.cross_attn.")
         context_out = self._context_output(ctx)
         context_views = None
+        context_rids = None
         # a preplan leases a different cg slot, so its wrappers and workspaces
         # are disjoint from the ones the in-flight forward reads
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
-        for plan_label, packing in self._query_packings(step, ctx).items():
+        packings = self._query_packings(step, ctx)
+        laps.lap("packing")
+        for plan_label, packing in packings.items():
             qo_indptr = tuple(packing.qo_indptr.tolist())
             num_rows = len(qo_indptr) - 1
             # every row queries one token (a span-0 row does not)
@@ -199,10 +205,23 @@ class FlashInferCrossManager(CrossAttentionManager):
                 and last.request_ids == request_ids and last.qo_indptr == qo_indptr
             ):
                 plan_states[plan_label] = wrapper
+                laps.lap("unchanged")
                 continue
-            if context_views is None:
-                context_views = {view.request_id: view for view in context_out.views}
-            indptrs = self._build_indptrs(packing, context_views, plan_label)
+            if context_rids is None and context_out.columns is not None:
+                context_rids = tuple(row[0] for row in context_out.rows)
+            if request_ids == context_rids:
+                indptrs = self._context_indptrs(packing, context_out.columns)
+            else:
+                if context_views is None:
+                    context_views = {view.request_id: view for view in context_out.views}
+                indptrs = self._build_indptrs(packing, context_views)
+            # fork repeats pages, so batch can index more than held in cache.
+            assert len(indptrs.paged_kv_indices) <= self._kv_config.max_num_pages, (
+                f"cross attention plan {plan_label!r} indexes {len(indptrs.paged_kv_indices)} "
+                f"pages but the context cache holds {self._kv_config.max_num_pages}; "
+                "raise max_num_pages on the context cache's PagedKVConfig"
+            )
+            laps.lap("indptrs" if request_ids == context_rids else "indptrs_views")
 
             # The context pages are immutable once written, so only the query
             # side moves between steps; when neither moved, FlashInfer's plan
@@ -212,12 +231,14 @@ class FlashInferCrossManager(CrossAttentionManager):
                 page_indices=indptrs.paged_kv_indices.numpy().tobytes(),
                 last_page_lens=indptrs.paged_kv_last_page_len.numpy().tobytes(),
             )
+            laps.lap("plan_key")
             if last is None or last.plan_key != plan_key:
                 wrapper.plan(
                     causal=False,
                     dtype=self._dtype,
                     **indptrs.to_kwargs_dict()
                 )
+                laps.lap("wrapper_plan")
             self._last_plans[state_key] = _LastPlan(context_out, request_ids, qo_indptr, plan_key)
             plan_states[plan_label] = wrapper
 
@@ -266,9 +287,12 @@ class FlashInferCrossManager(CrossAttentionManager):
                 label: kv_out for label, kv_out in plan_outputs.items()
                 if label != self._context_label
             }
+        # `rows` (request id first) spares building the views
         return {
             label: QueryPacking(
-                request_ids=[view.request_id for view in kv_out.views],
+                request_ids=[
+                    view.request_id for view in kv_out.views
+                ] if kv_out.rows is None else [row[0] for row in kv_out.rows],
                 qo_indptr=kv_out.cpu_indptrs.qo_indptr,
             )
             for label, kv_out in plan_outputs.items()
@@ -296,11 +320,35 @@ class FlashInferCrossManager(CrossAttentionManager):
             for label, label_rids in rids.items()
         }
 
+    @staticmethod
+    def _context_indptrs(packing: QueryPacking, cols: PlanColumns) -> PagedIndptrs:
+        """``_build_indptrs`` when the query rows are the context label's rows
+        in order: its arrays are the context plan's, but for a row with no
+        context pages, which reads one SINK_PAGE token here."""
+        indptr, pages, last, lens = cols.kv_indptr, cols.indices, cols.last_page_len, cols.kv_lens
+        if not cols.all_have_pages:
+            counts = np.diff(indptr)
+            empty = counts == 0
+            sink_indptr = np.zeros_like(indptr)
+            np.cumsum(counts + empty, out=sink_indptr[1:])
+            sink_pages = np.full(int(sink_indptr[-1]), SINK_PAGE, np.int32)
+            # each real page moves up by the sink pages inserted before its row
+            sink_pages[np.arange(len(pages)) + np.repeat(sink_indptr[:-1] - indptr[:-1], counts)] = pages
+            one = np.int32(1)
+            indptr, pages = sink_indptr, sink_pages
+            last, lens = np.where(empty, one, last), np.where(empty, one, lens)
+        return PagedIndptrs(
+            qo_indptr=packing.qo_indptr,
+            paged_kv_indptr=torch.from_numpy(indptr),
+            paged_kv_indices=torch.from_numpy(pages),
+            paged_kv_last_page_len=torch.from_numpy(last),
+            kv_lens=torch.from_numpy(lens).as_subclass(HostLens),
+        )
+
     def _build_indptrs(
         self,
         packing: QueryPacking,
         context_views: dict[str, SequenceView],
-        plan_label: str,
     ) -> PagedIndptrs:
         """key off context, query off the packing
 
@@ -337,13 +385,6 @@ class FlashInferCrossManager(CrossAttentionManager):
             last = context.last_page_len(page_size) or page_size
             last_page_lens.append(last)
             kv_lens.append((n_pages - 1) * page_size + last)
-
-        # fork repeats pages, so batch can index more than held in cache.
-        assert len(all_pages) <= self._kv_config.max_num_pages, (
-            f"cross attention plan {plan_label!r} indexes {len(all_pages)} "
-            f"pages but the context cache holds {self._kv_config.max_num_pages}; "
-            "raise max_num_pages on the context cache's PagedKVConfig"
-        )
 
         # numpy builds an int32 array from a list in about half the time
         # `torch.tensor(list)` takes; host `kv_lens` let a captured decode
