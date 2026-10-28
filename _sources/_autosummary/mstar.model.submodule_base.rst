@@ -20,6 +20,7 @@ mstar.model.submodule\_base
       ARNodeInputs
       ARNodeSubmodule
       BatchedModelOutput
+      BatchedStopCheck
       HostRows
       InputMetadata
       LazyRequestStates
@@ -28,6 +29,7 @@ mstar.model.submodule\_base
       NodeSubmodule
       PerRequestState
       StackingMethod
+      StopCheck
    
    
 

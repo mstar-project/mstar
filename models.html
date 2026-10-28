@@ -1285,8 +1285,9 @@ On its own it lowers first-audio latency at high concurrency; with
 overlap, which raised c=32 throughput by about a fifth on an H100.</p></li>
 <li><p>The codec decoder runs in float32 by default, reproducing the reference
 decoder bit for bit. <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{codec_dtype:</span> <span class="pre">bfloat16}</span></code> in the
-deployment YAML halves its GPU time when throughput matters more than
-bit-exactness (the Talker is bf16 either way).</p></li>
+deployment YAML selects a bf16 codec (the Talker is bf16 either way). On a
+B300 that is slower, not faster: cuDNN’s heuristics run several of its
+convs on a kernel without tensor cores, so measure before switching.</p></li>
 <li><p>Opt-in AudioSeal watermark on the codec’s output (off by default; install
 <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">'.[audioseal]'</span></code>). Turn it on in the deployment YAML:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">model_kwargs</span><span class="p">:</span>

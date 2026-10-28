@@ -1060,10 +1060,15 @@ methods are:
    scheduling overlap. Use this method only to rename outputs for routing. Put decisions
    that depend on tensor values in ``check_stop``.
 
-``check_stop(...) -> set[str]`` (optional)
+``check_stop(...) -> set[str] | StopCheck`` (optional)
    Runs off the GPU thread, and may read tensor values. Return the names of the ``Loop``
    objects to stop, for example after seeing the EOS token. This is how a decode loop
-   terminates.
+   terminates. To also keep some of this step's outputs from being routed, return
+   ``StopCheck(stops, withheld=(names...))``, for example a frame streamed alongside the
+   EOS token: its consumer then never receives it, instead of finding and dropping it with
+   a device read. ``check_stop_batched`` returns a ``BatchedStopCheck`` for the same.
+   The Qwen3-TTS and Qwen3-Omni Talkers and Fish S2 Pro's AR keep their EOS frame out of
+   the codec stream this way.
 
 ``on_request_added(self, request_id, request_info)`` (optional)
    Called on the worker's main thread when the request reaches the worker, before any of
@@ -1094,8 +1099,10 @@ methods are:
    fixed width and does no host read.
    The worker cuts each row to its span after the step's completion event, before the stop
    check, transport or a streaming edge reads it. The cut is a view, not a copy. Engine-side
-   ``postprocess`` still sees the uncut output. A spanned output must not feed a node that
-   the same worker speculates into.
+   ``postprocess`` still sees the uncut output. A row whose span is empty is left out of the
+   store after the stop check, as a withheld output is (``StopCheck``): a streaming edge
+   gets no item for it. A spanned output must not feed a node that the same worker
+   speculates into.
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
 ``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.

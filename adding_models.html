@@ -1737,9 +1737,14 @@ synchronization, which stalls the GPU thread and loses the worker’s asynchrono
 scheduling overlap. Use this method only to rename outputs for routing. Put decisions
 that depend on tensor values in <code class="docutils literal notranslate"><span class="pre">check_stop</span></code>.</p>
 </dd>
-<dt><code class="docutils literal notranslate"><span class="pre">check_stop(...)</span> <span class="pre">-&gt;</span> <span class="pre">set[str]</span></code> (optional)</dt><dd><p>Runs off the GPU thread, and may read tensor values. Return the names of the <code class="docutils literal notranslate"><span class="pre">Loop</span></code>
+<dt><code class="docutils literal notranslate"><span class="pre">check_stop(...)</span> <span class="pre">-&gt;</span> <span class="pre">set[str]</span> <span class="pre">|</span> <span class="pre">StopCheck</span></code> (optional)</dt><dd><p>Runs off the GPU thread, and may read tensor values. Return the names of the <code class="docutils literal notranslate"><span class="pre">Loop</span></code>
 objects to stop, for example after seeing the EOS token. This is how a decode loop
-terminates.</p>
+terminates. To also keep some of this step’s outputs from being routed, return
+<code class="docutils literal notranslate"><span class="pre">StopCheck(stops,</span> <span class="pre">withheld=(names...))</span></code>, for example a frame streamed alongside the
+EOS token: its consumer then never receives it, instead of finding and dropping it with
+a device read. <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code> returns a <code class="docutils literal notranslate"><span class="pre">BatchedStopCheck</span></code> for the same.
+The Qwen3-TTS and Qwen3-Omni Talkers and Fish S2 Pro’s AR keep their EOS frame out of
+the codec stream this way.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">on_request_added(self,</span> <span class="pre">request_id,</span> <span class="pre">request_info)</span></code> (optional)</dt><dd><p>Called on the worker’s main thread when the request reaches the worker, before any of
 its steps, with the request’s first <code class="docutils literal notranslate"><span class="pre">CurrentForwardPassInfo</span></code>. For host work worth
@@ -1766,8 +1771,10 @@ declared here, since per-request forwards are merged by name. The forward keeps 
 fixed width and does no host read.
 The worker cuts each row to its span after the step’s completion event, before the stop
 check, transport or a streaming edge reads it. The cut is a view, not a copy. Engine-side
-<code class="docutils literal notranslate"><span class="pre">postprocess</span></code> still sees the uncut output. A spanned output must not feed a node that
-the same worker speculates into.</p>
+<code class="docutils literal notranslate"><span class="pre">postprocess</span></code> still sees the uncut output. A row whose span is empty is left out of the
+store after the stop check, as a withheld output is (<code class="docutils literal notranslate"><span class="pre">StopCheck</span></code>): a streaming edge
+gets no item for it. A spanned output must not feed a node that the same worker
+speculates into.</p>
 </dd>
 </dl>
 <p>Two more methods control batching and CUDA graphs: <code class="docutils literal notranslate"><span class="pre">can_batch</span></code> with
