@@ -1540,9 +1540,10 @@ class Engine:
         A region still declares, plans and commits its own step — its shape is
         its own, and several regions can share a resource — but the outer
         ``declare_step`` has to know which resources are already spoken for so
-        it doesn't declare them a second time. The lease is settled from the
-        same batch size and token count the region will resolve at replay, so
-        the two agree by construction.
+        it doesn't declare them a second time for the rows the region runs.
+        The lease is settled for the whole batch, and the forward may replay
+        the region on only some of its rows; the runner's lease covers every
+        such sub-batch (``PiecewiseAcceleratorGraphRunner.lease_slot``).
 
         Nothing to take when the whole forward replays: the region is baked
         inside that graph and runs no Python, so the outer step owns its work.

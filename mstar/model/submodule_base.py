@@ -708,8 +708,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         the batch *could* be captured, the lease says it was.
 
         ``piecewise_leases`` names the regions of this node that hold a slot
-        for this step. Such a region declares, plans and commits its own work,
-        so a resource it owns must be left out of this declaration.
+        for this step. Such a region declares, plans and commits its own work
+        for the rows it runs, so leave those rows out of this declaration for
+        the resources it owns; rows the forward runs outside it are declared
+        here as usual.
 
         ``per_request_info`` holds the real rows' forward-pass info (capture
         passes dummy metadata); padding rows are absent, so read it with

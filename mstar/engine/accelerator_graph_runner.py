@@ -1956,7 +1956,7 @@ class PiecewiseAcceleratorGraphRunner:
         if self.dropped_shapes:
             logger.error(
                 "PiecewiseAcceleratorGraphRunner[%s]: captured %d of %d shapes; these "
-                "run eagerly: %s", self._label,
+                "pad up to the next captured one, or run eagerly past the last: %s", self._label,
                 len(ordered) - len(self.dropped_shapes), len(ordered),
                 self.dropped_shapes,
             )
@@ -2118,38 +2118,33 @@ class PiecewiseAcceleratorGraphRunner:
 
     # ── Replay ──────────────────────────────────────────────────────────
 
-    def _padded_bs(self, batch_size: int) -> int | None:
-        return next(
-            (bs for bs in self._capture_batch_sizes if bs >= batch_size), None
-        )
-
     def _resolve(
         self, batch_size: int, total_tokens: int | None,
     ) -> PiecewiseGraphData | None:
-        """The captured bucket serving this call, or None for eager.
-
-        BATCHED buckets are fixed by the padded batch size; PACKED ones take
-        the smallest captured token bucket that fits.
+        """The captured bucket serving this call, or None for eager: the
+        smallest captured batch size that fits, so a bucket dropped at capture
+        pads up to the next one. A batch that can replay then has a graph for
+        each of its sub-batches too, which a region replaying part of a leased
+        batch relies on. PACKED buckets also take the smallest captured token
+        bucket that fits.
         """
-        padded_bs = self._padded_bs(batch_size)
-        if padded_bs is None:
+        packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
+        if packed and total_tokens is None:
             return None
-        if self._config.get_config_type() == PiecewiseConfigType.BATCHED:
-            return self._graphs.get(PiecewiseGraphKey(
-                bs=padded_bs, seq_len=self._config.seq_len * padded_bs,
-                slot=self._current_slot
-            ))
-        if total_tokens is None:
-            return None
-        fits = [
-            key for key in self._graphs
-            if key.bs == padded_bs
-            and key.slot == self._current_slot
-            and key.seq_len >= total_tokens
-        ]
-        if not fits:
-            return None
-        return self._graphs[min(fits, key=lambda key: key.seq_len)]
+        slot = self._current_slot
+        for bs in self._capture_batch_sizes:
+            if bs < batch_size:
+                continue
+            if not packed:
+                data = self._graphs.get(PiecewiseGraphKey(bs=bs, seq_len=self._config.seq_len * bs, slot=slot))
+                if data is not None:
+                    return data
+                continue
+            fits = [key for key in self._graphs
+                    if key.bs == bs and key.slot == slot and key.seq_len >= total_tokens]
+            if fits:
+                return self._graphs[min(fits, key=lambda key: key.seq_len)]
+        return None
 
     def can_run(self, batch_size: int, total_tokens: int | None = None) -> bool:
         return self._resolve(batch_size, total_tokens) is not None
@@ -2166,10 +2161,10 @@ class PiecewiseAcceleratorGraphRunner:
     def lease_slot(
         self, batch_size: int, total_tokens: int | None = None,
     ) -> SlotLease | None:
-        """The bucket this batch would replay on, asked before the forward.
-
-        Same question ``run`` settles per call, answered early so the outer
-        ``declare_step`` can plan the region's resources against it.
+        """A slot for the region to run this batch's rows on, asked before
+        the forward so the outer ``declare_step`` can leave the rows it runs
+        to it. ``run`` may then replay any part of the batch: a smaller batch
+        resolves to a captured bucket no larger than this one (``_resolve``).
         """
         data = self._resolve(batch_size, total_tokens)
         return None if data is None else SlotLease(

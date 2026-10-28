@@ -289,8 +289,10 @@ class PiecewiseAcceleratorGraphConfig(ABC):
     declare_step: Callable[[list[str], list[int]], SubmoduleStep | None] | None = None
     # Take this region's slot before the outer `declare_step` runs, and report
     # it on the step context. The region still declares, plans and commits its
-    # own work; the lease only tells the outer declaration which resources are
-    # already spoken for, so it can leave them out.
+    # own work for the rows it runs; the lease only tells the outer declaration
+    # which resources are spoken for, so it can leave those rows out. A lease
+    # covers every sub-batch of its batch: the forward may replay the region
+    # on only part of it and run the rest eagerly.
     lease_before_step: bool = False
     # For a `lease_before_step` region: whether this batch may take a slot at
     # all, beyond fitting a captured bucket. For a limit the bucket key does
