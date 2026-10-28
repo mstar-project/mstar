@@ -37,14 +37,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
+from mstar.utils import knobs  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
-from mstar.worker.worker import (  # noqa: E402
-    Worker,
-    _parse_tp_async_sched,
-    _tp_async_sched_setting,
-)
+from mstar.worker.worker import Worker  # noqa: E402
 
 NODE = "LLM"
 WALK = "decode"
@@ -182,11 +179,19 @@ def _nospec(from_seq):
 
 # ------------------------------------------------------------- the switch
 
-def test_env_parses_master_switch_and_node_list():
-    assert _parse_tp_async_sched("0") == (False, None)
-    assert _parse_tp_async_sched("") == (False, None)
-    assert _parse_tp_async_sched("1") == (True, None)
-    assert _parse_tp_async_sched("thinker, talker") == (
+def _tp_async_sched(monkeypatch, env, config):
+    if env is None:
+        monkeypatch.delenv("MSTAR_TP_ASYNC_SCHED", raising=False)
+    else:
+        monkeypatch.setenv("MSTAR_TP_ASYNC_SCHED", env)
+    return knobs.tp_async_sched(config)
+
+
+def test_env_parses_master_switch_and_node_list(monkeypatch):
+    assert _tp_async_sched(monkeypatch, "0", None) == (False, None)
+    assert _tp_async_sched(monkeypatch, "", None) == (False, None)
+    assert _tp_async_sched(monkeypatch, "1", None) == (True, None)
+    assert _tp_async_sched(monkeypatch, "thinker, talker", None) == (
         True, frozenset({"thinker", "talker"}),
     )
 
@@ -201,8 +206,8 @@ def test_env_parses_master_switch_and_node_list():
     ("1", ["talker"], (True, None)),
     ("", True, (True, None)),  # empty env falls through to the config
 ])
-def test_config_key_and_env_override(env, config, want):
-    assert _tp_async_sched_setting(env, config) == want
+def test_config_key_and_env_override(monkeypatch, env, config, want):
+    assert _tp_async_sched(monkeypatch, env, config) == want
 
 
 @pytest.mark.parametrize("env, config, want", [
@@ -214,8 +219,8 @@ def test_config_key_and_env_override(env, config, want):
     ("off", True, (False, None)),
     ("True", None, (True, None)),
 ])
-def test_boolean_words_are_the_switch_not_node_names(env, config, want):
-    assert _tp_async_sched_setting(env, config) == want
+def test_boolean_words_are_the_switch_not_node_names(monkeypatch, env, config, want):
+    assert _tp_async_sched(monkeypatch, env, config) == want
 
 
 def test_node_list_narrows_which_parallel_nodes_take_part():

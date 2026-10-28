@@ -4,6 +4,8 @@ Each knob is set per deployment in the serving config's ``knobs:`` block
 (``configure`` installs it once per worker process, before the engine is
 built) and can be overridden for a run by its environment variable: a
 non-empty ``MSTAR_*`` value wins over the config, which wins over the default.
+``tp_async_sched`` is the exception: it names nodes, so it is a top-level
+config key rather than a ``knobs:`` one, and the caller passes it in.
 """
 import os
 from collections.abc import Mapping
@@ -160,3 +162,31 @@ def pre_plan_enabled() -> bool:
     4 layers), where the step is too short to hide the planning in and the
     extra thread is just GIL contention."""
     return _setting("pre_plan", "1") == "1"
+
+
+def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
+    raw = raw.strip()
+    # a quoted yaml boolean arrives as a string; it is the switch, not a node name
+    word = raw.lower()
+    if word in ("", "0", "false", "no", "off"):
+        return False, None
+    if word in ("1", "true", "yes", "on"):
+        return True, None
+    return True, frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
+def tp_async_sched(config: bool | str | list[str] | None) -> tuple[bool, frozenset[str] | None]:
+    """``tp_async_sched`` / ``MSTAR_TP_ASYNC_SCHED`` (default off): async
+    scheduling for lockstep-parallel nodes, as ``(enabled, nodes)`` with
+    ``nodes`` None for every parallel node. ``config`` is the serving
+    config's top-level ``tp_async_sched`` (a bool or a node list, not a
+    ``knobs:`` key, since it names nodes); a non-empty env var overrides it:
+    ``0``/``false`` off, ``1``/``true`` on, or a comma-separated node list."""
+    env = os.environ.get("MSTAR_TP_ASYNC_SCHED")
+    if env:
+        return _parse_tp_async_sched(env)
+    if isinstance(config, (list, tuple)):
+        return _parse_tp_async_sched(",".join(config))
+    if isinstance(config, bool):
+        return config, None
+    return _parse_tp_async_sched(str(config or "0"))

@@ -481,7 +481,8 @@ Worker scheduling
        on every rank of an instance: the workers compare it at startup and
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at
        ``0`` with it: that throttle holds the GPU thread until step N drains,
-       which serialises the very overlap this flag buys.
+       which serialises the very overlap this flag buys. Read by
+       ``knobs.tp_async_sched``.
    * - ``MSTAR_PRE_PLAN_SPEC``
      - config's ``knobs: pre_plan``, else ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread
