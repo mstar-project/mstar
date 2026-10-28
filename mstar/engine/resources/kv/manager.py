@@ -3797,15 +3797,18 @@ class KVManager(AttentionResource):
         takes from the evictable set comes out of that request's allotment, not this one's. Neither
         moves the room, so the index counts both. The counts only rise, so two changes between passes
         can't cancel out."""
-        grew = self._grew_since(mark)
-        if _DEBUG_ASSERTS and not grew and mark.rid in self._asks:
-            with self._lock:
+        if not _DEBUG_ASSERTS:
+            return self._grew_since(mark)
+        # under the lock, so a page freed on the GPU thread between the two reads can't trip it
+        with self._lock:
+            grew = self._grew_since(mark)
+            if not grew and mark.rid in self._asks:
                 pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
                 assert pages > self._room(), (
                     f"KV {self.name}: {mark.rid} fits now, but nothing `grew_since` reads has moved "
                     "since it didn't, so nothing would admit it"
                 )
-        return grew
+            return grew
 
     def _grew_since(self, mark: RoomMark) -> bool:
         filed, taken = self._index_counts()
