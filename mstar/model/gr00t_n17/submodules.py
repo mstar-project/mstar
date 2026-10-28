@@ -55,8 +55,8 @@ class Gr00tN17VisionEncoderSubmodule(NodeSubmodule):
     Shaped after ``qwen3_5``'s ``VisionEncoderSubmodule``, which drives the same
     tower: the grid maths runs here rather than in the forward, where a
     ``.tolist()`` would break the graph and leave h, w as symints inductor
-    cannot codegen from. Capture is a later cycle, so there is no piecewise
-    config and the node takes one request a step (``can_batch`` stays off).
+    cannot codegen from. This node is not captured, so there is no piecewise
+    config, and it takes one request a step (``can_batch`` stays off).
     """
 
     def __init__(
@@ -284,7 +284,7 @@ class Gr00tN17StateEncoderSubmodule(NodeSubmodule):
         state = inputs["state"][0].reshape(1, -1, inputs["state"][0].shape[-1])
         embodiment_id = inputs["embodiment_id"][0].reshape(-1)
         # `W[cat_ids]` would read -1 as the last embodiment and serve the
-        # wrong robot in silence, which is the failure D06 exists to stop.
+        # wrong robot in silence.
         # The request carries this id, so it is checked where it arrives.
         categories = self.state_encoder.layer1.W.shape[0]
         if int(embodiment_id.min()) < 0 or int(embodiment_id.max()) >= categories:
@@ -334,21 +334,21 @@ class Gr00tN17VLBridgeSubmodule(NodeSubmodule):
     the rows are separated **once**, into ``vl_text`` and ``vl_image``, and the
     loop attends a whole span with no mask at all. Softmax over a span does
     not care in what order the keys arrive, so the two are the same
-    computation (D03).
+    computation.
 
     Unmasked in the reference, so one ragged segment per request is the same
-    thing at B = 1 and keeps a request independent of its neighbours (R12).
+    thing at B = 1 and keeps a request independent of its neighbours.
     """
 
     # Under autocast `vlln` runs in fp32 and its output *is* the residual
     # stream, so all four blocks and both spans come out fp32. NVIDIA runs the
     # bridge in plain bf16; so does this node, which then matches it bitwise
-    # on SDPA and hands the denoise loop bf16 rows (D14).
+    # on SDPA and hands the denoise loop bf16 rows.
     disable_autocast = True
     # Compiled in plain bf16, a request's spans changed once a prompt of
     # another length had been served (the recompile for dynamic shapes rounds
-    # differently), so the same request stopped returning the same actions
-    # (C11). Eager is also the arithmetic D14 matches; a captured graph keeps it.
+    # differently), so the same request stopped returning the same actions.
+    # Eager is also NVIDIA's arithmetic; a captured graph keeps it.
     disable_torch_compile = True
 
     def __init__(self, model: Gr00tN17VLBridge, config: Gr00tN17Config):
@@ -445,7 +445,7 @@ class Gr00tN17Shape:
 class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
     """The ``denoise_step`` node: one flow-matching step of the action head.
 
-    The loop is the scaffold's, not ours ([[D07]]): it owns the iteration counter, the
+    The loop is the scaffold's, not ours: it owns the iteration counter, the
     seeded noise, the per-request schedule, the graph buckets, the overshoot veto and
     the step declaration's plumbing. What is here is the hooks -- what GR00T's step
     *is*, rather than how a step is driven.
@@ -558,7 +558,7 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         embodiment_id = inputs["embodiment_id"][0].reshape(())
         # `W[-1]` is `W[31]`, so a caller using -1 for "unset" is served a plausible,
         # wrong robot in silence. Torch's own IndexError defends only the top end.
-        # The state encoder makes the same check for the same reason (D06).
+        # The state encoder makes the same check for the same reason.
         categories = self.action_encoder.W1.W.shape[0]
         if not 0 <= int(embodiment_id) < categories:
             raise ValueError(
@@ -574,7 +574,7 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
         """A batch mixing prompt lengths matches no capture and runs eager one request at a
-        time, so batch each length apart (D16: on a GH200 the mix capped serving at ~8 req/s)."""
+        time, so batch each length apart (on a GH200 the mix capped serving at ~8 req/s)."""
         del graph_walk
         return True
 
@@ -700,12 +700,12 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         # is bf16 at every step.
         #
         # Carrying fp32 instead is the better *integrator* -- one increment is about
-        # 3 bf16 ulp, so the reference quantises each update -- and C08 did exactly
-        # that until QA priced it. It costs the only end-to-end bar that catches a
-        # wiring bug: over 4 steps an fp32 carry moves the trajectory by 0.0243,
-        # while the R7 block-phase off-by-one moves it by 0.0391. A tolerance wide
-        # enough to admit our own "improvement" is within 1.6x of admitting a real
-        # defect. Accuracy we were not asked for, bought with the test that matters.
+        # 3 bf16 ulp, so the reference quantises each update -- but it costs the only
+        # end-to-end bar that catches a wiring bug: over 4 steps an fp32 carry moves
+        # the trajectory by 0.0243, while an off-by-one in the DT's text/image
+        # alternation moves it by 0.0391. A tolerance wide enough to admit our own
+        # "improvement" is within 1.6x of admitting a real defect. Accuracy we were
+        # not asked for, bought with the test that matters.
         #
         # `euler_step` already sums in fp32 before rounding back, and for two bf16
         # operands and an exact `dt` that is bit-identical to bf16 arithmetic

@@ -40,7 +40,7 @@ _DEEPSTACK = "deepstack_merger_list."
 # GR00T reads `hidden_states[-1]` off `Qwen3VLForConditionalGeneration`, which
 # is the last decoder layer's output *before* the final norm -- checked at that
 # level, because `Qwen3VLTextModel` called directly reports the normed state
-# there instead (C04 CHK-2). So neither the norm nor the logits run.
+# there instead. So neither the norm nor the logits run.
 SKIPPED = frozenset({
     "backbone.model.model.language_model.norm.weight",
     "backbone.model.lm_head.weight",

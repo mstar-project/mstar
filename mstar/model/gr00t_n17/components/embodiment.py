@@ -23,7 +23,7 @@ class SinusoidalPositionalEncoding(nn.Module):
     frequency spacing here is ``log(10000) / half_dim`` where the usual form
     divides by ``half_dim - 1``. The module has no parameters, so nothing in
     the checkpoint would reveal a wrong convention -- only a comparison
-    against the reference's own class does (C06 CHK-1).
+    against the reference's own class does.
 
     The exponent is built in **fp32 throughout**, as the reference does.
     Computing it in fp64 and casting at the end diverges by ~1e-6 (measured);
@@ -48,7 +48,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         # `[B]` tensor meant for the DT's `TimestepEncoder`: that returns
         # `[B, dim]` too, so a crossed call site would change no shape, raise
         # nothing, and produce plausible magnitudes under a different sinusoid
-        # convention (found by C06 CHK-1's QA).
+        # convention.
         if timesteps.dim() != 2:
             raise ValueError(
                 f"the action encoder's timesteps are [B, T], got "

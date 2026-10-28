@@ -28,7 +28,7 @@ BRIDGE_ATTN = "bridge_attn"
 DT_ATTN = "dt_attn"
 DT_XATTN = "dt_xattn"
 
-# The spans a `denoise_step` declares. D03 packs the bridge's rows into two
+# The spans a `denoise_step` declares. The bridge's rows are packed into two
 # per-request spans so the loop carries no attention masks at all; the cross
 # pairs say which queries read which of them.
 SA_SPAN = "sa"

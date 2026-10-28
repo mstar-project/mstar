@@ -34,7 +34,7 @@ class BridgeAttention(nn.Module):
 
     Unmasked in the reference, so every row sees every other row of the same
     request; running it as one ragged segment is the same computation at
-    B = 1 and keeps it independent of a request's neighbours (R12).
+    B = 1 and keeps it independent of a request's neighbours.
     """
 
     def __init__(self, config: Gr00tN17StackConfig):
