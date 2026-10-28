@@ -35,7 +35,8 @@ Router contract
 
 Each block computes its expert assignment with a router. The block keeps
 the router in ``self.gate``. The default router is :class:`TopKRouter`;
-:class:`NoAuxTcRouter` is DeepSeek-V3's sigmoid ``noaux_tc`` one (GLM-5.x).
+:class:`NoAuxTcRouter` is DeepSeek-V3's ``noaux_tc`` one (GLM-5.x, Kimi K2.x
+and K3, DeepSeek-V4.1).
 
 A router is an ``nn.Module``. A router does not extend a base class. The
 ``forward`` method of the router must obey this contract::
@@ -156,12 +157,20 @@ class TopKRouter(nn.Module):
 
 
 class NoAuxTcRouter(nn.Module):
-    """DeepSeek-V3's ``noaux_tc`` router, groupless (``n_group=1``), as GLM-5.x routes.
+    """DeepSeek-V3's ``noaux_tc`` router, groupless (``n_group=1``), as GLM-5.x, Kimi K2.x / K3 and
+    DeepSeek-V4.1 route.
 
-    Sigmoid scores in fp32; each token's top-k by score + ``e_score_correction_bias``; weights
-    are the unbiased scores of those experts, renormalized if ``norm_topk_prob``, times
-    ``routed_scaling_factor``. Stateless (see the router contract above).
+    Scores in fp32 by ``scoring_func``: ``sigmoid`` (GLM-5.x, Kimi), ``sqrtsoftplus``
+    (DeepSeek-V4.1, ``sqrt(softplus(logit))``) or ``softmax``. Each token's top-k by score +
+    ``e_score_correction_bias``; weights are the unbiased scores of those experts, renormalized
+    if ``norm_topk_prob`` and ``top_k > 1`` (over their sum + ``topk_norm_eps``: the 1e-20 Kimi's
+    and DeepSeek's references add, which only matters when every score underflows), times
+    ``routed_scaling_factor``. ``vl_bias`` adds DeepSeek-V4.1's second correction bias, which
+    selects for the rows ``forward``'s ``vl_rows`` marks (image-span tokens). Stateless (see the
+    router contract above).
     """
+
+    SCORING_FUNCS = ("sigmoid", "sqrtsoftplus", "softmax")
 
     def __init__(
         self,
@@ -170,18 +179,29 @@ class NoAuxTcRouter(nn.Module):
         num_experts_per_tok: int,
         routed_scaling_factor: float,
         norm_topk_prob: bool = True,
+        *,
+        scoring_func: str = "sigmoid",
+        topk_norm_eps: float = 0.0,
+        vl_bias: bool = False,
     ) -> None:
         super().__init__()
+        if scoring_func not in self.SCORING_FUNCS:
+            raise ValueError(
+                f"noaux_tc scoring_func {scoring_func!r} is not one of {self.SCORING_FUNCS}")
         self.hidden_size = hidden_size
         self.n_routed_experts = n_routed_experts
         self.top_k = num_experts_per_tok
         self.routed_scaling_factor = routed_scaling_factor
         self.norm_topk_prob = norm_topk_prob
+        self.scoring_func = scoring_func
+        self.topk_norm_eps = topk_norm_eps
 
         self.weight = nn.Parameter(torch.zeros(n_routed_experts, hidden_size))
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(n_routed_experts, dtype=torch.float32)
         )
+        self.vl_e_score_correction_bias = (
+            nn.Parameter(torch.zeros(n_routed_experts, dtype=torch.float32)) if vl_bias else None)
         # fp32 copy of ``weight``, built once by ``finalize_weights``: the
         # forward needs fp32 and the router never changes, so casting it once
         # per layer per step is pure waste. A plain attribute, not a buffer,
@@ -194,7 +214,9 @@ class NoAuxTcRouter(nn.Module):
 
     def forward(
         self, hidden_states: torch.Tensor, router_states: torch.Tensor | None = None,
+        vl_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """``vl_rows``: a bool per row, True where ``vl_e_score_correction_bias`` selects."""
         flat = hidden_states.reshape(-1, self.hidden_size)
         # the engine's bf16 autocast would run F.linear in bf16 and round the logits
         with torch.autocast(flat.device.type, enabled=False):
@@ -207,14 +229,27 @@ class NoAuxTcRouter(nn.Module):
                 if w is None or w.device != self.weight.device:
                     w = self.weight.float()
                 logits = F.linear(flat.float(), w)
-        scores = logits.sigmoid()  # (T, E)
+        if self.scoring_func == "sigmoid":
+            scores = logits.sigmoid()  # (T, E)
+        elif self.scoring_func == "sqrtsoftplus":
+            scores = F.softplus(logits).sqrt()
+        else:
+            scores = logits.softmax(dim=-1)
 
-        biased = scores + self.e_score_correction_bias.unsqueeze(0)
+        bias = self.e_score_correction_bias.unsqueeze(0)
+        if vl_rows is not None:
+            if self.vl_e_score_correction_bias is None:
+                raise ValueError("vl_rows given to a router built without vl_bias")
+            bias = torch.where(vl_rows.reshape(-1, 1), self.vl_e_score_correction_bias, bias)
+        biased = scores + bias
         topk_ids = torch.topk(biased, k=self.top_k, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_ids)
 
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if self.norm_topk_prob and self.top_k > 1:
+            denominator = topk_weights.sum(dim=-1, keepdim=True)
+            if self.topk_norm_eps:
+                denominator = denominator + self.topk_norm_eps
+            topk_weights = topk_weights / denominator
         if self.routed_scaling_factor != 1.0:
             topk_weights = topk_weights * self.routed_scaling_factor
 
