@@ -541,11 +541,12 @@ To keep it, persist these (all under ``~/.cache`` by default):
 and ``TRITON_CACHE_DIR`` follows an exported ``TORCHINDUCTOR_CACHE_DIR``.
 
 In a container, mount these from a volume rather than only ``~/.cache/huggingface``.
-Inductor keys its entries on the torch and Triton builds and, on CUDA and ROCm, the GPU
-model and CUDA or HIP version, so changing any of those recompiles. It doesn't key on the
-``ptxas`` that built a kernel or on the driver: after changing either, delete the cache or
-set torch's ``TORCH_COMPILE_CACHE_KEY_TAG`` to a new value. On other backends (XPU) the key
-has no GPU model, so give each GPU model its own cache there.
+Inductor keys compiled graphs (and ``-O2``'s GEMM picks) on the torch and Triton builds and,
+on CUDA and ROCm, the GPU model and CUDA or HIP version; on XPU, on none of these.
+``-O1``'s tuning picks are keyed on the kernel source, which names the compute capability and
+SM count but not the GPU model, so give each GPU model its own cache if one home serves
+several. Neither key covers the ``ptxas`` that built a kernel or the driver: after changing
+either, delete the cache or set torch's ``TORCH_COMPILE_CACHE_KEY_TAG`` to a new value.
 
 The default trades torch's node-local ``/tmp`` for home. Nothing prunes the cache, and every
 upgrade, ``-O`` level and changed graph adds to it; it is safe to delete, which costs only the
