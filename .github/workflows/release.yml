@@ -77,7 +77,7 @@ jobs:
             3.13
             3.14
       # Outside the build container, with no dependencies installed: the
-      # extension imports, the frontend binary runs from the scripts directory
+      # extension imports at the version mstar expects, the frontend binary runs from the scripts directory
       # find_server_binary looks in without any libpython (setup-python puts
       # its libdir on LD_LIBRARY_PATH, which would hide a link to one), and
       # the licenses, where the step above wrote them, are in the metadata.
@@ -85,8 +85,11 @@ jobs:
         shell: python
         run: |
           import glob, re, subprocess, tempfile
+          expected = re.search(r'^EXPECTED_MSTAR_RUST_VERSION = "(.+)"$',
+                               open("mstar/communication/communicator.py").read(), re.M)[1]
           check = """
-          import importlib.metadata as md, mstar_rust, os, pathlib, subprocess, sysconfig
+          import importlib.metadata as md, mstar_rust, os, pathlib, subprocess, sys, sysconfig
+          assert mstar_rust.__version__ == sys.argv[1], mstar_rust.__version__
           licenses = 'LICENSES-THIRD-PARTY.txt'
           assert not os.path.exists(licenses) or licenses in {f.name for f in md.files('mstar-ai')}
           server = pathlib.Path(sysconfig.get_path('scripts')) / 'mstar-server'
@@ -102,7 +105,7 @@ jobs:
               venv = tempfile.mkdtemp()
               subprocess.run([py, "-m", "venv", venv], check=True)
               subprocess.run([f"{venv}/bin/pip", "install", "-q", "--no-deps", whl], check=True)
-              subprocess.run([f"{venv}/bin/python", "-c", check], check=True)
+              subprocess.run([f"{venv}/bin/python", "-c", check, expected], check=True)
               print("ok", whl)
       # These wheels turn the Rust transport and graph runtime on by default
       # (MSTAR_RUST_ZMQ / MSTAR_RUST_GRAPH AUTO) on Python versions and an
