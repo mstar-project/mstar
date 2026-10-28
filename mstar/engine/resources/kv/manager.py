@@ -3594,6 +3594,14 @@ class KVManager(AttentionResource):
             )
         )
 
+    def after_capture(self):
+        """Zero SINK_PAGE. Every capture row runs there, on dummy inputs that
+        can leave non-finite K/V, and served padding rows don't overwrite all
+        of it. A real row's padded block table names the page too, so a kernel
+        that reads past the row's length and masks arithmetically (0 * inf)
+        would return NaN for that row."""
+        self.kv_cache.tensor[:, SINK_PAGE].zero_()
+
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
 

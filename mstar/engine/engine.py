@@ -729,6 +729,9 @@ class Engine:
             for bs, tokens in runner.dropped_shapes
         ])
 
+        for resource in self._resources.values():
+            resource.after_capture()
+
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
         self._compile_submodules()

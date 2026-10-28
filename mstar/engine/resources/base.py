@@ -414,6 +414,12 @@ class Resource(ABC):
         # thing that came to mind
         return
 
+    def after_capture(self) -> None:
+        """Called once on every rank after all of this engine's captures, before
+        the first request: undo what capture's dummy rows left in storage that a
+        real row can read. Local work, no collective."""
+        return
+
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical
