@@ -95,15 +95,14 @@ def test_long_context_bind_warns_of_a_pool_below_the_window(caplog):
     assert "usable pages" in caplog.text
 
 
-def test_long_context_captures_no_prefill_bucket_past_the_chunk(monkeypatch, caplog):
+def test_long_context_captures_no_prefill_bucket_past_the_chunk(torch_flag, caplog):
     import torch
 
     chunk = max(Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS) // 2
     cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_chunk_tokens=chunk)
     sub = _submodule(cfg)
-    monkeypatch.setattr(sub, "_moe_capture_blocked", lambda tp_world_size: False, raising=False)
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit",
-                        torch._dynamo.config.recompile_limit)
+    sub._moe_capture_blocked = lambda tp_world_size: False
+    torch_flag(torch._dynamo.config, "recompile_limit", torch._dynamo.config.recompile_limit)
     configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     prefill = [n for c in configs if c.capture_graph_walk == "prefill"
                for n in c.capture_token_lengths]
