@@ -98,6 +98,7 @@ from mstar.utils.profiler import (
     phase_start,
     range_pop,
     range_push,
+    set_step_key,
 )
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
@@ -2002,6 +2003,9 @@ class Worker:
 
         if not engine.can_pre_plan(spec_batch.node_name):
             return False
+        if self._phase_period:
+            sb = speculation.scheduled_batch
+            set_step_key(_step_key(sb.node_name, sb.graph_walk))
         try:
             if pending is not None:
                 # A step N this slow (a long admit, say) skips the pre-plan
@@ -2027,6 +2031,9 @@ class Worker:
             logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
             self._reset_skip_plan_flags(spec_batch)
             return False
+        finally:
+            if self._phase_period:
+                set_step_key(None)
 
     def _reset_skip_plan_flags(self, spec_node_batch: ExecutingBatch) -> None:
         """Drop the pre-plan staged for ``spec_node_batch``.
@@ -2116,8 +2123,9 @@ class Worker:
             self._gpu_spans.popleft()
             # elapsed_time is ms; the phase buffer holds seconds
             elapsed = start.elapsed_time(end) / 1000
-            self._phase_record("gpu_exec", elapsed)
-            self._phase_record(f"{key}.gpu_exec", elapsed)
+            # drained while another step runs: not that step's sample
+            self._phase_buf.unkeyed("gpu_exec").append(elapsed)
+            self._phase_buf.unkeyed(f"{key}.gpu_exec").append(elapsed)
 
     def _execute_on_gpu_thread(
         self,
@@ -2140,6 +2148,8 @@ class Worker:
         timed = self._phase_period
         t_start = _time.perf_counter() if timed else 0.0
         c_start = _time.thread_time() if timed else 0.0
+        if timed:
+            set_step_key(_step_key(batch.node_name, batch.graph_walk))
         laps = PhaseLaps("worker.gpu_thread.")
         engine = self.engine_manager.get_engine(batch.node_name)
         if self.enable_nvtx:
@@ -2249,14 +2259,13 @@ class Worker:
             )
             laps.lap("finalize_batch")
             if timed:
-                wall, cpu = _time.perf_counter() - t_start, _time.thread_time() - c_start
-                self._phase_record("worker.gpu_thread.total", wall)
-                self._phase_record("worker.gpu_thread.total.cpu", cpu)
-                # per node and walk: a worker that runs several (an encoder and
-                # a decoder, prefill and decode) pools them in every other phase
-                key = _step_key(batch.node_name, batch.graph_walk)
-                self._phase_record(f"{key}.gpu_thread", wall)
-                self._phase_record(f"{key}.gpu_thread.cpu", cpu)
+                self._phase_record(
+                    "worker.gpu_thread.total", _time.perf_counter() - t_start,
+                )
+                self._phase_record(
+                    "worker.gpu_thread.total.cpu", _time.thread_time() - c_start,
+                )
+                set_step_key(None)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -4930,17 +4939,17 @@ class Worker:
                             len(pending.batch.request_to_worker_graph),
                             walks=pending.batch.rids_by_walk(),
                         )
-                        _t_pp = _time.perf_counter() if phase_period else 0.0
-                        with self._span(
-                            "worker.postprocess_batch",
-                            cpu="worker.postprocess_batch.cpu",
-                        ):
-                            self._postprocess_batch(pending, outputs)
                         if phase_period:
-                            self._phase_record(
-                                f"{_step_key(pending.node_name, pending.graph_walk)}.postprocess",
-                                _time.perf_counter() - _t_pp,
-                            )
+                            set_step_key(_step_key(pending.node_name, pending.graph_walk))
+                        try:
+                            with self._span(
+                                "worker.postprocess_batch",
+                                cpu="worker.postprocess_batch.cpu",
+                            ):
+                                self._postprocess_batch(pending, outputs)
+                        finally:
+                            if phase_period:
+                                set_step_key(None)
                         laps.skip()
                         if metrics is not None:
                             metrics.step_done(
