@@ -2374,9 +2374,9 @@ class KVManager(AttentionResource):
     ) -> KVPlanOutput:
         """One plan label's output: ``_plan_output(_sequence_views(...))``,
         built from columns. One pass over the rows reads each stream's extent,
-        length and generation; the page indices are then one gather from the
-        page table, and the views are built only if a consumer asks. A step
-        whose pre-forks are pending plans from the views."""
+        length and generation; the arrays then come from one call
+        (`PageTable.plan_columns`), and the views are built only if a consumer
+        asks. A step whose pre-forks are pending plans from the views."""
         if pending:
             return self._plan_output(self._sequence_views(segments, pending, ctx, sink))
         page_size = self.kv_cache.page_size
@@ -2406,43 +2406,21 @@ class KVManager(AttentionResource):
             held.append(pages.n)
             lens.append(span + stream.stored_len)
             gens.append(stream.generation)
-        n = len(segments)
-        # int32 throughout: what FlashInfer takes, so the tensors wrap these arrays
-        offs_a, held_a, lens_a = np.array((offs, held, lens), np.int32)
         if sink_rows:
             sink_pages = self._sink_pages
             need = -(-max(spans[i] for i in sink_rows) // page_size)
             if len(sink_pages) < need:
                 sink_pages.extend([SINK_PAGE] * (need - len(sink_pages)))
-            offs_a[sink_rows] = sink_pages.off
-            held_a[sink_rows] = len(sink_pages)
-        # a stream can hold more pages than its length needs (a high-water
-        # mark), and the slice in `_sequence_views` takes no more than it holds
-        npages = lens_a + (page_size - 1)
-        npages //= page_size
-        np.minimum(npages, held_a, out=npages)
-        kv_indptr = np.zeros(n + 1, np.int32)
-        np.cumsum(npages, out=kv_indptr[1:])
-        indices = self._page_table.gather(offs_a, npages, kv_indptr)
-        # `SequenceView.last_page_len(page_size) or page_size`
-        last = lens_a - 1
-        last %= page_size
-        last += 1
-        # FlashInfer's `get_seq_lens`: (pages - 1) * page_size + last
-        kv_lens = np.maximum(npages, 1)
-        kv_lens -= 1
-        kv_lens *= page_size
-        kv_lens += last
-        if decode:
-            qo_indptr = np.arange(n + 1, dtype=np.int32)
-        else:
-            qo_indptr = np.zeros(n + 1, np.int32)
-            np.cumsum(spans, out=qo_indptr[1:])
+            for i in sink_rows:
+                offs[i] = sink_pages.off
+                held[i] = need
+        cols = self._page_table.plan_columns(offs, held, lens, spans, page_size)
+        indices, kv_indptr, last = cols.indices, cols.kv_indptr, cols.last_page_len
         ring = self._indptr_ring
         make = ring.take if ring is not None else torch.from_numpy
         # a decode row writes the token after its last: the last page, at its
         # last slot (`_decode_locations`); none without a page to write
-        write_at = decode and bool(npages.all())
+        write_at = decode and cols.all_have_pages
 
         def build_views(segments=segments, indices=indices, kv_indptr=kv_indptr, lens=lens, gens=gens):
             bounds = kv_indptr.tolist()
@@ -2456,14 +2434,14 @@ class KVManager(AttentionResource):
 
         return KVPlanOutput(
             cpu_indptrs=PagedIndptrs(
-                qo_indptr=make(qo_indptr),
+                qo_indptr=make(cols.qo_indptr),
                 paged_kv_indptr=make(kv_indptr),
                 paged_kv_indices=make(indices),
                 paged_kv_last_page_len=make(last),
-                kv_lens=torch.from_numpy(kv_lens).as_subclass(HostLens),
+                kv_lens=torch.from_numpy(cols.kv_lens).as_subclass(HostLens),
             ),
-            decode_pages=indices[kv_indptr[1:] - 1] if write_at else None,
-            decode_offsets=last - 1 if write_at else None,
+            decode_pages=cols.decode_pages if write_at else None,
+            decode_offsets=cols.decode_offsets if write_at else None,
             decode=decode,
             rows=segments,
             view_builder=build_views,

@@ -12,9 +12,29 @@ a model allows.
 """
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
+try:  # the one-call plan (rust/src/kv_plan.rs); an older build has none
+    from mstar_rust import kv_plan_columns as _rust_plan_columns
+except ImportError:
+    _rust_plan_columns = None
+
 _MIN_CAPACITY = 8
+
+
+class PlanColumns(NamedTuple):
+    """A plan label's index arrays (int32), from per-row columns."""
+    qo_indptr: np.ndarray
+    kv_indptr: np.ndarray
+    indices: np.ndarray
+    last_page_len: np.ndarray
+    kv_lens: np.ndarray
+    # each row's write page and slot; meaningful only when every row has a page
+    decode_pages: np.ndarray
+    decode_offsets: np.ndarray
+    all_have_pages: bool
 
 
 def _capacity_for(n: int) -> int:
@@ -57,6 +77,51 @@ class PageTable:
     def _release(self, off: int, capacity: int) -> None:
         if capacity:
             self._free.setdefault(capacity, []).append(off)
+
+    def plan_columns(
+        self, offs: list[int], held: list[int], lens: list[int], spans: list[int], page_size: int,
+    ) -> PlanColumns:
+        """Per row: the first ``min(ceil(len / page_size), held)`` pages of the
+        extent at ``off``, and the arrays FlashInfer takes for those rows
+        (``build_paged_indptrs``). One Rust call when the extension has it:
+        the numpy version is the same arithmetic in about 30 small calls, which
+        cost more than a few dozen rows of per-row Python do."""
+        if _rust_plan_columns is not None:
+            raw, total, all_have_pages = _rust_plan_columns(self.pool, offs, held, lens, spans, page_size)
+            buf = np.frombuffer(raw, np.int32)
+            n = len(offs)
+            a, b = n + 1, 2 * (n + 1)
+            return PlanColumns(
+                qo_indptr=buf[:a], kv_indptr=buf[a:b], indices=buf[b + 4 * n:],
+                last_page_len=buf[b:b + n], kv_lens=buf[b + n:b + 2 * n],
+                decode_pages=buf[b + 2 * n:b + 3 * n], decode_offsets=buf[b + 3 * n:b + 4 * n],
+                all_have_pages=all_have_pages,
+            )
+        return self._plan_columns_numpy(offs, held, lens, spans, page_size)
+
+    def _plan_columns_numpy(self, offs, held, lens, spans, page_size) -> PlanColumns:
+        n = len(offs)
+        offs_a, held_a, lens_a = np.array((offs, held, lens), np.int32).reshape(3, n)
+        npages = lens_a + (page_size - 1)
+        npages //= page_size
+        np.minimum(npages, held_a, out=npages)
+        kv_indptr = np.zeros(n + 1, np.int32)
+        np.cumsum(npages, out=kv_indptr[1:])
+        indices = self.gather(offs_a, npages, kv_indptr)
+        # `SequenceView.last_page_len(page_size) or page_size`
+        last = lens_a - 1
+        last %= page_size
+        last += 1
+        # FlashInfer's `get_seq_lens`: (pages - 1) * page_size + last
+        kv_lens = np.maximum(npages, 1)
+        kv_lens -= 1
+        kv_lens *= page_size
+        kv_lens += last
+        qo = np.zeros(n + 1, np.int32)
+        np.cumsum(spans, out=qo[1:])
+        all_have_pages = bool(npages.all())
+        pages = indices[kv_indptr[1:] - 1] if all_have_pages and n else np.zeros(n, np.int32)
+        return PlanColumns(qo, kv_indptr, indices, last, kv_lens, pages, last - 1, all_have_pages)
 
     def gather(self, offs: np.ndarray, counts: np.ndarray, indptr: np.ndarray) -> np.ndarray:
         """The first ``counts[i]`` pages of the extent at ``offs[i]``, for every

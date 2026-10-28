@@ -16,6 +16,8 @@ mod bindings;
 pub mod communicator;
 #[cfg(feature = "python")]
 pub mod graph;
+#[cfg(feature = "python")]
+pub mod kv_plan;
 pub mod shm;
 #[cfg(feature = "python")]
 pub mod tensors;

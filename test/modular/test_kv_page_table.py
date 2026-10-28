@@ -138,8 +138,20 @@ def _same(a, b):
         assert [int(o) for o in a.decode_offsets] == [(v.last_page_len(PAGE) or PAGE) - 1 for v in b.views]
 
 
+@pytest.fixture(params=["rust", "numpy"])
+def plan_backend(request, monkeypatch):
+    """Both ways `PageTable.plan_columns` computes: the Rust call and numpy."""
+    from mstar.engine.resources.kv import page_table
+    if request.param == "rust":
+        if page_table._rust_plan_columns is None:
+            pytest.skip("the Rust extension has no kv_plan_columns")
+    else:
+        monkeypatch.setattr(page_table, "_rust_plan_columns", None)
+    return request.param
+
+
 @pytest.mark.parametrize("seed", range(12))
-def test_a_columnar_plan_equals_the_per_row_plan(seed):
+def test_a_columnar_plan_equals_the_per_row_plan(seed, plan_backend):
     rng = random.Random(seed)
     kv = _manager()
     live: list[str] = []
