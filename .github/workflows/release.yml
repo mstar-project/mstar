@@ -104,6 +104,28 @@ jobs:
               subprocess.run([f"{venv}/bin/pip", "install", "-q", "--no-deps", whl], check=True)
               subprocess.run([f"{venv}/bin/python", "-c", check], check=True)
               print("ok", whl)
+      # These wheels turn the Rust transport and graph runtime on by default
+      # (MSTAR_RUST_ZMQ / MSTAR_RUST_GRAPH AUTO) on Python versions and an
+      # architecture rust-transport never runs, so each one also runs test/rust
+      # with its dependencies installed (CPU torch). From a copy of test/, so
+      # `mstar` imports from the wheel rather than the checkout.
+      - name: Run test/rust against each wheel
+        shell: python
+        run: |
+          import glob, re, shutil, subprocess, tempfile
+          for whl in sorted(glob.glob("wheelhouse/*.whl")):
+              py = "python3." + re.search(r"-cp3(\d+)-", whl).group(1)
+              venv, tests = tempfile.mkdtemp(), tempfile.mkdtemp()
+              subprocess.run([py, "-m", "venv", venv], check=True)
+              # triton: the arena tests reach mstar.utils.sampling; the rest
+              # are what ci.yml's rust-transport job adds for test/rust.
+              subprocess.run([f"{venv}/bin/pip", "install", "-q",
+                              "--extra-index-url", "https://download.pytorch.org/whl/cpu",
+                              whl, "pytest==9.2.0", "prometheus-client", "httpx", "triton"],
+                             check=True)
+              for d in ("rust", "modular"):  # test/rust imports helpers from test/modular
+                  shutil.copytree(f"test/{d}", f"{tests}/test/{d}")
+              subprocess.run([f"{venv}/bin/pytest", "-q", "-ra", "test/rust"], cwd=tests, check=True)
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}
