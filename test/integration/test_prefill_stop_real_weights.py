@@ -12,9 +12,11 @@ output token, which samples the same token but does not stop on it.
 
 - Qwen3.5 streams a token's raw bytes with special tokens kept, and keeps the
   stop token under ``ignore_eos``, so the probe names the token exactly.
-- Qwen3-ASR's output drops every special token, so a stop token shows only as
-  an empty probe chunk; after the clip's own finished transcript that special
-  token is end of turn.
+- Qwen3-ASR's output drops every special token, so an empty probe chunk names
+  only "some special token". The case assumes that after the clip's own
+  finished transcript it is a stop token (``<|im_end|>`` or ``<|endoftext|>``).
+  If it is another special token the run decodes on, so a wrong assumption
+  fails the case rather than passing it.
 
 A case skips only when the model's greedy first token is not a stop token,
 which the API gives no deterministic way to arrange.
@@ -52,22 +54,25 @@ def _load_e2e(name: str):
     if key not in sys.modules:
         spec = importlib.util.spec_from_file_location(key, E2E / f"{name}.py")
         sys.modules[key] = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(sys.modules[key])
+        try:
+            spec.loader.exec_module(sys.modules[key])
+        except BaseException:
+            del sys.modules[key]
+            raise
     return sys.modules[key]
 
 
-def _speech_wav() -> bytes:
-    """A LibriSpeech utterance as WAV, from ``test/e2e/cases.py``."""
+def _cases():
+    """``test/e2e/cases.py``, which imports ``validators`` by its bare name."""
     had = sys.modules.get("validators")
-    sys.modules["validators"] = _load_e2e("validators")  # cases.py imports it by its bare name
+    sys.modules["validators"] = _load_e2e("validators")
     try:
-        cases = _load_e2e("cases")
+        return _load_e2e("cases")
     finally:
         if had is None:
             del sys.modules["validators"]
         else:
             sys.modules["validators"] = had
-    return cases.speech_sample()[0]
 
 
 def _serve(config: str, tmp_path_factory):
@@ -112,7 +117,7 @@ def qwen3_asr_url(tmp_path_factory):
 def test_qwen3_asr_stops_when_the_prefilled_hypothesis_is_complete(qwen3_asr_url):
     """The realtime path's case: re-decode a clip with its own finished
     transcript as the assistant prefix, so the next token is end of turn."""
-    wav = _speech_wav()
+    wav = _cases().speech_wav()
     kwargs = {"language": "en", "max_output_tokens": 256}  # greedy by default
 
     transcript = b"".join(_text_chunks(qwen3_asr_url, kwargs, wav=wav)).decode()
@@ -123,7 +128,10 @@ def test_qwen3_asr_stops_when_the_prefilled_hypothesis_is_complete(qwen3_asr_url
     if first:
         pytest.skip(f"the greedy token after the transcript is text, not a stop token: {first!r}")
     chunks = _text_chunks(qwen3_asr_url, kwargs, wav=wav)
-    assert chunks == [b""], f"decoded past a first-token stop: {chunks!r}"
+    assert chunks == [b""], (
+        f"decoded past the first token: {chunks!r}. The probe's empty chunk is a "
+        "special token assumed to be a stop token; check that before the stop path"
+    )
 
 
 @pytest.fixture(scope="module")

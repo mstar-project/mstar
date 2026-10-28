@@ -2,9 +2,9 @@
 //! is running, and which workers own which nodes for it.
 //!
 //! Deliberately NOT stored inside the worker graph queues. A partition's walk
-//! and its stream-done flag are per (request, partition); a partition can span
-//! several worker graphs, so putting them there would duplicate the value and
-//! turn `set_walk` into a scatter-write. The worker graph -> partition
+//! and its partition-done flag are per (request, partition); a partition can
+//! span several worker graphs, so putting them there would duplicate the value
+//! and turn `set_walk` into a scatter-write. The worker graph -> partition
 //! direction is static, so it lives on `WorkerGraphMeta` and costs nothing per
 //! request.
 

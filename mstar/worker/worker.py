@@ -3612,11 +3612,12 @@ class Worker:
         # END_PARTITION (e.g. a prefill that sampled a stop token) ends the
         # partition on this pass's report. Only a row outside any loop can end
         # its pass here: inside one it would stop only the innermost loop, and
-        # a speculated next iteration would carry no report of it.
+        # a speculated next iteration would carry no report of it. Returning it
+        # from a loop is a model bug, so the client sees an internal error.
         for rid in [rid for rid, s in stops.items() if END_PARTITION in s]:
             walk = batch_N.batch.walk_of(rid)
             if (walk, batch_N.node_name) in self._innermost_loop_by_node:
-                batch_N.node_batch.register_failure(rid, ValueError(
+                batch_N.node_batch.register_failure(rid, RuntimeError(
                     f"check_stop of node {batch_N.node_name!r} returned END_PARTITION "
                     f"inside a loop of walk {walk!r}; it may end a partition only "
                     "from a row outside any loop"
