@@ -348,6 +348,12 @@ class Cosmos3Config:
     # stream's first window (fresh or resumed); a stream's windows all go to
     # the decoder copy it was admitted to.
     windowed_decode_context_latents: int = 8
+    # Latents a chained window's head (ChainedWindowHead) decodes behind the
+    # frames it re-encodes, so the causal decoder is warm at them. 1-2 hold a
+    # rollout as well as a whole window does and keep the per-boundary cost
+    # small (the head runs between every two windows); 0 reads as 1, since a
+    # mid-stream latent is not a clip start.
+    chained_head_context_latents: int = 2
     # Keep each live stream's VAE decoder cache (the last frames every causal
     # conv saw) in its request state, so a window decodes only its new latents.
     # Without compile, at windowed_decode_latents_per_call=1 and the contiguous
@@ -379,15 +385,16 @@ class Cosmos3Config:
     # Run the streaming decode on channels-last weights and activations,
     # cuDNN's native conv3d layout: no per-conv layout conversion kernels.
     # Same math; bf16 output differs from the default layout only by rounding.
-    # A decoder node that converts takes its own decoder-only copy of the VAE
-    # (~1.03 GiB of bf16 weights for Wan2.2): the streaming node here, the
-    # whole-clip decoder under ``vae_decode_fast``. A node with its switch off
-    # shares one default-layout instance instead.
+    # The decoders that convert share one decoder-only copy of the VAE per
+    # device (~1.03 GiB of bf16 weights for Wan2.2): the streaming node and a
+    # chained window's head here, the whole-clip decoder under
+    # ``vae_decode_fast``. A node with its switch off shares the default-layout
+    # instance instead.
     vae_decode_channels_last: bool = True
     # Decode a video clip (the non-windowed video walks) with the shared Wan
     # VAE decoder: the same per-latent decoder calls as ``vae.decode`` from an
     # empty cache, channels-last, in the decode dtype (fp32 below cuDNN 9.16),
-    # on a decoder-only copy of the VAE (~1 GiB in bf16). The first two calls
+    # on the decoder-only copy of the VAE (~1 GiB in bf16). The first two calls
     # run eager, every later one compiled in Inductor's deterministic mode. An
     # image (one latent) keeps the compiled stock ``vae.decode`` on the same
     # copy, faster for a single frame. False decodes everything with the
@@ -561,7 +568,8 @@ class Cosmos3Config:
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")
-        for name in ("windowed_decode_max_warm_streams", "windowed_decode_latents_per_call"):
+        for name in ("windowed_decode_max_warm_streams", "windowed_decode_latents_per_call",
+                     "chained_head_context_latents"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"Cosmos3 {name} must be an integer >= 0, got {value!r}.")

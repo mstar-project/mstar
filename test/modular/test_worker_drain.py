@@ -420,7 +420,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     )
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: ["n"],
-        add_request=lambda rid, cfgs: seen.setdefault("engine", rid),
+        add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
     )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, cfg: seen.setdefault("tensors", rid),

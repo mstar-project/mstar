@@ -784,7 +784,7 @@ def test_vae_decode_fast_routes_whole_clips_through_the_shared_decoder(monkeypat
         return torch.zeros(1, 3, t, 8, 8, dtype=torch.bfloat16)
 
     monkeypatch.setattr(wan_vae, "decode_causal", fake_decode_causal)
-    sub = Cosmos3VAEDecoderSubmodule(_StubVAE(), Cosmos3Config())
+    sub = Cosmos3VAEDecoderSubmodule(_StubVAE(), Cosmos3Config(), fast=True)
     sub._decode_dtype_cached = torch.bfloat16
     out = sub.forward("video_gen", None, torch.zeros(1, 4, 3, 8, 8, dtype=torch.bfloat16))
     assert calls == ["channels_last", ("decode_causal", True, True)]
@@ -819,7 +819,7 @@ def test_vae_decode_fast_keeps_images_on_the_stock_decode(monkeypatch) -> None:
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     monkeypatch.setattr(wan_vae, "to_channels_last", lambda vae: None)
     monkeypatch.setattr(wan_vae, "decode_causal", no_step)
-    sub = Cosmos3VAEDecoderSubmodule(_StubVAE(), Cosmos3Config())
+    sub = Cosmos3VAEDecoderSubmodule(_StubVAE(), Cosmos3Config(), fast=True)
     sub._decode_dtype_cached = torch.bfloat16
     out = sub.forward("image_gen", None, torch.zeros(1, 4, 1, 8, 8, dtype=torch.bfloat16))
     assert out["image_output"][0].shape == (1, 3, 1, 8, 8) and out["image_output"][0].dtype == torch.uint8

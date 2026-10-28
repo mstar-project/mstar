@@ -170,7 +170,16 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
        A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
-       rows for up to the 4,077-frame maximum. Needs ``flash-attn``; one rollout per GPU.
+       rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT's attention runs
+       through the engine's ragged attention resource, its blocks are compiled (Inductor's
+       deterministic mode), the condition encode runs channels-last, and the VAE decode is
+       channels-last, compiled and bf16 where cuDNN >= 9.16 (frames 51 dB from the fp32 decode).
+       ``model_kwargs: {reference_numerics: true}`` runs the reference's numerics instead
+       (FlashAttention-2, needs ``flash-attn``; an eager DiT; the fp32 contiguous encode and
+       decode), with which a rollout is bit-identical to the reference's.
+       ``lingbot_world_1_3b_fast.yaml`` compiles the DiT with autotuned kernels
+       (``dit_compile_autotune``): ~5% faster, but the rollout for a seed then differs from one
+       server process to the next.
        The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
        before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (``Robbyant/lingbot-world``).
    * - ``flux2_klein``
@@ -1047,7 +1056,10 @@ own ``window_decoder`` partition; a request opts in per call:
    * - ``window_mode``
      - — (``chained`` with ``stream_video``)
      - ``chained``: every window is a full bidirectional denoise conditioned on
-       the previous window's tail (``overlap_frames`` pinned clean). ``kv``
+       the previous window's tail (``overlap_frames`` pinned clean: the last
+       frames are decoded and encoded again as a clip of their own, the
+       video-to-video conditioning layout, so the window's first latent frame
+       is a single-frame one as in training). ``kv``
        (experimental, see below): the finished window's clean K/V is committed
        to the cache and later windows attend to it block-causally; no overlap,
        and frames older than ``context_frames`` behind the frontier are
@@ -1058,8 +1070,9 @@ own ``window_decoder`` partition; a request opts in per call:
      - Pixel frames per window (quantized to latent frames).
    * - ``overlap_frames``
      - 32 on Edge, 8 elsewhere
-     - ``chained`` only: frames re-pinned from the previous window (at least two
-       latent frames).
+     - ``chained`` only: frames re-pinned from the previous window, as k = 1 +
+       (overlap_frames - 1) // 4 latent frames (at least two), which pin
+       1 + 4(k - 1) frames: 5 and 29 at the defaults.
    * - ``context_frames``
      - 61
      - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.

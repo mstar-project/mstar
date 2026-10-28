@@ -1341,6 +1341,7 @@ class Engine:
                     submodule_mgmt, lease, raw, inputs, req_info,
                     request_ids=batch.request_ids,
                     step_request_ids=batch.step_context.padded_request_ids,
+                    graph_walk=batch.step_context.graph_walk,
                     rows_only=batch.rows_only,
                 )
             finally:
@@ -1458,6 +1459,7 @@ class Engine:
                 merged.update(self._collect_outputs(
                     submodule_mgmt, None, raw, [inp], req_info,
                     request_ids=[rid], step_request_ids=(rid,),
+                    graph_walk=batch.step_context.graph_walk,
                 ))
             finally:
                 if nvtx:
@@ -1722,11 +1724,12 @@ class Engine:
             "the unbatched forward takes one request; batch of "
             f"{len(request_ids)} needs running_batched"
         )
-        return BatchedModelOutput.coerce(
-            {request_ids[0]: submodule_mgmt.forward(
-                graph_walk, engine_inputs=engine_inputs, **preprocessed
-            )}
+        out = submodule_mgmt.forward(
+            graph_walk, engine_inputs=engine_inputs, **preprocessed
         )
+        if isinstance(out, BatchedModelOutput):
+            return out
+        return BatchedModelOutput.coerce({request_ids[0]: out})
 
     def postprocess_batch(
         self, batch: ExecutingBatch, outputs: BatchedModelOutput,
@@ -1959,6 +1962,7 @@ class Engine:
         req_info: Mapping[str, CurrentForwardPassInfo],
         request_ids: list[str],
         step_request_ids: tuple[str, ...],
+        graph_walk: str,
         rows_only: bool = False,
     ) -> BatchedModelOutput:
         """Per-rid outputs for the real requests: drop the padding rows and map
@@ -2006,6 +2010,9 @@ class Engine:
             outputs, raw_outputs, request_ids, submodule,
             inputs[:len(request_ids)], req_info,
         )
+        spans = raw_outputs.output_spans
+        if spans:
+            spans = self._real_spans(submodule, graph_walk, spans, len(request_ids))
         return BatchedModelOutput(
             per_rid_outputs=outputs,
             rows_only=rows_only and not outputs,
@@ -2018,7 +2025,43 @@ class Engine:
             # worker's later-rewritten request list
             row_request_ids=tuple(request_ids),
             row_views=row_views,
+            output_spans=spans or None,
+            span_request_ids=tuple(request_ids) if spans else None,
         )
+
+    @staticmethod
+    def _real_spans(
+        submodule: NodeSubmodule, graph_walk: str,
+        spans: dict[str, torch.Tensor], num_rows: int,
+    ) -> dict[str, torch.Tensor]:
+        """The step's spans narrowed to its real rows (a replay pads past
+        them), refusing a span on an output the walk does not declare and a
+        step that spans some declared outputs but not all: the per-request
+        path merges one forward's spans into another's by name, so every
+        forward on a walk has to return the same names."""
+        declared = submodule.spanned_outputs(graph_walk)
+        undeclared = spans.keys() - declared
+        if undeclared:
+            raise ValueError(
+                f"{type(submodule).__name__} returned spans for {sorted(undeclared)} "
+                f"on walk {graph_walk!r}, which spanned_outputs does not declare"
+            )
+        missing = declared - spans.keys()
+        if missing:
+            raise ValueError(
+                f"{type(submodule).__name__} returned spans for {sorted(spans)} on walk "
+                f"{graph_walk!r} but none for {sorted(missing)}: a step that returns spans "
+                f"returns one for every output spanned_outputs declares"
+            )
+        for name, span in spans.items():
+            if span.dim() != 2 or span.shape[1] != 2 or span.shape[0] < num_rows:
+                raise ValueError(
+                    f"{type(submodule).__name__}: the span of {name!r} is "
+                    f"{tuple(span.shape)}, not [{num_rows}, 2]"
+                )
+        # A view, not a clone: the gpu thread copies the spans to the host on
+        # this stream right behind the step, before a later replay can write them.
+        return {name: span[:num_rows] for name, span in spans.items()}
 
     def _merge_per_rid(
         self,
@@ -2657,8 +2700,19 @@ class Engine:
     def add_request(
         self, request_id: str,
         overrides: Mapping[str, ResourceReqConfig] | None = None,
+        request_info: CurrentForwardPassInfo | None = None,
     ) -> None:
+        """Open the request on every resource, then tell each submodule. All or
+        nothing: a raise leaves the request on none of them."""
         self._runner.ingest_request(request_id, overrides)
+        if request_info is None:
+            return
+        try:
+            for submodule_mgmt in self._submodules.values():
+                submodule_mgmt.submodule.on_request_added(request_id, request_info)
+        except Exception:
+            self.remove_request(request_id)
+            raise
 
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down on every resource. Returns the resources it
