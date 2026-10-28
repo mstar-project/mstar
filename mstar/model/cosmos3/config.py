@@ -385,9 +385,11 @@ class Cosmos3Config:
     vae_decode_channels_last: bool = True
     # Decode a whole clip (the non-windowed video and image walks) with the
     # shared Wan VAE decoder: the same per-latent decoder calls as
-    # ``vae.decode`` from an empty cache, channels-last and compiled per call in
-    # Inductor's deterministic mode, on a decoder-only copy of the VAE (~1 GiB
-    # bf16). False decodes with the compiled stock ``vae.decode``.
+    # ``vae.decode`` from an empty cache, channels-last, in the decode dtype
+    # (fp32 below cuDNN 9.16), on a decoder-only copy of the VAE (~1 GiB in
+    # bf16). The first two calls run eager, every later one compiled in
+    # Inductor's deterministic mode. False decodes with the compiled stock
+    # ``vae.decode``.
     vae_decode_fast: bool = True
     # Let cuDNN time its conv algorithms for each new streaming-decode shape
     # (once, then cached) instead of its heuristic pick. Same math, but the

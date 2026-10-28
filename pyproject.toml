@@ -172,8 +172,8 @@ cosmos3 = [
     # diffusers 0.39; serving itself uses AutoencoderKLWan and the scheduler.
     "diffusers>=0.39",
     # bs=1 dense attention fast path. The wheel is ABI-tied to the torch/CUDA
-    # build; on a mismatch the engine logs a warning and falls back to the
-    # paged flashinfer backend. See docs/models.rst.
+    # build; on a mismatch the engine runs the dense pass on FlashInfer's
+    # ragged prefill instead. See docs/models.rst.
     "fa3-fwd",
     "flashinfer-python>=0.6.14",
     "huggingface-hub",

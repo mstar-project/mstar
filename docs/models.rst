@@ -926,9 +926,12 @@ Cosmos3 environment requirements
   a B300 is CUTLASS's FMHA: 1.5 ms per layer for the 832x480x121 guidance pair
   against 6.3 ms for the paged prefill. ``resources: attn_gen:
   flashinfer_backend:`` picks that kernel (``cudnn``, ``cutlass``, ``fa2``).
-  Without FlashInfer either, the engine logs a warning and falls back to the
-  paged backend. ``model_kwargs.attention_backend: flashinfer`` in the config
-  YAML selects the paged backend explicitly.
+  Without a usable FlashInfer either, the engine logs a warning and switches to
+  the paged backend, but that is FlashInfer too (the default backend on every
+  platform for now), so it cannot run there either: the dense pass needs
+  fa3-fwd (AITER on ROCm) or FlashInfer.
+  ``model_kwargs.attention_backend: flashinfer`` in the config YAML selects the
+  paged backend explicitly.
 - Video-input requests (video-to-video, action inverse-dynamics) decode the
   conditioning clip with ``torchcodec``; environments without it reject those
   requests at preprocessing (other modes are unaffected).
@@ -998,9 +1001,11 @@ picked by rule, so a seed gives the same video from every server process.
 serve -O`` level's options (``-O2``: max-autotune).
 
 Whole clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
-bf16, channels-last, one compiled decoder call per latent in Inductor's
-deterministic mode, on the node's own decoder-only copy of the VAE. False
-decodes with the compiled stock ``vae.decode`` on the shared instance.
+one decoder call per latent, channels-last, in the decode dtype (bf16 with
+cuDNN >= 9.16, otherwise fp32; see above), on the node's own decoder-only copy
+of the VAE. The first two calls (the clip-start latent and the one after it)
+run eager; every later call is compiled in Inductor's deterministic mode.
+False decodes with the compiled stock ``vae.decode`` on the shared instance.
 
 Two or more requests at the same denoise step run one cross-request forward
 (``max_gen_batch_size``, default 8), compiled with the same mode

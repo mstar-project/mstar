@@ -61,7 +61,8 @@ def _fa3_unavailable_reason(device: torch.device | None = None) -> str | None:
 def _warn_dense_fallback(reason: str, fallback: AttnBackend) -> None:
     logger.warning(
         "Attention backend 'dense' requested but no varlen kernel is "
-        "available (%s); using the paged %r backend instead.",
+        "available (%s); using the paged %r backend instead, though it also "
+        "runs on FlashInfer and cannot run where FlashInfer is unusable.",
         reason, fallback.value,
     )
 
