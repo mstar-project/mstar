@@ -1454,7 +1454,23 @@ show <code class="docutils literal notranslate"><span class="pre">hit</span> <sp
 <code class="docutils literal notranslate"><span class="pre">2</span></code>: <code class="docutils literal notranslate"><span class="pre">max-autotune-no-cudagraphs</span></code>. A capture config that names its
 own <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> keeps it.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_PTXAS_BLACKWELL_PATH</span></code></p></td>
+<td><p>torch’s ptxas, when needed</p></td>
+<td><p>Triton’s own variable: the ptxas it runs for sm_100 and up. ptxas
+before 13.1.115, including the 13.1.80 that Triton 3.7.1 bundles,
+miscompiles some integer floor divisions on sm_103 (Inductor’s fused
+interleaved mRoPE table came out wrong on B300). Unset, the conductor
+points its workers at torch’s <code class="docutils literal notranslate"><span class="pre">torch/bin/ptxas</span></code> when a compute
+capability 10.x GPU is present, Triton’s bundled ptxas predates
+13.1.115 and torch’s does not; it then also sets
+<code class="docutils literal notranslate"><span class="pre">TORCH_COMPILE_CACHE_KEY_TAG</span></code>, since Inductor’s graph cache would
+otherwise reuse kernels compiled by the bundled ptxas (decided by
+<code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.platforms.ptxas.blackwell_ptxas_env()</span></code>). A value you set
+is kept, and the cache tag then names the ptxas you chose, so a cache
+another ptxas wrote is not reused. A <code class="docutils literal notranslate"><span class="pre">TORCH_COMPILE_CACHE_KEY_TAG</span></code>
+you set gets <code class="docutils literal notranslate"><span class="pre">-ptxas-blackwell-&lt;version&gt;</span></code> appended.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">$XDG_CACHE_HOME/mstar/torchinductor</span></code> (<code class="docutils literal notranslate"><span class="pre">~/.cache/mstar/torchinductor</span></code> when unset)</p></td>
 <td><p>torch’s own variable; M* sets this default when importing
 <a class="reference internal" href="_autosummary/mstar.engine.html#module-mstar.engine" title="mstar.engine"><code class="xref py py-mod docutils literal notranslate"><span class="pre">mstar.engine</span></code></a> (<code class="docutils literal notranslate"><span class="pre">_default_compile_caches</span></code>), so compiled graphs and
@@ -1465,7 +1481,7 @@ start (Triton’s kernels follow it unless <code class="docutils literal notrans
 FlashInfer’s JIT cache stays warm). See
 <a class="reference internal" href="serving.html#restarts-and-the-compile-cache"><span class="std std-ref">Restarts and the compile cache</span></a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRITON_CACHE_DIR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">$TORCHINDUCTOR_CACHE_DIR/triton</span></code></p></td>
 <td><p>Triton’s own variable, defaulted by the same function once
 <code class="docutils literal notranslate"><span class="pre">TORCHINDUCTOR_CACHE_DIR</span></code> is resolved (exported or M*’s default; left unset
