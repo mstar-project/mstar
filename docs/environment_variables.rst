@@ -165,6 +165,12 @@ Communication
        the conductor sets ``lo`` for its workers and NCCL's bootstrap
        sockets listen on loopback only. A value you set, or a set
        ``NCCL_SOCKET_FAMILY``, is kept as is.
+   * - ``NCCL_GRAPH_REGISTER``
+     - ``0``
+     - NCCL's own variable. On, NCCL registers the buffers a CUDA graph
+       captures, which succeeds on ``expandable_segments`` memory, and
+       Cosmos3 SP4 with batched captures then gave wrong images (#897).
+       Workers on CUDA set ``0`` unless you set it.
    * - ``GLOO_SOCKET_IFNAME``
      - ``lo``
      - PyTorch's variable for the Gloo groups next to each TP/SP group.
