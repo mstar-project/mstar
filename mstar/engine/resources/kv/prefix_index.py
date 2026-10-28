@@ -33,8 +33,11 @@ class PrefixIndex:
         self._leaves: list[tuple[int, int]] = []
         self._clock = 0
         self._evictable: set[int] = set()
-        # pages ever inserted, which a request waiting for room is measured against
+        # Pages ever inserted, and pages ever taken out of the evictable set by a request that holds
+        # them: both can lower what a request waiting for room needs, and a waiting request is measured
+        # against them.
         self.filed = 0
+        self.taken = 0
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
@@ -131,6 +134,7 @@ class PrefixIndex:
             # nothing changes for a page that isn't indexed or is pinned from below
             return
         if shared:
+            self.taken += 1
             self._evictable.discard(page)
             self._pin_above(page)
         else:
