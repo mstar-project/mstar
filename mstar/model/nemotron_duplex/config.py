@@ -29,6 +29,21 @@ TALKER_KV = "talker_kv"             # paged KV of the talker's 28 Gemma3 layers 
 TALKER_ATTN = "talker_attn"         # attention planned over TALKER_KV
 TALKER_POS = "talker_pos"           # positions / RoPE for the talker (per-layer theta at call time)
 TALKER_CFG_LABEL = "_cfg"           # the two talker streams combined into one plan (cond rows, then uncond)
+AUDIO_IN = "audio_in"               # the client stream carrying the user's audio into the Encoder
+ENCODER_STATE = "encoder_state"     # recurrent-state pool: each call's streaming-encoder conv tails
+ENCODER_FRONT = "encoder_front"     # recurrent-state pool: each call's streaming-encoder audio and mel tails
+CODEC_STATE = "codec_state"         # recurrent-state pool: each call's streaming codec decoder state
+ENCODER_KV = "encoder_kv"           # bounded KV: each call's streaming-encoder attention window, per layer
+
+# Every node's CUDA-graph batch sizes: a row per live session, up to the sessions
+# a deployment serves by default (``NemotronDuplexModel.DEFAULT_SESSIONS``).
+SESSION_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+
+
+def session_too_long(max_session_s: float) -> ValueError:
+    """The one error for a call whose audio outgrows ``max_session_s``, whichever
+    stage sees it first."""
+    return ValueError(f"the call's audio passed {max_session_s:g} s, the longest session this server takes")
 
 
 @dataclass
@@ -178,15 +193,6 @@ class EarTTSConfig:
     # generation) so audio is reproducible AND does not land on rare collapse-to-
     # constant-code RNG states that an uncontrolled global RNG occasionally hits.
     inference_seed: int = 0
-
-    # Streaming codec chunking (engine Talker->Codec connection): decode `chunk` new
-    # code frames with `left_context` prior frames so the causal codec has enough
-    # receptive field, emitting only the new tail (see AudioCodecDecoderSubmodule).
-    codec_chunk_frames: int = 5
-    # The decoder only looks back ~2.3 code frames (three causal k=7 blocks at
-    # 9 positions per frame, plus the iSTFT window), so 3 frames of context give
-    # the same samples as decoding the whole history.
-    codec_left_context_frames: int = 3
 
     sample_rate: int = 22050
 

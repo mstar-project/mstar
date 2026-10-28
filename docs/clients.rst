@@ -48,6 +48,11 @@ NDJSON stream.
        again once that request finished, failed or was aborted (a client that
        drops a stream can resubmit its id at once).
 
+A client ``request_id`` is at most 128 characters from ``[A-Za-z0-9._:-]``; any other is
+refused with ``400`` (on ``/generate/ws``, with the in-band error below). An empty
+``request_id`` counts as none: the server mints a fresh one, on both frontends and on
+``/generate/ws``.
+
 A non-streaming response groups outputs by modality, each payload base64-encoded:
 
 .. code-block:: json
@@ -61,11 +66,19 @@ A non-streaming response groups outputs by modality, each payload base64-encoded
    }
 
 A streaming response is ``application/x-ndjson`` — one JSON object per line as chunks
-arrive. A client that sends ``Accept: application/vnd.mstar.frames`` receives
+arrive. A request that fails after its stream has started ends it with one chunk of
+modality ``error`` (the HTTP status in ``metadata.status``); nothing follows it. A client that sends ``Accept: application/vnd.mstar.frames`` receives
 length-framed binary chunks instead, which skips the base64 pass on multi-megabyte
 ``video_frame`` payloads; a server without the framing keeps answering NDJSON, so a
 client must parse by the response ``Content-Type``. ``GET /health`` returns
 ``{"status": "healthy"}``.
+
+Streamed ``text`` chunks (``/generate`` and ``/generate/ws``) are the raw UTF-8 bytes
+of each token, so one character can be split across two chunks. Decode the stream
+incrementally (``codecs.getincrementaldecoder("utf-8")``, as the Python SDK does)
+or join the chunks before decoding; decoding each chunk on its own with
+``errors="strict"`` raises on a split character, and with ``"replace"`` turns both
+halves into U+FFFD.
 
 .. code-block:: bash
 
@@ -85,19 +98,24 @@ WebSocket ``/generate/ws``
 
 ``/generate/ws`` is the same request over one persistent WebSocket, for control loops
 that cannot afford an HTTP round trip per step (robot policies, streaming world models).
+The server negotiates per-message deflate on its WebSocket routes unless the deployment
+turns it off (``ws_per_message_deflate`` in :doc:`serving`, as the Nemotron VoiceChat
+configs do).
 Each message is one request with the ``/generate`` fields — ``text``, ``files`` as
 ``[{"name": ..., "data": ...}]``, ``input_modalities``, ``output_modalities``,
 ``model_kwargs``, ``request_id`` — sent either as a JSON text frame (``data`` base64) or
-as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as the
+as a msgpack binary frame (``data`` raw bytes); a field sent as ``null`` counts as
+absent. Replies use the same encoding as the
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
 ``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
-was accepted ends the same way. Both carry the HTTP ``status`` when there is one
+was accepted ends with one such reply. Both carry the HTTP ``status`` when there is one
 (``409`` for a ``request_id`` still in flight, as on ``/generate``), and no
 ``finish`` follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
-``request_id`` tells the replies apart. Closing the socket aborts whatever is still in
-flight.
+``request_id`` tells the replies apart. Pipelined messages are submitted in the order
+they were sent, so of two under one ``request_id`` it is the later one that gets the
+``409`` while the earlier one runs; their replies may interleave. Closing the socket aborts whatever is still in flight.
 
 .. code-block:: python
 
@@ -121,6 +139,80 @@ flight.
 
 ``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
 loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+
+**Live input.** A model that listens while it runs (a full-duplex speech model) keeps a
+request's input open after the opening message, so the opening message may carry no media
+at all. An append feeds the running request more input, in order, while its output keeps
+streaming back:
+
+.. code-block:: text
+
+   {"request_id": ..., "append": {"text": ..., "files": [{"name": ..., "data": ..., "stream": ...}],
+                                  "model_kwargs": {...}}}
+
+Every field of the record is optional, but an append needs text, files or ``end_input``.
+``stream`` names the client stream a file is for (the model decides when it is absent; a
+name the model doesn't have is rejected), and ``model_kwargs`` are this append's own: they
+reach only the model's ``process_stream_chunk``, so they mean what that model reads from
+them, and the opening message's still hold for the request (its sampling settings, say).
+``"append": [files]`` is short for ``"append": {"files": [files]}``. What a model takes
+in an append is its own. An append of text alone that the model turns into no stream item
+is rejected; text sent with files reaches the model, and if it ignores the text, the text
+is dropped without an error. ``{"request_id", "end_input": true}``
+ends the input, alone or on an append (or on the opening message, for a one-shot
+request). The request then finishes as usual. Such a model treats every request over the
+socket as live, so a one-shot request to it carries ``end_input: true`` on its opening
+message: without it, the request waits for appends until it times out (or, with no
+``request_id``, is refused). A model may take several client streams
+(audio and video, say); ``end_input`` may then name the ones it ends, as a list
+(``"end_input": ["video_in"]``), and the call's input has ended once every stream has.
+An append that names a stream already ended, as a file's ``stream`` or in
+``end_input``, is answered as late, as one after ``end_input: true`` is (below). So is
+one whose files name no stream and that the model routes to a stream already ended:
+what it carried for that stream is dropped, uncounted, and the rest goes on. The opening
+message's files may name a ``stream`` too, which is checked the same way (a name the
+model doesn't have gets a 400), but the model routes the opening's files itself.
+
+A live call needs a ``request_id``; only the socket that opened it can append to it, and
+closing the socket aborts it. A message is an append if it carries ``append`` at its top
+level, or ``end_input`` (true or a list) and no ``text`` or ``files``; the fields inside
+an append's record never open a request, and a message that opens a request under the
+call's id gets a 409 while the call goes on. An append carries its text, files and
+``model_kwargs`` inside the record: beside it they are rejected. A ``null`` field counts as absent, inside
+the record too. Input resets the request timeout. A rejected append (an unknown file type,
+say) ends the call with its error (``status`` 400), and no finish follows, since the input
+it carried is lost. So does an append the server then fails to load or process (a corrupt
+file, say), with that failure's status, as for a request's own files, and so does input
+past a limit the model or the deployment sets on how much a stream may carry over a call
+(``client_streams`` in :doc:`serving`), with a 400 that names the limit. An append after
+``end_input``, or after the model has ended the call, or to a request this socket has no
+live call under, gets ``{"request_id", "append": true, "error"}``: a reply to that append,
+not the end of a request, and the call goes on. A live call that opens while the server
+is at ``max_concurrent_requests`` ends at once with ``status`` 503, rather than wait for a
+slot and start that far behind its input; a one-shot request waits in the queue. Other
+models ignore ``end_input``, and an append to them is rejected.
+Live input needs the Python frontend: ``--rust-frontend`` serves no ``/generate/ws``.
+The append size that serves best is the model's: Nemotron VoiceChat runs a live step as one
+CUDA graph only for an append of exactly 80 ms (1280 samples at 16 kHz) onto a call whose
+audio so far is a whole number of 80 ms frames. Keep the opening clip and every append a
+multiple of 1280 samples: one that is not (a one-second opening clip, 16000 samples) keeps
+the call off the graph for the rest of its life. Other sizes are served the same, more
+slowly (see :doc:`models`).
+
+.. code-block:: python
+
+   ws.send(msgpack.packb({"request_id": "call", "output_modalities": ["text", "audio"]}))
+   for chunk in microphone_chunks():  # e.g. 80 ms WAV files
+       ws.send(msgpack.packb({"request_id": "call",
+                              "append": [{"name": "chunk.wav", "data": chunk}]}))
+   # the record form: text, files aimed at a stream, and settings for this append,
+   # which only the model's process_stream_chunk reads
+   ws.send(msgpack.packb({"request_id": "call", "append": {
+       "text": "and now in French",
+       "files": [{"name": "chunk.wav", "data": chunk, "stream": "audio_in"}],
+       "model_kwargs": {"gain": 2.0},  # what this model's hook reads, not a sampling setting
+   }}))
+   ws.send(msgpack.packb({"request_id": "call", "end_input": True}))
 
 Python SDK
 ----------
@@ -237,7 +329,8 @@ Endpoints and model coverage:
      - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/audio/transcriptions``
-     - ``whisper_large``, ``higgs_audio``
+     - ``whisper_large``, ``whisper_large_v3_turbo``, ``qwen3_asr``, ``qwen3_asr_realtime``, ``higgs_audio``, ``omnilingual_asr_ctc_*``, ``canary``, ``canary_qwen``, ``parakeet``,
+       ``nemotron_asr``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
    * - ``WS /v1/realtime?intent=transcription``
@@ -245,7 +338,9 @@ Endpoints and model coverage:
      - Streaming speech-to-text: ``input_audio_buffer.append`` PCM16 chunks in,
        ``conversation.item.input_audio_transcription.delta`` (append-only) and
        ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
-       finishes the utterance.
+       finishes the utterance. Input is ``pcm16`` at 16 kHz (the default) or
+       ``{"type": "audio/pcm", "rate": 24000}``, resampled to 16 kHz. Turn
+       detection is null (client commits), ``server_vad`` or ``semantic_vad``; see below.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
@@ -293,7 +388,9 @@ Per-model notes:
   ``initial_prompt``), and ``response_format``
   ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
   model for timestamps. Whisper's language and timestamp tokens travel in the
-  text stream and are lifted into ``language`` / ``segments`` by the server; a
+  text stream and are lifted into ``language`` / ``segments`` by the server;
+  Higgs-Audio emits no timestamps, so its ``verbose_json`` / ``srt`` / ``vtt`` get
+  one segment per window, timed to the windows. A
   streaming client receives only the spoken words. Uploads longer than the
   model's clip (30 s for Whisper) are served as consecutive windows. By default
   they run in order, openai-whisper style: each window gets the transcript so
@@ -306,7 +403,28 @@ Per-model notes:
   Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
   as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
   once, each cut at the quietest moment before its boundary. Segment timestamps
-  are offset to the whole file.
+  are offset to the whole file. For Whisper, ``window_seconds`` in ``extra_body``
+  (5 to 30) sets the window length for one request, and an upload longer than it
+  is windowed. An upload, like any audio a request attaches, is refused once it
+  decodes past 30 min, whatever its header says (a 413 here, a 400 from the data
+  worker). The decode up to that point still runs, so this bounds memory, not
+  time: refusing a 31 min file takes about as long as decoding it.
+- **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
+  its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
+  clip of up to 20 s is one request; a longer upload is cut into windows of about equal
+  length, at most 16 s, at quiet points and transcribed in parallel (``window_seconds``
+  in ``extra_body``, 5 to 40, sets both lengths). There are no timestamps: ``srt`` / ``vtt``
+  get one cue per window, timed to the windows. Nothing detects the language: ``verbose_json``'s
+  ``language`` is the request's ``language`` as given, or null.
+- **Canary / Canary-Qwen / Parakeet / Nemotron ASR** — no conditioning text (``prompt`` is
+  dropped) and no timestamps: ``timestamp_granularities`` is a 400, and ``srt`` / ``vtt`` /
+  ``verbose_json`` get one segment per window. Canary takes ``language`` (the speech's,
+  English by default) and, through ``extra_body``, ``target_language`` or
+  ``task="translate"`` (into English) and ``punctuation``; the other three only transcribe,
+  and refuse a ``task`` other than ``transcribe``. Canary-Qwen is English only. Parakeet detects the language itself and refuses a ``language`` outside the 25 it knows;
+  Nemotron takes a locale (``en-US``), a bare code or ``auto``. Uploads longer than the
+  model's clip (40 s for Canary and Canary-Qwen, 10 min for Parakeet and Nemotron) run as
+  parallel windows.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
@@ -315,6 +433,52 @@ Per-model notes:
   in ``transcription_session.update``; a smaller ``chunk_seconds`` is raised to 0.5. An item holds
   at most 300 s of audio (``max_item_seconds`` in the session, lower if the model hears
   less): commit before then, since an append past it is refused with an ``error``.
+- **Realtime turn detection** — by default the client ends each utterance with
+  ``input_audio_buffer.commit``. With ``"turn_detection": {"type": "server_vad"}`` the
+  server does it, as OpenAI's server VAD does: ``threshold`` (default 0.5),
+  ``prefix_padding_ms`` (300) and ``silence_duration_ms`` (500). Silero VAD scores each
+  32 ms frame; a turn starts on a frame at or above ``threshold`` with up to
+  ``prefix_padding_ms`` of the audio before it. Silence starts on a frame below
+  ``threshold`` minus 0.15, and a frame at or above ``threshold`` cancels it; the turn
+  ends on whichever frame completes ``silence_duration_ms`` of whole frames counted from
+  that first silent frame, borderline frames included. The hysteresis is that of
+  Silero's own ``VADIterator``, but ``VADIterator`` counts from the frame after the first
+  silent one and ends only on a frame below ``threshold`` minus 0.15, so with a nonzero
+  ``silence_duration_ms`` it ends a turn one frame or more later. The server then sends
+  ``input_audio_buffer.speech_started`` (``audio_start_ms``),
+  ``input_audio_buffer.speech_stopped`` (``audio_end_ms``) and ``committed``, and the
+  transcription completes. Times are milliseconds of audio since the session started,
+  cleared audio included. A commit takes exactly the turn's audio; what follows, even
+  in the same append, goes to the next turn. A turn never passes the item cap: it is
+  committed before the frame that would pass it, and speech goes on in a new turn that
+  starts with that frame. A client ``commit`` ends an open turn; between turns it
+  drops what the VAD has not put in a turn yet. ``create_response`` and
+  ``interrupt_response`` are accepted and echoed but do nothing in a transcription
+  session; ``idle_timeout_ms`` and other types are refused. With 24 kHz input each
+  decision waits 3 ms more for the resampler. Install ``mstar[vad]`` (Silero VAD, MIT,
+  bundled 2 MB ONNX weights, run by onnxruntime on one CPU thread) or point
+  ``MSTAR_SILERO_VAD_PATH`` at the ONNX file (``silero_vad.onnx``; the package's other
+  exports take other inputs, and with one of them ``server_vad`` is refused); weights are
+  never downloaded. The Dynamo bridge has no turn detection yet and
+  refuses it.
+- **Semantic turn detection** — ``"turn_detection": {"type": "semantic_vad", "eagerness":
+  "auto"}`` ends a turn when the speaker sounds finished rather than after a fixed
+  silence, as OpenAI's semantic VAD does. When a pause reaches the eagerness' pause
+  (high 200 ms, medium and auto 300 ms, low 400 ms; all shorter than server_vad's
+  500 ms), Pipecat's Smart Turn v3 judges the turn's last 8 s of audio once; a
+  probability of at least 0.3, 0.5 or 0.7 (high, medium/auto, low) commits there, and
+  otherwise the server keeps listening. A silence of 2, 4 or 8 s always ends the turn.
+  Speech starts on Silero's 0.5 with 300 ms of prefix padding; the events are the same
+  as server_vad's. Smart Turn (BSD-2, 8 MB int8 ONNX, about 45 ms per pause on one CPU
+  thread) runs off the event loop. It needs ``onnxruntime`` and ``transformers``
+  (``mstar[vad]``) and its weights at ``MSTAR_SMART_TURN_PATH`` or in the local Hugging
+  Face cache (``hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx``). Without
+  them, or with an ONNX file whose inputs or outputs differ, the server warns at startup
+  and refuses ``semantic_vad`` with an ``error`` event that says why (no weights, a
+  missing package, or a file that is not the model), as ``server_vad`` is refused
+  without Silero. The session goes on with its previous settings, so the client can
+  choose ``server_vad`` or manual commits instead. See OpenAI's `realtime VAD guide
+  <https://platform.openai.com/docs/guides/realtime-vad>`_.
 - **Kokoro** — ``voice`` is one of the 54 bundled voices (default ``af_heart``) or a
   blend such as ``af_bella+af_sky`` or ``af_bella(2)+af_sky(1)``; ``speed`` scales the
   speaking rate (0.25-4.0). ``lang_code`` and ``phonemes`` go through ``extra_body``.

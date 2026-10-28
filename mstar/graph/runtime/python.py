@@ -107,11 +107,11 @@ class GraphRuntimeRequestInfo:
     # Buffered between send_outputs calls and flushed onto WORKER_GRAPHS_DONE,
     # so a persist signal cannot race the message that announces it.
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
-    pending_new_token_counts: dict[str, int] = field(default_factory=dict)
+    pending_new_token_counts: dict[str, dict[str, int]] = field(default_factory=dict)  # by partition
+    # one name per chunk emitted to the client; the conductor counts them
+    # stream edge -> destination worker -> items sent, local ones included
+    pending_stream_items: dict[str, dict[str, int]] = field(default_factory=dict)
     current_output_chunks: list[str] = field(default_factory=list)
-    output_loop_indices: dict[str, NestedLoopIndices] = field(
-        default_factory=dict
-    )
 
 
 class PythonGraphRuntime(GraphRuntime):
@@ -213,7 +213,8 @@ class PythonGraphRuntime(GraphRuntime):
         partition: str,
         graph_walk: str,
         partition_worker_graph_ids: list[int],
-        worker_graph_to_workers: ParallelList[int, list[str]]
+        worker_graph_to_workers: ParallelList[int, list[str]],
+        loop_caps: dict[str, int],
     ) -> int:
         # The conductor sends one NewRequest PER PARTITION, so this runs
         # several times for one request; they all share the first's handle.
@@ -255,7 +256,7 @@ class PythonGraphRuntime(GraphRuntime):
 
         for graph_id in partition_worker_graph_ids:
             if graph_id in self._queues:
-                self._queues[graph_id].add_request(handle)
+                self._queues[graph_id].add_request(handle, loop_caps)
 
         self._request_info[handle].partition_info[partition] = GraphRuntimePartitionInfo(
             graph_walk=graph_walk,
@@ -1373,7 +1374,7 @@ class PythonGraphRuntime(GraphRuntime):
             for edge in routing.persist:
                 for info in edge.tensor_info:
                     self._tensor_manager.set_persist(info.uuid, persist=True)
-            if owned:
+            if owned or completion.transferred_refs:
                 # persist is deliberately absent: those tensors are held alive
                 # by the persist marker, and counting them here would
                 # double-count a signal whose destination is EMPTY_DESTINATION
@@ -1385,7 +1386,9 @@ class PythonGraphRuntime(GraphRuntime):
                     + sum(routing.to_workers.values(), start=[])
                     + sum(routing.streaming_to_workers.values(), start=[])
                 )
-                self._tensor_manager.set_output_ref_counts(owned, routed_edges)
+                self._tensor_manager.set_output_ref_counts(
+                    owned, routed_edges, completion.transferred_refs,
+                )
 
             # What the caller has to stage for remote reads. Every tensor on
             # an outgoing edge, not just the ones this batch produced: a loop
@@ -1484,6 +1487,8 @@ class PythonGraphRuntime(GraphRuntime):
         sent_rids: list[int] = []
 
         for rid, routing in completion.routing.items():
+            if rid in input.failed_rids:
+                continue
             fwd_info = fwd_infos.get(rid)
             info = self._request_info.get(rid)
 
@@ -1495,10 +1500,9 @@ class PythonGraphRuntime(GraphRuntime):
 
             counts = new_token_counts.get(rid)
             if counts and info is not None:
+                pending = info.pending_new_token_counts.setdefault(partition, {})
                 for name, count in counts.items():
-                    info.pending_new_token_counts[name] = (
-                        info.pending_new_token_counts.get(name, 0) + count
-                    )
+                    pending[name] = pending.get(name, 0) + count
 
             if routing.emit_to_client and info is not None:
                 # As in _send_input_signals: the api server reads these
@@ -1510,7 +1514,6 @@ class PythonGraphRuntime(GraphRuntime):
                     edge.name for edge in routing.emit_to_client
                 )
                 for edge in routing.emit_to_client:
-                    info.output_loop_indices[edge.name] = nested_idxs.get(rid)
                     self._communicator.send("api_server", APIServerMessage(
                         message_type="result_tensors",
                         body=ResultTensors(
@@ -1527,6 +1530,16 @@ class PythonGraphRuntime(GraphRuntime):
             # local_streaming_by_signal is how the caller finds those.
             for worker_id, edges in routing.streaming_to_workers.items():
                 self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
+
+            if info is not None:
+                for worker_id, edges in [
+                    (self._my_worker_id, routing.streaming_local),
+                    *routing.streaming_to_workers.items(),
+                ]:
+                    for edge in edges:
+                        if edge.tensor_info:
+                            sent = info.pending_stream_items.setdefault(edge.name, {})
+                            sent[worker_id] = sent.get(worker_id, 0) + len(edge.tensor_info)
 
             if routing.completed_worker_graph_ids and info is not None:
                 part = info.partition_info.get(partition)
@@ -1598,8 +1611,9 @@ class PythonGraphRuntime(GraphRuntime):
                     seen.add((edge.name, i.uuid))
                     infos.append(i)
         info.pending_persist_signals = []
-        new_token_counts = info.pending_new_token_counts
-        info.pending_new_token_counts = {}
+        new_token_counts = info.pending_new_token_counts.pop(partition, {})
+        stream_items_sent = info.pending_stream_items
+        info.pending_stream_items = {}
         output_signal_names = list(info.current_output_chunks)
         info.current_output_chunks.clear()
 
@@ -1620,7 +1634,7 @@ class PythonGraphRuntime(GraphRuntime):
                 partition_name=partition,
                 partition_done=partition_done,
                 stream_tokens_consumed=stream_tokens_consumed,
-                output_loop_indices=info.output_loop_indices,
+                stream_items_sent=stream_items_sent,
                 graph_timings=graph_timings,
                 rx_info=rx_info,
                 tx_info=tx_info,

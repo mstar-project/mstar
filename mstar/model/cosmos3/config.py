@@ -230,19 +230,22 @@ class Cosmos3ReasonerConfig:
 REASONER_MODEL_TYPES: frozenset[str] = frozenset({"cosmos3_edge"})
 # transformer/config.json ``backbone_type`` of the Edge checkpoints, and the
 # model card's serving recipe for them: 832x480 video (121 frames, 20 UniPC
-# steps on the native flow schedule at flow shift 12), 640x640 images,
-# cover-scale + center-crop image conditioning (the diffusers 0.40 pipeline
-# recipe), action modes at flow shift 10. Applied by ``from_pretrained`` where
-# a field still holds the Nano default, so a yaml overrides any of them.
+# steps on the native flow schedule at flow shift 12), 640x640 images, action
+# modes at flow shift 10. Applied by ``from_pretrained`` where a field still
+# holds the Nano default, so a yaml overrides any of them.
+# Chained windows of 61 frames re-pinning 32 hold the conditioning scene over
+# a 241-frame rollout when the prompt describes the image; 29/8 windows smear
+# more at every boundary.
 EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
 EDGE_RECIPE_DEFAULTS = {
-    "conditioning_resize": "aspect_crop",
     "image_size_default": (640, 640),
     "video_size_default": (832, 480),
     "num_frames_video": 121,
     "num_inference_steps_video": 20,
     "flow_shift_video": 12.0,
     "flow_shift_action": 10.0,
+    "window_frames_default": 61,
+    "overlap_frames_default": 32,
 }
 
 
@@ -329,6 +332,9 @@ class Cosmos3Config:
     # one-frame conditioning visibly degrades the continuation.
     window_frames_default: int = 29
     overlap_frames_default: int = 8
+    # kv windows have their own default: a longer kv window cuts harder at the
+    # first boundary, so it does not follow the chained one.
+    kv_window_frames_default: int = 29
     # kv-mode committed-context horizon (61 px = 16 latent frames): frames
     # older than this behind the commit frontier are released from the cache.
     # A request may pass context_frames=0 to retain everything.
@@ -433,11 +439,11 @@ class Cosmos3Config:
     flow_shift_image: float | None = 3.0
     flow_shift_video: float | None = None
     # How an image-to-video conditioning frame reaches the generation size:
-    # "stretch" (plain bilinear resize; the diffusers 0.39 pipeline the Nano
-    # checkpoints were validated against) or "aspect_crop" (cover-scale,
-    # antialiased resize, center crop, 8-bit rounding; the diffusers 0.40 /
-    # vLLM-Omni recipe, set by the Edge yamls). See components/conditioning.py.
-    conditioning_resize: str = "stretch"
+    # "aspect_crop" (cover-scale, antialiased bilinear resize, center crop,
+    # 8-bit rounding; the cosmos-framework and diffusers >= 0.40 recipe) or
+    # "stretch" (antialiased bilinear resize to the target, aspect ratio not
+    # kept; diffusers 0.39). See components/conditioning.py.
+    conditioning_resize: str = "aspect_crop"
     # ``model_index.json``: the pipeline sets the UniPC schedule from
     # explicitly linspaced flow sigmas (1 - 1/T ... 0) instead of the
     # scheduler's own timestep spacing. Edge checkpoints set it; the karras
@@ -534,12 +540,13 @@ class Cosmos3Config:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"Cosmos3 {name} must be an integer >= 0, got {value!r}.")
-        window = 1 + (self.window_frames_default - 1) // self.vae.scale_factor_temporal
+        default_frames = min(self.window_frames_default, self.kv_window_frames_default)
+        window = 1 + (default_frames - 1) // self.vae.scale_factor_temporal
         if self.windowed_decode_latents_per_call > window:
             raise ValueError(
                 f"Cosmos3 windowed_decode_latents_per_call={self.windowed_decode_latents_per_call} is more "
-                f"than the {window} latent frames of the default window (window_frames_default="
-                f"{self.window_frames_default}); 0 decodes each window's new latents in one call."
+                f"than the {window} latent frames of the smaller default window ({default_frames} frames); "
+                "0 decodes each window's new latents in one call."
             )
 
     @property

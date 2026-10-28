@@ -10,8 +10,19 @@ protocol are untouched):
     frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
                           prompt_parts, streaming} | {t:"abort", rid, sub}
+                       | {t:"ping", rid, sub}
+                       | {t:"metrics", rid, sub, refusals:{route, status, count}}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
+                       | {t:"pong", rid, sub}
+                       | {t:"metrics", rid, sub, data(bin), metadata}
+
+A ``metrics`` request carries the frontend's cumulative refusal counts as
+three parallel lists (route template, status, count), which the API server
+exports as ``mstar_http_refusals_total``. The reply is what ``GET /metrics``
+serves on the Python frontend: the text rendered from ``APIServer.metrics``
+with its ``content_type`` in ``metadata``, or empty ``metadata`` when metrics
+are off (a 404; the counts are then ignored).
 
 ``sub`` names one submission and is never reused. A client may resubmit its
 ``rid`` as soon as it drops a stream, and that stream's ``done`` or late
@@ -49,6 +60,7 @@ from mstar.communication.rust_communicator import (
     RustZMQCommunicator,
 )
 from mstar.model.multimodal import PromptPart
+from mstar.utils.client_errors import client_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +68,18 @@ logger = logging.getLogger(__name__)
 #: the loop stays responsive to shutdown. Not a latency knob: an arriving
 #: message ends the wait immediately.
 BRIDGE_RECV_WAIT_S = 0.05
+
+#: The model's adapter class in ``ADAPTER_REGISTRY``; ``mstar-server`` picks
+#: its OpenAI translation by it (``Adapter::from_python``).
+OPENAI_ADAPTER_ENV = "MSTAR_OPENAI_ADAPTER"
+
+
+def openai_adapter_class(model_name: str) -> str:
+    """The class name of ``model_name``'s OpenAI adapter, "" when it has none."""
+    from mstar.api_server.openai.adapters import get_adapter
+
+    adapter = get_adapter(model_name)
+    return "" if adapter is None else type(adapter).__name__
 
 
 
@@ -88,6 +112,7 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env = {k: v for k, v in os.environ.items() if k != API_KEY_ENV}
     if api_key:
         env[API_KEY_ENV] = api_key
+    env[OPENAI_ADAPTER_ENV] = openai_adapter_class(model_name)
     proc = subprocess.Popen([binary, model_name, str(port), bridge_dir,
                              upload_dir], env=env)
     logger.info("Rust frontend started (pid=%d, port=%d)", proc.pid, port)
@@ -161,8 +186,10 @@ class RustFrontendBridge:
                     "data": str(detail).encode(), "metadata": {"status": status},
                 })
                 return
-            logger.warning("submit %s failed: %r", rid, e)
-            self._err(rid, sub, repr(e))
+            text, _ = client_error_text(
+                e, f"submit {rid} failed", log=logger, type_name=False,
+            )
+            self._err(rid, sub, text)
             return
         # Bound to this submission now, not when the task first runs: a later
         # submit in the same receive batch may reuse the rid.
@@ -180,9 +207,15 @@ class RustFrontendBridge:
                 })
             self._send({"t": "done", "rid": rid, "sub": sub})
         except Exception as e:  # noqa: BLE001 — includes the per-request timeout
-            detail = getattr(e, "detail", None) or repr(e)
-            logger.warning("request %s failed: %s", rid, detail)
-            self._err(rid, sub, str(detail))
+            detail = getattr(e, "detail", None)
+            if detail:
+                detail = str(detail)
+                logger.warning("request %s failed: %s", rid, detail)
+            else:
+                detail, _ = client_error_text(
+                    e, f"request {rid} failed", log=logger, type_name=False,
+                )
+            self._err(rid, sub, detail)
         finally:
             self._keys.pop(sub, None)
 
@@ -194,6 +227,34 @@ class RustFrontendBridge:
             self.server.abort_request(msg["rid"])
         else:
             self.server.abort_submission(self._keys.pop(sub, None))
+
+    def _metrics(self, msg: dict) -> None:
+        metrics = self.server.metrics
+        reply = {"t": "metrics", "rid": msg["rid"], "sub": msg.get("sub"),
+                 "data": b"", "metadata": {}}
+        if metrics is not None:
+            refusals = msg.get("refusals")
+            if refusals is not None:
+                metrics.refusals.update_rust(
+                    refusals["route"], refusals["status"], refusals["count"])
+            reply["data"] = metrics.render()
+            reply["metadata"] = {"content_type": metrics.content_type}
+        self._send(reply)
+
+    def _handle(self, msg: dict) -> None:
+        t = msg.get("t")
+        if t == "submit":
+            self._submit(msg)
+        elif t == "abort":
+            self._abort(msg)
+        elif t == "ping":
+            # Deep-health liveness: the frontend's /health goes red
+            # unless this loop answers.
+            self._send({"t": "pong", "rid": msg["rid"], "sub": msg.get("sub")})
+        elif t == "metrics":
+            self._metrics(msg)
+        else:
+            logger.warning("bridge: unknown message type %r", t)
 
     # -- loop ----------------------------------------------------------------
 
@@ -219,17 +280,7 @@ class RustFrontendBridge:
                 # and takes the whole server down. `_submit` is already wrapped;
                 # this guards every other branch.
                 try:
-                    t = msg.get("t")
-                    if t == "submit":
-                        self._submit(msg)
-                    elif t == "abort":
-                        self._abort(msg)
-                    elif t == "ping":
-                        # Deep-health liveness: the frontend's /health goes red
-                        # unless this loop answers.
-                        self._send({"t": "pong", "rid": msg["rid"], "sub": msg.get("sub")})
-                    else:
-                        logger.warning("bridge: unknown message type %r", t)
+                    self._handle(msg)
                 except Exception:  # noqa: BLE001 — one bad message must not kill the loop
                     logger.exception("bridge: dropping a message that raised (%r)",
                                      msg.get("t"))

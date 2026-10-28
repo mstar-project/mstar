@@ -59,7 +59,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.chatterbox.components.audio_frontend import resample, trim_silence
 from mstar.model.chatterbox.config import (
     COND_LABEL,
@@ -100,7 +100,7 @@ BUILTIN_VOICE = "default"
 _BUILTIN_VOICE_ALIASES = {None, "", BUILTIN_VOICE, "builtin", "built-in"}
 
 # Per-request generation knobs that ride on the conductor metadata
-_T3_KNOBS = ("cfg_weight", "exaggeration", "min_p", "max_new_tokens")
+_T3_KNOBS = ("cfg_weight", "exaggeration", "min_p")
 _S3GEN_KNOBS = ("n_cfm_timesteps", "watermark")
 
 MAX_REFERENCE_SECONDS = 30.0
@@ -121,7 +121,7 @@ MAX_REPETITION_PENALTY = 2.0
 MAX_CFG_WEIGHT = 1.0
 MAX_EXAGGERATION = 2.0
 # Dividing the logits by a smaller value overflows the same way: a temperature
-# under it samples greedily (vLLM's convention), a penalty under it is refused
+# under it samples greedily, a penalty under it is refused
 MIN_TEMPERATURE = 1e-5
 MIN_REPETITION_PENALTY = 1e-5
 
@@ -129,6 +129,8 @@ MIN_REPETITION_PENALTY = 1e-5
 class ChatterboxModel(Model):
     """Model contract: prompt processing, graph, partitions, resources and the
     per-partition state machine. No GPU compute lives here."""
+
+    LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def __init__(
         self,
@@ -425,6 +427,14 @@ class ChatterboxModel(Model):
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
         return self.resolve_generation_kwargs(model_kwargs)["max_new_tokens"]
 
+    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
+        # The stop check counts the prefill's token, so it allows max_new_tokens - 1 iterations.
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        t3 = KVLabel(growth=(("decode", "decode_loop"),))
+        return {T3_KV: {COND_LABEL: t3, UNCOND_LABEL: t3}}
+
     # -----------------------------------------------------------------------
     # Graph
     # -----------------------------------------------------------------------
@@ -554,20 +564,19 @@ class ChatterboxModel(Model):
         any system library; torchcodec needs FFmpeg's shared libraries, which
         the nodes may not have, so it is only the fallback for other codecs.
         """
-        try:
-            import soundfile as sf
+        from mstar.api_server.media_io import AudioRefusedError, decode_torchcodec_capped, read_soundfile_capped
 
-            data, sr = sf.read(filepath, dtype="float32", always_2d=True)
-            wav = torch.from_numpy(data).mean(dim=1)
+        try:
+            data, sr = read_soundfile_capped(filepath)
+            wav = torch.from_numpy(data)
+        except AudioRefusedError:
+            raise
         except Exception as exc:  # noqa: BLE001 - any decode failure falls through
             logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
-            from torchcodec.decoders import AudioDecoder
-
             # an undecodable upload is the client's error (400); a missing
             # decoder library above still surfaces as a server error
             try:
-                decoder = AudioDecoder(filepath, sample_rate=S3GEN_SR, num_channels=1)
-                return decoder.get_all_samples().data[0].float()
+                return decode_torchcodec_capped(filepath, S3GEN_SR).float()
             except RuntimeError as decode_exc:
                 raise ValueError(f"Could not decode the reference audio: {decode_exc}") from decode_exc
         if wav.numel() == 0:
@@ -624,7 +633,7 @@ class ChatterboxModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs: Any,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         if not prompt or not prompt.strip():
             raise ValueError("Chatterbox requires a non-empty text prompt")
         if any(m not in ("text", "audio") for m in input_modalities):
@@ -632,7 +641,7 @@ class ChatterboxModel(Model):
         if set(output_modalities) != {"audio"}:
             raise ValueError("Chatterbox produces audio output only")
         # a bad knob fails here as a 400; past this point it would hang the request
-        self.resolve_generation_kwargs(kwargs)
+        knobs = self.resolve_generation_kwargs(kwargs)
 
         text_ids = self._tokenize(prompt, kwargs.get("language_id"))
         if text_ids.numel() > self.config.max_text_tokens:
@@ -646,16 +655,44 @@ class ChatterboxModel(Model):
         uploaded = (tensors or {}).get("audio_inputs") or []
         if len(uploaded) > 1:
             raise ValueError("Give one reference clip per request")
+        wav = None
         if uploaded:
             wav = uploaded[0]
-        elif voice in _BUILTIN_VOICE_ALIASES:
-            return out
-        else:
+        elif voice not in _BUILTIN_VOICE_ALIASES:
             wav = self.load_audio(str(self._preset_voice_path(str(voice))), "cpu").data
-        wav = self._prepare_reference(wav)
-        out[REF_AUDIO] = [wav]
-        out[VOICE_KEY] = [voice_key_for(wav)]
-        return out
+        if wav is not None:
+            wav = self._prepare_reference(wav)
+            out[REF_AUDIO] = [wav]
+            out[VOICE_KEY] = [voice_key_for(wav)]
+        layout = self._t3_layout(text_ids, wav)
+        guided = knobs["cfg_weight"] > 0
+        labels = (COND_LABEL, UNCOND_LABEL) if guided else (COND_LABEL,)
+        return ProcessPromptOutput(out, {"kv_layout": {T3_KV: dict.fromkeys(labels, layout)}})
+
+    def _t3_layout(self, text_ids: torch.Tensor, reference: torch.Tensor | None) -> LabelLayout:
+        """What T3 writes on each label the request opens: ``[cond | text | BOS]``, then a row per decode step."""
+        from mstar.model.chatterbox.submodules import reference_tokens
+
+        t3 = self.config.t3
+        walk = "prefill" if reference is None else "prefill_voice"
+        cond = t3.cond_len
+        if not t3.use_perceiver_resampler:
+            # `cond_len` counts the most prompt tokens there can be, so count the raw prompt tokens written instead
+            prompt = (
+                self._builtin_voice()["t3"]["cond_prompt_speech_tokens"].numel() if reference is None
+                else reference_tokens(reference.numel(), self.config)
+            )
+            cond += prompt - t3.speech_cond_prompt_len
+        text = text_ids.numel()
+        bos = 2 if t3.duplicate_bos_in_prefill else 1
+        return LabelLayout(
+            spans=(
+                Span("rows", walk, cond, cond, PROMPT_TOKENS),
+                Span("ids", walk, text, text, TEXT_INPUTS),
+                Span("rows", walk, bos, bos, PREV_TOKEN),
+            ),
+            growth=(("decode_loop", 1),),
+        )
 
     def _tokenize(self, prompt: str, language_id: str | None) -> torch.Tensor:
         """Text ids for the variant's front end; ``language_id`` (a request knob)

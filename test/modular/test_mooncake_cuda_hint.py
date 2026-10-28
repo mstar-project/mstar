@@ -5,6 +5,8 @@ with the dlopen error below, and the old advice ("Install mooncake-transfer-engi
 pointed at the wheel that was already installed.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -36,8 +38,8 @@ def test_cuda12_wheel_on_cuda13_torch_names_the_cuda13_wheel(monkeypatch, torch_
     message = _start_error(monkeypatch, _NO_CUDART_12, torch_cuda)
     assert f"needs the CUDA 12 runtime, but torch is built for CUDA {torch_cuda}" in message
     assert (
-        "`pip uninstall -y mooncake-transfer-engine && "
-        "pip install --force-reinstall --no-deps mooncake-transfer-engine-cuda13`"
+        "`uv pip uninstall mooncake-transfer-engine && "
+        "uv pip install --reinstall --no-deps mooncake-transfer-engine-cuda13`"
     ) in message
     assert "nvidia-cuda-runtime" not in message
 
@@ -46,21 +48,21 @@ def test_cuda13_wheel_on_cuda12_torch_names_the_default_wheel(monkeypatch):
     message = _start_error(monkeypatch, _NO_CUDART_13, "12.8")
     assert "needs the CUDA 13 runtime, but torch is built for CUDA 12.8" in message
     assert (
-        "`pip uninstall -y mooncake-transfer-engine-cuda13 && "
-        "pip install --force-reinstall --no-deps mooncake-transfer-engine`"
+        "`uv pip uninstall mooncake-transfer-engine-cuda13 && "
+        "uv pip install --reinstall --no-deps mooncake-transfer-engine`"
     ) in message
 
 
 def test_cuda_wheel_on_cpu_torch_names_the_non_cuda_wheel(monkeypatch):
     message = _start_error(monkeypatch, _NO_CUDART_12, None)
     assert "but torch is built without CUDA" in message
-    assert "pip install --force-reinstall --no-deps mooncake-transfer-engine-non-cuda`" in message
+    assert "uv pip install --reinstall --no-deps mooncake-transfer-engine-non-cuda`" in message
 
 
 def test_missing_runtime_for_the_same_cuda_major_names_the_runtime(monkeypatch):
     message = _start_error(monkeypatch, _NO_CUDART_12, "12.8")
-    assert "`pip install nvidia-cuda-runtime-cu12`" in message
-    assert "pip uninstall" not in message
+    assert "`uv pip install nvidia-cuda-runtime-cu12`" in message
+    assert "uninstall" not in message
 
 
 @pytest.mark.parametrize(
@@ -86,3 +88,11 @@ def test_not_installed_names_the_wheel_for_this_torch(monkeypatch, torch_cuda, w
 def test_other_import_failures_keep_the_generic_advice(monkeypatch, import_error):
     message = _start_error(monkeypatch, import_error, "13.0")
     assert message.endswith("Install mooncake-transfer-engine or use SHM protocol.")
+
+
+def test_the_printed_swap_is_the_one_the_install_docs_give(monkeypatch):
+    message = _start_error(monkeypatch, _NO_CUDART_12, "13.0")
+    docs = (Path(__file__).resolve().parents[2] / "docs" / "installation.rst").read_text()
+    for command in ("uv pip uninstall mooncake-transfer-engine",
+                    "uv pip install --reinstall --no-deps mooncake-transfer-engine-cuda13"):
+        assert command in message and command in docs

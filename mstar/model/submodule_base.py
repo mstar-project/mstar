@@ -26,6 +26,28 @@ class HostRows(NamedTuple):
     request_ids: tuple
     buffers: dict[str, torch.Tensor]
 
+    def first_values(self, name: str, request_ids: Sequence[str]):
+        """``(rid, value)`` for each of ``request_ids`` that has a row, where
+        ``value`` is the first element of its row of buffer ``name``, off one
+        ``tolist``; None when the step staged no such buffer. A request with
+        no row is skipped, as the per-request stop path skips a request with
+        no output."""
+        buffer = self.buffers.get(name)
+        if not torch.is_tensor(buffer) or buffer.dim() == 0:
+            return None
+        values = buffer.reshape(buffer.shape[0], -1)[:, 0].tolist()
+        rows = self.request_ids
+        if len(rows) >= len(request_ids) and all(
+            a == b for a, b in zip(request_ids, rows, strict=False)
+        ):
+            # the common case: the batch in forward order, no row map needed
+            return zip(request_ids, values, strict=False)
+        row_of = {rid: i for i, rid in enumerate(rows)}
+        return (
+            (rid, values[i]) for rid in request_ids
+            if (i := row_of.get(rid)) is not None and i < len(values)
+        )
+
 
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
@@ -464,6 +486,13 @@ class ModelInputsFromEngine:
     # ``capture_forward_method``, so most submodules never need this.
     captured: bool = False
 
+    # Every row is a dummy request (CUDA-graph capture or warmup), not real traffic.
+    synthetic: bool = False
+
+    # Real requests' token count; they lead the batch, later rows are replay padding.
+    # None: no padding.
+    real_seq_len: int | None = None
+
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
@@ -500,6 +529,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # params to the autocast dtype nor wraps its forward (or capture) in
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
+
+    # Float32 math for this node's forward, where the process default (TF32
+    # matmuls and cuDNN, see ``mstar.engine.apply_torch_config``) is too coarse:
+    # "highest" runs fp32 matmuls in full fp32, and ``cudnn_allow_tf32 = False``
+    # does the same for cuDNN convolutions and RNNs. None keeps the default. The
+    # engine applies them around the forward, its compile and its capture (see
+    # ``mstar.engine.fp32_precision``); don't flip the process-wide flags here.
+    # Read once, when the engine loads the submodule.
+    float32_matmul_precision: str | None = None
+    cudnn_allow_tf32: bool | None = None
 
     # Set True on a submodule whose decode walk may read its last sampled
     # tokens back off the sampler's slot masters (``device_loopback_signals``).
@@ -584,7 +623,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return state
 
     def get_device(self):
-        return next(self.parameters()).device
+        # Cached rather than read off ``parameters()``, which walks the module
+        # tree; ``_apply`` (to / cuda / to_empty) drops it, so a moved module
+        # reports its new device.
+        device = self.__dict__.get("_cached_device")
+        if device is None:
+            device = self.__dict__["_cached_device"] = next(self.parameters()).device
+        return device
+
+    def _apply(self, fn, recurse=True):
+        self.__dict__.pop("_cached_device", None)
+        return super()._apply(fn, recurse)
 
     @abstractmethod
     def prepare_inputs(
@@ -917,10 +966,20 @@ class NodeSubmodule(torch.nn.Module, ABC):
         self, outputs: BatchedModelOutput,
         request_infos: dict[int, CurrentForwardPassInfo],
         inputs: list[NodeInputs],
+        piecewise_runners: Mapping[str, PiecewiseAcceleratorGraphRunner] | None = None,
     ) -> None:
-        """``postprocess`` for a rows-only step, which has no per-request
-        outputs: works on the rows of ``outputs`` in place. Optional; only
-        called when overridden."""
+        """Once per step, for work that batches across the step's requests
+        (e.g. watermarking the audio chunks ``postprocess`` trimmed). Works on
+        ``outputs`` in place: its rows on a rows-only step, which has no
+        per-request outputs, and otherwise the per-request outputs after
+        every request's ``postprocess``, for the requests whose
+        ``postprocess`` succeeded (``request_infos``' keys, in the order of
+        ``inputs``); a raise then fails every one of them. Optional; only
+        called when overridden.
+
+        ``piecewise_runners`` are this node's captured regions
+        (``get_piecewise_accelerator_graph_configs``), as ``engine_inputs`` hands
+        them to the forward, so this work can replay a capture too."""
 
     def check_stop(
         self, request_id: str,
@@ -968,6 +1027,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 
 class ARNodeSubmodule(NodeSubmodule):
+    # Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.
+    # The engine probes the prefix cache for a walk that carries them only then.
+    cuts_tensor_inputs: bool = False
+
     def split_inputs(
         self,
         graph_walk: str,

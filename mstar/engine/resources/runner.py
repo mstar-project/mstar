@@ -9,23 +9,24 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection, Mapping
-from time import perf_counter
 from typing import Any
 
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
-from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
     FullAdmitOutcome,
     SubmoduleStep,
 )
-from mstar.utils.profiler import PHASE_PERIOD, phase_record, range_pop, range_push
+from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
 
-def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
+def topo_sort(resources: Mapping[str, Resource | NodeResourceSpec]) -> tuple[str, ...]:
+    """Keys in dependency order; built resources at load, their specs when the
+    conductor validates a deployment."""
     deps: dict[str, set[str]] = {
         key: set(resource.depends_on()) for key, resource in resources.items()
     }
@@ -100,6 +101,10 @@ class StepRunner:
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
+        self._trail_order = [
+            key for key in self._order if self._resources[key].page_trail() is not None
+        ]
+        self._node_trail_order = self._per_node(node_resources, self._trail_order)
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
@@ -136,6 +141,34 @@ class StepRunner:
             self._resources[key].apply_cached_prefix(
                 rid, node_name, graph_walk, inputs, prefix,
             )
+
+    def lease_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> dict[str, list[int]]:
+        leases = {}
+        for key in self._sweep(self._node_order, self._order, node_name):
+            pages = self._resources[key].lease_cached_prefix(rid, node_name, graph_walk)
+            if pages is not None:
+                leases[key] = pages
+        return leases
+
+    def adopt_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, leases: dict[str, list[int]], caught_up: bool,
+    ) -> bool:
+        ready = True
+        for key, pages in leases.items():
+            ready &= self._resources[key].adopt_cached_prefix(rid, node_name, graph_walk, pages, caught_up)
+        return ready
+
+    def release_cached_prefix(self, rid: str, node_name: str, graph_walk: str) -> None:
+        for key in self._sweep(self._node_order, self._order, node_name):
+            self._resources[key].release_cached_prefix(rid, node_name, graph_walk)
+
+    def page_trails(self, node_name: str) -> dict[str, tuple[int, int]]:
+        return {
+            key: self._resources[key].page_trail()
+            for key in self._sweep(self._node_trail_order, self._trail_order, node_name)
+        }
 
     def prefix_chain_keys(self, node_name: str | None) -> list[str]:
         """The node's resources with a prefix cache open right now. Empty in
@@ -415,12 +448,12 @@ class StepRunner:
                 continue
             if self._nvtx:
                 range_push(f"res.admit.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.admit.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.admit.{key}", t0)
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
@@ -428,14 +461,22 @@ class StepRunner:
                     "Admit for resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
-                for done in reversed([*covered, *admitted, key]):
-                    self._resources[done].rollback_admit(
-                        step.get(done), step.ctx,
-                    )
+                self._unwind(step, [*covered, *admitted, key])
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
+
+    def rollback_admit(self, step: SubmoduleStep) -> None:
+        """Give back everything an admitted step reserved, for a step that
+        will not run: the unwind a refused ``admit`` does, over every
+        resource the step declares."""
+        self._unwind(step, self._keys_for(step))
+
+    def _unwind(self, step: SubmoduleStep, keys: list[str]) -> None:
+        # reverse dependency order, off a list so every rank unwinds alike
+        for key in reversed(keys):
+            self._resources[key].rollback_admit(step.get(key), step.ctx)
 
     def plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan in dependency order
@@ -453,12 +494,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.plan.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.plan.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.plan.{key}", t0)
                 if self._nvtx:
                     range_pop()
         return results
@@ -476,9 +517,12 @@ class StepRunner:
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_admit.{key}")
+            t0 = phase_start()
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
+                if t0 is not None:
+                    phase_end(f"res.pre_admit.{key}", t0)
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
@@ -486,10 +530,7 @@ class StepRunner:
                     "Admit for pre-planning resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
-                for done in reversed([*admitted, key]):
-                    self._resources[done].rollback_admit(
-                        step.get(done), step.ctx,
-                    )
+                self._unwind(step, [*admitted, key])
                 self._pre_admitted = None
                 return FullAdmitOutcome(outcome, key)
             admitted.append(key)
@@ -507,12 +548,12 @@ class StepRunner:
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_plan.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.pre_plan.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.pre_plan.{key}", t0)
                 if self._nvtx:
                     range_pop()
         self._staged = self._step_key(step)
@@ -523,12 +564,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.commit.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 self._resources[key].commit(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.commit.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.commit.{key}", t0)
                 if self._nvtx:
                     range_pop()
 

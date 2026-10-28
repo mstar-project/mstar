@@ -41,9 +41,10 @@ model_kwargs:
   flow_shift_action: 10.0
   # Streaming rollout: windowed autoregressive video (the video_gen_ar walk,
   # the vae_decoder_ar node and its streaming decoder partition). Requests opt
-  # in per call with window_mode ("chained" | "kv") and stream each finished
-  # window with stream_video; the kv-mode context horizon (context_frames)
-  # bounds the committed K/V a long rollout keeps.
+  # in per call with window_mode ("chained" | "kv") or stream_video alone
+  # (chained). Edge's chained windows default to 61 frames re-pinning 32
+  # (window_frames_default / overlap_frames_default). kv is experimental: it
+  # leaves the conditioning image within a few windows on this checkpoint.
   enable_windowed_video: true
   # The streaming decoder keeps each live stream's VAE conv cache (1.33 GiB
   # of tensors per stream at 832x480 in bf16; it grows with the frame area and
@@ -66,10 +67,12 @@ node_groups:
 # Requests the server runs after the workers are ready and before it binds,
 # so no client pays a shape's first torch.compile of the denoise step (15-25 s
 # to the first frame on a fresh server against 1.9 s warm). One per default
-# video shape: the 121-frame clip and the 29-frame kv window (57 frames is two
-# windows) and an image-conditioned rollout (the conditioning encode and the
-# i2v prefill are their own first-time cost). The compile keys on shapes, not
-# steps, so four steps do. Startup grows by their wall time.
+# video shape: the 121-frame clip and the 61-frame chained window (93 frames is
+# two windows) and an image-conditioned rollout (the conditioning encode and
+# the i2v prefill are their own first-time cost). The compile keys on shapes,
+# not steps, so four steps do. Startup grows by their wall time. The
+# experimental kv mode is not warmed: its first request pays the 29-frame
+# window's compile.
 warmup_requests:
   - text: warmup
     output_modalities: [video]
@@ -77,4 +80,4 @@ warmup_requests:
   - text: warmup
     files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
     output_modalities: [video]
-    model_kwargs: {window_mode: kv, num_frames: 57, num_inference_steps: 4}
+    model_kwargs: {window_mode: chained, num_frames: 93, num_inference_steps: 4}

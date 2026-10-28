@@ -15,8 +15,10 @@ use subtle::{Choice, ConstantTimeEq};
 
 pub const API_KEY_ENV: &str = "MSTAR_API_KEY";
 
-/// Served without a key: liveness probes from load balancers and orchestrators.
-pub const UNAUTHENTICATED_PATHS: &[&str] = &["/health"];
+/// Served without a key: liveness probes from load balancers and orchestrators,
+/// and the Prometheus scrape endpoint (request counts, latencies and the model
+/// name; never prompts or outputs).
+pub const UNAUTHENTICATED_PATHS: &[&str] = &["/health", "/metrics"];
 
 /// The deployment's key; `None` turns the check off. An empty value is no key.
 #[derive(Clone)]
@@ -91,6 +93,7 @@ mod tests {
         let key = ApiKey::new(key.map(str::to_string));
         Router::new()
             .route("/health", get(|| async { "ok" }))
+            .route("/metrics", get(|| async { "mstar_requests_total 0" }))
             .route("/v1/models", get(|| async { "models" }))
             .layer(axum::middleware::from_fn_with_state(key, require_api_key))
     }
@@ -116,7 +119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_key_is_required_on_every_route_but_the_probe() {
+    async fn a_key_is_required_on_every_route_but_the_probe_and_the_scrape() {
         let k = Some("s3cret");
         assert_eq!(
             status(app(k), "/v1/models", None).await,
@@ -143,14 +146,22 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(status(app(k), "/health", None).await, StatusCode::OK);
+        assert_eq!(status(app(k), "/metrics", None).await, StatusCode::OK);
+        assert_eq!(
+            status(app(k), "/metrics", Some("Bearer wrong")).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
     async fn an_unknown_path_is_refused_before_routing() {
-        assert_eq!(
-            status(app(Some("k")), "/health/", None).await,
-            StatusCode::UNAUTHORIZED
-        );
+        for path in ["/health/", "/metrics/", "/metrics/../v1/models", "/metricsx"] {
+            assert_eq!(
+                status(app(Some("k")), path, None).await,
+                StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+        }
     }
 
     #[test]

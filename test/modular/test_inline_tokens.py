@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from types import SimpleNamespace
 
 import torch
 
@@ -46,6 +47,10 @@ def test_result_tokens_round_trips_through_the_codec():
 
 
 class _Model:
+    def get_partition_topology(self):
+        from mstar.streaming.topology import PartitionTopology
+        return PartitionTopology(partitions=["default"])
+
     def postprocess(self, output, modality, request_kwargs=None):
         assert modality == "text"
         return f"<{int(output[0])}>".encode()
@@ -58,10 +63,22 @@ class _Comm:
     def send(self, entity, msg):
         pass
 
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
+
 
 class _TM:
     def start_read_tensors(self, request_id, graph_edges, graph_walk=None):
         return []
+
+    def take_failed_reads(self):
+
+        return []
+
 
     def get_ready_tensors(self):
         return {}
@@ -130,12 +147,12 @@ def test_the_facade_accounts_an_inline_token_like_a_tensor():
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.result_tensor_input_queue = queue.Queue()
     facade.per_request_reading_tensors = {"r1": 0}
-    facade.output_loop_idxs = {"r1": {}}
+    facade.received_chunk_counts = {"r1": {}}
     facade.new_result_token("r1", 42, _loop(4), "text_inputs", "text")
     facade.new_result_token("r1", 43, _loop(5), "text_inputs", "text")
     facade.new_result_token("unknown", 1, _loop(0), "text_inputs", "text")  # dropped, no raise
     assert facade.per_request_reading_tensors["r1"] == 2
-    assert facade.output_loop_idxs["r1"]["text_inputs"].loop_indices == {"decode_loop": 5}
+    assert facade.received_chunk_counts["r1"] == {"text_inputs": 2}
     items = [facade.result_tensor_input_queue.get_nowait() for _ in range(2)]
     assert [i.value for i in items] == [42, 43]
     assert facade.result_tensor_input_queue.empty()

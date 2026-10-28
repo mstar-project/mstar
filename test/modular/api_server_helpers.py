@@ -29,8 +29,12 @@ def make_test_api_server(**overrides) -> APIServer:
     server.enable_nvtx = False
     server.log_stats = False
     server.log_stats_file = None
+    server.metrics = None
     server.model = None
     server.model_name = "dummy"
+    server.client_streams = frozenset()
+    server.takes_stream_input = False
+    server._model_config = None   # max_call_input_bytes reads it on first use
     server.preprocess_worker = None
     server.communicator = None
     server._msg_thread = None

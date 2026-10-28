@@ -13,6 +13,7 @@ on whether a capture succeeded.
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -21,8 +22,10 @@ import pytest
 import torch
 
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
+from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
+    CaptureCost,
     capture_into_graph,
     fail_if_graphs_required,
 )
@@ -52,9 +55,8 @@ class _Group:
 
 
 class _FakeRunner:
-    """`warmup_and_capture` and `_register_slot` bound onto stubs."""
+    """`warmup_and_capture`, with every bucket planned, and `_register_slot` bound onto stubs."""
 
-    warmup_and_capture = AcceleratorGraphRunner.warmup_and_capture
     _register_slot = AcceleratorGraphRunner._register_slot
     _buckets_captured_everywhere = AcceleratorGraphRunner._buckets_captured_everywhere
     _report_dropped = AcceleratorGraphRunner._report_dropped
@@ -74,9 +76,12 @@ class _FakeRunner:
         self._num_slots = num_slots
         self._specs = specs
         self._fail = fail
+        # every bucket alike, so capture keeps the specs' order
+        self._capture_costs = {spec.bucket: CaptureCost(0, 0, 0, num_slots) for spec in specs}
         self._buckets = {}
         self._memory_pool = None
         self._blocked_buckets = []
+        self._executables = {}
         self.barrier = _Group(peer_flags)
         self._comm_group = SimpleNamespace(
             tp_group=self.barrier, sp_group=self.barrier
@@ -90,7 +95,10 @@ class _FakeRunner:
     def prepare_for_capture(self):
         return self._specs
 
-    def _capture_one(self, spec):
+    def warmup_and_capture(self):
+        AcceleratorGraphRunner.warmup_and_capture(self, {spec.bucket for spec in self._specs})
+
+    def _capture_one(self, spec, forwards):
         if (spec.bucket.graph_walk, spec.slot) in self._fail:
             raise RuntimeError("capture failed")
         # stands in for the CudaGraphSlot; identity is what the test checks
@@ -108,13 +116,18 @@ class _FakeRunner:
         del before, after
 
 
-def _specs(walks=("decode",), num_slots=2):
+def _specs(walks=("decode",), num_slots=2, packed=()):
     out = []
     for walk in walks:
         bucket = BucketKey(graph_walk=walk, bs=1, num_tokens=8, cg_key_info=None)
+        kind = (
+            AcceleratorGraphConfigType.FLASH_INFER_PACKED if walk in packed
+            else AcceleratorGraphConfigType.BASIC_BATCHED
+        )
         for slot in range(num_slots):
             out.append(CGSlotSpec(
-                bucket=bucket, slot=slot, config=SimpleNamespace(), config_idx=0,
+                bucket=bucket, slot=slot, config_idx=0,
+                config=SimpleNamespace(get_config_type=lambda kind=kind: kind),
             ))
     return out
 
@@ -226,6 +239,19 @@ def test_single_slot_runners_still_register():
     (bucket,) = runner._buckets.values()
     assert bucket.slots == ["decode:slot0"]
     assert runner.declared == [], "nothing to pre-plan with a single slot"
+
+
+def test_only_a_batched_bucket_gets_pre_seeded_rows():
+    """A batch that hasn't built its inputs can only lease a batched bucket, so
+    no step ever reads a packed bucket's template rows. Pre-seeded for every
+    bucket, they held over 0.5 GiB for the prefill buckets of Qwen3-Omni's Thinker."""
+    runner = _FakeRunner(_specs(walks=("decode", "prefill"), packed=("prefill",)))
+
+    runner.warmup_and_capture()
+
+    assert [lease.bucket.graph_walk for lease in runner.declared] == ["decode"], (
+        "a packed bucket's rows are never read, so they must not be built"
+    )
 
 
 class _InternRunner:
@@ -363,6 +389,29 @@ def test_a_failed_capture_leaves_the_pool_and_stream_usable():
     graph.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [2.0] * 8
+
+
+@requires_cuda
+@pytest.mark.parametrize("fails", [False, True], ids=["captured", "failed"])
+def test_benchmark_is_off_inside_the_capture_and_restored_after(torch_flag, fails):
+    """Qwen3-Omni turns cuDNN's benchmark mode on for Code2Wav's warm-up.
+    Inside a capture its search fails the capture, which cost Code2Wav its
+    bs=32 graph and kept that graph's pool."""
+    device = torch.device("cuda")
+    x = torch.ones(8, device=device)
+    seen = []
+
+    def run():
+        seen.append(torch.backends.cudnn.benchmark)
+        # a pageable host-to-device copy is not permitted while capturing
+        return x + torch.tensor([1.0], device=device) if fails else x * 2
+
+    for benchmark in (True, False):
+        torch_flag(torch.backends.cudnn, "benchmark", benchmark)
+        with pytest.raises(RuntimeError) if fails else nullcontext():
+            capture_into_graph(run, AcceleratorGraphPool(torch.cuda.graph_pool_handle()), device, None)
+        assert torch.backends.cudnn.benchmark is benchmark, "the caller's setting must come back"
+    assert seen == [False, False], "cuDNN must not search inside the capture"
 
 
 def test_required_graphs_turn_a_dropped_bucket_into_a_startup_failure(monkeypatch):

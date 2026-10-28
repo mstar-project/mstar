@@ -20,13 +20,17 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
-from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT
+from test_kv_prefix_correctness import KV, NODE, PAGE_SIZE, ROOT, ROPE
 from test_kv_prefix_correctness import _Node as _TextNode
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.engine.resources import StepContext
+from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig
-from mstar.model.base import PrefixStream, Span
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep
+from mstar.engine.resources.position.config import PositionStep
+from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, Span
 from mstar.model.submodule_base import ARNodeInputs
 
 RID = "r1"
@@ -56,24 +60,29 @@ def _walks(parts: list) -> list[tuple[str, int]]:
     ]
 
 
-def _config(parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WALK) -> KVReqConfig:
+def _config(parts: list, text_walk: str = TEXT_WALK, image_walk: str = IMAGE_WALK, decode: int = 0) -> KVReqConfig:
     """What the preprocess worker sends for ``parts``, keyed by its own code."""
-    layout = [
+    layouts = {"kv": {"main": LabelLayout(spans=tuple(
         Span("ids", text_walk, slots, slots, "text_inputs") if isinstance(part, list)
         # The span's source holds the digest itself, which the stand-in `_digest` returns.
         else Span("digest", image_walk, slots, 1, part[1] if isinstance(part, tuple) else DIGEST)
         for part, (_, slots) in zip(parts, _walks(parts), strict=True)
-    ]
+    ), growth=(("decode_loop", 1),))}}
+    walks = (text_walk, image_walk)
     worker = SimpleNamespace(
-        _prefix_streams={"kv": {"main": PrefixStream("text_inputs", "ids", text_walk, "decode", (image_walk,))}},
+        _keyed_labels={"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", walks, growth=True))}},
         _prefix_page_sizes={"kv": PAGE_SIZE}, model=None,
         _digest=lambda span, file_paths, file_states: span.source,
         _page_layout=lambda *args: PreprocessWorkerThread._page_layout(None, *args),
     )
     tensors = {"text_inputs": [torch.tensor(part) for part in parts if isinstance(part, list)]}
-    sent = PreprocessWorkerThread._prefix_keys(worker, tensors, {"kv": {"main": layout}}, None, {})
+    rows = {key: {label: layout.row() for label, layout in by_label.items()} for key, by_label in layouts.items()}
+    sent = PreprocessWorkerThread._prefix_keys(worker, tensors, layouts, rows, None, {})
     config = KVReqConfig()
-    config.apply_conductor_config(**{name: by_resource["kv"] for name, by_resource in sent.items()})
+    config.apply_conductor_config(
+        kv_layout=rows["kv"], loop_caps={"decode_loop": decode},
+        **{name: by_resource["kv"] for name, by_resource in sent.items()},
+    )
     return config
 
 
@@ -81,10 +90,10 @@ class _Node(_TextNode):
     """One request's cache and positions under a real runner, after an earlier
     request ran every walk of ``seeded`` and indexed what it filled."""
 
-    def __init__(self, seeded: list = PARTS, parts: list | None = None):
+    def __init__(self, seeded: list = PARTS, parts: list | None = None, decode: int = 0):
         super().__init__()
-        self.kv.enable_prefix_cache(ROOT, {"main": (TEXT_WALK, "decode", IMAGE_WALK)})
-        self.runner.ingest_request("seed", {"kv": _config(seeded)})
+        self.kv.enable_prefix_cache(ROOT, {"main": KeyedWalks((TEXT_WALK, IMAGE_WALK), ("decode",))})
+        self.runner.ingest_request("seed", {"kv": _config(seeded, decode=decode)})
         for walk, length in _walks(seeded):
             self.step("seed", length, walk)
         self.runner.ingest_request(RID, {"kv": _config(parts or seeded)})
@@ -106,6 +115,19 @@ class _Node(_TextNode):
         else:
             self.step(RID, length - tokens, walk)
         return tokens
+
+    def mixed_step(self, spans: dict[str, int], walks: dict[str, str]) -> None:
+        """One step of a combined walk, each row writing its span under its own walk."""
+        step = SubmoduleStep(
+            steps={KV: KVStep(), ROPE: PositionStep()},
+            segments=[Segment(rid, "main", span) for rid, span in spans.items()],
+        )
+        step.set_ctx(StepContext(
+            request_ids=tuple(spans), graph_walk="mixed", slot=0, capture=False, request_walks=walks,
+        ))
+        assert self.runner.admit(step).outcome.ok
+        self.runner.plan(step)
+        self.runner.commit(step)
 
     @property
     def stream(self):
@@ -226,7 +248,7 @@ def test_a_missed_probe_asked_again_hashes_nothing_and_is_served_what_was_cached
 def test_a_page_a_reply_fills_after_an_image_is_matched_by_the_next_turn():
     reply = list(range(400, 409))
     # the image's last two slots, the question and the reply's nine ids fill page 3
-    node = _Node([TEXT, IMAGE, ASK], [TEXT, IMAGE, ASK + reply + OTHER_ASK])
+    node = _Node([TEXT, IMAGE, ASK], [TEXT, IMAGE, ASK + reply + OTHER_ASK], decode=len(reply))
     for token in reply:
         node.kv.extend_prefix_chain("seed", NODE, "decode", {"text_inputs": [torch.tensor([token])]})
         node.step("seed", 1, "decode")
@@ -247,4 +269,16 @@ def test_a_different_image_is_never_served_another_images_end():
 
     assert node.probe(IMAGE_WALK, 10).tokens == 0, (
         "a request was served the end of another image laid out in the same slots"
+    )
+
+
+def test_a_prompt_prefilled_beside_a_decode_is_matched_by_its_repeat():
+    prompt = list(range(500, 500 + 3 * PAGE_SIZE))
+    node = _Node(parts=[prompt], decode=1)
+    node.runner.ingest_request("first", {"kv": _config([prompt])})
+
+    node.mixed_step({"first": len(prompt), "seed": 1}, {"first": TEXT_WALK, "seed": "decode"})
+
+    assert node.walk(TEXT_WALK, len(prompt)) == 2 * PAGE_SIZE, (
+        "a prompt prefilled in a step of a combined walk filed no pages, so its repeat recomputed it"
     )

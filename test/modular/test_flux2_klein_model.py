@@ -501,7 +501,7 @@ def test_vae_decode_sizes_are_the_four_compiled_sizes_clamped_to_the_max_batch()
     assert [s for s in VAE_DECODE_BATCH_SIZES if s <= small.max_batch_size] == [1, 2, 4]
 
 
-def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch):
+def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch, torch_flag):
     """``torch.compile`` traces lazily, so ``emulate_precision_casts`` has to be in
     effect when the compiled callable is CALLED, not when it is built -- the build runs
     on the worker's main thread and the traces on the GPU executor thread, and since
@@ -513,7 +513,7 @@ def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch):
 
     calls, seen = [], []
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: calls.append(kw) or fn)
-    monkeypatch.setattr(inductor_config, "emulate_precision_casts", False)
+    torch_flag(inductor_config, "emulate_precision_casts", False)
 
     module = torch.nn.Linear(2, 2)
     module.forward = lambda *a, **k: seen.append(inductor_config.emulate_precision_casts)
@@ -534,7 +534,7 @@ def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch):
     assert _make_model(compile_eager_rounding=False).compile_eager_rounding is False
 
 
-def test_the_vae_decode_asks_for_its_own_rounding_instead_of_inheriting(monkeypatch):
+def test_the_vae_decode_asks_for_its_own_rounding_instead_of_inheriting(monkeypatch, torch_flag):
     """It used to read whatever the transformer's compile left in the global config, so
     the decoder's kernels depended on which node was built first."""
     import torch._inductor.config as inductor_config
@@ -543,7 +543,7 @@ def test_the_vae_decode_asks_for_its_own_rounding_instead_of_inheriting(monkeypa
 
     seen = []
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)
-    monkeypatch.setattr(inductor_config, "emulate_precision_casts", False)
+    torch_flag(inductor_config, "emulate_precision_casts", False)
 
     vae = torch.nn.Module()
     vae.decode = lambda *a, **k: seen.append(inductor_config.emulate_precision_casts)

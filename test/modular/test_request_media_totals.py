@@ -58,7 +58,7 @@ def _preprocess_thread(model):
     wt.in_flight_requests = set()
     wt.request_output_state = {}
     wt.device = "cpu"
-    wt._prefix_streams = {}
+    wt._keyed_labels = {}
     wt._live_requests = {}
     wt.model = model
     return wt
@@ -95,7 +95,7 @@ def _fake_model(loaded, seconds, max_input_files=None):
 
 
 def _status(wt, error):
-    wt._fail_request("r1", error, "preprocessing")
+    wt._fail_request("r1", error, "preprocessing", abort=False)
     return wt.out_queue.get_nowait().metadata["status"]
 
 

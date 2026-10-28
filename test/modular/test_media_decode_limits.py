@@ -162,7 +162,7 @@ def test_refused_image_reaches_the_client_as_a_400(tmp_path, no_decode):
     wt.in_flight_requests = set()
     wt.request_output_state = {}
     wt.device = "cpu"
-    wt._prefix_streams = {}
+    wt._keyed_labels = {}
     wt._live_requests = {}
     wt.model = types.SimpleNamespace(
         load_image=lambda p, device: Model.load_image(None, p, device), max_input_files=dict,
@@ -173,7 +173,7 @@ def test_refused_image_reaches_the_client_as_a_400(tmp_path, no_decode):
     )
     with pytest.raises(ValueError) as info:
         wt._process_input(request)
-    wt._fail_request("r1", info.value, "preprocessing")
+    wt._fail_request("r1", info.value, "preprocessing", abort=False)
     chunk = wt.out_queue.get_nowait()
     assert chunk.modality == "error"
     assert chunk.metadata["status"] == 400
@@ -514,7 +514,7 @@ def _preprocess_thread(model):
     wt.in_flight_requests = set()
     wt.request_output_state = {}
     wt.device = "cpu"
-    wt._prefix_streams = {}
+    wt._keyed_labels = {}
     wt._live_requests = {}
     wt.model = model
     return wt
@@ -554,7 +554,7 @@ def test_images_in_one_request_share_the_image_limit(tmp_path, decoded):
     with pytest.raises(ValueError, match="images decode to more than .* together") as info:
         wt._process_input(_image_request(paths))
     assert decoded == paths[:1]
-    wt._fail_request("r1", info.value, "preprocessing")
+    wt._fail_request("r1", info.value, "preprocessing", abort=False)
     assert wt.out_queue.get_nowait().metadata["status"] == 400
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from contextlib import contextmanager
+from time import perf_counter, thread_time
 from typing import Iterator
 
 import torch
@@ -29,6 +30,47 @@ def nvtx_enabled(
 def phase_record(name: str, dt: float) -> None:
     if PHASE_PERIOD:
         _PHASE_BUF[name].append(dt)
+
+
+def phase_start() -> tuple[float, float] | None:
+    """Start stamp for ``phase_end``: None unless MSTAR_PHASE_TIMING is set."""
+    return (perf_counter(), thread_time()) if PHASE_PERIOD else None
+
+
+def phase_end(name: str, start: tuple[float, float] | None) -> None:
+    """Record wall time as ``name`` and this thread's CPU time as
+    ``name.cpu``. Wall minus CPU is time the thread spent blocked -- on the
+    GIL, an event or a lock -- which wall time alone cannot tell from work.
+    Three threads share the GIL, so that gap is often large."""
+    if start is not None:
+        _PHASE_BUF[name].append(perf_counter() - start[0])
+        _PHASE_BUF[name + ".cpu"].append(thread_time() - start[1])
+
+
+class PhaseLaps:
+    """Consecutive stage timings: each ``lap(stage)`` records the wall and CPU
+    time since the previous lap (or construction) as ``prefix + stage`` and
+    ``prefix + stage + ".cpu"``. A no-op unless MSTAR_PHASE_TIMING is set;
+    ``skip()`` restarts the clock without recording, for a stretch timed
+    elsewhere."""
+
+    __slots__ = ("_prefix", "_t", "_c")
+
+    def __init__(self, prefix: str = "") -> None:
+        self._prefix = prefix
+        self.skip()
+
+    def lap(self, stage: str) -> None:
+        if PHASE_PERIOD:
+            now, cpu = perf_counter(), thread_time()
+            name = self._prefix + stage
+            _PHASE_BUF[name].append(now - self._t)
+            _PHASE_BUF[name + ".cpu"].append(cpu - self._c)
+            self._t, self._c = now, cpu
+
+    def skip(self) -> None:
+        if PHASE_PERIOD:
+            self._t, self._c = perf_counter(), thread_time()
 
 
 def phase_buffer() -> dict[str, list[float]]:

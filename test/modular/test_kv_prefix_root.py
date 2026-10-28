@@ -19,6 +19,7 @@ time out.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from types import SimpleNamespace
 
@@ -27,17 +28,19 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Resource
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import PrefixStream
-from mstar.worker.engine_manager import _refuse_unservable_walks
+from mstar.model.base import KVLabel, PrefixKeys
+from mstar.streaming.topology import StreamingGraphEdge
+from mstar.validation.resources import _unservable_walks
 
 KV = "kv"
 ROPE = "rope"
@@ -88,15 +91,20 @@ class _Model:
     def preprocess_fingerprint(self):
         return self._name
 
-    def prefix_key_streams(self):
+    def kv_labels(self):
         return {}
 
 
 class _Declaring(_Model):
     """Keys ``main`` on the KV resource from its text walk."""
 
-    def prefix_key_streams(self):
-        return {KV: {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}}
+    def kv_labels(self):
+        return {KV: {"main": KVLabel(growth=(("decode", "decode_loop"),), keys=PrefixKeys(
+            "text_inputs", ("prefill_text",), growth=True,
+        ))}}
+
+    def get_graph_walk_graphs(self):
+        return {"prefill_text": GraphNode(name="LLM", input_names=["text_inputs"], outputs=[])}
 
 
 def _checkpoint(root, config: bytes) -> str:
@@ -312,13 +320,13 @@ def test_an_uncached_node_says_nothing_at_load(caplog, overrides, model):
 # ── the keys the request brought ────────────────────────────────────────
 
 
-_LAYOUT = {"main": [PrefixSpan(32, 32, "prefill_text")]}
+_LAYOUT = {"main": StreamLayout(spans=(PrefixSpan(32, 32, "prefill_text"),), keyed_spans=1)}
 
 
 def test_ingest_puts_the_requests_keys_on_the_stream():
     kv = _kv()
 
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}, prefix_layout=_LAYOUT))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}, kv_layout=_LAYOUT))
 
     assert kv._streams["r0"]["main"].chain.keys == [b"k0", b"k1"], (
         "the chain the request brought never reached its stream"
@@ -327,7 +335,7 @@ def test_ingest_puts_the_requests_keys_on_the_stream():
 
 def test_a_label_the_request_did_not_key_carries_none():
     kv = _kv()
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0"]}, prefix_layout=_LAYOUT))
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0"]}, kv_layout=_LAYOUT))
 
     stream = kv._ensure_label("r0", "cfg_text")
 
@@ -338,7 +346,7 @@ def test_a_request_can_opt_out_of_the_cache():
     kv = _kv()
 
     kv.ingest_request("r0", KVReqConfig(
-        prefix_keys={"main": [b"k0"]}, prefix_layout=_LAYOUT, prefix_cache=False,
+        prefix_keys={"main": [b"k0"]}, kv_layout=_LAYOUT, prefix_cache=False,
     ))
 
     assert kv._streams["r0"]["main"].chain is None, (
@@ -428,9 +436,12 @@ def _laid_out(text_feeds=EMIT_TO_CLIENT, image_feeds=EMIT_TO_CLIENT, image_walk_
         "prefill_image": Sequential([node("vit", "LLM"), node("LLM", image_feeds)])
         if image_walk_runs_llm else node("vit", EMIT_TO_CLIENT),
     }
-    stream = PrefixStream("text_inputs", "ids", "prefill", None, ("prefill_image",))
+    walks = ("prefill", "prefill_image")
+    label = KVLabel(keys=PrefixKeys("text_inputs", walks))
+    partition = PartitionDefinition(name="LLM", graph_walks=set(graphs), initial_walk="prefill", producer_partitions=[])
     return SimpleNamespace(
-        prefix_key_streams=lambda: {KV: {"main": stream}}, get_graph_walk_graphs=lambda: graphs,
+        kv_labels=lambda: {KV: {"main": label}}, get_graph_walk_graphs=lambda: graphs,
+        get_partitions=lambda: [partition],
         checkpoint_path=lambda: None, preprocess_fingerprint=lambda: "laid out",
     )
 
@@ -445,14 +456,32 @@ _REFUSED = {
 
 
 @pytest.mark.parametrize(("node", "model", "message"), _REFUSED.values(), ids=_REFUSED.keys())
-def test_a_walk_the_cache_cannot_serve_whole_is_refused_at_load(node, model, message):
+def test_a_walk_the_cache_cannot_serve_whole_is_refused_at_startup(node, model, message):
     spec = KVSpec(
         resource_key=KV, nodes={node},
         config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
     )
 
-    with pytest.raises(ValueError, match=message):
-        _refuse_unservable_walks([spec], model)
+    problems = list(_unservable_walks([spec], model))
+
+    assert problems and re.search(message, problems[0]), problems
+
+
+def test_a_keyed_node_that_streams_into_another_partition_loads():
+    model = _laid_out()
+    for graph in model.get_graph_walk_graphs().values():
+        graph.get_nodes()["LLM"].outputs.append(
+            StreamingGraphEdge(next_node="talker", name="hidden", target_partition="Talker"),
+        )
+    spec = KVSpec(
+        resource_key=KV, nodes={"LLM"},
+        config=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64),
+    )
+
+    assert not list(_unservable_walks([spec], model)), (
+        "a keyed node that streams into another partition was refused, though a walk the cache "
+        "serves whole leaves its own partition nothing to read"
+    )
 
 
 def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(monkeypatch):
@@ -474,4 +503,24 @@ def test_only_a_node_whose_output_is_cached_under_a_digest_is_compiled_dynamic(m
     assert compiled == {"vit": True, "LLM": None, "vae": None}, (
         "an image encoder left to recompile caches KV it no longer computes for the same "
         "file, or a node the cache never keys from lost the compile main gives it"
+    )
+
+
+def test_an_encoder_that_marks_its_own_dims_compiles_with_the_default_while_its_output_is_cached(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch, "compile", lambda fn, dynamic, **kwargs: dynamic)
+    engine = Engine.__new__(Engine)
+    engine._resources = {}
+    engine._device = torch.device("cuda")
+    spec = KVSpec(resource_key=KV, nodes={"LLM"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
+    ))
+    engine._open_prefix_caches({KV: spec}, _laid_out())
+    vit = SimpleNamespace(forward="eager", forward_batched="eager", marks_dynamic_dims=True)
+    engine._submodules = {"vit": SimpleNamespace(submodule=vit, forward="eager")}
+
+    engine._compile_submodules()
+
+    assert engine._submodules["vit"].forward is None, (
+        "an encoder that marks its own dynamic dimensions was compiled with dynamic=True while its KV is cached"
     )

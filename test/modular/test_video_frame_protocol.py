@@ -140,7 +140,11 @@ def test_native_endpoint_reports_nonstreaming_raw_frames_as_bad_request(monkeypa
         )
 
     assert raised.value.status_code == 400
-    assert "requires streaming=true" in str(raised.value.detail)
+    # test/rust/test_rust_frontend.py checks mstar-server sends the same
+    assert raised.value.detail == (
+        "Output modality video_frame requires streaming=true; raw frame "
+        "chunks cannot be returned as an aggregated response."
+    )
 
 
 def test_native_endpoint_rejects_raw_frames_as_input(monkeypatch):
@@ -200,6 +204,11 @@ class _ReadyTensorManager:
         self.ready = tensors_by_request
         self.dereferenced = []
         self.cleaned = []
+
+    def take_failed_reads(self):
+
+        return []
+
 
     def get_ready_tensors(self):
         ready, self.ready = self.ready, {}
@@ -392,8 +401,10 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {})
     worker.device = "cpu"
     worker.enable_prof = False
-    worker._prefix_streams = {}
+    worker.timing_requested = threading.Event()
+    worker._keyed_labels = {}
     worker._live_requests = {}
+    worker._client_edges = frozenset()
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(
         PreprocessInput(

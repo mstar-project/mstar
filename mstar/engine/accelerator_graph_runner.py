@@ -1,8 +1,11 @@
+import ctypes
 import logging
 import os
 import threading
-from dataclasses import dataclass, field, replace
-from typing import Any, Mapping, NamedTuple
+from contextlib import contextmanager
+from dataclasses import dataclass, field, is_dataclass, replace
+from functools import cache, partial
+from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -22,6 +25,7 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.platforms import current_platform
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
@@ -30,6 +34,51 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+
+
+# torch.compile arguments per compile level (``mstar serve -O``), for a captured
+# forward whose config names no ``compile_mode``. Qwen3.5-0.8B on H200 with an
+# empty Inductor cache started in 170 s / 320 s / 1,294 s at levels 0 / 1 / 2.
+# Coordinate descent alone got all of max-autotune's GPU time per decode step
+# (it fuses the decode GEMMs with their epilogues); the GEMM template search on
+# top bought nothing measurable.
+COMPILE_LEVELS: dict[int, dict[str, Any]] = {
+    0: {},  # torch.compile's default: Inductor fusion, cuBLAS GEMMs, no tuning
+    1: {"options": {"coordinate_descent_tuning": True}},
+    2: {"mode": "max-autotune-no-cudagraphs"},
+}
+DEFAULT_COMPILE_LEVEL = 1
+
+
+@cache
+def compile_level() -> int:
+    """How much tuning a captured forward's compile does: ``MSTAR_COMPILE_LEVEL``
+    (``mstar serve -O``), one of ``COMPILE_LEVELS``."""
+    raw = os.environ.get("MSTAR_COMPILE_LEVEL") or str(DEFAULT_COMPILE_LEVEL)
+    try:
+        level = int(raw)
+    except ValueError:
+        level = -1
+    if level not in COMPILE_LEVELS:
+        logger.warning(
+            "MSTAR_COMPILE_LEVEL=%r is not one of %s; using %d",
+            raw, sorted(COMPILE_LEVELS), DEFAULT_COMPILE_LEVEL,
+        )
+        return DEFAULT_COMPILE_LEVEL
+    return level
+
+
+def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
+    """``torch.compile``'s arguments for a capture config whose ``compile_mode``
+    is ``config_mode``, which the config checked when it was built. None takes
+    the compile level's arguments."""
+    kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": False}
+    if config_mode is None:
+        return {**kwargs, **COMPILE_LEVELS[compile_level()]}
+    # "default" is torch.compile's own: Inductor fusion, cuBLAS GEMMs, no autotuning
+    if config_mode != "default":
+        kwargs["mode"] = config_mode
+    return kwargs
 
 
 def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[str]:
@@ -48,9 +97,11 @@ def autocast_scope(dtype: torch.dtype | None, device_type: str):
 
 
 def agree_across_ranks(
-    comm_group: JointGroups | None, flags: list[bool], device: torch.device,
-) -> list[bool]:
-    """AND each flag across every rank of the joint group.
+    comm_group: JointGroups | None, values: list[int], device: torch.device,
+    reduce: Callable[..., torch.Tensor],
+) -> list[int]:
+    """Reduce each of ``values`` over every rank of the joint group with
+    ``reduce``. `torch.amin` ANDs flags and `torch.amax` takes the largest.
 
     Capture failure is per-rank: a rank that keeps a graph another rank
     dropped replays it while the other runs eager, which hangs as soon as the
@@ -60,16 +111,16 @@ def agree_across_ranks(
     groups = [] if comm_group is None else [
         comm_group.tp_group, comm_group.sp_group
     ]
-    if not flags or all(group.world_size == 1 for group in groups):
-        return flags
-    gathered = torch.tensor(flags, dtype=torch.int64, device=device)
+    if not values or all(group.world_size == 1 for group in groups):
+        return values
+    gathered = torch.tensor(values, dtype=torch.int64, device=device)
     for group in groups:
         if group.world_size > 1:
-            # all_gather is rank-major, so the min down dim 0 is the AND
-            gathered = group.all_gather(gathered, dim=0).reshape(
+            # all_gather is rank-major, so dim 0 runs over the ranks
+            gathered = reduce(group.all_gather(gathered, dim=0).reshape(
                 group.world_size, -1
-            ).amin(dim=0)
-    return [bool(value) for value in gathered.tolist()]
+            ), dim=0)
+    return gathered.tolist()
 
 
 #: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
@@ -113,7 +164,7 @@ def dummy_metadata(
     }
 
 
-def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
+def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
     Returns the graph and what ``run`` returned. A capture that fails part
@@ -134,7 +185,12 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
     if backend is None:
         raise ValueError(f"Accelerator graphs are unsupported on device {device!r}")
     prev_stream = backend.current_stream()
-    graph = backend.create_graph()
+    graph = backend.create_graph(keep_graph)
+    # benchmark off, so cuDNN searches in the warm-up and not in here: a conv
+    # whose cached plan can't get its workspace would search again, timing
+    # candidates and emptying the allocator's cache, which fails the capture
+    benchmark = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = False
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
                 autocast_scope(autocast_dtype, backend.device_type):
@@ -144,12 +200,16 @@ def capture_into_graph(run, pool: AcceleratorGraphPool, device, autocast_dtype):
         pool.on_failure(graph)
         backend.recover_failed_capture(pool, prev_stream)
         raise
+    finally:
+        torch.backends.cudnn.benchmark = benchmark
     backend.synchronize()
     pool.on_success()
     return graph, output
 
 
-def capture_with_static_outputs(run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype):
+def capture_with_static_outputs(
+    run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
+):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
     ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:
@@ -177,7 +237,7 @@ def capture_with_static_outputs(run, warm_outputs, pool: AcceleratorGraphPool, d
             static_outputs[name].copy_(value)
         return static_outputs
 
-    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype)
+    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype, keep_graph)
     return graph, static_outputs
 
 
@@ -196,6 +256,309 @@ def fail_if_graphs_required(missing: list[str]) -> None:
 
 def _is_packed(config: AcceleratorGraphConfig) -> bool:
     return config.get_config_type() == AcceleratorGraphConfigType.FLASH_INFER_PACKED
+
+
+class CaptureCost(NamedTuple):
+    """What one bucket costs on the device: its warm-up, and a capture thrown away, its own or its walk's largest."""
+    # bytes the eager forward allocated at its peak, above what was live
+    peak: int
+    # bytes one slot's graph holds at most, in its pool and out; None if it can't be captured
+    graph: int | None
+    # what of ``graph`` no later graph in the pool reuses: outputs, and a region's inputs
+    kept: int
+    # graphs the bucket captures, one per slot
+    slots: int
+    # bytes each slot's graph holds outside the allocator: its executable memory
+    outside: int = 0
+    # the walk's measurement, whose copies hold memory the graphs reuse
+    executable: "ExecutableMemory | None" = None
+
+
+class GraphMemory(NamedTuple):
+    """What a captured graph holds: in its pool, and outside the allocator."""
+    pool: int
+    outside: int
+
+
+class ExecutableMemory:
+    """The executable memory a walk's graphs take per node, outside any pool,
+    measured on copies of its first throwaway graph: executables instantiated
+    from it through libcuda. The cost per node changes with a graph's size,
+    even for the same kernels: a chain of adds takes 3.1 KiB a node at 300
+    nodes and 2.4 at 2222. A walk's graphs are about the same size, so the
+    first graph's cost per node holds for all of them.
+
+    The copies are held until the runner captures. The driver keeps a destroyed
+    graph's executable memory to reuse, and maps new memory beside it, so after
+    any destroy, free memory drops by less than a copy takes.
+    """
+
+    def __init__(self):
+        self.per_node: float | None = None
+        # a lower bound on the bytes the copies hold
+        self.held = 0
+        self._copies: list[ctypes.c_void_p] = []
+
+    def measure(self, graph, nodes: int) -> None:
+        """Set ``per_node`` and ``held`` from copies of ``graph``, held until `release`.
+
+        The count starts after the first copy that takes free memory, since
+        copies until then fill pieces the driver mapped earlier. It adds one
+        2 MiB piece, since the first counted copy may start partway into a
+        piece. Free memory is the device's, so another process allocating or
+        freeing moves it: a count is kept only if free memory never rose and no
+        copy took more than two pieces above the mean. If no count is kept,
+        ``per_node`` is the largest rate a count gave. None if no copy could be
+        counted.
+        """
+        cuda = ctypes.CDLL("libcuda.so.1")
+        largest: float | None = None
+        drops: list[int] | None = None
+        free = torch.cuda.mem_get_info()[0]
+        tries = 0
+        first = len(self._copies)
+        while tries < _MEASURE_TRIES and len(self._copies) < _MEASURE_COPIES:
+            copy = ctypes.c_void_p()
+            status = cuda.cuGraphInstantiateWithFlags(
+                ctypes.byref(copy), ctypes.c_void_p(graph.raw_cuda_graph()), ctypes.c_ulonglong(0),
+            )
+            if status != 0:
+                logger.warning("Stopped measuring graph executable memory: CUresult %d", status)
+                break
+            self._copies.append(copy)
+            drop = free - torch.cuda.mem_get_info()[0]
+            free -= drop
+            if drop < 0:
+                tries += 1
+                drops = None
+            elif drops is None:
+                if drop > 0:
+                    drops = []
+            else:
+                drops.append(drop)
+                if sum(drops) >= _MEASURE_BYTES:
+                    rate = (sum(drops) + _EXEC_PIECE) / (len(drops) * nodes)
+                    if max(drops) <= sum(drops) / len(drops) + 2 * _EXEC_PIECE:
+                        self.per_node = rate
+                        # Subtract two pieces, since the count may start partway into one and leave the last
+                        # one partly unused.
+                        each = (sum(drops) - 2 * _EXEC_PIECE) / len(drops)
+                        self.held += int((len(self._copies) - first) * each)
+                        return
+                    largest = max(rate, largest or 0)
+                    tries += 1
+                    drops = None
+        if drops:
+            largest = max((sum(drops) + _EXEC_PIECE) / (len(drops) * nodes), largest or 0)
+        elif drops is None and not tries and self._copies:
+            # every copy fit in a piece mapped before
+            largest = _EXEC_PIECE / (len(self._copies) * nodes)
+        self.per_node = largest
+
+    def release(self) -> None:
+        # copies are made only on NVIDIA GPUs, since others may have no libcuda
+        if self._copies:
+            cuda = ctypes.CDLL("libcuda.so.1")
+            for copy in self._copies:
+                cuda.cuGraphExecDestroy(copy)
+            self._copies.clear()
+
+
+#: the driver maps executable memory in pieces of 2 MiB
+_EXEC_PIECE = 2 * 2**20
+#: copies are counted until they take 16 MiB, so the one piece added to a count is an eighth of it at most
+_MEASURE_BYTES = 16 * 2**20
+#: a count spoiled by another process is tried again
+_MEASURE_TRIES = 4
+_MEASURE_COPIES = 512
+
+
+def _tensor_bytes(value: Any) -> int:
+    """Bytes of the distinct storages behind every tensor in ``value``, however nested."""
+    storages: dict[int, int] = {}
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, torch.Tensor):
+            storages[item.untyped_storage().data_ptr()] = item.untyped_storage().nbytes()
+        elif isinstance(item, Mapping):
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+        elif is_dataclass(item):
+            pending.extend(vars(item).values())
+    return sum(storages.values())
+
+
+def _capture_thrown_away(
+    capture: Callable[..., tuple[Any, Any]], what: str, executable: ExecutableMemory,
+) -> GraphMemory | None:
+    """Run ``capture`` into a pool of its own and hand it all back: what the
+    graph held, None if it failed.
+
+    A capture records kernels and collectives without running them, so a rank
+    short of memory fails its own capture here and no other rank waits on it.
+    """
+    torch.cuda.empty_cache()
+    pool = DeviceCapability.of("cuda").graph_backend.graph_pool_handle()
+    # Keep the graph so its nodes can be counted. It is never instantiated, so no executable is
+    # destroyed before `ExecutableMemory` measures. The measurement calls libcuda, so a ROCm
+    # graph's executable memory is counted as zero.
+    counted = current_platform.is_cuda()
+    nodes = 0
+    try:
+        graph, outputs = capture(pool=pool, keep_graph=counted)
+        if counted:
+            nodes = _graph_nodes(graph)
+            if nodes and executable.per_node is None:
+                executable.measure(graph, nodes)
+                if executable.per_node is None:
+                    # Leave the graph unsized. Counted as zero, its executable memory would go unplanned.
+                    logger.warning("Could not measure the executable memory of %s", what)
+                    graph = outputs = None
+                else:
+                    logger.info(
+                        "%s: graph executable memory, %.0f bytes a node, %.0f MiB held for the walk's graphs",
+                        what, executable.per_node, executable.held / 2**20,
+                    )
+    except RuntimeError:
+        logger.warning("Could not capture %s to size it", what, exc_info=True)
+        graph = outputs = None
+    taken = None if graph is None else sum(
+        segment["total_size"] for segment in torch.cuda.memory_snapshot(pool.handle)
+    )
+    del graph, outputs
+    # A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS
+    # workspace in the pool. No real graph uses it yet.
+    torch._C._cuda_clearCublasWorkspaces()
+    torch.cuda.empty_cache()
+    return None if taken is None else GraphMemory(taken, round(nodes * (executable.per_node or 0)))
+
+
+def _graph_nodes(graph) -> int:
+    """``graph`` must be captured with ``keep_graph=True``, so the driver still holds it to count."""
+    count = ctypes.c_size_t(0)
+    status = ctypes.CDLL("libcuda.so.1").cuGraphGetNodes(
+        ctypes.c_void_p(graph.raw_cuda_graph()), None, ctypes.byref(count),
+    )
+    assert status == 0, f"cuGraphGetNodes failed with CUresult {status}"
+    return count.value
+
+
+def _size_in_walk(
+    captured: list[CaptureCost], cost: CaptureCost, kept_in_pool: bool,
+    capture: Callable[..., tuple[Any, Any]], what: str, executable: ExecutableMemory,
+) -> tuple[CaptureCost, bool]:
+    """Return ``cost`` with its graph's size, and whether that size came from
+    another bucket's capture: the bucket is captured, thrown away, unless two
+    of its walk already were and they show it fits in the larger's scratch.
+
+    The lender is the bucket with the largest eager peak of those ``captured``
+    in the walk so far. A bucket that peaks no higher takes the lender's
+    scratch and adds its own kept bytes: a walk runs one forward at every
+    shape, and a smaller shape allocates no more at any step, so its graph
+    fits in the scratch a larger one leaves free. A smaller bucket runs the same
+    kernels, so its executable memory is taken as the lender's.
+
+    That holds only while no captured bucket took more scratch than the
+    lender. Where one did, a lender tells nothing of this walk, and every
+    bucket of it is captured: Chatterbox's CFG decode takes 24 MiB at 32 rows
+    and 56 MiB at 16.
+    """
+    def scratch(bucket: CaptureCost) -> int:
+        return -(-(bucket.graph - bucket.kept) // _SEGMENT)
+
+    cost = cost._replace(executable=executable)
+    lender = max(captured, key=lambda bucket: bucket.peak, default=None)
+    if (
+        len(captured) > 1 and cost.peak <= lender.peak
+        and all(scratch(bucket) <= scratch(lender) for bucket in captured)
+    ):
+        return cost._replace(graph=lender.graph - lender.kept + cost.kept, outside=lender.outside), True
+    memory = _capture_thrown_away(capture, what, executable)
+    if memory is not None:
+        cost = cost._replace(
+            graph=memory.pool if kept_in_pool else memory.pool + cost.kept, outside=memory.outside,
+        )
+        captured.append(cost)
+    return cost, False
+
+
+#: the caching allocator's smallest segment: what a graph's kept tensors are counted in
+_SEGMENT = 2 * 2**20
+
+
+class CapturePlan(NamedTuple):
+    """Which buckets each graph pool on a device captures, chosen before any is."""
+    # pool -> the buckets it captures
+    buckets: dict[str, set]
+    # pool -> bytes it is predicted to hold
+    predicted: dict[str, int]
+    # pool -> bytes its graphs hold outside the allocator
+    outside: dict[str, int]
+    # bytes the largest eager step on the device takes
+    floor: int
+
+
+def plan_captures(
+    pools: Mapping[str, Mapping[Any, CaptureCost]], free: int, reusable: int | None = None,
+) -> CapturePlan:
+    """The cheapest buckets across every pool on a device, added while the
+    largest eager step still fits in ``free`` beside them.
+
+    A pool's graphs, captured largest first, reuse its memory: it holds what
+    every graph keeps, plus the most any one graph needs beyond that. So a
+    bucket adds its slots' kept bytes, and whatever it needs past the pool's
+    most so far. That is a model; the boot log compares it with what capture took.
+    A bucket also adds its slots' executable memory, less the memory its
+    graphs reuse from the walk's copies. A walk's copies pay for its planned
+    graphs' executable memory once, across all its buckets. ``reusable`` bounds
+    the reuse summed over all buckets, None for no bound.
+    """
+    floor = max((cost.peak for costs in pools.values() for cost in costs.values()), default=0)
+    room = free - floor
+    plan = CapturePlan({pool: set() for pool in pools}, dict.fromkeys(pools, 0), dict.fromkeys(pools, 0), floor)
+    scratch = dict.fromkeys(pools, 0)
+    # walk's measurement -> what its copies held that no planned graph reuses yet
+    unused = {
+        cost.executable: cost.executable.held
+        for costs in pools.values() for cost in costs.values() if cost.executable is not None
+    }
+    bound = float("inf") if reusable is None else reusable
+
+    def reused(cost: CaptureCost) -> int:
+        return min(unused.get(cost.executable, 0), bound, cost.slots * cost.outside)
+
+    def added(pool: str, cost: CaptureCost) -> int:
+        # whole segments: the costliest graph's scratch may have no room left for a small tensor
+        kept = -(-cost.kept // _SEGMENT) * _SEGMENT
+        return cost.slots * kept + max(cost.graph - cost.kept - scratch[pool], 0)
+
+    def on_device(candidate) -> int:
+        pool, _, _, cost = candidate
+        return added(pool, cost) + cost.slots * cost.outside - reused(cost)
+
+    left = [
+        (pool, index, bucket, cost) for pool, costs in pools.items()
+        for index, (bucket, cost) in enumerate(costs.items()) if cost.graph is not None
+    ]
+    while left:
+        # a tie goes to the pool named first, which leads with its node, then to capture order
+        best = min(left, key=lambda candidate: (on_device(candidate), *candidate[:2]))
+        pool, _, bucket, cost = best
+        if on_device(best) > room:
+            break
+        room -= on_device(best)
+        used = reused(cost)
+        if used:
+            unused[cost.executable] -= used
+            bound -= used
+        plan.predicted[pool] += added(pool, cost)
+        plan.outside[pool] += cost.slots * cost.outside
+        scratch[pool] = max(scratch[pool], cost.graph - cost.kept)
+        plan.buckets[pool].add(bucket)
+        left.remove(best)
+    return plan
 
 
 class DummyRowPool:
@@ -274,6 +637,19 @@ class AcceleratorGraphBucket:
     slots: list[AcceleratorGraphSlot] = field(default_factory=list)
 
 
+class WarmedSpec(NamedTuple):
+    """A spec prepared and run eagerly: what its capture reads."""
+    run: Callable[[], Any]
+    static_inputs: dict[str, Any]
+    static_input_keys: tuple[str, ...]
+    dummy_rids: list[int]
+    dummy_metadata: dict[int, CurrentForwardPassInfo]
+    # bytes the last warm-up forward allocated at its peak, above what was live
+    peak: int
+    # bytes of what it returned
+    returned: int
+
+
 class AcceleratorGraphRunner:
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
@@ -321,6 +697,12 @@ class AcceleratorGraphRunner:
         self._blocked_buckets: list[BucketKey] = []
         # set by prepare_for_capture; capture reuses it rather than re-deriving
         self._prepared_slot_specs: list[CGSlotSpec] | None = None
+        # bucket -> what it costs, from size_captures
+        self._capture_costs: dict[BucketKey, CaptureCost] = {}
+        # the buckets of them sized by a lender's capture, not their own
+        self._lent: set[BucketKey] = set()
+        # walk -> its graphs' executable memory
+        self._executables: dict[tuple, ExecutableMemory] = {}
 
         # (config_idx, tensor_key) → max-bucket static buffer. Lazily populated
         # by _intern_static_buffer on the first capture. Smaller-bucket captures
@@ -449,8 +831,91 @@ class AcceleratorGraphRunner:
             self._prepared_slot_specs = slot_specs
         return self._prepared_slot_specs
 
-    def warmup_and_capture(self):
-        """Capture graphs for all configs and batch sizes."""
+    def size_captures(self) -> dict[BucketKey, CaptureCost]:
+        """Warm every spec up, and capture each walk's largest buckets once,
+        thrown away, before any runner captures for real.
+
+        Every bucket is warmed rather than the first in capture order: that
+        order leads with batch size, so it can open on a decode bucket while a
+        one-row prefill of thousands of tokens peaks far higher. And every slot: a
+        slot's first plan builds state of its own (FlashInfer's graph wrappers
+        and their workspace, 750 MiB for the Talker's second slot), which has
+        to be spent before free memory is read.
+        """
+        # walk -> the buckets of it captured so far
+        captured: dict[tuple, list[CaptureCost]] = {}
+        for spec in self.prepare_for_capture():
+            # the warm-up may hold collectives; every rank sizes these specs, in
+            # config order, as it does the captures
+            self._comm_group.tp_group.barrier()
+            self._comm_group.sp_group.barrier()
+            free = torch.cuda.mem_get_info(self._device)[0]
+            try:
+                with self._warmed(spec, self.NUM_WARMUP) as warmed:
+                    if spec.slot == 0:
+                        walk = (spec.bucket.graph_walk, spec.bucket.cg_key_info)
+                        self._capture_costs[spec.bucket], lent = _size_in_walk(
+                            captured.setdefault(walk, []),
+                            CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
+                            partial(
+                                capture_into_graph, warmed.run, device=self._device,
+                                autocast_dtype=self._autocast_dtype,
+                            ),
+                            f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
+                        )
+                        if lent:
+                            self._lent.add(spec.bucket)
+            except Exception as e:
+                # Fail the boot. A skipped step would leave its peak out of the plan's floor.
+                # A step that cannot run here cannot run once graphs hold memory either.
+                raise RuntimeError(
+                    f"AcceleratorGraphRunner[{self._submodule_name}]: could not run {spec} eagerly to size "
+                    f"its capture, with {free / 2**20:.0f} MiB free before it: {e}"
+                ) from e
+        return self._capture_costs
+
+    def size_lent_captures(self, wanted: bool) -> dict[BucketKey, CaptureCost]:
+        """Capture every bucket a lender sized, thrown away, if ``wanted`` here
+        or on another rank: a plan that leaves graphs out needs what each
+        takes, not what its walk's largest does.
+
+        Every rank asks, so the ranks of a group size again together or not at
+        all, and plan on the same kind of cost. With no forward and no barrier:
+        sizing ran the forwards, and a capture runs no collective.
+        """
+        if not agree_across_ranks(self._comm_group, [int(wanted)], self._device, torch.amax)[0]:
+            return self._capture_costs
+        for spec in self.prepare_for_capture():
+            if spec.slot != 0 or spec.bucket not in self._lent:
+                continue
+            self._lent.discard(spec.bucket)
+            cost = self._capture_costs[spec.bucket]._replace(graph=None)
+            try:
+                with self._warmed(spec, forwards=0) as warmed:
+                    memory = _capture_thrown_away(
+                        partial(
+                            capture_into_graph, warmed.run, device=self._device,
+                            autocast_dtype=self._autocast_dtype,
+                        ),
+                        f"{self._submodule_name} {spec}",
+                        self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
+                    )
+                if memory is not None:
+                    cost = cost._replace(graph=memory.pool, outside=memory.outside)
+            except Exception:
+                logger.warning(
+                    "AcceleratorGraphRunner[%s]: could not prepare %s to size its capture",
+                    self._submodule_name, spec, exc_info=True,
+                )
+            self._capture_costs[spec.bucket] = cost
+        return self._capture_costs
+
+    def warmup_and_capture(self, planned: Collection[BucketKey] | None):
+        """Capture the ``planned`` buckets, of every config and batch size.
+        With no plan, every bucket, each warmed up first as sizing would have."""
+        # the plan has read free memory, and the graphs captured here reuse what the copies held
+        for executable in self._executables.values():
+            executable.release()
         if self._graph_backend is None or not self._graph_backend.is_available():
             logger.warning(
                 "%s is not available, skipping graph capture for %s",
@@ -463,20 +928,34 @@ class AcceleratorGraphRunner:
         mem_before = self._graph_backend.memory_allocated()
 
         slot_specs = self.prepare_for_capture()
+        sized = planned is not None
+        # what every rank planned, as though captured in full (see `_buckets_captured_everywhere`)
+        planned = self._buckets_captured_everywhere(slot_specs, {
+            bucket: range(self._num_slots)
+            for bucket in (planned if sized else {spec.bucket for spec in slot_specs})
+        })
+        # costliest first, so the graphs after it fit in what it leaves free; by
+        # the most each costs on any rank, so every rank warms up in one order
+        buckets = list(dict.fromkeys(spec.bucket for spec in slot_specs))
+        costs = dict(zip(buckets, agree_across_ranks(self._comm_group, [
+            self._capture_costs[bucket].graph if sized and bucket in planned else 0 for bucket in buckets
+        ], self._device, torch.amax), strict=True))
 
         # bucket -> slot index -> (spec, captured slot). Registration is
         # deferred to a whole bucket at a time: its slots are double buffers of
         # one shape, so a bucket holding only some of them would silently hand
         # pre-plan and replay the same buffers.
         captured: dict[BucketKey, dict[int, tuple[CGSlotSpec, AcceleratorGraphSlot]]] = {}
-        for spec in slot_specs:
+        for spec in sorted(slot_specs, key=lambda spec: -costs[spec.bucket]):
+            if spec.bucket not in planned:
+                continue
             # every rank barriers once per spec, pass or fail — a rank that
             # stopped early here would leave the others waiting
             self._comm_group.tp_group.barrier()
             self._comm_group.sp_group.barrier()
 
             try:
-                slot = self._capture_one(spec)
+                slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
             except Exception:
                 logger.error(
                     "Failed to capture accelerator graph for %s: %s",
@@ -505,8 +984,11 @@ class AcceleratorGraphRunner:
                 spec, slot = slots[slot_idx]
                 for key_spec in [spec, *self._get_addtl_slot_specs(spec)]:
                     self._register_slot(key_spec, slot)
-            if self._num_slots > 1:
-                # pre-seed preplan inputs; cached per bucket, so once is enough
+            config = self._buckets[bucket_key].config
+            if self._num_slots > 1 and config.get_config_type() == AcceleratorGraphConfigType.BASIC_BATCHED:
+                # pre-seed preplan inputs; cached per bucket, so once is enough.
+                # A packed bucket's rows would never be read: a batch with no inputs
+                # yet can only lease a batched one (see `select_batched_bucket`).
                 self.declare_inputs_for(SlotLease(slot=0, bucket=bucket_key))
 
         self._dummy_rows.release_all()
@@ -554,7 +1036,7 @@ class AcceleratorGraphRunner:
         agreed = agree_across_ranks(
             self._comm_group,
             [len(captured.get(key, ())) == self._num_slots for key in order],
-            self._device,
+            self._device, torch.amin,
         )
         return {key for key, ok in zip(order, agreed, strict=True) if ok}
 
@@ -588,7 +1070,29 @@ class AcceleratorGraphRunner:
             (mem_after - mem_before) / (1024 ** 2),
         )
 
-    def _capture_one(self, spec: CGSlotSpec) -> AcceleratorGraphSlot:
+    def _capture_one(self, spec: CGSlotSpec, forwards: int) -> AcceleratorGraphSlot:
+        # no forward after sizing, which already ran this spec's
+        with self._warmed(spec, forwards) as warmed:
+            # what preparing it left cached in the allocator is out of the
+            # capture pool's reach
+            torch.accelerator.empty_cache()
+            graph, output = capture_into_graph(
+                warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+            )
+            return self._build_slot_from_capture(
+                output=BatchedModelOutput.coerce(output),
+                graph=graph,
+                static_inputs=warmed.static_inputs,
+                static_input_keys=warmed.static_input_keys,
+                dummy_rids=warmed.dummy_rids,
+                dummy_metadata=warmed.dummy_metadata,
+                config_idx=spec.config_idx,
+            )
+
+    @contextmanager
+    def _warmed(self, spec: CGSlotSpec, forwards: int) -> Iterator[WarmedSpec]:
+        """Prepare ``spec`` and run its forward eagerly ``forwards`` times, as
+        its first capture needs."""
         walk = spec.bucket.graph_walk
         config = spec.config
         dummy_rids = self._dummy_rows.ensure(
@@ -657,28 +1161,28 @@ class AcceleratorGraphRunner:
 
             self._graph_backend.set_device()
             self._graph_backend.synchronize()
-            for _ in range(self.NUM_WARMUP):
+            peak = returned = 0
+            for _ in range(forwards):
+                # the last forward's peak, not the first's: that one may compile and autotune
+                live = torch.accelerator.memory_allocated(self._device)
+                torch.accelerator.reset_peak_memory_stats(self._device)
                 with autocast_scope(self._autocast_dtype, self._device.type):
-                    run_forward()
+                    returned = _tensor_bytes(run_forward())
+                peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the same shapes the first prepare did
                 self._dummy_rows.reset(dummy_rids)
                 prepare()
             self._graph_backend.synchronize()
 
-            graph, output = capture_into_graph(
-                run_forward, self._memory_pool, self._device, self._autocast_dtype,
-            )
-            output = BatchedModelOutput.coerce(output)
-
-            return self._build_slot_from_capture(
-                output=output,
-                graph=graph,
+            yield WarmedSpec(
+                run=run_forward,
                 static_inputs=static_inputs,
                 static_input_keys=static_input_keys,
                 dummy_rids=dummy_rids,
                 dummy_metadata=engine_inputs.per_request_info,
-                config_idx=spec.config_idx,
+                peak=peak,
+                returned=returned,
             )
         finally:
             # Capture ran the dummy rows as real requests; free their storage
@@ -702,10 +1206,7 @@ class AcceleratorGraphRunner:
             return forward
         if spec.config_idx not in self._compiled_forwards:
             self._compiled_forwards[spec.config_idx] = torch.compile(
-                forward,
-                mode="max-autotune-no-cudagraphs",
-                fullgraph=False,
-                dynamic=False,
+                forward, **compile_kwargs(spec.config.compile_mode),
             )
         return with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
@@ -719,6 +1220,7 @@ class AcceleratorGraphRunner:
             per_request_info=dummy_metadata(dummy_rids, graph_walk),
             resources=dict(self._resources),
             captured=True,
+            synthetic=True,
         )
 
     @staticmethod
@@ -1020,12 +1522,16 @@ class AcceleratorGraphRunner:
         earlier hands the main thread a GIL the GPU thread still needs. Only
         `graph.replay()` below drops it in C++.
         """
+        laps = profiler.PhaseLaps("engine.forward.")
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
             self._graph_backend.current_stream().wait_event(plan_done_event)
         if launch_started_event is not None:
             launch_started_event.set()
-        return self._replay(lease)
+        laps.lap("stage")
+        out = self._replay(lease)
+        laps.lap("replay")
+        return out
 
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
@@ -1121,6 +1627,15 @@ class PiecewiseGraphKey(NamedTuple):
     slot: int
 
 
+class WarmedRegion(NamedTuple):
+    """A region's shape planned and run eagerly: what its capture reads."""
+    run: Callable[[], Any]
+    static_inputs: dict[str, torch.Tensor]
+    dummy_rids: list[int]
+    warm_outputs: dict[str, torch.Tensor]
+    peak: int
+
+
 class PiecewiseAcceleratorGraphRunner:
     """Captures one inner callable of a submodule's forward as a CUDA graph.
 
@@ -1172,6 +1687,14 @@ class PiecewiseAcceleratorGraphRunner:
         self._memory_pool = memory_pool
         # (bs, total_tokens) shapes that failed to capture and run eagerly
         self.dropped_shapes: list[tuple[int, int]] = []
+        # bucket -> what it costs, from size_captures
+        self._capture_costs: dict[BucketKey, CaptureCost] = {}
+        # the buckets of them sized by a lender's capture, not their own
+        self._lent: set[BucketKey] = set()
+        # executable memory of the region's graphs, which are all one walk
+        self._executable = ExecutableMemory()
+        # bucket -> the shape, dtype and device of each output of its warm-up
+        self._output_likes: dict[BucketKey, dict[str, tuple]] = {}
         self._dummy_rows = DummyRowPool(
             prefix=f"pw_{label}", step_runner=step_runner, resources=resources,
         )
@@ -1260,7 +1783,93 @@ class PiecewiseAcceleratorGraphRunner:
             self._prepared_shapes = shapes
         return self._prepared_shapes
 
-    def warmup_and_capture(self) -> None:
+    def size_captures(self) -> dict[BucketKey, CaptureCost]:
+        """Warm every shape up and capture the largest once, thrown away; see
+        `AcceleratorGraphRunner.size_captures`."""
+        self._graph_backend.set_device()
+        shapes = sorted(
+            self.prepare_for_capture(), key=lambda s: (s.bs, s.total_tokens), reverse=True,
+        )
+        # the region is one walk
+        captured: list[CaptureCost] = []
+        for shape in shapes:
+            for slot in range(self._num_slots):
+                if self._comm_group is not None:
+                    self._comm_group.tp_group.barrier()
+                    self._comm_group.sp_group.barrier()
+                free = torch.cuda.mem_get_info(self._device)[0]
+                try:
+                    with self._warmed(shape, slot, self.NUM_WARMUP) as warmed:
+                        self._output_likes[self._bucket(shape)] = {
+                            name: (value.shape, value.dtype, value.device)
+                            for name, value in warmed.warm_outputs.items()
+                        }
+                        if slot == 0:
+                            # a region's outputs and inputs live outside the pool, a set per graph
+                            kept = _tensor_bytes(warmed.warm_outputs) + _tensor_bytes(warmed.static_inputs)
+                            self._capture_costs[self._bucket(shape)], lent = _size_in_walk(
+                                captured, CaptureCost(warmed.peak, None, kept, self._num_slots), False,
+                                partial(
+                                    capture_with_static_outputs, warmed.run, warmed.warm_outputs,
+                                    device=self._device, autocast_dtype=self._autocast_dtype,
+                                ),
+                                f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
+                            )
+                            if lent:
+                                self._lent.add(self._bucket(shape))
+                except Exception as e:
+                    # as in `AcceleratorGraphRunner.size_captures`
+                    raise RuntimeError(
+                        f"PiecewiseAcceleratorGraphRunner[{self._label}]: could not run bs={shape.bs} "
+                        f"total_tokens={shape.total_tokens} slot={slot} eagerly to size its capture, "
+                        f"with {free / 2**20:.0f} MiB free before it: {e}"
+                    ) from e
+        # hand the pages back: held through the captures, they would shift every
+        # admit after them on a node that shares the resource
+        self._dummy_rows.release_all()
+        return self._capture_costs
+
+    def size_lent_captures(self, wanted: bool) -> dict[BucketKey, CaptureCost]:
+        """Capture every shape a lender sized, thrown away, if ``wanted`` here
+        or on another rank; see `AcceleratorGraphRunner.size_lent_captures`."""
+        if not agree_across_ranks(self._comm_group, [int(wanted)], self._device, torch.amax)[0]:
+            return self._capture_costs
+        for shape in self.prepare_for_capture():
+            bucket = self._bucket(shape)
+            if bucket not in self._lent:
+                continue
+            self._lent.discard(bucket)
+            cost = self._capture_costs[bucket]._replace(graph=None)
+            try:
+                with self._warmed(shape, 0, forwards=0) as warmed:
+                    memory = _capture_thrown_away(
+                        partial(
+                            capture_with_static_outputs, warmed.run, self._outputs_like(bucket),
+                            device=self._device, autocast_dtype=self._autocast_dtype,
+                        ),
+                        f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
+                    )
+                if memory is not None:
+                    cost = cost._replace(graph=memory.pool + cost.kept, outside=memory.outside)
+            except Exception:
+                logger.warning(
+                    "PiecewiseAcceleratorGraphRunner[%s]: could not prepare bs=%d total_tokens=%d "
+                    "to size its capture", self._label, shape.bs, shape.total_tokens, exc_info=True,
+                )
+            self._capture_costs[bucket] = cost
+        self._dummy_rows.release_all()
+        return self._capture_costs
+
+    def _outputs_like(self, bucket: BucketKey) -> dict[str, torch.Tensor]:
+        """Tensors shaped as the outputs of sizing's warm-up of ``bucket``, one
+        element each, expanded: a capture reads their shape and dtype."""
+        return {
+            name: torch.empty((), dtype=dtype, device=device).expand(size)
+            for name, (size, dtype, device) in self._output_likes[bucket].items()
+        }
+
+    def warmup_and_capture(self, planned: Collection[BucketKey] | None) -> None:
+        self._executable.release()
         if self._graph_backend is None or not self._graph_backend.is_available():
             logger.warning(
                 "%s is not available, skipping piecewise capture for %s",
@@ -1281,8 +1890,21 @@ class PiecewiseAcceleratorGraphRunner:
         ordered = sorted(
             shapes, key=lambda s: (s.bs, s.total_tokens), reverse=True
         )
-        captured: list[bool] = []
-        for shape in ordered:
+        # as in `AcceleratorGraphRunner.warmup_and_capture`: what every rank planned, costliest first
+        sized = planned is not None
+        planned_everywhere = agree_across_ranks(
+            self._comm_group, [not sized or self._bucket(shape) in planned for shape in ordered],
+            self._device, torch.amin,
+        )
+        costs = agree_across_ranks(self._comm_group, [
+            self._capture_costs[self._bucket(shape)].graph if sized and ok else 0
+            for shape, ok in zip(ordered, planned_everywhere, strict=True)
+        ], self._device, torch.amax)
+        captured = [False] * len(ordered)
+        for i in sorted(range(len(ordered)), key=lambda i: -costs[i]):
+            shape = ordered[i]
+            if not planned_everywhere[i]:
+                continue
             shape_captured = True
             for slot in range(self._num_slots):
                 # keep ranks in lockstep: the region may hold collectives, and a
@@ -1293,7 +1915,7 @@ class PiecewiseAcceleratorGraphRunner:
                     self._comm_group.tp_group.barrier()
                     self._comm_group.sp_group.barrier()
                 try:
-                    self._capture_one(shape, slot)
+                    self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)
                 except Exception:
                     shape_captured = False
                     logger.error(
@@ -1301,7 +1923,7 @@ class PiecewiseAcceleratorGraphRunner:
                         "total_tokens=%d slot=%d", self._label, shape.bs,
                         shape.total_tokens, slot, exc_info=True,
                     )
-            captured.append(shape_captured)
+            captured[i] = shape_captured
             if shape_captured:
                 logger.info(
                     "PiecewiseAcceleratorGraphRunner[%s]: captured bs=%d total_tokens=%d "
@@ -1312,7 +1934,7 @@ class PiecewiseAcceleratorGraphRunner:
         # `ordered` comes from the config, so every rank agrees on the order
         for shape, ok in zip(
             ordered,
-            agree_across_ranks(self._comm_group, captured, self._device),
+            agree_across_ranks(self._comm_group, captured, self._device, torch.amin),
             strict=True,
         ):
             if ok:
@@ -1339,7 +1961,30 @@ class PiecewiseAcceleratorGraphRunner:
                 self.dropped_shapes,
             )
 
-    def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
+    def _capture_one(self, shape: PiecewiseCaptureShape, slot: int, forwards: int) -> None:
+        # as in `AcceleratorGraphRunner._capture_one`
+        with self._warmed(shape, slot, forwards) as warmed:
+            torch.accelerator.empty_cache()
+            graph, static_outputs = capture_with_static_outputs(
+                warmed.run, warmed.warm_outputs if forwards else self._outputs_like(self._bucket(shape)),
+                self._memory_pool, self._device, self._autocast_dtype,
+            )
+
+        self._graphs[PiecewiseGraphKey(
+            bs=shape.bs, seq_len=shape.total_tokens, slot=slot
+        )] = PiecewiseGraphData(
+            graph=graph,
+            static_inputs=warmed.static_inputs,
+            static_outputs=static_outputs,
+            dummy_rids=list(warmed.dummy_rids),
+            shape=shape,
+            bucket=self._bucket(shape),
+        )
+
+    @contextmanager
+    def _warmed(self, shape: PiecewiseCaptureShape, slot: int, forwards: int) -> Iterator[WarmedRegion]:
+        """Plan ``shape`` and run the region eagerly ``forwards`` times; see
+        ``AcceleratorGraphRunner._warmed``."""
         dummy_rids = self._dummy_rows.ensure(
             self._dummy_key(shape, slot), shape.bs
         )
@@ -1353,9 +1998,7 @@ class PiecewiseAcceleratorGraphRunner:
         fn = self._config.capture_fn
         if self._config.compile:
             fn = with_inductor_overrides(
-                torch.compile(
-                    fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
-                ),
+                torch.compile(fn, **compile_kwargs(self._config.compile_mode)),
                 shape.total_tokens,
             )
 
@@ -1365,35 +2008,28 @@ class PiecewiseAcceleratorGraphRunner:
         try:
             self._plan(step, shape)
             self._graph_backend.synchronize()
-            warm_outputs = None
-            for _ in range(self.NUM_WARMUP):
+            warm_outputs, peak = None, 0
+            for _ in range(forwards):
+                # as in `AcceleratorGraphRunner._warmed`
+                live = torch.accelerator.memory_allocated(self._device)
+                torch.accelerator.reset_peak_memory_stats(self._device)
                 with autocast_scope(self._autocast_dtype, self._device.type):
                     warm_outputs = run_fn()
+                peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the shapes the first plan did
                 self._dummy_rows.reset(dummy_rids)
                 self._plan(step, shape)
             self._graph_backend.synchronize()
 
-            graph, static_outputs = capture_with_static_outputs(
-                run_fn, warm_outputs, self._memory_pool, self._device,
-                self._autocast_dtype,
+            yield WarmedRegion(
+                run=run_fn, static_inputs=static_inputs,
+                dummy_rids=dummy_rids, warm_outputs=warm_outputs, peak=peak,
             )
         finally:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident
             self._dummy_rows.reset(dummy_rids)
-
-        self._graphs[PiecewiseGraphKey(
-            bs=shape.bs, seq_len=shape.total_tokens, slot=slot
-        )] = PiecewiseGraphData(
-            graph=graph,
-            static_inputs=static_inputs,
-            static_outputs=static_outputs,
-            dummy_rids=list(dummy_rids),
-            shape=shape,
-            bucket=self._bucket(shape),
-        )
 
     def _call_inputs(
         self,
@@ -1417,6 +2053,7 @@ class PiecewiseAcceleratorGraphRunner:
                 per_request_info=dummy_metadata(step_ids, PIECEWISE_WALK),
                 resources=dict(self._resources),
                 step=step,
+                synthetic=True,
             ),
             kwargs=self._config.forward_kwargs,
         )
@@ -1521,6 +2158,10 @@ class PiecewiseAcceleratorGraphRunner:
     def lease_before_step(self) -> bool:
         """Whether this region takes its slot ahead of the declaration."""
         return self._config.lease_before_step
+
+    def can_lease(self, inputs: list[NodeInputs]) -> bool:
+        """The config's ``can_lease`` for this batch; True when it sets none."""
+        return self._config.can_lease is None or self._config.can_lease(inputs)
 
     def lease_slot(
         self, batch_size: int, total_tokens: int | None = None,

@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCKER_DIR = REPO_ROOT / "mstar/integrations/dynamo/docker"
 DOCKERFILES = [DOCKER_DIR / "Dockerfile", DOCKER_DIR / "Dockerfile.dynamo-base"]
 # extras that are not a model family's runtime
-NOT_MODEL_EXTRAS = {"all", "dev", "audio", "dynamo", "eval", "omnivoice"}
+NOT_MODEL_EXTRAS = {"all", "dev", "audio", "dynamo", "eval", "metrics", "omnivoice"}
 # model-extra packages [all] leaves out, with the reason
 NOT_IN_ALL = {
     # Intel XPU kernels; [all] targets CUDA

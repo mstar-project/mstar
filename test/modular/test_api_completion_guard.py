@@ -2,7 +2,7 @@
 fully delivered, and a request that fails preprocessing must reach the
 client as an error instead of leaving it to hit the server timeout.
 
-An empty final_outputs dict made received_final_chunks vacuously true, so a
+An empty output_chunk_counts dict made received_final_chunks vacuously true, so a
 request whose walk emitted nothing (or whose completion message raced ahead
 of every result) completed instantly with zero chunks instead of holding for
 late results.
@@ -14,29 +14,25 @@ from types import SimpleNamespace
 
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
-from mstar.graph.loop_indices import NestedLoopIndices
 
 
-def _worker_with(output_loop_idxs):
+def _worker_with(received_chunk_counts):
     worker = PreprocessWorker.__new__(PreprocessWorker)
-    worker.output_loop_idxs = output_loop_idxs
+    worker.received_chunk_counts = received_chunk_counts
     return worker
 
 
-def test_empty_final_outputs_is_not_done():
+def test_empty_output_chunk_counts_is_not_done():
     worker = _worker_with({"r1": {}})
     assert worker.received_final_chunks("r1", {}) is False
 
 
-def test_final_outputs_wait_for_registration_then_complete():
-    final = NestedLoopIndices(
-        loop_name_order=["denoise"], loop_indices={"denoise": 34}, wg_fwd_pass_idx=0
-    )
+def test_output_chunk_counts_wait_for_registration_then_complete():
     worker = _worker_with({"r1": {}})
     # Completion reported but the terminal chunk hasn't registered yet.
-    assert worker.received_final_chunks("r1", {"video_output": final}) is False
-    worker.output_loop_idxs["r1"]["video_output"] = final
-    assert worker.received_final_chunks("r1", {"video_output": final}) is True
+    assert worker.received_final_chunks("r1", {"video_output": 1}) is False
+    worker.received_chunk_counts["r1"]["video_output"] = 1
+    assert worker.received_final_chunks("r1", {"video_output": 1}) is True
 
 
 def test_preprocess_failure_emits_error_chunk():
@@ -49,6 +45,7 @@ def test_preprocess_failure_emits_error_chunk():
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.in_queue = queue.Queue()
+    wt._is_pending = lambda key: True
     wt.out_queue = queue.Queue()
     wt.result_tensor_queue = queue.Queue()
     wt.cleanup_request_queue = queue.Queue()
@@ -56,6 +53,7 @@ def test_preprocess_failure_emits_error_chunk():
     wt.reads_done_queue = queue.Queue()
     wt.discard_tensor_queue = queue.Queue()
     wt.stop_event = threading.Event()
+    wt.timing_requested = threading.Event()
     wt.communicator = SimpleNamespace(
         get_all_new_messages=lambda: [], send=lambda *args: None,
     )
@@ -64,6 +62,7 @@ def test_preprocess_failure_emits_error_chunk():
         force_cleanup_request=cleaned.append,
         has_inflight_reads=lambda rid: False,
         get_ready_tensors=lambda: {},
+        take_failed_reads=lambda: [],
     )
     wt.model = _RejectingModel()
     wt.device = "cpu"

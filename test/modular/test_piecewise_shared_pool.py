@@ -52,7 +52,7 @@ def test_region_outputs_are_copied_into_buffers_outside_the_pool(monkeypatch):
 
     captured = {}
 
-    def fake_capture(fn, pool, device, autocast_dtype):
+    def fake_capture(fn, pool, device, autocast_dtype, keep_graph=False):
         captured["pool"] = pool
         return "graph", fn()
 

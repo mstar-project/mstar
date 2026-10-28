@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionStep, AttnBackend
+from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
@@ -35,10 +35,24 @@ if flash_attn_varlen_func is None and current_platform.is_rocm():
         _VARLEN_IMPORT_ERROR = None
 
 
+def _fa3_has_kernel(capability: tuple[int, int]) -> bool:
+    # fa3-fwd ships sm_90a and sm_80 kernels and no PTX, so a GPU of any other
+    # architecture, Blackwell's among them, has no image to launch
+    return capability == (9, 0) or capability[0] == 8
+
+
 @functools.cache
-def _fa3_unavailable_reason() -> str | None:
-    """why no varlen kernel imported: fa3-fwd, and AITER on ROCm"""
-    return _VARLEN_IMPORT_ERROR
+def _fa3_unavailable_reason(device: torch.device | None = None) -> str | None:
+    """why no varlen kernel can run on ``device`` (the current GPU if None): none
+    imported (fa3-fwd, and AITER on ROCm), or fa3-fwd has none for its capability"""
+    if _VARLEN_IMPORT_ERROR is not None:
+        return _VARLEN_IMPORT_ERROR
+    if device is not None and torch.device(device).type != "cuda":
+        return None
+    capability = current_platform.cuda_capability(device)
+    if capability is not None and not _fa3_has_kernel(capability):
+        return f"fa3-fwd has no kernel for compute capability {capability[0]}.{capability[1]}"
+    return None
 
 
 @functools.cache
@@ -162,6 +176,7 @@ class DenseAttentionManager(AttentionManager):
             del self._prefix_cache[key]
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
         if ctx.slot_lease is not None or ctx.is_preplan:
             raise RuntimeError(

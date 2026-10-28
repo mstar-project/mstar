@@ -9,6 +9,8 @@ writes one file per point. Layout (``schema: "mstar-eval/1"``)::
       "suite": "tts", "label": "kokoro", "created_at": "2026-10-16T07:00:00Z",
       "config": {...},       # everything that decides the numbers (dataset, n, load, judges, seed)
       "meta": {...},         # git commit, GPU, driver, versions, MSTAR_* env, server, CLI flags
+                             # (meta.git and meta.versions describe the eval's checkout;
+                             # meta.server.git and meta.server.versions what was served)
       "repeats": [{"index": 0, "wall_s": 12.3, "metrics": {...}, "requests": [...]}, ...],
       "summary": {"<metric>": {"mean": .., "std": .., "min": .., "max": .., "n": 3}, ...}
     }
@@ -110,8 +112,8 @@ def _scrub_row(row: dict[str, Any]) -> dict[str, Any]:
     in ``scrubbed`` so nothing downstream mistakes them for what the model said."""
     out, changed = {}, []
     for k, v in row.items():
-        if isinstance(v, str) and k != "id":
-            clean = _scrub(v)
+        if k != "id":
+            clean = _scrub_strings(v)
             if clean != v:
                 changed.append(k)
             v = clean
@@ -119,6 +121,17 @@ def _scrub_row(row: dict[str, Any]) -> dict[str, Any]:
     if changed:
         out["scrubbed"] = sorted(set(changed) | set(row.get("scrubbed") or []))
     return out
+
+
+def _scrub_strings(v: Any) -> Any:
+    """Every string inside a row value (nested transcripts too) scrubbed; keys kept."""
+    if isinstance(v, str):
+        return _scrub(v)
+    if isinstance(v, dict):
+        return {k: _scrub_strings(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return type(v)(_scrub_strings(x) for x in v)
+    return v
 
 
 def _json_default(obj: Any) -> Any:
@@ -172,6 +185,8 @@ def redact_url(url: str | None) -> str | None:
 _SECRET = re.compile(
     r"TOKEN|SECRET|PASSW|API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|AUTH|CREDENTIAL|COOKIE|SESSION", re.IGNORECASE
 )
+# Token counts (decoding settings), kept when their value is a number.
+_TOKEN_COUNT = re.compile(r"(max|min|num)_(new_|prompt_|output_)?tokens", re.IGNORECASE)
 # Keys whose values name a machine; their values are kept only when loopback.
 _HOSTLIKE = re.compile(r"HOST|ADDR|ENDPOINT|URL|URI|DOMAIN|PEER|(^|_)IP($|_)", re.IGNORECASE)
 _URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"]+")
@@ -244,7 +259,9 @@ def scrub(obj: Any, host: bool = False) -> Any:
             if host and isinstance(k, str):  # under a host-like key, mapping keys can be hosts too
                 k = _value("HOST", k)
                 k = k if k not in out else f"{k}{i}"
-            out[k] = "<redacted>" if _SECRET.search(name) else scrub(v, host or bool(_HOSTLIKE.search(name)))
+            count = _TOKEN_COUNT.fullmatch(name) and isinstance(v, int) and not isinstance(v, bool)
+            secret = _SECRET.search(name) and not count
+            out[k] = "<redacted>" if secret else scrub(v, host or bool(_HOSTLIKE.search(name)))
         return out
     if isinstance(obj, (list, tuple)):
         return [scrub(v, host) for v in obj]

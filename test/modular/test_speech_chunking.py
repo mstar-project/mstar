@@ -483,6 +483,7 @@ def test_release_request_aborts_only_requests_still_running():
         pending_requests={"done#1": types.SimpleNamespace(event=done),
                           "running#2": types.SimpleNamespace(event=running)},
         _retire=lambda key: None,
+        _record_end=lambda req, outcome: None,
         abort_submission=aborted.append,
     )
     APIServer.release_request(server, "done")

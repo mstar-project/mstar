@@ -9,7 +9,9 @@ workers) with SIGINT, then SIGTERM, then SIGKILL.
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -21,13 +23,45 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from benchmark.eval.schema import describe_args, describe_command, redact_url, scrub_argv, scrub_env
+from benchmark.eval.schema import describe_args, describe_command, git_info, redact_url, scrub_argv, scrub_env
+
+_TREE_PROBE = """
+import importlib.metadata as md, importlib.util, json, pathlib
+spec = importlib.util.find_spec("mstar")
+root = pathlib.Path(spec.origin).resolve().parents[1] if spec and spec.origin else None
+def v(d):
+    try:
+        return md.version(d)
+    except md.PackageNotFoundError:
+        return None
+print(json.dumps({"root": str(root) if root else None,
+                  "versions": {d: v(d) for d in ("mstar-ai", "torch", "transformers")}}))
+"""
 
 
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def python_tree(python: str, env: dict[str, str] | None = None,
+                cwd: str | Path | None = None) -> dict[str, Any]:
+    """The checkout and package versions ``python`` imports M* from, without importing it.
+
+    With ``--serve-python`` the server runs another venv, often another checkout, so the
+    eval's own ``meta.git`` and ``meta.versions`` do not describe what was served. Run with
+    the server's cwd and env: ``-c`` puts the cwd first on ``sys.path`` as ``-m`` does.
+    """
+    try:
+        out = subprocess.run([python, "-c", _TREE_PROBE], capture_output=True, text=True,
+                             env=env, cwd=cwd, timeout=60, check=True)
+        probe = json.loads(out.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return {}
+    root = probe.get("root")
+    in_checkout = bool(root) and (Path(root) / "pyproject.toml").is_file()
+    return {"git": git_info(root) if in_checkout else {}, "versions": probe.get("versions") or {}}
 
 
 def is_healthy(url: str, timeout: float = 2.0) -> bool:
@@ -74,9 +108,11 @@ class ManagedServer:
         startup_timeout_s: float = 1800.0,
         command: list[str] | None = None,
         python: str | None = None,
+        cwd: str | Path | None = None,
     ):
         self.model = model
         self.python = python or sys.executable
+        self._own_python = python is not None
         self.config = config
         self.port = port or free_port()
         self.url = f"http://127.0.0.1:{self.port}"
@@ -85,9 +121,11 @@ class ManagedServer:
         self.log_path = Path(log_path) if log_path else None
         self.startup_timeout_s = startup_timeout_s
         self._command = command
+        self.cwd = cwd
         self._proc: subprocess.Popen | None = None
         self._log = None
         self._scratch: tempfile.TemporaryDirectory | None = None
+        self._tree: dict[str, Any] | None = None
         self.startup_s: float | None = None
 
     def command(self) -> list[str]:
@@ -101,6 +139,22 @@ class ManagedServer:
         if self.config:
             cmd += ["--config", self.config]
         return cmd + self.extra_args
+
+    def environment(self) -> dict[str, str]:
+        env = {**os.environ, **self.env}
+        if self._own_python and self._command is None:
+            python = self.python
+            if not os.path.dirname(python):
+                # a bare name (`python3.12`) runs from PATH, where Popen finds it, not from the cwd
+                python = shutil.which(python, path=env.get("PATH"))
+            if python:
+                # Tools the server finds on PATH (FlashInfer's JIT needs ninja) come from its own
+                # venv, as when that venv is activated; the abspath keeps a venv's bin/python
+                # symlink unresolved.
+                # A relative path runs from the server's cwd, as Popen resolves it there.
+                bin_dir = os.path.dirname(os.path.abspath(os.path.join(self.cwd or "", python)))
+                env["PATH"] = os.pathsep.join([bin_dir, env["PATH"]]) if env.get("PATH") else bin_dir
+        return env
 
     def __enter__(self) -> ManagedServer:
         self.start()
@@ -125,9 +179,15 @@ class ManagedServer:
             stdin=subprocess.DEVNULL,
             stdout=self._log or subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
-            env={**os.environ, **self.env},
+            env=self.environment(),
+            cwd=self.cwd,
             start_new_session=True,
         )
+
+    @property
+    def pid(self) -> int | None:
+        """The launched process; it leads its own session and process group (API server, conductor, workers)."""
+        return self._proc.pid if self._proc is not None else None
 
     def wait_ready(self) -> None:
         assert self._proc is not None
@@ -174,6 +234,8 @@ class ManagedServer:
             self._scratch = None
 
     def info(self) -> dict[str, Any]:
+        if self._tree is None:
+            self._tree = python_tree(self.python, self.environment(), self.cwd) if self._command is None else {}
         return {
             "managed": True,
             "model": self.model,
@@ -183,4 +245,7 @@ class ManagedServer:
             "env": scrub_env(self.env),
             "startup_s": self.startup_s,
             "url": redact_url(self.url),
+            # the tree and versions that were served; meta.git and meta.versions are the eval's
+            "git": self._tree.get("git", {}),
+            "versions": self._tree.get("versions", {}),
         }

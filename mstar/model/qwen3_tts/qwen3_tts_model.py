@@ -67,7 +67,8 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
+from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -401,6 +402,12 @@ class Qwen3TTSModel(Model):
         # codec decoder's dtype. float32 reproduces the reference decoder
         # bit for bit; bfloat16 roughly halves the codec's GPU time.
         self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
+        # Server-init knob: opt-in AudioSeal watermark on the codec's output
+        # (``mstar.model.audio_watermark``). Checked here so a missing package
+        # fails the server at startup, not at the first request.
+        self.audio_watermark = AudioWatermarkConfig.parse(kwargs.get("audio_watermark"))
+        if self.audio_watermark.enabled:
+            import_audioseal()
 
         # The lightweight API-side object needs config and tokenizer only.
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
@@ -542,7 +549,7 @@ class Qwen3TTSModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.talker.max_position_embeddings,
             outputs=[],
         )
         walks = {
@@ -642,15 +649,24 @@ class Qwen3TTSModel(Model):
         import soundfile
         import torchaudio.functional as audio_functional
 
-        from mstar.api_server.media_io import check_resample_rate
+        from mstar.api_server.media_io import check_resample_rate, read_soundfile_capped
+        from mstar.model.media_limits import read_sound_file, sound_file_seconds
 
         # Bound the clip before decoding it: a small compressed file can hold hours of audio.
         info = soundfile.info(filepath)
         target_rate = self.config.codec.input_sample_rate
         check_resample_rate(info.samplerate, target_rate)
-        self._check_reference_duration(info.frames / info.samplerate)
-        waveform, sample_rate = soundfile.read(filepath, dtype="float32", always_2d=True)
-        audio = torch.from_numpy(waveform).mean(dim=1)
+        seconds = sound_file_seconds(info.frames, info.samplerate)
+        if seconds is not None:
+            self._check_reference_duration(seconds)
+            # the header can understate the length, so the decode stops at the bound too
+            waveform, sample_rate = read_soundfile_capped(filepath, self.config.reference_max_seconds)
+            audio = torch.from_numpy(waveform)
+        else:
+            # no sample count in the header (a FLAC written to a pipe): count it as it decodes
+            waveform, sample_rate = read_sound_file(filepath, self.config.reference_max_seconds)
+            self._check_reference_duration(len(waveform) / sample_rate)
+            audio = torch.from_numpy(waveform).mean(dim=1)
         if sample_rate != target_rate:
             audio = audio_functional.resample(audio, sample_rate, target_rate)
         return TensorAndMetadata(
@@ -778,6 +794,10 @@ class Qwen3TTSModel(Model):
 
     # model_kwargs key: reference frames leading an in-context clone's codec stream
     CODEC_STREAM_LEAD_KEY = "codec_stream_lead_frames"
+    INTERNAL_KWARGS = (
+        PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY, CODEC_STREAM_LEAD_KEY,
+    )
+    LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def process_prompt(
         self,
@@ -798,9 +818,9 @@ class Qwen3TTSModel(Model):
         a clone's ``REF_CLIP_KEY`` digest. ``stream_text`` follows the
         reference default per variant (whole text in the prefill for
         CustomVoice and VoiceDesign, one token per frame for Base) unless the
-        request sets ``non_streaming_mode``. An in-context clone also reports,
-        as ``CODEC_STREAM_LEAD_KEY``, how many reference frames lead the codec
-        stream (context only; see ``get_initial_forward_pass_args``).
+        request sets ``non_streaming_mode``. ``CODEC_STREAM_LEAD_KEY`` reports
+        how many reference frames lead the codec stream (context only, 0
+        without an in-context clone; see ``get_initial_forward_pass_args``).
         """
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
@@ -848,13 +868,22 @@ class Qwen3TTSModel(Model):
             PROMPT_LAYOUT_KEY: [instruct_ids.numel(), text_len, int(stream_text), ref_ids.numel(), ref_frames],
             SPEAKER_ID_KEY: speaker_id,
             LANGUAGE_ID_KEY: language_id,
+            # set in every mode (0 without an in-context clone): the data worker
+            # lays this over the request's own kwargs
+            self.CODEC_STREAM_LEAD_KEY: min(ref_frames, self.config.codec.left_context_frames),
         }
         clips = (tensors or {}).get("audio_inputs", [])
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
-        lead = min(ref_frames, self.config.codec.left_context_frames)
-        if lead:
-            metadata[self.CODEC_STREAM_LEAD_KEY] = lead
+        from mstar.model.qwen3_tts.submodules import prefill_rows
+
+        # a clone's x-vector takes the speaker row
+        clone = "audio" in input_modalities
+        rows = prefill_rows(metadata[PROMPT_LAYOUT_KEY], language_id, speaker_id >= 0 or clone)
+        metadata["kv_layout"] = {TALKER_KV: {"main": LabelLayout(
+            spans=(Span("rows", "talker_prefill_clone" if clone else "talker_prefill", rows, rows, "text_inputs"),),
+            growth=(("talker_decode_loop", 1),),
+        )}}
         return ProcessPromptOutput(
             {"text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])]}, metadata
         )
@@ -902,9 +931,6 @@ class Qwen3TTSModel(Model):
                 output_modalities=output_modalities,
                 graph_walk=walk,
                 is_prefill=True,
-                kwargs={
-                    "talker_max_tokens": self.get_max_output_tokens(**model_kwargs),
-                },
             )
             routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
             step_metadata = self._talker_step_metadata(metadata)
@@ -1059,6 +1085,13 @@ class Qwen3TTSModel(Model):
             "max_output_tokens",
             model_kwargs.get("max_new_tokens", self.config.generation.max_new_tokens),
         )
+
+    def get_loop_caps(self, **model_kwargs: Any) -> dict[str, int]:
+        # the stop check counts the prefill's frame, so decode runs one iteration fewer than max tokens
+        return {"talker_decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {TALKER_KV: {"main": KVLabel(growth=(("talker_decode", "talker_decode_loop"),))}}
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.codec.output_sample_rate
@@ -1226,7 +1259,9 @@ class Qwen3TTSModel(Model):
         decoder.eval()
         if self.codec_dtype != torch.float32:
             decoder.to(dtype=self.codec_dtype)
-        return CodecSubmodule(decoder, self.config)
+        watermark = getattr(self, "audio_watermark", AudioWatermarkConfig())
+        watermarker = AudioSealWatermarker.build(watermark, device) if watermark.enabled else None
+        return CodecSubmodule(decoder, self.config, watermarker=watermarker)
 
     def _create_ref_encoder_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
@@ -1292,8 +1327,4 @@ class Qwen3TTSModel(Model):
     def _talker_step_metadata(
         metadata: CurrentForwardConductorMetadata,
     ) -> dict[str, Any]:
-        """Copy conductor-owned generation controls into worker step metadata."""
-        return {
-            "is_prefill": metadata.is_prefill,
-            "talker_max_tokens": metadata.kwargs["talker_max_tokens"],
-        }
+        return {"is_prefill": metadata.is_prefill}

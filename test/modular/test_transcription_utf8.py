@@ -69,7 +69,7 @@ def _wav_seconds(path: str) -> float | None:
         return None
 
 
-def _read_wav(path: str, sample_rate: int = 16_000):
+def _read_wav(path: str, sample_rate: int = 16_000, max_seconds: float | None = None):
     with wave.open(path) as wf:
         assert wf.getframerate() == sample_rate
         return np.frombuffer(wf.readframes(wf.getnframes()), "<i2").astype(np.float32) / 32768

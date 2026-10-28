@@ -101,7 +101,7 @@ def allreduce_add_rmsnorm(
         weight_bias=weight_bias,
         # Complete at the end: with an early trigger a PDL-launched consumer
         # can read the one-shot Lamport buffer before it is committed (see
-        # vLLM's allreduce_rms_fusion and flashinfer-ai/flashinfer#1223).
+        # flashinfer-ai/flashinfer#1223).
         trigger_completion_at_end=True,
     )
     return norm_out, residual_out
@@ -110,3 +110,23 @@ def allreduce_add_rmsnorm(
 @allreduce_add_rmsnorm.register_fake
 def _(x, residual, weight, eps, weight_bias, ws_id):
     return torch.empty_like(x), torch.empty_like(residual)
+
+
+@torch.library.custom_op("mstar::allreduce_oneshot", mutates_args=())
+def allreduce_oneshot(x: torch.Tensor, ws_id: int) -> torch.Tensor:
+    """``allreduce(x)`` with the same one-kernel collective, and no norm."""
+    import flashinfer.comm as fc
+
+    out = torch.empty_like(x)
+    fc.allreduce_fusion(
+        input=x, workspace=_WORKSPACES[ws_id],
+        pattern=fc.AllReduceFusionPattern.kAllReduce,
+        launch_with_pdl=True, output=out, fp32_acc=True,
+        trigger_completion_at_end=True,
+    )
+    return out
+
+
+@allreduce_oneshot.register_fake
+def _(x, ws_id):
+    return torch.empty_like(x)

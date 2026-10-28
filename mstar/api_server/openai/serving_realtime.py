@@ -5,11 +5,25 @@ that streams microphone audio and wants partial transcripts:
 
 Client events
     ``transcription_session.update``  ``{"session": {"input_audio_transcription":
-    {"model", "language", "prompt"}, "input_audio_format": "pcm16", "mstar":
-    {"chunk_seconds", "unfixed_chunks", "unfixed_tokens"}}}``
-    ``input_audio_buffer.append``      ``{"audio": <base64 PCM16 mono 16 kHz>}``
+    {"model", "language", "prompt"}, "input_audio_format", "turn_detection",
+    "mstar": {"chunk_seconds", "unfixed_chunks", "unfixed_tokens"}}}``
+    ``input_audio_buffer.append``      ``{"audio": <base64 PCM16 mono>}``
     ``input_audio_buffer.commit``      end of the utterance: flush and finish
     ``input_audio_buffer.clear``       drop buffered audio and start over
+
+``input_audio_format`` is ``"pcm16"`` (16 kHz, the default) or OpenAI's
+``{"type": "audio/pcm", "rate": 24000}``; 24 kHz audio is resampled to the
+model's 16 kHz as it arrives, so partial ``audio_seconds`` stay on the
+client's timeline. The rate changes only with an empty buffer.
+
+``turn_detection`` null (the default) leaves ending an utterance to the
+client's commit. ``{"type": "server_vad", "threshold", "prefix_padding_ms",
+"silence_duration_ms"}`` lets the server end it (``realtime_vad``), adding
+``input_audio_buffer.speech_started`` / ``.speech_stopped`` events with
+``audio_start_ms`` / ``audio_end_ms`` on the session's audio timeline; a
+turn that reaches the item cap is committed there instead of refused.
+``{"type": "semantic_vad", "eagerness"}`` asks an end-of-turn model at each
+pause instead, and the update is refused when that model is unavailable.
 
 ``chunk_seconds`` below ``MIN_CHUNK_SECONDS`` is raised to it and must not
 pass the item cap, and the unfixed counts are non-negative integers; numeric
@@ -64,12 +78,21 @@ import numpy as np
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
 from mstar.api_server import media_io
+from mstar.api_server.openai import realtime_vad
 from mstar.api_server.openai._util import now, rid
 from mstar.api_server.openai.protocol import TranscriptionRequest
+from mstar.utils.utf8_stream import decode_joined
 
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
+# Input rates a session accepts; 24 kHz (OpenAI's pcm rate) is resampled to SAMPLE_RATE.
+INPUT_SAMPLE_RATES = (16000, 24000)
+# Appends up to this many input samples (4 ms at 24 kHz) cost less to resample
+# than a thread hop, so they resample on the event loop; longer ones go to a thread.
+INLINE_RESAMPLE_SAMPLES = 96
+# Longest server_vad prefix padding or silence window.
+MAX_VAD_MS = 10_000
 DEFAULT_CHUNK_SECONDS = 2.0
 DEFAULT_UNFIXED_CHUNKS = 2
 DEFAULT_UNFIXED_TOKENS = 5
@@ -133,26 +156,97 @@ class RealtimeSession:
     # error ids of this item's distinct step failures (at most
     # MAX_FAILURES_PER_ITEM), so a failure that repeats is logged once per item
     failures: tuple[str, dict] = ("", {})
+    # the first byte of a sample whose second byte is in the next append;
+    # kept across commit (the byte stream goes on), dropped by clear
+    odd_byte: bytes = b""
+    # the client's audio rate; anything but SAMPLE_RATE goes through resampler
+    input_rate: int = SAMPLE_RATE
+    resampler: media_io.StreamResampler | None = None
+    # samples the last chunk was short of its boundary (see take_chunk)
+    short: int = 0
+    # server turn detection (None: the client commits); the segmenter, like
+    # the resampler, spans turns, so a commit does not reset either
+    turn_detection: realtime_vad.ServerVAD | realtime_vad.SemanticVAD | None = None
+    segmenter: realtime_vad.TurnSegmenter | None = None
+    stream_samples: int = 0    # SAMPLE_RATE samples written this session: the event timeline
+    # the input clock: stream_samples at the last rate change, and input samples since
+    clock_base: int = 0
+    clock_in: int = 0
 
     @property
     def chunk_samples(self) -> int:
         return int(round(self.chunk_seconds * SAMPLE_RATE))
 
-    def append(self, audio: np.ndarray) -> None:
+    def set_input_rate(self, rate: int) -> None:
+        self.clock_base, self.clock_in = self.stream_samples, 0
+        self.input_rate = rate
+        self.resampler = None if rate == SAMPLE_RATE else media_io.StreamResampler(rate, SAMPLE_RATE)
+
+    def resample(self, audio: np.ndarray) -> np.ndarray:
+        self.clock_in += int(audio.size)
+        out = audio if self.resampler is None else self.resampler.push(audio)
+        self.stream_samples += int(out.size)
+        return out
+
+    def segment(self, audio: np.ndarray) -> list[tuple]:
+        """Resample and segment ``audio``: the segmenter's operations."""
+        return self.segmenter.feed(self.resample(audio))
+
+    def reset_stream(self) -> None:
+        """A clear: drop what the resampler and the segmenter hold, keeping
+        the timeline (the dropped audio still counts)."""
+        skipped = self.resampler.held() if self.resampler is not None else 0
+        self.stream_samples += skipped
+        if self.resampler is not None:
+            self.resampler.reset()
+        if self.segmenter is not None:
+            self.segmenter.reset(skipped)
+        self.realign()
+
+    def realign(self) -> None:
+        """After the resampler starts over (a commit or a clear), put the
+        timeline back on the input clock: each start-over rounds its output
+        up by less than a sample, which would add up over many of them."""
+        exact = self.clock_base + self.clock_in * SAMPLE_RATE // self.input_rate
+        if self.segmenter is not None:
+            self.segmenter.shift(exact - self.stream_samples)
+        self.stream_samples = exact
+
+    def drain_resampler(self) -> np.ndarray:
+        """What the resampler still holds, as if silence followed; it starts over."""
+        out = np.zeros(0, dtype=np.float32) if self.resampler is None else self.resampler.flush()
+        self.stream_samples += int(out.size)
+        return out
+
+    def add(self, audio: np.ndarray) -> None:
+        """Add SAMPLE_RATE audio to the item."""
         if audio.size:
             self.pending.append(audio)
             self.pending_samples += int(audio.size)
 
-    def item_samples(self) -> int:
-        return self.pending_samples + sum(int(a.size) for a in self.heard)
+    def append(self, audio: np.ndarray) -> None:
+        self.add(self.resample(audio))
+
+    def item_samples(self, extra: int = 0) -> int:
+        """SAMPLE_RATE samples in the item once ``extra`` more input samples
+        arrive, rounded once over the whole item (not per append), so the cap
+        does not depend on how the audio was split."""
+        held = self.resampler.held(extra) if self.resampler is not None else extra
+        return self.pending_samples + held + sum(int(a.size) for a in self.heard)
 
     def take_chunk(self) -> np.ndarray | None:
         """Every full chunk of pending audio as one array, or None until
-        enough arrived."""
-        if self.pending_samples < self.chunk_samples:
+        enough arrived. Output the resampler still holds for its lookahead
+        counts toward the chunk, so a chunk of 24 kHz input is decoded on the
+        append that completes it, not the one after; the chunk is then short
+        by those samples (``short``), which go with the next one."""
+        held = self.resampler.held() if self.resampler is not None else 0
+        k = (self.pending_samples + held - self.short) // self.chunk_samples
+        if k <= 0:
             return None
+        n = min(self.pending_samples, k * self.chunk_samples + self.short)
+        self.short = k * self.chunk_samples + self.short - n
         buf = np.concatenate(self.pending)
-        n = self.pending_samples // self.chunk_samples * self.chunk_samples
         chunk, rest = buf[:n], buf[n:]
         self.pending = [rest] if rest.size else []
         self.pending_samples = int(rest.size)
@@ -169,16 +263,23 @@ class RealtimeSession:
         return np.concatenate(self.heard) if self.heard else np.zeros(0, dtype=np.float32)
 
     def clear(self) -> None:
-        self.pending, self.pending_samples, self.heard = [], 0, []
+        """Start a new item; the stream state (resampler, segmenter, odd byte) goes on."""
+        self.pending, self.pending_samples, self.heard, self.short = [], 0, [], 0
         self.chunk_id, self.raw_hypothesis, self.emitted = 0, "", ""
         self.item_id = f"item_{uuid.uuid4().hex[:12]}"
 
 
-def pcm16_to_float(payload: str) -> np.ndarray:
-    """Base64 PCM16 (little-endian, mono) -> float32 in [-1, 1). Strict
-    decoding: a malformed payload is an error, not silence."""
-    raw = base64.b64decode(payload, validate=True)
-    return np.frombuffer(raw[: len(raw) - len(raw) % 2], dtype="<i2").astype(np.float32) / 32768.0
+def pcm16_to_float(payload: str, carry: bytes = b"") -> tuple[np.ndarray, bytes]:
+    """Base64 PCM16 (little-endian, mono) -> (float32 in [-1, 1), the odd
+    trailing byte). ``carry`` is the previous append's odd byte, so a sample
+    split across two appends is joined instead of shifting every sample after
+    it. Strict decoding: a malformed payload is an error, not silence."""
+    # whitespace is allowed (base64.encodebytes wraps lines); anything else
+    # outside the alphabet is an error. translate stays linear in the payload
+    # where split() would build a list of its pieces
+    raw = carry + base64.b64decode(payload.encode("ascii").translate(None, b" \t\n\r\v\f"), validate=True)
+    whole = len(raw) - len(raw) % 2
+    return np.frombuffer(raw[:whole], dtype="<i2").astype(np.float32) / 32768.0, raw[whole:]
 
 
 def _excerpt(value) -> str:
@@ -228,8 +329,30 @@ def _object(value, name: str) -> dict:
     return value
 
 
+def _input_rate(fmt, current: int) -> int:
+    """The input rate an ``input_audio_format`` declares (``current`` when
+    absent): ``"pcm16"`` is 16 kHz, as this endpoint has always read it;
+    OpenAI's ``{"type": "audio/pcm", "rate": N}`` names its rate (24 kHz when
+    left out, OpenAI's only one)."""
+    if fmt is None:
+        return current
+    if fmt == "pcm16":
+        return SAMPLE_RATE
+    if isinstance(fmt, dict) and fmt.get("type") == "audio/pcm":
+        if extra := sorted(set(fmt) - {"type", "rate"}):
+            # channels, encoding and the like would change how the bytes read
+            raise ValueError(f"input_audio_format takes only type and rate; got {_excerpt(extra)}")
+        rate = fmt.get("rate", 24000)
+        if not isinstance(rate, bool) and rate in INPUT_SAMPLE_RATES:
+            return int(rate)
+        raise ValueError(f"input_audio_format.rate must be 16000 or 24000; got {_excerpt(rate)}")
+    raise ValueError(
+        f'input_audio_format must be "pcm16" or {{"type": "audio/pcm", "rate": 24000}}; got {_excerpt(fmt)}'
+    )
+
+
 def _number(knobs: dict, name: str, default, lo: float, hi: float = math.inf, integer: bool = False,
-            clamp_low: bool = False):
+            clamp_low: bool = False, scope: str = "mstar"):
     """``knobs[name]`` (or ``default``) checked to be a finite number in
     ``[lo, hi]``, and integral when ``integer``. A numeric string is read as
     its number, and with ``clamp_low`` a value below ``lo`` is raised to it.
@@ -255,8 +378,53 @@ def _number(knobs: dict, name: str, default, lo: float, hi: float = math.inf, in
     ok = ok and lo <= value <= hi
     if not ok:
         bound = f">= {lo:g}" if hi == math.inf else f"between {lo:g} and {hi:g}"
-        raise ValueError(f"mstar.{name} must be {kind} {bound}; got {_excerpt(value)}")
+        raise ValueError(f"{scope}.{name} must be {kind} {bound}; got {_excerpt(value)}")
     return int(value) if integer else float(value)
+
+
+_TURN_DETECTION_KEYS = {
+    "server_vad": frozenset({"type", "threshold", "prefix_padding_ms", "silence_duration_ms",
+                             "create_response", "interrupt_response", "idle_timeout_ms"}),
+    "semantic_vad": frozenset({"type", "eagerness", "create_response", "interrupt_response"}),
+}
+
+
+def _turn_detection(value) -> realtime_vad.ServerVAD | realtime_vad.SemanticVAD | None:
+    """A session's ``turn_detection``: null (the client commits),
+    ``server_vad`` or ``semantic_vad``; fields left out take OpenAI's defaults."""
+    if value is None:
+        return None
+    td = _object(value, "turn_detection")
+    kind = td.get("type")
+    if not isinstance(kind, str) or kind not in _TURN_DETECTION_KEYS:
+        what = f"type {_excerpt(kind)}" if isinstance(kind, str) else _excerpt(td)
+        raise ValueError(f"turn_detection {what} is not supported; use server_vad, semantic_vad, "
+                         "or null to commit with input_audio_buffer.commit")
+    unknown = next((k for k in td if k not in _TURN_DETECTION_KEYS[kind]), None)
+    if unknown is not None:
+        raise ValueError(f"turn_detection.{_excerpt(unknown)} is not supported")
+    if td.get("idle_timeout_ms") is not None:
+        raise ValueError("turn_detection.idle_timeout_ms is not supported")
+    flags = {}
+    for name in ("create_response", "interrupt_response"):
+        flags[name] = td.get(name, True)
+        if not isinstance(flags[name], bool):
+            raise ValueError(f"turn_detection.{name} must be a boolean; got {_excerpt(flags[name])}")
+    if kind == "semantic_vad":
+        eagerness = td.get("eagerness", "auto")
+        if not isinstance(eagerness, str) or eagerness not in realtime_vad.EAGERNESS:
+            raise ValueError(f"turn_detection.eagerness must be one of low, medium, high, auto; "
+                             f"got {_excerpt(eagerness)}")
+        return realtime_vad.SemanticVAD(eagerness=eagerness, **flags)
+    d = realtime_vad.ServerVAD()
+    return realtime_vad.ServerVAD(
+        threshold=_number(td, "threshold", d.threshold, 0.0, 1.0, scope="turn_detection"),
+        prefix_padding_ms=_number(td, "prefix_padding_ms", d.prefix_padding_ms, 0, MAX_VAD_MS, integer=True,
+                                  scope="turn_detection"),
+        silence_duration_ms=_number(td, "silence_duration_ms", d.silence_duration_ms, 0, MAX_VAD_MS,
+                                    integer=True, scope="turn_detection"),
+        **flags,
+    )
 
 
 def stable_prefix(raw_text: str, tokenizer, unfixed_tokens: int) -> str:
@@ -313,7 +481,7 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
             raise StepError(str(exc.detail), exc.status_code) from exc
     finally:
         Path(path).unlink(missing_ok=True)
-    text = "".join(c.data.decode("utf-8", "replace") for c in chunks if c.modality == "text")
+    text = decode_joined(c.data for c in chunks if c.modality == "text")
     errors = [c for c in chunks if c.modality == "error"]
     if errors:
         raise StepError(
@@ -326,8 +494,11 @@ def _event(kind: str, **fields) -> dict:
     return {"event_id": f"event_{uuid.uuid4().hex[:12]}", "type": kind, **fields}
 
 
-def _error(message: str, kind: str = "invalid_request_error") -> dict:
-    return _event("error", error={"type": kind, "message": message})
+def _error(message: str, kind: str = "invalid_request_error", code: str | None = None) -> dict:
+    error = {"type": kind, "message": message}
+    if code is not None:
+        error["code"] = code
+    return _event("error", error=error)
 
 
 class RealtimeTranscription:
@@ -352,7 +523,10 @@ class RealtimeTranscription:
         return {
             "id": s.session_id,
             "object": "realtime.transcription_session",
-            "input_audio_format": "pcm16",
+            "input_audio_format": (
+                "pcm16" if s.input_rate == SAMPLE_RATE else {"type": "audio/pcm", "rate": s.input_rate}
+            ),
+            "turn_detection": s.turn_detection.view() if s.turn_detection is not None else None,
             "input_audio_transcription": {
                 "model": self.model_name,
                 "language": s.request.language,
@@ -363,7 +537,7 @@ class RealtimeTranscription:
                 "unfixed_chunks": s.unfixed_chunks,
                 "unfixed_tokens": s.unfixed_tokens,
                 "max_item_seconds": s.max_item_seconds,
-                "sample_rate": SAMPLE_RATE,
+                "sample_rate": s.input_rate,
             },
         }
 
@@ -403,46 +577,138 @@ class RealtimeTranscription:
                 return
             await self.send(_event("transcription_session.updated", session=self._session_view()))
         elif kind == "input_audio_buffer.append":
-            try:
-                audio = pcm16_to_float(event.get("audio") or "")
-            except Exception:  # noqa: BLE001 — bad base64
-                await self.send(_error("audio is not base64"))
-                return
             s = self.session
-            if s.item_samples() + audio.size > s.max_item_seconds * SAMPLE_RATE:
+            try:
+                # not `or ""`: a null is an error, not an empty append, on every realtime path
+                audio, odd_byte = pcm16_to_float(event.get("audio", ""), s.odd_byte)
+            except Exception:  # noqa: BLE001 — bad base64
+                await self.send(_error("audio is not base64", code="invalid_audio"))
+                return
+            # with server_vad the segmenter ends a turn at the cap instead
+            if s.segmenter is None and s.item_samples(audio.size) > s.max_item_seconds * SAMPLE_RATE:
                 await self.send(_error(
                     f"the item would pass {s.max_item_seconds:g} s of audio; "
                     "commit or clear the input audio buffer first",
                 ))
                 return
-            s.append(audio)
-            if (chunk := s.take_chunk()) is not None:
-                await self.step(chunk)
-        elif kind == "input_audio_buffer.commit":
-            tail = self.session.flush()
-            if tail is not None and tail.size:
-                await self.step(tail, final=True)
+            s.odd_byte = odd_byte
+            if not audio.size:
+                return
+            if s.segmenter is None:
+                # off the event loop: resampling a long append takes long enough
+                # to stall every other session on this server
+                if s.resampler is None or audio.size <= INLINE_RESAMPLE_SAMPLES:
+                    audio = s.resample(audio)
+                else:
+                    audio = await asyncio.to_thread(s.resample, audio)
+                await self.apply([("audio", audio)])
             else:
-                # nothing left to hear: what was held back is final now
-                await self.emit(self.current_text(), hold=0)
-            await self.send(_event("input_audio_buffer.committed", item_id=self.session.item_id))
-            await self.send(_event(
-                "conversation.item.input_audio_transcription.completed",
-                item_id=self.session.item_id, transcript=self.current_text(),
-            ))
-            self.session.clear()
+                # off the event loop: one large append is thousands of VAD frames,
+                # and an end-of-turn model call takes about 45 ms
+                await self.apply(await asyncio.to_thread(s.segment, audio))
+        elif kind == "input_audio_buffer.commit":
+            s = self.session
+            tail = s.drain_resampler()
+            if s.segmenter is None:
+                s.realign()
+                await self.apply([("audio", tail)])
+            else:
+                ops = await asyncio.to_thread(s.segmenter.feed, tail) + s.segmenter.end_turn()
+                s.realign()
+                await self.apply(ops)
+                if ops and ops[-1] == ("commit",):
+                    # the drained tail ended a turn: that commit was this one
+                    return
+            await self.commit()
         elif kind == "input_audio_buffer.clear":
-            self.session.clear()
+            s = self.session
+            s.clear()
+            s.odd_byte = b""
+            s.reset_stream()
             await self.send(_event("input_audio_buffer.cleared"))
         else:
             await self.send(_error(f"unknown event {_excerpt(kind)}"))
 
+    async def apply(self, ops: list[tuple]) -> None:
+        """Carry out segmenter operations in order (see ``TurnSegmenter``).
+        Audio steps once, after the last operation, so one long append is one
+        step, as without turn detection; a turn's commit decodes the rest."""
+        s = self.session
+        if any(op[0] == "end_of_turn_failed" for op in ops):
+            for op in ops:
+                if op[0] == "end_of_turn_failed":
+                    await self._end_of_turn_failed(op[1])
+            ops = [op for op in ops if op[0] != "end_of_turn_failed"]
+        for i, op in enumerate(ops):
+            if op[0] == "audio":
+                s.add(op[1])
+                if i == len(ops) - 1 and (chunk := s.take_chunk()) is not None:
+                    await self.step(chunk)
+            elif op[0] == "commit":
+                await self.commit()
+            elif op[0] == "speech_started":
+                await self.send(_event("input_audio_buffer.speech_started", audio_start_ms=op[1], item_id=s.item_id))
+            else:
+                await self.send(_event("input_audio_buffer.speech_stopped", audio_end_ms=op[1], item_id=s.item_id))
+
+    async def _end_of_turn_failed(self, exc: Exception) -> None:
+        """semantic_vad's end-of-turn model raised: the segmenter no longer
+        asks it, so tell the client how this session's turns end now. The
+        error is logged in full under an id; the event carries only the id,
+        as for a failed step."""
+        s = self.session
+        error_id = uuid.uuid4().hex[:12]
+        logger.error("realtime end-of-turn model failed (error id %s, session %s); semantic_vad turns now end "
+                     "on silence alone", error_id, s.session_id, exc_info=exc)
+        silence_s = realtime_vad.EAGERNESS[s.turn_detection.eagerness][2] / 1000
+        await self.send(_error(
+            f"semantic_vad's end-of-turn model failed (error id {error_id}); this session's turns now end after "
+            f"{silence_s:g} s of silence; send transcription_session.update to switch to server_vad",
+            kind="server_error", code="end_of_turn_failed",
+        ))
+
+    async def commit(self) -> None:
+        """Finish the item: decode what is left, report it, start a new one."""
+        s = self.session
+        tail = s.flush()
+        if tail is not None and tail.size:
+            await self.step(tail, final=True)
+        else:
+            # nothing left to hear: what was held back is final now
+            await self.emit(self.current_text(), hold=0)
+        await self.send(_event("input_audio_buffer.committed", item_id=s.item_id))
+        await self.send(_event(
+            "conversation.item.input_audio_transcription.completed",
+            item_id=s.item_id, transcript=self.current_text(),
+        ))
+        s.clear()
+
     def update(self, session: dict) -> None:
         """Apply a session update, all or nothing."""
         s = self.session
-        fmt = session.get("input_audio_format")
-        if fmt not in (None, "pcm16"):
-            raise ValueError(f"only pcm16 input is supported; got {_excerpt(fmt)}")
+        rate = _input_rate(session.get("input_audio_format"), s.input_rate)
+        if rate != s.input_rate and s.item_samples():
+            raise ValueError("commit or clear the input audio buffer before changing the input sample rate")
+        if rate != s.input_rate and s.odd_byte:
+            # a commit keeps the half sample, so only clear helps
+            raise ValueError("half a sample is pending; clear the input audio buffer before changing "
+                             "the input sample rate")
+        td = _turn_detection(session["turn_detection"]) if "turn_detection" in session else s.turn_detection
+        vad = end_of_turn = None
+        if td != s.turn_detection:
+            # with server_vad on, the resampler's lookahead is in no item between turns
+            in_item = (s.pending_samples or s.heard or s.segmenter.speaking) if s.segmenter is not None \
+                else s.item_samples()
+            if in_item:
+                raise ValueError("commit or clear the input audio buffer before changing turn_detection")
+            if td is not None and (vad := realtime_vad.silero_factory()) is None:
+                raise ValueError("server_vad is unavailable here (Silero VAD is missing or not the expected "
+                                 "model; see the server log); "
+                                 "set turn_detection to null and commit with input_audio_buffer.commit")
+            if isinstance(td, realtime_vad.SemanticVAD) and (end_of_turn := realtime_vad.smart_turn()) is None:
+                raise ValueError(f"semantic_vad is unavailable here ({realtime_vad.smart_turn_problem()}; see the "
+                                 "server log); use server_vad, or set turn_detection to null and commit with "
+                                 "input_audio_buffer.commit")
         knobs = _object(session.get("mstar"), "mstar")
         chunk_seconds = _number(knobs, "chunk_seconds", s.chunk_seconds, MIN_CHUNK_SECONDS, s.max_item_seconds,
                                 clamp_low=True)
@@ -462,6 +728,18 @@ class RealtimeTranscription:
         request = TranscriptionRequest.model_validate({**s.request.model_dump(), **fields}) if fields else s.request
         s.request = request
         s.chunk_seconds, s.unfixed_chunks, s.unfixed_tokens = chunk_seconds, unfixed_chunks, unfixed_tokens
+        if rate != s.input_rate:
+            s.set_input_rate(rate)
+        if td != s.turn_detection:
+            old, s.turn_detection = s.segmenter, td
+            s.segmenter = None if td is None else realtime_vad.TurnSegmenter(
+                vad(), td, int(s.max_item_seconds * SAMPLE_RATE), pos=s.stream_samples, end_of_turn=end_of_turn)
+            if old is not None:
+                # audio the old segmenter had not scored yet is not dropped
+                if s.segmenter is not None:
+                    s.segmenter.take_over(old)
+                else:
+                    s.add(old.unscored())
 
     def current_text(self) -> str:
         return self.adapter.parse_transcript(self.session.raw_hypothesis, self.session.request).text
@@ -483,7 +761,8 @@ class RealtimeTranscription:
             return
         # a coalesced step counts every chunk it heard, so the prefix that keeps
         # sent text fixed starts after the same audio as with one step per chunk
-        s.chunk_id += max(1, chunk.size // s.chunk_samples)
+        # (rounded: at 24 kHz a chunk can be short by the resampler's lookahead)
+        s.chunk_id += max(1, round(chunk.size / s.chunk_samples))
         text = self.current_text()
         if final or tokenizer is None:
             hold = 0
