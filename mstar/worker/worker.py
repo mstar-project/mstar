@@ -1247,9 +1247,9 @@ class Worker:
         return loop is not None and len(kept.sampled) == info.dynamic_loop_iter_counts.get(loop, 0) + 1
 
     def _preempt(self, node_batch: ExecutingBatch) -> bool:
-        """`KVManager.preempt` chooses victims for the request that hit KV OOM. Move each victim to the host or
+        """`StepRunner.preempt` chooses victims for the request that hit KV OOM. Move each victim to the host or
         drop it, now or once its step lands, and return True. Return False, so the offload and the hold
-        run, when the failed resource isn't the node's only paged KV cache, `KVManager.preempt` returns None, or
+        run, when the failed resource isn't the node's only paged KV cache, `StepRunner.preempt` returns None, or
         the cache has no host pool and no request on the node keeps ids."""
         kv = self._kv_caches.get(node_batch.failed_resource)
         node_name = node_batch.node_name
@@ -1266,7 +1266,7 @@ class Worker:
                 self._rebuildable(rid, node_name) and engine.drop_refusal(node_name, rid) is None for node_name in held
             )
 
-        victims = kv.cache.preempt(reason.request_id, reason.pages_short, droppable)
+        victims = engine.preempt(kv.key, reason.request_id, reason.pages_short, droppable)
         if victims is None:
             return False
         if not victims and kv.cache.waits(reason.request_id):
@@ -1290,7 +1290,7 @@ class Worker:
         return True
 
     def _move_victims(self, broadcast: str | None = None) -> None:
-        """Once no step in flight holds a victim, move the victim to the host or drop it, as `KVManager.preempt`
+        """Once no step in flight holds a victim, move the victim to the host or drop it, as `StepRunner.preempt`
         decided. A backlogged row goes back to the runtime and a queued rebuild row leaves its queue first, so
         neither runs on pages the move gave up.
 

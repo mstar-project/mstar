@@ -561,6 +561,62 @@ class StepRunner:
         self._untried = False
         return started
 
+    def preempt(
+        self, rid: str, key: str, pages_short: int, droppable: Callable[[str], bool],
+    ) -> list[str] | None:
+        """Choose the requests to move off ``key``'s pool so that ``rid`` gets the ``pages_short`` pages its grant
+        ran short of, and have the pool earmark the pages they free for ``rid``.
+
+        The victims are the newest requests that arrived after ``rid``, taken until their moves cover the shortage.
+        A victim the host can take whole moves there. Any other victim is dropped. When all the newer requests
+        free less than the shortage, return ``[rid]`` alone with no earmark if moving ``rid`` frees pages.
+        Otherwise return an empty list, and ``rid`` waits until the room grows. It also returns an empty list when
+        pages released since the grant ran short cover the shortage. None when the pool doesn't preempt or
+        ``rid`` has no arrival number. ``droppable`` returns whether a request can be dropped once every step
+        holding it has landed.
+        """
+        pool, arrival = self._resources[key], self._arrival.get(rid)
+        if not pool.preempts or arrival is None or arrival[0]:
+            return None
+        with pool.lock:
+            pages_short = pool.still_short(rid, pages_short)
+            if pages_short <= 0:
+                return []
+            newer = sorted(
+                (other for other, place in self._arrival.items() if place > arrival and not place[0]
+                 and pool.holds(other)),
+                key=self._arrival.__getitem__, reverse=True,
+            )
+            on_host = left = pool.host_room()
+            hosted: set[str] = set()
+            victims: list[str] = []
+            for other in newer:
+                pages = pool.host_pages(other)
+                if pages is not None and pages <= left:
+                    left -= pages
+                    hosted.add(other)
+                elif not droppable(other):
+                    continue
+                victims.append(other)
+                if pool.frees(victims) >= pages_short:
+                    break
+            else:
+                pages = pool.host_pages(rid)
+                to_host = pages is not None and pages <= on_host
+                if (to_host or droppable(rid)) and pool.frees([rid]) > 0:
+                    pool.preempt_itself(rid, to_host)
+                    return [rid]
+                pool.wait_for_room(rid)
+                return []
+            # a victim whose move frees nothing the rest don't is spared
+            freed = pool.frees(victims)
+            for victim in list(victims):
+                rest = [other for other in victims if other != victim]
+                if pool.frees(rest) == freed:
+                    victims = rest
+            pool.earmark(rid, pages_short, victims, hosted)
+            return victims
+
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────
     #
     # A pre-plan is staged across every pre-planning resource for one step,

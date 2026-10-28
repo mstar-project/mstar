@@ -2319,6 +2319,13 @@ class Engine:
             request_id, node_name, request_info.graph_walk, request_info.resource_publish_info,
         )
 
+    def preempt(
+        self, key: str, request_id: str, pages_short: int, droppable: Callable[[str], bool],
+    ) -> list[str] | None:
+        """The victims to move so that the request gets the pages it ran short of in pool ``key``; see
+        `StepRunner.preempt`."""
+        return self._runner.preempt(request_id, key, pages_short, droppable)
+
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
     ) -> list[tuple[str, str]]:
@@ -2582,7 +2589,7 @@ class Engine:
 
         Returns what was reclaimed, in whatever each resource counts (pages,
         today); 0 means nothing moved and the caller should pick another
-        victim. A victim `KVManager.preempt` chose is the exception: it can
+        victim. A victim `StepRunner.preempt` chose is the exception: it can
         move with 0 reclaimed.
         """
         if node_name in self._tp_follower_nodes:

@@ -4097,77 +4097,46 @@ class KVManager(AttentionResource):
 
     # Preemption
 
-    def preempt(self, rid: str, pages_short: int, droppable: Callable[[str], bool]) -> list[str] | None:
-        """Choose the requests to move off the device so that ``rid`` gets the ``pages_short`` pages its grant ran
-        short of, and earmark the pages they free for ``rid``.
+    # Preemption. `StepRunner.preempt` chooses the victims, and the pool answers what each would free and
+    # makes the earmark.
 
-        The victims are the newest requests that arrived after ``rid``, taken until their moves cover the shortage.
-        A victim the host can take whole moves there, and `moves_to_host` returns True for it. Any other victim is
-        dropped. When all the newer requests free less than the shortage, return ``[rid]`` alone with no earmark if
-        moving ``rid`` frees pages. Otherwise return an empty list, and ``rid`` waits until the room grows. It also
-        returns an empty list when pages released since the grant ran short cover the shortage. None when the pool
-        doesn't decide or ``rid`` has no arrival number. ``droppable`` returns whether a request can be dropped
-        once every step holding it has landed.
-        """
-        if not self._decides:
-            return None
-        with self._lock:
-            overrides = self._overrides.get(rid)
-            if overrides is None or overrides.arrival is None:
-                return None
-            arrival = overrides.arrival
-            room, then = self._room(), self._ran_short.pop(rid, None)
-            if then is not None:
-                pages_short -= max(0, room - then)
-                if pages_short <= 0:
-                    return []
-            newer = sorted(
-                (other for other, overrides in self._overrides.items()
-                 if overrides.arrival is not None and overrides.arrival > arrival
-                 and self._holds(other)),
-                key=lambda other: self._overrides[other].arrival, reverse=True,
-            )
-            # Above one rank, count only free host pages. The victims move after the readiness checks, and a host
-            # fetch there can retain the cached pages `CPUPagePool.room` counts.
-            on_host = 0 if self._cpu_pool is None else (
-                self._cpu_pool.arena.num_free if self._world_size > 1 else self._cpu_pool.room()
-            )
-            left, hosted = on_host, set()
-            victims: list[str] = []
-            for other in newer:
-                pages = self._host_pages(other)
-                if pages is not None and pages <= left:
-                    left -= pages
-                    hosted.add(other)
-                elif not droppable(other):
-                    continue
-                victims.append(other)
-                if self._frees(victims) >= pages_short:
-                    break
-            else:
-                pages = self._host_pages(rid)
-                to_host = pages is not None and pages <= on_host
-                if (to_host or droppable(rid)) and self._frees([rid]) > 0:
-                    self._victims[rid] = None
-                    if to_host:
-                        self._host(rid, [rid])
-                    return [rid]
-                self._short[rid] = room
-                return []
-            freed = self._frees(victims)
-            for victim in list(victims):
-                rest = [other for other in victims if other != victim]
-                if self._frees(rest) == freed:
-                    victims = rest
-            for victim in victims:
-                if self._overrides[victim].arrival <= arrival or not (victim in hosted or droppable(victim)):
-                    raise RuntimeError(
-                        f"KV {self.name}: chose {victim} (arrival {self._overrides[victim].arrival}) to free pages "
-                        f"for {rid} (arrival {arrival}), but a victim must be newer and able to move"
-                    )
-            self._earmark(rid, pages_short, victims)
-            self._host(rid, [victim for victim in victims if victim in hosted])
-            return victims
+    @property
+    def preempts(self) -> bool:
+        """Whether this pool's victims are chosen for it: it decides admission."""
+        return self._decides
+
+    @property
+    def lock(self) -> threading.RLock:
+        """Held for the whole choice of victims, so the counts it reads don't move under it."""
+        return self._lock
+
+    def still_short(self, rid: str, pages_short: int) -> int:
+        """``rid``'s shortage less the pages released since its grant ran short."""
+        room, then = self._room(), self._ran_short.pop(rid, None)
+        return pages_short if then is None else pages_short - max(0, room - then)
+
+    def host_room(self) -> int:
+        """The pages the host can take. Above one rank only its free pages count: the victims move after the
+        readiness checks, and a host fetch there can retain the cached pages `CPUPagePool.room` counts."""
+        if self._cpu_pool is None:
+            return 0
+        return self._cpu_pool.arena.num_free if self._world_size > 1 else self._cpu_pool.room()
+
+    def preempt_itself(self, rid: str, to_host: bool) -> None:
+        """``rid`` moves its own pages off the device, to the host or by a drop, with no earmark."""
+        self._victims[rid] = None
+        if to_host:
+            self._host(rid, [rid])
+
+    def wait_for_room(self, rid: str) -> None:
+        """No move covers ``rid``'s shortage, so it waits until the room grows; see `waits`."""
+        self._short[rid] = self._room()
+
+    def earmark(self, rid: str, pages_short: int, victims: list[str], hosted: Collection[str]) -> None:
+        """Earmark for ``rid`` the ``pages_short`` pages the moves of ``victims`` free, of which ``hosted`` move to
+        the host and the others are dropped."""
+        self._earmark(rid, pages_short, victims)
+        self._host(rid, [victim for victim in victims if victim in hosted])
 
     def _earmark(self, rid: str, pages: int, victims: list[str]) -> None:
         earmark = Earmark(rid, pages, set(victims))
@@ -4220,13 +4189,16 @@ class KVManager(AttentionResource):
             del self._short[rid]
             return False
 
-    def _holds(self, rid: str) -> bool:
+    def holds(self, rid: str) -> bool:
+        """Whether ``rid`` holds pages or allotted room in this pool."""
+        if rid not in self._streams:
+            return False
         allotment = self._allotments.get(rid)
         return (allotment is not None and allotment.remaining > 0) or any(
             stream.page_indices or stream.lease for stream in self._streams[rid].values()
         )
 
-    def _host_pages(self, rid: str) -> int | None:
+    def host_pages(self, rid: str) -> int | None:
         """The host pages that moving every stream of ``rid`` takes, or None when ``rid`` can't move there: the
         pool has no host memory, ``rid`` is guaranteed or isn't resident, or a stream holds a cached image end `plan`
         hasn't copied.
@@ -4250,7 +4222,7 @@ class KVManager(AttentionResource):
             pages += self._cpu_pool.takes(len(stream.page_indices), rooted[:self._filed(rooted, stream.page_indices)])
         return pages
 
-    def _frees(self, rids: Collection[str]) -> int:
+    def frees(self, rids: Collection[str]) -> int:
         """The room moving ``rids`` off the device would make: the pages of their streams and leases that would
         reach the free list or the evictable set, and their unused allotments."""
         released: Counter = Counter()
@@ -4307,7 +4279,7 @@ class KVManager(AttentionResource):
             if kind == MoveKind.EARMARK:
                 # The same filter as rank 0's `preempt`, which can choose a dropped request again once it is
                 # allotted pages.
-                stale = [victim for victim in victims if victim not in self._streams or not self._holds(victim)]
+                stale = [victim for victim in victims if victim not in self._streams or not self.holds(victim)]
                 if stale or rid not in self._allotments:
                     raise RuntimeError(
                         f"KV {self.name}: rank 0 earmarked {count} pages for {rid} on victims {victims}, but here "

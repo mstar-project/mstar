@@ -256,6 +256,11 @@ class Resource(ABC):
         """Whether a request that didn't fit against ``mark`` may fit now."""
         return True
 
+    # Whether the runner chooses victims to move off this resource when a grant runs short
+    # (`StepRunner.preempt`). Such a resource reports, under its `lock`, what each request holds and
+    # frees and where it can move (`KVManager`).
+    preempts = False
+
     # Step lifecycle
 
     def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:

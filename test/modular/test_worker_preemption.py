@@ -47,6 +47,7 @@ def _worker(kv):
         drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid, kept: _drop(kv, rid),
         offload_request=lambda node, rid: _offload(kv, rid),
         admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
+        preempt=lambda key, rid, short, droppable: _runner(kv).preempt(rid, "kv", short, droppable),
     )
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()

@@ -82,6 +82,10 @@ def _queue(kv) -> list[str]:
     return _runner(kv)._queues["kv"]
 
 
+def _preempt(kv, rid: str, pages_short: int, droppable) -> list[str] | None:
+    return _runner(kv).preempt(rid, "kv", pages_short, droppable)
+
+
 def _step(kv, rid: str, tokens: int) -> AdmitOutcome:
     """One step of ``tokens`` for ``rid``, committed when it is admitted."""
     step = KVStep(segments=(Segment(rid, "main", tokens),))
@@ -132,7 +136,7 @@ def test_a_newer_victim_waits_until_the_older_request_has_its_page():
     _running(kv, "v", 5, arrival=2)
     assert _step(kv, "r", 2 * PAGE_SIZE).ok, "r grows past its allotment into the room"
 
-    assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True) == ["v"]
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True) == ["v"]
     _drop(kv, "v")
 
     assert kv._allotments["r"].remaining == 1, "the page v freed isn't reserved for r"
@@ -149,7 +153,7 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     _running(kv, "older", 5, arrival=0)
     _running(kv, "r", 5, arrival=1)
 
-    victims = kv.preempt("r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
+    victims = _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: then == "drops itself")
 
     assert victims == (["r"] if then == "drops itself" else []) and not kv._earmarks, "nothing newer frees a page"
     assert kv.waits("r") == (then != "drops itself"), "r waits only when it can't drop itself"
@@ -170,7 +174,7 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     _running(kv, "r", 3, arrival=1)
     _running(kv, "v", 5, arrival=2)
     assert _step(kv, "r", 2 * PAGE_SIZE).ok
-    assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True) == ["v"]
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True) == ["v"]
     if state in ("dropped", "rebuilding"):
         _drop(kv, "v")
     if state == "rebuilding":
@@ -204,8 +208,8 @@ def test_victims_that_share_pages_are_preempted_together():
     assert _step(kv, "b", PAGE_SIZE).ok and kv._arena.num_free == 0, "b writes only its page past the shared three"
     short = _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short
 
-    assert kv.preempt("r", short, droppable=lambda rid: True) == ["b", "a"], "a victim alone frees one page"
-    alone, both = kv._frees(["a"]), kv._frees(["b", "a"])
+    assert _preempt(kv, "r", short, droppable=lambda rid: True) == ["b", "a"], "a victim alone frees one page"
+    alone, both = kv.frees(["a"]), kv.frees(["b", "a"])
     before = kv._arena.num_free + len(kv._index.evictable())
     _drop(kv, "b")
     _drop(kv, "a")
@@ -222,7 +226,7 @@ def test_a_page_the_failing_step_gives_back_is_no_release():
     outcome = kv.admit(step, ctx)
     kv.rollback_admit(step, ctx)
 
-    assert kv.preempt("r", outcome.reason.pages_short, droppable=lambda rid: True) == ["v"], (
+    assert _preempt(kv, "r", outcome.reason.pages_short, droppable=lambda rid: True) == ["v"], (
         "the page a's row gave back counted as room, so r waits on the step that will fail again"
     )
 
@@ -298,7 +302,7 @@ def test_the_page_check_catches_a_request_on_the_host_that_kept_a_device_page():
     _running(kv, "r", 5, arrival=1)
     _running(kv, "v", 5, arrival=2)
     short = _step(kv, "r", 1).reason.pages_short
-    assert kv.preempt("r", short, droppable=lambda rid: False) == ["v"]
+    assert _preempt(kv, "r", short, droppable=lambda rid: False) == ["v"]
     _offload(kv, "v")
     assert "v" in kv._asks and kv.is_offloaded("v")
     kv.assert_pages_conserved()
@@ -315,7 +319,7 @@ def test_an_older_request_on_the_host_returns_before_a_newer_one():
     _running(kv, "a", 3, arrival=2)
     _running(kv, "b", 3, arrival=3)
     short = _step(kv, "r", 4 * PAGE_SIZE).reason.pages_short
-    assert kv.preempt("r", short, droppable=lambda rid: False) == ["b", "a"]
+    assert _preempt(kv, "r", short, droppable=lambda rid: False) == ["b", "a"]
     assert kv.moves_to_host("b") and kv.moves_to_host("a")
     _offload(kv, "b")
     _offload(kv, "a")
@@ -351,4 +355,4 @@ def test_a_guaranteed_request_is_never_moved_to_the_host():
     _running(kv, "g", 2, arrival=1, guaranteed=True)
     short = _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short
 
-    assert kv.preempt("r", short, droppable=lambda rid: False) == ["r"], "a guaranteed request was moved to the host"
+    assert _preempt(kv, "r", short, droppable=lambda rid: False) == ["r"], "a guaranteed request was moved to the host"

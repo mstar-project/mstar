@@ -1291,7 +1291,7 @@ def _both_short_then_drop(monkeypatch):
     for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
         assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok, f"one rank alone admitted {rid}"
         assert _counts(leader) == _counts(follower)
-    assert leader.preempt("r", 1, droppable=lambda rid: True) == ["v"]
+    assert _ENGINES[id(leader)].preempt("kv", "r", 1, lambda rid: True) == ["v"]
     lead.drop_request(NODE, "v", len(_kept("v")))
     return (leader, lead), (follower, follow)
 
@@ -1335,7 +1335,7 @@ def test_a_follower_takes_a_returning_request_as_rank_0s_victim_again(monkeypatc
     _ingest((leader, follower), "x", 1, arrival=0)
     leader._allotments["x"] = follower._allotments["x"] = Allotment(pages=1)
 
-    assert leader.preempt("x", 1, droppable=lambda rid: True) == ["v"]
+    assert _ENGINES[id(leader)].preempt("kv", "x", 1, lambda rid: True) == ["v"]
     assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
     assert _counts(leader) == _counts(follower)
 
@@ -1374,7 +1374,7 @@ def test_a_follower_moves_rank_0s_victim_to_the_host_and_takes_it_back_as_rank_0
     assert follow.apply_resident_delta(NODE, lead.take_resident_delta(NODE), _kept)
     for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
         assert _step(leader, rid, tokens).ok == _step(follower, rid, tokens).ok
-    assert leader.preempt("r", 1, droppable=lambda rid: False) == ["v"] and leader.moves_to_host("v")
+    assert _ENGINES[id(leader)].preempt("kv", "r", 1, lambda rid: False) == ["v"] and leader.moves_to_host("v")
     lead.offload_request(NODE, "v")
     delta = lead.take_resident_delta(NODE)
     assert delta.kinds == [MoveKind.EARMARK, MoveKind.OFFLOAD, MoveKind.OFFLOAD], "a choice or a move went unjournaled"
@@ -1415,7 +1415,7 @@ def test_above_one_rank_a_host_victim_moves_when_a_fetch_retains_cached_host_pag
     for rid, tokens in (("r", 2 * PAGE_SIZE), ("v", 6 * PAGE_SIZE), ("r", 2 * PAGE_SIZE)):
         assert _step(leader, rid, tokens).ok
     assert not _step(leader, "r", 1).ok
-    victims = leader.preempt("r", 1, droppable=lambda rid: False)
+    victims = _ENGINES[id(leader)].preempt("kv", "r", 1, lambda rid: False)
     hosted = [rid for rid in victims if leader.moves_to_host(rid)]
     cpu.retain_run(keys)
     for rid in hosted:
@@ -1481,7 +1481,7 @@ def test_rank_0_holds_a_victim_and_the_request_it_was_chosen_for_until_the_drop(
     assert _admits(leader, "v")
     for rid, tokens in (("r", 3 * PAGE_SIZE), ("v", 5 * PAGE_SIZE), ("r", 2 * PAGE_SIZE), ("r", 1)):
         _step(leader, rid, tokens)
-    assert leader.preempt("r", 1, droppable=lambda rid: True) == ["v"]
+    assert _ENGINES[id(leader)].preempt("kv", "r", 1, lambda rid: True) == ["v"]
 
     for rid in ("r", "v"):
         assert not _admits(leader, rid, "decode"), f"a step before the drop could take {rid}"
