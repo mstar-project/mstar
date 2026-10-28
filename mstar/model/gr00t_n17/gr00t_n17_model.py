@@ -232,7 +232,7 @@ class Gr00tN17Model(Model):
             # Causality is a property of the *step*, not the resource: the LLM
             # node declares `AttentionStep(causal=True)` (`Gr00tN17LLMSubmodule.declare_step`).
             # GR00T is the first model on `main` to ask for that on a ragged
-            # resource — every other user is non-causal.
+            # resource; every other user is non-causal.
             RaggedAttentionSpec(
                 resource_key=LLM_ATTN, nodes={LLM},
                 config=RaggedAttentionConfig(
@@ -745,7 +745,7 @@ class Gr00tN17Model(Model):
         The bucket key's span counts are set here and read back by
         ``Gr00tN17DenoiseStepSubmodule.bucket_key_for``. They come off the
         **persisted tensors' own `dims`** rather than a separately kept count:
-        a count that is derived from the thing it describes cannot drift from
+        a count that is derived from the thing it describes cannot disagree with
         it, which is most of what the node's own check guards against.
         """
         metadata = partition_metadata

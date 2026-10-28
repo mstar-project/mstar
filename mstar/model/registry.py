@@ -157,7 +157,7 @@ HF_MODELS: dict[str, dict] = {
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     # GR00T N1.7: the action head's weights are here, but its backbone *config*
     # and processor come from `nvidia/Cosmos-Reason2-2B`, which is a **gated**
-    # repo — accept its terms on the Hub first or construction fails. Pass it as
+    # repo: accept its terms on the Hub first or construction fails. Pass it as
     # `backbone_path_hf` to use a different one.
     "gr00t_n17": {"model_path_hf": "nvidia/GR00T-N1.7-3B"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},

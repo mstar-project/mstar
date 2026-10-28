@@ -1,7 +1,7 @@
 model: "gr00t_n17"
 
-# No node keeps a KV cache — every attention in GR00T is cacheless and ragged,
-# because nothing is ever decoded token by token — so `max_seq_len` here only
+# No node keeps a KV cache: every attention in GR00T is cacheless and ragged,
+# because nothing is ever decoded token by token, so `max_seq_len` here only
 # satisfies the conductor's config check. The longest of the 20 recorded DROID
 # requests is 469 tokens: 21 text rows plus 448 image rows, two cameras at two
 # timesteps.

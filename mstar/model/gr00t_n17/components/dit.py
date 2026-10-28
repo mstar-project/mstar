@@ -205,7 +205,7 @@ def _attends_encoder(index: int) -> bool:
 
     The even blocks cross-attend and the odd ones attend their own tokens.
     The stack reads this once to size ``to_k``/``to_v`` and again to decide
-    what to hand each block, so the two cannot drift apart -- a block given
+    what to hand each block, so the two cannot disagree -- a block given
     1536-wide rows will cross-attend them perfectly happily, so nothing below
     this function would catch a mismatch.
 

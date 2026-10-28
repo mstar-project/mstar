@@ -386,7 +386,7 @@ def test_the_carried_dtype_is_the_weights_and_does_not_change_mid_loop():
             carried = node.denoise(None, _SHAPE, latents=carried, **_scalars(k), **cond)
             seen.append(carried.dtype)
 
-        # the premise: the forward really is in `dtype`, so what `euler_step` returns in the
+        # the premise: the forward is in `dtype`, so what `euler_step` returns in the
         # velocity's dtype is testable at all
         assert _by_hand(node, carried, cond, _scalars(0)["timestep"]).dtype is dtype
         assert seen == [dtype] * _STEPS, seen
@@ -412,7 +412,7 @@ def test_four_bf16_iterations_are_the_references_arithmetic_to_the_bit():
     for k in range(_STEPS):
         scalars = _scalars(k)
         # the hand-written chain steps by the schedule's own dt, so it is not a second
-        # schedule that can drift from the node's
+        # schedule that can disagree with the node's
         assert float(scalars["sigma_next"] - scalars["sigma"]) == _REF_DT
 
         ours = node.denoise(None, _SHAPE, latents=ours, **scalars, **cond)
