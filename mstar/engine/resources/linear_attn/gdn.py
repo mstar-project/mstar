@@ -174,6 +174,14 @@ class GDNManager(LinearAttnManager):
         self._preplanned = False
         self._cached_plan_output = None
 
+    # a plan reads the pool's slots and the rows' spans, which no rewind moves: a verify step's
+    # state is settled in its own forward
+    corrects_preplan = True
+
+    def correct_preplan(self, verdicts, step: LinearAttnStep, ctx: StepContext) -> bool:
+        del verdicts, step, ctx
+        return True
+
     @staticmethod
     def _group_by_label(segments) -> dict[str, list[Segment]]:
         out: dict[str, list[Segment]] = {}

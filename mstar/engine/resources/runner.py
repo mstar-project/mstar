@@ -298,17 +298,25 @@ class StepRunner:
         return ahead
 
     def settle_preplan(self, step: SubmoduleStep) -> bool:
-        """After the pre-plan of a step planned ahead: wait for its rows' last verdicts, rewind
-        them, and have each pre-planned resource correct its staged plan, in plan order. False
-        when one can't; the stage is dropped then, and the step plans inline (the rewind
-        stays, as it would after a dropped pre-plan anyway)."""
-        if not self.plans_ahead(step):
+        """After the pre-plan of a step of a node that verifies drafts: when it was planned
+        ahead, wait for its rows' last verdicts and rewind them; then each pre-planned resource
+        that corrects (every one, ahead) puts right what it staged, in plan order, for the rows
+        rewound (none when nothing was, or when ``pre_admit`` rewound them first) and for what a
+        stage reads of the verdicts themselves (an engine-side proposer's drafts). False when
+        one can't; the stage is dropped then, and the step plans inline (the rewind stays, as
+        it would after a dropped pre-plan anyway)."""
+        if not self._rewinders or not self._rewind_hooks(frozenset(step.keys())):
             return True
-        rewound = self._rewind(step)
+        rewound = self._rewind(step) if self.plans_ahead(step) else []
         if not rewound:
-            return True
-        verdicts = rewound[0] if len(rewound) == 1 else _merged(rewound)
+            from mstar.engine.resources.draft_verify.config import VerdictBatch
+
+            verdicts = VerdictBatch([], [], [])
+        else:
+            verdicts = rewound[0] if len(rewound) == 1 else _merged(rewound)
         for key in self._preplan_keys_for(step):
+            if not self._resources[key].corrects_preplan:
+                continue  # its pre-plan ran after the rewind (`pre_admit`), so it is right
             t0 = phase_start()
             try:
                 ok = self._resources[key].correct_preplan(verdicts, step.get(key), step.ctx)

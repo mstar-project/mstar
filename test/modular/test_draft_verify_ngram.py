@@ -178,15 +178,42 @@ def test_a_preplan_is_promoted_only_for_its_own_step():
     for rid, prompt in ((1, [5, 6, 7, 5, 6]), (2, [8, 9, 3, 8, 9])):
         prop.ingest_request(rid)
         prop.commit(ProposeStep(history={rid: torch.tensor(prompt)}), _ctx([rid]))
-    prop.plan(ProposeStep(drafts=2), _ctx([1, 2], preplan=True, slot=1))
+    step = ProposeStep(drafts=2, verify=True)
+    ahead = _ctx([1, 2], preplan=True, slot=1)
+    prop.plan(step, ahead)
+    # planned ahead of the rows' verdicts, it stages nothing until they are read
+    assert prop._staged[1] is None
+    assert prop.correct_preplan(None, step, ahead)
     staged = prop._staged[1]
-    prop.plan(ProposeStep(drafts=2), _ctx([1, 2], slot=1))
+    assert staged.tolist() == [[5, 6], [8, 9]]
+    prop.plan(step, _ctx([1, 2], slot=1))
     assert prop._current is staged
     # staged for [1], run as [2]: planned again
-    prop.plan(ProposeStep(drafts=2), _ctx([1], preplan=True))
-    prop.plan(ProposeStep(drafts=2), _ctx([2]))
+    prop.plan(step, _ctx([1], preplan=True))
+    prop.correct_preplan(None, step, _ctx([1], preplan=True))
+    prop.plan(step, _ctx([2]))
     # fresh: [8, 9] last ended before the 3, taken as the prefill's token, so 8, 9 follow
     assert prop.propose([2], 1)[0].tolist() == [[8, 9]]
+
+
+def test_the_drafts_planned_ahead_are_the_ones_planned_after_the_verdict():
+    """A verify step planned ahead stages its drafts at ``correct_preplan``, after the runner
+    read the step in flight's verdict: the same drafts an inline plan stages then."""
+    rows = {}
+    for ahead in (True, False):
+        prop = NgramProposer(CPU, max_drafts=2, min_ngram=2, max_ngram=3)
+        prop.ingest_request(7)
+        prop.commit(ProposeStep(history={7: torch.tensor([4, 1, 2, 9, 9, 4, 1])}), _ctx([7]))
+        step = ProposeStep(drafts=2, verify=True)
+        if ahead:
+            prop.plan(step, _ctx([7], preplan=True))
+        # the verdict lands: input 2 (the prefill's), drafts [9, 9] kept, then 4
+        prop.observe(7, np.array([2, 2, 9, 9, 4]))
+        if ahead:
+            prop.correct_preplan(None, step, _ctx([7], preplan=True))
+        prop.plan(step, _ctx([7]))
+        rows[ahead] = prop.propose([7], 1)[0].tolist()
+    assert rows[True] == rows[False] == [[1, 2]]
 
 
 def test_a_row_that_keeps_missing_looks_up_less_often(monkeypatch):

@@ -1387,11 +1387,14 @@ combined walk over the verifying walk or a prefix-cache key on its labels.
 Under the async worker, the next step is pre-planned while the current one runs, before its
 verdict is known: from the lengths the current step committed, as if it kept its whole block.
 Once the verdict lands, the runner rewinds and each pre-planned resource corrects its staged
-plan (``Resource.correct_preplan``; paged KV, positions, FlashInfer attention and the sampler
-do). A node pre-plans this way only when every pre-planning resource of its verify step sets
-``corrects_preplan``; otherwise its pre-plan waits for the verdict first. A resource that adds
+plan (``Resource.correct_preplan``; paged KV, positions and FlashInfer attention from the
+rewound lengths; the sampler, GDN and the recurrent pool have nothing a rewind moves; an
+engine-side proposer stages its drafts there, from the verdicts just read). A node pre-plans
+this way only when every pre-planning resource of its verify step sets ``corrects_preplan``;
+otherwise its pre-plan waits for the verdict first, and ``correct_preplan`` still runs, with
+nothing rewound, so a proposer stages its drafts in one place either way. A resource that adds
 state to a verifying node and pre-plans should implement it: what the pre-plan read of a
-length the rewind moved has to be put right there, in place.
+length the rewind moved, or of the verdict, has to be put right there, in place.
 Two kinds of drafter need no drafting code of the model's own, and a verify step's forward
 runs either through one helper, ``draft_verify_step(dv, request_ids, inputs, target,
 drafter=None)``: the drafts, ``agree``, ``target`` (the block's ids, flat, to the target's
@@ -1403,8 +1406,8 @@ logits) and ``verify``; it returns the next step's inputs.
   ``DraftVerifyResource.propose``. The proposer learns the prompt from the prefill steps,
   which declare ``ProposeStep(history={rid: prompt_ids})`` under its key, and every emitted
   token from the verdicts. A proposer is a ``DraftProposer`` resource: ``observe`` takes each
-  verdict once, ``plan`` stages a verify step's drafts and ``propose`` hands them to the
-  forward. It fits drafters whose state is per-request host data.
+  verdict once, ``plan`` stages a verify step's drafts (``correct_preplan`` for a pre-planned
+  step, once the verdicts are read) and ``propose`` hands them to the forward. It fits drafters whose state is per-request host data.
 - A drafter with weights runs in the forward as a ``Drafter`` (``propose(inputs, dv,
   request_ids) -> Drafts``, ``next_inputs(block, verdict)``), passed to
   ``draft_verify_step``. A separate draft model (a small LLM with the target's tokenizer) is

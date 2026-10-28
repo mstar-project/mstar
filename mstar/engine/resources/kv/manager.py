@@ -2823,6 +2823,8 @@ class KVManager(AttentionResource):
             return True
         if self._preplan_unfixable:
             return False
+        if not verdicts.request_ids:
+            return True
         rewound = set(zip(verdicts.request_ids, verdicts.labels, strict=True))
         res = self._cached_plan_output
         lease = ctx.slot_lease

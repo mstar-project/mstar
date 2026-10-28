@@ -239,7 +239,7 @@ class FlashInferManager(AttentionManager):
     def correct_preplan(self, verdicts, step: AttentionStep, ctx: StepContext) -> bool:
         """Each staged wrapper with a rewound row, put right from the corrected KV plan: under
         FA3 by rewriting its rows' lengths in the plan (`patch_kv_lens`), else planned again."""
-        if not self._preplanned:
+        if not self._preplanned or not verdicts.request_ids:
             return True
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         rewound = set(zip(verdicts.request_ids, verdicts.labels, strict=True))

@@ -315,7 +315,7 @@ class RopeManager(PositionManager):
     def correct_preplan(self, verdicts: "VerdictBatch", step: PositionStep, ctx: StepContext) -> bool:
         """Restage the staged step's positions for each label holding a rewound row, from the
         counters `rewind` moved back. Positions a step gives explicitly can't follow a rewind."""
-        if not self._preplanned:
+        if not self._preplanned or not verdicts.request_ids:
             return True
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         rewound = set(zip(verdicts.request_ids, verdicts.labels, strict=True))

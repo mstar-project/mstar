@@ -10,7 +10,9 @@ that verdict, rewinds, and the KV, positions and FlashInfer (FA3: each row's len
 in the plan) correct what they staged. Every KV row a request keeps, in both caches of the
 draft model and every layer, must equal bitwise what the same steps planned inline after the
 rewind wrote, the streams must be plain greedy decode's, and with any one correction left out
-the caches differ. Skips without CUDA.
+the caches differ. With the n-gram proposer drafting (and adaptive, between steps of no drafts
+and verify steps), the drafts are staged once the runner has read the verdicts, so every step
+keeps and accepts what the same steps planned after the rewind do. Skips without CUDA.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import draft_model_toy as dm  # noqa: E402
 import draft_verify_toy as toy  # noqa: E402
 
 from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper  # noqa: E402
+from mstar.engine.resources.draft_verify.ngram import NgramProposer  # noqa: E402
 from mstar.engine.resources.kv import manager as kv_manager  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.position.manager import RopeManager  # noqa: E402
@@ -39,14 +42,22 @@ GPU = torch.device("cuda", 0)
 PROMPTS = [[3, 9, 12, 40], [5, 11], [20, 21, 22, 23, 24, 25]]
 MAX_TOKENS = 20
 # the KV and attention resources each toy's verify step plans
-KV_KEYS = {"head": (toy.KV,), "draft_model": (toy.KV, dm.DKV)}
-ATTN_KEYS = {"head": (toy.ATTN,), "draft_model": (toy.ATTN, dm.DATTN)}
+KV_KEYS = {"head": (toy.KV,), "draft_model": (toy.KV, dm.DKV), "ngram": (toy.KV,), "ngram_adaptive": (toy.KV,)}
+ATTN_KEYS = {"head": (toy.ATTN,), "draft_model": (toy.ATTN, dm.DATTN), "ngram": (toy.ATTN,),
+             "ngram_adaptive": (toy.ATTN,)}
 
 
 def _run(k: int, plan_ahead: bool, corrupt: int = 2, sample: bool | None = None, kind: str = "head",
          drafter_seed: int | None = 3):
     spec = dict(sampled_verify=sample is not None, argmax_prefill=sample is not None)
-    if kind == "head":
+    if kind.startswith("ngram"):
+        # adaptive: any row with a stretch makes the step draft, so the rows without one
+        # reject filler drafts and the next step (a verify step or one of no drafts) corrects
+        sub = toy.ToySubmodule(k=k, proposer="ngram", adaptive=kind == "ngram_adaptive", min_gain=1e-6)
+        eng = toy.engine(sub, GPU, attn="flashinfer", warmup=True, dtype=torch.float32, kv_dtype=torch.float16,
+                         **spec)
+        drv = toy.Driver(eng, sub, plan_ahead=plan_ahead)
+    elif kind == "head":
         sub = toy.ToySubmodule(k=k, corrupt=corrupt, sampled_drafts=bool(sample))
         eng = toy.engine(sub, GPU, attn="flashinfer", warmup=True, dtype=torch.float32, kv_dtype=torch.float16,
                          **spec)
@@ -92,16 +103,22 @@ def _decode_steps(drv) -> int:
 
 @pytest.fixture
 def patched(monkeypatch):
-    """Counts the FA3 length rewrites that took."""
-    count = {"patched": 0}
+    """Counts the FA3 length rewrites that took, and the KV stages corrected for rewound rows."""
+    count = {"patched": 0, "corrected": 0}
     real = FlashInferPrefillWrapper.patch_kv_lens
+    real_correct = KVManager.correct_preplan
 
     def counting(self, kv_lens):
         ok = real(self, kv_lens)
         count["patched"] += ok
         return ok
 
+    def correcting(self, verdicts, step, ctx):
+        count["corrected"] += bool(verdicts.request_ids)
+        return real_correct(self, verdicts, step, ctx)
+
     monkeypatch.setattr(FlashInferPrefillWrapper, "patch_kv_lens", counting)
+    monkeypatch.setattr(KVManager, "correct_preplan", correcting)
     return count
 
 
@@ -221,3 +238,54 @@ def test_each_correction_is_needed(left_out, kind, monkeypatch):
     assert drv.planned_ahead > 0
     rows, want = _kept_rows(eng, kind), _kept_rows(behind_eng, kind)
     assert not _same_rows(rows, want)
+
+
+@pytest.mark.parametrize("cache", [0, 1], ids=["streams", "plan_cache"])
+@pytest.mark.parametrize("kind", ["ngram", "ngram_adaptive"])
+def test_ngram_steps_planned_ahead_keep_and_accept_what_steps_planned_after_the_rewind_do(
+    kind, cache, monkeypatch, patched,
+):
+    monkeypatch.setattr(kv_manager, "_DEBUG_ASSERTS", True)
+    monkeypatch.setattr(kv_manager, "kv_plan_cache", lambda: cache)
+    out, eng, drv = _run(3, plan_ahead=True, kind=kind)
+    assert out == {rid: toy.reference(p, MAX_TOKENS) for rid, p in enumerate(PROMPTS)}
+    # every decode step was pre-planned, and ahead of its rows' verdicts: the proposer, GDN and
+    # the pool (on Qwen3.5) correct their stages, so nothing keeps the order that waits first
+    assert drv.planned_ahead == _decode_steps(drv) > 0
+    assert eng._runner._plan_ahead_cache and all(eng._runner._plan_ahead_cache.values())
+    behind, behind_eng, behind_drv = _run(3, plan_ahead=False, kind=kind)
+    assert out == behind and drv.step_drafts == behind_drv.step_drafts
+    assert _same_rows(_kept_rows(eng), _kept_rows(behind_eng))
+    dv, behind_dv = eng._resources[toy.DV], behind_eng._resources[toy.DV]
+    # the drafts were the ones a step planned after its verdict stages: the same acceptance
+    assert dv.accepted_hist.tolist() == behind_dv.accepted_hist.tolist()
+    assert 0 < dv.drafts_accepted < 3 * dv.rows_verified, dv.stats()
+    assert (dv.steps_plain > 0) == (kind == "ngram_adaptive")
+    # rows rejected drafts, so the corrections had lengths to put right: in a verify step's FA3
+    # plan, or (adaptive, a step of no drafts after one) its decode plan, planned again
+    assert patched["corrected"] > 0
+    assert patched["patched"] > 0 or kind == "ngram_adaptive"
+
+
+def test_ngram_drafts_staged_before_the_verdict_would_draft_a_step_late(monkeypatch):
+    """Not vacuous: a pre-plan that looks drafts up as it stages (before the runner reads the
+    step in flight's verdict) drafts from a history a step short, and keeps fewer drafts than
+    the same steps planned after their verdicts."""
+    behind, behind_eng, _ = _run(3, plan_ahead=False, kind="ngram")
+    real_plan = NgramProposer.plan
+
+    def early(self, step, ctx):
+        if not (ctx.is_preplan and step.drafts):
+            return real_plan(self, step, ctx)
+        verifier, self._verifier = self._verifier, None
+        try:
+            self._staged = (self._plan_key(ctx), self._stage(ctx, self._draft_rows(ctx)))
+        finally:
+            self._verifier = verifier
+
+    monkeypatch.setattr(NgramProposer, "plan", early)
+    out, eng, drv = _run(3, plan_ahead=True, kind="ngram")
+    assert drv.planned_ahead > 0
+    assert out == behind
+    accepted = eng._resources[toy.DV].drafts_accepted
+    assert accepted < behind_eng._resources[toy.DV].drafts_accepted

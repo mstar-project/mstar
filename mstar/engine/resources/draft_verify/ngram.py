@@ -323,50 +323,75 @@ class NgramProposer(DraftProposer):
             return  # a step that adds history does so at its commit
         if step.drafts != self.max_drafts:
             raise ValueError(f"a verify step of {step.drafts} drafts from an n-gram proposer of {self.max_drafts}")
-        lease = ctx.slot_lease
         key = self._plan_key(ctx)
-        if not ctx.is_preplan and self._staged is not None:
+        if ctx.is_preplan:
+            # The drafts need the rows' last verdicts, which a step planned ahead of them hasn't
+            # read yet: `correct_preplan` stages them once it has, before the event the replay
+            # waits on, so nothing here waits for the step in flight.
+            self._staged = (key, None)
+            return
+        if self._staged is not None:
             staged, self._staged = self._staged, None
-            if staged[0] == key:
+            if staged[0] == key and staged[1] is not None:
                 self._current = staged[1]
                 return
+        self._current = self._stage(ctx, self._draft_rows(ctx))
+
+    corrects_preplan = True
+
+    def correct_preplan(self, verdicts, step: ProposeStep, ctx: StepContext) -> bool:
+        """Stage the drafts of the verify step planned ahead, now that the runner has read its
+        rows' last verdicts (or, for a row whose last step drafted nothing, reads it here)."""
+        del verdicts
+        staged = self._staged
+        if not step.drafts or staged is None or staged[1] is not None:
+            return True
+        self._staged = (staged[0], self._stage(ctx, self._draft_rows(ctx)))
+        return True
+
+    def _draft_rows(self, ctx: StepContext) -> np.ndarray:
+        """``[rows, k]``: each padded row's drafts, filler where nothing matched (and on a
+        capture's or a replay's padding rows), from every verdict before the step."""
         padded = ctx.padded_request_ids
         drafts = np.full((len(padded), self.max_drafts), _FILLER, dtype=np.int64)
-        if not ctx.capture:
-            if self._verifier is not None:
-                # the runner's rewinds read these verdicts at admit; this makes sure, outside
-                # the lock (reading one calls `observe`)
-                self._verifier.harvest(padded)
-            with self._lock:
-                histories, waiting = self._histories, self._prompts or self._verdicts
-                at: list[int] = []
-                guesses: list[int] = []
-                proposed = 0
-                for i, rid in enumerate(padded):
-                    history = histories.get(rid)
-                    if history is None:
-                        continue  # a replay's padding row: filler
-                    if waiting:
-                        self._take_in(history, rid)
-                    guess = self._index.propose(history)
-                    proposed += 1
-                    if guess is not None:
-                        at.append(i)
-                        guesses += guess
-                if at:
-                    drafts[at] = np.array(guesses, dtype=np.int64).reshape(len(at), self.max_drafts)
-                self.rows_proposed += proposed
-                self.rows_matched += len(at)
+        if ctx.capture:
+            return drafts
+        if self._verifier is not None:
+            # the runner's rewinds read most of these verdicts already; a row whose last step
+            # drafted nothing is read here. Outside the lock (reading one calls `observe`)
+            self._verifier.harvest(padded)
+        with self._lock:
+            histories, waiting = self._histories, self._prompts or self._verdicts
+            at: list[int] = []
+            guesses: list[int] = []
+            proposed = 0
+            for i, rid in enumerate(padded):
+                history = histories.get(rid)
+                if history is None:
+                    continue  # a replay's padding row: filler
+                if waiting:
+                    self._take_in(history, rid)
+                guess = self._index.propose(history)
+                proposed += 1
+                if guess is not None:
+                    at.append(i)
+                    guesses += guess
+            if at:
+                drafts[at] = np.array(guesses, dtype=np.int64).reshape(len(at), self.max_drafts)
+            self.rows_proposed += proposed
+            self.rows_matched += len(at)
+        return drafts
+
+    def _stage(self, ctx: StepContext, drafts: np.ndarray) -> torch.Tensor:
+        """``drafts`` on the device, in the slot's buffer under a lease (one H2D on the current
+        stream, the plan stream for a step planned ahead)."""
+        lease = ctx.slot_lease
         if lease is None:
-            out = self._stager.to_device(drafts, self._device)
-        else:
-            out = self._buffer(lease, len(padded))
-            self._stager.copy_(out, drafts.reshape(-1), pad_value=_FILLER)
-            out = out[: len(padded)]
-        if ctx.is_preplan:
-            self._staged = (key, out)
-        else:
-            self._current = out
+            return self._stager.to_device(drafts, self._device)
+        rows = drafts.shape[0]
+        out = self._buffer(lease, rows)
+        self._stager.copy_(out, drafts.reshape(-1), pad_value=_FILLER)
+        return out[:rows]
 
     def _buffer(self, lease, rows: int) -> torch.Tensor:
         key = (lease.bucket, lease.slot)

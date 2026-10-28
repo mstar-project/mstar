@@ -404,6 +404,14 @@ class RecurrentStatePool(Resource):
         self._preplanned = False
         self._cached_plan_output = None
 
+    # a plan addresses the rows' slots, which no rewind moves (what a slot holds is its
+    # backend's to settle)
+    corrects_preplan = True
+
+    def correct_preplan(self, verdicts, step: RecurrentStep, ctx: StepContext) -> bool:
+        del verdicts, step, ctx
+        return True
+
     def commit(self, step: RecurrentStep, ctx: StepContext) -> None:
         if ctx.capture:
             return

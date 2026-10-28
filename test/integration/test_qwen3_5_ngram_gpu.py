@@ -14,6 +14,11 @@ So the streams must agree up to the first such tie: a stream that leaves plain d
 plain decode's choice was clear is wrong (a missed rewind does that within a few tokens of
 the first rejected draft).
 
+Planned ahead of their verdicts (as the worker's plan thread pre-plans), the same steps keep
+bitwise the KV rows and GDN states, and accept the drafts, of steps planned after the rewind:
+paged KV, positions and FlashInfer correct their stages, the proposer stages its drafts once
+the verdicts are read, and GDN and the pool have nothing a rewind moves.
+
 Needs CUDA, FlashInfer and the cached Qwen/Qwen3.5-0.8B checkpoint.
 """
 
@@ -52,7 +57,7 @@ from mstar.engine.resources.draft_verify.config import DRAFT_VERIFY  # noqa: E40
 from mstar.engine.resources.kv.config import KVReqConfig  # noqa: E402
 from mstar.engine.resources.kv.transfer import TransferEngineInfo  # noqa: E402
 from mstar.engine.resources.sampler.resource import SamplerResource  # noqa: E402
-from mstar.model.qwen3_5.config import KV_CACHE, SAMPLER  # noqa: E402
+from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE, SAMPLER  # noqa: E402
 from mstar.model.qwen3_5.qwen3_5_model import TEXT_PART, Qwen3_5DenseModel  # noqa: E402
 from mstar.model.qwen3_5.submodules import LLMSubmodule  # noqa: E402
 
@@ -119,7 +124,7 @@ class _Serve:
     """The worker's part for the LLM node: ingest, a prefill step, then decode steps through
     the engine's own exec and stop check until every request stops."""
 
-    def __init__(self, draft: dict | None, captured: bool):
+    def __init__(self, draft: dict | None, captured: bool, plan_ahead: bool = False):
         self.model = Qwen3_5DenseModel(CKPT, draft=draft)
         self.sub = self.model.get_submodule("LLM", device=str(GPU))
         specs = [spec for spec in self.model.get_node_resources() if "LLM" in spec.nodes]
@@ -137,6 +142,11 @@ class _Serve:
         self.emitted: dict[int, list[int]] = {}
         self.next: dict[int, torch.Tensor] = {}
         self.leases = []
+        # pre-plan each decode step as the worker's plan thread does: after the step before it
+        # committed, before anything reads its verdict, on a slot of its own
+        self.plan_ahead = plan_ahead
+        self.planned_ahead = 0
+        self.step_drafts = []
 
     def add(self, prompts: list[str]) -> None:
         inputs = {}
@@ -168,13 +178,19 @@ class _Serve:
         batch = ExecutingBatch(
             node_name="LLM",
             per_request_info={rid: self.infos[rid] for rid in rids},
-            step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False),
+            step_context=StepContext(
+                request_ids=tuple(rids), graph_walk=walk, slot=None if self.plan_ahead else 0, capture=False,
+            ),
             per_request_input_tensors={rid: {"text_inputs": [inputs[rid]]} for rid in rids},
         )
+        if self.plan_ahead and walk == "decode" and self.eng.reserve_replay_slot(batch) is not None:
+            self.planned_ahead += bool(self.eng.pre_plan_for_batch(batch))
         self.eng.prepare_inputs(batch)
         outputs = self.eng.exec_and_postprocess(batch)
         assert batch.admit_error is None, batch.admit_error
         self.leases.append(batch.step_context.slot_lease)
+        if walk == "decode":
+            self.step_drafts.append(batch.verify_drafts)
         self.stops = self.eng.check_stop_for_batch(batch, outputs.per_rid_outputs)
         return outputs.per_rid_outputs
 
@@ -265,3 +281,48 @@ def test_ngram_greedy_emits_what_plain_greedy_emits(k, captured, adaptive, plain
     assert (dv.steps_plain > 0) == adaptive, dv.stats()
     if captured and adaptive:
         assert {lease.bucket.cg_key_info.drafts for lease in leases} == {0, k}
+
+
+def _kept(serve: _Serve) -> dict:
+    """Every KV row each request keeps (full-attention layers) and every GDN layer's state and
+    conv window in its slot."""
+    out = {}
+    kv = serve.eng._resources[KV_CACHE]
+    page = kv.kv_cache.page_size
+    for rid in serve.emitted:
+        stream = kv._streams[rid]["main"]
+        pages = torch.tensor(stream.page_indices[: -(-stream.stored_len // page)], device=GPU)
+        for layer in range(kv.config.num_layers):
+            view = kv.layer_view(layer)[pages]
+            rows = view.transpose(0, 1).reshape(2, -1, *view.shape[3:])
+            out[("kv", rid, layer)] = rows[:, : stream.stored_len].clone()
+    pool = serve.eng._resources[GDN_STATE]
+    for rid in serve.emitted:
+        index = pool._slots[rid]["main"].index
+        for name, block in pool._blocks.items():
+            out[(name, rid)] = block[:, index].clone()
+    return out
+
+
+@pytest.mark.parametrize("adaptive", [False, True], ids=["every_step", "adaptive"])
+def test_steps_planned_ahead_keep_and_accept_what_steps_planned_after_the_rewind_do(adaptive):
+    draft = {"method": "ngram", "max_drafts": 4, "sampled_verify": False, "adaptive": adaptive}
+    kept, stats = {}, {}
+    for ahead in (True, False):
+        serve = _Serve(draft, captured=True, plan_ahead=ahead)
+        serve.add(PROMPTS)
+        out = serve.run()
+        torch.cuda.synchronize()
+        dv = serve.eng._resources[DRAFT_VERIFY]
+        if ahead:
+            assert serve.planned_ahead == len(serve.step_drafts) > 0
+            # ahead of the verdicts: every pre-planning resource of the step corrects its stage
+            assert all(serve.eng._runner._plan_ahead_cache.values()) and serve.eng._runner._plan_ahead_cache
+        kept[ahead] = _kept(serve)
+        stats[ahead] = (out, list(serve.step_drafts), dv.accepted_hist.tolist(), dv.rows_verified)
+        del serve, dv
+        _release()
+    assert stats[True] == stats[False]
+    assert kept[True].keys() == kept[False].keys()
+    assert all(torch.equal(kept[True][key], kept[False][key]) for key in kept[True])
+    assert (0 in stats[True][1]) == adaptive
