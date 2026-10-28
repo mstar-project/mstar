@@ -682,7 +682,7 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
-    def mark_stream_partition_done(self, rid: int, partition: str):
+    def mark_partition_done(self, rid: int, partition: str):
         """The partition is done: the consuming pass saw the final streaming
         chunk, or a stop check returned ``END_PARTITION``. Reported on the
         WORKER_GRAPHS_DONE that follows, unless the node was speculative."""

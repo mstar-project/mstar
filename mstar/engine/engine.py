@@ -303,7 +303,7 @@ class ExecutingBatch:
 
     # rids for which this step ends every finite stream into the partition, or
     # whose stop check returned END_PARTITION; this step reports the partition done
-    stream_partition_done_rids: set[int] = field(default_factory=set)
+    partition_done_rids: set[int] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -424,7 +424,7 @@ class ExecutingBatch:
         # A row that does not run this step must not end its streams on it:
         # the worker would stop its loop and finalize a row it no longer has.
         self.final_stream_rids.difference_update(rids)
-        self.stream_partition_done_rids.difference_update(rids)
+        self.partition_done_rids.difference_update(rids)
         self.per_request_info = {
             rid: info for rid, info in self.per_request_info.items()
             if rid not in rids

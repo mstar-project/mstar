@@ -339,7 +339,7 @@ pub struct GraphRuntime {
             && self
                 .interner
                 .get(partition_name)
-                .and_then(|p| self.info(rid).map(|i| i.stream_done(p)))
+                .and_then(|p| self.info(rid).map(|i| i.partition_done(p)))
                 .unwrap_or(false);
 
         let partition = self.interner.get(partition_name);
@@ -1798,10 +1798,10 @@ impl GraphRuntime {
         info.set_walk(p, walk_sym, || live)
     }
 
-    fn mark_stream_partition_done(&mut self, rid: u32, partition: &str) {
+    fn mark_partition_done(&mut self, rid: u32, partition: &str) {
         let Some(p) = self.interner.get(partition) else { return };
         if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
-            info.mark_stream_done(p);
+            info.mark_partition_done(p);
         }
     }
 
@@ -3638,9 +3638,9 @@ impl GraphRuntime {
         Ok(plan)
     }
 
-    fn stream_partition_done(&self, rid: u32, partition: &str) -> bool {
+    fn partition_done(&self, rid: u32, partition: &str) -> bool {
         let Some(p) = self.interner.get(partition) else { return false };
-        self.info(rid).is_some_and(|i| i.stream_done(p))
+        self.info(rid).is_some_and(|i| i.partition_done(p))
     }
 
     /// Parked routing awaiting a send. Non-zero between

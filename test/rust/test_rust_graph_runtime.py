@@ -186,10 +186,10 @@ def test_removing_twice_is_idempotent(runtime):
 
 # --- per-request state -------------------------------------------------------
 
-def test_set_walk_and_stream_done_reach_the_request(runtime):
+def test_set_walk_and_partition_done_reach_the_request(runtime):
     rid = _admit(runtime)
     runtime.set_walk(rid, "default", "other_walk")
-    runtime.mark_stream_partition_done(rid, "default")
+    runtime.mark_partition_done(rid, "default")
     # No getter for stream-done on the ABC; not raising is the assertion, and
     # the walk change is observable.
     assert runtime is not None

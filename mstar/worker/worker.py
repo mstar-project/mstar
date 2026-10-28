@@ -1853,7 +1853,7 @@ class Worker:
         consumes. The context starts unleased and eager; a slot is reserved
         later, once the real token count is known.
         """
-        final_stream_rids, stream_partition_done_rids = self._settle_final_streams(
+        final_stream_rids, partition_done_rids = self._settle_final_streams(
             node_name, final_edges or {},
         )
         return ExecutingBatch(
@@ -1861,7 +1861,7 @@ class Worker:
             per_request_info=per_request_info,
             per_request_input_tensors=per_request_input_tensors,
             final_stream_rids=final_stream_rids,
-            stream_partition_done_rids=stream_partition_done_rids,
+            partition_done_rids=partition_done_rids,
             per_request_input_metadata=per_request_input_metadata or {},
             step_context=StepContext(
                 request_ids=tuple(request_ids),
@@ -3122,7 +3122,7 @@ class Worker:
                 speculation.node_batch.per_request_input_metadata.pop(r, None)
                 # Its final chunks go back below; it must not flush or report done.
                 speculation.node_batch.final_stream_rids.discard(r)
-                speculation.node_batch.stream_partition_done_rids.discard(r)
+                speculation.node_batch.partition_done_rids.discard(r)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
 
@@ -3503,7 +3503,7 @@ class Worker:
                 batch_N.node_batch.per_request_info.pop(stopped_rid, None)
                 # its loop already stopped; see ExecutingBatch.drop_rids
                 batch_N.node_batch.final_stream_rids.discard(stopped_rid)
-                batch_N.node_batch.stream_partition_done_rids.discard(stopped_rid)
+                batch_N.node_batch.partition_done_rids.discard(stopped_rid)
         # keep the forward's order: other code walks this list positionally
         batch_N.node_batch.request_ids = [
             rid for rid in batch_N.node_batch.request_ids if rid in valid_rids
@@ -3623,7 +3623,7 @@ class Worker:
                 ), walk)
             else:
                 del stops[rid]
-                batch_N.node_batch.stream_partition_done_rids.add(rid)
+                batch_N.node_batch.partition_done_rids.add(rid)
 
         if batch_N.node_batch.failed_requests:
             # A rid whose stop check raised (or was refused above) has no
@@ -3739,8 +3739,8 @@ class Worker:
         # The consuming pass (not the earlier ingest) reports the partition
         # done, so it rides the WGD that also counts this pass's last chunks;
         # an END_PARTITION stop rides this pass's WGD the same way.
-        for rid in batch_N.node_batch.stream_partition_done_rids:
-            self._graph_runtime.mark_stream_partition_done(rid, batch_N.partition)
+        for rid in batch_N.node_batch.partition_done_rids:
+            self._graph_runtime.mark_partition_done(rid, batch_N.partition)
 
         # set this before send_outputs so that we can send updated profiling info to the conductor
         if self.enable_prof:
@@ -4376,7 +4376,7 @@ class Worker:
             pending.node_batch.failed_requests.pop(rid, None)
             # its streams do not end here; see ExecutingBatch.drop_rids
             pending.node_batch.final_stream_rids.discard(rid)
-            pending.node_batch.stream_partition_done_rids.discard(rid)
+            pending.node_batch.partition_done_rids.discard(rid)
         pending.node_batch.request_ids = [
             rid for rid in pending.node_batch.request_ids
             if rid not in failed_requests

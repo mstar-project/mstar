@@ -32,8 +32,9 @@ pub struct RequestPartitionInfo {
     /// Local worker graphs live in the CURRENT walk. Derived from the walk, so
     /// it is a cache: `set_walk` recomputes it, and nothing else may write it.
     pub walk_worker_graphs: Vec<WgIndex>,
-    /// Set when the consuming pass sees the final streaming chunk.
-    pub stream_partition_done: bool,
+    /// Set when the consuming pass sees the final streaming chunk, or a stop
+    /// check returns `END_PARTITION`.
+    pub partition_done: bool,
 }
 
 /// Python's `NestedLoopIndices`, as the runtime stores it.
@@ -207,7 +208,7 @@ impl RequestInfo {
             RequestPartitionInfo {
                 graph_walk: walk,
                 walk_worker_graphs: live,
-                stream_partition_done: false,
+                partition_done: false,
             },
         );
     }
@@ -233,16 +234,16 @@ impl RequestInfo {
         true
     }
 
-    pub fn mark_stream_done(&mut self, partition: PartitionId) {
+    pub fn mark_partition_done(&mut self, partition: PartitionId) {
         if let Some(info) = self.partitions.get_mut(&partition) {
-            info.stream_partition_done = true;
+            info.partition_done = true;
         }
     }
 
-    pub fn stream_done(&self, partition: PartitionId) -> bool {
+    pub fn partition_done(&self, partition: PartitionId) -> bool {
         self.partitions
             .get(&partition)
-            .is_some_and(|p| p.stream_partition_done)
+            .is_some_and(|p| p.partition_done)
     }
 }
 
@@ -355,12 +356,12 @@ mod tests {
     }
 
     #[test]
-    fn stream_done_is_per_partition() {
+    fn partition_done_is_per_partition() {
         let mut info = RequestInfo::default();
         info.set_partition(1, 10, vec![]);
         info.set_partition(2, 20, vec![]);
-        info.mark_stream_done(1);
-        assert!(info.stream_done(1));
-        assert!(!info.stream_done(2));
+        info.mark_partition_done(1);
+        assert!(info.partition_done(1));
+        assert!(!info.partition_done(2));
     }
 }

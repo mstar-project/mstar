@@ -112,7 +112,7 @@ def _batch(rids, streams=True):
         ),
         # every row takes its stream's final chunk this step
         final_stream_rids=set(rids) if streams else set(),
-        stream_partition_done_rids=set(rids) if streams else set(),
+        partition_done_rids=set(rids) if streams else set(),
     )
 
 
@@ -175,7 +175,7 @@ def test_a_row_dropped_by_prepare_inputs_does_not_end_its_streams():
     _engine(_Sub(bad={2})).prepare_inputs(batch)
     assert batch.request_ids == [1]
     assert batch.final_stream_rids == {1}
-    assert batch.stream_partition_done_rids == {1}
+    assert batch.partition_done_rids == {1}
 
 
 def test_a_failed_prepare_inputs_row_does_not_fail_the_batch():
@@ -195,7 +195,7 @@ def test_a_failed_check_stop_row_does_not_fail_the_batch():
     assert runtime.stopped == [1]
     assert set(w.reported) == {2}
     assert batch.final_stream_rids == {1}
-    assert batch.stream_partition_done_rids == {1}
+    assert batch.partition_done_rids == {1}
 
 
 def test_a_row_that_overstayed_its_loop_stop_is_not_stopped_again():
@@ -203,13 +203,13 @@ def test_a_row_that_overstayed_its_loop_stop_is_not_stopped_again():
     assert runtime.stopped == [1]
     assert not w.reported
     assert batch.final_stream_rids == {1}
-    assert batch.stream_partition_done_rids == {1}
+    assert batch.partition_done_rids == {1}
 
 
 def test_an_end_partition_stop_reports_the_partition_done():
     """END_PARTITION from a row outside any loop is never a loop name for the runtime."""
     batch, runtime, w = _postprocess(_Sub(stops={1: {END_PARTITION}}), streams=False, in_loop=False)
-    assert batch.stream_partition_done_rids == {1}
+    assert batch.partition_done_rids == {1}
     assert runtime.loop_names == {}
     assert not w.reported
 
@@ -218,5 +218,5 @@ def test_an_end_partition_stop_inside_a_loop_fails_the_request():
     batch, runtime, w = _postprocess(_Sub(stops={1: {END_PARTITION}}), streams=False)
     assert set(w.reported) == {1}
     assert "END_PARTITION" in w.reported[1] and repr(NODE) in w.reported[1]
-    assert batch.request_ids == [2] and batch.stream_partition_done_rids == set()
+    assert batch.request_ids == [2] and batch.partition_done_rids == set()
     assert runtime.stopped == []

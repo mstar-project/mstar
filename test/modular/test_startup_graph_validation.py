@@ -352,7 +352,7 @@ def test_colocated_successor_reports_the_final_stream(tmp_path):
     assert voc != post
     w.trigger()
     w.feed_chunk()
-    w.rt.mark_stream_partition_done(w.rid, "C")  # the vocoder step popped the final chunk
+    w.rt.mark_partition_done(w.rid, "C")  # the vocoder step popped the final chunk
     assert w.run("vocoder") == [voc]
     assert w.run("post") == [post]
     assert w.reports() == [([voc], True), ([post], True)]
