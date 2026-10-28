@@ -109,7 +109,8 @@ def _decode_direct_variant(w) -> str | None:
     """Which planner FlashInfer decode wrapper ``w``'s plan resolved to, when
     ``_plan_direct`` reproduces it on a checked FlashInfer version: fa2
     tensor-core or generic CUDA-core decode, under a graph, one query token per
-    row, no window, no soft cap. None otherwise."""
+    row, no window, no soft cap. None otherwise. CUDA-core decode takes the
+    generic module under "auto" (unless it resolved to cuDNN) and "fa2" alike."""
     if not (
         _direct_plan_supported() and w.is_cuda_graph_enabled
         and not getattr(w, "_uses_cudnn", False) and w._jit_module is None
@@ -118,7 +119,7 @@ def _decode_direct_variant(w) -> str | None:
         return None
     if w.use_tensor_cores:
         return _TENSOR_CORE_DECODE if w._backend == "fa2" else None
-    if w._backend == "auto" and not w._logits_soft_cap:
+    if w._backend in ("auto", "fa2") and not w._logits_soft_cap:
         return _CUDA_CORE_DECODE
     return None
 
