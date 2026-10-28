@@ -1499,10 +1499,10 @@ class Worker:
         self._lockstep_unread = {}
 
     def _note_lockstep_reads(self, ready: dict[int, list[GraphEdge]]) -> None:
-        """Rank 0: the inputs of its lockstep node that landed here by a read,
-        which each follower reads too. This rank's own output of the node coming
-        back (a persisted token as the decode walk's input) is every rank's own
-        copy, with no read."""
+        """Rank 0: the inputs of a lockstep node it leads that landed here by a
+        read, which each follower reads too. This rank's own output of a led node
+        coming back (a persisted token as the decode walk's input) is every
+        rank's own copy, with no read."""
         led, me = self._lockstep_led, self.tensor_manager.my_entity_id
         for rid, edges in ready.items():
             for edge in edges:
@@ -1547,8 +1547,8 @@ class Worker:
         return False
 
     def _consume_lockstep_reads(self, node_batch: ExecutingBatch) -> None:
-        """Rank 0, once a step of its lockstep node ran: the marked inputs its
-        rows took are spent. Not at the broadcast: a step that does not run (a
+        """Rank 0, once a step of a node it leads ran: the marked inputs its
+        rows took for that node are spent. Not at the broadcast: a step that does not run (a
         voided speculation, a refused admit) leaves its rows to a later one."""
         unread, node = self._lockstep_unread, node_batch.node_name
         tensors = node_batch.per_request_input_tensors
