@@ -33,10 +33,11 @@ from mstar.engine.resources.attn import dense as dense_module
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.dense import (
     DenseAttentionManager,
-    FlashInferDenseAttentionManager,
     _fa3_unavailable_reason,
 )
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
+from mstar.engine.resources.attn.ragged.dense_wrappers import DensePrefixedPrefillWrapper
+from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.plan import KVPlanOutput, SequenceView
 
@@ -57,12 +58,14 @@ def _kv_config() -> PagedKVConfig:
     )
 
 
-def _manager() -> DenseAttentionManager:
+def _manager(wrapper_class=DensePrefixedPrefillWrapper, **kwargs) -> DenseAttentionManager:
     return DenseAttentionManager(
         kv_cache="kv",
         device=torch.device("cpu"),
         dtype=torch.float32,
         kv_config=_kv_config(),
+        wrapper_class=wrapper_class,
+        **kwargs,
     )
 
 
@@ -266,7 +269,9 @@ class TestBackendSelection:
 
     def _build_on_cuda(self, monkeypatch, fa3_reason, flashinfer_reason, flashinfer_backend="auto"):
         """Build a dense spec for a CUDA device with FA3's and FlashInfer's
-        availability forced; nothing is allocated, so this runs on CPU."""
+        availability forced; nothing runs, so this passes on CPU."""
+        monkeypatch.setattr(dense_module, "workspace_bytes", lambda: 1024)
+        monkeypatch.setattr(DenseAttentionManager, "_check_flashinfer_backend", lambda self: None)
         monkeypatch.setattr(dense_module, "_fa3_unavailable_reason", lambda device=None: fa3_reason)
         monkeypatch.setattr(
             dense_module, "_flashinfer_ragged_unavailable_reason", lambda device=None: flashinfer_reason,
@@ -295,10 +300,27 @@ class TestBackendSelection:
         manager = self._build_on_cuda(
             monkeypatch, "fa3-fwd has no kernel for compute capability 10.3", None, "cudnn",
         )
-        assert type(manager) is FlashInferDenseAttentionManager
-        assert manager._backend == "cudnn"
+        assert type(manager) is DenseAttentionManager
+        assert manager._wrapper_class is FlashInferPrefixedPrefillWrapper
+        assert manager._flashinfer_backend == "cudnn"
         assert manager.requires_kv_write is False
         assert manager.force_double_buffer is True
+
+    def test_dense_with_fa3_holds_the_fa3_wrapper(self, monkeypatch):
+        manager = self._build_on_cuda(monkeypatch, None, None, "cudnn")
+        assert type(manager) is DenseAttentionManager
+        assert manager._wrapper_class is DensePrefixedPrefillWrapper
+        # FA3 has no FlashInfer backend to pick, and its plan stages nothing
+        assert manager._flashinfer_backend is None
+        assert manager.force_double_buffer is False
+
+    def test_the_ragged_resources_and_dense_share_one_selection(self, monkeypatch):
+        """Both go through ``dense_or_flashinfer``: patching FA3's reason moves them together."""
+        from mstar.engine.resources.attn.ragged.base import dense_or_flashinfer
+
+        for reason, want in ((None, "dense"), ("no kernel", "flashinfer")):
+            monkeypatch.setattr(dense_module, "_fa3_unavailable_reason", lambda device=None, r=reason: r)
+            assert dense_or_flashinfer(torch.device("cuda", 0), "dense", "flashinfer", "Test") == want
 
     def test_dense_without_fa3_or_flashinfer_goes_paged(self, monkeypatch, caplog):
         import logging
@@ -315,11 +337,59 @@ class TestBackendSelection:
     def test_dense_kernels_do_not_share_a_fingerprint(self):
         """They differ in the last bits, so a cached artifact keyed on the
         resource must not carry over from one to the other."""
-        fa3 = _manager()
-        fi = FlashInferDenseAttentionManager(
-            kv_cache="kv", device=torch.device("cpu"), dtype=torch.float32, kv_config=_kv_config(),
+        prints = {
+            _manager().fingerprint(),
+            _manager(FlashInferPrefixedPrefillWrapper).fingerprint(),
+            _manager(FlashInferPrefixedPrefillWrapper, flashinfer_backend="cudnn").fingerprint(),
+        }
+        assert len(prints) == 3
+
+
+class _StubFlashInferWrapper(FlashInferPrefixedPrefillWrapper):
+    """Stands in for FlashInfer's wrapper: refuses every backend but ``auto``."""
+
+    def __init__(self, workspace_buffer=None, *, backend="auto", **kwargs):
+        del workspace_buffer, kwargs
+        self.backend = backend
+
+    def plan(self, q_cu_seqlens, kv_cu_seqlens, causal=False):
+        if self.backend != "auto":
+            raise RuntimeError(f"no {self.backend} kernel for this GPU")
+
+    def run(self, q, k, v):
+        return torch.zeros_like(q)
+
+
+class TestFlashInferBackendCheck:
+    """A backend the GPU or the FlashInfer build cannot run is refused when
+    the resource is built, not on every request."""
+
+    @pytest.mark.parametrize("backend", ["cudnnn", "cutlass"])
+    def test_a_backend_that_cannot_run_raises_naming_it(self, backend):
+        manager = _manager(_StubFlashInferWrapper, flashinfer_backend=backend)
+        with pytest.raises(ValueError, match=f"flashinfer_backend='{backend}' cannot run the dense attention"):
+            manager._check_flashinfer_backend()
+
+    def test_a_backend_that_runs_passes(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+        _manager(_StubFlashInferWrapper, flashinfer_backend="auto")._check_flashinfer_backend()
+
+    def test_the_check_runs_when_the_manager_is_built_on_cuda(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(dense_module, "workspace_bytes", lambda: 0)
+        monkeypatch.setattr(dense_module.torch, "empty", lambda *a, **k: None)
+
+
+        def check(manager):
+            calls.append(manager)
+
+        monkeypatch.setattr(DenseAttentionManager, "_check_flashinfer_backend", check)
+        manager = DenseAttentionManager(
+            kv_cache="kv", device=torch.device("cuda", 0), dtype=torch.bfloat16, kv_config=_kv_config(),
+            wrapper_class=_StubFlashInferWrapper, flashinfer_backend="cudnnn",
         )
-        assert fa3.fingerprint() != fi.fingerprint()
+        assert calls == [manager]
 
     def test_only_the_dense_backend_skips_the_kv_write(self):
         assert _manager().requires_kv_write is False
@@ -342,19 +412,42 @@ def _gpu_flashinfer():
 
 
 @pytest.mark.skipif(not _gpu_flashinfer(), reason="needs a CUDA GPU and flashinfer")
+@pytest.mark.parametrize("backend", ["cudnnn", "not-a-backend"])
+def test_flashinfer_backend_the_gpu_cannot_run_fails_at_build(backend):
+    with pytest.raises(ValueError, match=f"flashinfer_backend='{backend}'"):
+        DenseAttentionManager(
+            kv_cache="kv", device=torch.device("cuda"), dtype=torch.bfloat16,
+            kv_config=PagedKVConfig(
+                num_layers=1, num_kv_heads=2, head_dim=128, max_seq_len=256, max_num_pages=16,
+                page_size=16, num_qo_heads=4,
+            ),
+            wrapper_class=FlashInferPrefixedPrefillWrapper, flashinfer_backend=backend,
+        )
+
+
+def _wrapper_classes():
+    classes = []
+    if _gpu_flashinfer():
+        classes.append(pytest.param(FlashInferPrefixedPrefillWrapper, id="flashinfer"))
+    if torch.cuda.is_available() and _fa3_unavailable_reason(torch.device("cuda")) is None:
+        classes.append(pytest.param(DensePrefixedPrefillWrapper, id="fa3"))
+    return classes or [pytest.param(None, marks=pytest.mark.skip(reason="needs a CUDA GPU with FA3 or flashinfer"))]
+
+
+@pytest.mark.parametrize("wrapper_class", _wrapper_classes())
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_flashinfer_dense_matches_sdpa_over_prefix_and_fresh(causal):
+def test_dense_matches_sdpa_over_prefix_and_fresh(wrapper_class, causal):
     """Two segments with different frozen prefixes and GQA: each query block
     attends its own [prefix | fresh] keys, and a causal plan aligns the block
-    to the end of them, as FA3 does."""
+    to the end of them, on either kernel."""
     dev = torch.device("cuda")
     page, hq, hkv, d = 16, 4, 2, 128
     cfg = PagedKVConfig(
         num_layers=1, num_kv_heads=hkv, head_dim=d, max_seq_len=256, max_num_pages=16,
         page_size=page, num_qo_heads=hq,
     )
-    manager = FlashInferDenseAttentionManager(
-        kv_cache="kv", device=dev, dtype=torch.bfloat16, kv_config=cfg,
+    manager = DenseAttentionManager(
+        kv_cache="kv", device=dev, dtype=torch.bfloat16, kv_config=cfg, wrapper_class=wrapper_class,
     )
     torch.manual_seed(0)
     layer = torch.randn(16, 2, page, hkv, d, device=dev, dtype=torch.bfloat16)

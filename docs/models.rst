@@ -934,7 +934,10 @@ Cosmos3 environment requirements
   same dense pass runs on FlashInfer's ragged prefill, whose ``auto`` kernel on
   a B300 is CUTLASS's FMHA: 1.5 ms per layer for the 832x480x121 guidance pair
   against 6.3 ms for the paged prefill. ``resources: attn_gen:
-  flashinfer_backend:`` picks that kernel (``cudnn``, ``cutlass``, ``fa2``).
+  flashinfer_backend:`` picks that kernel (``cudnn``, ``cutlass``, ``fa2``); the
+  server checks it at startup with a tiny plan and run, and a backend this GPU or
+  FlashInfer build cannot run (a typo, ``fa3`` on Blackwell, ``cutlass`` on
+  Hopper) stops it with a ``ValueError`` naming the backend.
   Without a usable FlashInfer either, the engine logs a warning and switches to
   the paged backend, but that is FlashInfer too (the default backend on every
   platform for now), so it cannot run there either: the dense pass needs

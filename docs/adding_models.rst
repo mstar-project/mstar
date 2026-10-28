@@ -524,7 +524,11 @@ The spec types are:
        ``RingKVConfig``. ``DENSE`` runs one varlen pass over each stream's frozen
        prefix (gathered from the pages once) and the step's fresh K/V, eager only:
        FA3 (AITER on ROCm), or FlashInfer's ragged prefill where FA3 has no kernel for
-       the GPU, with ``flashinfer_backend`` picking its kernel.
+       the GPU, the same choice the ragged resources make (``dense_or_flashinfer``), with
+       ``flashinfer_backend`` picking its kernel. The engine plans and runs a tiny layout on
+       that kernel when it builds the resource, so a backend the GPU or FlashInfer build
+       cannot run stops the server with a ``ValueError`` naming it. Its wrappers share one
+       workspace, taken at build.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
        ``"fa3"`` when the FlashInfer backend is selected. ``decode_tensor_cores``
        (default ``True``) runs one-token decode rows on FlashInfer's tensor-core

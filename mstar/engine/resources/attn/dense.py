@@ -3,14 +3,15 @@ FlashInfer's ragged prefill where neither has a kernel for the GPU."""
 
 import functools
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import torch
 
-from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey, WorkspacePool
+from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey, workspace_bytes
 from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
-from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
+from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper, _FlashInferRaggedPrefillBase
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
 from mstar.platforms import current_platform
@@ -81,12 +82,22 @@ def _flashinfer_ragged_unavailable_reason(device: torch.device | None = None) ->
     return None
 
 
-@functools.cache
-def _log_dense_on_flashinfer(reason: str, backend: str) -> None:
-    logger.info(
-        "Attention backend 'dense': %s; running the dense pass on FlashInfer's "
-        "ragged prefill (backend %r).", reason, backend,
-    )
+def _flashinfer_version() -> str:
+    try:
+        import flashinfer
+    except Exception:  # noqa: BLE001
+        return "(not importable)"
+    return flashinfer.__version__
+
+
+def _dense_unavailable_reason(device: torch.device | None = None) -> str | None:
+    """why neither FA3 (AITER on ROCm) nor FlashInfer can run the dense pass on
+    ``device``; None if either can"""
+    fa3 = _fa3_unavailable_reason(device)
+    if fa3 is None:
+        return None
+    flashinfer = _flashinfer_ragged_unavailable_reason(device)
+    return None if flashinfer is None else f"{fa3}; {flashinfer}"
 
 
 @dataclass(frozen=True)
@@ -112,8 +123,8 @@ class DensePlan:
     max_q: int
     max_k: int
     causal: bool
-    # what the backend's kernel planned this layout into (see `_plan_kernel`)
-    kernel: object = None
+    # the wrapper this layout was planned into
+    wrapper: PrefixedPrefillWrapper | None = None
 
 
 @dataclass
@@ -128,8 +139,11 @@ class _GatheredPrefix:
 
 
 class DenseAttentionManager(AttentionManager):
-    """Attention as one dense varlen pass (FA3, AITER on ROCm) over a contiguous
-    [frozen prefix | fresh tokens] sequence.
+    """Attention as one dense varlen pass over a contiguous
+    [frozen prefix | fresh tokens] sequence, through a prefixed ragged wrapper:
+    FA3's (AITER on ROCm), or FlashInfer's where FA3 has no kernel for the GPU
+    (``ragged.base.dense_or_flashinfer`` picks; ``AttentionManager.build``
+    passes the class).
 
     For a workload that recomputes every one of its K/V every step and only
     reuses a small frozen prefix — diffusion denoise, where the prefix is the
@@ -167,6 +181,8 @@ class DenseAttentionManager(AttentionManager):
         device: torch.device,
         dtype: torch.dtype,
         kv_config: PagedKVConfig,
+        wrapper_class: type[PrefixedPrefillWrapper],
+        flashinfer_backend: str = "auto",
     ):
         self._kv_cache_name = kv_cache
         self._device = device
@@ -179,11 +195,72 @@ class DenseAttentionManager(AttentionManager):
         # (request, label) -> the prefix gathered out of the pages
         self._prefix_cache: dict[tuple[str, str], _GatheredPrefix] = {}
 
+        self._wrapper_class = wrapper_class
+        self._wrappers: dict[EagerSlotKey, PrefixedPrefillWrapper] = {}
+        self._wrapper_kwargs = dict(
+            num_qo_heads=kv_config.num_qo_heads,
+            num_kv_heads=kv_config.num_kv_heads,
+            head_dim=kv_config.head_dim,
+            device=device,
+            q_data_type=dtype,
+        )
+        self._on_flashinfer = issubclass(wrapper_class, _FlashInferRaggedPrefillBase)
+        self._flashinfer_backend = flashinfer_backend if self._on_flashinfer else None
+        if self._on_flashinfer:
+            # One workspace for every wrapper, taken now rather than at the first
+            # plan: it is scratch during `run` only (a plan writes the wrapper's
+            # own buffers), and the runs are serialized on the node's stream.
+            workspace = (
+                torch.empty(workspace_bytes(), dtype=torch.uint8, device=device) if self._on_cuda else None
+            )
+            self._wrapper_kwargs.update(workspace_buffer=workspace, backend=flashinfer_backend)
+            if self._on_cuda:
+                self._check_flashinfer_backend()
+
+    def fingerprint(self) -> bytes:
+        # the kernel, not just the class: FA3 and each FlashInfer backend
+        # differ in the last bits
+        return fingerprint(type(self).__name__, self._wrapper_class.__name__, self._flashinfer_backend)
+
     def depends_on(self):
         return {self._kv_cache_name}
 
     def can_capture(self) -> bool:
         return False
+
+    @property
+    def force_double_buffer(self):
+        # FlashInfer's plan stages its schedule in a pinned buffer per wrapper
+        # and H2Ds it on the stream, so each slot keeps its own wrapper
+        return self._on_flashinfer
+
+    def _check_flashinfer_backend(self) -> None:
+        """Plan and run a tiny layout on the configured kernel, so a backend
+        this GPU or FlashInfer build cannot run stops the server at startup
+        instead of failing every request."""
+        cfg = self._kv_config
+        try:
+            wrapper = self._wrapper_class(**self._wrapper_kwargs)
+            wrapper.plan(torch.tensor([0, 16], dtype=torch.int32), torch.tensor([0, 32], dtype=torch.int32))
+            q = torch.zeros(16, cfg.num_qo_heads, cfg.head_dim, device=self._device, dtype=self._dtype)
+            kv = torch.zeros(32, cfg.num_kv_heads, cfg.head_dim, device=self._device, dtype=self._dtype)
+            wrapper.run(q, kv, kv)
+            # a launch failure is reported asynchronously
+            torch.cuda.synchronize(self._device)
+        except Exception as exc:  # noqa: BLE001
+            capability = current_platform.cuda_capability(self._device) if self._device.type == "cuda" else None
+            raise ValueError(
+                f"flashinfer_backend={self._flashinfer_backend!r} cannot run the dense attention "
+                f"on this GPU (compute capability {'.'.join(map(str, capability or ()))}) with "
+                f"FlashInfer {_flashinfer_version()}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def _wrapper(self, label: str, slot: int) -> PrefixedPrefillWrapper:
+        key = EagerSlotKey(label=label, slot=slot)
+        wrapper = self._wrappers.get(key)
+        if wrapper is None:
+            wrapper = self._wrappers[key] = self._wrapper_class(**self._wrapper_kwargs)
+        return wrapper
 
     @property
     def requires_kv_write(self) -> bool:
@@ -220,33 +297,12 @@ class DenseAttentionManager(AttentionManager):
             f"Dense Attention Manager expected plan result from {self._kv_cache_name}"
         )
 
-        plans = {}
-        for plan_label, kv_out in plan_outputs.items():
-            plan = self._build_plan(kv_out, step.causal)
-            plans[plan_label] = replace(plan, kernel=self._plan_kernel(plan_label, plan, ctx.slot))
-        self._current_plans = plans
+        self._current_plans = {
+            plan_label: self._build_plan(kv_out, step.causal, self._wrapper(plan_label, ctx.slot))
+            for plan_label, kv_out in plan_outputs.items()
+        }
 
-    def _plan_kernel(self, label: str, plan: DensePlan, slot: int) -> object:
-        """Plan the varlen kernel on one label's layout; `_varlen` gets it back."""
-        del label, slot
-        return (
-            torch.tensor(plan.cu_q, dtype=torch.int32, device=self._device),
-            torch.tensor(plan.cu_k, dtype=torch.int32, device=self._device),
-        )
-
-    def _varlen(self, plan: DensePlan, q: torch.Tensor, key: torch.Tensor, val: torch.Tensor) -> torch.Tensor:
-        cu_q, cu_k = plan.kernel
-        out = flash_attn_varlen_func(
-            q, key, val,
-            cu_q, cu_k, plan.max_q, plan.max_k,
-            # a causal plan aligns the query block to the end of the key
-            # sequence, so the fresh tokens see the whole prefix; only
-            # non-causal generation attention is exercised today
-            causal=plan.causal,
-        )
-        return out[0] if isinstance(out, tuple) else out
-
-    def _build_plan(self, kv_out: KVPlanOutput, causal: bool) -> DensePlan:
+    def _build_plan(self, kv_out: KVPlanOutput, causal: bool, wrapper: PrefixedPrefillWrapper) -> DensePlan:
         """The per-segment gather layout plus the cumulative lengths one varlen
         kernel needs, in the packed order the KV plan defined."""
         page_size = self._kv_config.page_size
@@ -275,6 +331,15 @@ class DenseAttentionManager(AttentionManager):
             max_q = max(max_q, view.to_compute)
             max_k = max(max_k, view.length)
 
+        # Fresh pinned host layouts per plan: the FA3 wrapper H2Ds them
+        # non-blocking (from pageable memory that copy would sync the stream),
+        # FlashInfer's plan reads them on the host.
+        pin = self._on_cuda
+        wrapper.plan(
+            torch.tensor(cu_q, dtype=torch.int32, pin_memory=pin),
+            torch.tensor(cu_k, dtype=torch.int32, pin_memory=pin),
+            causal=causal,
+        )
         return DensePlan(
             segments=tuple(segments),
             cu_q=tuple(cu_q),
@@ -282,6 +347,7 @@ class DenseAttentionManager(AttentionManager):
             max_q=max_q,
             max_k=max_k,
             causal=causal,
+            wrapper=wrapper,
         )
 
     def _prefix_kv(
@@ -355,64 +421,5 @@ class DenseAttentionManager(AttentionManager):
 
         key = torch.cat(k_parts, dim=0)
         val = torch.cat(v_parts, dim=0)
-        if q.dtype != key.dtype:
-            q = q.to(key.dtype)
-        return self._varlen(plan, q, key, val)
+        return plan.wrapper.run(q, key, val)
 
-
-class FlashInferDenseAttentionManager(DenseAttentionManager):
-    """The dense pass on FlashInfer's ragged prefill: the same gathered prefix
-    and concatenation, one ``BatchPrefillWithRaggedKVCacheWrapper`` run per
-    layer. ``AttentionManager.build`` picks it where FA3 has no kernel for the
-    GPU (Blackwell): there ``backend="auto"`` resolves to FlashInfer's cuDNN or
-    CUTLASS FMHA, about 4x the paged prefill's FA2 kernel on a long
-    non-causal step.
-    """
-
-    def __init__(
-        self,
-        kv_cache: str,
-        device: torch.device,
-        dtype: torch.dtype,
-        kv_config: PagedKVConfig,
-        backend: str = "auto",
-    ):
-        super().__init__(kv_cache=kv_cache, device=device, dtype=dtype, kv_config=kv_config)
-        self._backend = backend
-        self._workspaces = WorkspacePool(device)
-        self._wrappers: dict[EagerSlotKey, FlashInferPrefixedPrefillWrapper] = {}
-
-    @property
-    def force_double_buffer(self):
-        # FlashInfer's plan stages its schedule in a pinned buffer per wrapper
-        # and H2Ds it on the stream, so each slot keeps its own wrapper
-        return True
-
-    def _wrapper(self, label: str, slot: int):
-        key = EagerSlotKey(label=label, slot=slot)
-        wrapper = self._wrappers.get(key)
-        if wrapper is None:
-            cfg = self._kv_config
-            wrapper = self._wrappers[key] = FlashInferPrefixedPrefillWrapper(
-                self._workspaces.get(label, slot),
-                num_qo_heads=cfg.num_qo_heads,
-                num_kv_heads=cfg.num_kv_heads,
-                head_dim=cfg.head_dim,
-                backend=self._backend,
-                device=self._device,
-                q_data_type=self._dtype,
-            )
-        return wrapper
-
-    def _plan_kernel(self, label: str, plan: DensePlan, slot: int) -> object:
-        wrapper = self._wrapper(label, slot)
-        # host layouts: a device one would cost FlashInfer's plan a sync
-        wrapper.plan(
-            torch.tensor(plan.cu_q, dtype=torch.int32),
-            torch.tensor(plan.cu_k, dtype=torch.int32),
-            causal=plan.causal,
-        )
-        return wrapper
-
-    def _varlen(self, plan: DensePlan, q: torch.Tensor, key: torch.Tensor, val: torch.Tensor) -> torch.Tensor:
-        return plan.kernel.run(q, key, val)

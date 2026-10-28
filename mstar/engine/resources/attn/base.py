@@ -96,33 +96,27 @@ class AttentionManager(AttentionResource):
             # tells the layer which one it is talking to.
             from mstar.engine.resources.attn.dense import (
                 DenseAttentionManager,
-                FlashInferDenseAttentionManager,
-                _fa3_unavailable_reason,
-                _flashinfer_ragged_unavailable_reason,
-                _log_dense_on_flashinfer,
+                _dense_unavailable_reason,
                 _warn_dense_fallback,
             )
+            from mstar.engine.resources.attn.ragged.base import dense_or_flashinfer
+            from mstar.engine.resources.attn.ragged.dense_wrappers import DensePrefixedPrefillWrapper
+            from mstar.engine.resources.attn.ragged.wrappers import FlashInferPrefixedPrefillWrapper
 
-            reason = _fa3_unavailable_reason(info.device)
+            reason = _dense_unavailable_reason(info.device)
             if reason is None:
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,
                     device=info.device,
                     dtype=info.kv_dtype,
                     kv_config=kv_config,
-                )
-            fi_reason = _flashinfer_ragged_unavailable_reason(info.device)
-            if fi_reason is None:
-                _log_dense_on_flashinfer(reason, spec.config.flashinfer_backend)
-                return FlashInferDenseAttentionManager(
-                    kv_cache=spec.config.kv_cache,
-                    device=info.device,
-                    dtype=info.kv_dtype,
-                    kv_config=kv_config,
-                    backend=spec.config.flashinfer_backend,
+                    wrapper_class=dense_or_flashinfer(
+                        info.device, DensePrefixedPrefillWrapper, FlashInferPrefixedPrefillWrapper, "Attention",
+                    ),
+                    flashinfer_backend=spec.config.flashinfer_backend,
                 )
             backend = resolve_attn_backend(AttnBackend.AUTO, info.device)
-            _warn_dense_fallback(f"{reason}; {fi_reason}", backend)
+            _warn_dense_fallback(reason, backend)
 
         if backend == AttnBackend.FLASHINFER_MLA:
             from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
@@ -235,6 +229,11 @@ def captured_page_capacity(num_rows: int, num_tokens: int, kv_config: KVConfig) 
     )
 
 
+def workspace_bytes() -> int:
+    """Size of one FlashInfer workspace buffer (``MSTAR_WORKSPACE_BUFFER_MB``)."""
+    return int(os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")) * 1024 * 1024
+
+
 class WorkspacePool:
     """FlashInfer workspace buffers, one per (plan label, cg slot).
 
@@ -244,9 +243,7 @@ class WorkspacePool:
 
     def __init__(self, device: torch.device):
         self._device = device
-        self._size = int(
-            os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")
-        ) * 1024 * 1024
+        self._size = workspace_bytes()
         self._buffers: dict[str, torch.Tensor] = {}
 
     def get(self, label: str, cg_slot: int | None = None) -> torch.Tensor:
