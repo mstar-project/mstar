@@ -62,7 +62,10 @@ from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
 # the sampling knobs a request may set. A model's SamplerSpec enables the
 # min-p filter only where ``sampling_defaults`` sets min_p, so elsewhere a
 # min_p > 0 is refused at admission rather than dropped
-SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos")
+SAMPLING_KEYS = (
+    "temperature", "top_p", "top_k", "min_p",
+    "repetition_penalty", "penalize_prompt", "ignore_eos",
+)
 
 # A mixed step's prompt rows (as many as `max_rows_in_combined` lets in) take
 # the prefill kernels, its decode rows the decode ones; for the ``splits`` of

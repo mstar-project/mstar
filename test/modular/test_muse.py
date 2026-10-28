@@ -642,8 +642,8 @@ def test_the_checkpoint_sampling_defaults_apply_under_the_request(model_dir):
     from mstar.model.muse.glimmer_model import MuseGlimmerModel
 
     model = MuseGlimmerModel(str(model_dir))
-    cfg = model.get_request_resource_configs({}, {"temperature": 0.0})[SAMPLER]
-    assert (cfg.temperature, cfg.top_p, cfg.top_k) == (0.0, 0.95, 64)
+    cfg = model.get_request_resource_configs({}, {"temperature": 0.0, "penalize_prompt": False})[SAMPLER]
+    assert (cfg.temperature, cfg.top_p, cfg.top_k, cfg.penalize_prompt) == (0.0, 0.95, 64, False)
     specs = {spec.resource_key: spec for spec in model.get_node_resources()}
     cfg.validate(specs[SAMPLER])
     # the checkpoint sets no min_p, so the sampler has no min-p filter and a
