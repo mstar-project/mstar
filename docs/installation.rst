@@ -490,12 +490,15 @@ runs on the pure-Python paths as before. Migrated so far (see
   wherever that holds, so on a machine with the extension built, installing
   it is what moves a worker onto the Rust runtime.
 
-The release workflow also builds Linux wheels of ``mstar-ai`` (x86_64 and
-aarch64, CPython 3.12 to 3.14) that carry the extension, but they are not on
-PyPI yet (``PACKAGING.md`` says why), so ``pip install mstar-ai`` gets the
-pure-Python wheel. Build the extension into your environment with `maturin
-<https://www.maturin.rs>`_ (needs `rustup <https://rustup.rs>`_, which installs
-the compiler version pinned in ``rust-toolchain.toml``):
+The Linux wheels of ``mstar-ai`` on PyPI (x86_64 and aarch64, CPython 3.12 to
+3.14) carry the extension, so ``pip install mstar-ai`` there gets it; other
+platforms get the pure-Python wheel. The extension statically links libzmq
+4.3.4, under LGPL-3.0-or-later with its static-linking exception; its source is
+the upstream `v4.3.4 release <https://github.com/zeromq/libzmq/releases/tag/v4.3.4>`_.
+Elsewhere, or to build from a checkout, build the extension into your
+environment with `maturin <https://www.maturin.rs>`_ (needs `rustup
+<https://rustup.rs>`_, which installs the compiler version pinned in
+``rust-toolchain.toml``):
 
 .. code-block:: bash
 

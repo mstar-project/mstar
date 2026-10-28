@@ -55,13 +55,12 @@ Python transport and graph runtime.
   fails the `wheels` job. The C/C++ that crates vendor is declared there by
   hand (libzmq via zeromq-src, Oniguruma via onig_sys, esaxx via esaxx-rs);
   check those entries when bumping those crates.
-- **Not published yet.** libzmq 4.3.4 (vendored by zeromq-src, statically
-  linked into both binaries) is LGPL-3.0-or-later with its own static-linking
-  exception, and that license is not in `accepted` until a maintainer signs off
-  on distributing it. Until then a release's license step fails, so `wheels`
-  fails and `pypi-wheels` is skipped; `pypi` still publishes the sdist, the
-  pure wheel and the aliases. PR and manual runs accept that one license in a
-  temporary copy of the config, so they still build and check the wheels.
+- **libzmq.** libzmq 4.3.4, statically linked into both binaries, is
+  LGPL-3.0-or-later with its own static-linking exception (the end of its
+  `COPYING.LESSER`, which the notices carry in full). Its source is the
+  unmodified upstream release that the zeromq-src 0.2.6+4.3.4 crate vendors:
+  <https://github.com/zeromq/libzmq/releases/tag/v4.3.4>. The build only adds
+  defines (`.cargo/config.toml`).
 - **Two copies of `mstar_rust`.** `maturin develop` (or `pip install ./rust`)
   installs `rust/` as a separate `mstar-rust` distribution, a `mstar_rust/`
   package directory. In an environment that also has a Rust wheel's top-level

@@ -6,6 +6,7 @@
 accepted = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "LGPL-3.0-or-later WITH AdditionRef-libzmq-static-linking-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
@@ -28,22 +29,21 @@ workarounds = ["ring"]
 # C/C++ sources that are compiled into the binaries. onig_sys and esaxx-rs are
 # only in rust/server's tree, so the rust/ run warns that they are absent.
 
-# libzmq 4.3.4: LGPL-3.0 plus a static-linking exception appended to
-# COPYING.LESSER, and the BSD-3-Clause SHA-1 it compiles. The exception is
-# libzmq's own Classpath-style text, which matches no SPDX exception id
-# (LGPL-3.0-linking-exception is different text). LGPL-3.0-or-later is left out
-# of `accepted` on purpose: until a maintainer signs off on distributing libzmq
-# under it, cargo-about fails here and the release publishes no Rust wheels
-# (the sdist and pure wheel still go up).
+# libzmq 4.3.4: LGPL-3.0-or-later plus the static-linking exception appended to
+# its COPYING.LESSER ("SPECIAL EXCEPTION GRANTED BY COPYRIGHT HOLDERS"), and
+# the BSD-3-Clause SHA-1 it compiles. The exception is libzmq's own
+# Classpath-style text, which matches no SPDX exception id
+# (LGPL-3.0-linking-exception is different text), hence the AdditionRef. The
+# notice carries the whole COPYING.LESSER, exception included.
 [zeromq-src.clarify]
-license = "(MIT OR Apache-2.0) AND LGPL-3.0-or-later AND BSD-3-Clause"
+license = "(MIT OR Apache-2.0) AND (LGPL-3.0-or-later WITH AdditionRef-libzmq-static-linking-exception) AND BSD-3-Clause"
 [[zeromq-src.clarify.files]]
 path = "LICENSE-MIT"
 license = "MIT"
 checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
 [[zeromq-src.clarify.files]]
 path = "vendor/COPYING.LESSER"
-license = "LGPL-3.0-or-later"
+license = "LGPL-3.0-or-later WITH AdditionRef-libzmq-static-linking-exception"
 checksum = "83f32abe61ee58ffb1b007412c08415168c052501dbf56d7a47aaaac52b03ef6"
 [[zeromq-src.clarify.files]]
 path = "vendor/external/sha1/sha1.c"
