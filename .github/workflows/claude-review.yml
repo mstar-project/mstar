@@ -76,7 +76,7 @@ name: Claude Review
 # fork's own `pull_request` workflow can upload an artifact with any name.
 #
 # Every run that reaches Claude records its API calls, tokens, turns and cost
-# in the job summary, the log and a review-usage-* artifact, never on the PR.
+# in the job summary and a review-usage-* artifact, never on the PR.
 
 on:
   pull_request_target:
@@ -475,8 +475,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # What the run used, from the execution file or, after a timeout, the
-      # session transcript: a table in the job summary, one JSON line in the
-      # log, and a small artifact to compare runs by. Never posted on the PR.
+      # session transcript: a table in the job summary, and a small artifact to
+      # compare runs by. Never posted on the PR.
       - name: Record usage
         if: always() && steps.diff.outcome == 'success'
         id: usage

@@ -318,7 +318,6 @@ def record_usage(a):
     except Exception as e:
         record["error"] = f"{type(e).__name__}: {e}"
         print(f"::warning::Couldn't read the review's usage: {record['error']}")
-    print("review-usage " + json.dumps(record, separators=(",", ":")))
     try:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
         Path(a.out).write_text(json.dumps(record, indent=1) + "\n")
