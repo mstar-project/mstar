@@ -60,6 +60,8 @@ def _no_home(cls):
 def test_compile_cache_without_a_usable_cache_home(tmp_path, monkeypatch, xdg, has_home):
     """A relative ``XDG_CACHE_HOME`` is ignored, as the XDG spec says, and a
     process with no home keeps torch's default rather than failing to import."""
+    # a copy, so what _default_compile_caches writes can't outlive the test
+    monkeypatch.setattr(os, "environ", dict(os.environ))
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
     monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
