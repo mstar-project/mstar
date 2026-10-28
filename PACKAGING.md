@@ -58,9 +58,10 @@ Python transport and graph runtime.
 - **Not published yet.** libzmq 4.3.4 (vendored by zeromq-src, statically
   linked into both binaries) is LGPL-3.0-or-later with its own static-linking
   exception, and that license is not in `accepted` until a maintainer signs off
-  on distributing it. Until then the license step fails, so `wheels` fails and
-  `pypi-wheels` is skipped; `pypi` still publishes the sdist, the pure wheel
-  and the aliases.
+  on distributing it. Until then a release's license step fails, so `wheels`
+  fails and `pypi-wheels` is skipped; `pypi` still publishes the sdist, the
+  pure wheel and the aliases. PR and manual runs accept that one license in a
+  temporary copy of the config, so they still build and check the wheels.
 - **Two copies of `mstar_rust`.** `maturin develop` (or `pip install ./rust`)
   installs `rust/` as a separate `mstar-rust` distribution, a `mstar_rust/`
   package directory. In an environment that also has a Rust wheel's top-level

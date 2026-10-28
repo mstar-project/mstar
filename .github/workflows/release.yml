@@ -51,15 +51,20 @@ jobs:
           tool: cargo-about@0.9.2
       # The licenses of the crates and vendored C/C++ compiled into the wheel,
       # shipped in its dist-info/licenses (setuptools' default LICEN[CS]E*
-      # glob). Fails on any license rust/about.toml does not accept, which
-      # stops only a release: PR and manual runs go on to build and check the
-      # wheels (without the file) while libzmq's license awaits sign-off.
+      # glob). Fails on any license rust/about.toml does not accept. Until a
+      # maintainer signs off on libzmq's LGPL-3.0-or-later that includes
+      # libzmq, so PR and manual runs, which publish nothing, accept that one
+      # license in a copy of the config and stay strict about every other.
       - name: Collect third-party licenses
-        continue-on-error: ${{ github.event_name != 'release' }}
         run: |
-          cargo about generate --locked -c rust/about.toml -m rust/Cargo.toml \
+          config=rust/about.toml
+          if [ "$GITHUB_EVENT_NAME" != release ]; then
+            config="$RUNNER_TEMP/about.toml"
+            sed '/^accepted = \[$/a "LGPL-3.0-or-later",' rust/about.toml > "$config"
+          fi
+          cargo about generate --locked -c "$config" -m rust/Cargo.toml \
             rust/about.hbs -o LICENSES-THIRD-PARTY-mstar_rust.txt
-          cargo about generate --locked -c rust/about.toml -m rust/server/Cargo.toml \
+          cargo about generate --locked -c "$config" -m rust/server/Cargo.toml \
             rust/about.hbs -o LICENSES-THIRD-PARTY-mstar-server.txt
       - uses: pypa/cibuildwheel@v4.2.1
         env:
@@ -82,8 +87,8 @@ jobs:
       # extension imports at the version mstar expects, the frontend binary
       # runs from the scripts directory find_server_binary looks in without
       # any libpython (setup-python puts its libdir on LD_LIBRARY_PATH, which
-      # would hide a link to one), and the licenses, where the step above
-      # wrote them, are in the metadata.
+      # would hide a link to one), and both license notices are in the
+      # metadata.
       - name: Check each wheel in a clean venv
         shell: python
         run: |
@@ -95,7 +100,7 @@ jobs:
           assert mstar_rust.__version__ == sys.argv[1], mstar_rust.__version__
           shipped = {f.name for f in md.files('mstar-ai')}
           for licenses in ('LICENSES-THIRD-PARTY-mstar_rust.txt', 'LICENSES-THIRD-PARTY-mstar-server.txt'):
-              assert not os.path.exists(licenses) or licenses in shipped, licenses
+              assert licenses in shipped, licenses
           server = pathlib.Path(sysconfig.get_path('scripts')) / 'mstar-server'
           needed = subprocess.run(['readelf', '-d', server], capture_output=True, text=True, check=True).stdout
           assert 'libpython' not in needed, needed
