@@ -382,6 +382,10 @@ class Gr00tN17Model(Model):
         eval-mode claim, and `qwen3_5`, `whisper` and `orpheus` all make it
         explicit at load rather than leaving it to the caller.
         """
+        # no node shards its weights or heads: under a TP group every rank would
+        # build and run the whole model
+        if tp_group is not None and tp_group.world_size > 1:
+            raise ValueError("gr00t_n17 does not support tensor parallelism")
         cached = self._submodules.get(node_name)
         if cached is not None:
             return cached
