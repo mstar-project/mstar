@@ -52,6 +52,26 @@ if "triton" not in sys.modules:
     sys.modules["triton.language"] = triton.language
 
 
+# --- torch flag proxies ------------------------------------------------------
+
+@pytest.fixture
+def torch_flag():
+    """``monkeypatch.setattr`` for torch's flags (``torch._inductor.config``,
+    ``torch.backends.*``), restored by assignment. Some of them are served through
+    ``__getattr__`` / ``__setattr__``, which monkeypatch restores by deleting the
+    attribute since pytest 9.2, removing the flag for every later test in the
+    process; one fixture for all of them means nobody has to know which."""
+    saved = []
+
+    def set_flag(obj, name, value):
+        saved.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    yield set_flag
+    for obj, name, value in reversed(saved):
+        setattr(obj, name, value)
+
+
 # --- platform cache ----------------------------------------------------------
 
 @pytest.fixture(autouse=True)

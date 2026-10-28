@@ -209,6 +209,20 @@ def test_a_request_past_the_context_is_refused(tmp_path, monkeypatch, context, m
     assert [body.status for body in failed] == [400], "a request past the model's context was served"
 
 
+def test_whisper_cuts_an_asked_length_to_the_context_its_prompt_leaves(tmp_path, monkeypatch):
+    """Whisper's long-form windows carry the transcript so far as a prompt, so a length
+    the client asked for is cut to the room that prompt leaves, never refused."""
+    from mstar.model.whisper.whisper_model import WhisperModel
+
+    class _Cuts(_Model):
+        LENGTH_KWARGS = WhisperModel.LENGTH_KWARGS
+
+    model = _Cuts(max_seq_len=PROMPT + 29)
+
+    new_request = _ingest(model, _preprocess(model, {"max_output_tokens": 40}), tmp_path, monkeypatch)
+
+    assert new_request.loop_caps["decode_loop"] == 29, "an asked length past the context was refused or kept"
+
 def test_a_span_counts_its_advance_not_its_slots_against_the_context():
     cfg = KVReqConfig(
         kv_layout={"main": StreamLayout(spans=(PrefixSpan(100, 40, "prefill"),), growth=(("decode_loop", 1),))},

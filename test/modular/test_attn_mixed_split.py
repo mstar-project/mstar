@@ -62,7 +62,8 @@ def _kw(device):
 
 
 @requires_gpu
-def test_mixed_split_attends_as_the_packed_prefill_does():
+@pytest.mark.parametrize("window_left", [-1, 7])
+def test_mixed_split_attends_as_the_packed_prefill_does(window_left):
     device = torch.device("cuda")
     plan, num_pages = _layout()
     torch.manual_seed(0)
@@ -77,7 +78,7 @@ def test_mixed_split_attends_as_the_packed_prefill_does():
         workspace_buffer=torch.empty(WS, dtype=torch.uint8, device=device), **_kw(device),
     )
     ref.plan(
-        causal=True, dtype=torch.bfloat16,
+        causal=True, dtype=torch.bfloat16, window_left=window_left,
         qo_indptr=plan["qo_indptr"][: n + 1].clone(),
         paged_kv_indptr=kvp[: n + 1].clone(),
         paged_kv_indices=plan["paged_kv_indices"][: int(kvp[n])].clone(),
@@ -91,7 +92,7 @@ def test_mixed_split_attends_as_the_packed_prefill_does():
         batch_size=BUCKET_BS, max_total_tokens=BUCKET_TOKENS,
         max_prefill_rows=MAX_PROMPTS, **_kw(device),
     )
-    mixed.plan(causal=True, dtype=torch.bfloat16, **plan)
+    mixed.plan(causal=True, dtype=torch.bfloat16, window_left=window_left, **plan)
     out = mixed.run(q, cache)
 
     err = (out[:real].float() - ref_out[:real].float()).abs().max().item()
@@ -100,7 +101,7 @@ def test_mixed_split_attends_as_the_packed_prefill_does():
     assert torch.equal(mixed._qo_indptr_buf.cpu(), plan["qo_indptr"])
 
     # a second plan of the same layout on the same buffers gives the same answer
-    mixed.plan(causal=True, dtype=torch.bfloat16, **plan)
+    mixed.plan(causal=True, dtype=torch.bfloat16, window_left=window_left, **plan)
     assert torch.equal(mixed.run(q, cache)[:real], out[:real])
 
 

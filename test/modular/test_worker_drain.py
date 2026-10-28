@@ -421,7 +421,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     )
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: ["n"],
-        add_request=lambda rid, cfgs: seen.setdefault("engine", rid),
+        add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
     )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, cfg: seen.setdefault("tensors", rid),
@@ -498,9 +498,9 @@ def test_preprocess_reads_done_idempotent():
 
 
 def test_preprocess_finished_reading_acks_immediately_when_drained():
-    """Happy path: delivery completed, so the ACK goes out without paying for a
-    drain check (and without gating on reads that cannot exist)."""
-    wt = _preprocess(inflight_reads=True)  # would block a gated ACK
+    """Happy path: delivery completed and no read is in flight, so the ACK
+    goes out at once, without a drain."""
+    wt = _preprocess(inflight_reads=False)
     wt._finish_reading("X", drained=True)
     assert len(_pw_reads_done(wt)) == 1
     assert "X" not in wt._draining_rids

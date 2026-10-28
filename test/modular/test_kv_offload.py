@@ -823,6 +823,8 @@ def test_a_copier_checks_each_pair_of_caches_once():
     each pair's pitches and strides."""
 
     class _Counting(page_copier._Memcpy2DCopier):
+        _max_pitch = 1 << 62
+
         def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
             return 0
 
@@ -851,6 +853,8 @@ def test_pages_adjacent_in_both_caches_go_as_one_copy():
     calls = []
 
     class _Recording(page_copier._Memcpy2DCopier):
+        _max_pitch = 1 << 62
+
         def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
             calls.append((dst, dpitch, src, spitch, width, height))
             return 0
@@ -932,6 +936,7 @@ def test_copier_falls_through_to_the_next_that_works(monkeypatch, caplog):
 
     class _Wrong(page_copier._Memcpy2DCopier):
         name = "wrong"
+        _max_pitch = 1 << 62
 
         def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
             return 0  # claims success, copies nothing

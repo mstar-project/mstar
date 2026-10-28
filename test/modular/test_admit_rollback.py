@@ -152,8 +152,14 @@ def _whisper():
     for mgr in (cross, selfkv):
         mgr.ingest_request("a", None)
     assert _drive(runner, _whisper_step(2 * PAGE, PAGE), _ctx("a")).ok
-    # a decode step needing more self-attention pages than exist
-    outcome = _drive(runner, _whisper_step(0, 5 * PAGE), _ctx("a"))
+    # "b" holds the other two self-attention pages, so a's next page fits the
+    # pool but not what is free: a retryable refusal, not a terminal one
+    selfkv.ingest_request("b", None)
+    b_step, b_ctx = _kv_step("b", 2 * PAGE), _ctx("b")
+    assert selfkv.admit(b_step, b_ctx).ok
+    selfkv.plan(b_step, b_ctx)
+    selfkv.commit(b_step, b_ctx)
+    outcome = _drive(runner, _whisper_step(0, PAGE), _ctx("a"))
     assert not outcome.ok and isinstance(outcome.reason, AllocationFailed)
     assert outcome.failed_resource == "kv_cache"
     return cross, selfkv

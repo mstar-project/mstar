@@ -1,4 +1,5 @@
-"""Whole-page copies between the device KV cache and the host page pool.
+"""Page copies between KV caches: the device cache and the host page pool, or
+two device caches (CUDA IPC KV transfer).
 
 Both caches are laid out ``[layers, pages, ...]``, so a page is one contiguous
 block per layer, a layer stride apart. ``copy_`` of that strided view between
@@ -45,6 +46,14 @@ class PageCopier:
     ) -> None:
         raise NotImplementedError
 
+    def copy_rows(
+        self, dst: torch.Tensor, src: torch.Tensor, stream: torch.cuda.Stream,
+    ) -> None:
+        """``dst.copy_(src)`` queued on ``stream``, for two views of the same
+        shape whose rows (``[i]``) are each contiguous: e.g. a page or a token
+        range of it, every layer."""
+        raise NotImplementedError
+
 
 class TorchCopier(PageCopier):
     """Per-page ``copy_``: works everywhere, but on CUDA blocks the host."""
@@ -55,6 +64,10 @@ class TorchCopier(PageCopier):
         with torch.cuda.stream(stream):
             for dst_idx, src_idx in zip(dst_pages, src_pages, strict=True):
                 dst[:, dst_idx].copy_(src[:, src_idx], non_blocking=True)
+
+    def copy_rows(self, dst, src, stream):
+        with torch.cuda.stream(stream):
+            dst.copy_(src, non_blocking=True)
 
 
 class _Layout(NamedTuple):
@@ -71,7 +84,12 @@ class _Layout(NamedTuple):
 
 
 class _Memcpy2DCopier(PageCopier):
-    """One ``cudaMemcpy2DAsync`` per run of adjacent pages; subclasses supply the call."""
+    """One ``cudaMemcpy2DAsync`` per run of adjacent pages; subclasses supply the call and the device's
+    maximum pitch."""
+
+    # Pitches above this are rejected by the runtime, e.g. a layer stride of a
+    # cache over 2 GiB a layer; such copies go one row at a time instead.
+    _max_pitch: int
 
     def __init__(self):
         # Each pair of caches is checked once, keyed by the two tensors' ids. The tensors are held weakly, so
@@ -81,6 +99,19 @@ class _Memcpy2DCopier(PageCopier):
 
     def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream) -> int:
         raise NotImplementedError
+
+    def _copy_2d(self, dst, dpitch, src, spitch, width, height, stream):
+        if max(dpitch, spitch) <= self._max_pitch:
+            err = self._memcpy_2d(dst, dpitch, src, spitch, width, height, stream)
+        else:
+            err = 0
+            for row in range(height):
+                err = err or self._memcpy_2d(
+                    dst + row * dpitch, width, src + row * spitch, width,
+                    width, 1, stream,
+                )
+        if err != 0:
+            raise RuntimeError(f"cudaMemcpy2DAsync failed with error {err}")
 
     def _check(self, dst: torch.Tensor, src: torch.Tensor) -> _Layout:
         assert dst[0, 0].is_contiguous() and src[0, 0].is_contiguous()
@@ -109,13 +140,21 @@ class _Memcpy2DCopier(PageCopier):
                 runs.append([dst_idx, src_idx, 1])
         handle = stream.cuda_stream
         for dst_idx, src_idx, pages in runs:
-            err = self._memcpy_2d(
+            self._copy_2d(
                 dst_ptr + dst_idx * dst_page, dst_pitch,
                 src_ptr + src_idx * src_page, src_pitch,
                 pages * width, height, handle,
             )
-            if err != 0:
-                raise RuntimeError(f"cudaMemcpy2DAsync failed with error {err}")
+
+    def copy_rows(self, dst, src, stream):
+        assert dst.shape == src.shape and dst.dtype == src.dtype
+        assert dst[0].is_contiguous() and src[0].is_contiguous()
+        elt = dst.element_size()
+        self._copy_2d(
+            dst.data_ptr(), dst.stride(0) * elt,
+            src.data_ptr(), src.stride(0) * elt,
+            dst[0].numel() * elt, dst.shape[0], stream.cuda_stream,
+        )
 
 
 class CudaBindingsCopier(_Memcpy2DCopier):
@@ -129,6 +168,11 @@ class CudaBindingsCopier(_Memcpy2DCopier):
         super().__init__()
         self._runtime = runtime
         self._default = runtime.cudaMemcpyKind.cudaMemcpyDefault
+        err, self._max_pitch = runtime.cudaDeviceGetAttribute(
+            runtime.cudaDeviceAttr.cudaDevAttrMaxPitch, torch.cuda.current_device()
+        )
+        if int(err) != 0:
+            raise RuntimeError(f"cudaDeviceGetAttribute failed with error {int(err)}")
 
     def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
         (err,) = self._runtime.cudaMemcpy2DAsync(
@@ -142,7 +186,8 @@ class _MappedRuntimeCopier(_Memcpy2DCopier):
     mapping rather than by name, so it is never some other toolkit's runtime that
     happens to be on the library path."""
 
-    _lib = _symbol = ""
+    _lib = _symbol = _attr_symbol = ""
+    _max_pitch_attr = 0
     _dll = ctypes.CDLL
 
     def __init__(self):
@@ -154,7 +199,15 @@ class _MappedRuntimeCopier(_Memcpy2DCopier):
             }
         if len(paths) != 1:
             raise OSError(f"expected one {self._lib} mapped by torch, found {sorted(paths)}")
-        fn = getattr(self._dll(paths.pop()), self._symbol)
+        lib = self._dll(paths.pop())
+        max_pitch = ctypes.c_int()
+        err = getattr(lib, self._attr_symbol)(
+            ctypes.byref(max_pitch), self._max_pitch_attr, torch.cuda.current_device()
+        )
+        if err != 0:
+            raise RuntimeError(f"{self._attr_symbol} failed with error {err}")
+        self._max_pitch = max_pitch.value
+        fn = getattr(lib, self._symbol)
         fn.restype = ctypes.c_int
         fn.argtypes = [
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t,
@@ -175,6 +228,7 @@ class CudartCopier(_MappedRuntimeCopier):
 
     name = "libcudart"
     _lib, _symbol = "libcudart", "cudaMemcpy2DAsync"
+    _attr_symbol, _max_pitch_attr = "cudaDeviceGetAttribute", 11  # cudaDevAttrMaxPitch
     _dll = ctypes.PyDLL
 
 
@@ -183,6 +237,7 @@ class HipCopier(_MappedRuntimeCopier):
 
     name = "libamdhip64"
     _lib, _symbol = "libamdhip64", "hipMemcpy2DAsync"
+    _attr_symbol, _max_pitch_attr = "hipDeviceGetAttribute", 58  # hipDeviceAttributeMaxPitch
 
 
 def _round_trips(copier: PageCopier) -> bool:
