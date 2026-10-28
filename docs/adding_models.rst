@@ -316,7 +316,7 @@ returns each request's layout from ``process_prompt``.
 ``KVReqConfig`` can name on any node and walk, ``main`` when it names none. A layout may be
 empty where an opened label is never written. It may also name labels the request opens
 only on another deployment, as an unguided BAGEL generation does for a CFG-parallel one.
-A layout has five fields:
+A layout has six fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A
   :class:`mstar.model.base.Span` has a ``kind``: ``"ids"`` for token ids from the tensor
@@ -330,11 +330,18 @@ A layout has five fields:
 - ``retention``: the ``RetentionPolicy`` the label's committing steps declare.
 - ``keyed_spans``: how many leading spans the label's keys cover, by default every span
   before the first ``rows`` span.
+- ``lookahead``: the most slots a committing step writes past the tokens the request keeps,
+  before a trim takes them back. A draft-verify step commits its whole block and its
+  rejected drafts are trimmed, so ``growth`` counts one slot per kept token and the
+  lookahead the rows written ahead of them. A layout can't have both a lookahead and a
+  ``retention``: retention releases at commit, before the trim.
 
-The footprint adds the spans, the growth at each loop's iterations and the scratch, and
-rounds up to whole pages per label. A span's own scratch counts only with the spans before
-it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
-takes the window's peak instead.
+The footprint adds the spans, the growth at each loop's iterations, the lookahead and the
+scratch, and rounds up to whole pages per label. A span's own scratch counts only with the
+spans before it, so a window's denoise steps and its commit count once. Under a
+``RetentionPolicy`` it takes the window's peak instead. The lookahead's rows have positions
+too, so the conductor holds the positions at the caps plus the lookahead to the pool's
+``max_seq_len``.
 
 ``prompt_spans(plan, texts, text_walk, item_spans)`` builds the common case: a prompt's
 text and attachments in ``prefill_plan`` order. Qwen3.5 lays out its one label with it:
