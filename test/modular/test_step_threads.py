@@ -80,7 +80,7 @@ def test_smt_siblings_come_after_every_first_thread():
 def test_a_taskset_off_the_gpu_node_falls_back_to_the_process_mask():
     allowed = parse_cpu_list("32-39")
     assert _cpus("auto", [NODE0], allowed) == [32]
-    assert "process affinity" in choose_step_core("auto", 0, [NODE0], allowed).source
+    assert "process affinity" in choose_step_core("auto", 0, [NODE0], allowed, host_cpus=HOST_CPUS).source
     # no local list at all (no sysfs entry, a CPU device, macOS)
     assert _cpus("auto", [None, None], allowed) == [32, 33]
 
