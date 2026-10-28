@@ -365,16 +365,21 @@ def test_a_hit_page_taken_while_another_page_turns_evictable_lets_the_head_in():
     assert _ready(kv, "a"), "the head waits for room it no longer needs"
 
 
+def _recurrent(max_slots: int, labels: tuple[str, ...] = ("main",)) -> RecurrentStatePool:
+    return RecurrentStatePool.build(
+        RecurrentStateSpec(resource_key="state", nodes={NODE}, config=RecurrentStateConfig(
+            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
+            max_slots=max_slots, labels=labels,
+        )),
+        EngineResourceInfo(device=torch.device("cpu")),
+    )
+
+
 def test_a_request_with_no_recurrent_slot_keeps_no_kv_pages():
     """Qwen3.5 runs a KV pool and a recurrent pool on one node. A request the KV admitted with no slot
     free would fail its first step, and its allotment would keep room from the requests running."""
     kv = _manager(max_num_pages=9)
-    state = RecurrentStatePool.build(
-        RecurrentStateSpec(resource_key="state", nodes={NODE}, config=RecurrentStateConfig(
-            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)}, max_slots=2,
-        )),
-        EngineResourceInfo(device=torch.device("cpu")),
-    )
+    state = _recurrent(max_slots=2)
     runner = StepRunner({"kv": kv, "state": state}, node_resources={NODE: ["kv", "state"]})
     for rid in ("r0", "r1"):
         _laid_out(kv, rid, list(range(16)))
@@ -384,6 +389,32 @@ def test_a_request_with_no_recurrent_slot_keeps_no_kv_pages():
 
     assert runner.admit_retrieve("r1", NODE, WALK).queued
     assert "r1" not in kv._allotments, "a request with no slot kept the KV pages it was allotted"
+
+
+def test_a_request_that_forks_its_recurrent_state_is_admitted_with_a_slot_for_each_label():
+    """Two forking requests admitted on one slot each would each find the other's slot kept for it at the
+    fork, refuse, and retry forever."""
+    state = _recurrent(max_slots=3, labels=("main", "fork"))
+    runner = StepRunner({"state": state}, node_resources={NODE: ["state"]})
+    for rid in ("r0", "r1"):
+        state.ingest_request(rid)
+    assert runner.admit_retrieve("r0", NODE, WALK).ready
+
+    assert runner.admit_retrieve("r1", NODE, WALK).queued, "admitted with only one of its slots free"
+    fork = RecurrentStep(segments=(Segment("r0", "main", 4),), pre_forks=(("main", "fork"),))
+    assert state.admit(fork, _ctx("r0")).ok
+    runner.remove_request("r0")
+    assert runner.admit_waiting(lambda rid, node: None) == [(NODE, "r1")]
+
+
+def test_a_step_that_opens_an_undeclared_recurrent_label_fails_its_request():
+    state = _recurrent(max_slots=3)
+    state.ingest_request("r")
+    fork = RecurrentStep(segments=(Segment("r", "main", 4),), pre_forks=(("main", "fork"),))
+
+    outcome = state.admit(fork, _ctx("r"))
+
+    assert not outcome.ok and outcome.reason.terminal, "a slot admission never counted was taken or retried"
 
 
 def test_a_later_grant_cannot_take_the_heads_cached_hits():
