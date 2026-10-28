@@ -633,6 +633,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         end: int,
     ) -> ARNodeInputs:
         tensors = inputs.tensor_inputs
+        # a key not cut here would be dropped from the chunk
+        unknown = tensors.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance"}
+        if unknown:
+            raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
         cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
         cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
         if graph_walk == "prefill_vision":
