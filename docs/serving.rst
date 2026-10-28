@@ -456,12 +456,13 @@ weight loaders then shard parameters automatically, with no model-code changes. 
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
 
-Several TP (or SP) nodes can share a GPU when they share one instance: the same ``ranks``,
-in the same order, with the same ``tp_size`` and ``sp_size``. A vision encoder sharded beside
-its LLM, for example, goes in the LLM's entry as ``node_names: [vision_encoder, LLM]``.
-The ranks then run both nodes' steps in one order. The conductor refuses lockstep nodes on
-one worker that sit in different instances, or that share a KV resource with
-``cpu_offload_pages`` set: give each its own.
+Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and
+SP groups; each must be TP- (or SP-) enabled by the model. Qwen3-Omni's ``Thinker`` and
+``Talker``, for example, can share one entry, ``{node_names: [Thinker, Talker], ranks: [0, 1],
+tp_size: 2}``, and the ranks then run both nodes' steps in one order. The conductor refuses
+lockstep nodes on one worker in different TP or SP groups, and two lockstep nodes on one
+worker that share a KV resource: rank 0 replicates its page moves per node, with that node's
+next step, and journaling a shared pool across lockstep nodes is mstar PR #873's work.
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank

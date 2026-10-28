@@ -333,10 +333,12 @@ def _worker_parallelism(
 ) -> Iterator[str]:
     """What each worker would check of its own ``WorkerParallelGroups``, on the
     same groups the conductor hands it: every lockstep-parallel node on a
-    worker in the same TP and SP groups (one lockstep instance), and every resource spec's nodes on one
-    TP x SP shape and, on each worker, in one parallel group. Over every node
-    placed on the worker; the engine checked only nodes it built a submodule
-    for, so a dummy run (no weights) skipped the resource checks."""
+    worker in the same TP and SP groups (one lockstep instance), every
+    resource spec's nodes on one TP x SP shape and, on each worker, in one
+    parallel group, and no KV resource under two lockstep nodes of a worker.
+    Over every node placed on the worker; the engine checked only nodes it
+    built a submodule for, so a dummy run (no weights) skipped the resource
+    checks."""
     ranks = sorted({rank for wg in worker_graphs for rank in wg.ranks})
     if not ranks:
         return
@@ -391,7 +393,6 @@ def _worker_parallelism(
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
                 "must use the same TP x SP shape across replicas"
             )
-        evictable = isinstance(spec, KVSpec) and getattr(spec.config, "cpu_offload_pages", 0) > 0
         for wid, nodes in deployed.items():
             local = spec.nodes & nodes
             if local and not per_worker[wid].all_in_same_group(sorted(local)):
@@ -399,19 +400,18 @@ def _worker_parallelism(
                     f"Resource spec {spec.resource_key} local nodes {sorted(local)} "
                     f"on {wid} must all be in the same parallel (tp x sp) group"
                 )
-            # Rank 0 journals an eviction with the next step of the node that
-            # made it (#873 reworks the journal), so a follower can admit
-            # another node's step on the same pool before the move lands.
+            # Rank 0's resident journal is per node, so a page move reaches a
+            # follower only with the next step of the node that made it.
             lockstep = sorted(
                 node for node in local
                 if per_worker[wid].get_instance_world_size_for_node(node) > 1
             )
-            if evictable and len(lockstep) > 1:
+            if isinstance(spec, KVSpec) and len(lockstep) > 1:
                 yield (
-                    f"Resource spec {spec.resource_key} offloads to the host (cpu_offload_pages "
-                    f"{spec.config.cpu_offload_pages}) and is shared by lockstep-parallel nodes "
-                    f"{lockstep} on {wid}. Rank 0 replicates an eviction with the next step of "
-                    "the node that made it, so another node's step could admit on a follower "
-                    "before the eviction lands there. Give each node its own KV spec, or set "
-                    "cpu_offload_pages to 0 (the instance-wide journal is #873's)."
+                    f"KV resource {spec.resource_key} is shared by lockstep-parallel nodes "
+                    f"{lockstep} on {wid}. Rank 0 replicates its page moves (evictions, "
+                    "reloads) to the other ranks per node, with that node's next step, so two "
+                    "lockstep nodes on one pool could admit out of step on a follower. "
+                    "Journaling a shared pool across lockstep nodes is mstar PR #873's work, and "
+                    "until then this layout is refused: place these nodes on different workers."
                 )

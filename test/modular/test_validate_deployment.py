@@ -26,6 +26,7 @@ from test_startup_graph_validation import (
 from mstar.conductor.conductor import Conductor
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.resources.base import Resource
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -350,6 +351,12 @@ def test_worker_graph_and_sharding_group_tp_mismatch_is_refused():
 _TP2 = {"ranks": [0, 1], "tp_size": 2}
 
 
+def _kv(key, nodes):
+    return KVSpec(resource_key=key, nodes=set(nodes), config=PagedKVConfig(
+        num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64,
+    ))
+
+
 @pytest.mark.parametrize("groups", [
     [{"node_names": ["a", "b"], **_TP2}],
     [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **_TP2}],
@@ -358,32 +365,29 @@ _TP2 = {"ranks": [0, 1], "tp_size": 2}
      {"node_names": ["b"], "ranks": [0, 1, 2, 3], "tp_size": 2}],
 ], ids=["one_group", "two_groups", "replicas"])
 def test_lockstep_nodes_sharing_one_instance_are_accepted(groups, tmp_path, monkeypatch):
-    """One leader and one step stream, so the nodes may share a resource too."""
-    model = _Model(_a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a", "b"])
+    """One leader and one step stream. Each node has a KV pool of its own."""
+    model = _Model(
+        _a_then_b, specs=[_kv("kv_a", ["a"]), _kv("kv_b", ["b"])],
+        kv_labels={"kv_a": {"main": KVLabel()}, "kv_b": {"main": KVLabel()}}, tp_enabled_nodes=["a", "b"],
+    )
     _start_conductor(model, _cfg(tmp_path, groups), tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("offload", [0, 4])
-def test_lockstep_nodes_sharing_an_evictable_kv_are_refused(offload, tmp_path, monkeypatch):
-    """Rank 0's evictions reach the followers with the next step of the node
-    that made them, so two lockstep nodes over one evictable pool could admit
-    out of step. Without host offload nothing is evicted."""
-    from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-
+def test_lockstep_nodes_sharing_a_kv_resource_are_refused(offload, tmp_path):
+    """Rank 0's page moves reach the followers with the next step of the node
+    that made them, so two lockstep nodes over one pool could admit out of
+    step, with or without host offload."""
     model = _Model(
-        _a_then_b, specs=[KVSpec("kv", {"a", "b"}, PagedKVConfig(max_seq_len=64))],
-        tp_enabled_nodes=["a", "b"],
+        _a_then_b, specs=[_kv("kv", ["a", "b"])], kv_labels={"kv": {"main": KVLabel()}}, tp_enabled_nodes=["a", "b"],
     )
     cfg = _cfg(tmp_path, [{"node_names": ["a", "b"], **_TP2}], resources={"kv": {"cpu_offload_pages": offload}})
-    if not offload:
-        _start_conductor(model, cfg, tmp_path, monkeypatch)
-        return
-    assert [p for p in _problems(model, cfg) if "offloads to the host" in p] == [
-        f"Resource spec kv offloads to the host (cpu_offload_pages 4) and is shared by "
-        f"lockstep-parallel nodes ['a', 'b'] on worker_{rank}. Rank 0 replicates an eviction "
-        "with the next step of the node that made it, so another node's step could admit on "
-        "a follower before the eviction lands there. Give each node its own KV spec, or set "
-        "cpu_offload_pages to 0 (the instance-wide journal is #873's)."
+    assert _problems(model, cfg) == [
+        f"KV resource kv is shared by lockstep-parallel nodes ['a', 'b'] on worker_{rank}. Rank 0 "
+        "replicates its page moves (evictions, reloads) to the other ranks per node, with that "
+        "node's next step, so two lockstep nodes on one pool could admit out of step on a "
+        "follower. Journaling a shared pool across lockstep nodes is mstar PR #873's work, and "
+        "until then this layout is refused: place these nodes on different workers."
         for rank in (0, 1)
     ]
 
