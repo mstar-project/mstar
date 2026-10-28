@@ -510,10 +510,10 @@ class KVManager(AttentionResource):
                 )
             if tp_cache and needs_remote_transfer:
                 raise ValueError(
-                    f"KV {name}: prefix_cache_tp needs this pool's nodes on one TP group. With more "
-                    "than one (replicas, or walks placed on other ranks) the pool counts as shared, "
-                    "and a read from another group would take pages outside rank 0's order. Serve "
-                    "the nodes from one group or set prefix_cache_tp to false."
+                    f"KV {name}: prefix_cache_tp needs this pool's nodes and walks in one node "
+                    "group (its replicas each keep their own cache). With a node or walk in another "
+                    "group the pool is shared, and a read from that group would take pages outside "
+                    "rank 0's order. Serve them from one node group or set prefix_cache_tp to false."
                 )
         self.kv_cache = KVCache(
             cfg, device, dtype
