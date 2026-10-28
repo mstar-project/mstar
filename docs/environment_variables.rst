@@ -338,8 +338,9 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_SERVER_BIN``
      - unset
      - Path to the ``mstar-server`` binary. Fallback order:
-       ``--rust-frontend-bin``, this variable, ``$PATH``, then the in-repo
-       ``rust/server/target/release`` build.
+       ``--rust-frontend-bin``, this variable, the running environment's
+       scripts directory (where the Linux wheels install it), ``$PATH``, then
+       the in-repo ``rust/server/target/release`` build.
    * - ``MSTAR_API_KEY``
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read
@@ -647,3 +648,20 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``TORCHINDUCTOR_CACHE_DIR``
+     - ``$XDG_CACHE_HOME/mstar/torchinductor`` (``~/.cache/mstar/torchinductor`` when unset)
+     - torch's own variable; M* sets this default when importing
+       :mod:`mstar.engine` (``_default_compile_caches``), so compiled graphs and
+       autotune picks survive a restart that keeps the cache directory. An exported
+       value wins, and a home that can't be written keeps torch's
+       ``/tmp/torchinductor_<user>``. Point it at an empty directory to measure a cold
+       start (Triton's kernels follow it unless ``TRITON_CACHE_DIR`` is exported;
+       FlashInfer's JIT cache stays warm). See
+       :ref:`serving:Restarts and the compile cache`.
+   * - ``TRITON_CACHE_DIR``
+     - ``$TORCHINDUCTOR_CACHE_DIR/triton``
+     - Triton's own variable, defaulted by the same function once
+       ``TORCHINDUCTOR_CACHE_DIR`` is resolved (exported or M*'s default; left unset
+       when that falls back to torch's). An exported value wins. Holds Triton's compiled
+       kernels, Inductor's and those compiled outside it; without it, where a kernel
+       lands depends on whether Inductor compiled first.

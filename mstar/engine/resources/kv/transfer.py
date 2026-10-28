@@ -24,6 +24,7 @@ import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from mstar.engine.resources.kv.cache import KVCache, KVLayout
+from mstar.engine.resources.kv.page_copier import make_page_copier
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import (
@@ -216,6 +217,10 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         )
         self._device = kv_cache.device
         self._kv_cache = kv_cache
+        # Copies go on the copy engines, one 2D memcpy per page (K and V apart
+        # for a partial one), rather than one copy kernel per layer and page.
+        self._copier = make_page_copier()
+        self._copy_stream = torch.cuda.Stream(device=self._device)
 
         self._pending: list[Future] = []
         self._executor = ThreadPoolExecutor(
@@ -276,7 +281,6 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         read_info: list[KVReadInfo],
         event: torch.Event=None
     ):
-        event.synchronize()
         # The remote tensor is sliced with our layout, so it must match.
         assert remote_kv_info.layout == self._kv_cache.layout, (
             f"remote KV layout {remote_kv_info.layout} != "
@@ -318,22 +322,47 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
             event_sync_required,
         )
 
-        for info in read_info:
-            src = self._kv_cache.chunk_view(
-                layer_idx=info.layer_idx, page_idx=info.remote_page_idx,
-                token_start=info.token_start, token_end=info.token_end,
-                tensor=tensor
-            )
-            dst = self._kv_cache.chunk_view(
-                layer_idx=info.layer_idx, page_idx=info.local_page_idx,
-                token_start=info.token_start, token_end=info.token_end
-            )
-            dst.copy_(src)
+        stream = self._copy_stream
+        stream.wait_event(event)
+        cache = self._kv_cache
+        for (local, remote, start, end), layers in _layers_by_page(read_info).items():
+            for lo, hi in _contiguous_runs(layers):
+                dst = cache.layer_rows(lo, hi, local, start, end)
+                src = cache.layer_rows(lo, hi, remote, start, end, tensor=tensor)
+                for dst_rows, src_rows in zip(dst, src, strict=True):
+                    self._copier.copy_rows(dst_rows, src_rows, stream)
+        # The Future is the readiness gate: done means the pages are written,
+        # not just queued.
+        stream.record_event().synchronize()
 
     def shutdown(self):
         for fut in self._pending:
             fut.result()
         self._executor.shutdown(wait=True)
+
+
+def _layers_by_page(
+    read_info: list[KVReadInfo],
+) -> dict[tuple[int, int, int, int], list[int]]:
+    """(local page, remote page, token start, token end) -> its layers."""
+    out: dict[tuple[int, int, int, int], list[int]] = {}
+    for info in read_info:
+        out.setdefault(
+            (info.local_page_idx, info.remote_page_idx, info.token_start, info.token_end),
+            [],
+        ).append(info.layer_idx)
+    return out
+
+
+def _contiguous_runs(layers: list[int]) -> list[tuple[int, int]]:
+    """``[lo, hi)`` ranges covering ``layers`` (normally one: every layer)."""
+    runs: list[tuple[int, int]] = []
+    for layer in sorted(set(layers)):
+        if runs and runs[-1][1] == layer:
+            runs[-1] = (runs[-1][0], layer + 1)
+        else:
+            runs.append((layer, layer + 1))
+    return runs
 
 
 class LocalOnlyKVTransferEngine(KVTransferEngine):
