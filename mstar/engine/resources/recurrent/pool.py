@@ -23,6 +23,7 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
+    ASKS,
     AdmitOutcome,
     AllocationFailed,
     Segment,
@@ -74,9 +75,10 @@ class RecurrentStatePool(Resource):
         config = spec.config
         if info.joint_comm_group is not None:
             config.shard(info.joint_comm_group.world_size)
-        return cls(device=info.device, config=config)
+        world_size = 1 if info.joint_comm_group is None else info.joint_comm_group.world_size
+        return cls(device=info.device, config=config, world_size=world_size)
 
-    def __init__(self, device: torch.device, config: RecurrentStateConfig):
+    def __init__(self, device: torch.device, config: RecurrentStateConfig, world_size: int = 1):
         self._device = device
         self.config = config
 
@@ -101,10 +103,17 @@ class RecurrentStatePool(Resource):
             assert sink == SINK_SLOT, f"expected slot {SINK_SLOT} first, got {sink}"
         # guards `_slots`/`_free` across threads; see `KVManager._lock`
         self._lock = threading.RLock()
-        # (rid, label) -> slot the live admit took fresh, for `rollback_admit`.
-        # Per row like `KVManager._admit_reserved_pages`, and handle-keyed the
-        # same way, so a released request's entries are purged with it.
-        self._admit_taken: dict[tuple[str, str], int] = {}
+        # (rid, label) -> slot the live admit took fresh, and whether it took the
+        # request's reservation, for `rollback_admit`. Per row like
+        # `KVManager._admit_reserved_pages`, and handle-keyed the same way, so a
+        # released request's entries are purged with it.
+        self._admit_taken: dict[tuple[str, str], tuple[int, bool]] = {}
+        # Admission, as `KVManager` decides it: only at one rank, since a
+        # reservation held on rank 0 alone would make the ranks refuse different
+        # allocations. `_reserved` holds the requests admitted for a slot they
+        # haven't taken yet.
+        self._decides = world_size == 1
+        self._reserved: set[str] = set()
 
         self._cg_max_bs = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
@@ -160,6 +169,7 @@ class RecurrentStatePool(Resource):
         self.reset_request(rid, free=True)
         with self._lock:
             self._slots.pop(rid, None)
+            self._reserved.discard(rid)
 
     def reset_request(self, rid: str, free: bool = False):
         """Drop a request's slots. ``free`` hands them back to the pool.
@@ -192,13 +202,16 @@ class RecurrentStatePool(Resource):
             slot = labels.get(label)
             if slot is not None:
                 return slot
-            if not self._free:
+            reserved = rid in self._reserved
+            if len(self._free) - len(self._reserved) + reserved <= 0:
+                # every free slot is kept for a request already admitted
                 return None
+            self._reserved.discard(rid)
             # Slot ids must be unique across the batch: kernels assume it rather
             # than check, and a scatter with two rows on one slot is
             # nondeterministic. The free list guarantees it.
             slot = labels[label] = SlotState(index=self._free.pop())
-            self._admit_taken[(rid, label)] = slot.index
+            self._admit_taken[(rid, label)] = (slot.index, reserved)
             return slot
 
     def _forget_taken(self, is_mine) -> None:
@@ -207,6 +220,31 @@ class RecurrentStatePool(Resource):
         taken = self._admit_taken
         for key in [k for k in taken if is_mine(k[0])]:
             del taken[key]
+
+    # Admission: one slot for a request that holds none
+
+    def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        if not self._decides:
+            return None
+        with self._lock:
+            if self._slots.get(rid) or rid in self._reserved:
+                return None
+        return ASKS
+
+    def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        with self._lock:
+            room = len(self._free) - len(self._reserved)
+            if room <= 0:
+                return room
+            self._reserved.add(rid)
+            return None
+
+    def unreserve(self, rid: str) -> None:
+        with self._lock:
+            self._reserved.discard(rid)
+
+    def grew_since(self, mark: int) -> bool:
+        return len(self._free) - len(self._reserved) > mark
 
     # Step lifecycle
 
@@ -248,7 +286,7 @@ class RecurrentStatePool(Resource):
         with self._lock:
             taken = self._admit_taken
             for rid, label in [k for k in taken if ctx.is_real_row(k[0])]:
-                index = taken.pop((rid, label))
+                index, reserved = taken.pop((rid, label))
                 labels = self._slots.get(rid)
                 slot = labels.get(label) if labels else None
                 if slot is None or slot.index != index:
@@ -256,6 +294,8 @@ class RecurrentStatePool(Resource):
                 del labels[label]
                 self._zero_slot(index)
                 self._free.append(index)
+                if reserved:
+                    self._reserved.add(rid)
 
     def _out_of_slots(self, rid: str, label: str) -> AdmitOutcome:
         return AdmitOutcome(
