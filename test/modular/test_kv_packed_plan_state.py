@@ -2,7 +2,8 @@
 indptrs (`_packed_addressing`), matches unpacking the same indptrs with torch
 ops (the device path it replaced, kept here as the reference): staged into a
 captured state (`_stage_packed_plan_state`) and uploaded for an eager write
-(`_host_plan_state`)."""
+(`_host_plan_state`). A step that writes nothing leaves a slot's buffer zero
+and then issues no copy."""
 
 from __future__ import annotations
 
@@ -11,11 +12,19 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from mstar.engine.resources.kv.manager import KVManager, KVPlanState
+from mstar.engine.resources.kv.manager import KVManager, KVPlanState, _SlotBuffer
 from mstar.engine.resources.kv.plan import SINK_PAGE, PagedIndptrs
-from mstar.utils.h2d import H2DMirror, PinnedStager
+from mstar.utils.h2d import PinnedStager
 
 PAGE, CAPTURE = 16, 96
+
+
+def _kv():
+    kv = KVManager.__new__(KVManager)
+    kv.kv_cache = SimpleNamespace(page_size=PAGE)
+    kv._device = torch.device("cpu")
+    kv._plan_stager = PinnedStager(torch.long)
+    return kv
 
 
 def _indptrs(rng):
@@ -43,12 +52,16 @@ def _indptrs(rng):
     )
 
 
-def _state():
-    """A captured state of CAPTURE tokens, as ``KVManager._static_plan_state``
-    lays it out: pages then offsets in one buffer."""
-    both = torch.full((2 * CAPTURE,), 7, dtype=torch.long)
+def _state(capture=CAPTURE, slot_buffer=None):
+    """A captured state of ``capture`` tokens, as ``KVManager._static_plan_state``
+    lays it out: pages then offsets at the front of the slot's buffer (by
+    default a new one holding garbage, so not known zero)."""
+    if slot_buffer is None:
+        slot_buffer = _SlotBuffer(torch.full((2 * CAPTURE,), 7, dtype=torch.long))
+        slot_buffer.zero_prefix = 0
+    both = slot_buffer.buffer[:2 * capture]
     return KVPlanState(
-        token_to_page=both[:CAPTURE], token_to_cache=both[CAPTURE:], staging=both, mirror=H2DMirror(),
+        token_to_page=both[:capture], token_to_cache=both[capture:], staging=both, slot_buffer=slot_buffer,
     )
 
 
@@ -78,10 +91,7 @@ def _device_unpacked(kv, indptrs) -> KVPlanState:
 
 
 def test_host_addressing_matches_device_unpacking():
-    kv = KVManager.__new__(KVManager)
-    kv.kv_cache = SimpleNamespace(page_size=PAGE)
-    kv._device = torch.device("cpu")
-    kv._plan_stager = PinnedStager(torch.long)
+    kv = _kv()
     rng = np.random.default_rng(0)
     for _ in range(20):
         indptrs = _indptrs(rng)
@@ -96,10 +106,7 @@ def test_a_step_that_only_reads_stages_the_sink():
     """Every row zero-span (a decoder reading the encoder context it wrote
     earlier): nothing is written, and every slot the graph scatters goes to
     SINK_PAGE, overwriting what the buffer held."""
-    kv = KVManager.__new__(KVManager)
-    kv.kv_cache = SimpleNamespace(page_size=PAGE)
-    kv._device = torch.device("cpu")
-    kv._plan_stager = PinnedStager(torch.long)
+    kv = _kv()
     i32 = lambda v: torch.tensor(v, dtype=torch.int32)  # noqa: E731
     indptrs = PagedIndptrs(
         qo_indptr=i32([0, 0, 0, 0]), paged_kv_indptr=i32([0, 2, 3, 3]), paged_kv_indices=i32([5, 6, 9]),
@@ -135,10 +142,7 @@ def test_a_row_past_its_pages_is_refused():
 
 
 def test_an_eager_writes_host_addressing_matches_the_reference():
-    kv = KVManager.__new__(KVManager)
-    kv.kv_cache = SimpleNamespace(page_size=PAGE)
-    kv._device = torch.device("cpu")
-    kv._plan_stager = PinnedStager(torch.long)
+    kv = _kv()
     rng = np.random.default_rng(1)
     for _ in range(20):
         indptrs = _indptrs(rng)
@@ -148,3 +152,21 @@ def test_an_eager_writes_host_addressing_matches_the_reference():
         assert got.total_tokens == total
         assert torch.equal(got.token_to_page, pages)
         assert torch.equal(got.token_to_cache, offsets)
+
+
+def test_a_zeroed_buffer_takes_no_copy_for_a_step_that_writes_nothing():
+    """Once a zero-write step has zeroed a slot's buffer, another one at any
+    capture length up to it is not staged; a write makes the next one copy."""
+    kv = _kv()
+    slot = _state().slot_buffer
+    kv._stage_static(_state(CAPTURE, slot), (), (), 0)
+    assert slot.buffer.tolist() == [0] * (2 * CAPTURE)
+    # poke the buffer behind the stager's back: an untouched poke shows no copy ran
+    slot.buffer[0] = 99
+    kv._stage_static(_state(CAPTURE // 2, slot), (), (), 0)
+    assert slot.buffer[0].item() == 99
+    slot.buffer[0] = 0
+    kv._stage_static(_state(4, slot), [5, 6], [1, 2], 2)
+    assert slot.buffer[:8].tolist() == [5, 6, SINK_PAGE, SINK_PAGE, 1, 2, 0, 0]
+    kv._stage_static(_state(4, slot), (), (), 0)
+    assert slot.buffer[:8].tolist() == [0] * 8
