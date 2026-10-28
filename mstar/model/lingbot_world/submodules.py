@@ -324,16 +324,19 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         attention = self.attention()
 
         with torch.inference_mode():
+            # per chunk, and freed before the decode rather than kept with the request
+            conditioning = self.dit.chunk_conditioning(plucker, chunk * cs)
             steps = self.schedule.step_timesteps
             for i, t in enumerate(steps):
                 timestep = torch.stack([t]).to(device)
-                flow = self.dit(latent, timestep, context, y, plucker, kv, current_start, frame_seqlen, attention)
+                flow = self.dit(latent, timestep, context, y, conditioning, kv, current_start, attention)
                 x0 = flow_to_x0(flow, latent, t, self.schedule)
                 if i < len(steps) - 1:
                     noise = torch.randn(x0.shape, generator=generator, device=x0.device, dtype=x0.dtype)
                     latent = add_noise(x0, noise, steps[i + 1], self.schedule)
             commit_t = torch.stack([steps[-1] * 0.0]).to(device)
-            self.dit(x0, commit_t, context, y, plucker, kv, current_start, frame_seqlen, attention)
+            self.dit(x0, commit_t, context, y, conditioning, kv, current_start, attention)
+            del conditioning
             pixels = self._decode(x0, state, clip_start=chunk == 0)
 
         state.add("chunk", chunk + 1)

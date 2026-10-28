@@ -121,23 +121,27 @@ def rope_params(max_seq_len: int, dim: int, theta: float = 10000) -> torch.Tenso
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-def causal_rope_apply(
-    x: torch.Tensor, grid: tuple[int, int, int], freqs: torch.Tensor, start_frame: int,
-) -> torch.Tensor:
-    """3D RoPE in complex128 with the temporal axis offset to ``start_frame``
-    (the chunk's absolute latent frame); ``x`` ``[1, L, H, D]``."""
-    n, c = x.size(2), x.size(3) // 2
+def rope_table(freqs: torch.Tensor, grid: tuple[int, int, int], start_frame: int) -> torch.Tensor:
+    """The 3D RoPE rotations of a chunk's tokens, ``[f*h*w, 1, head_dim // 2]``
+    complex128, with the temporal axis offset to ``start_frame`` (the chunk's
+    absolute latent frame)."""
+    c = freqs.size(1)
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
     f, h, w = grid
-    seq_len = f * h * w
-    x_i = torch.view_as_complex(x[0, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
-    freqs_i = torch.cat([
+    return torch.cat([
         freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
         freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
         freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-    ], dim=-1).reshape(seq_len, 1, -1)
-    x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-    x_i = torch.cat([x_i, x[0, seq_len:]])
+    ], dim=-1).reshape(f * h * w, 1, -1)
+
+
+def causal_rope_apply(x: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """RoPE in complex128 on ``x`` ``[1, L, H, D]`` by a ``rope_table``."""
+    seq_len, n = table.size(0), x.size(2)
+    x_i = torch.view_as_complex(x[0, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+    x_i = torch.view_as_real(x_i * table).flatten(2)
+    if seq_len < x.size(1):
+        x_i = torch.cat([x_i, x[0, seq_len:]])
     return x_i.unsqueeze(0).type_as(x)
 
 
@@ -259,15 +263,15 @@ class CausalSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps)
 
     def forward(
-        self, x: torch.Tensor, grid: tuple[int, int, int], freqs: torch.Tensor,
-        start_frame: int, cache: RollingKVCache, layer: int, plan: _WritePlan, attend: Attend,
+        self, x: torch.Tensor, rope: torch.Tensor, cache: RollingKVCache, layer: int, plan: _WritePlan,
+        attend: Attend,
     ) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
-        roped_query = causal_rope_apply(q, grid, freqs, start_frame).type_as(v)
-        roped_key = causal_rope_apply(k, grid, freqs, start_frame).type_as(v)
+        roped_query = causal_rope_apply(q, rope).type_as(v)
+        roped_key = causal_rope_apply(k, rope).type_as(v)
         cache.write(layer, roped_key, v, plan)
         window = cache.window(plan)
         x = attend(roped_query, cache.k[layer][:, window], cache.v[layer][:, window])
@@ -314,8 +318,14 @@ class CausalBlock(nn.Module):
         self.cam_scale_layer = nn.Linear(dim, dim)
         self.cam_shift_layer = nn.Linear(dim, dim)
 
+    def cam_modulation(self, cam: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The block's camera (scale, shift): a function of the chunk's rays alone."""
+        cam_hidden = self.cam_injector_layer2(F.silu(self.cam_injector_layer1(cam)))
+        cam_hidden = cam_hidden + cam
+        return self.cam_scale_layer(cam_hidden), self.cam_shift_layer(cam_hidden)
+
     def forward(
-        self, x: torch.Tensor, e: torch.Tensor, cam: torch.Tensor, cross_k: torch.Tensor,
+        self, x: torch.Tensor, e: torch.Tensor, cam: tuple[torch.Tensor, torch.Tensor], cross_k: torch.Tensor,
         cross_v: torch.Tensor, attn_args: dict, text_attend: Attend,
     ) -> torch.Tensor:
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -324,9 +334,8 @@ class CausalBlock(nn.Module):
         with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
-        cam_hidden = self.cam_injector_layer2(F.silu(self.cam_injector_layer1(cam)))
-        cam_hidden = cam_hidden + cam
-        x = (1.0 + self.cam_scale_layer(cam_hidden)) * x + self.cam_shift_layer(cam_hidden)
+        cam_scale, cam_shift = cam
+        x = (1.0 + cam_scale) * x + cam_shift
 
         x = x + self.cross_attn(self.norm3(x), cross_k, cross_v, text_attend)
         y = self.ffn(self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
@@ -346,6 +355,15 @@ class CausalHead(nn.Module):
         with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
             return self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2))
+
+
+class ChunkConditioning(NamedTuple):
+    """What a chunk's forwards (its denoise steps and the commit) share: each
+    block's camera (scale, shift) from the chunk's Plucker rays, and the RoPE
+    table at the chunk's latent frames."""
+
+    cam: list[tuple[torch.Tensor, torch.Tensor]]
+    rope: torch.Tensor
 
 
 class LingBotCausalDiT(nn.Module):
@@ -389,36 +407,61 @@ class LingBotCausalDiT(nn.Module):
             sink_tokens=cfg.sink_size * frame_seqlen, windowed=windowed, device=device,
         )
 
+    def chunk_conditioning(self, plucker: torch.Tensor, start_frame: int) -> ChunkConditioning:
+        """``ChunkConditioning`` for a chunk's Plucker rays ``[1, 384, f, h, w]``
+        bf16 starting at latent frame ``start_frame``. Its forwards see the same
+        rays and frames, so this runs once per chunk (four GEMMs a block)."""
+        cfg = self.config
+        f, h, w = (n // p for n, p in zip(plucker.shape[2:], cfg.patch_size, strict=True))
+        freqs = self.freqs(plucker.device)
+        if start_frame + f > freqs.shape[0]:
+            raise ValueError(f"latent frame {start_frame + f} is past the RoPE table ({freqs.shape[0]} frames)")
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
+            cam = rearrange(
+                plucker, "1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)",
+                c1=cfg.patch_size[0], c2=cfg.patch_size[1], c3=cfg.patch_size[2],
+            ).contiguous()
+            cam = self.patch_embedding_wancamctrl(cam)
+            cam = cam + self.c2ws_hidden_states_layer2(F.silu(self.c2ws_hidden_states_layer1(cam)))
+            return ChunkConditioning(
+                cam=[block.cam_modulation(cam) for block in self.blocks],
+                rope=rope_table(freqs, (f, h, w), start_frame),
+            )
+
     def forward(
         self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor, y: torch.Tensor,
-        plucker: torch.Tensor, cache: RollingKVCache, current_start: int, frame_seqlen: int,
+        chunk: ChunkConditioning, cache: RollingKVCache, current_start: int,
         attention: DitAttention = REFERENCE_ATTENTION,
     ) -> torch.Tensor:
         """One chunk: ``x`` ``[16, f, h, w]`` fp32 noisy latents, ``t`` ``[1]``
         timestep, ``context`` ``[L, 4096]`` text embeds, ``y`` ``[20, f, h, w]``
-        mask + image latent, ``plucker`` ``[1, 384, f, h, w]`` bf16. Writes the
+        mask + image latent, ``chunk`` its ``chunk_conditioning``. Writes the
         chunk's K/V at absolute token ``current_start``; returns the fp32 flow
         prediction ``[16, f, h, w]``."""
         with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
-            return self._forward(x, t, context, y, plucker, cache, current_start, frame_seqlen, attention)
+            return self._forward(x, t, context, y, chunk, cache, current_start, attention)
 
-    def _forward(self, x, t, context, y, plucker, cache, current_start, frame_seqlen, attention):
+    def _forward(self, x, t, context, y, chunk, cache, current_start, attention):
         cfg = self.config
-        device = self.patch_embedding.weight.device
-        freqs = self.freqs(device)
 
         x = self.patch_embedding(torch.cat([x, y], dim=0).unsqueeze(0))
         grid = tuple(x.shape[2:])
         x = x.flatten(2).transpose(1, 2)
         seq_len = x.size(1)
 
-        if t.dim() == 1:
+        per_token = t.dim() > 1
+        if not per_token:
             t = t.expand(t.size(0), seq_len)
         with torch.amp.autocast("cuda", dtype=torch.float32):
             bt = t.size(0)
             e = self.time_embedding(
                 sinusoidal_embedding_1d(cfg.freq_dim, t.flatten()).unflatten(0, (bt, seq_len)).float())
             e0 = self.time_projection(e).unflatten(2, (6, cfg.dim))
+        if not per_token:
+            # Every token's row is the same bits (embedded per token, as the
+            # reference does), so one row broadcasts in the blocks instead of
+            # each block adding and scaling [L, 6, dim] fp32 tensors.
+            e, e0 = e[:, :1], e0[:, :1]
 
         if not cache.cross_k:
             padded = torch.cat([context, context.new_zeros(cfg.text_len - context.size(0), context.size(1))])
@@ -428,22 +471,10 @@ class LingBotCausalDiT(nn.Module):
                 cache.cross_k.append(k)
                 cache.cross_v.append(v)
 
-        cam = rearrange(
-            plucker, "1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)",
-            c1=cfg.patch_size[0], c2=cfg.patch_size[1], c3=cfg.patch_size[2],
-        ).contiguous()
-        cam = self.patch_embedding_wancamctrl(cam)
-        cam = cam + self.c2ws_hidden_states_layer2(F.silu(self.c2ws_hidden_states_layer1(cam)))
-
         plan = cache.plan(current_start, seq_len)
-        start_frame = current_start // frame_seqlen
-        if start_frame + grid[0] > freqs.shape[0]:
-            raise ValueError(
-                f"latent frame {start_frame + grid[0]} is past the RoPE table ({freqs.shape[0]} frames)")
         for i, block in enumerate(self.blocks):
-            attn_args = dict(grid=grid, freqs=freqs, start_frame=start_frame, cache=cache, layer=i, plan=plan,
-                             attend=attention.window)
-            x = block(x, e0, cam, cache.cross_k[i], cache.cross_v[i], attn_args, attention.text)
+            attn_args = dict(rope=chunk.rope, cache=cache, layer=i, plan=plan, attend=attention.window)
+            x = block(x, e0, chunk.cam[i], cache.cross_k[i], cache.cross_v[i], attn_args, attention.text)
         cache.global_end = plan.current_end
         cache.local_end = plan.local_end
 
