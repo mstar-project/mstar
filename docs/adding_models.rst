@@ -1887,6 +1887,21 @@ To support it in a model:
 The shared-expert block (``ParallelSparseMoeBlockWithSharedExpert``) has no EP variant, so
 a node built from it stays TP-only.
 
+Tuned kernel configs
+~~~~~~~~~~~~~~~~~~~~
+
+Launch configs that depend on the GPU and the shapes, such as the fused MoE's tiles, are data,
+not code. Each kernel op (``mstar/kernels``) names the dimensions its configs are keyed by, and
+its tuned configs live in one JSON table per GPU under ``mstar/kernels/tables/<op>/``. A model
+on a shared component gets them without code of its own: the component looks its shape up once
+per process and keeps the default config where no table has it, and the server logs the sweep
+command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048,top_k=8 ...``).
+
+``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
+each against the default config's output, and writes the winners with where they were measured.
+``--out DIR`` with ``MSTAR_KERNEL_TABLES=DIR`` serves a sweep before it is committed;
+``benchmark/kernels/README.md`` has the workflow and how to add an op.
+
 Worked example: Orpheus
 -----------------------
 
