@@ -72,9 +72,12 @@ Python transport and graph runtime.
   deletes the other's: `pip uninstall mstar-rust` goes back to the wheel's
   copy.
 - **Checks.** Each wheel is installed without dependencies into a clean venv
-  outside the build container and must import `mstar_rust`, run
-  `mstar-server --help` and list the license file. A failure there keeps the
-  Rust wheels off PyPI.
+  outside the build container and must import `mstar_rust` at the version
+  `EXPECTED_MSTAR_RUST_VERSION` names, list both license notices, and have an
+  `mstar-server` that links no libpython and runs `--help` without
+  `LD_LIBRARY_PATH`. Then each is installed with its dependencies (CPU torch)
+  and runs `test/rust` from a copy of `test/`, so `mstar` imports from the
+  wheel. A failure in either keeps the Rust wheels off PyPI.
 
 ## Cutting a release
 
