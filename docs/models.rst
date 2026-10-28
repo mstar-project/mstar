@@ -70,7 +70,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        msgpack, one entry per joint group, each with its ``dtype``, ``shape`` and
        raw ``data``. Request knobs: ``embodiment_tag`` (the checkpoint's own
        spelling, matched case-insensitively — eight are shipped, and the error
-       lists them), ``state`` as ``{joint_group: float32 (1, T, D)}`` with the
+       lists them), ``state`` as ``{joint_group: float32 (1, 1, D)}`` (one
+       request, one timestep: the checkpoint's ``state_history_length``) with the
        embodiment's own joint-group names, and ``walk``, which selects one of the
        two reuse walks (``backbone`` or ``state``) instead of running the full
        path. **Camera frames are attached as images, not passed in
@@ -82,8 +83,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        JPEG moves them 167x further than PNG while passing every other check. The
        backbone's config **and its tokenizer and image
        processor** come from the **gated** ``nvidia/Cosmos-Reason2-2B``; accept its
-       terms on the Hub first. Needs the ``gr00t_n17`` extra for OpenCV, whose
-       ``INTER_AREA`` resize the reference's image transform uses.
+       terms on the Hub first. Needs the ``gr00t_n17`` extra: OpenCV for the
+       ``INTER_AREA`` resize the reference's image transform uses, ``diffusers``
+       for the action head's feed-forward, and the Hugging Face loaders.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
