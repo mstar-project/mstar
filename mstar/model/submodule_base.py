@@ -575,13 +575,6 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # steps keep the process setting, so a new eager shape never searches.
     capture_cudnn_benchmark: bool = False
 
-    # Whether this node's SP ranks split the attention heads, as Ulysses
-    # sequence parallelism does; its TP ranks always do. The engine sizes
-    # every resource it builds for the node (KV, attention, recurrent state)
-    # for one rank's slice. False keeps every head across the SP ranks, for a
-    # node that puts other work there, e.g. one guidance branch per rank.
-    splits_heads: bool = True
-
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs

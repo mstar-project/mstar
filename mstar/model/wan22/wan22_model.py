@@ -151,7 +151,7 @@ class Wan22Model(Model):
                     num_kv_heads=cfg.num_attention_heads,
                     head_dim=cfg.attention_head_dim,
                     # one segment per guidance branch
-                    max_segments_per_request=2,
+                    max_segments_per_request=Wan22DitSubmodule.CFG_BRANCHES,
                     # the DiT is compiled, not captured: keep attention in its graph
                     compile_op=True,
                     dtype=torch.bfloat16,
@@ -159,25 +159,13 @@ class Wan22Model(Model):
             ),
         ]
 
-    def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a dit lockstep instance (``sp_size``) of any size but 1 or 2:
-        the dit splits its two CFG branches over the instance and nothing else,
-        so more ranks would only recompute the same step."""
-        for group in config.get("node_groups") or []:
-            size = group.get("sp_size", 1)
-            if "dit" in group.get("node_names", []) and size not in (1, 2):
-                raise ValueError(
-                    f"Wan2.2 runs its dit on one rank or CFG-parallel on two (sp_size: 2); "
-                    f"got sp_size: {size!r} in {config_path}."
-                )
-
     def get_default_sharding_config(self) -> ShardingConfig:
-        # CFG-parallel, through the sp slot: the dit's lockstep group (sp_size) is
-        # used for guidance, each of two ranks running one CFG branch and
-        # all-gathering the two noise predictions (see Wan22DitSubmodule). Nothing
-        # splits the sequence, and signals stay replicated: no shard_dim entries.
+        # CFG-parallel: the dit's two guidance branches split over cfg_size
+        # ranks, which all-gather the noise predictions (see Wan22DitSubmodule).
+        # Signals stay replicated: no shard_dim entries.
         return ShardingConfig(
-            groups=[], tp_enabled_nodes=set(), shard_dim={}, sp_enabled_nodes={"dit"},
+            groups=[], tp_enabled_nodes=set(), shard_dim={},
+            cfg_enabled_nodes={"dit": Wan22DitSubmodule.CFG_BRANCHES},
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -731,19 +719,19 @@ class Wan22Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None, cfg_group=None,
     ) -> torch.nn.Module | None:
         # ``autocast_dtype`` exists for interface parity only: weights load in the
-        # checkpoint's own dtypes. ``sp_group`` reaches the dit only.
+        # checkpoint's own dtypes. ``cfg_group`` reaches the dit only.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, sp_group=sp_group)
+        submodule = self._create_submodule(node_name, device, cfg_group=cfg_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Wan2.2 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str = "cpu", sp_group=None) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device: str = "cpu", cfg_group=None) -> NodeSubmodule | None:
         """Construct one node's submodule from the checkpoint.
 
         The wrapped components load on CPU and the EngineManager moves them; the
@@ -782,7 +770,7 @@ class Wan22Model(Model):
                 # serving numerics, like the compile: the reference gates build with compile_dit off
                 fuse_ffn_gelu=self.config.compile_dit,
             )
-            return Wan22DitSubmodule(transformer, self.config, sp_group=sp_group)
+            return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 

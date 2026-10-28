@@ -305,27 +305,6 @@ def test_spec_declares_no_dependencies():
     assert manager().depends_on() == set()
 
 
-def test_shards_head_counts_at_build():
-    """Head counts are declared pre-sharding; the engine narrows them."""
-
-    class _Group:
-        world_size = 2
-
-    spec = RaggedAttentionSpec(
-        resource_key=ATTN, nodes={"encoder"},
-        config=RaggedAttentionConfig(
-            num_qo_heads=HEADS, num_kv_heads=HEADS, head_dim=HEAD_DIM,
-        ),
-    )
-    mgr = build_resource(
-        spec,
-        EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE, joint_comm_group=_Group()),
-    )
-    assert mgr._kwargs["num_qo_heads"] == HEADS // 2
-    # head_dim never shards
-    assert mgr._kwargs["head_dim"] == HEAD_DIM
-
-
 @pytest.mark.parametrize("compile_op", [True, False])
 def test_compiled_caller_keeps_attention_in_its_graph(compile_op):
     """With ``compile_op``, the resource's ``run`` traces as one custom op: the region

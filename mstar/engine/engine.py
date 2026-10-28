@@ -550,9 +550,6 @@ class Engine:
                 EngineResourceInfo(
                     device=device,
                     joint_comm_group=joint_comm_group,
-                    head_shards=self._head_shards(
-                        spec.resource_key, relevant_nodes, submodules, joint_comm_group,
-                    ),
                     transfer_engine_info=transfer_engine_info,
                     kv_dtype=kv_cache_type,
                     needs_remote_transfer=(
@@ -2216,30 +2213,6 @@ class Engine:
             graph_walk, {request_id: request_info},
             per_request_input_metadata={request_id: input_metadata},
         )
-
-    @staticmethod
-    def _head_shards(
-        resource_key: str,
-        nodes: set[str],
-        submodules: dict[str, NodeSubmodule],
-        group: JointGroups | None,
-    ) -> int:
-        """How many ways the ranks of ``nodes`` split the heads of a resource
-        they share: TP ranks always do, SP ranks unless the node declares
-        ``splits_heads = False``. One value for all of them, since the
-        resource is built once."""
-        if group is None:
-            return 1
-        shards: dict[str, int] = {}
-        for node in sorted(nodes):
-            sp = group.sp_group.world_size if getattr(submodules[node], "splits_heads", True) else 1
-            shards[node] = group.tp_group.world_size * sp
-        if len(set(shards.values())) > 1:
-            raise ValueError(
-                f"resource {resource_key!r}: the nodes it serves split its "
-                f"heads differently ({shards}); give them the same splits_heads"
-            )
-        return next(iter(shards.values()))
 
     @staticmethod
     def _max_rows_in_combined(

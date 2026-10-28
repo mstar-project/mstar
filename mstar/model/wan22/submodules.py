@@ -342,8 +342,8 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
     """Dense 5B video DiT with the UniPC step run inline.
 
     One loop iteration is one batch-2 transformer forward (the positive and
-    negative prompt embeddings stacked on the batch axis; CFG-parallel on a
-    two-rank instance, one branch per rank) plus one UniPC predictor/corrector update
+    negative prompt embeddings stacked on the batch axis; with cfg_size 2,
+    one branch per cfg rank) plus one UniPC predictor/corrector update
     from ``components/unipc.py``.
 
     Loop-carried edges, all float32 over the latent grid:
@@ -383,22 +383,20 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
     # (patchify -> blocks -> head) is compiled in __init__ (config.compile_dit),
     # leaving the solver, CFG combine, and everything touching sigma eager.
     disable_torch_compile = True
-    # CFG-parallel: the node's two ranks split guidance branches, not heads
-    splits_heads = False
+    # the [cond, uncond] stack a guided step forwards (the CFG axis splits it)
+    CFG_BRANCHES = 2
 
-    def __init__(self, transformer: nn.Module, config: Wan22Config, sp_group=None):
+    def __init__(self, transformer: nn.Module, config: Wan22Config, cfg_group=None):
         super().__init__()
         self.transformer = transformer
         self.config = config
-        # CFG parallelism: the node's lockstep group arrives as its sp group
-        # (not passed on one GPU, so trivial here; Wan22Model.validate_config_yaml
-        # refuses any size but 2), but nothing splits the sequence. The ranks
-        # split the batch-2 CFG stack (my_rows, then an all-gather), each running
-        # one branch at batch 1, so the step costs one branch's forward plus a
-        # latent-sized gather. Every rank then runs the same combine and UniPC
-        # step on replicated latents. Without guidance both ranks compute the
-        # whole step, correct but no faster.
-        self.sp_group = sp_group or CommGroup.trivial()
+        # CFG parallelism (cfg_size: 2; not passed on one GPU, so trivial here):
+        # the ranks split the batch-2 CFG stack (my_rows, then an all-gather),
+        # each running one branch at batch 1, so the step costs one branch's
+        # forward plus a latent-sized gather. Every rank then runs the same
+        # combine and UniPC step on replicated latents. Without guidance both
+        # ranks compute the whole step, correct but no faster.
+        self.cfg_group = cfg_group or CommGroup.trivial()
         self._record_fp32_islands()
         # Compile the inner DiT region only (tensors in, tensor out; nothing
         # CPU-resident crosses it), IN PLACE so ``self.transformer`` keeps its
@@ -491,7 +489,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
 
         ``guidance_scale`` is request metadata, identical on every rank of the
         instance, so all ranks agree on whether the forward's gather runs."""
-        return my_rows(self.sp_group, 2) if guidance_scale > 1.0 else slice(0, 1)
+        return my_rows(self.cfg_group, self.CFG_BRANCHES) if guidance_scale > 1.0 else slice(0, 1)
 
     def _branches(self, guidance_scale: float) -> int:
         """Guidance branches this rank's forward computes."""
@@ -630,7 +628,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, RaggedAttentionMi
         )
         if not do_cfg:
             return out
-        out = self.sp_group.all_gather(out.contiguous(), dim=0)
+        out = self.cfg_group.all_gather(out.contiguous(), dim=0)
         noise_cond, noise_uncond = out[0:1], out[1:2]
         return noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 

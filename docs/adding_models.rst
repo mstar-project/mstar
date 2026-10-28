@@ -1028,10 +1028,8 @@ methods are:
    (Kokoro is an example).
 
    Under TP or SP the engine sizes every resource it builds for a node (KV, attention,
-   recurrent state) for one rank's slice of the heads. A node whose SP ranks split other
-   work instead, such as one guidance branch per rank, sets ``splits_heads = False``,
-   and its SP ranks keep all the heads (TP ranks still split them). Nodes sharing a
-   resource must agree.
+   recurrent state) for one rank's slice of the heads. CFG ranks
+   (`Guidance (CFG) parallelism`_) keep every head.
 
 ``postprocess(...)`` (optional)
    Metadata-only fixups that run on the GPU thread. This method must not read tensor

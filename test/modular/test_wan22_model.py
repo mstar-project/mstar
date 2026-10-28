@@ -115,8 +115,6 @@ def test_wan22_declares_only_dit_attention_resources():
     specs = model.get_node_resources()
     assert [spec.resource_key for spec in specs] == [Wan22DitSubmodule.SELF_ATTN]
     assert all(spec.nodes == {"dit"} for spec in specs)
-    # CFG-parallel: every rank keeps all the heads
-    assert not Wan22DitSubmodule.splits_heads
     model.config = Wan22Config(attention_backend="sdpa")
     assert model.get_node_resources() == []
     assert model.get_request_resource_configs(partition_fwd_args={}) == {}
@@ -981,7 +979,7 @@ def test_wan22_config_echo_normalizes_bogus_decode_override(monkeypatch, caplog)
 # ----------------------------------------------------------------------
 
 
-class _FakeSPGroup:
+class _FakeCfgGroup:
     def __init__(self, world_size: int, rank: int = 0):
         self.world_size = world_size
         self.rank = rank
@@ -1001,8 +999,8 @@ def _dit_info(guidance: float) -> CurrentForwardPassInfo:
     (3, 5.0, None),  # two branches do not split over three ranks: refused
 ])
 def test_wan22_dit_branches_per_rank(world_size, guidance, branches):
-    group = _FakeSPGroup(world_size) if world_size else None
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config(), sp_group=group)
+    group = _FakeCfgGroup(world_size) if world_size else None
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config(), cfg_group=group)
 
     def prepare():
         return submodule.prepare_inputs(
@@ -1027,7 +1025,7 @@ class _BranchEcho(torch.nn.Module):
         return encoder_hidden_states[:, :1, :1, None, None].expand_as(hidden_states).clone()
 
 
-class _TwoRankGroup(_FakeSPGroup):
+class _TwoRankGroup(_FakeCfgGroup):
     """One rank of a two-rank instance. The all-gather checks this rank's rows
     and returns both ranks' rows, as each rank's forward computes them."""
     def __init__(self, rank: int, full: torch.Tensor):
@@ -1051,25 +1049,26 @@ def test_wan22_cfg_parallel_rank_runs_its_branch_and_matches_one_gpu(rank, guida
     expected = one_gpu._noise_prediction(latents, ts, pos, neg, guidance)
     full = _BranchEcho()(latents.repeat(2, 1, 1, 1, 1), None, torch.cat([pos, neg]), None)
     group = _TwoRankGroup(rank, full)
-    pair = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False), sp_group=group)
+    pair = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False), cfg_group=group)
     assert torch.equal(pair._noise_prediction(latents, ts, pos, neg, guidance), expected)
     assert group.gathers == (1 if guidance > 1.0 else 0)
 
 
-@pytest.mark.parametrize("sp_size,ok", [(None, True), (1, True), (2, True), (3, False), (4, False)])
-def test_wan22_refuses_a_dit_instance_it_cannot_split_cfg_over(sp_size, ok):
+@pytest.mark.parametrize("cfg_size,ok", [(None, True), (1, True), (2, True), (3, False), (4, False)])
+def test_wan22_refuses_a_dit_instance_it_cannot_split_cfg_over(cfg_size, ok):
     """CFG parallelism splits two branches; a larger dit instance would serve,
     every rank recomputing the whole step, unless refused at startup."""
-    group = {"node_names": ["dit"], "ranks": list(range(sp_size or 1))}
-    if sp_size is not None:
-        group["sp_size"] = sp_size
+    from mstar.validation.placement import check_placement
+
+    group = {"node_names": ["dit"], "ranks": list(range(cfg_size or 1))}
+    if cfg_size is not None:
+        group["cfg_size"] = cfg_size
     config = {"node_groups": [{"node_names": ["text_encoder", "vae_encoder", "vae_decoder"], "ranks": [0]}, group]}
-    model = Wan22Model(model_path_hf="test/wan22")
+    problems = check_placement(Wan22Model(model_path_hf="test/wan22"), config)
     if ok:
-        model.validate_config_yaml(config, "wan.yaml")
+        assert problems == []
     else:
-        with pytest.raises(ValueError, match="sp_size"):
-            model.validate_config_yaml(config, "wan.yaml")
+        assert len(problems) == 1 and "does not divide the 2 guidance branches" in problems[0], problems
 
 
 def test_wan22_dit_declares_one_segment_per_branch():

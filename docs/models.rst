@@ -1349,9 +1349,9 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 step) and no component offload.
 
 **Two GPUs.** ``configs/wan22_cfg_parallel_2gpu.yaml`` is CFG-parallel: it runs
-the dit as a two-rank lockstep instance (``sp_size: 2``, though nothing splits
-the sequence) that splits the classifier-free guidance batch: each rank runs one
-branch at batch 1 and the two noise predictions are all-gathered
+the dit over two ranks (``cfg_size: 2``) that split the classifier-free guidance
+batch: each rank runs one branch at batch 1 and the two noise predictions are
+all-gathered
 every step, so a guided step costs one branch's forward (502 vs 1000 ms at
 1280x704x81 on H200s; one request 13.4 s vs 23.3 s end to end at 20 steps). The
 text encoder and VAE run on rank 0. Without guidance both ranks compute the same
