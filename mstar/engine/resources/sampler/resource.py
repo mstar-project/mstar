@@ -415,6 +415,13 @@ class SamplerResource(Resource):
         self._preplan_cg_sampler = None
         self._preplan_key = None
 
+    # a pre-plan stages per-row configs, which no rewind moves
+    corrects_preplan = True
+
+    def correct_preplan(self, verdicts, step: SamplerStep, ctx: StepContext) -> bool:
+        del verdicts, step, ctx
+        return True
+
     @staticmethod
     def _plan_key(ctx: StepContext):
         """What identifies the step a pre-plan was staged for: its padded

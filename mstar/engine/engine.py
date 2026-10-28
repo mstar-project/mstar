@@ -2508,7 +2508,14 @@ class Engine:
             stream = cg_runner.plan_stream()
             with stream if stream is not None else nullcontext():
                 self._runner.pre_plan(step)
-            laps.skip()
+                laps.skip()
+                # a verify step planned ahead of its rows' last verdicts: wait for them here,
+                # rewind, and correct what was staged, before the event the replay waits on
+                if not self._runner.settle_preplan(step):
+                    laps.lap("settle")
+                    self.reset_pre_plan_for_batch(batch)
+                    return False
+                laps.lap("settle")
             batch.preplan_event = torch.Event(device=self._device)
             batch.preplan_event.record(stream)
             batch.preplanned_rids = tuple(batch.request_ids)

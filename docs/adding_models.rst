@@ -1363,6 +1363,15 @@ recurrent pool is storage (``NONE``); a backend that can't settle (Mamba-2 so fa
 nothing. A resource that declares no ``rewind_kind`` keeps the node from loading, as does a
 combined walk over the verifying walk or a prefix-cache key on its labels.
 
+Under the async worker, the next step is pre-planned while the current one runs, before its
+verdict is known: from the lengths the current step committed, as if it kept its whole block.
+Once the verdict lands, the runner rewinds and each pre-planned resource corrects its staged
+plan (``Resource.correct_preplan``; paged KV, positions, FlashInfer attention and the sampler
+do). A node pre-plans this way only when every pre-planning resource of its verify step sets
+``corrects_preplan``; otherwise its pre-plan waits for the verdict first. A resource that adds
+state to a verifying node and pre-plans should implement it: what the pre-plan read of a
+length the rewind moved has to be put right there, in place.
+
 Verification is greedy unless the sampler declares ``enable_sampled_verify=True``: a
 greedy verify keeps the drafts that equal the target's argmax, and refuses a request with a
 ``temperature``. A sampled verify runs rejection sampling against the target filtered as the

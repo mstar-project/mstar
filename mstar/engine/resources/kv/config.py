@@ -502,6 +502,9 @@ class KVStep(ResourceStep):
     # itself this step, applied at commit. It rides with the step rather than
     # living on the stream, so an offload has nothing to lose.
     retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)
+    # a draft-verify block (``with_draft_verify`` sets it): every row spans the same few
+    # tokens, whose write slots a leased step computes on the host
+    verify: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)

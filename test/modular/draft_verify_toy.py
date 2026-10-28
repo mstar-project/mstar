@@ -400,13 +400,17 @@ class Driver:
     """The worker's part, for one node: ingest, prefill, then decode steps until every
     request stops, each step through the engine's own exec and stop check."""
 
-    def __init__(self, eng: Engine, sub: ToySubmodule):
+    def __init__(self, eng: Engine, sub: ToySubmodule, plan_ahead: bool = False):
         self.eng, self.sub = eng, sub
         self.max_tokens: dict[int, int] = {}
         self.sampling: dict[int, SamplingReqConfig] = {}
         self.emitted: dict[int, list[int]] = {}
         self.next: dict[int, torch.Tensor] = {}
         self.leases: list = []
+        # pre-plan each decode step as the worker's plan thread does: after the step before it
+        # committed, before anything reads its verdict, on a slot of its own
+        self.plan_ahead = plan_ahead
+        self.planned_ahead = 0
 
     def add(self, rid: int, prompt: list[int], max_tokens: int, ignore_eos: bool = False,
             seed: int = 0, **sampling):
@@ -438,9 +442,13 @@ class Driver:
                 random_seed=0, max_tokens=self.max_tokens[rid],
                 resource_configs={SAMPLER: self.sampling[rid]},
             ) for rid in rids},
-            step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False),
+            step_context=StepContext(
+                request_ids=tuple(rids), graph_walk=walk, slot=None if self.plan_ahead else 0, capture=False,
+            ),
             per_request_input_tensors={rid: {"text_inputs": [inputs[rid]]} for rid in rids},
         )
+        if self.plan_ahead and walk == "decode" and self.eng.reserve_replay_slot(batch) is not None:
+            self.planned_ahead += bool(self.eng.pre_plan_for_batch(batch))
         self.eng.prepare_inputs(batch)
         outputs = self.eng.exec_and_postprocess(batch)
         assert batch.admit_error is None, batch.admit_error

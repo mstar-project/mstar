@@ -94,10 +94,10 @@ def with_draft_verify(
     """``step``, a decode step of a walk with ``policy``, as a verify step: ``VerifyStep``
     added under ``key``, and a ``SamplerStep`` under ``sampler`` (the ``DraftVerifySpec``'s),
     which a sampled verify draws with. Every row, padding rows included, spans
-    ``policy.block``. Each step of the submodule's with a ``verify`` field gets it set: its
-    resource keeps per-token state that the verdict settles in the forward
-    (``RewindKind.DEVICE``). The submodule calls this in ``declare_step``, on a step that
-    declares no sampler step of its own."""
+    ``policy.block``. Each step of the submodule's with a ``verify`` field gets it set: paged KV
+    then computes the block's write slots on the host, and state the forward updates in place
+    waits for the verdict to settle it (``RewindKind.DEVICE``). The submodule calls this in
+    ``declare_step``, on a step that declares no sampler step of its own."""
     segments = step.segments
     if segments is None:
         raise ValueError("with_draft_verify needs the step's segments on the SubmoduleStep")

@@ -117,6 +117,8 @@ class StepRunner:
         self._rewinders = self._draft_verify_rewinders(node_resources)
         # keyset -> [(draft-verify resource, the step's resources it rewinds)]
         self._rewind_cache: dict[frozenset[str], list[tuple[Resource, list[Resource]]]] = {}
+        # keyset -> whether a pre-plan of such a step runs ahead of its rows' verdicts
+        self._plan_ahead_cache: dict[frozenset[str], bool] = {}
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
@@ -255,13 +257,7 @@ class StepRunner:
             ]
         return out
 
-    def _rewind(self, step: SubmoduleStep) -> None:
-        """Take back the rejected rows of the step's requests' last verify steps, on every
-        resource of the step that rewinds, before any of them admits the step. Each verdict
-        is taken once and never given back, so a step admitted again, or a dropped pre-plan,
-        finds nothing more. The same verdict on every rank of a lockstep instance, rewound at
-        the same point of the same step, keeps their streams alike."""
-        keyset = frozenset(step.keys())
+    def _rewind_hooks(self, keyset: frozenset[str]) -> list[tuple[Resource, list[Resource]]]:
         hooks = self._rewind_cache.get(keyset)
         if hooks is None:
             hooks = self._rewind_cache[keyset] = [
@@ -269,11 +265,64 @@ class StepRunner:
                 for dv, keys in self._rewinders.items()
                 if any(k in keyset for k in keys)
             ]
-        for dv, targets in hooks:
+        return hooks
+
+    def _rewind(self, step: SubmoduleStep) -> list:
+        """Take back the rejected rows of the step's requests' last verify steps, on every
+        resource of the step that rewinds, before any of them admits the step (or, for a step
+        planned ahead, after its pre-plan: `settle_preplan`). Each verdict is taken once and
+        never given back, so a step admitted again, or a dropped pre-plan, finds nothing more.
+        The same verdict on every rank of a lockstep instance, rewound at the same point of
+        the same step, keeps their streams alike. Returns the verdicts it rewound."""
+        rewound = []
+        for dv, targets in self._rewind_hooks(frozenset(step.keys())):
             verdicts = dv.settle(step.ctx.request_ids)
             if verdicts is not None:
                 for target in targets:
                     target.rewind(verdicts)
+                rewound.append(verdicts)
+        return rewound
+
+    def plans_ahead(self, step: SubmoduleStep) -> bool:
+        """Whether a pre-plan of ``step`` runs before its rows' last verdicts are read: the
+        step verifies drafts and every one of its pre-planning resources can correct its
+        staged plan for the rewind that follows (`settle_preplan`). Fixed per resource set."""
+        if not self._rewinders:
+            return False
+        keyset = frozenset(step.keys())
+        ahead = self._plan_ahead_cache.get(keyset)
+        if ahead is None:
+            ahead = self._plan_ahead_cache[keyset] = bool(self._rewind_hooks(keyset)) and all(
+                self._resources[key].corrects_preplan for key in self._preplan_keys_for(step)
+            )
+        return ahead
+
+    def settle_preplan(self, step: SubmoduleStep) -> bool:
+        """After the pre-plan of a step planned ahead: wait for its rows' last verdicts, rewind
+        them, and have each pre-planned resource correct its staged plan, in plan order. False
+        when one can't; the stage is dropped then, and the step plans inline (the rewind
+        stays, as it would after a dropped pre-plan anyway)."""
+        if not self.plans_ahead(step):
+            return True
+        rewound = self._rewind(step)
+        if not rewound:
+            return True
+        verdicts = rewound[0] if len(rewound) == 1 else _merged(rewound)
+        for key in self._preplan_keys_for(step):
+            t0 = phase_start()
+            try:
+                ok = self._resources[key].correct_preplan(verdicts, step.get(key), step.ctx)
+            finally:
+                if t0 is not None:
+                    phase_end(f"res.correct.{key}", t0)
+            if not ok:
+                logger.warning(
+                    "resource %s could not correct a step planned ahead of its verdict; "
+                    "planning it inline", key,
+                )
+                self.clear_preplan()
+                return False
+        return True
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -555,9 +604,11 @@ class StepRunner:
         the later full `admit` covers the rest; these resources see their own
         state as already reserved and no-op
 
-        Unwound on refusal exactly as ``admit`` is.
+        Unwound on refusal exactly as ``admit`` is. A step planned ahead of its
+        rows' verdicts admits from the lengths their last step committed, its
+        rewind waiting for ``settle_preplan``.
         """
-        if self._rewinders:
+        if self._rewinders and not self.plans_ahead(step):
             self._rewind(step)
         ready = True
         admitted: list[str] = []
@@ -756,3 +807,13 @@ class StepRunner:
             self._resources[key].build_accelerator_graph_buffers(
                 slots, max_bs, max_seq_len
             )
+
+
+def _merged(batches: list) -> Any:
+    """Several draft-verify resources' verdicts as one batch."""
+    first = batches[0]
+    return type(first)(
+        [rid for b in batches for rid in b.request_ids],
+        [label for b in batches for label in b.labels],
+        [r for b in batches for r in b.rejected],
+    )

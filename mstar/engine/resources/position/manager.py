@@ -310,6 +310,31 @@ class RopeManager(PositionManager):
         self._preplanned = False
         self._preplan_pos_ids = {}
 
+    corrects_preplan = True
+
+    def correct_preplan(self, verdicts: "VerdictBatch", step: PositionStep, ctx: StepContext) -> bool:
+        """Restage the staged step's positions for each label holding a rewound row, from the
+        counters `rewind` moved back. Positions a step gives explicitly can't follow a rewind."""
+        if not self._preplanned:
+            return True
+        plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
+        rewound = set(zip(verdicts.request_ids, verdicts.labels, strict=True))
+        lease = ctx.slot_lease
+        for plan_label in list(self._preplan_pos_ids):
+            kv_out = plan_outputs[plan_label]
+            rows = kv_out.rows
+            if rows is None:
+                rows = [(v.request_id, v.label, v.to_compute) for v in kv_out.views]
+            if not any((rid, label) in rewound for rid, label, _ in rows):
+                continue
+            if self._explicit_pos_ids(step, plan_label, len(plan_outputs)) is not None:
+                return False
+            # the same slot's buffers, behind the staged copy on the same stream
+            self._preplan_pos_ids[plan_label] = self._place(
+                self._build_pos_ids(rows, plan_label, lease), plan_label, lease,
+            )
+        return True
+
     def plan(self, step: PositionStep, ctx: StepContext) -> dict[str, torch.Tensor]:
         """submits one position id vector for each plan label
 

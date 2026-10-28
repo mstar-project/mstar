@@ -339,7 +339,10 @@ def _cycle(runner, sampler, span, accepted=None, preplan=False):
     ctx = StepContext(request_ids=(1,), graph_walk="decode", slot=0, capture=False)
     step.set_ctx(ctx)
     if preplan:
+        # as the engine pre-plans: a staged step, then dropped
+        ctx.is_preplan = True
         runner.pre_admit(step)
+        ctx.is_preplan = False
         runner.clear_preplan()
     assert runner.admit(step).ok
     runner.plan(step)
