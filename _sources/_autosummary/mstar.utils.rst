@@ -34,6 +34,7 @@
    causal_conv1d
    client_errors
    containers
+   cpus
    device
    exitcode
    fast_tokenize

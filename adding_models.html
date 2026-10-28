@@ -420,6 +420,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.cache_home.html">mstar.utils.cache_home</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.client_errors.html">mstar.utils.client_errors</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.cpus.html">mstar.utils.cpus</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
@@ -2396,11 +2397,13 @@ the resource name.</p>
 </section>
 <section id="preprocessing-threads">
 <h3>Preprocessing threads<a class="headerlink" href="#preprocessing-threads" title="Link to this heading">#</a></h3>
-<p>The API server runs <code class="docutils literal notranslate"><span class="pre">load_image</span></code> / <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> with torch’s intra-op pool, which
-defaults to one thread per core. For a few small ops per request a small pool is faster,
-especially on a shared node, where an op waits on any of its threads another process has
-descheduled. A model sets its size with <code class="docutils literal notranslate"><span class="pre">PREPROCESS_TORCH_THREADS</span></code> on the class (Qwen3.5
-uses 4). A deployment overrides it at the top level of its config; <code class="docutils literal notranslate"><span class="pre">null</span></code> keeps torch’s
+<p>The API server runs <code class="docutils literal notranslate"><span class="pre">load_image</span></code> / <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> and output encoding with torch’s
+intra-op pool. Torch sizes it at one thread per host core, which in a container can be
+several times the CPUs the cgroup quota lets run, and an op waits on any of its threads
+the scheduler has parked. The API server therefore defaults to a quarter of the CPUs it
+may use (its affinity, capped by the cgroup <code class="docutils literal notranslate"><span class="pre">cpu.max</span></code> quota), at most 4. A model sets
+its own size with <code class="docutils literal notranslate"><span class="pre">PREPROCESS_TORCH_THREADS</span></code> on the class (Qwen3.5 uses 4). A
+deployment overrides either at the top level of its config; <code class="docutils literal notranslate"><span class="pre">null</span></code> keeps torch’s
 default:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"qwen3_5_4b"</span>
 <span class="nt">preprocess_torch_threads</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
