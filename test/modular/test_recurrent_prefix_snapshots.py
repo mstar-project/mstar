@@ -520,6 +520,20 @@ def test_removal_frees_an_unfiled_decode_snapshot_and_keeps_a_filed_one():
     assert not pool._decode and not pool._unkeyed and len(pool._snap_free) == 1
 
 
+def test_a_decode_snapshot_the_chain_never_keys_leaves_the_one_it_replaces_filed():
+    """The step speculated past a reply's last token can end a page, and its token never
+    reaches the chain."""
+    pool = _pool()
+    _reply(pool)
+    _decode(pool, "a", 1)
+    previous = pool._decode[("a", "main")]
+    pool._kv.add("a", A[:7])
+    _decode(pool, "a", 4)
+    pool.remove_request("a")
+    assert pool._snap_by_key.get(previous.key) == previous.slot, "the reply's snapshot went with the wasted step"
+    assert len(pool._snap_free) == 1
+
+
 def test_a_restored_request_places_its_decode_boundaries_from_the_restored_length():
     pool = _pool(prefix_slots=3)
     _snapshot(pool, "a", A, 8, 1.0)

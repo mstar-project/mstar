@@ -103,6 +103,8 @@ class DecodeSnapshot(NamedTuple):
     tokens: int
     # None until the KV chain keys its page
     key: bytes | None = None
+    # the filed snapshot this one replaces once the chain keys it
+    replaces: DecodeSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -801,14 +803,19 @@ class RecurrentStatePool(Resource):
         if (rid, label) not in self._keyed:
             return
         previous = self._decode.pop((rid, label), None)
-        if previous is not None:
+        if previous is not None and (rid, label) in self._unkeyed:
             self._drop_decode((rid, label), previous)
+            previous = previous.replaces
         snap = self._reserve_snapshot()
         if snap is None:
+            if previous is not None:
+                self._decode[(rid, label)] = previous
             return
         for tensor in self._blocks.values():
             tensor[:, snap].copy_(tensor[:, slot.index])
-        self._decode[(rid, label)] = DecodeSnapshot(snap, slot.tokens)
+        # a filed `previous` stays until this one is filed: a step whose token never
+        # reaches the chain (the one speculated past the reply's end) never is
+        self._decode[(rid, label)] = DecodeSnapshot(snap, slot.tokens, replaces=previous)
         self._unkeyed.add((rid, label))
 
     def _drop_decode(self, key: tuple[str, str], decode: DecodeSnapshot) -> None:
@@ -834,8 +841,10 @@ class RecurrentStatePool(Resource):
             if name is None:
                 continue
             self._unkeyed.discard(key)
+            if decode.replaces is not None:
+                self._drop_decode(key, decode.replaces)
             if self._index(decode.slot, name):
-                self._decode[key] = decode._replace(key=name)
+                self._decode[key] = DecodeSnapshot(decode.slot, decode.tokens, name)
             else:
                 del self._decode[key]
 
