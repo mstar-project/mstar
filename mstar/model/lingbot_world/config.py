@@ -79,6 +79,10 @@ class LingBotWorldConfig:
     # Compile each DiT block (Inductor's defaults in its deterministic mode,
     # eager rounding); the attentions and the cache writes stay eager.
     dit_compile: bool = True
+    # Compile the blocks at the -O level's options instead: 35.4 -> 37.1 fps
+    # served at 464x832 on a B300 (-O2), but each server process picks its own
+    # kernels, so one seed gives a different rollout per process.
+    dit_compile_autotune: bool = False
 
     # The condition encode stays fp32, as the reference's; channels-last runs
     # its convs without layout conversions: 187 -> 140 ms per chunk on a B300

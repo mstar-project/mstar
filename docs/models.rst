@@ -177,7 +177,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        (``vae_encode_channels_last``), and the VAE decode is bf16, channels-last and compiled by
        default (frames 51 dB from the fp32 decode); ``vae_decode_fp32``, ``vae_decode_channels_last``
        and ``vae_decode_compile`` set it. ``REFERENCE_MODEL_KWARGS`` in ``lingbot_world_model.py``
-       lists the settings that are bit-identical to the reference.
+       lists the settings that are bit-identical to the reference. ``lingbot_world_1_3b_fast.yaml``
+       compiles the DiT with autotuned kernels (``dit_compile_autotune``): ~5% faster, but the
+       rollout for a seed then differs from one server process to the next.
        The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
        before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (``Robbyant/lingbot-world``).
    * - ``flux2_klein``

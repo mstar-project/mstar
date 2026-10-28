@@ -408,20 +408,24 @@ class LingBotCausalDiT(nn.Module):
         ], dim=1)
         self._freqs: dict[torch.device, torch.Tensor] = {}
 
-    def compile_blocks(self, **compile_kwargs) -> None:
-        """Compile each block's forward in place: Inductor's defaults in its
-        deterministic mode, rounding every intermediate where eager does
-        (``emulate_precision_casts``). Not the -O level's autotuning: on a B300
-        it was no faster here, and it picked kernels per process, so one seed
-        gave a different rollout per server. The cache write and both
-        attentions stay eager (``_window_attention``, the ragged callables), so
-        a block traces once for every chunk."""
+    def compile_blocks(self, autotune: bool = False, **compile_kwargs) -> None:
+        """Compile each block's forward in place, rounding every intermediate
+        where eager does (``emulate_precision_casts``): by default Inductor's
+        defaults in its deterministic mode, so every process compiles the same
+        kernels; with ``autotune`` the -O level's options, whose kernel picks
+        are per process. The cache write and both attentions stay eager
+        (``_window_attention``, the ragged callables), so a block traces once
+        for every chunk."""
         from mstar.model.components.diffusion.compile_utils import with_inductor_rounding
 
+        if autotune:
+            from mstar.engine.accelerator_graph_runner import compile_kwargs as level_kwargs
+
+            compile_kwargs = {**level_kwargs(None), **compile_kwargs}
         compile_kwargs = {"fullgraph": False, "dynamic": False, **compile_kwargs}
         for block in self.blocks:
             block.forward = with_inductor_rounding(
-                torch.compile(block.forward, **compile_kwargs), eager_rounding=True, deterministic=True,
+                torch.compile(block.forward, **compile_kwargs), eager_rounding=True, deterministic=not autotune,
             )
 
     def freqs(self, device: torch.device) -> torch.Tensor:

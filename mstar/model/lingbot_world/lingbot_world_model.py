@@ -51,8 +51,8 @@ logger = logging.getLogger(__name__)
 
 # LingBotWorldConfig switches a deployment sets in model_kwargs
 _CONFIG_KWARGS = (
-    "reference_attention", "dit_compile", "vae_encode_channels_last", "vae_decode_fp32", "vae_decode_channels_last",
-    "vae_decode_compile",
+    "reference_attention", "dit_compile", "dit_compile_autotune", "vae_encode_channels_last", "vae_decode_fp32",
+    "vae_decode_channels_last", "vae_decode_compile",
 )
 
 # The switches set to the reference's numerics: FA2 attention, an eager DiT, the contiguous encode and the

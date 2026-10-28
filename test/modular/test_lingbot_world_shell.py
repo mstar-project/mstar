@@ -479,8 +479,8 @@ def test_the_dit_declares_one_ragged_cross_attention(model):
     assert LingBotWorldModel(skip_weight_loading=True, reference_attention=True).get_node_resources() == []
 
 
-SWITCHES = ("reference_attention", "dit_compile", "vae_encode_channels_last", "vae_decode_fp32",
-            "vae_decode_channels_last", "vae_decode_compile")
+SWITCHES = ("reference_attention", "dit_compile", "dit_compile_autotune", "vae_encode_channels_last",
+            "vae_decode_fp32", "vae_decode_channels_last", "vae_decode_compile")
 
 
 @pytest.mark.parametrize("name", SWITCHES)
@@ -493,13 +493,13 @@ def test_a_model_kwargs_switch_must_be_a_bool(name, value):
 
 def test_model_kwargs_switches_set_the_config():
     default = LingBotWorldModel(skip_weight_loading=True).config
-    assert [getattr(default, n) for n in SWITCHES] == [False, True, True, False, True, True]
+    assert [getattr(default, n) for n in SWITCHES] == [False, True, False, True, False, True, True]
     for name in SWITCHES:
         flipped = LingBotWorldModel(skip_weight_loading=True, **{name: not getattr(default, name)}).config
         assert getattr(flipped, name) is not getattr(default, name)
         assert all(getattr(flipped, n) is getattr(default, n) for n in SWITCHES if n != name)
     reference = LingBotWorldModel(skip_weight_loading=True, **REFERENCE_MODEL_KWARGS).config
-    assert [getattr(reference, n) for n in SWITCHES] == [True, False, False, True, False, False]
+    assert [getattr(reference, n) for n in SWITCHES] == [True, False, False, False, True, False, False]
 
 
 def _bare_dit_submodule(model, resources):
@@ -556,6 +556,19 @@ def test_the_declared_window_is_what_the_rolling_cache_attends(model):
         window = cache.window(plan)
         assert window.stop - window.start == attended_frames(cfg, c) * frame_seqlen
         cache.global_end, cache.local_end = plan.current_end, plan.local_end
+
+
+def test_the_fast_config_only_adds_the_autotuned_compile():
+    from pathlib import Path
+
+    import yaml
+
+    configs = Path(__file__).parents[2] / "configs"
+    base = yaml.safe_load((configs / "lingbot_world_1_3b.yaml").read_text())
+    fast = yaml.safe_load((configs / "lingbot_world_1_3b_fast.yaml").read_text())
+    assert fast.pop("model_kwargs") == {"dit_compile_autotune": True}
+    assert fast == base
+    LingBotWorldModel(skip_weight_loading=True).validate_config_yaml(fast, "lingbot_world_1_3b_fast.yaml")
 
 
 def test_the_shipped_config_serves_one_rollout_at_a_time(model):

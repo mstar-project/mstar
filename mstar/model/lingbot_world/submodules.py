@@ -216,7 +216,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             for lat_hw in warmup_latent_sizes:
                 self.warmup_decode(lat_hw)
         if dit is not None and config.dit_compile:
-            dit.compile_blocks()
+            dit.compile_blocks(autotune=config.dit_compile_autotune)
             for lat_hw in warmup_latent_sizes:
                 self.warmup_dit(lat_hw)
         self._attention: DitAttention | None = None
