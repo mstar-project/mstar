@@ -11,7 +11,7 @@ There is no final norm and no ``lm_head``. The reference reads
 ``hidden_states[-1]`` off ``Qwen3VLForConditionalGeneration``, which is the
 last decoder layer's output *before* the norm, and the loader skips both by
 name. Check that at the same level the reference calls: ``Qwen3VLTextModel``
-on its own reports the *normed* state at ``[-1]`` instead (C04 CHK-2).
+on its own reports the *normed* state at ``[-1]`` instead.
 """
 from __future__ import annotations
 

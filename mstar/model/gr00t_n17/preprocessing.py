@@ -313,8 +313,8 @@ class Gr00tN17Preprocessor:
         relative group's reference frame stay as they arrive and widen only where
         the reference widens, on the multiply by the float64 bounds.
 
-        Against the 20 recorded DROID requests (``docs-local/c08/chk3_parity.py``)
-        this is **bit-exact** for ``gripper_position`` (absolute) and
+        Against the 20 recorded DROID requests (``test_preprocessing.py``'s decode
+        parity test) this is **bit-exact** for ``gripper_position`` (absolute) and
         ``joint_position`` (relative, additive), and for the SE(3) group
         ``eef_9d`` it is min 4.7e-16 / median 8.3e-16 / max 3.3e-09 -- a bound of
         **one float32 ulp of the reference frame**, which 96 of 300 random frames
@@ -429,7 +429,7 @@ class Gr00tN17Preprocessor:
     def frame_layout(self, embodiment_tag: str) -> tuple[tuple[str, ...], int]:
         """This embodiment's camera views, in order, and its frames per view.
 
-        The order is the contract a request is sent in ([[D10]]): the engine's
+        The order is the contract a request is sent in: the engine's
         media path keys loaded files by *modality*, not by name
         (`data_worker.py:583`), so several cameras arrive as one positional list
         and only this order says which frame is which camera.
@@ -467,7 +467,7 @@ class Gr00tN17Preprocessor:
     def _shortest_edge_to(self, img: np.ndarray) -> np.ndarray:
         # albumentations' SmallestMaxSize: round() each side, skip at scale 1.
         # cv2's INTER_AREA is the reference's filter; torchvision's bilinear
-        # moved actions ~5x the whole port's error (D05).
+        # moved actions ~5x the error of the rest of the port.
         import cv2
 
         h, w = img.shape[:2]

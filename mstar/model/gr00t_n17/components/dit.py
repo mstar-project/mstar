@@ -5,7 +5,7 @@ through AdaLN, alternating cross-attention over the bridge's rows with
 self-attention over its own 41 tokens.
 
 Attention arrives as a callable, so nothing here knows whether it is a CPU
-stand-in or one of M\\*'s ragged resources (C07 supplies the second).
+stand-in or one of M\\*'s ragged resources.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ _SDPA_ATTEND = functools.partial(joint_attention, ragged=None)
 # without the check below a misspelt key would leave that span on SDPA --
 # bitwise identical to passing nothing, off the planned resource and off the
 # kernel a captured graph recorded. The engine side raises for an unplanned
-# label; this makes our side raise too (C07 QA).
+# label; this makes our side raise too.
 _SPANS = frozenset({SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN})
 
 # Every LayerNorm in the DT is non-affine, and the checkpoint says so: `norm1`
@@ -46,7 +46,7 @@ _NORM_EPS = 1e-5
 
 # The output head's norm is the one exception: the reference hardcodes 1e-6
 # there while the blocks take the config's 1e-5. No weight records an eps and
-# the bf16 dumps cannot resolve one either (C05), so this is a reading of
+# the bf16 recordings cannot resolve one either, so this is a reading of
 # `dit.py:284`, not something parity against the checkpoint would recover.
 _OUT_NORM_EPS = 1e-6
 
@@ -90,12 +90,12 @@ class AdaLayerNorm(nn.Module):
     ``scale`` comes first out of the chunk and is applied as ``1 + scale``, and
     both are indexed ``[:, None]`` so one request's pair applies to all of its
     tokens -- which is what lets a batch hold requests at different denoising
-    steps (R10).
+    steps.
 
     The activation is ``nn.SiLU``, where the action encoder's swish is spelled
     ``x * sigmoid(x)``. The same function twice in one model, and the two are
-    **not** bit-identical, so each has to keep its own spelling (C06 CHK-2
-    measured the difference at up to 0.5 in bf16 on a trained slot).
+    **not** bit-identical, so each has to keep its own spelling (measured: up to
+    0.5 apart in bf16 on a trained slot).
 
     This is written out rather than imported because **no argument to
     diffusers' own ``AdaLayerNorm`` reproduces it**: that class chunks
@@ -191,7 +191,7 @@ class _BlockAttention(nn.Module):
         # `[B, H, T, D]` is the natural mistake for a kernel that wants heads
         # first, and it has the same element count as `[B, T, H, D]` -- so a
         # transposed return would reshape without complaint and scramble every
-        # row. C07 swaps this callable, so the shape is checked here.
+        # row. The callable is swappable, so the shape is checked here.
         if out.shape != query.shape:
             raise ValueError(
                 f"attention returned {list(out.shape)}, expected "
@@ -222,8 +222,8 @@ def _span_for(index: int, attend_text_every_n_blocks: int) -> str:
     The odd blocks attend themselves. The cross blocks alternate between the
     bridge's two spans every ``attend_text_every_n_blocks`` *cross* blocks, so
     at its one value, 2, the text blocks are 0, 4, 8 ... and the image blocks
-    are 2, 6, 10 ... (``dit.py:380-396``). Block 0 is a text block, which is
-    R7's off-by-one.
+    are 2, 6, 10 ... (``dit.py:380-396``). Block 0 is a text block; starting
+    on an image block is the easy off-by-one.
 
     One function decides both which rows a block reads and which attention it
     reads them with, so the two cannot disagree.
@@ -265,8 +265,8 @@ class DiT(nn.Module):
     self-attention over the DT's own, then a conditioned output norm and two
     projections down to ``output_dim``.
 
-    ``attend`` is handed to every block, so C07 swaps one constructor argument
-    and nothing else moves.
+    ``attend`` is handed to every block, so swapping the attention is one
+    constructor argument and nothing else moves.
     """
 
     def __init__(self, config: Gr00tN17Config):
@@ -310,7 +310,7 @@ class DiT(nn.Module):
 
         Passing the *same* rows as ``vl_text`` and ``vl_image`` makes every
         cross block read all of them, which is the reference's plain
-        ``DiT.forward`` -- the unmasked case C06 measured against.
+        ``DiT.forward``, the unmasked case.
         """
         if attends is not None and not attends.keys() <= _SPANS:
             raise ValueError(
@@ -321,7 +321,7 @@ class DiT(nn.Module):
         temb = self.timestep_encoder(timestep)
         # the reference makes both contiguous here, and it is load-bearing:
         # non-contiguous rows take a different GEMM path and move the output by
-        # a whole fp32 floor (1.14e-05, C06 CHK-3 QA). Free when they already
+        # a whole fp32 floor (1.14e-05, measured). Free when they already
         # are, which is the usual case.
         hidden_states = hidden_states.contiguous()
         spans = {VL_TEXT_SPAN: vl_text.contiguous(), VL_IMAGE_SPAN: vl_image.contiguous()}

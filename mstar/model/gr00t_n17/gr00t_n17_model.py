@@ -1,10 +1,10 @@
 """GR00T N1.7's model class: the four walks, the resources they need, and the
 submodules that fill them.
 
-The walks are [[D02]]'s: `prefill` conditions a request once, `backbone` and
+Four walks: `prefill` conditions a request once, `backbone` and
 `state` expose two of its pieces for reuse by other models, and `action_gen`
-loops the denoise step four times. `denoise_step` is a `DenoiseLoopSubmodule`
-([[D07]]), so the Loop's machinery is the engine's and not this file's.
+loops the denoise step four times. `denoise_step` is a `DenoiseLoopSubmodule`,
+so the Loop's machinery is the engine's and not this file's.
 """
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ class Gr00tN17Model(Model):
     STATE_WALK = "state"
     ACTION_GEN_WALK = "action_gen"
 
-    # Which nodes each of [[D02]]'s reuse walks contains. Written out rather than
+    # Which nodes each reuse walk contains. Written out rather than
     # read from `get_graph_walk_graphs()`, which builds the graphs and runs once
     # per request here; `test_the_reuse_walk_node_sets_match_the_graphs` holds the
     # two in step, at setup time where the cost does not matter.
@@ -129,7 +129,7 @@ class Gr00tN17Model(Model):
         self.capture_batch_sizes = [int(b) for b in capture_batch_sizes or (1, 2, 4, 8)]
         # GR00T's weights and its backbone's config live in two repos: the
         # action head is `nvidia/GR00T-N1.7-3B`, the Qwen3-VL dims come from
-        # `nvidia/Cosmos-Reason2-2B`, which is gated (§3.7 row 1).
+        # `nvidia/Cosmos-Reason2-2B`, which is gated.
         self.backbone_path_hf = backbone_path_hf or self.config_backbone_default
         self.cache_dir = cache_dir
         self._repo_dir: Path | None = None
@@ -175,7 +175,7 @@ class Gr00tN17Model(Model):
     def _backbone_config(self) -> Path:
         """Cosmos-Reason2-2B's `config.json`, and nothing else from that repo.
 
-        Only the backbone's *dims* are GR00T's (§3.7 row 1) -- its 2B of weights
+        Only the backbone's *dims* are GR00T's -- its 2B of weights
         are not -- so a snapshot would download them to read one file.
         """
         if Path(self.backbone_path_hf).is_dir():
@@ -197,12 +197,13 @@ class Gr00tN17Model(Model):
 
     # ----------------------------------------------------------- resources
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The five from PR-1 §3.4. Every attention is cacheless and ragged —
-        there is no KV anywhere, because nothing is ever decoded token by token.
+        """The five attention resources, one per geometry and kind. Every attention is
+        cacheless and ragged -- there is no KV anywhere, because nothing is ever decoded
+        token by token.
 
         Each therefore declares its own `dtype`: with none, a cacheless resource
         falls back to "the engine's KV dtype (which is actually a misnamed
-        autocast dtype)" (`ragged/config.py:68-73`), so the dtype the T3 bar is
+        autocast dtype)" (`ragged/config.py:68-73`), so the dtype the parity bar is
         measured in would track an unrelated default. z_image, flux2_klein and
         ltx2_5 pin theirs for the same reason.
 
@@ -229,7 +230,7 @@ class Gr00tN17Model(Model):
             # Causality is a property of the *step*, not the resource: the LLM
             # node declares `AttentionStep(causal=True)` (`submodules.py:227`).
             # GR00T is the first model on `main` to ask for that on a ragged
-            # resource — every other user is non-causal (R1).
+            # resource — every other user is non-causal.
             RaggedAttentionSpec(
                 resource_key=LLM_ATTN, nodes={LLM},
                 config=RaggedAttentionConfig(
@@ -275,7 +276,7 @@ class Gr00tN17Model(Model):
 
     # --------------------------------------------------------------- walks
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        """[[D02]]'s four.
+        """The four walks.
 
         `prefill` is a `Parallel`, not a `Sequential`: the state encoder reads
         only the request's own state, so it does not wait on the backbone.
@@ -366,7 +367,7 @@ class Gr00tN17Model(Model):
         """Built once per node and cached, then put in **eval** mode.
 
         Our modules hold `Dropout(p=0.0)` rather than relying on the flag, so
-        nothing changes today -- but every parity number C05-C08 measured is an
+        nothing changes today -- but every parity number the tests measure is an
         eval-mode claim, and `qwen3_5`, `whisper` and `orpheus` all make it
         explicit at load rather than leaving it to the caller.
         """
@@ -387,7 +388,7 @@ class Gr00tN17Model(Model):
 
     def capture_buckets(self) -> list[tuple[str, Gr00tN17Shape]]:
         """The denoise step's graph buckets: the only node captured, and the one
-        that runs four times per request (C11's profile: 56% host time eager)."""
+        that runs four times per request (eager, it is bound by kernel launches)."""
         if not self.accelerator_graph:
             return []
         return [
@@ -433,7 +434,7 @@ class Gr00tN17Model(Model):
         return None
 
     def max_input_files(self) -> dict[str, int]:
-        """One frame per camera view per timestep, and no more ([[D10]]).
+        """One frame per camera view per timestep, and no more.
 
         The widest embodiment in this checkpoint has 3 views and every one has 2
         frames per view, so 6. The data worker refuses a request over this before
@@ -461,7 +462,7 @@ class Gr00tN17Model(Model):
         # still moves `pixel_values` by 0.32 against a lossless 0.0019 -- 167x --
         # so a compressed camera feed is the same silent-and-plausible failure as
         # a reordered or double-rescaled frame: the actions look fine and the
-        # robot moves wrong. [[D10]] promises lossless; this is what keeps it.
+        # robot moves wrong. Frames must be lossless; this is what keeps them so.
         fmt, _ = check_image_size(filepath)
         if fmt not in _LOSSLESS_IMAGE_FORMATS:
             raise ValueError(
@@ -478,8 +479,8 @@ class Gr00tN17Model(Model):
     def warmup_preprocess(self) -> None:
         """Pay the lazy `cv2` import before the first robot observation does.
 
-        The image transform imports cv2 inside the call (`preprocessing.py:440`)
-        because OpenCV is a `gr00t_n17` extra and not a core dependency ([[D05]]),
+        The image transform imports cv2 inside the call (`preprocessing.py:471`)
+        because OpenCV is a `gr00t_n17` extra and not a core dependency,
         so without this the first request of a server's life pays for it. Running
         the real resize rather than importing the module warms whatever else that
         path touches; the frame is camera-shaped so the work is the real work, and
@@ -497,7 +498,7 @@ class Gr00tN17Model(Model):
     def _views_from_frames(self, tag: str, frames: list | None) -> dict[str, np.ndarray]:
         """The request's frames, back into the reference's per-camera observation.
 
-        [[D10]]: camera frames travel the **media path**, because they are bulk
+        Camera frames travel the **media path**, because they are bulk
         media -- one recorded DROID observation is 3.36 MiB against the 1 MiB cap
         on a `model_kwargs` form field. That path keys loaded files by *modality*
         (`data_worker.py:583`), so every frame arrives in one list and the order
@@ -508,7 +509,7 @@ class Gr00tN17Model(Model):
         NVIDIA's processor both build their frame list. So `(t0,v0), (t0,v1),
         (t1,v0), (t1,v1)` for a two-camera robot.
 
-        Rebuilding the dict here rather than reshaping the processor keeps C02's
+        Rebuilding the dict here rather than reshaping the processor keeps its
         contract -- `video[view]` as uint8 `(B, T, H, W, 3)` -- which is the
         reference's, and is what the parity tests are written against.
         """
@@ -536,14 +537,14 @@ class Gr00tN17Model(Model):
         prompt_parts: list[dict] | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """One observation to the model's inputs, through C02's processor.
+        """One observation to the model's inputs, through `Gr00tN17Preprocessor`.
 
         GR00T does not take a prompt alone: an observation is a language
         instruction **plus** the camera views and the robot's proprioceptive
         state, and which views and which state keys depends on the embodiment
         tag. The tag therefore rides on the request
         (:meth:`request_kwargs`) and selects the normalisation stats, the
-        video keys and the per-robot weights ([[D06]]).
+        video keys and the per-robot weights.
         """
         tag = kwargs.get("embodiment_tag")
         if tag is None:
@@ -574,7 +575,7 @@ class Gr00tN17Model(Model):
     def request_kwargs(self) -> frozenset[str]:
         """What a request carries beyond the prompt and its media.
 
-        `walk` selects one of [[D02]]'s two **reuse** walks by name; without it a
+        `walk` selects one of the two **reuse** walks by name; without it a
         request takes the full path. It is how another model, or a caller that
         wants GR00T's backbone features or its encoded state on their own,
         reaches a walk that is otherwise unreachable.
@@ -605,11 +606,12 @@ class Gr00tN17Model(Model):
         return [self.PREFILL_WALK, self.ACTION_GEN_WALK]
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """The decoded action chunk as msgpack: one entry per joint group ([[D09]]).
+        """The decoded action chunk as msgpack: one entry per joint group, as NVIDIA
+        returns it.
 
         GR00T decodes **server-side**, unlike pi05, which returns its normalised
         chunk raw: the inverse needs the checkpoint's action statistics and the
-        request's own raw state, neither of which a client has ([[D06]]).
+        request's own raw state, neither of which a client has.
 
         The shape is the reference's, not a wire convention of ours. NVIDIA's
         policy returns `{joint_group: array}` cast to float32
