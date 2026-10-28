@@ -37,6 +37,13 @@ from mstar.engine.resources.kv.config import (
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
+from mstar.engine.resources.recurrent.config import (
+    RecurrentBlockConfig,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+    RecurrentStep,
+)
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -198,6 +205,43 @@ def test_a_hit_on_a_page_another_request_holds_costs_nothing():
     # one page is free, and "a" has it allotted for its prompt
     assert not _ready(kv, "c"), "the lease of pages another request holds was counted as pages taken"
     _grow(kv, "a", 80 - prefix.tokens)
+
+
+def test_a_hit_page_another_request_takes_lets_the_head_in():
+    """The other request pays for the page out of its own allotment, so the head's need drops while
+    the room stays where it was."""
+    kv = _manager(max_num_pages=9)
+    tokens = list(range(80))
+    _cached(kv, tokens, held=False)
+    _laid_out(kv, "b", tokens, keyed=True)
+    _laid_out(kv, "a", tokens + list(range(900, 932)), keyed=True)
+    assert _ready(kv, "b") and not _ready(kv, "a")
+    room = kv._room()
+
+    _probe(kv, "b", 80)
+
+    assert kv._room() == room and _ready(kv, "a"), "the head waits for room it no longer needs"
+
+
+def test_a_request_with_no_recurrent_slot_keeps_no_kv_pages():
+    """Qwen3.5 runs a KV pool and a recurrent pool on one node. A request the KV admitted with no slot
+    free would fail its first step, and its allotment would keep room from the requests running."""
+    kv = _manager(max_num_pages=9)
+    state = RecurrentStatePool.build(
+        RecurrentStateSpec(resource_key="state", nodes={NODE}, config=RecurrentStateConfig(
+            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)}, max_slots=2,
+        )),
+        EngineResourceInfo(device=torch.device("cpu")),
+    )
+    runner = StepRunner({"kv": kv, "state": state}, node_resources={NODE: ["kv", "state"]})
+    for rid in ("r0", "r1"):
+        _laid_out(kv, rid, list(range(16)))
+        state.ingest_request(rid)
+    assert runner.admit_retrieve("r0", NODE, WALK).ready
+    assert state.admit(RecurrentStep(segments=(Segment("r0", "main", 16),)), _ctx("r0")).ok
+
+    assert runner.admit_retrieve("r1", NODE, WALK).queued
+    assert "r1" not in kv._allotments, "a request with no slot kept the KV pages it was allotted"
 
 
 def test_a_later_grant_cannot_take_the_heads_cached_hits():
