@@ -1358,7 +1358,9 @@ text encoder and VAE run on rank 0. Without guidance both ranks compute the same
 step, correct but no faster. For throughput under concurrency,
 ``configs/wan22_dp2.yaml`` serves a whole replica per GPU instead: 5.2 videos/min
 at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0's VAE
-decode), while one request takes the 1-GPU time.
+decode), while one request takes the 1-GPU time. On four GPUs,
+``configs/wan22_cfg2_sp2_4gpu.yaml`` also splits each branch's tokens over a
+pair of ranks (``cfg_size: 2, sp_size: 2``, Ulysses on the dit's self-attention).
 
 LTX-2.5 (``ltx2_5``)
 --------------------

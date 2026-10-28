@@ -1,0 +1,29 @@
+# Needs upstream PR #705 to start: without it, a mesh with two axes hangs creating its gloo groups.
+model: "wan22"
+
+# See wan22_cfg_parallel_2gpu.yaml. On four GPUs the dit splits both ways: one
+# classifier-free-guidance branch per pair of ranks (cfg_size), and each
+# branch's tokens over its pair (sp_size, Ulysses). The text encoder and both
+# VAE passes run on rank 0.
+max_seq_len: 512
+
+model_kwargs:
+  vae_decode_fast_sizes: ["1280x704", "832x480"]
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - dit
+    ranks: [0, 1, 2, 3]
+    cfg_size: 2
+    sp_size: 2

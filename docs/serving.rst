@@ -493,8 +493,8 @@ one whole instance:
    max_seq_len: 512
    node_groups:
      - {node_names: [text_encoder, vae_encoder, vae_decoder], ranks: [0]}
-     # one guidance branch per rank
-     - {node_names: [dit], ranks: [0, 1], cfg_size: 2}
+     # one guidance branch per pair of ranks, each branch's tokens split over its pair
+     - {node_names: [dit], ranks: [0, 1, 2, 3], cfg_size: 2, sp_size: 2}
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
