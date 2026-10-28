@@ -364,6 +364,20 @@ needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
 via ``extra_body``.
 
+Speculative decoding by prompt lookup (``configs/qwen3_5_0.8b_ngram.yaml``):
+``model_kwargs: {draft: {method: ngram, max_drafts: 4}}`` drafts each decode
+step's next tokens from the request's own prompt and reply, and verifies them
+in the same forward (see `Draft-verify decoding` in :doc:`adding_models`).
+Output is unchanged: greedy requests emit what plain decoding emits, and
+sampled ones are distributed as plain sampling. It pays where replies copy
+their prompt (code edits, refactors: 2.6-4.6x plain decode on Qwen3.5-0.8B and
+4B) and costs elsewhere (chat at about 0.5-0.7x plain), so it is opt-in per
+deployment. Under it the
+mixed prefill-and-decode walk is off, ``repetition_penalty`` and ``min_tokens``
+are refused, and ``sampled_verify: false`` serves temperature 0 only, skipping
+the per-step filtering a sampled verify does. ``max_ngram`` and ``min_ngram``
+(4 and 2) bound the suffix looked up.
+
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::
 
@@ -376,6 +390,28 @@ refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends.
+
+Text LMs (``qwen3_*b``, ``qwen3_coder_30b_a3b``)
+-----------------------------------------------
+
+Text chat on the generic text LM (``mstar/model/text_lm``), which serves any
+``qwen3`` / ``qwen3_moe`` checkpoint::
+
+    mstar serve qwen3_8b --gpus 0
+
+``enable_thinking`` passes through to the chat template (Qwen3's default is on).
+``model_kwargs.draft`` makes decode speculative, as for Qwen3.5: ``method:
+ngram`` drafts by prompt lookup, and ``method: draft_model`` with ``model:``
+a smaller checkpoint of the same tokenizer drafts with it inside the LLM node
+(``configs/qwen3_8b_draft.yaml``: Qwen3-0.6B drafting 4 tokens a step for
+Qwen3-8B). The drafter runs on KV of its own, one token behind the target's, and
+a decode step (its passes, the target over the block, the verdict) replays as
+one CUDA graph; its prefill runs eager beside the target's. ``draft_sample:
+true`` draws the drafts as the request samples instead of taking the drafter's
+argmax. A deployment sizes the drafter's KV pool with ``resources: draft_kv:
+max_num_pages``. Under either method ``repetition_penalty`` and ``min_tokens``
+are refused, prefix caching is off on the node, and a draft model needs a
+prompt of at least two tokens.
 
 Command A+ (``command_a_plus``)
 -------------------------------

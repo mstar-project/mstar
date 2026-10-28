@@ -18,6 +18,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
 )
+from mstar.engine.resources.draft_verify.config import DraftConfig
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
@@ -166,15 +167,21 @@ class Qwen3_5DenseModel(Model):
     PREPROCESS_TORCH_THREADS = 4
 
     _text_detokenizer: TextChunkDetokenizer | None = None
+    # draft verify off; `__init__` reads the `draft` kwarg
+    draft: DraftConfig | None = None
 
     def __init__(
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        draft: dict | None = None,
         **kwargs: Any,
     ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
+        # `model_kwargs: {draft: {method: ngram, ...}}`: decode drafts and verifies
+        # (speculative decoding, `DraftConfig`); None decodes a token a step
+        self.draft = DraftConfig.from_kwargs(draft)
 
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
@@ -235,7 +242,7 @@ class Qwen3_5DenseModel(Model):
                 resource_key=ATTN, nodes={"LLM"},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
-                    splits=(_MIXED_SPLIT,),
+                    splits=self._mixed_splits(),
                 ),
             ),
             PositionSpec(
@@ -260,16 +267,25 @@ class Qwen3_5DenseModel(Model):
                 config=LinearAttnConfig(
                     recurrent_state=GDN_STATE,
                     variant=LinearAttnVariant.GDN,
-                    splits=(_MIXED_SPLIT,),
+                    splits=self._mixed_splits(),
                 ),
             ),
             SamplerSpec(
                 resource_key=SAMPLER, nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
+                # the verify refuses what it can't keep exact (a penalty, a greedy-only
+                # deployment's temperature)
+                draft_verify=self.draft is not None,
+                enable_sampled_verify=self.draft is not None and self.draft.sampled_verify,
             ),
+            *(self.draft.resources({"LLM"}, sampler=SAMPLER) if self.draft is not None else ()),
             *self._vision_resources(),
         ]
+
+    def _mixed_splits(self) -> tuple[CombinedSplit, ...]:
+        # the mixed walk is off under draft verify, whose rows need a step of their own
+        return () if self.draft is not None else (_MIXED_SPLIT,)
 
     def _vision_resources(self) -> list[NodeResourceSpec]:
         """The ViT tower's attention, its only resource; none when text-only."""
@@ -302,6 +318,9 @@ class Qwen3_5DenseModel(Model):
     # Model ABC: walk graph declaration
     # -----------------------------------------------------------------------
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        # read off the class too (a test asks it of no instance)
+        if getattr(self, "draft", None) is not None:
+            return {}
         return {"LLM": {LLM_MIXED: {"prefill_text", "decode"}}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -330,7 +349,9 @@ class Qwen3_5DenseModel(Model):
                     ),
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
-                        name="text_inputs",
+                        # under draft verify the loop-back is the next input and the engine
+                        # emits each step's accepted tokens apart (`DraftPolicy.emit`)
+                        name="new_token" if self.draft is not None else "text_inputs",
                         output_modality="text",
                     ),
                 ],
@@ -573,7 +594,11 @@ class Qwen3_5DenseModel(Model):
             return (Span("rows" if video else "digest", walk, rows, vision_position_advance(grid, merge) + 2, source),)
 
         plan = prefill_plan(expand_video_parts(parts, groups))
-        layout = LabelLayout(spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),))
+        layout = LabelLayout(
+            spans=tuple(prompt_spans(plan, segments, walk, media)), growth=(("decode_loop", 1),),
+            # under draft verify, the rows a verify step writes past the tokens it keeps
+            lookahead=self.draft.policy().lookahead if self.draft is not None else 0,
+        )
         # always set, so a `video_groups` the client sent never reaches the schedule
         return ProcessPromptOutput(result, {"video_groups": groups, "kv_layout": {KV_CACHE: {"main": layout}}})
 
@@ -889,7 +914,7 @@ class Qwen3_5DenseModel(Model):
             # collective over the TP group; every rank builds the LLM here
             tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
-        return LLMSubmodule(model, self.config, self.vision_config)
+        return LLMSubmodule(model, self.config, self.vision_config, draft=self.draft)
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:

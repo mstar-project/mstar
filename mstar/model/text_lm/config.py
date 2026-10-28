@@ -25,7 +25,8 @@ class LMFamily(NamedTuple):
     resources are declared from (``num_hidden_layers``, ``num_attention_heads``,
     ``num_key_value_heads``, ``head_dim``, ``rope_theta``, ``vocab_size``). ``build`` makes the
     language model, which has ``embed(ids)``, ``forward(embeds, *, label)``, ``logits(hidden)``
-    and ``load_weights(pairs)``. ``weight_name`` maps a checkpoint key to the module's, or None
+    and ``load_weights(pairs)``, its layers bound to the resource keys ``keys`` (attention, KV,
+    positions; a draft model's are its own). ``weight_name`` maps a checkpoint key to the module's, or None
     to skip it.
     """
     config: Callable[[dict], object]
@@ -48,10 +49,11 @@ def _qwen3_config(hf: dict):
     return Qwen3LMConfig.from_hf(hf)
 
 
-def _qwen3_build(config, *, comm_group=None, moe_parallel=None) -> nn.Module:
+def _qwen3_build(config, *, comm_group=None, moe_parallel=None, keys=(ATTN, KV_CACHE, ROPE)) -> nn.Module:
     from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3MoeLM
 
-    keys = dict(attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=comm_group)
+    attn, kv, pos = keys
+    keys = dict(attn_key=attn, kv_key=kv, pos_key=pos, comm_group=comm_group)
     if config.num_experts:
         return Qwen3MoeLM(config, moe_parallel=moe_parallel, **keys)
     return Qwen3DenseLM(config, **keys)

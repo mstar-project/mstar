@@ -1,0 +1,32 @@
+# qwen3_5_0.8b.yaml with prompt-lookup speculative decoding: each decode step runs the last
+# token and up to `max_drafts` tokens copied from the request's own prompt and reply, and keeps
+# the ones the model agrees with (exact: greedy and sampled output are unchanged). Pays where
+# replies repeat their prompt (code edits, refactors, summaries); costs where they don't (chat
+# runs at about 0.5-0.7x plain decode). Off: drop `draft`.
+model: "qwen3_5_0.8b"
+max_seq_len: 32768
+node_groups:
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]
+resources:
+  gdn_state:
+    max_slots: 129
+model_kwargs:
+  draft:
+    method: ngram
+    # drafts per step; each decode row then runs max_drafts + 1 tokens
+    max_drafts: 4
+    # the longest and shortest suffix looked up in the request's history
+    max_ngram: 4
+    min_ngram: 2
+    # serve temperature > 0 by rejection sampling; false serves temperature 0 only, and
+    # saves filtering every row of each block
+    sampled_verify: true
+
+warmup_requests:
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
+    model_kwargs: {max_output_tokens: 4}
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/edge_action_id_av_0_output.png]
+    model_kwargs: {max_output_tokens: 4}

@@ -29,6 +29,15 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.draft_verify.config import (
+    DRAFT_VERIFY,
+    NGRAM,
+    DraftConfig,
+    DraftPolicy,
+    ProposeStep,
+    with_draft_verify,
+)
+from mstar.engine.resources.draft_verify.drafter import draft_verify_step
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.position.config import PositionStep
@@ -85,6 +94,9 @@ logger = logging.getLogger(__name__)
 class LLMSubmodule(ARNodeSubmodule):
     # the decode walk reads its input ids off the sampler's slot masters
     reads_device_loopback = True
+    # draft verify off (see `__init__`)
+    _draft: DraftConfig | None = None
+    _draft_policy: DraftPolicy | None = None
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
@@ -134,12 +146,25 @@ class LLMSubmodule(ARNodeSubmodule):
         model: Qwen3_5ForCausalLM,
         config: Qwen3_5Config,
         vision_config: Qwen3_5VisionConfig | None = None,
+        draft: DraftConfig | None = None,
     ):
         super().__init__()
         self.model = model
         self.config = config
         self.vision_config = vision_config
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Draft verify (speculative decoding): each decode step runs the last emitted token and
+        # the proposer's drafts, and the engine keeps the drafts the model agrees with. Its
+        # tokens are cut on the host, so decode takes its input as a tensor, not off the
+        # sampler's slot masters.
+        self._draft = draft
+        self._draft_policy: DraftPolicy | None = (
+            draft.policy(stop_ids=config.stop_token_ids) if draft is not None else None
+        )
+        self.reads_device_loopback = draft is None
+
+    def get_draft_policy(self, graph_walk: str) -> DraftPolicy | None:
+        return self._draft_policy if graph_walk == "decode" else None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -174,18 +199,12 @@ class LLMSubmodule(ARNodeSubmodule):
                 },
             )
 
-        return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk="decode",
-                single_request_inputs=dummy(1),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            ),
-            PackedAcceleratorGraphConfig(
-                capture_graph_walk="prefill_text",
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                make_node_input=dummy,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-            ),
+        policy = self._draft_policy
+        decode_row = dummy(1) if policy is None else ARNodeInputs(
+            # one token in, the last emitted: the step verifies it and the drafts
+            input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=policy.block,
+        )
+        mixed = [] if policy is not None else [
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=LLM_MIXED,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
@@ -194,6 +213,20 @@ class LLMSubmodule(ARNodeSubmodule):
                 # the layout its GDN splits; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
             ),
+        ]
+        return [
+            BatchedAcceleratorGraphConfig(
+                capture_graph_walk="decode",
+                single_request_inputs=decode_row,
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            ),
+            PackedAcceleratorGraphConfig(
+                capture_graph_walk="prefill_text",
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=dummy,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            ),
+            *mixed,
             PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_vision",
                 capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
@@ -328,6 +361,9 @@ class LLMSubmodule(ARNodeSubmodule):
             # `preprocess`; the routed signal is empty (or ignored) here
             return ARNodeInputs(input_seq_len=1)
         input_ids = inputs["text_inputs"][0]
+        if graph_walk == "decode" and self._draft_policy is not None:
+            # the last emitted token, which the step verifies with its drafts
+            return ARNodeInputs(input_ids=input_ids.reshape(-1)[-1:], input_seq_len=self._draft_policy.block)
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
     def uniform_row_inputs(
@@ -340,7 +376,8 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _device_loopback(self) -> bool:
         return (
-            device_loopback_enabled()
+            self._draft_policy is None
+            and device_loopback_enabled()
             and self.node_resources[SAMPLER].has_slot_masters
         )
 
@@ -386,6 +423,9 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
+        if graph_walk == "decode" and self._draft_policy is not None:
+            # the verify forward builds its block and the block's rotary tables itself
+            return {"input_ids": torch.cat([inp.input_ids for inp in inputs])}
         captured = self._captured_decode(engine_inputs, graph_walk)
         first = inputs[0]
         if first.input_embeds is None and (
@@ -478,6 +518,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 int(inp.tensor_inputs["mrope_advance"]) for inp in inputs
             )
 
+        if self._draft_policy is not None:
+            return self._declare_drafting_step(graph_walk, request_ids, inputs, prefill_tokens, kept_rids, advance)
         return SubmoduleStep(
             segments=[
                 Segment(
@@ -501,9 +543,48 @@ class LLMSubmodule(ARNodeSubmodule):
             },
         )
 
+    def _declare_drafting_step(
+        self, graph_walk, request_ids, inputs, prefill_tokens, kept_rids, advance,
+    ) -> SubmoduleStep:
+        """``declare_step`` under draft verify: a decode step verifies (the sampler step is
+        ``with_draft_verify``'s), and a prefill hands the n-gram proposer its prompt."""
+        segments = [
+            Segment(request_id=rid, label="main", span=inp.input_seq_len)
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        ]
+        steps = {
+            KV_CACHE: KVStep(),
+            ATTN: AttentionStep(causal=True),
+            GDN_STATE: RecurrentStep(),
+            LINEAR_ATTN: LinearAttnStep(),
+            ROPE: PositionStep(advance=advance),
+        }
+        if graph_walk == "decode":
+            return with_draft_verify(
+                SubmoduleStep(segments=segments, steps=steps), self._draft_policy, DRAFT_VERIFY, sampler=SAMPLER,
+            )
+        steps[SAMPLER] = SamplerStep(apply_penalty=True, prefill_tracked_tokens=prefill_tokens, kept_rids=kept_rids)
+        steps[NGRAM] = ProposeStep(history=prefill_tokens)
+        return SubmoduleStep(segments=segments, steps=steps)
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+
+    def _verify(
+        self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """A verify step: the trunk over each row's block (its input token and the proposer's
+        drafts), verified by the draft-verify resource, which keeps the drafts the model
+        agrees with. Returns each row's next input token."""
+
+        def target(ids: torch.Tensor) -> torch.Tensor:
+            cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, ids.shape[0])
+            hidden = self.model.model(self.model.model.embed_tokens(ids), label="main", cos_sin=(cos_3d, sin_3d))
+            return self.model.lm_head(hidden)
+
+        dv = engine_inputs.resources[DRAFT_VERIFY]
+        return draft_verify_step(dv, list(engine_inputs.request_ids), input_ids, target)
 
     def _forward(
         self,
@@ -548,6 +629,8 @@ class LLMSubmodule(ARNodeSubmodule):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
+        if graph_walk == "decode" and self._draft_policy is not None:
+            return {"text_inputs": self._verify(engine_inputs, input_ids)}
         return {
             "new_token": self._forward(
                 graph_walk, engine_inputs, cos_3d, sin_3d,
@@ -579,6 +662,9 @@ class LLMSubmodule(ARNodeSubmodule):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> BatchedModelOutput:
+        if graph_walk == "decode" and self._draft_policy is not None:
+            # the emitted tokens are the engine's cut of the verdict (`policy.emit`)
+            return BatchedModelOutput(row_outputs={"text_inputs": self._verify(engine_inputs, input_ids)})
         new_tokens = self._forward(
             graph_walk, engine_inputs, cos_3d, sin_3d,
             input_ids=input_ids, input_embeds=input_embeds,
@@ -603,6 +689,9 @@ class LLMSubmodule(ARNodeSubmodule):
     ):
         if not self._token_is_real(request_info):
             outputs.pop("new_token", None)
+            return
+        if request_info.graph_walk == "decode" and self._draft_policy is not None:
+            # the forward returned the next input; new_token is the engine's cut of the verdict
             return
         # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
         # tested in `check_stop` so the GPU thread never syncs on `.item()`.
@@ -642,8 +731,9 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the decode loop's client edge carries the sampled token the stop
-        # check already has on the host; prefill's new_token edge is persisted
-        return {"text_inputs": "new_token"} if graph_walk == "decode" else {}
+        # check already has on the host; prefill's new_token edge is persisted.
+        # A verify step emits a run of tokens per row, sent as a tensor.
+        return {"text_inputs": "new_token"} if graph_walk == "decode" and self._draft_policy is None else {}
 
     def check_stop_batched(
         self,

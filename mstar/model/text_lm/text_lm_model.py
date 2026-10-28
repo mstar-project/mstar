@@ -4,6 +4,10 @@ The checkpoint's ``model_type`` picks the language-model family (``config.LM_FAM
 its config, its module and its weight names are all that differ between models here. The
 graph (a prefill, then a decode loop), the resources (paged KV, attention, RoPE positions,
 sampler), the chat template, stop handling and prefix-cache keys are shared.
+
+``model_kwargs.draft`` (``DraftConfig``) makes decode speculative: every decode step verifies
+``max_drafts`` drafts, from prompt lookup (``method: ngram``) or from a smaller checkpoint of the
+same tokenizer inside the node (``method: draft_model``, ``mstar.model.components.draft_model``).
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
+    DraftConfig,
     KVSpec,
     NodeResourceSpec,
     PagedKVConfig,
@@ -28,7 +33,7 @@ from mstar.engine.resources import (
     SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
     ForwardPassArgs,
     KVLabel,
@@ -38,6 +43,7 @@ from mstar.model.base import (
     ProcessPromptOutput,
     Span,
 )
+from mstar.model.components.draft_model import DraftModel
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.text_lm.config import (
@@ -58,6 +64,10 @@ logger = logging.getLogger(__name__)
 
 # sampling knobs a request may set, and the checkpoint's generation_config.json may default
 _SAMPLING_KEYS = ("temperature", "top_p", "top_k", "repetition_penalty")
+# a draft model's files the API server and conductor read (its config and tokenizer), and the
+# ones a worker loads
+_DRAFT_METADATA = ["*.json", "*.txt"]
+_DRAFT_WEIGHTS = ["*.json", "*.safetensors"]
 
 
 class TextLMModel(Model):
@@ -78,6 +88,7 @@ class TextLMModel(Model):
         max_output_tokens: int = 4096,
         accelerator_graph: bool = True,
         prefill_token_buckets: list[int] | None = None,
+        draft: dict | None = None,
         **kwargs,
     ):
         self.cache_dir = cache_dir
@@ -95,7 +106,16 @@ class TextLMModel(Model):
         self.max_seq_len = int(max_seq_len)
         self.default_max_output_tokens = int(max_output_tokens)
         self.accelerator_graph = bool(accelerator_graph)
+        # `model_kwargs: {draft: {...}}`: decode drafts and verifies (speculative decoding,
+        # `DraftConfig`); None decodes a token a step
+        self.draft = DraftConfig.from_kwargs(draft)
+        self.draft_model: DraftModel | None = None
+        if self.draft is not None and self.draft.method == "draft_model":
+            self._init_draft_model()
         buckets = self.PREFILL_TOKEN_BUCKETS if prefill_token_buckets is None else prefill_token_buckets
+        if self.draft_model is not None:
+            # the drafter prefills each prompt but its last token beside the target: eager
+            buckets = []
         # a bucket past the context could never be replayed
         self.prefill_token_buckets = [int(n) for n in buckets if int(n) <= self.max_seq_len]
         generation = self.local_dir / "generation_config.json"
@@ -104,6 +124,32 @@ class TextLMModel(Model):
         self._detokenizer = None
         self._stop_token_ids: frozenset[int] | None = None
         self._submodule: NodeSubmodule | None = None
+
+    def _init_draft_model(self) -> None:
+        """The draft model's declaration from its checkpoint's config: any family here, the
+        target's tokenizer, a KV pool of its own (``resources: draft_kv: ...`` resizes it)."""
+        path = self.draft.model
+        self.draft_dir = resolve_snapshot_dir(path, cache_dir=self.cache_dir, allow_patterns=_DRAFT_METADATA)
+        hf = json.loads((self.draft_dir / "config.json").read_text())
+        if hf.get("model_type") not in LM_FAMILIES:
+            raise ValueError(f"the draft model {path} is a {hf.get('model_type')!r}; known: {sorted(LM_FAMILIES)}")
+        self.draft_family = LM_FAMILIES[hf["model_type"]]
+        self.draft_config = config = self.draft_family.config(hf)
+        if config.vocab_size != self.config.vocab_size or _vocab(self.draft_dir) != _vocab(self.local_dir):
+            raise ValueError(
+                f"the draft model {path} tokenizes differently from the target; a draft model shares "
+                "the target's tokenizer"
+            )
+        if config.max_position_embeddings < self.max_seq_len:
+            raise ValueError(f"the draft model {path} takes {config.max_position_embeddings} positions, "
+                             f"short of max_seq_len {self.max_seq_len}")
+        self.draft_model = DraftModel(
+            max_drafts=self.draft.max_drafts, sample=self.draft.draft_sample, rope_theta=config.rope_theta,
+            kv=PagedKVConfig(
+                num_layers=config.num_hidden_layers, num_kv_heads=config.num_key_value_heads,
+                num_qo_heads=config.num_attention_heads, head_dim=config.head_dim, max_seq_len=self.max_seq_len,
+            ),
+        )
 
     @property
     def prebuild_fused_moe(self) -> bool:
@@ -151,17 +197,33 @@ class TextLMModel(Model):
             head_dim=config.head_dim,
             max_seq_len=self.max_seq_len,
         )
-        return [
+        # a verify step can't penalize per draft position: a drafting node refuses penalties,
+        # and its verify samples at temperature > 0 unless the deployment turns that off
+        sampling = {} if self.draft is None else dict(
+            enable_repetion_penalty=False, draft_verify=True, enable_sampled_verify=self.draft.sampled_verify,
+        )
+        specs = [
             KVSpec(resource_key=KV_CACHE, nodes=nodes, config=kv),
             AttentionSpec(resource_key=ATTN, nodes=nodes, config=AttentionConfig(kv_cache=KV_CACHE)),
             PositionSpec(
                 resource_key=ROPE, nodes=nodes,
                 config=PositionConfig(kv_cache=KV_CACHE, rope_theta=config.rope_theta),
             ),
-            SamplerSpec(resource_key=SAMPLER, nodes=nodes, vocab_size=config.vocab_size),
+            SamplerSpec(resource_key=SAMPLER, nodes=nodes, vocab_size=config.vocab_size, **sampling),
         ]
+        if self.draft is not None:
+            specs += self.draft.resources(nodes, sampler=SAMPLER)
+        if self.draft_model is not None:
+            specs += self.draft_model.node_resources(nodes)
+        return specs
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        if self.draft is not None:
+            # a verifying walk keeps no prefix-cache keys (draft verify refuses them)
+            labels = {KV_CACHE: {"main": KVLabel(growth=((DECODE_WALK, DECODE_LOOP),))}}
+            if self.draft_model is not None:
+                labels.update(self.draft_model.kv_labels(DECODE_WALK, DECODE_LOOP))
+            return labels
         # the reply's ids extend the keys: an agent's next turn resends them in its prompt
         return {KV_CACHE: {"main": KVLabel(
             growth=((DECODE_WALK, DECODE_LOOP),),
@@ -181,6 +243,10 @@ class TextLMModel(Model):
         defaults = dict(self.generation)
         if defaults.get("do_sample") is False:
             defaults = {"temperature": 0.0}
+        if self.draft is not None:
+            # a drafting node can't penalize: the checkpoint's default penalty (Qwen3-Coder's
+            # 1.05) is dropped, and a request that names one is refused
+            defaults.pop("repetition_penalty", None)
         for key in _SAMPLING_KEYS:
             value = kw.get(key, defaults.get(key))
             if value is not None:
@@ -192,14 +258,16 @@ class TextLMModel(Model):
     # -------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        prefill = GraphNode(
-            name=LLM_NODE,
-            input_names=["text_inputs"],
-            outputs=[GraphEdge(
-                next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text",
-                conductor_new_token=True, persist=True,
-            )],
-        )
+        drafter = self.draft_model is not None
+        outputs = [GraphEdge(
+            next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text",
+            conductor_new_token=True, persist=not drafter,
+        )]
+        if drafter:
+            # a draft model's first verify step starts from the prompt's last token and the
+            # sampled one
+            outputs.append(GraphEdge(next_node=EMPTY_DESTINATION, name="decode_input", persist=True))
+        prefill = GraphNode(name=LLM_NODE, input_names=["text_inputs"], outputs=outputs)
         decode = Loop(
             name=DECODE_LOOP,
             section=GraphNode(
@@ -249,7 +317,7 @@ class TextLMModel(Model):
         metadata.is_prefill = False
         metadata.graph_walk = DECODE_WALK
         edge = GraphEdge(next_node=LLM_NODE, name="text_inputs")
-        edge.tensor_info = persist_signals.get("new_token", [])
+        edge.tensor_info = persist_signals.get("decode_input" if self.draft_model is not None else "new_token", [])
         return ForwardPassArgs(full_metadata=metadata, inputs=[edge], unpersist_tensors=list(edge.tensor_info))
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
@@ -283,17 +351,26 @@ class TextLMModel(Model):
             ids = self._render_chat(prompt, prompt_parts, kwargs)
         ids = ids.reshape(-1).to(torch.long)
         budget = self.get_max_output_tokens(**kwargs)
+        # under drafting, the rows a verify step writes past the tokens it keeps
+        lookahead = 0 if self.draft is None else self.draft.policy().lookahead
         # here, in the data worker, a ValueError reaches the client as a 400
-        if ids.numel() == 0 or ids.numel() + budget > self.max_seq_len:
+        if ids.numel() == 0 or ids.numel() + budget + lookahead > self.max_seq_len:
+            extra = f" + the drafts' lookahead ({lookahead})" if lookahead else ""
             raise ValueError(
-                f"prompt ({ids.numel()} tokens) + max_output_tokens ({budget}) must fit "
+                f"prompt ({ids.numel()} tokens) + max_output_tokens ({budget}){extra} must fit "
                 f"max_seq_len ({self.max_seq_len})"
             )
         if bool(((ids < 0) | (ids >= self.config.vocab_size)).any()):
             raise ValueError("prompt token ids must be within the vocabulary")
         n = ids.numel()
-        layout = LabelLayout(spans=(Span("ids", PREFILL_WALK, n, n, "text_inputs"),), growth=((DECODE_LOOP, 1),))
-        return ProcessPromptOutput({"text_inputs": [ids]}, {"kv_layout": {KV_CACHE: {"main": layout}}})
+        layout = LabelLayout(
+            spans=(Span("ids", PREFILL_WALK, n, n, "text_inputs"),), growth=((DECODE_LOOP, 1),), lookahead=lookahead,
+        )
+        kv_layout = {KV_CACHE: {"main": layout}}
+        if self.draft_model is not None:
+            self.draft_model.check_prompt(n)
+            kv_layout.update(self.draft_model.kv_layout(n, PREFILL_WALK, DECODE_LOOP, lookahead))
+        return ProcessPromptOutput({"text_inputs": [ids]}, {"kv_layout": kv_layout})
 
     def _render_chat(self, prompt: str | None, prompt_parts: list[PromptPart] | None, kwargs: dict) -> torch.Tensor:
         """The chat's turns through the checkpoint's template, the assistant turn opened. A
@@ -365,8 +442,39 @@ class TextLMModel(Model):
             if (name := self.family.weight_name(key)) is not None
         )
         lm.eval()
+        drafter = None
+        if self.draft_model is not None:
+            drafter = self._build_drafter(device, tp_group, autocast_dtype, moe_parallel)
         return TextLMSubmodule(
             lm, stop_token_ids=self.stop_token_ids, accelerator_graph=self.accelerator_graph,
-            prefill_token_buckets=self.prefill_token_buckets,
+            prefill_token_buckets=self.prefill_token_buckets, draft=self.draft, drafter=drafter,
         )
+
+    def _build_drafter(self, device, tp_group, autocast_dtype, moe_parallel):
+        """The draft model's LM on its own resources, sharded like the target."""
+        from mstar.model.components.draft_model import DraftLLMProposer
+        from mstar.model.loader.iterators import iter_safetensors_shards
+
+        weights_dir = resolve_snapshot_dir(self.draft.model, cache_dir=self.cache_dir, allow_patterns=_DRAFT_WEIGHTS)
+        keys = self.draft_model.keys
+        with torch.device("meta"):
+            lm = self.draft_family.build(
+                self.draft_config, comm_group=tp_group, moe_parallel=moe_parallel, keys=(keys.attn, keys.kv, keys.pos),
+            )
+        if autocast_dtype is not None:
+            lm = lm.to(autocast_dtype)
+        lm.to_empty(device=device)
+        lm.load_weights(
+            (name, tensor) for key, tensor in iter_safetensors_shards(weights_dir, device=device)
+            if (name := self.draft_family.weight_name(key)) is not None
+        )
+        lm.eval()
+        logger.info("%s drafts %d tokens a step", self.draft.model, self.draft.max_drafts)
+        return DraftLLMProposer(self.draft_model, lm)
+
+
+def _vocab(directory) -> dict | None:
+    """A checkpoint's tokenizer vocabulary, None without a ``tokenizer.json``."""
+    path = directory / "tokenizer.json"
+    return json.loads(path.read_text())["model"]["vocab"] if path.is_file() else None
 

@@ -849,6 +849,13 @@ def _text_lm(name, model_kwargs, tmp_path, monkeypatch):
         "model_type": "qwen3",
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
+    draft = model_kwargs.get("draft") or {}
+    if draft.get("model"):
+        # a draft model's config.json beside it (the target's own, so it tokenizes alike)
+        drafter = tmp_path / "drafter"
+        drafter.mkdir()
+        (drafter / "config.json").write_text(json.dumps(config))
+        model_kwargs = {**model_kwargs, "draft": {**draft, "model": str(drafter)}}
     return _constructed(name, model_kwargs, checkpoint_path=str(tmp_path))
 
 
