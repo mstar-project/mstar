@@ -168,9 +168,9 @@ def test_init_dist_sets_up_every_comm_group(monkeypatch, fake_cuda):
     )
     tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
     sp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1, 2, 3])
-    groups.add("llm", tp)
-    groups.add("llm_cfg", tp)  # same object twice: set up once
-    groups.add_sp("llm", sp)
+    groups.add("llm", tp, "tp")
+    groups.add("llm_cfg", tp, "tp")  # same object twice: set up once
+    groups.add("llm", sp, "sp")
     groups.init_dist(device=torch.device("cpu"))
 
     assert len(_FakeSymm.instances) == 2
@@ -215,7 +215,7 @@ def test_init_dist_takes_the_config_mode(monkeypatch, fake_cuda):
         world_parallel_groups=[(0, 1)], tp_allreduce="symm_multimem",
     )
     tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
-    groups.add("llm", tp)
+    groups.add("llm", tp, "tp")
     groups.init_dist(device=torch.device("cpu"))
     assert tp._all_reduce.mode == "symm_multimem"
 

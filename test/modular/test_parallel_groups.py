@@ -44,8 +44,8 @@ def test_shared_tp_group_with_no_sp():
     identity check saw two different objects and rejected a valid spec."""
     groups = _groups()
     tp = _tp([0, 1])
-    groups.add("llm", tp)
-    groups.add("llm_cfg", tp)
+    groups.add("llm", tp, "tp")
+    groups.add("llm_cfg", tp, "tp")
 
     assert groups.all_in_same_group(["llm", "llm_cfg"]) is True
 
@@ -53,25 +53,25 @@ def test_shared_tp_group_with_no_sp():
 def test_equivalent_tp_groups_registered_separately():
     """Same membership, distinct objects — still the same group."""
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
-    groups.add("llm_cfg", _tp([0, 1]))
+    groups.add("llm", _tp([0, 1]), "tp")
+    groups.add("llm_cfg", _tp([0, 1]), "tp")
 
     assert groups.all_in_same_group(["llm", "llm_cfg"]) is True
 
 
 def test_different_tp_groups_are_rejected():
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
-    groups.add("codec", _tp([2, 3]))
+    groups.add("llm", _tp([0, 1]), "tp")
+    groups.add("codec", _tp([2, 3]), "tp")
 
     assert groups.all_in_same_group(["llm", "codec"]) is False
 
 
 def test_remote_replicas_are_excluded_before_group_validation():
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
-    groups.add("llm_cfg_text", _tp([2, 3]))
-    groups.add("llm_cfg_img", _tp([4, 5]))
+    groups.add("llm", _tp([0, 1]), "tp")
+    groups.add("llm_cfg_text", _tp([2, 3]), "tp")
+    groups.add("llm_cfg_img", _tp([4, 5]), "tp")
 
     spec_nodes = {"llm", "llm_cfg_text", "llm_cfg_img"}
     local_nodes = spec_nodes & {"llm"}
@@ -82,7 +82,7 @@ def test_remote_replicas_are_excluded_before_group_validation():
 
 def test_tp_node_and_unparallelized_node_are_rejected():
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
+    groups.add("llm", _tp([0, 1]), "tp")
 
     assert groups.all_in_same_group(["llm", "codec"]) is False
 
@@ -90,10 +90,10 @@ def test_tp_node_and_unparallelized_node_are_rejected():
 def test_sp_is_checked_too():
     groups = _groups()
     tp = _tp([0, 1])
-    groups.add("a", tp)
-    groups.add("b", tp)
-    groups.add_sp("a", _tp([0, 1]))
-    groups.add_sp("b", _tp([2, 3]))
+    groups.add("a", tp, "tp")
+    groups.add("b", tp, "tp")
+    groups.add("a", _tp([0, 1]), "sp")
+    groups.add("b", _tp([2, 3]), "sp")
 
     assert groups.all_in_same_group(["a", "b"]) is False
 
@@ -102,19 +102,19 @@ def test_the_check_does_not_cache_groups_for_remote_nodes():
     """``spec.nodes`` names nodes this worker may not host; asking about them
     must not leave a trivial group behind for one that registers later."""
     groups = _groups()
-    groups.add("llm", _tp([0, 1]))
+    groups.add("llm", _tp([0, 1]), "tp")
 
     groups.all_in_same_group(["llm", "elsewhere"])
 
-    assert "elsewhere" not in groups.node_to_tp_group
-    assert "elsewhere" not in groups.node_to_sp_group
+    assert "elsewhere" not in groups.axis_groups["tp"]
+    assert "elsewhere" not in groups.axis_groups["sp"]
 
 
 def test_remote_replicas_with_matching_parallel_shapes_are_compatible():
     groups = _groups()
     groups.node_to_parallel_shapes = {
-        "llm": frozenset({(2, 1)}),
-        "llm_cfg": frozenset({(2, 1)}),
+        "llm": frozenset({(1, 2)}),
+        "llm_cfg": frozenset({(1, 2)}),
     }
 
     assert groups.all_have_compatible_parallel_shape({"llm", "llm_cfg"})
@@ -123,8 +123,8 @@ def test_remote_replicas_with_matching_parallel_shapes_are_compatible():
 def test_remote_replicas_with_different_parallel_shapes_are_rejected():
     groups = _groups()
     groups.node_to_parallel_shapes = {
-        "llm": frozenset({(2, 1)}),
-        "llm_cfg": frozenset({(4, 1)}),
+        "llm": frozenset({(1, 2)}),
+        "llm_cfg": frozenset({(1, 4)}),
     }
 
     assert not groups.all_have_compatible_parallel_shape({"llm", "llm_cfg"})
@@ -187,11 +187,11 @@ def test_init_dist_uses_mixed_groups_only_on_xpu(
     )
     tp = _tp([0, 1])
     sp = _tp([0, 1])
-    groups.add("llm", tp)
-    groups.add("llm_cfg", tp)
-    groups.add_sp("llm", sp)
+    groups.add("llm", tp, "tp")
+    groups.add("llm_cfg", tp, "tp")
+    groups.add("llm", sp, "sp")
     singleton = CommGroup.trivial()
-    groups.add("codec", singleton)
+    groups.add("codec", singleton, "tp")
     calls = []
     handles = {}
     devices = []

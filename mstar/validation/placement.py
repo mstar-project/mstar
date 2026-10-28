@@ -311,11 +311,11 @@ def _sharding_groups(
                         f"and {key!r}). v1 requires one TP group per worker graph; split "
                         "the worker graph or merge the groups."
                     )
-                if wg.tp_size != group.tp_size and (id(wg), "tp") not in reported:
+                if wg.instance_size != group.tp_size and (id(wg), "tp") not in reported:
                     reported.add((id(wg), "tp"))
                     yield (
-                        f"{_describe(wg)} has tp_size {wg.tp_size}, but its sharding group "
-                        f"has tp_size {group.tp_size}. node_groups and sharding_config disagree."
+                        f"{_describe(wg)} has instance size {wg.instance_size}, but its sharding "
+                        f"group has tp_size {group.tp_size}. node_groups and sharding_config disagree."
                     )
 
 
@@ -334,7 +334,7 @@ def _worker_parallelism(
     # GlobalParallelConfig and init_dist number workers by their position
     # among the deployment's ranks, and parallel groups by rank
     misplaced = sorted({
-        rank for wg in worker_graphs for group in wg._tp_ranks + wg._sp_ranks
+        rank for wg in worker_graphs for groups in wg._axis_ranks.values() for group in groups
         for rank in group if rank >= len(ranks) or ranks[rank] != rank
     })
     if misplaced:

@@ -1,8 +1,30 @@
 import math
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
+
+# The mesh axes of a node's lockstep instance, outermost first. An instance's
+# ranks are row-major over them, so the innermost axis, whose collectives run
+# most often, spans adjacent ranks.
+PARALLEL_AXES = ("sp", "tp")
+
+
+def mesh_groups(block: Sequence[int], sizes: Mapping[str, int]) -> dict[str, list[list[int]]]:
+    """Each axis's comm groups over one instance's ``block`` of ranks: a group
+    varies that axis's coordinate and holds the others fixed. Groups come in
+    ascending order of their first rank."""
+    groups: dict[str, list[list[int]]] = {}
+    stride = len(block)
+    for axis in PARALLEL_AXES:
+        size = sizes[axis]
+        stride //= size
+        groups[axis] = [
+            [block[i + k * stride] for k in range(size)]
+            for i in range(len(block)) if (i // stride) % size == 0
+        ]
+    return groups
 
 
 @dataclass

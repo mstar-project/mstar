@@ -342,7 +342,7 @@ def test_worker_graph_claimed_by_two_sharding_groups_is_refused():
 def test_worker_graph_and_sharding_group_tp_mismatch_is_refused():
     groups = [ShardingGroup(nodes={"a"}, tp_size=4)]
     assert list(_sharding_groups([_wg(["a"])], ShardingConfig(groups, set(), {}))) == [
-        "the worker graph of ['w'] with nodes ['a'] on ranks [0, 1] has tp_size 2, but its "
+        "the worker graph of ['w'] with nodes ['a'] on ranks [0, 1] has instance size 2, but its "
         "sharding group has tp_size 4. node_groups and sharding_config disagree."
     ]
 

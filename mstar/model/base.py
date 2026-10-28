@@ -1,4 +1,5 @@
 import itertools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -15,7 +16,7 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, ShardingGroup, mesh_groups
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.sampler.utils import SamplingConfig
@@ -196,21 +197,14 @@ class WorkerGraph:
     tp_size: int = 1
     sp_size: int = 1
 
-    # ``ranks`` form a 2D [sp_size, tp_size] mesh per instance (instances tile
-    # for data parallelism). ``_tp_ranks`` are the mesh rows (tensor-parallel
-    # comm groups: sharded heads/weights, all-reduce); ``_sp_ranks`` are the
-    # columns (sequence-parallel comm groups: Ulysses all-to-all);
-    # ``_instance_ranks`` are the whole instances (the conductor's lockstep
-    # routing unit — every rank of an instance runs a request together). With
-    # sp_size==1 this reduces to the old ``ranks`` chunked by ``tp_size``
-    # (trivial SP groups; instance == TP row). ``tp_size`` is rewritten in
-    # __post_init__ to the instance size (tp*sp) so the conductor — which models
-    # a parallel group as its lockstep unit — routes to the whole instance; the
-    # original per-axis degrees live in ``_tp_comm_size`` and ``sp_size``.
-    _tp_ranks: list[list[int]] = field(default_factory=list)
-    _sp_ranks: list[list[int]] = field(default_factory=list)
+    # ``ranks`` tile into lockstep instances (instances tile for data
+    # parallelism), each a row-major mesh over ``PARALLEL_AXES``.
+    # ``_axis_ranks`` holds each axis's comm groups (tp: sharded heads and
+    # weights, all-reduce; sp: Ulysses all-to-all); ``_instance_ranks`` are the
+    # whole instances (the conductor's lockstep routing unit — every rank of an
+    # instance runs a request together).
+    _axis_ranks: dict[str, list[list[int]]] = field(default_factory=dict)
     _instance_ranks: list[list[int]] = field(default_factory=list)
-    _tp_comm_size: int = 1
     _group_id: int = field(default=-1)  # original index into config's node_groups
 
     # Dense index over the deployment's worker graphs, reassigned by the
@@ -221,37 +215,31 @@ class WorkerGraph:
     worker_graph_id: int = field(default_factory=lambda: next(_wg_id_counter))
 
     def __post_init__(self):
-        if (self.tp_size > 1 or self.sp_size > 1) and not self._tp_ranks:
-            tp = self.tp_size  # tensor-parallel (row / all-reduce) degree
-            sp = self.sp_size  # sequence-parallel (all-to-all) degree
-            inst = tp * sp
+        inst = self.instance_size
+        if inst > 1:
             assert len(self.ranks) % inst == 0, (
                 f"WorkerGraph {self.worker_graph_id} has {len(self.ranks)} ranks; "
-                f"not divisible by tp_size*sp_size ({tp}*{sp}={inst})."
+                f"not divisible by its instance size ({self.axis_sizes}: {inst})."
             )
-            tp_ranks: list[list[int]] = []
-            sp_ranks: list[list[int]] = []
-            instance_ranks: list[list[int]] = []
-            for base in range(0, len(self.ranks), inst):
-                block = self.ranks[base:base + inst]
-                instance_ranks.append(block)
-                # row-major [sp][tp] grid over this instance's ranks
-                grid = [block[s * tp:(s + 1) * tp] for s in range(sp)]
-                tp_ranks += grid  # rows: vary tp within fixed sp
-                sp_ranks += [
-                    [grid[s][t] for s in range(sp)] for t in range(tp)
-                ]  # columns: vary sp within fixed tp
-            self._tp_ranks = tp_ranks
-            self._sp_ranks = sp_ranks
-            self._instance_ranks = instance_ranks
-            self._tp_comm_size = tp
-            # Conductor routes to the lockstep unit (the whole instance).
-            self.tp_size = inst
+            self._instance_ranks = [self.ranks[base:base + inst] for base in range(0, len(self.ranks), inst)]
+            self._axis_ranks = {axis: [] for axis in PARALLEL_AXES}
+            for block in self._instance_ranks:
+                for axis, groups in mesh_groups(block, self.axis_sizes).items():
+                    self._axis_ranks[axis] += groups
+
+    @property
+    def axis_sizes(self) -> dict[str, int]:
+        return {axis: getattr(self, f"{axis}_size") for axis in PARALLEL_AXES}
+
+    @property
+    def instance_size(self) -> int:
+        """Ranks in one lockstep instance: the conductor's routing unit."""
+        return math.prod(self.axis_sizes.values())
 
     @property
     def replica_ranks(self) -> list[list[int]]:
         """The ranks of each data-parallel replica: the lockstep instances, or
-        one rank apiece without TP/SP. The conductor routes a request to one."""
+        one rank apiece without a parallel axis. The conductor routes a request to one."""
         return self._instance_ranks or [[r] for r in self.ranks]
 
 

@@ -60,7 +60,7 @@ def _two_tp_groups() -> WorkerParallelGroups:
         num_workers=4, global_rank=0, any_parallelism=True,
         world_parallel_groups=[(0, 1), (2, 3)],
     )
-    groups.add("llm", CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]))
+    groups.add("llm", CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]), "tp")
     return groups
 
 
@@ -115,7 +115,7 @@ def test_serving_returns_every_group_to_torch_default(one_rank_gloo_world):
     sub = one_rank_gloo_world
     groups = _two_tp_groups()
     groups.dist_timeout_s = 3600
-    comm = groups.node_to_tp_group["llm"]
+    comm = groups.axis_groups["tp"]["llm"]
     comm.device_group = comm.cpu_group = sub
     assert _timeout(dist.group.WORLD) == _timeout(sub) == timedelta(seconds=3600)
 
