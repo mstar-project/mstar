@@ -68,6 +68,17 @@ class TestUsage(unittest.TestCase):
         self.assertEqual((u["cache_read_input_tokens"], u["output_tokens"]), (2000, 50))
         self.assertEqual((u["num_turns"], u["total_cost_usd"]), (2, 0.5))
 
+    def test_the_result_s_counts_win_over_the_messages(self):
+        per_model = {"claude-opus-5-5": {"inputTokens": 3, "outputTokens": 70, "cacheReadInputTokens": 5000,
+                                         "cacheCreationInputTokens": 200, "costUSD": 0.4},
+                     "claude-haiku-4-5": {"inputTokens": 1, "outputTokens": 9, "cacheReadInputTokens": 0,
+                                          "cacheCreationInputTokens": 0, "costUSD": 0.01}}
+        u = usage([assistant("msg_a", text("x")), {"type": "result", "modelUsage": per_model}])
+        self.assertEqual((u["tokens_from"], u["api_calls"]), ("result", 1))
+        self.assertEqual((u["input_tokens"], u["output_tokens"], u["cache_read_input_tokens"]), (4, 79, 5000),
+                         "calls missing from the transcript, e.g. another model's, would be left out")
+        self.assertEqual(u["models"]["claude-haiku-4-5"]["cost_usd"], 0.01)
+
     def test_synthetic_messages_are_not_api_calls(self):
         msg = assistant("msg_s", text("Credit balance is too low"))
         msg["message"]["model"] = "<synthetic>"
@@ -88,6 +99,7 @@ class TestUsage(unittest.TestCase):
             u = usage(load([str(Path(d, "exec.json")), str(Path(d, "projects")), str(Path(d, "missing.json"))]))
         self.assertEqual(u["api_calls"], 2)
         self.assertIsNone(u["num_turns"], "a run without a result message has no turn count")
+        self.assertEqual((u["tokens_from"], u["output_tokens"]), ("messages", 20))
 
     def test_a_corrupt_or_missing_execution_file_still_records(self):
         with tempfile.TemporaryDirectory() as d:

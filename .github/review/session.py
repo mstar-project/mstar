@@ -21,6 +21,9 @@ import sys
 from pathlib import Path
 
 TOKENS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+# The same counts in the result message's per-model ``modelUsage``.
+MODEL_USAGE = {"input_tokens": "inputTokens", "cache_creation_input_tokens": "cacheCreationInputTokens",
+               "cache_read_input_tokens": "cacheReadInputTokens", "output_tokens": "outputTokens"}
 # The prompt asks for notes that start with "Progress:"; tolerate Markdown around it.
 PROGRESS = re.compile(r"[#*_\s]*progress[*_\s]*:", re.IGNORECASE)
 NOTE_CHARS = 6000
@@ -67,7 +70,9 @@ def from_api(m):
 
 
 def usage(messages):
-    """API calls and token counts, one entry per API response, plus the run's result fields."""
+    """API calls (one per API response), token counts and the run's result fields. Tokens come
+    from the result's per-model counts, which cover every call the session made; only a run that
+    ended without a result (a timeout, a cancel) has them summed from its messages."""
     calls = {}
     for m in messages:
         if not from_api(m):
@@ -81,9 +86,19 @@ def usage(messages):
                 # Lines of one response repeat its usage; output_tokens can grow along them.
                 seen[k] = max(seen[k], u[k])
     result = next((m for m in reversed(messages) if m.get("type") == "result"), {})
+    models = result.get("modelUsage")
+    if isinstance(models, dict) and models:
+        models = {name: {**{k: u.get(f) if isinstance(u.get(f), int) else 0 for k, f in MODEL_USAGE.items()},
+                         "cost_usd": u.get("costUSD")}
+                  for name, u in models.items() if isinstance(u, dict)}
+        counts, source = list(models.values()), "result"
+    else:
+        models, counts, source = {}, list(calls.values()), "messages"
     return {
         "api_calls": len(calls),
-        **{k: sum(c[k] for c in calls.values()) for k in TOKENS},
+        **{k: sum(c[k] for c in counts) for k in TOKENS},
+        "tokens_from": source,
+        "models": models,
         "num_turns": result.get("num_turns"),
         "total_cost_usd": result.get("total_cost_usd"),
         "subtype": result.get("subtype"),
@@ -105,6 +120,7 @@ def usage_table(r):
         ("Input tokens, cache writes", n(r.get("cache_creation_input_tokens"))),
         ("Input tokens, cache reads", n(r.get("cache_read_input_tokens"))),
         ("Output tokens", n(r.get("output_tokens"))),
+        ("Tokens counted from", r.get("tokens_from") or "?"),
         ("Cost", "?" if cost is None else f"${cost:.2f}"),
     ]
     if r.get("error"):
