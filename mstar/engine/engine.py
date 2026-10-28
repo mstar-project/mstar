@@ -314,6 +314,9 @@ class ExecutingBatch:
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
+    # the one object every row shares, when the step was prepared with the
+    # submodule's ``uniform_row_inputs``
+    uniform_inputs: NodeInputs | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[int] = field(default_factory=set)
@@ -405,8 +408,9 @@ class ExecutingBatch:
     def graph_walk(self) -> str:
         return self.step_context.graph_walk
 
-    def register_prepare_batch(self, inputs: list[NodeInputs]):
+    def register_prepare_batch(self, inputs: list[NodeInputs], uniform: NodeInputs | None = None):
         self.inputs = inputs
+        self.uniform_inputs = uniform
 
     def release_waiters(self):
         """Let anything waiting on this step proceed.
@@ -1036,7 +1040,7 @@ class Engine:
                 # return an equal one each time (128 calls at a full decode
                 # batch, on the gpu thread before the launch)
                 node_inputs = [uniform] * len(batch.request_ids)
-                batch.register_prepare_batch(node_inputs)
+                batch.register_prepare_batch(node_inputs, uniform=uniform)
                 batch.running_batched = submodule.can_batch(
                     batch=batch, model_inputs=node_inputs
                 )
@@ -1364,7 +1368,7 @@ class Engine:
         inputs = batch.inputs
         req_info = batch.per_request_info_wrapped
         if lease is not None:
-            inputs = cg_runner.pad_inputs(lease, inputs)
+            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
             req_info = cg_runner.step_metadata(
                 lease, batch.request_ids, req_info
             )
@@ -2483,7 +2487,7 @@ class Engine:
         inputs = (
             cg_runner.declare_inputs_for(lease)
             if batch.inputs is None
-            else cg_runner.pad_inputs(lease, batch.inputs)
+            else cg_runner.pad_inputs(lease, batch.inputs, uniform=batch.uniform_inputs)
         )
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
