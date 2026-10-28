@@ -914,7 +914,16 @@ frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.</
 chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
 A request carries the whole camera trajectory as JSON in <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, which the API
 server caps at 1 MiB: about 3,900 frames of <code class="docutils literal notranslate"><span class="pre">[4,</span> <span class="pre">4]</span></code> float32 poses; send <code class="docutils literal notranslate"><span class="pre">[F,</span> <span class="pre">3,</span> <span class="pre">4]</span></code>
-rows for up to the 4,077-frame maximum. Needs <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>; one rollout per GPU.
+rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT’s attention runs
+through the engine’s ragged attention resource, its blocks are compiled (Inductor’s
+deterministic mode), the condition encode runs channels-last, and the VAE decode is
+channels-last, compiled and bf16 where cuDNN &gt;= 9.16 (frames 51 dB from the fp32 decode).
+<code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{reference_numerics:</span> <span class="pre">true}</span></code> runs the reference’s numerics instead
+(FlashAttention-2, needs <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>; an eager DiT; the fp32 contiguous encode and
+decode), with which a rollout is bit-identical to the reference’s.
+<code class="docutils literal notranslate"><span class="pre">lingbot_world_1_3b_fast.yaml</span></code> compiles the DiT with autotuned kernels
+(<code class="docutils literal notranslate"><span class="pre">dit_compile_autotune</span></code>): ~5% faster, but the rollout for a seed then differs from one
+server process to the next.
 The weights are CC-BY-NC-SA-4.0 (non-commercial, share-alike), not Apache-2.0; check it
 before deploying. The code is Apache-2.0, adapted from LingBot-World v1 (<code class="docutils literal notranslate"><span class="pre">Robbyant/lingbot-world</span></code>).</p></td>
 </tr>

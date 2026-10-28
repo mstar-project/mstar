@@ -1035,10 +1035,28 @@ window.runMermaid = runMermaid;</script>
     <span class="n">video_fps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
     <span class="n">max_chunks</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">255</span>  <span class="c1"># rollout ceiling, inside rope_max_frames</span>
 
-    <span class="c1"># The reference decodes in fp32. bf16 is faster on cuDNN &gt;= 9.16 but is not</span>
-    <span class="c1"># the reference's numerics.</span>
-    <span class="n">vae_decode_fp32</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="n">vae_decode_channels_last</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># True: the reference's numerics, with which a rollout is bit-identical to</span>
+    <span class="c1"># the reference's: both DiT attentions on FlashAttention-2 varlen (needs</span>
+    <span class="c1"># flash-attn), an eager DiT, and the fp32 contiguous eager VAE encode and</span>
+    <span class="c1"># decode. False: the engine's ragged attention resource (its backend is the</span>
+    <span class="c1"># deployment's; AUTO is FlashInfer's prefill, the cutlass FMHA on</span>
+    <span class="c1"># Blackwell), each DiT block compiled (Inductor's deterministic mode, eager</span>
+    <span class="c1"># rounding; the attentions and the cache writes stay eager), the fp32</span>
+    <span class="c1"># encode channels-last (187 -&gt; 140 ms per chunk on a B300 at 464x832 for</span>
+    <span class="c1"># the first ~8 chunks, after which the black-frame encode is cached; the</span>
+    <span class="c1"># latents within 0.0023 of the contiguous encode's), and the decode</span>
+    <span class="c1"># channels-last, compiled and bf16 where cuDNN &gt;= 9.16 has fast bf16</span>
+    <span class="c1"># conv3d (291 -&gt; 77 ms per 16-frame chunk, frames 51 dB from the fp32</span>
+    <span class="c1"># decode of the same latents; fp32 channels-last compiled, the pick under</span>
+    <span class="c1"># an older cuDNN, 135 ms at 71 dB). Nothing in the rollout reads the</span>
+    <span class="c1"># decoded frames, so the decode's error stays per frame. The compiles are</span>
+    <span class="c1"># per output size; the default size is compiled at load.</span>
+    <span class="n">reference_numerics</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Compile the blocks at the -O level's options instead of Inductor's</span>
+    <span class="c1"># deterministic defaults: 35.4 -&gt; 37.1 fps served at 464x832 on a B300</span>
+    <span class="c1"># (-O2), but each server process picks its own kernels, so one seed gives</span>
+    <span class="c1"># a different rollout per process. No effect under reference_numerics.</span>
+    <span class="n">dit_compile_autotune</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">head_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>

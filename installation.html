@@ -951,7 +951,7 @@ transport for disaggregated deployments.</p>
 <ul class="simple">
 <li><p><strong>FlashInfer</strong> (<code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>) — paged attention and continuous batching for the
 autoregressive backbones (every model with a <code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code> node runs attention through it).</p></li>
-<li><p><strong>flash-attn</strong> — used by Qwen3-Omni and LingBot-World. <strong>Not installed by any extra</strong>; install it separately
+<li><p><strong>flash-attn</strong> — used by Qwen3-Omni and by LingBot-World’s <code class="docutils literal notranslate"><span class="pre">reference_numerics</span></code> mode. <strong>Not installed by any extra</strong>; install it separately
 (see <a class="reference internal" href="#flash-attn-qwen3-omni-lingbot-world">flash-attn (Qwen3-Omni, LingBot-World)</a>).</p></li>
 <li><p><strong>flash-attn-4</strong> — Waypoint’s flex-attention <code class="docutils literal notranslate"><span class="pre">FLASH</span></code> backend. <strong>Not installed by any
 extra</strong>; install it separately (see <a class="reference internal" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a>).</p></li>
@@ -1004,7 +1004,7 @@ others) as unmet for <code class="docutils literal notranslate"><span class="pre
 </section>
 <section id="flash-attn-qwen3-omni-lingbot-world">
 <h2>flash-attn (Qwen3-Omni, LingBot-World)<a class="headerlink" href="#flash-attn-qwen3-omni-lingbot-world" title="Link to this heading">#</a></h2>
-<p><code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> is only needed for <strong>Qwen3-Omni</strong> and <strong>LingBot-World</strong>, and it is <strong>not</strong> pulled in by
+<p><code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> is only needed for <strong>Qwen3-Omni</strong> and <strong>LingBot-World</strong> with <code class="docutils literal notranslate"><span class="pre">reference_numerics:</span> <span class="pre">true</span></code>, and it is <strong>not</strong> pulled in by
 <code class="docutils literal notranslate"><span class="pre">.[qwen3_omni]</span></code>, <code class="docutils literal notranslate"><span class="pre">.[lingbot_world]</span></code> or <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> — you install it as a separate step. The reason: flash-attn
 publishes no wheels on PyPI, so <code class="docutils literal notranslate"><span class="pre">pip</span></code>/<code class="docutils literal notranslate"><span class="pre">uv</span></code> fall back to compiling it from source, which is
 slow. When a prebuilt GitHub wheel matches your stack, use it to skip the build; otherwise
