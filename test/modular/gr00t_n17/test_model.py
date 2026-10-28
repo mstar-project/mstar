@@ -492,7 +492,7 @@ def test_every_input_the_loop_needs_is_delivered_to_it():
 
 def test_the_reuse_walks_expose_the_nodes_prefill_already_contains():
     """Each reuse walk is ``prefill``'s own nodes stopping early (same names, inputs and
-    internal edge), not a second description that can drift. ``vl_bridge`` stays out of
+    internal edge), not a second description that can disagree. ``vl_bridge`` stays out of
     ``backbone``: its weights are GR00T's ``action_head.*``. The emitted modality is
     ``tensor`` because "embedding" is not in ``entrypoint.py``'s
     ``SUPPORTED_MODALITIES``, and the server would reject the response after the work."""
@@ -654,7 +654,7 @@ def test_the_embodiment_id_is_parked_only_where_a_loop_reads_it_back():
 
 
 def test_the_reuse_walk_node_sets_match_the_graphs():
-    """``Gr00tN17Model.REUSE_WALK_NODES`` is a hand copy of graph structure and drifts
+    """``Gr00tN17Model.REUSE_WALK_NODES`` is a hand copy of graph structure and goes stale
     both ways: a stale node lets an input through to nothing, a missing one refuses a valid
     request. A selectable walk missing from it gets ``reachable=None``
     (``Gr00tN17Model.get_initial_forward_pass_args``), "route everything", so selectable

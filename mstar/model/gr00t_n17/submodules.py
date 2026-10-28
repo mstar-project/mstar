@@ -651,7 +651,7 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         **kwargs: Any,
     ) -> SubmoduleStep | None:
         # `attention_segments` is the one description of the layout; building the
-        # segments here from anything else would say it twice and let the two drift.
+        # segments here from anything else would say it twice and let the two disagree.
         by_label: dict[str, list[Segment]] = {SA_SPAN: [], VL_TEXT_SPAN: [], VL_IMAGE_SPAN: []}
         for rid, inp in zip(request_ids, inputs, strict=True):
             for label, span in self.attention_segments(inp.resource_step_info):
