@@ -232,6 +232,10 @@ class Resource(ABC):
     # whether a request may pass the first one waiting for this resource while that one can't start
     passes = False
 
+    def may_pass(self) -> bool:
+        """Whether some request could pass the first one now, on a resource that `passes`."""
+        return False
+
     def reserve(
         self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
         passing: bool = False,

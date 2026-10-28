@@ -516,7 +516,7 @@ class StepRunner:
                 if nodes:
                     started.extend((node, rid) for node in nodes)
                     admitted = True
-        if self._short:
+        if any(self._resources[key].passes and self._resources[key].may_pass() for key in self._short):
             for rid in sorted(self._waiting, key=self._arrival.__getitem__):
                 if rid in self._waiting and (nodes := self._pass(rid, lambda node, rid=rid: published_of(rid, node))):
                     started.extend((node, rid) for node in nodes)

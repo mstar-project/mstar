@@ -3795,6 +3795,8 @@ class KVManager(AttentionResource):
         A request ``passing`` the first one, while that one doesn't fit, is admitted when it has a hit, no page
         of the hit is evictable, and its own pages fit, growth included.
         """
+        if passing:
+            return self._pass(rid, node_name, graph_walk, published)
         with self._lock:
             if self._host_copies:
                 self._land_host_copies()
@@ -3807,23 +3809,43 @@ class KVManager(AttentionResource):
         for chain in chains:
             self._root_chain(chain)
         with self._lock:
-            room = self._room()
-            if passing:
-                whole, charged = self._hit(rid, node_name, graph_walk, published)
-                overrides = self._overrides[rid]
-                pages = overrides.pages(self._nodes, overrides.loop_caps, self.config.page_size) - whole
-                if not whole or charged or not self._may_pass(pages):
-                    return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
-            else:
-                pages = self._need(rid, node_name, graph_walk, published)
-                if pages > room:
-                    if self._head_wait is None or self._head_wait.rid != rid:
-                        self._head_wait = HeadWait(rid, pages)
-                    self._head_wait.pages = pages
-                    return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
-                if self._head_wait is not None and self._head_wait.rid == rid:
-                    self._head_wait = None
-            self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid), passed=passing)
+            pages, room = self._need(rid, node_name, graph_walk, published), self._room()
+            if pages > room:
+                if self._head_wait is None or self._head_wait.rid != rid:
+                    self._head_wait = HeadWait(rid, pages)
+                self._head_wait.pages = pages
+                return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
+            if self._head_wait is not None and self._head_wait.rid == rid:
+                self._head_wait = None
+            self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid))
+            self._recount(rid)
+            return None
+
+    def _pass(
+        self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
+    ) -> RoomMark | None:
+        """Allot ``rid`` past a first request that doesn't fit, when it has a hit, no page of the hit is
+        evictable, and its own pages fit, growth included, in the room less the pages kept for that request."""
+        with self._lock:
+            wait, room = self._head_wait, self._room()
+            refused = RoomMark(rid, node_name, graph_walk, published, room, 0, 0)
+            if wait is None or wait.pages <= room or room - wait.kept < 1:
+                return refused
+            chains = [] if self._index is None else [
+                stream.chain for stream in self._streams[rid].values()
+                if stream.chain is not None and stream.chain.rooted is None
+            ]
+        for prefix_chain in chains:
+            self._root_chain(prefix_chain)
+        with self._lock:
+            whole, charged = self._hit(rid, node_name, graph_walk, published)
+            if not whole or charged:
+                return refused
+            overrides = self._overrides[rid]
+            pages = overrides.pages(self._nodes, overrides.loop_caps, self.config.page_size) - whole
+            if not self._may_pass(pages):
+                return refused
+            self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid), passed=True)
             self._recount(rid)
             return None
 
@@ -3858,6 +3880,10 @@ class KVManager(AttentionResource):
     def _index_counts(self) -> tuple[int, int]:
         """The pages the index has ever filed, and how many it holds evictable."""
         return (0, 0) if self._index is None else (self._index.filed, len(self._index.evictable()))
+
+    def may_pass(self) -> bool:
+        with self._lock:
+            return self._may_pass()
 
     def _may_pass(self, need: int = 1) -> bool:
         """True while the head asks for more than the room, and ``need`` pages fit in the room less
