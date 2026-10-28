@@ -59,15 +59,21 @@ def blocks(message):
     return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
 
 
+def from_api(m):
+    """An assistant message the API returned. Claude Code writes an API error as an assistant
+    message of model ``<synthetic>``."""
+    msg = m.get("message")
+    return m.get("type") == "assistant" and isinstance(msg, dict) and msg.get("model") != "<synthetic>"
+
+
 def usage(messages):
     """API calls and token counts, one entry per API response, plus the run's result fields."""
     calls = {}
     for m in messages:
-        msg = m.get("message")
-        if m.get("type") != "assistant" or not isinstance(msg, dict):
+        if not from_api(m):
             continue
-        u, mid = msg.get("usage"), msg.get("id")
-        if not isinstance(u, dict) or not mid or msg.get("model") == "<synthetic>":
+        u, mid = m["message"].get("usage"), m["message"].get("id")
+        if not isinstance(u, dict) or not mid:
             continue
         seen = calls.setdefault(mid, dict.fromkeys(TOKENS, 0))
         for k in TOKENS:
@@ -122,7 +128,7 @@ def handoff(messages, root, diff_paths, previous=None):
     prefix = root.rstrip("/") + "/"
     for m in messages:
         main_thread = not m.get("parent_tool_use_id") and not m.get("isSidechain")
-        if m.get("type") != "assistant":
+        if not from_api(m):
             continue
         for b in blocks(m):
             kind, inp = b.get("type"), b.get("input")
@@ -152,7 +158,7 @@ def handoff(messages, root, diff_paths, previous=None):
         "not_opened": [p for p in diff_paths if p not in opened],
         "note": (note or prev.get("note") or "")[:NOTE_CHARS],
         "last_text": (last_text or prev.get("last_text") or "")[-LAST_TEXT_CHARS:],
-        "seen_assistant": any(m.get("type") == "assistant" for m in messages),
+        "seen_assistant": any(map(from_api, messages)),
     }
 
 

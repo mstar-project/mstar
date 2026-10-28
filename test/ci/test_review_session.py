@@ -138,6 +138,13 @@ class TestHandoff(unittest.TestCase):
         self.assertTrue(second["note"].startswith("Progress:"), "the last progress note would be lost")
         self.assertEqual(second["last_text"], "No note here")
 
+    def test_an_api_error_is_not_the_reviewer_s_output(self):
+        msg = assistant("m1", text("API Error: 529 Overloaded"))
+        msg["message"]["model"] = "<synthetic>"
+        h = handoff([msg], ROOT, [])
+        self.assertFalse(h["seen_assistant"], "a run that only hit an API error would leave a handoff")
+        self.assertEqual(h["last_text"], "")
+
     def test_only_a_note_that_starts_with_progress_colon_counts(self):
         h = handoff([assistant("m1", text("**Progress:** P1 `a.py:3`, verified")),
                      assistant("m2", text("Progress was slow on this file."))], ROOT, [])
