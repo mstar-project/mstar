@@ -141,6 +141,23 @@ def test_a_newer_victim_waits_until_the_older_request_has_its_page():
     assert _admitted(kv, "v") and kv._allotments["v"].pages == 7, "v didn't reserve its history and a page"
 
 
+def test_a_victim_still_to_move_is_chosen_for_no_other_request():
+    kv = _pool()
+    _running(kv, "r1", 3, arrival=1)
+    _running(kv, "r2", 3, arrival=2)
+    _running(kv, "v", 4, arrival=3)
+    assert kv.preempt("r1", _short(kv, "r1"), droppable=lambda rid: True) == ["v"]
+
+    assert kv.preempt("r2", _short(kv, "r2"), droppable=lambda rid: True) == [], "r2 took r1's victim or moved itself"
+    assert kv.waits("r2"), "r2 doesn't wait for the room v's move makes"
+    assert kv.preempt("r1", _short(kv, "r1"), droppable=lambda rid: True) == [], "r1 chose again before v moved"
+    _drop(kv, "v")
+
+    assert not kv.waits("r2") and not kv._earmarks and not kv._victims, "v's move didn't settle r1's earmark"
+    assert _step(kv, "r1", 1).ok, "r1 didn't get the page its victim freed"
+    assert _step(kv, "r2", 1).ok, "r2 didn't get a page from the room v's move made"
+
+
 @pytest.mark.parametrize("then", ["drops itself", "waits", "waits, then is dropped"])
 def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     kv = _pool()
