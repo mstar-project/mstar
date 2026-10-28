@@ -54,10 +54,11 @@ def _batch(seq: int, rids: list[int]):
     scheduled = SimpleNamespace(
         node_name=NODE, graph_walk=WALK, tp_seq=seq,
         request_to_worker_graph={rid: 0 for rid in rids},
+        rids_by_walk=lambda: {WALK: list(rids)},
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
-        launch_started_event=None, rebuild_rids=frozenset(),
+        launch_started_event=None, read_check_rids=None, rebuild_rids=frozenset(),
     )
     return scheduled, executing
 
@@ -96,6 +97,10 @@ class _Scheduler:
 
     def take_admit_errors(self):
         return {}
+
+    def clear_batch_limit(self, node_name, graph_walk, rows, walks=()):
+        # an admitted step lifts its refusal limit; this stub has none
+        del node_name, graph_walk, rows, walks
 
     def clear_rid(self, rid, wire_rid):
         pass

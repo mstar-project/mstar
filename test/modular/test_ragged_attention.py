@@ -44,7 +44,10 @@ from mstar.engine.resources.attn.ragged.flashinfer import (
     FlashInferRaggedCrossManager,
     FlashInferRaggedManager,
 )
-from mstar.engine.resources.attn.ragged.wrappers import RaggedCrossPrefillWrapper, RaggedPrefillWrapper
+from mstar.engine.resources.attn.ragged.wrappers import (
+    FlashInferRaggedCrossPrefillWrapper,
+    FlashInferRaggedPrefillWrapper,
+)
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
 pytestmark = pytest.mark.skipif(
@@ -106,16 +109,16 @@ def workspace():
     return torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
 
 
-def wrapper(**overrides) -> RaggedPrefillWrapper:
+def wrapper(**overrides) -> FlashInferRaggedPrefillWrapper:
     kwargs = dict(
         workspace_buffer=workspace(), num_qo_heads=HEADS, num_kv_heads=HEADS,
         head_dim=HEAD_DIM, device=DEVICE, q_data_type=DTYPE,
     )
     kwargs.update(overrides)
-    return RaggedPrefillWrapper(**kwargs)
+    return FlashInferRaggedPrefillWrapper(**kwargs)
 
 
-def graph_wrapper() -> RaggedPrefillWrapper:
+def graph_wrapper() -> FlashInferRaggedPrefillWrapper:
     return wrapper(
         max_num_segments=MAX_SEGMENTS, max_total_tokens=MAX_TOKENS, accelerator_graph=True
     )
@@ -621,13 +624,13 @@ def cross_ref(q, k, v, q_cu, kv_cu):
     return out
 
 
-def cross_wrapper(**overrides) -> RaggedCrossPrefillWrapper:
+def cross_wrapper(**overrides) -> FlashInferRaggedCrossPrefillWrapper:
     kwargs = dict(
         workspace_buffer=workspace(), num_qo_heads=HEADS, num_kv_heads=HEADS,
         head_dim=HEAD_DIM, device=DEVICE, q_data_type=DTYPE,
     )
     kwargs.update(overrides)
-    return RaggedCrossPrefillWrapper(**kwargs)
+    return FlashInferRaggedCrossPrefillWrapper(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -750,5 +753,5 @@ def test_cross_pair_under_a_lease_gets_a_graph_wrapper_sized_for_its_keys():
         ctx(["r0", "r1"], lease=lease),
     )
     w = mgr._current_plan_states[cross_label("video", "text")]
-    assert isinstance(w, RaggedCrossPrefillWrapper) and w.accelerator_graph
+    assert isinstance(w, FlashInferRaggedCrossPrefillWrapper) and w.accelerator_graph
     assert w.max_total_kv_tokens == MAX_TOKENS

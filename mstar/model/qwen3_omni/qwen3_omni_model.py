@@ -30,6 +30,7 @@ Text-only mode:
 
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from jinja2 import TemplateError
@@ -61,10 +62,12 @@ from mstar.model.base import (
     KVLabel,
     LabelLayout,
     Model,
+    PrefixKeys,
     ProcessPromptOutput,
     Span,
     TensorAndMetadata,
 )
+from mstar.model.components import MoeParallelConfig
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -93,7 +96,7 @@ from mstar.model.qwen3_omni.config import (
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import Operation, WeightConverter, drop_stop_tokens
+from mstar.model.utils import Operation, TextChunkDetokenizer, WeightConverter, drop_stop_tokens
 from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -134,6 +137,19 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
+class ImageSpan(NamedTuple):
+    length: int
+    advance: int
+
+
+def image_span(grid_thw: torch.Tensor, merge_size: int) -> ImageSpan:
+    """An image's tokens share one temporal position and sit on the merged
+    grid, so it advances the position by the grid's longer side."""
+    t, h, w = (int(n) for n in grid_thw)
+    h, w = h // merge_size, w // merge_size
+    return ImageSpan(t * h * w + 2, max(h, w) + 2)
+
+
 # ---------------------------------------------------------------------------
 # Qwen3OmniModel
 # ---------------------------------------------------------------------------
@@ -142,6 +158,8 @@ class Qwen3OmniModel(Model):
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
 
     LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
+
+    _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(
         self,
@@ -309,6 +327,14 @@ class Qwen3OmniModel(Model):
                 top_p=model_kwargs.get("code_predictor_top_p", 0.8),
             )
         }
+
+    def checkpoint_path(self) -> str:
+        return self.local_dir
+
+    def _audio_frames(self, seqlens: torch.Tensor) -> torch.Tensor:
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
+
+        return _get_feat_extract_output_lengths(seqlens, n_window=self.config.audio_encoder.n_window)
 
     def _get_max_talker_output_tokens(self, **model_kwargs):
         return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
@@ -1281,12 +1307,9 @@ class Qwen3OmniModel(Model):
         The Talker prefills every step's rows except those of a system or earlier
         assistant turn. It then prefills its assistant prefix, and writes a row per decode step.
         """
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
-
         from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_text_mask
 
         merge = self.config.vision.spatial_merge_size
-        grids = {"image": tensors["image_grid_thw"], "video": tensors["video_grid_thw"]}
         thinker, talker, position = [], [], 0
         for step in plan:
             if step.modality == TEXT:
@@ -1295,12 +1318,16 @@ class Qwen3OmniModel(Model):
                 kept = int(talker_text_mask(ids, self.config).sum())
             elif step.modality == "audio":
                 # the encoder's rows between two sentinels
-                rows = int(_get_feat_extract_output_lengths(tensors["audio_seqlens"][step.index])) + 2
+                rows = int(self._audio_frames(tensors["audio_seqlens"][step.index])) + 2
                 span = Span("digest", "prefill_audio", rows, rows, ("audio", step.index))
                 kept = rows
+            elif step.modality == "image":
+                image = image_span(tensors["image_grid_thw"][step.index], merge)
+                span = Span("digest", "prefill_vision", image.length, image.advance, ("image", step.index))
+                kept = image.length
             else:
-                grid = grids[step.modality][step.index]
-                per_grid = tensors["video_second_per_grid"][step.index].item() if step.modality == "video" else None
+                grid = tensors["video_grid_thw"][step.index]
+                per_grid = tensors["video_second_per_grid"][step.index].item()
                 rows = int(grid.prod()) // merge ** 2 + 2
                 # the walk moves the counter one past its end sentinel, which follows the grid's largest position
                 positions = get_rope_index_vision(
@@ -1308,14 +1335,18 @@ class Qwen3OmniModel(Model):
                     spatial_merge_size=merge, seconds_per_grid=per_grid,
                 )
                 advance = int(positions.max()) + 2 - position
-                span = Span("digest", "prefill_vision", rows, advance, (step.modality, step.index))
+                span = Span("digest", "prefill_vision", rows, advance, ("video", step.index))
                 kept = rows
             thinker.append(span)
             talker.append(Span("rows", "talker_prefill", kept, kept, "thinker_states"))
             position += span.advance
         prefix = TalkerSubmodule.TALKER_LAST_PREFILL_TOKENS_PER_REQ
+        # A prompt with a video keys only its leading text, since keying past it has never been run or tested.
+        video = any(step.modality == "video" for step in plan)
         return {
-            THINKER_KV: {"main": LabelLayout(spans=tuple(thinker), growth=(("thinker_decode_loop", 1),))},
+            THINKER_KV: {"main": LabelLayout(
+                spans=tuple(thinker), growth=(("thinker_decode_loop", 1),), keyed_spans=1 if video else None,
+            )},
             TALKER_KV: {"main": LabelLayout(
                 spans=(*talker, Span("rows", "talker_last_prefill", prefix, prefix, "thinker_states")),
                 growth=(("talker_decode_loop", 1),),
@@ -1329,9 +1360,12 @@ class Qwen3OmniModel(Model):
         }
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        """The Thinker keys its prompt by text ids, each image and audio clip by
+        file, and its replies as they decode."""
         return {
             THINKER_KV: {"main": KVLabel(
                 growth=(("thinker_decode", "thinker_decode_loop"),),
+                keys=PrefixKeys("text_inputs", ("prefill_text", "prefill_vision", "prefill_audio"), growth=True),
             )},
             TALKER_KV: {"main": KVLabel(
                 growth=(("talker_decode", "talker_decode_loop"),),
@@ -1350,8 +1384,9 @@ class Qwen3OmniModel(Model):
     ) -> bytes:
         if modality == "text":
             ids = drop_stop_tokens(output, (self.config.im_end_token_id,), request_kwargs)
-            detok = self.tokenizer.decode(ids)
-            return detok.encode("utf-8")
+            if self._text_detokenizer is None or self._text_detokenizer.tokenizer is not self.tokenizer:
+                self._text_detokenizer = TextChunkDetokenizer(self.tokenizer)
+            return self._text_detokenizer.to_bytes(ids)
         elif modality == "audio":
             if output.numel() == 0:
                 return b""
@@ -1374,8 +1409,11 @@ class Qwen3OmniModel(Model):
         # ``codec_tokens``, ``talker_input_embeds``, ``new_token``) is
         # already replicated by the upstream all-reduce or sampler
         # broadcast before it leaves its producing node.
+        # The Thinker's routed experts can also run EP; the Talker's
+        # shared-expert block has no EP variant.
         return ShardingConfig(
             groups=[], tp_enabled_nodes={"Thinker", "Talker"}, shard_dim={},
+            ep_enabled_nodes={"Thinker"},
         )
 
     # -----------------------------------------------------------------------
@@ -1385,11 +1423,13 @@ class Qwen3OmniModel(Model):
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(
             node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+            moe_parallel=moe_parallel,
         )
         logger.info("Successfully loaded Qwen3-Omni submodule for %s", node_name)
         self._submodule_cache[node_name] = submodule
@@ -1417,10 +1457,12 @@ class Qwen3OmniModel(Model):
     def _create_submodule(
         self, node_name: str, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule | None:
         if node_name == "Thinker":
             return self._create_thinker_submodule(
                 device, tp_group=tp_group, autocast_dtype=autocast_dtype,
+                moe_parallel=moe_parallel,
             )
         elif node_name == "Talker":
             return self._create_talker_submodule(
@@ -1508,13 +1550,16 @@ class Qwen3OmniModel(Model):
     def _create_thinker_submodule(
         self, device: str, tp_group=None,
         autocast_dtype: torch.dtype | None = None,
+        moe_parallel: MoeParallelConfig | None = None,
     ) -> NodeSubmodule:
         from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
 
         with torch.device("meta"):
-            thinker_model = Qwen3OmniThinkerModel(self.config, comm_group=tp_group)
+            thinker_model = Qwen3OmniThinkerModel(
+                self.config, comm_group=tp_group, moe_parallel=moe_parallel,
+            )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         if autocast_dtype is not None:

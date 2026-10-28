@@ -1,6 +1,6 @@
 """A request whose grant runs short moves newer requests off the device and takes the pages they free.
 
-A new prompt waits in the queue for room, since a pool admits only its oldest waiting request.
+A new prompt waits in the runner's queue for room, since a pool admits only its oldest waiting request.
 A request that grows past what it was allotted can't wait that way: every request beside it
 may be growing too, and nothing would ever finish. The newest requests go to the host when the host holds
 them whole, and are otherwise dropped if they can be rebuilt from their token ids. They wait in the queue at their
@@ -17,6 +17,7 @@ sys.path.insert(0, ".")
 
 import pytest
 import test_kv_host_index as host
+from test_kv_admission import _remove, _runner
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
 
 from mstar.engine.resources.kv import manager as manager_mod
@@ -41,14 +42,42 @@ def _request(kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | N
     layout = StreamLayout(
         spans=(PrefixSpan(tokens, tokens, WALK),), growth=(("decode", 1),), keyed_spans=int(bool(keyed)),
     )
-    kv.ingest_request(rid, KVReqConfig(
+    _runner(kv).ingest_request(rid, {"kv": KVReqConfig(
         prefix_keys={"main": _keys(keyed)} if keyed else None, kv_layout={"main": layout},
         loop_caps={"decode": 4 * PAGE_SIZE}, arrival=arrival,
-    ))
+    )})
+
+
+def _admitted(kv, rid: str) -> bool:
+    """Whether the runner has admitted ``rid``, once it takes whatever has since been admitted."""
+    runner = _runner(kv)
+    runner.admit_waiting(lambda other, node: None)
+    return runner.admit_request(rid, NODE, WALK) is None
 
 
 def _ready(kv, rid: str) -> bool:
-    return kv.admit_retrieve(rid, NODE, WALK, None).ready
+    """A readiness check as the engine makes it: admission, a reload for a request on the host, then retrieve."""
+    if not _admitted(kv, rid):
+        return False
+    if kv.is_offloaded(rid) and not (kv.can_reload(rid) and kv.reload(rid)):
+        return False
+    return _runner(kv).admit_retrieve(rid, NODE, WALK, None).ready
+
+
+def _drop(kv, rid: str) -> int:
+    freed = kv.drop(rid)
+    _runner(kv).readmit(rid, NODE)
+    return freed
+
+
+def _offload(kv, rid: str) -> int:
+    freed = kv.offload(rid)
+    _runner(kv).readmit(rid, NODE)
+    return freed
+
+
+def _queue(kv) -> list[str]:
+    return _runner(kv)._queues["kv"]
 
 
 def _step(kv, rid: str, tokens: int) -> AdmitOutcome:
@@ -76,15 +105,16 @@ def test_a_dropped_request_rejoins_the_queue_at_its_arrival():
     for rid, pages, arrival in (("c", 5, 3), ("a", 3, 1), ("b", 3, 2)):
         _request(kv, rid, pages, arrival)
         assert not _ready(kv, rid)
-    assert list(kv._waiting) == ["a", "b", "c"], "the queue kept the order of the readiness checks"
+    assert _queue(kv) == ["a", "b", "c"], "the queue kept the order of the readiness checks"
 
-    kv.remove_request("x")
+    _remove(kv, "x")
     assert _ready(kv, "a") and _ready(kv, "b") and not _ready(kv, "c")
     assert _step(kv, "a", 3 * PAGE_SIZE).ok and _step(kv, "b", 2 * PAGE_SIZE).ok
     kv.drop("b")
-
     assert "b" not in kv._allotments and kv._unused == 0, "the drop kept part of b's allotment"
-    assert list(kv._waiting) == ["b", "c"] and not _ready(kv, "c"), "c passed the request dropped ahead of it"
+    _runner(kv).readmit("b", NODE)
+
+    assert "b" in kv._allotments and not _ready(kv, "c"), "c passed the request dropped ahead of it"
 
 
 def _short(kv, rid: str) -> int:
@@ -101,13 +131,14 @@ def test_a_newer_victim_waits_until_the_older_request_has_its_page():
     assert _step(kv, "r", 2 * PAGE_SIZE).ok, "r grows past its allotment into the room"
 
     assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True) == ["v"]
-    kv.drop("v")
+    _drop(kv, "v")
 
     assert kv._allotments["r"].remaining == 1, "the page v freed isn't reserved for r"
     assert _step(kv, "r", 1).ok, "the older request didn't get the page its victim freed"
-    assert not kv.readmit("v", 5 * PAGE_SIZE), "v came back into the room r needs to grow"
-    kv.remove_request("r")
-    assert kv.readmit("v", 5 * PAGE_SIZE) and kv._allotments["v"].pages == 6, "v didn't reserve its history and a page"
+    assert not _admitted(kv, "v"), "v came back into the room r needs to grow"
+    _remove(kv, "r")
+    # its history is the prompt's 5 pages and the sample its next step writes
+    assert _admitted(kv, "v") and kv._allotments["v"].pages == 7, "v didn't reserve its history and a page"
 
 
 @pytest.mark.parametrize("then", ["drops itself", "waits", "waits, then is dropped"])
@@ -121,11 +152,12 @@ def test_the_oldest_request_drops_itself_or_waits_for_room(then):
     assert victims == (["r"] if then == "drops itself" else []) and not kv._earmarks, "nothing newer frees a page"
     assert kv.waits("r") == (then != "drops itself"), "r waits only when it can't drop itself"
     if then == "waits, then is dropped":
-        kv.drop("r")
-        # readmitting r takes the rest of the room, so only the drop can end r's wait
-        assert kv.readmit("r", 4 * PAGE_SIZE) and not kv.waits("r"), "r's wait for room outlived its drop"
+        _drop(kv, "r")
+        assert not kv.waits("r") and _queue(kv) == ["r"], "r's wait for room outlived its drop"
+        _remove(kv, "older")
+        assert _admitted(kv, "r"), "r didn't return once its history and a page fit"
     elif then == "waits":
-        kv.remove_request("older")
+        _remove(kv, "older")
         assert not kv.waits("r"), "r kept waiting after the room grew"
 
 
@@ -138,16 +170,21 @@ def test_removing_a_request_in_any_state_leaks_nothing(monkeypatch, state):
     assert _step(kv, "r", 2 * PAGE_SIZE).ok
     assert kv.preempt("r", _short(kv, "r"), droppable=lambda rid: True) == ["v"]
     if state in ("dropped", "rebuilding"):
-        kv.drop("v")
+        _drop(kv, "v")
     if state == "rebuilding":
-        kv.remove_request("r")
-        assert kv.readmit("v", 5 * PAGE_SIZE)
+        _remove(kv, "r")
+        assert _admitted(kv, "v")
     gone = "r" if state == "earmark's request" else "v"
 
-    kv.remove_request(gone)
+    _remove(kv, gone)
 
-    left = [state for state in (kv._earmarks, kv._victims, kv._short, kv._ran_short, kv._waiting, kv._allotments)
-            if gone in state]
+    runner = _runner(kv)
+    left = [
+        state for state in (
+            kv._earmarks, kv._victims, kv._short, kv._ran_short, kv._asks, kv._dropped, kv._allotments,
+            runner._waiting, runner._admitted, runner._arrival, runner._queues["kv"],
+        ) if gone in state
+    ]
     assert not left and not kv._earmarks and not kv._victims, f"{gone} left preemption state behind"
     assert kv._unused == sum(allotment.remaining for allotment in kv._allotments.values())
 
@@ -168,8 +205,8 @@ def test_victims_that_share_pages_are_preempted_together():
     assert kv.preempt("r", short, droppable=lambda rid: True) == ["b", "a"], "a victim alone frees one page"
     alone, both = kv._frees(["a"]), kv._frees(["b", "a"])
     before = kv._arena.num_free + len(kv._index.evictable())
-    kv.drop("b")
-    kv.drop("a")
+    _drop(kv, "b")
+    _drop(kv, "a")
 
     assert alone == 1, "the shared pages counted as freed while b still holds them"
     assert kv._arena.num_free + len(kv._index.evictable()) - before == both == 5, "the drops freed other than counted"
@@ -213,8 +250,8 @@ def test_the_page_check_catches_a_request_on_the_host_that_kept_a_device_page():
     _running(kv, "v", 5, arrival=2)
     short = _step(kv, "r", 1).reason.pages_short
     assert kv.preempt("r", short, droppable=lambda rid: False) == ["v"]
-    kv.offload("v")
-    assert "v" in kv._waiting and kv.is_offloaded("v")
+    _offload(kv, "v")
+    assert "v" in kv._asks and kv.is_offloaded("v")
     kv.assert_pages_conserved()
     kv._streams["v"]["main"].page_indices = kv._arena.acquire(1)
 
@@ -231,15 +268,15 @@ def test_an_older_request_on_the_host_returns_before_a_newer_one():
     short = _step(kv, "r", 4 * PAGE_SIZE).reason.pages_short
     assert kv.preempt("r", short, droppable=lambda rid: False) == ["b", "a"]
     assert kv.moves_to_host("b") and kv.moves_to_host("a")
-    kv.offload("b")
-    kv.offload("a")
-    assert list(kv._waiting) == ["a", "b"] and not kv._allotments.keys() & {"a", "b"}, "a victim kept its allotment"
+    _offload(kv, "b")
+    _offload(kv, "a")
+    assert _queue(kv) == ["a", "b"] and not kv._allotments.keys() & {"a", "b"}, "a victim kept its allotment"
 
-    kv.remove_request("r")
+    _remove(kv, "r")
 
-    assert not kv.can_reload("b") and not kv.reload("b"), "b returned ahead of a"
-    assert kv.reload("a") and kv._allotments["a"].remaining == 1, "a didn't reserve its reload and a page"
-    assert kv.reload("b") and not kv._waiting
+    assert _runner(kv).admit_waiting(lambda rid, node: None) == [(NODE, "a"), (NODE, "b")], "b returned ahead of a"
+    assert _ready(kv, "a") and kv._allotments["a"].remaining == 1, "a didn't reserve its reload and a page"
+    assert _ready(kv, "b") and not _queue(kv)
 
 
 @pytest.mark.parametrize("decides", [False, True], ids=["a pool that doesn't decide", "an offload no victim chose"])
@@ -252,7 +289,7 @@ def test_an_offload_outside_preemption_reloads_as_before(decides):
     _ready(kv, "w")
     remaining = kv._allotments.get("r", manager_mod.Allotment(0)).remaining
 
-    assert kv.offload("r") == 5 and "r" not in kv._waiting
+    assert _offload(kv, "r") == 5 and "r" not in _queue(kv)
 
     assert kv.can_reload("r") and kv.reload("r"), "r waited in the queue behind w"
     assert kv._allotments.get("r", manager_mod.Allotment(0)).remaining == remaining, "the reload changed r's allotment"

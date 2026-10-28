@@ -57,10 +57,15 @@ class AttentionManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
+        backend = resolve_attn_backend(spec.config.backend, info.device)
+        if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
+            raise ValueError(
+                f"sliding_window is unsupported for attention backend {backend!r}; "
+                "use the flashinfer backend"
+            )
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
-        backend = resolve_attn_backend(spec.config.backend, info.device)
         # Before `shard`, so a mismatch is reported rather than half-applied to
         # a config the KV resource also holds.
         if backend not in _BACKEND_KV_CONFIG:
@@ -82,8 +87,9 @@ class AttentionManager(AttentionResource):
             kv_config.shard(info.joint_comm_group.world_size)
         if backend == AttnBackend.DENSE:
             # A dense backend needs the FlashAttention-3 kernel; where the
-            # wheel does not match the installed torch/CUDA build, degrade to
-            # the paged backend AUTO picks rather than failing to serve.
+            # wheel does not match the installed torch/CUDA build or has no
+            # kernel for the GPU, degrade to the paged backend AUTO picks
+            # rather than failing to serve.
             # The two are drop-in for each other: the step declaration is
             # identical (see DenseAttentionManager) and `requires_kv_write`
             # tells the layer which one it is talking to.
@@ -93,7 +99,7 @@ class AttentionManager(AttentionResource):
                 _warn_dense_fallback,
             )
 
-            reason = _fa3_unavailable_reason()
+            reason = _fa3_unavailable_reason(info.device)
             if reason is None:
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,
@@ -126,6 +132,8 @@ class AttentionManager(AttentionResource):
                 backend=spec.config.flashinfer_backend,
                 splits=spec.config.splits,
                 max_rows_in_combined=info.max_rows_in_combined,
+                decode_tensor_cores=spec.config.decode_tensor_cores,
+                sliding_window=spec.config.sliding_window,
             )
 
         if backend == AttnBackend.FLEX:
@@ -192,8 +200,7 @@ class EagerSlotKey(NamedTuple):
     same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""
     label: str
     slot: int
-    # decode and prefill take different wrapper classes; cross-attention plans
-    # one wrapper per label either way and leaves this False
+    # decode and prefill take different wrapper classes
     is_decode: bool = False
 
 

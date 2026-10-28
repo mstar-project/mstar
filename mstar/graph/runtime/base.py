@@ -512,6 +512,11 @@ class SendInput(NamedTuple):
     profiling: ParallelList[int, Profiling] | None = None
     # Only metadata produced by this worker since its last completion.
     resource_publish_info: ParallelList[int, dict[str, PublishedInfo]] | None = None
+    # Rids that failed after routing (their outputs could not be registered
+    # for send): nothing of theirs leaves -- no peer edges, client emits,
+    # persist signals or WORKER_GRAPHS_DONE. The worker has already failed
+    # them, so the conductor tears them down.
+    failed_rids: frozenset[int] = frozenset()
 
 
 class GraphRuntime(ABC):

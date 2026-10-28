@@ -16,7 +16,19 @@ sys.path.insert(0, ".")
 
 import pytest
 import test_kv_host_index as host
-from test_kv_preemption import PAGE_SIZE, _ctx, _pool, _ready, _request, _running, _step, _stub_transfer  # noqa: F401
+from test_kv_admission import _remove, _runner
+from test_kv_preemption import (  # noqa: F401
+    PAGE_SIZE,
+    _ctx,
+    _drop,
+    _offload,
+    _pool,
+    _ready,
+    _request,
+    _running,
+    _step,
+    _stub_transfer,
+)
 
 from mstar.engine.engine import PagedKVCache
 from mstar.engine.resources.kv.config import KVStep
@@ -30,10 +42,11 @@ NODE = "LLM"
 
 
 def _worker(kv):
-    """The real handlers over one pool, with the engine's drop going straight to the pool."""
+    """The real handlers over one pool, with the engine's drop going straight to the pool and its runner."""
     engine = SimpleNamespace(
-        drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid: kv.drop(rid),
-        offload_request=lambda node, rid: kv.offload(rid),
+        drop_refusal=lambda node, rid: kv.check_drop(rid), drop_request=lambda node, rid: _drop(kv, rid),
+        offload_request=lambda node, rid: _offload(kv, rid),
+        admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
     )
     w = Worker.__new__(Worker)
     w.worker_id, w.parallel_nodes, w.parallel_leader_nodes = "w", set(), set()
@@ -43,7 +56,10 @@ def _worker(kv):
     w._in_flight_rids, w._victims, w._dropped, w._rebuild_rows, w._hold_logged = set(), {}, {}, {}, {}
     w._preempted, w._preemptions, w._drop_logged, w._rid_str = {}, defaultdict(PreemptionCounts), {}, str
     w.held, w.tried = [], []
-    w.scheduler = SimpleNamespace(backlog={}, return_backlogged=lambda rid: None, hold_requests=w.held.extend)
+    w.scheduler = SimpleNamespace(
+        backlog={}, return_backlogged=lambda rid: None, hold_requests=w.held.extend,
+        could_refill=lambda *args: False, cap_batch=lambda *args: None, limit_batch=lambda *args: None,
+    )
     w.request_state = SimpleNamespace(
         get_partition_for_node=lambda node: "p",
         get_fwd_info=lambda rid, p: SimpleNamespace(graph_walk="decode", dynamic_loop_iter_counts={"decode": 0}),
@@ -52,7 +68,7 @@ def _worker(kv):
     w._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, wgs: None)
     w._apply_removes_whose_step_landed = lambda: None
     w._apply_pending_removes_safe_to_drop = lambda rids: None
-    w._try_offload_cold_request = lambda node, rids, affected_resources=None: w.tried.append(node)
+    w._try_offload_cold_request = lambda node, rids, affected_resources=None, inside_only=False: w.tried.append(node)
     return w
 
 
@@ -154,33 +170,29 @@ def test_a_dropped_request_returns_once_its_history_and_a_page_fit():
 
     Worker._readmit_dropped(w)
     assert not w.rebuilt, "v came back into the room r needs to grow"
-    kv.remove_request("r")
+    _remove(kv, "r")
     Worker._readmit_dropped(w)
 
     assert w.rebuilt == [("v", NODE)] and kv._allotments["v"].pages == 7, "v didn't return with its history and a page"
 
 
-def test_a_request_on_the_host_returns_from_the_head_of_the_queue_without_a_step_of_its_own():
-    """A request on the host may have no next step left on its node. If only the readiness check for that step
-    reloaded the request, every newer request would wait until the request's REMOVE."""
+def test_a_request_on_the_host_without_a_step_of_its_own_holds_back_no_newer_request():
+    """A request on the host may have no next step left on its node. It is admitted from the queue once it fits,
+    so a newer request waits for that and not for the request's REMOVE."""
     kv = _pool()
     kv._cpu_pool = host._HostPool(16)
     _running(kv, "r", 5, arrival=1)
     _running(kv, "v", 5, arrival=2)
     reason = _step(kv, "r", 1).reason
     w = _worker(kv)
-    w._is_tearing_down = lambda rid: False
-    w.engine_manager.get_engine(NODE).reload_request = lambda node, rid: kv.can_reload(rid) and kv.reload(rid)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
     node_batch = SimpleNamespace(node_name=NODE, admit_error=reason, failed_resource="kv")
     Worker._handle_allocation_failure(w, batch, node_batch)
-    kv.remove_request("r")
+    _remove(kv, "r")
     _request(kv, "x", 2, arrival=3)
-    assert kv.is_offloaded("v") and not _ready(kv, "x")
 
-    Worker._reload_from_host(w)
-
-    assert kv.is_resident("v") and _ready(kv, "x"), "x waited behind v on the host"
+    assert _ready(kv, "x"), "x waited behind v on the host"
+    assert kv.is_offloaded("v") and "v" in kv._allotments, "v wasn't admitted ahead of x"
 
 
 def test_a_backlogged_victim_goes_back_to_the_runtime():
@@ -234,10 +246,7 @@ def test_requests_short_of_pages_all_finish_and_each_goes_to_the_host_at_most_tw
     moves, tokens, offload = Counter(), Counter(), kv.offload
     kv.offload = lambda rid: moves.update([rid]) or offload(rid)
     for i in range(300):
-        ready = [
-            rid for rid in rids if rid in kv._streams
-            and (not kv.is_offloaded(rid) or kv.can_reload(rid) and kv.reload(rid)) and _ready(kv, rid)
-        ]
+        ready = [rid for rid in rids if rid in kv._streams and _ready(kv, rid)]
         if not ready:
             continue
         ctx = _ctx(*ready)
@@ -258,7 +267,7 @@ def test_requests_short_of_pages_all_finish_and_each_goes_to_the_host_at_most_tw
             w._last_active[(rid, NODE)] = float(i)
             tokens[rid] += 1
             if tokens[rid] == 3 * PAGE_SIZE:
-                kv.remove_request(rid)
+                _remove(kv, rid)
 
     assert not kv._streams, "a request never finished"
     assert max(moves.values()) <= 2, f"a request went to the host more than twice: {dict(moves)}"
