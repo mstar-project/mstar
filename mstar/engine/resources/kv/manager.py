@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -22,6 +22,7 @@ from mstar.engine.resources.base import (
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import (
+    KVLayout,
     KVReqConfig,
     KVSpec,
     KVStep,
@@ -55,6 +56,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 from mstar.utils.profiler import PhaseLaps
@@ -236,6 +238,8 @@ class CacheStream:
     # a failed retrieve, latched: the future is consumed once, but every later
     # readiness check has to keep reporting the stream as unusable
     read_error: BaseException | None = None
+    # what a client may see of it (no server paths or internal text)
+    read_error_text: str = ""
     # None while the stream is unkeyed, and once its keys stop describing it
     chain: PrefixChain | None = None
     # pages the index matched for this stream and is holding for it, from the
@@ -405,6 +409,9 @@ class KVPlanState:
     token_to_page: torch.Tensor
     token_to_cache: torch.Tensor
     total_tokens: int | None = None
+    # an eager-write state a pre-plan built on its own stream: the writer waits
+    # on it (the replay's plan-done wait comes after an eager write)
+    ready: Any = None
 
     def copy_(self, other: "KVPlanState", capture_len: int):
         """Stage a step's addressing into this captured state.
@@ -591,6 +598,18 @@ class KVManager(AttentionResource):
             PinnedIndexRing() if kv_pinned_indptrs() and torch.cuda.is_available() else None
         )
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
+        # A read-only step (every segment span 0, e.g. a decoder attending an
+        # encoder context it wrote at prefill) plans the same as the last one
+        # while its segments are the same and nothing touched their streams:
+        # (key, plan). The epoch moves with `_plan_epoch`, and when a stream of
+        # one of the cached step's real rows changes (`_readonly_rows`).
+        self._readonly_epoch = 0
+        self._readonly_plan: tuple | None = None
+        self._readonly_rows: frozenset | None = None
+        # (slot, label) -> the plan output whose state that slot's static
+        # buffers hold, so a reused plan skips re-staging them
+        self._staged_outputs: dict[tuple, KVPlanOutput] = {}
+        self._empty_locations: torch.Tensor | None = None
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
 
@@ -1777,9 +1796,7 @@ class KVManager(AttentionResource):
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
                 # to allocate on a near-full arena and hold the batch.
-                if segment.span == 0 or self._on_sink(ctx, segment.request_id) or (
-                    sink and (segment.request_id, segment.label) in sink
-                ):
+                if not self._reserves(ctx, sink, segment):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
@@ -1794,7 +1811,9 @@ class KVManager(AttentionResource):
                     segment.request_id, segment.label, seq_len,
                 )
                 if not alloc_res.success:
-                    return AdmitOutcome(ok=False, reason=alloc_res.error)
+                    return AdmitOutcome(
+                        ok=False, reason=self._sized_refusal(step, ctx, alloc_res.error),
+                    )
                 if alloc_res.new_pages:
                     self._admit_reserved_pages.setdefault(
                         (segment.request_id, segment.label), []
@@ -1807,7 +1826,7 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
-                if self._on_sink(ctx, segment.request_id) or (sink and (segment.request_id, segment.label) in sink):
+                if self._sinks(ctx, sink, segment):
                     continue
                 stream = self._streams.get(
                     segment.request_id, {}
@@ -1824,6 +1843,81 @@ class KVManager(AttentionResource):
         # retention is applied at commit (see `_apply_retention`)
 
         return ADMIT_OK
+
+    def _sized_refusal(
+        self, step: KVStep, ctx: StepContext, error: AdmitFailedReason,
+    ) -> AdmitFailedReason:
+        """``error`` with the step's ``rows_fit`` and ``rows_fit_alone`` filled
+        in, or a terminal refusal naming a request of the step that needs more
+        pages than the whole pool has, the one ``error`` names first: no
+        eviction can make that fit, so retrying it only spins until the client
+        gives up. Caller holds ``_lock``.
+
+        A request's footprint is every distinct page it would hold after the
+        step: the ones its streams hold already, counted once where labels or
+        requests share them, plus the ones `admit` would still reserve for each
+        stream. A segment that runs against the sink holds and needs nothing,
+        and a span-0 one needs nothing beyond what it holds, as in `admit`. The
+        pool is every page but the sink, cached prefixes included, since those
+        can be evicted. ``rows_sized`` is how many real rows were counted.
+        """
+        if not isinstance(error, AllocationFailed):
+            return error
+        page_size = self.config.page_size
+        sink = step.sink
+        held: dict[str, set[int]] = {}
+        needed: dict[tuple[str, str], int] = {}
+        for segment in step.segments:
+            rid = segment.request_id
+            if self._on_sink(ctx, rid):
+                continue
+            # a row with every label on the sink still counts as a row that fits
+            rows_pages = held.setdefault(rid, set())
+            if self._sinks(ctx, sink, segment):
+                continue
+            stream = self._streams.get(rid, {}).get(segment.label)
+            pages = () if stream is None else stream.page_indices
+            rows_pages.update(pages)
+            if not self._reserves(ctx, sink, segment):
+                continue
+            stored = 0 if stream is None else stream.stored_len
+            key = (rid, segment.label)
+            more = -(-(stored + segment.span) // page_size) - len(pages)
+            needed[key] = max(needed.get(key, 0), more)
+        extra: dict[str, int] = {}
+        for (rid, _), more in needed.items():
+            extra[rid] = extra.get(rid, 0) + max(more, 0)
+        capacity = self.config.max_num_pages - 1
+        rows = list(held)
+        # every row, not only the named one: a row refused ahead of one that
+        # fills the pool names itself, and the eviction then takes the filler,
+        # the only row holding pages
+        for rid in sorted(rows, key=lambda rid: rid != error.request_id):
+            own = len(held[rid]) + extra.get(rid, 0)
+            if own > capacity:
+                # the client reads this text, and the rid is the worker's
+                # handle, not an id it sent
+                return AdmitRuntimeError(
+                    message=(
+                        f"The request needs {own} pages of {self.name} for this "
+                        f"step, more than the {capacity} the pool holds; raise "
+                        "max_num_pages or shorten the request."
+                    ),
+                    request_ids=frozenset({rid}),
+                )
+        if error.request_id in rows:
+            error.rows_fit = rows.index(error.request_id)
+        resident: set[int] = set()
+        new = alone = 0
+        for rid in rows:
+            resident |= held[rid]
+            new += extra.get(rid, 0)
+            if len(resident) + new > capacity:
+                break
+            alone += 1
+        error.rows_fit_alone = alone
+        error.rows_sized = len(rows)
+        return error
 
     def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
         """Give back the pages this admit freshly acquired, and clear the
@@ -1973,6 +2067,12 @@ class KVManager(AttentionResource):
             total_tokens=total_tokens
         )
 
+    def _empty_plan_state(self) -> KVPlanState:
+        empty = self._empty_locations
+        if empty is None:
+            empty = self._empty_locations = torch.empty(0, dtype=torch.long, device=self._device)
+        return KVPlanState(token_to_page=empty, token_to_cache=empty, total_tokens=0)
+
     def _decode_plan_state(self, views: list[SequenceView]) -> KVPlanState:
         """Write addressing for a step appending one token per request.
 
@@ -2023,8 +2123,11 @@ class KVManager(AttentionResource):
 
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
-        ctx: StepContext, lease,
+        ctx: StepContext, lease, eager_write: bool = False,
     ):
+        if eager_write:
+            # written outside the graph (KVStep.eager_write): never staged
+            lease = None
         for label, indptrs in plan_output.items():
             if indptrs.is_decode and lease is not None:
                 # Straight into the captured buffers in one H2D per buffer:
@@ -2039,23 +2142,34 @@ class KVManager(AttentionResource):
                     lease.bucket.num_tokens,
                     pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
                 )
+                self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
                     self._preplan_states[label] = plan_state
                 else:
                     self._current_plan_states[label] = plan_state
                 continue
+            total_tokens = None if indptrs.is_decode else indptrs.get_total_len()
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(indptrs.views)
+            elif total_tokens == 0:
+                # every segment span 0 (a decoder reading the encoder context
+                # it wrote at prefill): nothing is written, so there is no
+                # addressing to upload and unpack
+                plan_state = self._empty_plan_state()
             else:
                 indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
                 plan_state = self._compute_plan_state(
                     indptrs.cuda_indptrs,
-                    total_tokens=indptrs.get_total_len()
+                    total_tokens=total_tokens,
                 )
             if lease is not None:
                 static_state = self._static_plan_state(lease.slot, label)
                 static_state.copy_(plan_state, lease.bucket.num_tokens)
                 plan_state = static_state
+                self._staged_outputs[(lease.slot, label)] = indptrs
+            elif eager_write and ctx.is_preplan and plan_state.token_to_page.is_cuda:
+                plan_state.ready = torch.cuda.Event()
+                plan_state.ready.record()
             if ctx.is_preplan:
                 self._preplan_states[label] = plan_state
             else:
@@ -2070,10 +2184,48 @@ class KVManager(AttentionResource):
             views=views,
         )
 
+    @staticmethod
+    def _is_readonly(step: KVStep, ctx: StepContext) -> bool:
+        # no sink rows: they change the views without changing the segments
+        # the reuse key holds; the read-only steps that repeat have none
+        return (
+            not ctx.is_preplan and not ctx.capture and bool(step.segments)
+            and not step.pre_forks and not step.post_forks and not step.sink
+            and all(seg.span == 0 for seg in step.segments)
+        )
+
+    def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple:
+        lease = ctx.slot_lease
+        return (
+            tuple(step.segments), lease.bucket if lease is not None else None,
+            self._plan_epoch, self._readonly_epoch,
+        )
+
+    def _reuse_readonly_plan(self, step: KVStep, ctx: StepContext) -> "KVPlanOutputs | None":
+        """The last read-only step's plan, when this step is the same read-only
+        step over untouched streams. Its views and indptrs are reused as they
+        are, and a slot whose static buffers already hold it is not re-staged."""
+        cached = self._readonly_plan
+        if cached is None or not self._is_readonly(step, ctx) or cached[0] != self._readonly_key(step, ctx):
+            return None
+        res = cached[1]
+        lease = ctx.slot_lease
+        if lease is not None and all(
+            self._staged_outputs.get((lease.slot, label)) is out for label, out in res.items()
+        ):
+            for label in res:
+                self._current_plan_states[label] = self._static_plan_state(lease.slot, label)
+        else:
+            self._setup_plan_states(res, ctx, lease)
+        return res
+
     def _touch_plan_cache(self, rid: str | None = None) -> None:
         """A stream of ``rid`` (any stream, when None) changed other than by a
-        commit: the plan cache no longer describes the streams if it holds
-        that request."""
+        commit: the plan caches no longer describe the streams if they hold
+        that request. A padding row's reset after a replay holds nothing."""
+        rows = self._readonly_rows
+        if rows is not None and (rid is None or rid in rows):
+            self._readonly_epoch += 1
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
@@ -2398,6 +2550,10 @@ class KVManager(AttentionResource):
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
 
+        reused = self._reuse_readonly_plan(step, ctx)
+        if reused is not None:
+            return reused
+
         # Forks run ahead of the views, which record length and generation;
         # staging only reads what the fork will land.
         if ctx.is_preplan:
@@ -2440,8 +2596,14 @@ class KVManager(AttentionResource):
                 if self._plan_cache_mode and not pending:
                     self._remember_decode_plan(step, ctx, res)
             laps.lap("full")
-        self._setup_plan_states(res, ctx, ctx.slot_lease)
+        self._setup_plan_states(res, ctx, ctx.slot_lease, eager_write=step.eager_write)
         laps.lap("setup_states")
+        if self._is_readonly(step, ctx):
+            # the rows first: a touch from here on invalidates the entry
+            self._readonly_rows = frozenset(
+                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
+            )
+            self._readonly_plan = (self._readonly_key(step, ctx), res)
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
             self._preplanned = True
@@ -2467,6 +2629,20 @@ class KVManager(AttentionResource):
             if not KVManager._on_sink(ctx, rid)
             and (step.fork_rids is None or rid in step.fork_rids)
         ]
+
+    @staticmethod
+    def _sinks(ctx: StepContext, sink: frozenset, segment: Segment) -> bool:
+        """Whether ``segment`` runs against SINK_PAGE: its row does (see
+        `_on_sink`), or the step puts its label there."""
+        return KVManager._on_sink(ctx, segment.request_id) or bool(
+            sink and (segment.request_id, segment.label) in sink
+        )
+
+    @staticmethod
+    def _reserves(ctx: StepContext, sink: frozenset, segment: Segment) -> bool:
+        """Whether `admit` reserves pages for ``segment``: it writes tokens,
+        and not against the sink. `_sized_refusal` counts the same ones."""
+        return bool(segment.span) and not KVManager._sinks(ctx, sink, segment)
 
     @staticmethod
     def _on_sink(ctx: StepContext, rid) -> bool:
@@ -2519,6 +2695,9 @@ class KVManager(AttentionResource):
                 self._plan_epoch += 1
         if not step.commit:
             self._plan_epoch += 1
+        rows = self._readonly_rows
+        if rows is not None and any(seg.span and seg.request_id in rows for seg in step.segments):
+            self._readonly_epoch += 1
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
@@ -3421,29 +3600,21 @@ class KVManager(AttentionResource):
         Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
         but not another), allocator-init bugs, and any future code path
         that adds requests asymmetrically before ``warmup`` returns. The
-        ``all_gather`` itself is synchronizing, so no extra barrier is
-        needed on the success path.
+        vote itself is synchronizing, so no extra barrier is needed on the
+        success path.
         """
         if self._comm_group.world_size == 1:
             return
-        local_free = self._arena.num_free
-        local_t = torch.tensor(
-            [local_free], dtype=torch.int64, device=self._device,
-        )
-
-        for group in [
-            self._comm_group.tp_group, self._comm_group.sp_group
-        ]:
-            gathered = group.all_gather(local_t, dim=0)
-            values = gathered.cpu().tolist()
-            if any(v != values[0] for v in values):
-                raise RuntimeError(
-                    f"KV cache {self.name!r} has asymmetric num_free_pages "
-                    f"across TP ranks: {values}. v1 requires symmetric "
-                    "allocator state; check the YAML for per-rank-divergent "
-                    "max_num_pages / cpu_offload_pages, and any model code "
-                    "that calls add_request before warmup completes."
-                )
+        free = self._arena.num_free
+        lo, neg_hi = self._comm_group.agree([free, -free])
+        if lo != -neg_hi:
+            raise RuntimeError(
+                f"KV cache {self.name!r} has asymmetric num_free_pages "
+                f"across TP ranks: min {lo}, max {-neg_hi}. v1 requires symmetric "
+                "allocator state; check the YAML for per-rank-divergent "
+                "max_num_pages / cpu_offload_pages, and any model code "
+                "that calls add_request before warmup completes."
+            )
 
     def cleanup(self):
         self._transfer.cleanup()
@@ -3470,16 +3641,17 @@ class KVManager(AttentionResource):
                 future.result()
             except Exception as e:
                 stream.read_error = e
+                stream.read_error_text, _ = client_error_text(
+                    e, f"KV retrieve for request {rid} label {label!r} failed", log=logger,
+                )
             else:
                 stream.read_pending = False
         if stream.host_copy is not None and stream.host_copy.landed:
             stream.host_copy = None
             stream.read_pending = stream.read_future is not None
         if stream.read_error is not None:
-            err = stream.read_error
             return False, AdmitRuntimeError(
-                f"KV retrieve for request {rid} label {label!r} failed: "
-                f"{type(err).__name__}: {err}"
+                f"KV retrieve for request {rid} label {label!r} failed: {stream.read_error_text}"
             )
         return not stream.read_pending, None
 
@@ -3650,6 +3822,25 @@ class KVManager(AttentionResource):
         self._default_layer_idx = 0
 
     @torch.compiler.disable
+    def write_target(self, layer_idx: int = None, label: str = None):
+        """Where this step's K/V go, for a layer that writes them itself in a
+        fused kernel instead of calling ``write_kv``: ``(layer cache, page of
+        each token, slot in page of each token, tokens to write)``. NHD only."""
+        if layer_idx is None:
+            layer_idx = self._default_layer_idx
+        if label is None:
+            label = self._default_label
+        if self.kv_cache.layout != KVLayout.NHD:
+            raise NotImplementedError(f"write_target is not implemented for layout {self.kv_cache.layout}")
+        state = self._current_plan_states[label]
+        if state.ready is not None:
+            torch.cuda.current_stream().wait_event(state.ready)
+        return (
+            self.kv_cache.tensor[layer_idx], state.token_to_page, state.token_to_cache,
+            int(state.total_tokens),
+        )
+
+    @torch.compiler.disable
     def layer_view(self, layer_idx: int=None) -> torch.Tensor:
         """layer pages as needed by attention kernel
 
@@ -3704,7 +3895,11 @@ class KVManager(AttentionResource):
         if label is None:
             label = self._default_label
         plan_state = self._current_plan_states[label]
-        n = plan_state.total_tokens
+        if plan_state.ready is not None:
+            torch.cuda.current_stream(k.device).wait_event(plan_state.ready)
+        # an eager write may carry only the real rows; the padding rows' tokens
+        # come last in the plan (on SINK_PAGE) and are skipped
+        n = min(plan_state.total_tokens, k.shape[0])
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
             k=k[:n], v=None if v is None else v[:n],

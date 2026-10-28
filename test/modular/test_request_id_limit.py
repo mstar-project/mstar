@@ -21,11 +21,19 @@ BAD_IDS = ["a" * 129, "caf\u00e9", "a b", "a/b", "a#1", "a\n"]
 
 
 class _Server:
+    takes_stream_input = False
+
     def __init__(self, upload_dir):
         self.upload_dir = upload_dir
         self.submitted = []
 
     async def wait_for_request_id(self, request_id):
+        pass
+
+    def submission_key(self, request_id):
+        return request_id
+
+    def abort_submission(self, key):
         pass
 
     def submit_request(self, **kwargs):

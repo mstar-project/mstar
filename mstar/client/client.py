@@ -39,6 +39,7 @@ from mstar.client.types import (
     TextChunk,
     VideoFrameChunk,
 )
+from mstar.utils.utf8_stream import Utf8Stream, decode_joined
 
 # When attaching raw bytes we need a filename whose extension lets the server
 # infer the modality (it keys off the extension).
@@ -343,7 +344,7 @@ class MStarClient:
             "Accept-Encoding": "identity",
         }
 
-    def _stream_binary(self, resp) -> Iterator[StreamEvent]:
+    def _stream_binary(self, resp, text: Utf8Stream) -> Iterator[StreamEvent]:
         """Consume a length-framed response body off the raw socket."""
         encoding = resp.headers.get("content-encoding", "").lower()
         if encoding and encoding != "identity":
@@ -356,7 +357,7 @@ class MStarClient:
         frames = iter_binary_frames(resp.raw)
         if self._nvtx is None:
             for parsed in frames:
-                yield self._to_event(parsed)
+                yield self._to_event(parsed, text)
             return
 
         range_push, range_pop = self._nvtx
@@ -372,11 +373,18 @@ class MStarClient:
                 break
             range_pop()
             range_push("client.to_event")
-            event = self._to_event(parsed)
+            event = self._to_event(parsed, text)
             range_pop()
             yield event
 
     def _stream(self, url, data, files, output_modalities=()) -> Iterator[StreamEvent]:
+        # One decoder per stream, so a TextChunk never ends mid-character.
+        text = Utf8Stream()
+        yield from self._stream_events(url, data, files, output_modalities, text)
+        if tail := text.flush():
+            yield TextChunk(tail, {})
+
+    def _stream_events(self, url, data, files, output_modalities, text: Utf8Stream) -> Iterator[StreamEvent]:
         with self._session.post(
             url,
             data=data,
@@ -391,7 +399,7 @@ class MStarClient:
             # for: that is what makes the negotiation safe against servers that
             # ignore ``Accept`` entirely.
             if resp.headers.get("content-type", "").startswith(BINARY_STREAM_MEDIA_TYPE):
-                yield from self._stream_binary(resp)
+                yield from self._stream_binary(resp, text)
                 return
             # ``decode_unicode=True`` only yields ``str`` when ``resp.encoding``
             # is set, and that is derived from the Content-Type charset. The
@@ -413,7 +421,7 @@ class MStarClient:
                     parsed = parse_ndjson_line(line)
                     if parsed is None:
                         continue
-                    yield self._to_event(parsed)
+                    yield self._to_event(parsed, text)
                 return
 
             range_push, range_pop = self._nvtx
@@ -438,12 +446,12 @@ class MStarClient:
                 if parsed is None:
                     continue
                 range_push("client.to_event")
-                event = self._to_event(parsed)
+                event = self._to_event(parsed, text)
                 range_pop()
                 yield event
 
     @staticmethod
-    def _to_event(parsed: dict) -> StreamEvent:
+    def _to_event(parsed: dict, text: Utf8Stream | None = None) -> StreamEvent:
         modality = parsed["modality"]
         raw = parsed["bytes"]
         meta = parsed["metadata"]
@@ -455,7 +463,7 @@ class MStarClient:
                 f"{raw.decode('utf-8', 'replace')}"
             )
         if modality == "text":
-            return TextChunk(raw.decode("utf-8", "replace"), meta)
+            return TextChunk(text.feed(raw) if text is not None else raw.decode("utf-8", "replace"), meta)
         if modality == "image":
             return ImageChunk(raw, meta)
         if modality == "audio":
@@ -469,7 +477,7 @@ class MStarClient:
     @staticmethod
     def _parse_result(payload: dict) -> GenerateResult:
         outputs = payload.get("outputs", {})
-        text_parts: list[str] = []
+        text_parts: list[bytes] = []
         images: list[bytes] = []
         audio_pcm: list[bytes] = []
         sample_rate, num_channels = 24000, 1
@@ -480,7 +488,7 @@ class MStarClient:
                 meta = e.get("metadata") or {}
                 raw.append({"modality": modality, "bytes": b, "metadata": meta})
                 if modality == "text":
-                    text_parts.append(b.decode("utf-8", "replace"))
+                    text_parts.append(b)
                 elif modality == "image":
                     images.append(b)
                 elif modality == "audio":
@@ -490,7 +498,7 @@ class MStarClient:
         audio = AudioBuffer(b"".join(audio_pcm), sample_rate, num_channels) if audio_pcm else None
         return GenerateResult(
             request_id=payload.get("request_id"),
-            text="".join(text_parts) if text_parts else None,
+            text=decode_joined(text_parts) if text_parts else None,
             images=images,
             audio=audio,
             raw=raw,

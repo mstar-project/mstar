@@ -26,6 +26,28 @@ class HostRows(NamedTuple):
     request_ids: tuple
     buffers: dict[str, torch.Tensor]
 
+    def first_values(self, name: str, request_ids: Sequence[str]):
+        """``(rid, value)`` for each of ``request_ids`` that has a row, where
+        ``value`` is the first element of its row of buffer ``name``, off one
+        ``tolist``; None when the step staged no such buffer. A request with
+        no row is skipped, as the per-request stop path skips a request with
+        no output."""
+        buffer = self.buffers.get(name)
+        if not torch.is_tensor(buffer) or buffer.dim() == 0:
+            return None
+        values = buffer.reshape(buffer.shape[0], -1)[:, 0].tolist()
+        rows = self.request_ids
+        if len(rows) >= len(request_ids) and all(
+            a == b for a, b in zip(request_ids, rows, strict=False)
+        ):
+            # the common case: the batch in forward order, no row map needed
+            return zip(request_ids, values, strict=False)
+        row_of = {rid: i for i, rid in enumerate(rows)}
+        return (
+            (rid, values[i]) for rid in request_ids
+            if (i := row_of.get(rid)) is not None and i < len(values)
+        )
+
 
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
@@ -95,6 +117,17 @@ class BatchedModelOutput:
     # A mixed step's rows whose own walk keeps every output signal on the
     # device (see ``ExecutingBatch.loopback_rids``)
     loopback_rids: frozenset = frozenset()
+    # output name -> [bs, 2] int64 on the forward's device: row i holds the
+    # first and one-past-last index of the valid part of request i's output
+    # along its last dim. The worker cuts the rows to it once the step has
+    # run (see ``NodeSubmodule.spanned_outputs``).
+    output_spans: dict[str, torch.Tensor] | None = None
+    # The request each row of ``output_spans`` belongs to, stamped by the
+    # engine like ``row_request_ids``.
+    span_request_ids: tuple | None = None
+    # ``output_spans`` on the host, staged by the gpu thread behind the step
+    # like ``host_rows``.
+    host_spans: dict[str, torch.Tensor] | None = None
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
@@ -200,6 +233,26 @@ class BatchedModelOutput:
             if self.row_outputs is None:
                 self.row_outputs = {}
             self.row_outputs.update(other.row_outputs)
+        # Unlike the stop buffers, spans cannot be dropped on a merge: a row
+        # left without its span would leave the step uncut. Both sides span
+        # the same names (the engine checks a step against its declaration),
+        # so the rows concatenate name by name.
+        if other.output_spans:
+            if not self.output_spans:
+                self.output_spans = dict(other.output_spans)
+                self.span_request_ids = other.span_request_ids
+            else:
+                if other.output_spans.keys() != self.output_spans.keys():
+                    raise ValueError(
+                        f"cannot merge spans for {sorted(self.output_spans)} with spans "
+                        f"for {sorted(other.output_spans)}: every forward of a step spans "
+                        f"the same outputs"
+                    )
+                self.output_spans = {
+                    name: torch.cat([span, other.output_spans[name]])
+                    for name, span in self.output_spans.items()
+                }
+                self.span_request_ids = self.span_request_ids + other.span_request_ids
 
 
 @dataclass
@@ -601,7 +654,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
         return state
 
     def get_device(self):
-        return next(self.parameters()).device
+        # Cached rather than read off ``parameters()``, which walks the module
+        # tree; ``_apply`` (to / cuda / to_empty) drops it, so a moved module
+        # reports its new device.
+        device = self.__dict__.get("_cached_device")
+        if device is None:
+            device = self.__dict__["_cached_device"] = next(self.parameters()).device
+        return device
+
+    def _apply(self, fn, recurse=True):
+        self.__dict__.pop("_cached_device", None)
+        return super()._apply(fn, recurse)
 
     @abstractmethod
     def prepare_inputs(
@@ -690,10 +753,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         **kwargs # coming from preprocess output
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | BatchedModelOutput:
         """
         Pure tensor → NameToTensorList computation.
-        Compilable + CUDA-graphable.
+        Compilable + CUDA-graphable. A ``BatchedModelOutput`` keyed by the
+        request id, as ``forward_batched`` returns, can carry ``output_spans``.
         """
         pass
 
@@ -763,6 +827,25 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``postprocess``: the stop check, the inline emit and the next step's
         speculation read the step's rows instead. Empty by default;
         ``MSTAR_DEVICE_LOOPBACK=0`` keeps every node on the tensor path."""
+        del graph_walk
+        return frozenset()
+
+    def spanned_outputs(self, graph_walk: str) -> frozenset[str]:
+        """Outputs of this walk that may come with a valid span per row, in
+        ``BatchedModelOutput.output_spans`` under the output's name. The worker
+        cuts each row to its span along the last dim once the step's completion
+        event has fired, before the stop check, transport or a streaming edge
+        reads it, so a forward (and its captured graphs) can keep a fixed width
+        and still emit a length known only on the device, without a host read.
+        The cut is a view, and a row whose span covers its whole output is left
+        as it is.
+
+        The engine-side ``postprocess`` and ``batch_postprocess`` see the
+        uncut output. A spanned output must not feed a node this worker
+        speculates into, which would read it before the cut; startup refuses
+        that unless one of the two nodes sets ``enable_async_scheduling=False``.
+        Not for a signal kept on the device or sent inline, which have no
+        per-request tensor to cut. Empty by default."""
         del graph_walk
         return frozenset()
 
@@ -987,6 +1070,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return None
 
+    def on_request_added(self, request_id: int, request_info: CurrentForwardPassInfo) -> None:
+        """The request has reached this worker; none of its steps has run yet.
+
+        Runs on the worker's main thread, so host work worth starting early
+        belongs on a thread of the submodule's own, and nothing here may touch
+        the device. State goes in :meth:`request_state`, which the removal of
+        the request frees. Default: nothing.
+        """
+
     def cleanup_request(self, request_id: str):
         """Remove per-request state when a request completes. The engines call
         this on request removal; overrides with extra internal state should
@@ -995,6 +1087,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 
 class ARNodeSubmodule(NodeSubmodule):
+    # Set True on a submodule whose `split_inputs` cuts its own ``tensor_inputs``.
+    # The engine probes the prefix cache for a walk that carries them only then.
+    cuts_tensor_inputs: bool = False
+
     def split_inputs(
         self,
         graph_walk: str,

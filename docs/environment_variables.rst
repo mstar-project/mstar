@@ -25,7 +25,11 @@ Communication
        this can be set per-process while the rest of the mesh stays on
        pyzmq. Under ``MSTAR_RUST_GRAPH=AUTO``, ``0`` also keeps that
        worker's graph runtime on Python -- the Rust one cannot share a
-       pyzmq transport.
+       pyzmq transport. An extension built before 0.1.1 has no
+       non-blocking ``try_send``, which the API server's preprocess thread
+       sends with: for that thread alone, ``AUTO`` then uses pyzmq with a
+       warning and ``1`` raises, asking for a rebuild. The conductor, the
+       workers and the rest of the API server keep the Rust transport.
    * - ``MSTAR_RUST_GRAPH``
      - ``AUTO``
      - Which graph runtime a worker builds (see
@@ -161,6 +165,12 @@ Communication
        the conductor sets ``lo`` for its workers and NCCL's bootstrap
        sockets listen on loopback only. A value you set, or a set
        ``NCCL_SOCKET_FAMILY``, is kept as is.
+   * - ``NCCL_GRAPH_REGISTER``
+     - ``0``
+     - NCCL's own variable. On, NCCL registers the buffers a CUDA graph
+       captures, which succeeds on ``expandable_segments`` memory, and
+       Cosmos3 SP4 with batched captures then gave wrong images (#897).
+       Workers on CUDA set ``0`` unless you set it.
    * - ``GLOO_SOCKET_IFNAME``
      - ``lo``
      - PyTorch's variable for the Gloo groups next to each TP/SP group.
@@ -223,6 +233,25 @@ model, so they are named for it.
        checkpoint the registry names. For serving a fine-tune of the same
        architecture off a mounted volume, where the registry entry would
        otherwise pull the public weights from the Hub.
+   * - ``MSTAR_ASR_DATA``
+     - ``data/asr``
+     - ``test/asr`` (GPU parity tests): the set ``benchmark.asr_data`` built.
+   * - ``MSTAR_WHISPER_REPO``
+     - ``openai/whisper-large-v3-turbo``
+     - ``test/asr/test_whisper_parity.py``: the Whisper checkpoint to compare.
+   * - ``MSTAR_QWEN_ASR_REPO``
+     - ``Qwen/Qwen3-ASR-1.7B``
+     - ``test/asr/test_qwen3_asr_parity.py``: the Qwen3-ASR checkpoint to compare.
+   * - ``MSTAR_QWEN_ASR_REF``
+     - ``refs/Qwen3-ASR``
+     - ``test/asr/test_qwen3_asr_parity.py``: a checkout of the qwen-asr SDK,
+       the reference transcripts come from.
+   * - ``MSTAR_QWEN_ASR_REF_SITE``
+     - unset
+     - ``test/asr/test_qwen3_asr_parity.py``: a directory holding transformers
+       4.57, put first on the path of the subprocess that runs the SDK (whose
+       model code does not run on transformers 5). Unset under transformers 5,
+       the SDK comparison skips.
 
 Serving (Python frontend)
 -------------------------
@@ -303,8 +332,9 @@ Read by the ``mstar-server`` binary and its bridge
    * - ``MSTAR_SERVER_BIN``
      - unset
      - Path to the ``mstar-server`` binary. Fallback order:
-       ``--rust-frontend-bin``, this variable, ``$PATH``, then the in-repo
-       ``rust/server/target/release`` build.
+       ``--rust-frontend-bin``, this variable, the running environment's
+       scripts directory (where the Linux wheels install it), ``$PATH``, then
+       the in-repo ``rust/server/target/release`` build.
    * - ``MSTAR_API_KEY``
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read
@@ -354,7 +384,11 @@ Read by the ``mstar-server`` binary and its bridge
 Rust frontend limitations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The Rust frontend carries no audio encoder or media muxer (the Python frontend
+The Rust frontend serves no ``/generate/ws``, so a model's live client input
+(appends to a running request, see :doc:`clients`) needs the Python frontend;
+over ``/generate`` such a model's input ends when the request is submitted.
+
+It also carries no audio encoder or media muxer (the Python frontend
 uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
 
 * ``/v1/audio/speech`` produces only ``wav`` and ``pcm``. Any other
@@ -450,10 +484,12 @@ Worker scheduling
        ``0`` with it: that throttle holds the GPU thread until step N drains,
        which serialises the very overlap this flag buys.
    * - ``MSTAR_PRE_PLAN_SPEC``
-     - ``1``
+     - config's ``knobs: pre_plan``, else ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
-       thread.
+       thread, which Whisper turbo's serve config sets: its 4-layer steps
+       are too short to hide the planning in. Read by
+       ``knobs.pre_plan_enabled``.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
      - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
@@ -542,12 +578,12 @@ Worker scheduling
        master and the next step reads its input ids from it, so the worker
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
-       (``reads_device_loopback``: Qwen3.5 decode) and only when the sampler
-       has graph buffers; the sampler keeps the masters for those nodes
-       alone, so a node that takes its tokens on the host (Whisper's
-       decoder) no longer pays the eager-step master write, a small
-       synchronous host-to-device copy per step. ``0`` keeps every node on
-       the per-request tensor path.
+       (``reads_device_loopback``: the decode walks of Qwen3.5, Qwen3-ASR and
+       Whisper, which also keeps its timestamp rule state in the sampler's
+       declared loop-back state) and only when the sampler has graph
+       buffers; the sampler keeps the masters for those nodes alone, so a
+       node that takes its tokens on the host does not pay the eager-step
+       master write. ``0`` keeps every node on the per-request tensor path.
    * - ``MSTAR_INGRAPH_DECODE_ROPE``
      - config's ``knobs: ingraph_decode_rope``, else ``0``
      - A captured decode step builds its rotary tables inside the graph from
@@ -606,3 +642,20 @@ Compilation
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
        own ``compile_mode`` keeps it.
+   * - ``TORCHINDUCTOR_CACHE_DIR``
+     - ``$XDG_CACHE_HOME/mstar/torchinductor`` (``~/.cache/mstar/torchinductor`` when unset)
+     - torch's own variable; M* sets this default when importing
+       :mod:`mstar.engine` (``_default_compile_caches``), so compiled graphs and
+       autotune picks survive a restart that keeps the cache directory. An exported
+       value wins, and a home that can't be written keeps torch's
+       ``/tmp/torchinductor_<user>``. Point it at an empty directory to measure a cold
+       start (Triton's kernels follow it unless ``TRITON_CACHE_DIR`` is exported;
+       FlashInfer's JIT cache stays warm). See
+       :ref:`serving:Restarts and the compile cache`.
+   * - ``TRITON_CACHE_DIR``
+     - ``$TORCHINDUCTOR_CACHE_DIR/triton``
+     - Triton's own variable, defaulted by the same function once
+       ``TORCHINDUCTOR_CACHE_DIR`` is resolved (exported or M*'s default; left unset
+       when that falls back to torch's). An exported value wins. Holds Triton's compiled
+       kernels, Inductor's and those compiled outside it; without it, where a kernel
+       lands depends on whether Inductor compiled first.

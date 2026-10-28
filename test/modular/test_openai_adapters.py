@@ -151,6 +151,37 @@ def test_extra_body_non_standard_knobs_pass_through(tmp_path):
     assert mk["talker_top_k"] == 50 and mk["talker_repetition_penalty"] == 1.05
 
 
+def test_text_chat_maps_text_and_sampling(tmp_path):
+    adapter = adapters.TextChatAdapter()
+    assert adapter.supports_chat
+    req = ChatCompletionRequest(
+        model="llm", messages=[{"role": "user", "content": "hi"}],
+        temperature=0.0, top_p=0.9, max_tokens=64, repetition_penalty=1.1,
+    )
+    sa = adapter.chat_to_request(req, tmp_path)
+    assert sa.text == "hi"
+    assert sa.input_modalities == ["text"] and sa.output_modalities == ["text"]
+    assert sa.model_kwargs == {
+        "repetition_penalty": 1.1, "temperature": 0.0, "top_p": 0.9, "max_output_tokens": 64,
+    }
+    assert [p.modality for p in sa.prompt_parts] == ["text"]
+
+
+def test_text_chat_keeps_each_turn(tmp_path):
+    req = ChatCompletionRequest(model="llm", messages=[
+        {"role": "system", "content": "Be brief."}, {"role": "user", "content": "Name a color."},
+        {"role": "assistant", "content": "Blue."}, {"role": "user", "content": "Another."},
+    ])
+    sa = adapters.TextChatAdapter().chat_to_request(req, tmp_path)
+    assert [(p.role, p.text) for p in sa.prompt_parts] == [
+        ("system", "Be brief."), ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another."),
+    ]
+
+
+def test_glm52_serves_text_chat():
+    assert isinstance(adapters.get_adapter("glm52"), adapters.TextChatAdapter)
+
+
 def test_bagel_image(tmp_path):
     req = ImageGenerationRequest(model="bagel", prompt="a cat")
     sa = adapters.BagelAdapter().image_to_request(req, tmp_path)
@@ -166,6 +197,7 @@ def test_extra_body_passthrough(tmp_path):
 
 _CHAT_ADAPTERS = [
     adapters.BagelAdapter, adapters.Qwen3OmniAdapter, adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter,
+    adapters.TextChatAdapter,
 ]
 _FUNCTION = {"name": "get_weather"}
 _NAMED = {"type": "function", "function": _FUNCTION}
@@ -236,3 +268,58 @@ def test_speech_without_a_speed_control_forwards_only_a_sent_speed(adapter, tmp_
     sent = adapter.speech_to_request(SpeechRequest(input="hi", speed=1.2), tmp_path)
     assert sent.model_kwargs["speed"] == 1.2
     assert "speed" not in adapter.speech_to_request(SpeechRequest(input="hi"), tmp_path).model_kwargs
+
+
+@pytest.mark.parametrize("body", [
+    {"messages": []},
+    {"messages": [{"role": "user"}]},
+    {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 0},
+    {"messages": [{"role": "user", "content": "hi"}], "max_tokens": -5},
+    {"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 0},
+    # extra_body overrides max_tokens: a string or null took the conductor's batch down
+    {"messages": [{"role": "user", "content": "hi"}], "max_output_tokens": "lots"},
+    {"messages": [{"role": "user", "content": "hi"}], "max_output_tokens": 0},
+    {"messages": [{"role": "user", "content": "hi"}], "repetition_penalty": "1.1x"},
+    # an image was decoded to disk and dropped: the model answered as if it saw it
+    {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+    ]}]},
+])
+def test_text_chat_refuses_what_it_cannot_serve(body, tmp_path):
+    # a ValueError is the route's 400; past the adapter these failed as a 500 or ran
+    with pytest.raises(ValueError):
+        adapters.TextChatAdapter().chat_to_request(ChatCompletionRequest(**body), tmp_path)
+
+
+def test_text_chat_maps_max_tokens(tmp_path):
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], max_tokens=7)
+    sa = adapters.TextChatAdapter().chat_to_request(req, tmp_path)
+    assert sa.text == "hi" and sa.model_kwargs["max_output_tokens"] == 7
+
+
+def test_text_chat_coerces_numeric_extra_body(tmp_path):
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}],
+                                max_output_tokens="256", repetition_penalty="1.1")
+    mk = adapters.TextChatAdapter().chat_to_request(req, tmp_path).model_kwargs
+    assert mk["max_output_tokens"] == 256 and mk["repetition_penalty"] == 1.1
+
+
+@pytest.mark.parametrize("field", [
+    {"n": 2}, {"stop": "\n"}, {"stop": ["END"]}, {"logprobs": True}, {"top_logprobs": 5},
+    {"logit_bias": {"100": -100}}, {"presence_penalty": 1.5}, {"frequency_penalty": 0.5},
+    {"best_of": 2}, {"response_format": {"type": "json_object"}}, {"stop_token_ids": [2]},
+])
+def test_text_chat_refuses_what_it_would_ignore(field, tmp_path):
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **field)
+    with pytest.raises(ValueError, match=next(iter(field))):
+        adapters.TextChatAdapter().chat_to_request(req, tmp_path)
+
+
+def test_text_chat_passes_those_fields_off(tmp_path):
+    req = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hi"}], n=1, stop=[], logprobs=False,
+        top_logprobs=0, logit_bias={}, presence_penalty=0, frequency_penalty=0.0,
+        best_of=1, response_format={"type": "text"}, stop_token_ids=[],
+    )
+    assert adapters.TextChatAdapter().chat_to_request(req, tmp_path).model_kwargs == {}

@@ -7,6 +7,7 @@ extension is installed and the server binary is built
 import contextlib
 import json
 import socket
+import sysconfig
 import tempfile
 import threading
 import time
@@ -1180,3 +1181,16 @@ def test_images_n_cap_follows_the_env():
         out = _post_json(port, "/v1/images/generations",
                          {"model": "cosmos3", "prompt": "x", "n": 2})
         assert len(out["data"]) == 2
+
+
+def test_the_running_environment_s_binary_wins_over_one_on_path(tmp_path, monkeypatch):
+    # An unactivated venv's python must not launch an older mstar-server that
+    # happens to be on $PATH against its own bridge code.
+    scripts, elsewhere = tmp_path / "venv-bin", tmp_path / "on-path"
+    for d in (scripts, elsewhere):
+        d.mkdir()
+        (d / "mstar-server").touch(mode=0o755)
+    monkeypatch.delenv("MSTAR_SERVER_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(elsewhere))
+    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(scripts))
+    assert find_server_binary() == str(scripts / "mstar-server")

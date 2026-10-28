@@ -300,7 +300,10 @@ def test_speech_maps_adapter_errors(client_and_stub, monkeypatch, exc, status):
     stub.model_name = "orpheus"
     monkeypatch.setattr(adapters.OrpheusAdapter, "speech_to_request", raising)
     r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": "hi", "voice": "tara"})
-    assert r.status_code == status and str(exc) in r.json()["error"]["message"]
+    assert r.status_code == status
+    # a refusal keeps its message; the server's own error shows only an error id
+    message = r.json()["error"]["message"]
+    assert (str(exc) in message) == (status == 400)
     assert stub.last_submit is None
 
 
