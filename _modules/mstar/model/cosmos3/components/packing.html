@@ -1487,9 +1487,17 @@ window.runMermaid = runMermaid;</script>
     <span class="n">pos_dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span> <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">is_floating_point</span><span class="p">()</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">)</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">long</span>
     <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">p</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pos_dtype</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
     <span class="n">static</span><span class="p">[</span><span class="s2">"position_ids"</span><span class="p">]</span> <span class="o">=</span> <span class="n">position_ids</span>
+    <span class="n">static</span><span class="p">[</span><span class="s2">"gen_position_ids"</span><span class="p">]</span> <span class="o">=</span> <span class="n">_gen_band</span><span class="p">(</span><span class="n">position_ids</span><span class="p">,</span> <span class="n">text</span><span class="p">[</span><span class="s2">"und_len"</span><span class="p">])</span>
     <span class="n">static</span><span class="p">[</span><span class="s2">"sequence_length"</span><span class="p">]</span> <span class="o">=</span> <span class="n">sequence_length</span>
     <span class="k">return</span> <span class="n">static</span></div>
 
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_gen_band</span><span class="p">(</span><span class="n">position_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">und_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The generation band's position ids as their own tensor. A slice of</span>
+<span class="sd">    ``position_ids`` has the prompt length in its stride, which the compiled</span>
+<span class="sd">    denoise step guards on, so every new prompt length would recompile it."""</span>
+    <span class="k">return</span> <span class="n">position_ids</span><span class="p">[:,</span> <span class="n">und_len</span><span class="p">:]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
 
 
 <div class="viewcode-block" id="build_t2i_static_inputs">
@@ -1581,6 +1589,7 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">"num_noisy_action_tokens"</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">action_noisy</span><span class="p">),</span>
         <span class="s2">"action_mode"</span><span class="p">:</span> <span class="n">mode</span><span class="p">,</span>
         <span class="s2">"position_ids"</span><span class="p">:</span> <span class="n">position_ids</span><span class="p">,</span>
+        <span class="s2">"gen_position_ids"</span><span class="p">:</span> <span class="n">_gen_band</span><span class="p">(</span><span class="n">position_ids</span><span class="p">,</span> <span class="n">text</span><span class="p">[</span><span class="s2">"und_len"</span><span class="p">]),</span>
         <span class="s2">"sequence_length"</span><span class="p">:</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">action_chunk_size</span><span class="p">,</span>
     <span class="p">}</span></div>
 
