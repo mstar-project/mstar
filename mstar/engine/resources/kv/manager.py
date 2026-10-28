@@ -59,7 +59,7 @@ from mstar.engine.resources.step import (
     StepContext,
 )
 from mstar.utils.client_errors import client_error_text
-from mstar.utils.h2d import H2DMirror, PinnedStager
+from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 from mstar.utils.profiler import PhaseLaps
 
@@ -450,10 +450,24 @@ class KVPlanState:
     # on it (the replay's plan-done wait comes after an eager write)
     ready: Any = None
     # a captured state: both arrays as one buffer (``token_to_page`` then
-    # ``token_to_cache``), staged in one copy, and what that copy last wrote
-    # into the slot's buffer (``KVManager._stage_static``)
+    # ``token_to_cache``), staged in one copy, and the slot's buffer it is a
+    # view of (``KVManager._stage_static``)
     staging: torch.Tensor | None = None
-    mirror: H2DMirror | None = None
+    slot_buffer: "_SlotBuffer | None" = None
+
+
+class _SlotBuffer:
+    """A slot and label's captured write addressing, which every capture
+    length's state views: the device buffer, and how many of its leading
+    elements are known to be zero. ``SINK_PAGE`` is 0, so a step that writes
+    nothing needs its length's ``2 * capture_len`` prefix zero, whatever the
+    length; once the whole buffer is, such a step needs no copy at all."""
+
+    __slots__ = ("buffer", "zero_prefix")
+
+    def __init__(self, buffer: torch.Tensor) -> None:
+        self.buffer = buffer
+        self.zero_prefix = buffer.numel()  # allocated zeroed
 
 
 class _LabelRows:
@@ -624,8 +638,8 @@ class KVManager(AttentionResource):
 
         # (slot, label) -> KVPlanState, sized for the largest capture bucket
         self._static_plan_states: dict[tuple[int, str, int], KVPlanState] = {}
-        # (slot, label) -> the buffer its states share, and its mirror
-        self._static_plan_buffers: dict[tuple[int, str], tuple[torch.Tensor, H2DMirror]] = {}
+        # (slot, label) -> the buffer its states share
+        self._static_plan_buffers: dict[tuple[int, str], _SlotBuffer] = {}
         # copy-only H2D into those, see `_stage_decode_plan_state`
         self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
@@ -722,17 +736,15 @@ class KVManager(AttentionResource):
                 )
             base = self._static_plan_buffers.get((slot, label))
             if base is None:
-                base = self._static_plan_buffers[(slot, label)] = (
+                base = self._static_plan_buffers[(slot, label)] = _SlotBuffer(
                     torch.zeros(2 * self._cg_max_seq_len, dtype=torch.long, device=self._device),
-                    H2DMirror(),
                 )
-            buffer, mirror = base
-            # no fill here: only the stager writes the buffer (the mirror
-            # records what it holds), and every replay is staged first
-            both = buffer[:2 * capture_len]
+            # no fill here: only the stager writes the buffer, and every
+            # replay is staged first
+            both = base.buffer[:2 * capture_len]
             state = self._static_plan_states[(slot, label, capture_len)] = KVPlanState(
                 token_to_page=both[:capture_len], token_to_cache=both[capture_len:],
-                staging=both, mirror=mirror,
+                staging=both, slot_buffer=base,
             )
         return state
 
@@ -740,18 +752,26 @@ class KVManager(AttentionResource):
         """Stage a step's write addressing into a captured state: its tokens'
         pages and offsets, the rest SINK_PAGE / 0 (the slots the graph scatters
         beyond the real tokens, else they hit another request's KV). One copy,
-        and none when the buffer already holds exactly this (the mirror)."""
+        and none for a step that writes nothing into a buffer already zero
+        there (a decoder's read of a context label it wrote eagerly)."""
         capture_len = state.token_to_page.shape[0]
         n = len(pages)
         if n > capture_len:
             raise ValueError(f"{n} tokens staged into a {capture_len}-token bucket")
+        state.total_tokens = total
+        slot_buffer = state.slot_buffer
+        if n == 0:
+            if slot_buffer.zero_prefix < 2 * capture_len:
+                self._plan_stager.copy_(state.staging, (), pad_value=0)
+                slot_buffer.zero_prefix = 2 * capture_len
+            return state
         host = np.empty(2 * capture_len, np.int64)
         host[:n] = pages
         host[n:capture_len] = SINK_PAGE
         host[capture_len:capture_len + n] = offsets
         host[capture_len + n:] = 0
-        self._plan_stager.copy_(state.staging, host, mirror=state.mirror)
-        state.total_tokens = total
+        self._plan_stager.copy_(state.staging, host)
+        slot_buffer.zero_prefix = 0
         return state
 
     def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
@@ -2221,8 +2241,7 @@ class KVManager(AttentionResource):
         """``_packed_addressing`` staged into the captured state."""
         total = int(indptrs.qo_indptr[-1])
         if total == 0:
-            # every row reads without writing (a zero-span context label):
-            # the buffer is all SINK_PAGE, which the mirror usually already holds
+            # every row reads without writing (a zero-span context label)
             return self._stage_static(static_state, (), (), 0)
         pages, offsets = self._packed_addressing(indptrs, total)
         return self._stage_static(static_state, pages, offsets, total)
@@ -2299,7 +2318,6 @@ class KVManager(AttentionResource):
                 else:
                     self._current_plan_states[label] = plan_state
                 continue
-            total_tokens = None if indptrs.is_decode else indptrs.get_total_len()
             if lease is not None:
                 # a captured packed step (prefill, mixed): addressing off the
                 # host indptrs, staged as for decode, not unpacked on device
@@ -2314,6 +2332,7 @@ class KVManager(AttentionResource):
                 else:
                     self._current_plan_states[label] = plan_state
                 continue
+            total_tokens = None if indptrs.is_decode else indptrs.get_total_len()
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(
                     None if indptrs.decode_pages is not None else indptrs.views,

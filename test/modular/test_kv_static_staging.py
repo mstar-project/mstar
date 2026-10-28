@@ -1,14 +1,14 @@
 """A captured step's write addressing is staged in one copy into its slot's
-buffer (pages then offsets, padded with SINK_PAGE / 0), and not at all when
-the buffer already holds exactly that; a slot's capture lengths share the
-buffer, so another length's staging in between forces the copy again."""
+buffer (pages then offsets, padded with SINK_PAGE / 0); a slot's capture
+lengths share the buffer. A step that writes nothing copies only when the
+buffer is not already zero where its length reads."""
 from __future__ import annotations
 
 import pytest
 import torch
 
 if not torch.cuda.is_available():
-    pytest.skip("the stager's skip is on the pinned H2D path, which needs CUDA", allow_module_level=True)
+    pytest.skip("the stager's copy count is on the pinned H2D path, which needs CUDA", allow_module_level=True)
 
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import PagedKVConfig  # noqa: E402
@@ -41,18 +41,31 @@ def _staged(kv, state):
     return state.token_to_page.tolist(), state.token_to_cache.tolist()
 
 
-def test_one_copy_padded_and_skipped_when_unchanged(kv):
+def test_one_copy_padded(kv):
     s4 = kv._static_plan_state(0, "main", 4)
     assert s4.staging.data_ptr() == s4.token_to_page.data_ptr()
-    kv._stage_static(s4, [5, 6], [1, 2], 2)
-    assert _staged(kv, s4) == ([5, 6, SINK_PAGE, SINK_PAGE], [1, 2, 0, 0])
-    assert s4.total_tokens == 2
     copies = kv._plan_stager.copies
     kv._stage_static(s4, [5, 6], [1, 2], 2)
-    assert kv._plan_stager.copies == copies, "the same addressing staged twice copied twice"
-    kv._stage_static(s4, [5, 7], [1, 2], 2)
     assert kv._plan_stager.copies == copies + 1
+    assert _staged(kv, s4) == ([5, 6, SINK_PAGE, SINK_PAGE], [1, 2, 0, 0])
+    assert s4.total_tokens == 2
+    kv._stage_static(s4, [5, 7], [1, 2], 2)
     assert _staged(kv, s4) == ([5, 7, SINK_PAGE, SINK_PAGE], [1, 2, 0, 0])
+
+
+def test_a_step_that_writes_nothing_copies_only_into_a_dirty_buffer(kv):
+    s2, s4 = kv._static_plan_state(0, "main", 2), kv._static_plan_state(0, "main", 4)
+    copies = kv._plan_stager.copies
+    # a new buffer is allocated zeroed: nothing to copy at either length
+    kv._stage_static(s4, (), (), 0)
+    kv._stage_static(s2, (), (), 0)
+    assert kv._plan_stager.copies == copies and s2.total_tokens == 0
+    kv._stage_static(s2, [5], [1], 1)
+    kv._stage_static(s4, (), (), 0)
+    assert kv._plan_stager.copies == copies + 2
+    assert _staged(kv, s4) == ([SINK_PAGE] * 4, [0] * 4)
+    kv._stage_static(s2, (), (), 0)
+    assert kv._plan_stager.copies == copies + 2
 
 
 def test_capture_lengths_share_a_slots_buffer(kv):
@@ -61,10 +74,7 @@ def test_capture_lengths_share_a_slots_buffer(kv):
     kv._stage_static(s4, [9, 9, 9, 9], [3, 3, 3, 3], 4)
     kv._stage_static(s2, [5], [1], 1)
     assert _staged(kv, s2) == ([5, SINK_PAGE], [1, 0])
-    # s4's values were overwritten by s2's: staging them again must copy
-    copies = kv._plan_stager.copies
     kv._stage_static(s4, [9, 9, 9, 9], [3, 3, 3, 3], 4)
-    assert kv._plan_stager.copies == copies + 1
     assert _staged(kv, s4) == ([9, 9, 9, 9], [3, 3, 3, 3])
     # another slot or label has its own buffer
     assert kv._static_plan_state(1, "main", 4).staging.data_ptr() != s4.staging.data_ptr()
