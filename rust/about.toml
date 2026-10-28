@@ -18,7 +18,8 @@ accepted = [
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 ignore-build-dependencies = false
 ignore-dev-dependencies = true
-# mstar-rust and mstar-server are this project, covered by LICENSE.
+# mstar-rust and mstar-server are this project, covered by LICENSE; this skips
+# them because their Cargo.toml says `publish = false`.
 private = { ignore = true }
 workarounds = ["ring"]
 
