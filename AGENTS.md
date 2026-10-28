@@ -44,7 +44,7 @@ For example, nothing under `mstar/model/` should:
 - **Allocate, free, or evict resource state.** No calls into `PageArena`, `PageAllocator`, `CacheStream`, `CPUPagePool`, or `WorkspacePool`, and no direct `admit`/`commit`. Declare resources in `Model.get_node_resources()` and declare each step's effect on them in `NodeSubmodule.declare_step()`. The engine runs the lifecycle.
 - **Choose which requests form a batch.** Batch *selection* is the micro-scheduler's job: implement `can_batch` and `forward_batched`, set `input_seq_len` in `prepare_inputs`, and let it decide. (Note: given a batch, mechanically stacking or concatenating tensors in `preprocess` is normal and expected, and some audio submodules also pad to a maximum sequence length themselves for capture compatibility).
 - **Manage streams or synchronize.** No `torch.Stream`, `torch.Event`, `torch.accelerator.synchronize`, or device-specific equivalents under `mstar/model/`.
-- **Index a resource's storage or hold its plans.** No `pool.block(...).index_select` / `index_copy_`, host-side slot lookups, or keeping `resource.current` to select rows from later. The resource exposes the access, driven by the step (e.g., `RecurrentStatePool.gather` / `scatter_` ([#383](https://github.com/mstar-project/mstar/pull/383), open PR), `attend` over the current plan), so eager and captured paths address rows the same way.
+- **Index a resource's storage or hold its plans.** No `pool.block(...).index_select` / `index_copy_`, host-side slot lookups, or keeping `resource.current` to select rows from later. The resource exposes the access, driven by the step (e.g., `RecurrentStatePool.gather` / `scatter_`, `attend` over the current plan), so eager and captured paths address rows the same way.
 
 Things that look model-specific but belong to the system:
 
@@ -191,7 +191,7 @@ python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
     test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
                                       # the CPU Core CI job (CI adds -p xdist -n 4), no GPU or weights
 pytest test/integration/              # needs GPU + weights
-cd rust && cargo test --release --no-default-features && pytest ../test/rust/
+cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
 
 The CPU Core job runs every test module under the directories in `CPU_TEST_PATHS` ([scripts/ci/select_cpu_tests.py](scripts/ci/select_cpu_tests.py)), including `test/modular/`, `test/distributed/` and `mstar/model/*/tests/`; there is no list of test files to add to. A new module there runs in CI as soon as it exists, so it must pass or skip on a CPU-only machine: guard CUDA, weights and optional packages with a `skipif` or `pytest.importorskip("<module>")` (import names: `flashinfer`, `misaki`, `qwen_tts`, `mstar_rust`), and give a test that is broken on `main` an in-file `pytest.mark.skip` whose reason says why and names the fixing PR or issue when one exists. A test module outside those directories goes in `NOT_CPU_CORE` there with where it runs instead; `test/ci/test_cpu_selection.py` fails on one in neither, and on two selected modules outside a package with the same basename. A guard on a reference package named like an mstar model (`kokoro`, `chatterbox`, `omnivoice`) imports a submodule only the reference has: once pytest puts `mstar/model` on `sys.path` for `mstar/model/*/tests`, the bare name finds mstar's own package (see [CONTRIBUTING.md](CONTRIBUTING.md)).

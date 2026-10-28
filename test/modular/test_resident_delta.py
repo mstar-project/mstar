@@ -602,6 +602,7 @@ class _Leader:
 
     maybe_send_zmq_to_tp_followers = Worker.maybe_send_zmq_to_tp_followers
     _rid_str = Worker._rid_str
+    _step_reads = Worker._step_reads
 
     def __init__(self, followers=("rank1", "rank2")):
         self.engine = _Engine("leader")
@@ -626,6 +627,9 @@ class _Leader:
         self.communicator = SimpleNamespace(
             send=lambda worker, msg: self.sent.append((worker, msg))
         )
+        # nothing the followers read: no step goes out read-checked
+        self._lockstep_unread: dict = {}
+        self._streaming_edge_names: set[str] = set()
 
 
 def _node_batch():
@@ -726,8 +730,8 @@ class _Rank:
         self.flushed_removes += 1
         self.flush_protected = set(in_flight_rids)
 
-    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None):
-        del batch_ids, affected_resources
+    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None, inside_only=False):
+        del batch_ids, affected_resources, inside_only
         self.offload_attempts.append(node_name)
         return "victim"
 
@@ -737,7 +741,7 @@ def _oom(rank, referenced_rids=frozenset()):
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
-    node_batch = SimpleNamespace(node_name="node", failed_resource=None)
+    node_batch = SimpleNamespace(node_name="node", failed_resource=None, admit_error=None)
     rank._handle_allocation_failure(batch, node_batch, referenced_rids)
 
 
@@ -927,6 +931,7 @@ class _ForwardingLeader:
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False
+        self._lockstep_led = frozenset()
         self._tp_broadcast_seq = broadcast_seq
         # handle-keyed state, per rid_table's list
         self._in_flight_rids: set[int] = set()

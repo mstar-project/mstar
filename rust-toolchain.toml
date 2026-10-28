@@ -1,0 +1,6 @@
+# The Rust compiler for rust/ and rust/server: CI, the release wheels and
+# local builds all resolve it from here.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

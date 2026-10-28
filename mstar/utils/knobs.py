@@ -18,6 +18,7 @@ KNOBS: dict[str, str] = {
     "kv_plan_cache": "MSTAR_KV_PLAN_CACHE",
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
+    "pre_plan": "MSTAR_PRE_PLAN_SPEC",
 }
 
 # this process's ``knobs:`` block, as strings in the env vars' format
@@ -148,3 +149,14 @@ def gc_gen0_threshold() -> int:
     c=128 (8% shorter decode step) for at most that many young objects held
     between collections."""
     return max(0, int(_setting("gc_gen0_threshold", "0")))
+
+
+def pre_plan_enabled() -> bool:
+    """``pre_plan`` / ``MSTAR_PRE_PLAN_SPEC`` (default on): the worker
+    pre-plans the speculative batch on a plan thread while the previous step
+    replays, and the engine double-buffers the resources that support it.
+    Off, each step plans inline on the GPU thread. It wins on a deep decoder
+    (Whisper large-v3, Qwen3-ASR) and loses on a shallow one (Whisper turbo's
+    4 layers), where the step is too short to hide the planning in and the
+    extra thread is just GIL contention."""
+    return _setting("pre_plan", "1") == "1"

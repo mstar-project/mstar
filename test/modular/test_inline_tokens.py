@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from types import SimpleNamespace
 
 import torch
 
@@ -46,6 +47,10 @@ def test_result_tokens_round_trips_through_the_codec():
 
 
 class _Model:
+    def get_partition_topology(self):
+        from mstar.streaming.topology import PartitionTopology
+        return PartitionTopology(partitions=["default"])
+
     def postprocess(self, output, modality, request_kwargs=None):
         assert modality == "text"
         return f"<{int(output[0])}>".encode()
@@ -58,10 +63,22 @@ class _Comm:
     def send(self, entity, msg):
         pass
 
+    # the data worker's outbox encodes with this: identity, so sends arrive as objects
+    codec = SimpleNamespace(encode=lambda msg: msg)
+
+    def try_send_bytes(self, entity, msg):
+        self.send(entity, msg)
+        return True
+
 
 class _TM:
     def start_read_tensors(self, request_id, graph_edges, graph_walk=None):
         return []
+
+    def take_failed_reads(self):
+
+        return []
+
 
     def get_ready_tensors(self):
         return {}
