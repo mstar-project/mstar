@@ -393,6 +393,23 @@ def test_kernel_choice():
     assert swiglu.fused is False
 
 
+@pytest.mark.parametrize("key", list(FORMATS))
+def test_a_module_dtype_cast_leaves_the_stored_parts_alone(key):
+    """The engine casts each submodule to its autocast dtype after loading: the experts' stored
+    parts keep their container dtypes and values (fp8 block scales stay fp32, as the fused kernel
+    takes them), while the module's other weights are cast."""
+    fmt, names = FORMATS[key]
+    experts = _load(fmt, names, _checkpoint(fmt, names, _dense_layer()))
+    before = {n: p.detach().clone() for n, p in experts.named_parameters()}
+    layer = _Layer(experts)
+    layer.router = nn.Linear(HIDDEN, E, bias=False)
+    layer.to(torch.bfloat16)
+    assert layer.router.weight.dtype == torch.bfloat16
+    for n, p in experts.named_parameters():
+        assert p.dtype == before[n].dtype and torch.equal(p, before[n]), n
+        assert hasattr(p, "weight_loader"), n
+
+
 def test_shards_that_cut_a_stored_element_are_refused():
     with pytest.raises(ValueError, match="int4"):
         QuantizedExperts(Int4Group(32), E, 40, HIDDEN, SimpleNamespace(rank=0, world_size=2))

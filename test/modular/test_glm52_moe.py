@@ -355,7 +355,9 @@ def test_autocast_then_restore_keeps_fp8_layout():
 
     block8.to(torch.bfloat16)  # the submodule-load autocast
     assert block8.experts.gate_up_proj_fp8.dtype == torch.uint8  # ints immune
-    assert block8.experts.gate_up_proj_scale_inv.dtype == torch.bfloat16
+    # the quantized experts keep their stored dtypes through a module cast; the router's bias
+    # is what restore_fp32_params widens back
+    assert block8.experts.gate_up_proj_scale_inv.dtype == torch.float32
     assert block8.gate.e_score_correction_bias.dtype == torch.bfloat16
 
     restore_fp32_params(block8)

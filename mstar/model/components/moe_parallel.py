@@ -5,14 +5,24 @@
 * :class:`MoeParallelMixin` gives the owning model padding masks and EP load logging.
 """
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.moe import ExpertParallelSparseMoeBlock, ParallelSparseMoeBlock
+from mstar.model.components.moe import (
+    ExpertParallelSparseMoeBlock,
+    ParallelSparseMoeBlock,
+    QuantizedSparseMoeBlock,
+)
+
+if TYPE_CHECKING:
+    from mstar.model.components.quantization import QuantMethod
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +77,28 @@ def instantiate_moe_block(
     router: nn.Module | None = None,
     comm_group: CommGroup | None = None,
     moe_parallel: MoeParallelConfig | None = None,
-) -> ParallelSparseMoeBlock | ExpertParallelSparseMoeBlock:
+    quant: QuantMethod | None = None,
+) -> ParallelSparseMoeBlock | ExpertParallelSparseMoeBlock | QuantizedSparseMoeBlock:
     """The routed-expert block ``moe_parallel`` asks for; TP when None.
 
-    ``comm_group`` is the node's TP group; EP picks its group from it.
+    ``comm_group`` is the node's TP group; EP picks its group from it. ``quant`` is the
+    checkpoint's quantization method: experts it keeps quantized are held in their stored
+    format (TP only for now); without one, or with experts it dequantizes at load, they are bf16.
     """
     moe_parallel = moe_parallel or MoeParallelConfig()
+    if quant is not None and quant.keeps_quantized("routed_experts"):
+        if moe_parallel.parallel != "tp":
+            raise NotImplementedError("expert parallelism over quantized experts is not implemented; "
+                                      "use ep_config parallel: tp")
+        return QuantizedSparseMoeBlock(
+            quant.routed_experts(num_experts, moe_intermediate_size, hidden_size, comm_group),
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            norm_topk_prob=norm_topk_prob,
+            router=router,
+            comm_group=comm_group,
+        )
     if moe_parallel.parallel == "tp":
         return ParallelSparseMoeBlock(
             hidden_size=hidden_size,

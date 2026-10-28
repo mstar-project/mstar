@@ -86,7 +86,18 @@ class QuantizedExperts(nn.Module):
                 _down_proj_fp8_weight_loader, rank, size, inter, part.unit[1])
 
     def _apply(self, fn, recurse=True):
-        result = super()._apply(fn, recurse=recurse)
+        # A module-wide dtype cast (the engine casts each submodule to its autocast dtype after
+        # loading) must not touch the stored parts: fp32 scales would round to bf16, and the
+        # fused kernels take them fp32. Each part moves without a cast instead.
+        stored = {id(p): p.dtype for p in self._parameters.values() if p is not None}
+
+        def keep_dtype(t):
+            out = fn(t)
+            if out.dtype != stored.get(id(t), out.dtype):
+                out = t.to(device=out.device)
+            return out
+
+        result = super()._apply(keep_dtype, recurse=recurse)
         self._attach_weight_loaders()
         return result
 

@@ -15,6 +15,8 @@ Parallel (TP-aware) variants:
 
 * :class:`ParallelSparseMoeBlock`
 * :class:`ParallelSparseMoeBlockWithSharedExpert`
+* :class:`QuantizedSparseMoeBlock` — the first, with experts held in a
+  quantized checkpoint's format (``mstar.model.components.quantization``).
 
 Expert-parallel variant:
 
@@ -670,6 +672,66 @@ class ParallelSparseMoeBlock(nn.Module):
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
         self.comm_group.all_reduce(output)
         return output
+
+
+class QuantizedSparseMoeBlock(nn.Module):
+    """:class:`ParallelSparseMoeBlock` over routed experts held in a checkpoint's quantized format.
+
+    ``experts`` is the container ``QuantMethod.routed_experts`` builds
+    (``mstar.model.components.quantization``): its stored parts load through their own weight
+    loaders, and ``experts(x, routing_weights, selected_experts)`` returns this rank's partial,
+    summed over the top-k. The router and the TP routing sync are the bf16 block's.
+    """
+
+    def __init__(
+        self,
+        experts: nn.Module,
+        hidden_size: int,
+        num_experts: int,
+        num_experts_per_tok: int,
+        norm_topk_prob: bool = True,
+        router: nn.Module | None = None,
+        comm_group: CommGroup | None = None,
+    ) -> None:
+        super().__init__()
+        self.comm_group = comm_group or CommGroup.trivial()
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.gate = router if router is not None else TopKRouter(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            norm_topk_prob=norm_topk_prob,
+        )
+        self.experts = experts
+
+    def process_weights_after_loading(self, device) -> None:
+        """The fused kernels where the experts' format has them on ``device``."""
+        self.experts.resolve_kernels(device)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_states: torch.Tensor | None = None,
+        *,
+        return_router_states: bool = False,
+        token_valid: torch.Tensor | None = None,
+    ):
+        if token_valid is not None:
+            raise NotImplementedError("quantized experts do not skip padding rows (mask_padding)")
+        input_shape = hidden_states.shape
+        flat = hidden_states.view(-1, hidden_states.shape[-1]).contiguous()
+        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
+        if self.comm_group.world_size > 1:
+            routing_weights, selected_experts = _sync_routing(
+                self.comm_group, routing_weights, selected_experts,
+            )
+        out = self.experts(flat, routing_weights, selected_experts)
+        if self.comm_group.world_size > 1:
+            self.comm_group.all_reduce(out)
+        out = out.view(input_shape)
+        return (out, router_states_next) if return_router_states else out
 
 
 class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
