@@ -513,18 +513,19 @@ removes the other's files. Verify with:
 ``test/rust`` is skipped wholesale when the extension is not importable, so
 a green run there without the build above proves nothing.
 
-The Rust-side tests need one extra flag. The crate's default features turn on
-``pyo3/extension-module``, which tells pyo3 *not* to link libpython — right
+The Rust-side tests need different features. The crate's default features turn
+on ``pyo3/extension-module``, which tells pyo3 *not* to link libpython — right
 for the cdylib, which resolves CPython symbols from the interpreter that
 imports it, wrong for ``cargo test``, which is an executable and has to link
-it itself. Without this the link fails on ``undefined symbol:
-PyEval_RestoreThread``:
+it itself. Without ``--no-default-features`` the link fails on ``undefined
+symbol: PyEval_RestoreThread``; ``--features python`` keeps the bindings and
+the graph runtime, whose tests need them:
 
 .. code-block:: bash
 
    export LD_LIBRARY_PATH="$(python -c 'import sysconfig
    print(sysconfig.get_config_var("LIBDIR"))')"
-   cargo test --release --no-default-features --manifest-path rust/Cargo.toml
+   cargo test --release --no-default-features --features python --manifest-path rust/Cargo.toml
 
 Optional: the Rust HTTP frontend
 --------------------------------

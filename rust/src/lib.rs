@@ -4,28 +4,41 @@
 //! ZMQ PUSH/PULL control mesh, as a transport + codec split) and `shm.rs`
 //! (the shared-memory tensor arena). The crate is not limited to these —
 //! new components land as new modules with their own bindings. Also
-//! usable as a plain Rust library (rlib) by Rust-side consumers.
+//! usable as a plain Rust library (rlib) by Rust-side consumers; without the
+//! `python` feature (rust/server) it builds only the transport and arena and
+//! links no Python, since the bindings, `graph` and `tensors` need pyo3.
 //! Build: `maturin develop --release` in rust/.
 
 pub mod communicator;
+#[cfg(feature = "python")]
 pub mod graph;
 pub mod shm;
+#[cfg(feature = "python")]
 pub mod tensors;
 
+#[cfg(feature = "python")]
 use std::os::raw::{c_int, c_void};
+#[cfg(feature = "python")]
 use std::time::Duration;
 
+#[cfg(feature = "python")]
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
+#[cfg(feature = "python")]
 use pyo3::ffi;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::PyBytes;
 
+#[cfg(feature = "python")]
 use communicator::{RawZmqCommunicator, RecvEvent};
+#[cfg(feature = "python")]
 use shm::{SegmentedShmArena, ShmArena};
 
 /// Opaque byte frames over ZMQ PUSH/PULL: ipc or tcp endpoints, lazily-cached
 /// peers, and wakeup-fd polling (an eventfd wakes `recv_or_wake` instantly).
 /// Encoding is the caller's (pickle today; msgpack by swapping the codec).
+#[cfg(feature = "python")]
 #[pyclass(name = "ZmqCommunicator")]
 pub struct PyZmqCommunicator {
     /// Behind an Arc so the graph runtime can hold a share of the SAME
@@ -35,12 +48,14 @@ pub struct PyZmqCommunicator {
     inner: std::sync::Arc<RawZmqCommunicator>,
 }
 
+#[cfg(feature = "python")]
 impl PyZmqCommunicator {
     pub fn share(&self) -> std::sync::Arc<RawZmqCommunicator> {
         self.inner.clone()
     }
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyZmqCommunicator {
     /// Bind the PULL inbox at `ipc://{dir}/{my_id}.ipc`.
@@ -140,11 +155,13 @@ impl PyZmqCommunicator {
 /// memoryview(arena)[off:off+n], dtype=..).copy_(cpu_tensor)`; send the
 /// offset descriptor; `free(off)` on reclaim. Consumer: `open(name)` and
 /// `torch.frombuffer(memoryview(arena)[off:off+n], ..)` (then H2D).
+#[cfg(feature = "python")]
 #[pyclass(name = "ShmArena")]
 struct PyShmArena {
     arena: ShmArena,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyShmArena {
     #[staticmethod]
@@ -219,11 +236,13 @@ impl PyShmArena {
 /// staging stays zero-copy per segment. The mapping never moves, so a
 /// memoryview (and a CUDA host-registration of the segment) stays valid for
 /// the segment's lifetime.
+#[cfg(feature = "python")]
 #[pyclass(name = "ShmSegment")]
 struct PyShmSegment {
     seg: std::sync::Arc<ShmArena>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PyShmSegment {
     #[getter]
@@ -262,11 +281,13 @@ impl PyShmSegment {
 /// `reserve(n) -> (segment_idx, offset)`; descriptors carry
 /// `segment_name(idx)` so consumers keep opening plain `ShmArena`s by name.
 /// Segments are created once and never move — registration-friendly.
+#[cfg(feature = "python")]
 #[pyclass(name = "SegmentedShmArena")]
 struct PySegmentedShmArena {
     arena: SegmentedShmArena,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl PySegmentedShmArena {
     #[staticmethod]
@@ -321,6 +342,7 @@ impl PySegmentedShmArena {
     }
 }
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

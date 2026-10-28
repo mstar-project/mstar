@@ -64,16 +64,22 @@ jobs:
             3.14
       # Outside the build container, with no dependencies installed: the
       # extension imports, the frontend binary runs from the scripts directory
-      # find_server_binary looks in, and the licenses are in the metadata.
+      # find_server_binary looks in without any libpython (setup-python puts
+      # its libdir on LD_LIBRARY_PATH, which would hide a link to one), and
+      # the licenses are in the metadata.
       - name: Check each wheel in a clean venv
         shell: python
         run: |
           import glob, re, subprocess, tempfile
-          check = (
-              "import importlib.metadata as md, mstar_rust, pathlib, subprocess, sysconfig\n"
-              "assert 'LICENSES-THIRD-PARTY.txt' in {f.name for f in md.files('mstar-ai')}\n"
-              "subprocess.run([pathlib.Path(sysconfig.get_path('scripts')) / 'mstar-server', '--help'], check=True)\n"
-          )
+          check = """
+          import importlib.metadata as md, mstar_rust, os, pathlib, subprocess, sysconfig
+          assert 'LICENSES-THIRD-PARTY.txt' in {f.name for f in md.files('mstar-ai')}
+          server = pathlib.Path(sysconfig.get_path('scripts')) / 'mstar-server'
+          needed = subprocess.run(['readelf', '-d', server], capture_output=True, text=True, check=True).stdout
+          assert 'libpython' not in needed, needed
+          env = {k: v for k, v in os.environ.items() if k != 'LD_LIBRARY_PATH'}
+          subprocess.run([server, '--help'], env=env, check=True)
+          """
           wheels = sorted(glob.glob("wheelhouse/*.whl"))
           assert len(wheels) == 3, wheels
           for whl in wheels:

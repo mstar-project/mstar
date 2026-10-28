@@ -155,13 +155,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
       - name: Cargo tests (transport + arena semantics)
         working-directory: rust
-        # Off with extension-module (see rust/Cargo.toml): the test binary is an
-        # executable, so it links libpython rather than resolving CPython
-        # symbols at import time. setup-python's interpreter is --enable-shared,
-        # so point the loader at its libdir for the run.
+        # The bindings without extension-module (see rust/Cargo.toml): the test
+        # binary is an executable, so it links libpython rather than resolving
+        # CPython symbols at import time. setup-python's interpreter is
+        # --enable-shared, so point the loader at its libdir for the run.
         env:
           LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
-        run: cargo test --release --no-default-features
+        run: cargo test --release --no-default-features --features python
       - run: cargo test --release --manifest-path rust/server/Cargo.toml
       - name: Build the Rust frontend (mstar-server)
         working-directory: rust/server
@@ -173,8 +173,6 @@ jobs:
           maturin build --release
           pip install target/wheels/*.whl
       - name: Interop tests (transport + arena + frontend)
-        env:
-          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: |
           # pyyaml: the runtime tests reach mstar.model.base, which imports it;
           # prometheus-client: the frontend's /metrics test renders a real registry;
