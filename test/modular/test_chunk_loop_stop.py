@@ -13,6 +13,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+from mstar.graph.base import GraphEdge, GraphNode, Loop
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.worker.worker import Worker
 
@@ -80,3 +83,83 @@ def test_a_node_that_chunks_nowhere_does_no_work_at_all():
     rows = {rid: "decode" for rid in range(1, 21)}
     stops, mid = _run(rows, chunkable=())
     assert stops == {} and not mid
+
+
+def test_a_mid_prefill_row_keys_no_prefix():
+    """Postprocess must hand the rows it names mid-prefill to the prefix
+    chain as skips: a non-final chunk's sampled token is not a real sample,
+    so keying the chain on it keys a token the request never generated.
+
+    A structural guard, not a behavioural one -- driving the real postprocess
+    needs most of a worker. It is here because the call was dropped once and
+    nothing else noticed: the chain simply stopped being extended.
+    """
+    import inspect
+
+    src = inspect.getsource(Worker._postprocess_batch)
+    assert "extend_prefix_chains(" in src, "the prefix chain is never extended"
+    call = src[src.index("extend_prefix_chains("):]
+    call = call[: call.index(")")]
+    assert "skip_rids=mid_prefill_rids" in call, (
+        "mid-prefill rows must be skipped, or a non-final chunk's token keys "
+        "the prefix cache"
+    )
+
+
+def test_a_loop_is_ended_even_where_the_deployment_chunks_nothing():
+    """``apply_chunking`` wraps the node from the MODEL's policy, so the Loop
+    is in the walk's graph whether or not this deployment chunks it. A null
+    budget or a node under TP/SP runs the walk inside the Loop, once, and it
+    still has to be ended -- otherwise it spins to max_iters holding the
+    request's KV, which reads as pool exhaustion rather than a hung loop."""
+    # The worker reads its set off the graphs it was given, so it holds a
+    # walk whose chunking the config or TP turned off -- the Loop is still
+    # there, built from the model's policy, and runs once.
+    stops, mid = _run({1: "prefill"}, chunkable=("prefill",))
+    assert stops == {1: {chunk_loop_name(NODE, "prefill")}} and not mid
+
+
+def _wrapped_walk(chunkable: bool):
+    """A walk's graph as ``apply_chunking`` leaves it, wrapped or not."""
+    from mstar.model.base import _wrap_node_in_loop
+    from mstar.model.submodule_base import ChunkingPolicy
+
+    node = GraphNode(
+        name=NODE, input_names={"text_inputs"},
+        outputs=[GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT)],
+    )
+    if not chunkable:
+        return node
+    return _wrap_node_in_loop(
+        node, NODE, "prefill", chunk_loop_name(NODE, "prefill"),
+        ChunkingPolicy(walks=("prefill",), chunkable=True, max_chunks=8),
+    )
+
+
+def _wg(section):
+    return WorkerGraph(
+        section=section, graph_walks={"prefill"}, ranks=[0], worker_graph_id=0,
+    )
+
+
+def test_the_worker_finds_its_chunk_loops_in_its_own_graphs():
+    assert Worker._chunk_loops_in([_wg(_wrapped_walk(True))]) == {(NODE, "prefill")}
+
+
+def test_an_unwrapped_walk_contributes_no_chunk_loop():
+    """A deployment that excludes a node from chunking builds no Loop there,
+    and the worker must not expect one -- it would end a loop that is not."""
+    assert Worker._chunk_loops_in([_wg(_wrapped_walk(False))]) == frozenset()
+
+
+def test_another_loop_is_not_mistaken_for_a_chunk_loop():
+    """A decode Loop is not a chunk Loop; only the derived name counts."""
+    decode = Loop(
+        name="decode_loop",
+        section=GraphNode(
+            name=NODE, input_names={"text_inputs"},
+            outputs=[GraphEdge(name="text_inputs", next_node=NODE)],
+        ),
+        max_iters=8, outputs=[],
+    )
+    assert Worker._chunk_loops_in([_wg(decode)]) == frozenset()

@@ -484,6 +484,7 @@ class Worker:
             my_walks.update(
                 (node, walk) for node in wg_nodes for walk in wg.graph_walks
             )
+        self._chunk_loop_walks = self._chunk_loops_in(my_worker_graphs)
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
 
@@ -492,14 +493,6 @@ class Worker:
         loaded = EngineManager.load_submodules(
             node_names, device, model_config, self.parallel_groups, model,
         ) if model is not None else None
-
-        # (node, walk) pairs whose prefill runs as a Loop: a set lookup in
-        # postprocess, rather than asking the engine per step on every node
-        # that never chunks.
-        chunkable_node_walks = (
-            loaded.chunkable_node_walks(model) if loaded is not None else ()
-        )
-        self._chunk_loop_walks = frozenset(chunkable_node_walks)
 
         # The graph runtime owns the per-request queues and the graph state.
         self._graph_runtime = _make_graph_runtime(
@@ -513,7 +506,9 @@ class Worker:
             tensor_manager=self.tensor_manager,
             communicator=self.communicator,
             combined_walk_of=model.combined_walk_of() if model is not None else None,
-            disable_spec_node_walks=chunkable_node_walks,
+            disable_spec_node_walks=(
+                loaded.chunkable_node_walks(model) if loaded is not None else ()
+            ),
         )
 
         self.engine_manager = EngineManager.build(
@@ -3307,6 +3302,14 @@ class Worker:
 
         mid_prefill_rids = self._end_finished_chunk_loops(batch_N, stops)
 
+        # The stop check's host copy, so a request ending here still indexes
+        # its pages. After the stop loops, which name the rows mid-prefill: a
+        # non-final chunk's sampled token is not a real sample and keys nothing.
+        engine.extend_prefix_chains(
+            batch_N.node_batch, cpu_outputs, host_rows=host_rows,
+            skip_rids=mid_prefill_rids,
+        )
+
         if batch_N.node_batch.failed_requests:
             # A rid whose stop check raised has no trustworthy stop decision:
             # routing it would either run its loop forever or end it early.
@@ -3440,6 +3443,28 @@ class Worker:
         _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
+
+    @staticmethod
+    def _chunk_loops_in(
+        worker_graphs: "list[WorkerGraph]",
+    ) -> frozenset[tuple[str, str]]:
+        """``(node, walk)`` pairs these graphs run inside a chunk Loop.
+
+        Read off the graphs rather than off the model's chunking policy: the
+        policy says where a Loop may be built, and a deployment that excludes
+        a node from chunking builds none there. The graph cannot disagree with
+        itself, and a Loop nothing ends spins to ``max_iters`` holding the
+        request's state.
+        """
+        found: set[tuple[str, str]] = set()
+        for wg in worker_graphs:
+            loops = wg.section.get_loops()
+            found.update(
+                (node, walk)
+                for node in wg.section.get_nodes() for walk in wg.graph_walks
+                if chunk_loop_name(node, walk) in loops
+            )
+        return frozenset(found)
 
     def _end_finished_chunk_loops(
         self, batch_N: PendingBatch, stops: dict,
