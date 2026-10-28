@@ -283,15 +283,6 @@ class Gr00tN17StateEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         state = inputs["state"][0].reshape(1, -1, inputs["state"][0].shape[-1])
         embodiment_id = inputs["embodiment_id"][0].reshape(-1)
-        # `W[cat_ids]` would read -1 as the last embodiment and serve the
-        # wrong robot in silence.
-        # The request carries this id, so it is checked where it arrives.
-        categories = self.state_encoder.layer1.W.shape[0]
-        if int(embodiment_id.min()) < 0 or int(embodiment_id.max()) >= categories:
-            raise ValueError(
-                f"embodiment id {embodiment_id.tolist()} outside the "
-                f"checkpoint's {categories} embodiments"
-            )
         return NodeInputs(
             # one token per state row, which is one while the checkpoint's
             # `state_history_length` is 1
@@ -556,15 +547,6 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
                 "preprocess counts them and must count what it then emits"
             )
         embodiment_id = inputs["embodiment_id"][0].reshape(())
-        # `W[-1]` is `W[31]`, so a caller using -1 for "unset" is served a plausible,
-        # wrong robot in silence. Torch's own IndexError defends only the top end.
-        # The state encoder makes the same check for the same reason.
-        categories = self.action_encoder.W1.W.shape[0]
-        if not 0 <= int(embodiment_id) < categories:
-            raise ValueError(
-                f"embodiment id {int(embodiment_id)} outside the checkpoint's "
-                f"{categories} embodiments"
-            )
         return {
             "vl_text": text,
             "vl_image": image,
