@@ -1898,6 +1898,19 @@ def test_a_chunked_row_starts_past_its_cached_prefix():
     assert not sched.cached_prefix
 
 
+def test_a_row_the_cache_holds_whole_is_not_chunked():
+    """It runs nothing, so it takes no budget and no range: prepare serves it
+    from the cache whole, as it would a row the budget never touched."""
+    sched = _combined_scheduler(_ChunkingEngine(max_bs=8, cached={"p0": 10}))
+    sched.get_tensor = lambda uuid: uuid
+    manager = _Manager(["d0", "p0", "d1"], walks={"p0": "prefill"})
+
+    first = _next_batch(sched, manager)
+
+    assert "p0" in first.request_to_worker_graph and not first.chunk_ranges
+    assert not sched.chunk_progress and not sched.cached_prefix
+
+
 @pytest.mark.parametrize("seq_lens,chunk", [
     ([3], (0, 1, 10)),   # the continuing row ran 3 tokens last step: 1 of the 4 is left
     ([-1], (0, 3, 10)),  # unknown: guessed at one token

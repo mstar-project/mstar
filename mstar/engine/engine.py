@@ -2382,7 +2382,10 @@ class Engine:
         rid: int | None = None,
     ) -> InputSeqLenInfo | None:
         """A row's length; a chunkable keyed row's leaves out the prefix the
-        cache holds, which ``rid``'s lease keeps until its first chunk applies it."""
+        cache holds, which ``rid``'s lease keeps until its first chunk applies it.
+        A row the cache holds whole measures 0, so the budget never cuts it and
+        prepare serves it (`_skip_cached_prefix`): a chunk cut from 0 would
+        write over the lease the walks before it were served from."""
         submodule = self._submodules[node_name].submodule
         info = submodule.get_input_sequence_len(graph_walk, request_info, inputs)
         policy = self._chunking.policy(node_name, graph_walk)
@@ -2399,8 +2402,8 @@ class Engine:
         prefix = self._runner.resolve_cached_prefix(
             rid, node_name, graph_walk, _MeasuredRow(info.seq_len),
         )
-        matched = prefix.tokens if prefix is not None else 0
-        if not 0 < matched < info.seq_len:
+        matched = min(prefix.tokens if prefix is not None else 0, info.seq_len)
+        if matched <= 0:
             return info
         return InputSeqLenInfo(info.seq_len - matched, cached_prefix=matched)
 

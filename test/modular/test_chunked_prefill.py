@@ -236,6 +236,17 @@ def test_a_keyed_row_is_measured_without_its_cached_prefix():
     assert (info.seq_len, info.cached_prefix) == (6, 4)
 
 
+def test_a_row_the_cache_holds_whole_is_measured_at_nothing():
+    """Measured whole, the budget would cut it into chunks from 0, and its
+    first chunk would write over the lease the walks before it were served
+    from, failing the request when those walks end inside a page."""
+    engine = _keyed_engine(_KeyedPrompt(10), matched=10)
+
+    info = engine.input_sequence_len("LLM", "prefill", None, {}, rid=0)
+
+    assert (info.seq_len, info.cached_prefix) == (0, 10)
+
+
 def test_a_row_its_model_will_not_cut_is_measured_whole():
     engine = _keyed_engine(_KeyedPrompt(10, reuses=False), matched=4)
 
