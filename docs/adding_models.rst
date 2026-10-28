@@ -1933,6 +1933,16 @@ If a node group has ``tp_size > 1`` and names a node that is not in ``tp_enabled
 loading fails. See ``configs/qwen3omni_thinker_tp2.yaml`` for an example with several node
 types.
 
+A row-parallel projection followed by an RMSNorm can leave its all-reduce to the norm, which
+runs both in one fused kernel. Set the projection's ``reduce_results = False``, so it returns
+its partial sum, and hand the norm the comm group: ``RMSNorm.forward_residual(x, residual,
+comm_group)`` reduces, adds and norms, and ``RMSNorm.forward(x, comm_group)`` reduces and
+norms (a post-norm before the residual add). The two go together, since a norm called
+without the group norms an unreduced partial sum, which is wrong only under TP. Keep both in
+the module whose ``forward`` calls the norms, as ``Qwen3_5LanguageModel`` and
+``MuseGlimmerTextModel`` do. ``MultimodalDecoderModel`` builds the kernel's workspace for its
+TP node.
+
 .. _Expert parallelism (MoE):
 
 Expert parallelism (MoE)

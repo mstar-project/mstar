@@ -54,6 +54,13 @@ def _all_to_all_single(
     return recv
 
 
+def _rms_norm(r: torch.Tensor, weight: torch.Tensor, eps: float, weight_bias: float) -> torch.Tensor:
+    """The fused kernel's norm, unfused: fp32, scaling by ``weight + weight_bias``."""
+    v = r.float()
+    v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+    return (v * (weight.float() + weight_bias)).to(r.dtype)
+
+
 class CommGroup:
     """A communication group over one axis of the worker device mesh.
 
@@ -83,6 +90,9 @@ class CommGroup:
         # see ``init_allreduce_fusion``
         self._ar_fusion_ws: int | None = None
         self._ar_fusion_max_tokens = 0
+        # ``[max_tokens, hidden]`` zeros, ``allreduce_rmsnorm``'s residual; shared,
+        # which is safe only because the fused op never writes ``residual``
+        self._ar_fusion_zeros: torch.Tensor | None = None
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce(self.device_group)
 
@@ -160,9 +170,12 @@ class CommGroup:
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
-        """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs; larger inputs keep the NCCL path. Collective: every
-        member calls it at the same point. Returns whether it is available."""
+        """Set up the fused kernel of ``allreduce_add_rmsnorm`` and
+        ``allreduce_rmsnorm`` for ``[<=max_tokens, hidden]`` inputs; larger
+        inputs keep the NCCL path. Also allocates ``allreduce_rmsnorm``'s zero
+        residual, ``max_tokens x hidden`` in ``dtype`` per rank (16 MiB at
+        hidden 4096, bf16). Collective: every member calls it at the same
+        point. Returns whether it is available."""
         if self.world_size == 1 or self._ar_fusion_ws is not None:
             return self._ar_fusion_ws is not None
         from mstar.distributed.ar_fusion import create_workspace
@@ -171,6 +184,11 @@ class CommGroup:
             self, max_tokens, hidden, dtype,
         )
         self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
+        if self._ar_fusion_ws is not None:
+            # where the workspace was just built
+            self._ar_fusion_zeros = torch.zeros(
+                max_tokens, hidden, dtype=dtype, device=torch.accelerator.current_accelerator(),
+            )
         return self._ar_fusion_ws is not None
 
     def allreduce_add_rmsnorm(
@@ -189,9 +207,21 @@ class CommGroup:
                 x, residual, weight, eps, weight_bias, self._ar_fusion_ws,
             )
         r = self.all_reduce(x) + residual
-        v = r.float()
-        v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
-        return (v * (weight.float() + weight_bias)).to(r.dtype), r
+        return _rms_norm(r, weight, eps, weight_bias), r
+
+    def allreduce_rmsnorm(
+        self, x: torch.Tensor, weight: torch.Tensor, eps: float, weight_bias: float = 0.0,
+    ) -> torch.Tensor:
+        """``rms_norm(all_reduce(x))``, a norm before the residual add, in the
+        same fused kernel: it always adds a residual, so this adds zeros."""
+        zeros = self._ar_fusion_zeros
+        if zeros is not None and x.shape[0] <= zeros.shape[0] and x.is_contiguous():
+            from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
+
+            return allreduce_add_rmsnorm(
+                x, zeros[: x.shape[0]], weight, eps, weight_bias, self._ar_fusion_ws,
+            )[0]
+        return _rms_norm(self.all_reduce(x), weight, eps, weight_bias)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size

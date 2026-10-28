@@ -382,9 +382,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
     # ------------------------------------------------------------------
 
     def _create_submodule(
-        self, node_name: str, device: str,
-        autocast_dtype: torch.dtype | None = None,
-        tp_group=None,
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
         from mstar.model.qwen3_5.submodules import (
             LLMSubmodule,
@@ -394,7 +392,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         if node_name not in ("LLM", "vision_encoder"):
             return None
 
-        dtype = autocast_dtype or torch.bfloat16
         weights_dir = self._resolve_weights()
 
         if node_name == "vision_encoder":
@@ -426,8 +423,5 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
-        if tp_group is not None and tp_group.world_size > 1:
-            # collective over the TP group; every rank builds the LLM here
-            tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
         return LLMSubmodule(model, self.config, self.vision_config, self.encoders)
