@@ -223,6 +223,25 @@ def test_rows_reach_the_stop_check_and_the_store_cut_to_their_spans(batched):
     assert stored[2]["audio"][0] is uncut[2]
 
 
+def test_a_row_whose_span_is_empty_is_left_out_of_the_store():
+    """An empty span means the row has no data this step: the stop check sees
+    it cut to nothing, and like a withheld output nothing reaches the store, so
+    a streaming edge gets no item for it."""
+
+    class _Silent(_SpanningVocoder):
+        def _output(self, rids, padded):
+            out = super()._output(rids, padded)
+            out.output_spans["audio"][0] = 0
+            return out
+
+    sub = _Silent()
+    stored, _, _ = _run_step(sub, {1: SAMPLES[1], 2: SAMPLES[2]})
+    assert sub.stop_check_lengths[1] == 0
+    assert "audio" not in stored[1]
+    assert stored[1]["level"][0].shape == (1,)
+    assert stored[2]["audio"][0].tolist() == pytest.approx(EXPECTED[2])
+
+
 def test_a_span_on_an_undeclared_output_fails_the_step():
     class _Undeclared(_SpanningVocoder):
         def spanned_outputs(self, graph_walk):

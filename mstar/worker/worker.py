@@ -3566,8 +3566,9 @@ class Worker:
         _pp_stage("completion_event_sync")
         # Waited on above, so the spans have landed; cut before anything reads
         # the outputs: the stop check, the store, a streaming edge.
+        empty_spans: dict[int, list[str]] = {}
         if outputs.output_spans and batch_N.batch.request_to_worker_graph:
-            self._crop_to_spans(outputs)
+            empty_spans = self._crop_to_spans(outputs)
             _pp_stage("crop_spans")
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -3591,14 +3592,16 @@ class Worker:
             )
         # the same host copy, before stops, so a request ending here still indexes its pages
         engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs, host_rows=host_rows)
-        # What the stop check withheld (``StopCheck.withheld``) is not stored,
-        # so not routed: a streaming edge then carries no item for the row, and
-        # the producer's item count leaves it out as well.
-        for rid, names in batch_N.node_batch.withheld_outputs.items():
-            rid_outputs = outputs.get(rid)
-            if rid_outputs:
-                for name in names:
-                    rid_outputs.pop(name, None)
+        # What the stop check withheld (``StopCheck.withheld``), and an output
+        # cut to an empty span, is not stored, so not routed: a streaming edge
+        # then carries no item for the row, and the producer's item count
+        # leaves it out as well.
+        for withheld in (batch_N.node_batch.withheld_outputs, empty_spans):
+            for rid, names in withheld.items():
+                rid_outputs = outputs.get(rid)
+                if rid_outputs:
+                    for name in names:
+                        rid_outputs.pop(name, None)
 
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes the
@@ -4151,7 +4154,7 @@ class Worker:
         return host
 
     @staticmethod
-    def _crop_to_spans(outputs: "BatchedModelOutput") -> None:
+    def _crop_to_spans(outputs: "BatchedModelOutput") -> dict[int, list[str]]:
         """Cut each row of a spanned output to its span along the last dim
         (``NodeSubmodule.spanned_outputs``). Called once the step's completion
         event has fired, so the spans staged behind the step are on the host.
@@ -4159,10 +4162,14 @@ class Worker:
         a second name that ``postprocess`` or ``unpack_packed_outputs`` gave
         the same list is cut with it. Two names the forward returned on its own
         get their own lists from the engine and keep their own widths.
+
+        Returns rid -> the outputs whose span is empty, which the caller leaves
+        out of the store as it does a withheld output.
         """
         spans = outputs.host_spans or outputs.output_spans
         per_rid = outputs.per_rid_outputs
         cut = False
+        empty: dict[int, list[str]] = {}
         for name, span in spans.items():
             # columns, not a [start, end] list per row
             starts, ends = span.t().tolist()
@@ -4171,6 +4178,8 @@ class Worker:
                 tensors = row.get(name) if row is not None else None
                 if not tensors:
                     continue
+                if end <= start:
+                    empty.setdefault(rid, []).append(name)
                 for i, tensor in enumerate(tensors):
                     if start > 0 or end < tensor.shape[-1]:
                         tensors[i] = tensor[..., max(start, 0):max(end, 0)]
@@ -4178,6 +4187,7 @@ class Worker:
         if cut:
             # the views no longer describe the stored rows
             outputs.row_views = None
+        return empty
 
     def _get_pinned_d2h_buffer(
         self,
