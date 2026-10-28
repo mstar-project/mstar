@@ -71,6 +71,12 @@ class LingBotWorldConfig:
     video_fps: int = 16
     max_chunks: int = 255  # rollout ceiling, inside rope_max_frames
 
+    # True: both DiT attentions run the reference's FlashAttention-2 varlen
+    # (needs flash-attn), bit-identical to the reference. False: the engine's
+    # ragged attention resource, whose backend the deployment picks (AUTO is
+    # FlashInfer's prefill, the cutlass FMHA on Blackwell).
+    reference_attention: bool = False
+
     # The reference decodes in fp32. bf16 is faster on cuDNN >= 9.16 but is not
     # the reference's numerics.
     vae_decode_fp32: bool = True

@@ -25,9 +25,12 @@ Numerics contract: the reference runs the whole DiT under
 ``torch.amp.autocast("cuda", dtype=bfloat16)`` on bf16 weights, with fp32
 autocast islands around the modulation and the residual gates, RoPE in
 complex128, and FlashAttention-2 varlen for both attentions. This module enters
-the same contexts itself (``LingBotCausalDiT.forward``) in the same order, so
-its forward is bit-identical to the reference's on the same inputs. The
-differences from the reference are structural only: batch 1 without the list
+the same contexts itself (``LingBotCausalDiT.forward``) in the same order. Its
+two attentions are whatever ``DitAttention`` the caller hands it: served, the
+engine's ragged attention resource; without one, the reference's FA2 varlen
+(``REFERENCE_ATTENTION``), with which the forward is bit-identical to the
+reference's on the same inputs. The other differences from the reference are
+structural only: batch 1 without the list
 wrapping, the cache indices kept as Python ints instead of 1-element device
 tensors read back with ``.item()``, and one index computation per forward
 instead of one per layer (every layer sees the same indices).
@@ -38,7 +41,9 @@ diffusers pipeline's, not this checkpoint's reference.
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -54,8 +59,9 @@ def require_flash_attn() -> None:
         import flash_attn  # noqa: F401
     except ImportError as e:
         raise ImportError(
-            "LingBot-World's DiT runs FlashAttention-2 (flash_attn_varlen_func), as the reference does; "
-            "install flash-attn (docs/installation.rst, 'flash-attn (Qwen3-Omni, LingBot-World)')."
+            "LingBot-World's reference attention is FlashAttention-2 (flash_attn_varlen_func), as the "
+            "reference runs; install flash-attn (docs/installation.rst, 'flash-attn (Qwen3-Omni, "
+            "LingBot-World)') or serve without reference_attention."
         ) from e
 
 
@@ -82,6 +88,21 @@ def _flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch
         dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), deterministic=False,
     ).unflatten(0, (b, lq))
     return x.type(out_dtype)
+
+
+# ``(q, k, v) -> out`` on ``[1, L, H, D]`` tensors; ``k`` / ``v`` have their own length.
+Attend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+class DitAttention(NamedTuple):
+    """The DiT's two attentions: the chunk's queries over its rolling K/V
+    window, and over the text K/V."""
+
+    window: Attend
+    text: Attend
+
+
+REFERENCE_ATTENTION = DitAttention(window=_flash_attention, text=_flash_attention)
 
 
 def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
@@ -191,6 +212,11 @@ class RollingKVCache:
             local_end = self.local_end + current_end - self.global_end
         return _WritePlan(local_end - num_new, local_end, evicted, rolled, current_end)
 
+    def window(self, plan: "_WritePlan") -> slice:
+        """The buffer tokens a forward under ``plan`` attends: the sink and
+        the latest window, ending with the chunk it writes."""
+        return slice(max(0, plan.local_end - self.capacity), plan.local_end)
+
     def write(self, layer: int, k: torch.Tensor, v: torch.Tensor, plan: "_WritePlan") -> None:
         """Apply ``plan`` to one layer: shift the tokens behind the sink left by
         the eviction, then write the chunk's ``[1, L, H, D]`` K/V."""
@@ -213,6 +239,13 @@ class _WritePlan:
     current_end: int
 
 
+def attended_frames(config: LingBotWorldConfig, chunk: int) -> int:
+    """Latent frames of rolling K/V that chunk ``chunk``'s queries attend, its
+    own included: what ``RollingKVCache.window`` spans once the chunk is written."""
+    frames = (chunk + 1) * config.chunk_size
+    return min(frames, config.local_attn_size) if config.local_attn_size > -1 else frames
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, eps: float):
         super().__init__()
@@ -227,7 +260,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(
         self, x: torch.Tensor, grid: tuple[int, int, int], freqs: torch.Tensor,
-        start_frame: int, cache: RollingKVCache, layer: int, plan: _WritePlan,
+        start_frame: int, cache: RollingKVCache, layer: int, plan: _WritePlan, attend: Attend,
     ) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -236,8 +269,8 @@ class CausalSelfAttention(nn.Module):
         roped_query = causal_rope_apply(q, grid, freqs, start_frame).type_as(v)
         roped_key = causal_rope_apply(k, grid, freqs, start_frame).type_as(v)
         cache.write(layer, roped_key, v, plan)
-        window = slice(max(0, plan.local_end - cache.capacity), plan.local_end)
-        x = _flash_attention(roped_query, cache.k[layer][:, window], cache.v[layer][:, window])
+        window = cache.window(plan)
+        x = attend(roped_query, cache.k[layer][:, window], cache.v[layer][:, window])
         return self.o(x.flatten(2))
 
 
@@ -260,10 +293,10 @@ class CrossAttention(nn.Module):
         b, n, d = context.size(0), self.num_heads, self.head_dim
         return self.norm_k(self.k(context)).view(b, -1, n, d), self.v(context).view(b, -1, n, d)
 
-    def forward(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attend: Attend) -> torch.Tensor:
         b, n, d = x.size(0), self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        return self.o(_flash_attention(q, k, v).flatten(2))
+        return self.o(attend(q, k, v).flatten(2))
 
 
 class CausalBlock(nn.Module):
@@ -283,7 +316,7 @@ class CausalBlock(nn.Module):
 
     def forward(
         self, x: torch.Tensor, e: torch.Tensor, cam: torch.Tensor, cross_k: torch.Tensor,
-        cross_v: torch.Tensor, attn_args: dict,
+        cross_v: torch.Tensor, attn_args: dict, text_attend: Attend,
     ) -> torch.Tensor:
         with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
@@ -295,7 +328,7 @@ class CausalBlock(nn.Module):
         cam_hidden = cam_hidden + cam
         x = (1.0 + self.cam_scale_layer(cam_hidden)) * x + self.cam_shift_layer(cam_hidden)
 
-        x = x + self.cross_attn(self.norm3(x), cross_k, cross_v)
+        x = x + self.cross_attn(self.norm3(x), cross_k, cross_v, text_attend)
         y = self.ffn(self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
         with torch.amp.autocast("cuda", dtype=torch.float32):
             x = x + y * e[5].squeeze(2)
@@ -359,6 +392,7 @@ class LingBotCausalDiT(nn.Module):
     def forward(
         self, x: torch.Tensor, t: torch.Tensor, context: torch.Tensor, y: torch.Tensor,
         plucker: torch.Tensor, cache: RollingKVCache, current_start: int, frame_seqlen: int,
+        attention: DitAttention = REFERENCE_ATTENTION,
     ) -> torch.Tensor:
         """One chunk: ``x`` ``[16, f, h, w]`` fp32 noisy latents, ``t`` ``[1]``
         timestep, ``context`` ``[L, 4096]`` text embeds, ``y`` ``[20, f, h, w]``
@@ -366,9 +400,9 @@ class LingBotCausalDiT(nn.Module):
         chunk's K/V at absolute token ``current_start``; returns the fp32 flow
         prediction ``[16, f, h, w]``."""
         with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
-            return self._forward(x, t, context, y, plucker, cache, current_start, frame_seqlen)
+            return self._forward(x, t, context, y, plucker, cache, current_start, frame_seqlen, attention)
 
-    def _forward(self, x, t, context, y, plucker, cache, current_start, frame_seqlen):
+    def _forward(self, x, t, context, y, plucker, cache, current_start, frame_seqlen, attention):
         cfg = self.config
         device = self.patch_embedding.weight.device
         freqs = self.freqs(device)
@@ -407,8 +441,9 @@ class LingBotCausalDiT(nn.Module):
             raise ValueError(
                 f"latent frame {start_frame + grid[0]} is past the RoPE table ({freqs.shape[0]} frames)")
         for i, block in enumerate(self.blocks):
-            attn_args = dict(grid=grid, freqs=freqs, start_frame=start_frame, cache=cache, layer=i, plan=plan)
-            x = block(x, e0, cam, cache.cross_k[i], cache.cross_v[i], attn_args)
+            attn_args = dict(grid=grid, freqs=freqs, start_frame=start_frame, cache=cache, layer=i, plan=plan,
+                             attend=attention.window)
+            x = block(x, e0, cam, cache.cross_k[i], cache.cross_v[i], attn_args, attention.text)
         cache.global_end = plan.current_end
         cache.local_end = plan.local_end
 

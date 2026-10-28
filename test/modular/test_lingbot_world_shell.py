@@ -15,19 +15,27 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.engine.resources import RaggedCrossAttentionSpec, RaggedCrossAttentionStep, cross_label  # noqa: E402
 from mstar.graph.base import GraphNode, Loop  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
-from mstar.model.lingbot_world.components.dit import RollingKVCache  # noqa: E402
+from mstar.model.lingbot_world.components.dit import (  # noqa: E402
+    REFERENCE_ATTENTION,
+    RollingKVCache,
+    attended_frames,
+)
 from mstar.model.lingbot_world.components.schedule import make_fast_schedule  # noqa: E402
 from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel  # noqa: E402
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
+    DIT_ATTN,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
+    ChunkSpans,
     EncoderStream,
     LingBotDitSubmodule,
     encode_condition_chunk,
     first_frame_mask,
 )
+from mstar.model.submodule_base import NodeInputs  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -433,7 +441,7 @@ def test_the_text_encoder_runs_eager_attention_as_the_reference_t5(monkeypatch):
     assert seen["attn_implementation"] == "eager"
 
 
-def test_the_dit_node_fails_to_build_without_flash_attn(monkeypatch):
+def test_the_reference_attention_dit_fails_to_build_without_flash_attn(monkeypatch):
     """Not the first request: with flash-attn missing the server must not
     come up healthy and then fail every request."""
     from mstar.model.lingbot_world import weight_loader
@@ -444,7 +452,94 @@ def test_the_dit_node_fails_to_build_without_flash_attn(monkeypatch):
     monkeypatch.setitem(sys.modules, "flash_attn", None)
     monkeypatch.setattr(weight_loader, "build_lingbot_dit", no_weights)
     with pytest.raises(ImportError, match="install flash-attn"):
+        LingBotWorldModel(reference_attention=True).get_submodule("dit")
+
+
+def test_the_engine_attention_dit_builds_without_flash_attn(monkeypatch):
+    from mstar.model.lingbot_world import weight_loader
+
+    class BuiltError(Exception):
+        pass
+
+    def no_weights(*args, **kwargs):
+        raise BuiltError
+
+    monkeypatch.setitem(sys.modules, "flash_attn", None)
+    monkeypatch.setattr(weight_loader, "build_lingbot_dit", no_weights)
+    with pytest.raises(BuiltError):
         LingBotWorldModel().get_submodule("dit")
+
+
+def test_the_dit_declares_one_ragged_cross_attention(model):
+    (spec,) = model.get_node_resources()
+    assert isinstance(spec, RaggedCrossAttentionSpec)
+    assert spec.resource_key == DIT_ATTN and spec.nodes == {"dit"}
+    assert (spec.config.num_qo_heads, spec.config.num_kv_heads, spec.config.head_dim) == (12, 12, 128)
+    assert spec.config.dtype == torch.bfloat16
+    assert LingBotWorldModel(skip_weight_loading=True, reference_attention=True).get_node_resources() == []
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_reference_attention_must_be_a_bool(value):
+    """A yaml "false" is truthy; read as on it would serve the other attention."""
+    with pytest.raises(ValueError, match="reference_attention"):
+        LingBotWorldModel(skip_weight_loading=True, reference_attention=value)
+
+
+def _bare_dit_submodule(model, resources):
+    sub = LingBotDitSubmodule.__new__(LingBotDitSubmodule)
+    torch.nn.Module.__init__(sub)
+    sub.request_states = {}
+    sub.config = model.config
+    sub._attention = None
+    sub.node_resources = resources
+    return sub
+
+
+def test_a_chunks_step_pairs_its_queries_with_its_window_and_the_text(model):
+    sub = _bare_dit_submodule(model, {DIT_ATTN: object()})
+    frame = 58 * 104 // 4  # 464x832
+    windows = [sub.chunk_spans(c, (464, 832)).window // frame for c in range(7)]
+    assert windows == [4, 8, 12, 16, 18, 18, 18]  # sink included, capped at local_attn_size
+    inputs = [NodeInputs(resource_step_info=sub.chunk_spans(5, (464, 832)))]
+    step = sub.declare_step(ROLLOUT_WALK, ["r"], inputs).steps[DIT_ATTN]
+    assert isinstance(step, RaggedCrossAttentionStep)
+    assert [(s.label, s.span) for s in step.segments] == [("chunk", 4 * frame), ("window", 18 * frame), ("text", 512)]
+    assert step.pairs == (("chunk", "window"), ("chunk", "text"))
+
+
+def test_without_the_resource_the_dit_runs_the_reference_attention(model):
+    sub = _bare_dit_submodule(model, {})
+    assert sub.attention() is REFERENCE_ATTENTION
+    assert sub.declare_step(ROLLOUT_WALK, ["r"], [NodeInputs(resource_step_info=ChunkSpans(1, 1, 1))]) is None
+
+
+def test_the_engine_attention_binds_both_pairs(model):
+    calls = []
+
+    class Resource:
+        def run(self, q, k, v, label):
+            calls.append((label, q.shape[0], k.shape[0]))
+            return q
+
+    sub = _bare_dit_submodule(model, {DIT_ATTN: Resource()})
+    attention = sub.attention()
+    q, k = torch.zeros(1, 6, 2, 4), torch.zeros(1, 10, 2, 4)
+    assert attention.window(q, k, k).shape == q.shape and attention.text(q, k[:, :3], k[:, :3]).shape == q.shape
+    assert calls == [(cross_label("chunk", "window"), 6, 10), (cross_label("chunk", "text"), 6, 3)]
+    assert sub.attention() is attention  # one set of callables per binding
+
+
+def test_the_declared_window_is_what_the_rolling_cache_attends(model):
+    cfg, frame_seqlen = model.config, 3
+    cache = RollingKVCache.allocate(1, cfg.local_attn_size * frame_seqlen, 1, 1,
+                                    sink_tokens=cfg.sink_size * frame_seqlen, windowed=True, device="cpu",
+                                    dtype=torch.float32)
+    for c in range(9):
+        plan = cache.plan(c * cfg.chunk_size * frame_seqlen, cfg.chunk_size * frame_seqlen)
+        window = cache.window(plan)
+        assert window.stop - window.start == attended_frames(cfg, c) * frame_seqlen
+        cache.global_end, cache.local_end = plan.current_end, plan.local_end
 
 
 def test_the_shipped_config_serves_one_rollout_at_a_time(model):

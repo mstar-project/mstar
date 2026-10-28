@@ -1,6 +1,6 @@
 """LingBotWorldModel: LingBot-World-V2 causal-fast, camera-controlled image-to-world.
 
-Architecture (2 nodes, no engine resources):
+Architecture (2 nodes; the dit's attention is the one engine resource):
     text_encoder - UMT5-XXL prompt encoder (wan22's submodule, reused)
     dit          - the 1.3B causal DiT. One rollout iteration is one chunk of
                    4 latent frames: the chunk's I2V condition (a warm-cache
@@ -32,7 +32,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
@@ -44,7 +44,7 @@ from mstar.model.lingbot_world.config import (
     UMT5_DIFFUSERS_REPO,
     WAN21_VAE_DIFFUSERS_REPO,
 )
-from mstar.model.lingbot_world.submodules import ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
+from mstar.model.lingbot_world.submodules import DIT_ATTN, ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -61,11 +61,16 @@ class LingBotWorldModel(Model):
         cache_dir: str | None = None,
         variant: str = LINGBOT_VARIANT_1_3B,
         skip_weight_loading: bool = False,
+        reference_attention: bool = False,
         **kwargs,
     ):
         if variant != LINGBOT_VARIANT_1_3B:
             raise NotImplementedError(f"LingBot-World variant {variant!r} is not implemented yet.")
+        # a yaml "false" is a truthy string
+        if not isinstance(reference_attention, bool):
+            raise ValueError(f"LingBot-World reference_attention must be true or false, got {reference_attention!r}.")
         self.config = LINGBOT_CONFIGS[variant]()
+        self.config.reference_attention = reference_attention
         self.model_path_hf = model_path_hf or LINGBOT_HF_REPOS[variant]
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
@@ -77,7 +82,16 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        return []
+        if self.config.reference_attention:
+            return []
+        cfg = self.config
+        return [RaggedCrossAttentionSpec(
+            resource_key=DIT_ATTN, nodes={"dit"},
+            config=RaggedAttentionConfig(
+                num_qo_heads=cfg.num_heads, num_kv_heads=cfg.num_heads, head_dim=cfg.head_dim,
+                dtype=torch.bfloat16,
+            ),
+        )]
 
     def kv_cache_bytes(self, lat_h: int, lat_w: int) -> int:
         """The rolling self-attention plus text K/V one request allocates at
@@ -377,7 +391,8 @@ class LingBotWorldModel(Model):
             from mstar.model.lingbot_world.components.dit import require_flash_attn
             from mstar.model.lingbot_world.weight_loader import build_lingbot_dit
 
-            require_flash_attn()
+            if self.config.reference_attention:
+                require_flash_attn()
             dit = build_lingbot_dit(self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir)
             return LingBotDitSubmodule(
                 dit, self._load_vae().to(device), self.config, encoder_vae=self._load_vae().to(device),

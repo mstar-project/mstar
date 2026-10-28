@@ -16,25 +16,37 @@
     dit          -> LingBotDitSubmodule (one chunk per rollout iteration: the
                     chunk's I2V condition and Plucker rays, the DiT, the decode)
 
-Neither declares engine resources: the rolling self-attention K/V and the text
-K/V live in the request's ``PerRequestState`` (dense, model-owned, freed with the
-request), the VAE encoder's and decoder's causal-conv caches likewise.
+The rolling self-attention K/V and the text K/V live in the request's
+``PerRequestState`` (dense, model-owned, freed with the request), the VAE
+encoder's and decoder's causal-conv caches likewise. The dit's one engine
+resource is the attention over them: a ragged cross-attention (``DIT_ATTN``)
+whose step pairs the chunk's queries with its K/V window and with the text.
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
 runs fp32 as the reference does.
 """
 
+import functools
 import logging
+from typing import NamedTuple
 
 import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources import RaggedCrossAttentionStep, Segment, SubmoduleStep, cross_label
+from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components import wan_vae
+from mstar.model.components.diffusion.attention import joint_attention
 from mstar.model.lingbot_world.components.camera import plucker_embedding
-from mstar.model.lingbot_world.components.dit import LingBotCausalDiT
+from mstar.model.lingbot_world.components.dit import (
+    REFERENCE_ATTENTION,
+    DitAttention,
+    LingBotCausalDiT,
+    attended_frames,
+)
 from mstar.model.lingbot_world.components.schedule import add_noise, flow_to_x0, make_fast_schedule
 from mstar.model.lingbot_world.config import LingBotWorldConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
@@ -44,6 +56,19 @@ logger = logging.getLogger(__name__)
 
 ROLLOUT_LOOP_NAME = "rollout_loop"
 ROLLOUT_WALK = "rollout"
+
+DIT_ATTN = "dit_attn"
+CHUNK_SPAN, WINDOW_SPAN, TEXT_SPAN = "chunk", "window", "text"
+DIT_ATTN_PAIRS = ((CHUNK_SPAN, WINDOW_SPAN), (CHUNK_SPAN, TEXT_SPAN))
+
+
+class ChunkSpans(NamedTuple):
+    """Tokens of one chunk's attentions: its queries, the rolling K/V window
+    they attend (sink, history, the chunk itself) and the padded text."""
+
+    chunk: int
+    window: int
+    text: int
 
 
 def first_frame_mask(num_latent_frames: int, lat_h: int, lat_w: int, device) -> torch.Tensor:
@@ -172,9 +197,38 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         if vae is not None and config.vae_decode_channels_last:
             wan_vae.to_channels_last(vae)
         self._decode_step = wan_vae.DecoderStep(vae, compile=False) if vae is not None else None
+        self._attention: DitAttention | None = None
         # Debug hook for the parity harness: keep the last chunk's latents and
         # float frames in the request state.
         self.keep_chunk_outputs = False
+
+    def bind_node_resources(self, resources) -> None:
+        super().bind_node_resources(resources)
+        self._attention = None
+
+    def attention(self) -> DitAttention:
+        """The DiT's attentions through ``DIT_ATTN`` when the engine bound it,
+        else the reference's FA2 (``reference_attention``, the parity harness)."""
+        if self._attention is None:
+            resource = self.node_resources.get(DIT_ATTN)
+            if resource is None:
+                self._attention = REFERENCE_ATTENTION
+            else:
+                def on(kv_label):
+                    ragged = RaggedAttentionCallable(resource, cross_label(CHUNK_SPAN, kv_label))
+                    return functools.partial(joint_attention, ragged=ragged)
+                self._attention = DitAttention(window=on(WINDOW_SPAN), text=on(TEXT_SPAN))
+        return self._attention
+
+    def chunk_spans(self, chunk: int, image_hw: tuple[int, int]) -> ChunkSpans:
+        cfg = self.config
+        lat_h, lat_w = image_hw[0] // cfg.vae_stride[1], image_hw[1] // cfg.vae_stride[2]
+        frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
+        return ChunkSpans(
+            chunk=cfg.chunk_size * frame_seqlen,
+            window=attended_frames(cfg, chunk) * frame_seqlen,
+            text=cfg.text_len,
+        )
 
     def prepare_inputs(self, graph_walk, fwd_info: CurrentForwardPassInfo, inputs, **kwargs) -> NodeInputs | None:
         state = self.request_state(fwd_info.rid_handle)
@@ -186,12 +240,27 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
                 chunk, fwd_info.request_id, num_chunks,
             )
             return None
-        return NodeInputs(tensor_inputs={
-            "text_embeds": inputs["text_embeds_pos"][0],
-            "image": inputs["image_inputs"][0],
-            "camera_poses": inputs["camera_poses"][0],
-            "intrinsics": inputs["intrinsics"][0],
-        })
+        image = inputs["image_inputs"][0]
+        return NodeInputs(
+            tensor_inputs={
+                "text_embeds": inputs["text_embeds_pos"][0],
+                "image": image,
+                "camera_poses": inputs["camera_poses"][0],
+                "intrinsics": inputs["intrinsics"][0],
+            },
+            resource_step_info=self.chunk_spans(chunk, tuple(image.shape[1:])),
+        )
+
+    def declare_step(self, graph_walk, request_ids, inputs, **kwargs) -> SubmoduleStep | None:
+        if DIT_ATTN not in self.node_resources:
+            return None
+        segments = []
+        for rid, inp in zip(request_ids, inputs, strict=True):
+            spans: ChunkSpans = inp.resource_step_info
+            segments += [Segment(request_id=rid, label=CHUNK_SPAN, span=spans.chunk),
+                         Segment(request_id=rid, label=WINDOW_SPAN, span=spans.window),
+                         Segment(request_id=rid, label=TEXT_SPAN, span=spans.text)]
+        return SubmoduleStep(steps={DIT_ATTN: RaggedCrossAttentionStep(segments=tuple(segments), pairs=DIT_ATTN_PAIRS)})
 
     def _seed_request(self, state, md: dict, seed: int, image: torch.Tensor, device):
         cfg = self.config
@@ -239,18 +308,23 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         current_start = chunk * cs * frame_seqlen
         kv = state["kv"]
         generator = state["generator"]
+        # the step declared its K/V window from the chunk index; the cache must agree
+        window = kv.window(kv.plan(current_start, cs * frame_seqlen))
+        if window.stop - window.start != attended_frames(cfg, chunk) * frame_seqlen:
+            raise RuntimeError(f"LingBot dit: chunk {chunk} attends {window} of the rolling K/V, not the declared span")
+        attention = self.attention()
 
         with torch.inference_mode():
             steps = self.schedule.step_timesteps
             for i, t in enumerate(steps):
                 timestep = torch.stack([t]).to(device)
-                flow = self.dit(latent, timestep, context, y, plucker, kv, current_start, frame_seqlen)
+                flow = self.dit(latent, timestep, context, y, plucker, kv, current_start, frame_seqlen, attention)
                 x0 = flow_to_x0(flow, latent, t, self.schedule)
                 if i < len(steps) - 1:
                     noise = torch.randn(x0.shape, generator=generator, device=x0.device, dtype=x0.dtype)
                     latent = add_noise(x0, noise, steps[i + 1], self.schedule)
             commit_t = torch.stack([steps[-1] * 0.0]).to(device)
-            self.dit(x0, commit_t, context, y, plucker, kv, current_start, frame_seqlen)
+            self.dit(x0, commit_t, context, y, plucker, kv, current_start, frame_seqlen, attention)
             pixels = self._decode(x0, state, clip_start=chunk == 0)
 
         state.add("chunk", chunk + 1)
