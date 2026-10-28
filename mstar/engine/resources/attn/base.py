@@ -87,8 +87,9 @@ class AttentionManager(AttentionResource):
             kv_config.shard(info.joint_comm_group.world_size)
         if backend == AttnBackend.DENSE:
             # A dense backend needs the FlashAttention-3 kernel; where the
-            # wheel does not match the installed torch/CUDA build, degrade to
-            # the paged backend AUTO picks rather than failing to serve.
+            # wheel does not match the installed torch/CUDA build or has no
+            # kernel for the GPU, degrade to the paged backend AUTO picks
+            # rather than failing to serve.
             # The two are drop-in for each other: the step declaration is
             # identical (see DenseAttentionManager) and `requires_kv_write`
             # tells the layer which one it is talking to.
@@ -98,7 +99,7 @@ class AttentionManager(AttentionResource):
                 _warn_dense_fallback,
             )
 
-            reason = _fa3_unavailable_reason()
+            reason = _fa3_unavailable_reason(info.device)
             if reason is None:
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,

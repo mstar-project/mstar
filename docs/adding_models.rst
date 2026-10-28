@@ -444,13 +444,19 @@ A model with a keyed label is checked at load time. Loading fails in two more ca
   reuse; either drop the stream or give the resource the prefix hooks``.
 
 Some requests stay uncached even when the model keys a label. The engine checks each
-request's inputs on the keyed walk and cuts a prefix only from inputs that the default
-``split_inputs`` can slice. A request whose inputs carry ``tensor_inputs``, ``kwargs`` or
+request's inputs on the keyed walk and cuts a prefix only from inputs that
+``split_inputs`` can slice. A request whose inputs carry ``kwargs`` or
 ``resource_step_info`` is never probed; BAGEL's guided requests carry ``requires_cfg``
-there. BAGEL keys an understanding prompt's text and images, and a generation's first
-span when it is text: an edit's images are resized before their walks see them, and a
-file's digest doesn't cover the resize. A label under a sliding window files pages only
-up to its protected prefix, which the window never releases.
+there. The default ``split_inputs`` slices only the sequence, so a request whose inputs
+carry ``tensor_inputs`` is probed only when the submodule sets ``cuts_tensor_inputs``
+and overrides ``split_inputs`` to cut those tensors. For a label keyed over several
+walks, where a keyed node streams into a partition other than its own, a request that
+runs that partition is not cached either, since a hit would skip the rows the node
+streams for the tokens the cache holds. BAGEL
+keys an understanding prompt's text and images, and a generation's first span when it
+is text: an edit's images are resized before their walks see them, and a file's digest
+doesn't cover the resize. A label under a sliding window files pages only up to its
+protected prefix, which the window never releases.
 
 .. _Step 2a — Declare your resources:
 
@@ -1001,10 +1007,13 @@ methods are:
    The engine applies ``torch.compile`` to both ``forward`` and ``forward_batched``, for
    every submodule. It also captures CUDA graphs for them when you declare capture
    configs (see :ref:`Step 5 <step-5>`). To disable compilation for a submodule, set the
-   class attribute ``disable_torch_compile = True``. Keep the compiled paths
-   compile-friendly. If a helper must not be traced, because it uses data-dependent
-   Python control flow or forces a host synchronization, exclude it explicitly with
-   ``@torch.compiler.disable``.
+   class attribute ``disable_torch_compile = True``. An encoder whose output feeds a
+   prefix cache layout walk compiles with dynamic shapes instead. One that marks every
+   dimension that varies with ``torch._dynamo.mark_dynamic`` in ``prepare_inputs`` sets
+   ``marks_dynamic_dims = True`` and compiles as any other submodule. Keep the compiled
+   paths compile-friendly. If a helper must not be traced, because it uses
+   data-dependent Python control flow or forces a host synchronization, exclude it
+   explicitly with ``@torch.compiler.disable``.
 
    Some submodules must run in their own parameter dtype. One example is an fp32 vocoder
    that is numerically sensitive. Such a submodule sets ``disable_autocast = True``. The

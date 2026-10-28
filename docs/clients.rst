@@ -329,7 +329,8 @@ Endpoints and model coverage:
      - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/audio/transcriptions``
-     - ``whisper_large``, ``whisper_large_v3_turbo``, ``qwen3_asr``, ``qwen3_asr_realtime``, ``higgs_audio``, ``omnilingual_asr_ctc_*``, ``canary``, ``canary_qwen``
+     - ``whisper_large``, ``whisper_large_v3_turbo``, ``qwen3_asr``, ``qwen3_asr_realtime``, ``higgs_audio``, ``omnilingual_asr_ctc_*``, ``canary``, ``canary_qwen``, ``parakeet``,
+       ``nemotron_asr``
      - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
        ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
    * - ``WS /v1/realtime?intent=transcription``
@@ -415,13 +416,15 @@ Per-model notes:
   in ``extra_body``, 5 to 40, sets both lengths). There are no timestamps: ``srt`` / ``vtt``
   get one cue per window, timed to the windows. Nothing detects the language: ``verbose_json``'s
   ``language`` is the request's ``language`` as given, or null.
-- **Canary / Canary-Qwen** — no conditioning text (``prompt`` is dropped) and no
-  timestamps: ``timestamp_granularities`` is a 400, and ``srt`` / ``vtt`` /
+- **Canary / Canary-Qwen / Parakeet / Nemotron ASR** — no conditioning text (``prompt`` is
+  dropped) and no timestamps: ``timestamp_granularities`` is a 400, and ``srt`` / ``vtt`` /
   ``verbose_json`` get one segment per window. Canary takes ``language`` (the speech's,
   English by default) and, through ``extra_body``, ``target_language`` or
-  ``task="translate"`` (into English) and ``punctuation``. Canary-Qwen only transcribes
-  English, and refuses a ``task`` other than ``transcribe``. Uploads longer than the
-  models' 40 s clip run as parallel windows.
+  ``task="translate"`` (into English) and ``punctuation``; the other three only transcribe,
+  and refuse a ``task`` other than ``transcribe``. Canary-Qwen is English only. Parakeet detects the language itself and refuses a ``language`` outside the 25 it knows;
+  Nemotron takes a locale (``en-US``), a bare code or ``auto``. Uploads longer than the
+  model's clip (40 s for Canary and Canary-Qwen, 10 min for Parakeet and Nemotron) run as
+  parallel windows.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
