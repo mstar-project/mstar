@@ -78,6 +78,7 @@ def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
                 if edge.persist and tokens:
                     persisted[edge.name] = tokens
             if END_PARTITION in stops:
+                assert not isinstance(walks[walk], Loop), "END_PARTITION inside a loop fails the request"
                 # the worker reports the partition done, and the conductor ends it
                 return emitted
             runtime.clear_pending_loop_stops()

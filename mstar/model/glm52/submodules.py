@@ -408,7 +408,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def _stops(
         self, request_id: str, request_info: CurrentForwardPassInfo, token: int | None,
     ) -> set[str]:
-        """The loops the request's new ``token`` stops; None when the step emitted none."""
+        """The loops ``token`` stops, or ``END_PARTITION`` for a prefill stop; ``token`` is
+        None when the step emitted none."""
         if token is None:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
