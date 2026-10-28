@@ -647,11 +647,14 @@ Compilation
        :mod:`mstar.engine` (``_default_compile_caches``), so compiled graphs and
        autotune picks survive a restart that keeps the cache directory. An exported
        value wins, and a home that can't be written keeps torch's
-       ``/tmp/torchinductor_<user>``. A cold start needs it and ``TRITON_CACHE_DIR``
-       pointed at empty directories (FlashInfer's JIT cache stays warm). See
+       ``/tmp/torchinductor_<user>``. Point it at an empty directory to measure a cold
+       start (Triton's kernels follow it unless ``TRITON_CACHE_DIR`` is exported;
+       FlashInfer's JIT cache stays warm). See
        :ref:`serving:Restarts and the compile cache`.
    * - ``TRITON_CACHE_DIR``
-     - ``$XDG_CACHE_HOME/mstar/triton`` (``~/.cache/mstar/triton`` when unset)
-     - Triton's own variable, defaulted the same way and by the same function, for
-       Triton's compiled kernels: Inductor's, and those compiled outside it. Without it,
-       where a kernel lands depends on whether Inductor compiled first.
+     - ``$TORCHINDUCTOR_CACHE_DIR/triton``
+     - Triton's own variable, defaulted by the same function once
+       ``TORCHINDUCTOR_CACHE_DIR`` is resolved (exported or M*'s default; left unset
+       when that falls back to torch's). An exported value wins. Holds Triton's compiled
+       kernels, Inductor's and those compiled outside it; without it, where a kernel
+       lands depends on whether Inductor compiled first.

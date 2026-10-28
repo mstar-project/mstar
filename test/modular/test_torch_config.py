@@ -49,22 +49,28 @@ def test_compile_cache_defaults_under_the_user_cache(tmp_path, entry):
     out = subprocess.run(
         [sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300, check=True,
     ).stdout.strip().splitlines()[-1]
-    assert out == f"{tmp_path / 'mstar' / 'torchinductor'} {tmp_path / 'mstar' / 'triton'}"
+    inductor = tmp_path / "mstar" / "torchinductor"
+    assert out == f"{inductor} {inductor / 'triton'}"
 
 
 def _no_home(cls):
     raise RuntimeError("Could not determine home directory.")
 
 
-@pytest.mark.parametrize("xdg, has_home", [("relative/cache", True), (None, False)])
-def test_compile_cache_without_a_usable_cache_home(tmp_path, monkeypatch, xdg, has_home):
-    """A relative ``XDG_CACHE_HOME`` is ignored, as the XDG spec says, and a
-    process with no home keeps torch's default rather than failing to import."""
+@pytest.mark.parametrize("inductor, xdg, has_home", [
+    (None, "relative/cache", True),  # a relative XDG_CACHE_HOME is ignored, as the XDG spec says
+    (None, None, False),             # no home keeps torch's and Triton's defaults
+    ("exported", None, True),        # Triton's kernels follow an exported Inductor cache
+])
+def test_compile_cache_fallbacks(tmp_path, monkeypatch, inductor, xdg, has_home):
     # a copy, so what _default_compile_caches writes can't outlive the test
     monkeypatch.setattr(os, "environ", dict(os.environ))
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
     monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    if inductor is None:
+        monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    else:
+        monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / inductor))
     if xdg is None:
         monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     else:
@@ -74,5 +80,6 @@ def test_compile_cache_without_a_usable_cache_home(tmp_path, monkeypatch, xdg, h
     else:
         monkeypatch.setattr(Path, "home", classmethod(_no_home))
     _default_compile_caches()
-    expected = str(tmp_path / "home" / ".cache" / "mstar" / "torchinductor") if has_home else None
-    assert os.environ.get("TORCHINDUCTOR_CACHE_DIR") == expected
+    want = tmp_path / (inductor or "home/.cache/mstar/torchinductor") if has_home else None
+    got = (os.environ.get("TORCHINDUCTOR_CACHE_DIR"), os.environ.get("TRITON_CACHE_DIR"))
+    assert got == ((str(want), str(want / "triton")) if want else (None, None))
