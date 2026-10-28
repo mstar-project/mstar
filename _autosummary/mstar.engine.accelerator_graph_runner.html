@@ -800,7 +800,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.static_inputs"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.static_inputs</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks"><code class="docutils literal notranslate"><span class="pre">agree_across_ranks()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.autocast_scope"><code class="docutils literal notranslate"><span class="pre">autocast_scope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.blocked_capture_resources"><code class="docutils literal notranslate"><span class="pre">blocked_capture_resources()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.capture_into_graph"><code class="docutils literal notranslate"><span class="pre">capture_into_graph()</span></code></a></li>
@@ -828,40 +827,37 @@
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks" title="mstar.engine.accelerator_graph_runner.agree_across_ranks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">agree_across_ranks</span></code></a>(comm_group, values, ...)</p></td>
-<td><p>Reduce each of <code class="docutils literal notranslate"><span class="pre">values</span></code> over every rank of the joint group with <code class="docutils literal notranslate"><span class="pre">reduce</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.autocast_scope" title="mstar.engine.accelerator_graph_runner.autocast_scope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">autocast_scope</span></code></a>(dtype, device_type)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.autocast_scope" title="mstar.engine.accelerator_graph_runner.autocast_scope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">autocast_scope</span></code></a>(dtype, device_type)</p></td>
 <td><p>A forward's autocast scope; <code class="docutils literal notranslate"><span class="pre">None</span></code> (<code class="docutils literal notranslate"><span class="pre">disable_autocast</span></code>) runs the submodule in its own dtype and shuts out any ambient autocast.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.blocked_capture_resources" title="mstar.engine.accelerator_graph_runner.blocked_capture_resources"><code class="xref py py-obj docutils literal notranslate"><span class="pre">blocked_capture_resources</span></code></a>(step, resources)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.blocked_capture_resources" title="mstar.engine.accelerator_graph_runner.blocked_capture_resources"><code class="xref py py-obj docutils literal notranslate"><span class="pre">blocked_capture_resources</span></code></a>(step, resources)</p></td>
 <td><p>Return resource keys that prevent capture of the declared step.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.capture_into_graph" title="mstar.engine.accelerator_graph_runner.capture_into_graph"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_into_graph</span></code></a>(run, pool, device, ...[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.capture_into_graph" title="mstar.engine.accelerator_graph_runner.capture_into_graph"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_into_graph</span></code></a>(run, pool, device, ...[, ...])</p></td>
 <td><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> into a new CUDA graph allocated from <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs" title="mstar.engine.accelerator_graph_runner.capture_with_static_outputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_with_static_outputs</span></code></a>(run, ...[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.capture_with_static_outputs" title="mstar.engine.accelerator_graph_runner.capture_with_static_outputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_with_static_outputs</span></code></a>(run, ...[, ...])</p></td>
 <td><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> so its outputs land in buffers allocated OUTSIDE <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.compile_kwargs" title="mstar.engine.accelerator_graph_runner.compile_kwargs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compile_kwargs</span></code></a>(config_mode)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.compile_kwargs" title="mstar.engine.accelerator_graph_runner.compile_kwargs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compile_kwargs</span></code></a>(config_mode)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>'s arguments for a capture config whose <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> is <code class="docutils literal notranslate"><span class="pre">config_mode</span></code>, which the config checked when it was built.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.compile_level" title="mstar.engine.accelerator_graph_runner.compile_level"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compile_level</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.compile_level" title="mstar.engine.accelerator_graph_runner.compile_level"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compile_level</span></code></a>()</p></td>
 <td><p>How much tuning a captured forward's compile does: <code class="docutils literal notranslate"><span class="pre">MSTAR_COMPILE_LEVEL</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">-O</span></code>), one of <code class="docutils literal notranslate"><span class="pre">COMPILE_LEVELS</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_metadata" title="mstar.engine.accelerator_graph_runner.dummy_metadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_metadata</span></code></a>(rids, graph_walk)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_metadata" title="mstar.engine.accelerator_graph_runner.dummy_metadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_metadata</span></code></a>(rids, graph_walk)</p></td>
 <td><p>Stand-in request info for padding rows, which have no real request.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_rid_handle" title="mstar.engine.accelerator_graph_runner.dummy_rid_handle"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_handle</span></code></a>(name)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_rid_handle" title="mstar.engine.accelerator_graph_runner.dummy_rid_handle"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_handle</span></code></a>(name)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_rid_name" title="mstar.engine.accelerator_graph_runner.dummy_rid_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_name</span></code></a>(handle)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.dummy_rid_name" title="mstar.engine.accelerator_graph_runner.dummy_rid_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_name</span></code></a>(handle)</p></td>
 <td><p>The name a padding-row handle was minted from.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.fail_if_graphs_required" title="mstar.engine.accelerator_graph_runner.fail_if_graphs_required"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fail_if_graphs_required</span></code></a>(missing)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.fail_if_graphs_required" title="mstar.engine.accelerator_graph_runner.fail_if_graphs_required"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fail_if_graphs_required</span></code></a>(missing)</p></td>
 <td><p>MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup failure, for deployments that would rather not come up than serve the eager path at 10-20x the latency.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.plan_captures" title="mstar.engine.accelerator_graph_runner.plan_captures"><code class="xref py py-obj docutils literal notranslate"><span class="pre">plan_captures</span></code></a>(pools, free[, reusable])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_runner.plan_captures" title="mstar.engine.accelerator_graph_runner.plan_captures"><code class="xref py py-obj docutils literal notranslate"><span class="pre">plan_captures</span></code></a>(pools, free[, reusable])</p></td>
 <td><p>The cheapest buckets across every pool on a device, added while the largest eager step still fits in <code class="docutils literal notranslate"><span class="pre">free</span></code> beside them.</p></td>
 </tr>
 </tbody>
@@ -2106,30 +2102,6 @@ the same step; use <code class="docutils literal notranslate"><span class="pre">
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.agree_across_ranks">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">agree_across_ranks</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">comm_group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">values</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reduce</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#agree_across_ranks"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks" title="Link to this definition">#</a></dt>
-<dd><p>Reduce each of <code class="docutils literal notranslate"><span class="pre">values</span></code> over every rank of the joint group with
-<code class="docutils literal notranslate"><span class="pre">reduce</span></code>. <cite>torch.amin</cite> ANDs flags and <cite>torch.amax</cite> takes the largest.</p>
-<p>Capture failure is per-rank: a rank that keeps a graph another rank
-dropped replays it while the other runs eager, which hangs as soon as the
-captured region holds a collective. Callers pass an order derived from the
-configs, which are identical on every rank.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>comm_group</strong> (<em>JointGroups</em><em> | </em><em>None</em>)</p></li>
-<li><p><strong>values</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p></li>
-<li><p><strong>reduce</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><em>...</em><em>]</em><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_runner.autocast_scope">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_runner.</span></span><span class="sig-name descname"><span class="pre">autocast_scope</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device_type</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_runner.html#autocast_scope"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_runner.autocast_scope" title="Link to this definition">#</a></dt>
 <dd><p>A forward’s autocast scope; <code class="docutils literal notranslate"><span class="pre">None</span></code> (<code class="docutils literal notranslate"><span class="pre">disable_autocast</span></code>) runs the
@@ -2509,7 +2481,6 @@ the reuse summed over all buckets, None for no bound.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.WarmedSpec.static_inputs"><code class="docutils literal notranslate"><span class="pre">WarmedSpec.static_inputs</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.agree_across_ranks"><code class="docutils literal notranslate"><span class="pre">agree_across_ranks()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.autocast_scope"><code class="docutils literal notranslate"><span class="pre">autocast_scope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.blocked_capture_resources"><code class="docutils literal notranslate"><span class="pre">blocked_capture_resources()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_runner.capture_into_graph"><code class="docutils literal notranslate"><span class="pre">capture_into_graph()</span></code></a></li>

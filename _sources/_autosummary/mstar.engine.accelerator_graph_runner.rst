@@ -13,7 +13,6 @@ mstar.engine.accelerator\_graph\_runner
 
    .. autosummary::
    
-      agree_across_ranks
       autocast_scope
       blocked_capture_resources
       capture_into_graph
