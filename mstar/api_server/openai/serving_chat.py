@@ -34,7 +34,9 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
             request_id=request_id,
         )
         if req.stream:
-            return _stream(api, model_name, request_id, sample_rate)
+            # a request the engine refuses gets its status, not a 200
+            batches = await api.open_result_stream(request_id, raw_request, batches=True)
+            return _stream_events(batches, model_name, request_id, sample_rate)
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
@@ -81,12 +83,6 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
-
-
-def _stream(api, model_name, request_id, sample_rate):
-    # Bound to the submission now: the body is iterated later, by Starlette.
-    batches = api.iter_result_chunk_batches(request_id)
-    return _stream_events(batches, model_name, request_id, sample_rate)
 
 
 async def _stream_events(batches, model_name, request_id, sample_rate):

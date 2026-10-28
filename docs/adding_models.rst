@@ -2285,6 +2285,31 @@ stream-consuming walk split over worker graphs, unless every consumer also waits
 non-streamed input and all the walk's worker graphs run on the same workers. That input
 must arrive once per pass (from the conductor, say); startup cannot check this.
 
+A consumer whose walk should follow the producer's progress, rather than a count fixed at
+ingest, is *producer-triggered*: the producer decides the consumer's walk. Set the same
+``consumer_walk`` function on every connection into the consumer, all from one producer
+partition. The producer worker calls it for each row of a pass that emits on those edges,
+with a ``ProducerWalkCtx``: the walk that row ran (its own, even in a step that mixed
+walks), the node that just completed, the iteration each enclosing dynamic loop is on,
+and the producer's full ``CurrentForwardPassInfo`` (``step_metadata`` and all; the hook
+runs on the producer). The row's streamed items run under the walk it returns. The
+context is reused across calls, so a hook must not keep it.
+
+- Each streamed item carries its assigned walk, and a chunk never spans two walks, so
+  these connections need a ``FixedChunkPolicy``. A client stream cannot set
+  ``consumer_walk``.
+- The consumer's worker switches walk before popping a chunk, and only once the partition
+  has no pass under way. The conductor learns each pass's walk from the worker's
+  ``WORKER_GRAPHS_DONE``.
+- A walk the consumer enters on its own, with conductor inputs, takes effect when they
+  arrive, so send them only once the stream has moved the consumer through the walk
+  before it.
+
+Qwen3-Omni's Talker (``_talker_walk``) is the reference: Thinker prefill passes run
+``talker_prefill``, the first decode iteration runs ``talker_last_prefill``, and later
+ones run ``talker_decode``; the conductor feeds ``talker_decode`` its first input once
+``talker_last_prefill`` has run.
+
 Streams from the client
 ~~~~~~~~~~~~~~~~~~~~~~~
 
