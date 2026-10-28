@@ -402,7 +402,8 @@ def _worker_parallelism(
                 )
             # Rank 0's resident journal is per node, so a page move reaches a
             # follower only with the next step of the node that made it. Refused
-            # at any offload setting until the shared-pool journal (PR #873) lands.
+            # at any offload setting until rank 0 journals a shared pool's moves
+            # in one stream rather than per node.
             lockstep = sorted(
                 node for node in local
                 if per_worker[wid].get_instance_world_size_for_node(node) > 1
@@ -411,9 +412,10 @@ def _worker_parallelism(
                 yield (
                     f"KV resource {spec.resource_key} is shared by lockstep-parallel nodes "
                     f"{lockstep} on {wid}. Rank 0 replicates its page moves (host offloads and "
-                    "reloads, and the preemption drops of mstar PR #873) to the other ranks per "
-                    "node, with that node's next step, so two lockstep nodes on one pool could "
-                    "admit out of step on a follower. Journaling a shared pool across lockstep "
-                    "nodes is that PR's work, and until then this layout is refused: place these "
-                    "nodes on different workers."
+                    "reloads today; mstar PR #873 adds preemption drops and reservations) to the "
+                    "other ranks per node, with that node's next step, so two lockstep nodes on "
+                    "one pool could admit out of step on a follower. Journaling a shared pool "
+                    "across lockstep nodes in one stream belongs with the journal rework of mstar "
+                    "PR #873, and until then this layout is refused: place these nodes on "
+                    "different workers."
                 )

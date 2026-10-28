@@ -457,13 +457,14 @@ weight loaders then shard parameters automatically, with no model-code changes. 
 details.
 
 Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and SP
-groups, each TP- (or SP-) enabled by the model (for instance an encoder sharded beside its
-LLM, when the model TP-enables both). The ranks then run both nodes' steps in one order. The
-conductor refuses lockstep nodes on one worker in different TP or SP groups, and two
-lockstep nodes on one worker that share a KV resource: rank 0 replicates its page moves
-(host offloads and reloads, and the preemption drops of mstar PR #873) per node, with that
-node's next step, so two nodes on one pool could admit out of step on a follower. Journaling
-a shared pool across lockstep nodes is that PR's work.
+groups, each listed in the model's ``tp_enabled_nodes`` (or ``sp_enabled_nodes``). The ranks
+then run every node's steps in one order. The conductor refuses lockstep nodes on one worker
+in different TP or SP groups, and two lockstep nodes on one worker that share a KV resource:
+rank 0 replicates its page moves (host offloads and reloads today; mstar PR #873 adds
+preemption drops and reservations) per node, with that node's next step, so two nodes on one
+pool could admit out of step on a follower. Journaling a shared pool across lockstep nodes in
+one stream belongs with the journal rework of mstar PR #873, and until then this layout is
+refused: place these nodes on different workers.
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank
