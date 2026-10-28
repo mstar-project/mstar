@@ -681,11 +681,13 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.PageCopier"><code class="docutils literal notranslate"><span class="pre">PageCopier</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.PageCopier.copy"><code class="docutils literal notranslate"><span class="pre">PageCopier.copy()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.PageCopier.copy_rows"><code class="docutils literal notranslate"><span class="pre">PageCopier.copy_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.PageCopier.name"><code class="docutils literal notranslate"><span class="pre">PageCopier.name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.TorchCopier"><code class="docutils literal notranslate"><span class="pre">TorchCopier</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.TorchCopier.copy"><code class="docutils literal notranslate"><span class="pre">TorchCopier.copy()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.TorchCopier.copy_rows"><code class="docutils literal notranslate"><span class="pre">TorchCopier.copy_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.TorchCopier.name"><code class="docutils literal notranslate"><span class="pre">TorchCopier.name</span></code></a></li>
 </ul>
 </li>
@@ -703,7 +705,8 @@
                   
   <section id="module-mstar.engine.resources.kv.page_copier">
 <span id="mstar-engine-resources-kv-page-copier"></span><h1>mstar.engine.resources.kv.page_copier<a class="headerlink" href="#module-mstar.engine.resources.kv.page_copier" title="Link to this heading">#</a></h1>
-<p>Whole-page copies between the device KV cache and the host page pool.</p>
+<p>Page copies between KV caches: the device cache and the host page pool, or
+two device caches (CUDA IPC KV transfer).</p>
 <p>Both caches are laid out <code class="docutils literal notranslate"><span class="pre">[layers,</span> <span class="pre">pages,</span> <span class="pre">...]</span></code>, so a page is one contiguous
 block per layer, a layer stride apart. <code class="docutils literal notranslate"><span class="pre">copy_</span></code> of that strided view between
 device and pinned host memory blocks the host until the copy stream drains and
@@ -804,6 +807,26 @@ of <code class="docutils literal notranslate"><span class="pre">dst</span></code
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.page_copier.PageCopier.copy_rows">
+<span class="sig-name descname"><span class="pre">copy_rows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dst</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">src</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/page_copier.html#PageCopier.copy_rows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.page_copier.PageCopier.copy_rows" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">dst.copy_(src)</span></code> queued on <code class="docutils literal notranslate"><span class="pre">stream</span></code>, for two views of the same
+shape whose rows (<code class="docutils literal notranslate"><span class="pre">[i]</span></code>) are each contiguous: e.g. a page or a token
+range of it, every layer.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>dst</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>src</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>stream</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.cuda.streams.Stream.html#torch.cuda.streams.Stream" title="(in PyTorch v2.14)"><em>Stream</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.page_copier.PageCopier.name">
 <span class="sig-name descname"><span class="pre">name</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'base'</span></span><a class="headerlink" href="#mstar.engine.resources.kv.page_copier.PageCopier.name" title="Link to this definition">#</a></dt>
@@ -820,6 +843,14 @@ of <code class="docutils literal notranslate"><span class="pre">dst</span></code
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.page_copier.TorchCopier.copy">
 <span class="sig-name descname"><span class="pre">copy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dst</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dst_pages</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">src</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">src_pages</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/page_copier.html#TorchCopier.copy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.page_copier.TorchCopier.copy" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.page_copier.TorchCopier.copy_rows">
+<span class="sig-name descname"><span class="pre">copy_rows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">dst</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">src</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stream</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/page_copier.html#TorchCopier.copy_rows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.page_copier.TorchCopier.copy_rows" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">dst.copy_(src)</span></code> queued on <code class="docutils literal notranslate"><span class="pre">stream</span></code>, for two views of the same
+shape whose rows (<code class="docutils literal notranslate"><span class="pre">[i]</span></code>) are each contiguous: e.g. a page or a token
+range of it, every layer.</p>
+</dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.page_copier.TorchCopier.name">
@@ -902,11 +933,13 @@ of <code class="docutils literal notranslate"><span class="pre">dst</span></code
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.PageCopier"><code class="docutils literal notranslate"><span class="pre">PageCopier</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.PageCopier.copy"><code class="docutils literal notranslate"><span class="pre">PageCopier.copy()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.PageCopier.copy_rows"><code class="docutils literal notranslate"><span class="pre">PageCopier.copy_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.PageCopier.name"><code class="docutils literal notranslate"><span class="pre">PageCopier.name</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.TorchCopier"><code class="docutils literal notranslate"><span class="pre">TorchCopier</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.TorchCopier.copy"><code class="docutils literal notranslate"><span class="pre">TorchCopier.copy()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.TorchCopier.copy_rows"><code class="docutils literal notranslate"><span class="pre">TorchCopier.copy_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.page_copier.TorchCopier.name"><code class="docutils literal notranslate"><span class="pre">TorchCopier.name</span></code></a></li>
 </ul>
 </li>

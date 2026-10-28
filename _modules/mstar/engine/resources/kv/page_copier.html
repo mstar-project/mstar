@@ -958,7 +958,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.engine.resources.kv.page_copier</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""Whole-page copies between the device KV cache and the host page pool.</span>
+<span></span><span class="sd">"""Page copies between KV caches: the device cache and the host page pool, or</span>
+<span class="sd">two device caches (CUDA IPC KV transfer).</span>
 
 <span class="sd">Both caches are laid out ``[layers, pages, ...]``, so a page is one contiguous</span>
 <span class="sd">block per layer, a layer stride apart. ``copy_`` of that strided view between</span>
@@ -1006,6 +1007,17 @@ window.runMermaid = runMermaid;</script>
         <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span></div>
+
+
+<div class="viewcode-block" id="PageCopier.copy_rows">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.page_copier.html#mstar.engine.resources.kv.page_copier.PageCopier.copy_rows">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">copy_rows</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">src</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``dst.copy_(src)`` queued on ``stream``, for two views of the same</span>
+<span class="sd">        shape whose rows (``[i]``) are each contiguous: e.g. a page or a token</span>
+<span class="sd">        range of it, every layer."""</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span></div>
 </div>
 
 
@@ -1023,15 +1035,40 @@ window.runMermaid = runMermaid;</script>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">stream</span><span class="p">):</span>
             <span class="k">for</span> <span class="n">dst_idx</span><span class="p">,</span> <span class="n">src_idx</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">dst_pages</span><span class="p">,</span> <span class="n">src_pages</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
                 <span class="n">dst</span><span class="p">[:,</span> <span class="n">dst_idx</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">src</span><span class="p">[:,</span> <span class="n">src_idx</span><span class="p">],</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="TorchCopier.copy_rows">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.page_copier.html#mstar.engine.resources.kv.page_copier.TorchCopier.copy_rows">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">copy_rows</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
+        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">stream</span><span class="p">):</span>
+            <span class="n">dst</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
 </div>
 
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_Memcpy2DCopier</span><span class="p">(</span><span class="n">PageCopier</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">"""One ``cudaMemcpy2DAsync`` per page; subclasses supply the call."""</span>
+<span class="w">    </span><span class="sd">"""One ``cudaMemcpy2DAsync`` per page; subclasses supply the call and the</span>
+<span class="sd">    device's maximum pitch."""</span>
+
+    <span class="c1"># Pitches above this are rejected by the runtime, e.g. a layer stride of a</span>
+    <span class="c1"># cache over 2 GiB a layer; such copies go one row at a time instead.</span>
+    <span class="n">_max_pitch</span><span class="p">:</span> <span class="nb">int</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_memcpy_2d</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">dpitch</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">spitch</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_copy_2d</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">dpitch</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">spitch</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
+        <span class="k">if</span> <span class="nb">max</span><span class="p">(</span><span class="n">dpitch</span><span class="p">,</span> <span class="n">spitch</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_pitch</span><span class="p">:</span>
+            <span class="n">err</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memcpy_2d</span><span class="p">(</span><span class="n">dst</span><span class="p">,</span> <span class="n">dpitch</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">spitch</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">err</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">height</span><span class="p">):</span>
+                <span class="n">err</span> <span class="o">=</span> <span class="n">err</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memcpy_2d</span><span class="p">(</span>
+                    <span class="n">dst</span> <span class="o">+</span> <span class="n">row</span> <span class="o">*</span> <span class="n">dpitch</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">src</span> <span class="o">+</span> <span class="n">row</span> <span class="o">*</span> <span class="n">spitch</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span>
+                    <span class="n">width</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span>
+                <span class="p">)</span>
+        <span class="k">if</span> <span class="n">err</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"cudaMemcpy2DAsync failed with error </span><span class="si">{</span><span class="n">err</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">dst_pages</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">src_pages</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
         <span class="k">assert</span> <span class="n">dst</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span> <span class="ow">and</span> <span class="n">src</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span>
@@ -1044,13 +1081,21 @@ window.runMermaid = runMermaid;</script>
         <span class="n">dst_ptr</span><span class="p">,</span> <span class="n">src_ptr</span> <span class="o">=</span> <span class="n">dst</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">src</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span>
         <span class="n">handle</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">cuda_stream</span>
         <span class="k">for</span> <span class="n">dst_idx</span><span class="p">,</span> <span class="n">src_idx</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">dst_pages</span><span class="p">,</span> <span class="n">src_pages</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
-            <span class="n">err</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memcpy_2d</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_copy_2d</span><span class="p">(</span>
                 <span class="n">dst_ptr</span> <span class="o">+</span> <span class="n">dst_idx</span> <span class="o">*</span> <span class="n">dst_page</span><span class="p">,</span> <span class="n">dst_pitch</span><span class="p">,</span>
                 <span class="n">src_ptr</span> <span class="o">+</span> <span class="n">src_idx</span> <span class="o">*</span> <span class="n">src_page</span><span class="p">,</span> <span class="n">src_pitch</span><span class="p">,</span>
                 <span class="n">width</span><span class="p">,</span> <span class="n">dst</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">handle</span><span class="p">,</span>
             <span class="p">)</span>
-            <span class="k">if</span> <span class="n">err</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"cudaMemcpy2DAsync failed with error </span><span class="si">{</span><span class="n">err</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">copy_rows</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="n">dst</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">src</span><span class="o">.</span><span class="n">shape</span> <span class="ow">and</span> <span class="n">dst</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">src</span><span class="o">.</span><span class="n">dtype</span>
+        <span class="k">assert</span> <span class="n">dst</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span> <span class="ow">and</span> <span class="n">src</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">is_contiguous</span><span class="p">()</span>
+        <span class="n">elt</span> <span class="o">=</span> <span class="n">dst</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_copy_2d</span><span class="p">(</span>
+            <span class="n">dst</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">dst</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span>
+            <span class="n">src</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">src</span><span class="o">.</span><span class="n">stride</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span>
+            <span class="n">dst</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">elt</span><span class="p">,</span> <span class="n">dst</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">stream</span><span class="o">.</span><span class="n">cuda_stream</span><span class="p">,</span>
+        <span class="p">)</span>
 
 
 <div class="viewcode-block" id="CudaBindingsCopier">
@@ -1065,6 +1110,11 @@ window.runMermaid = runMermaid;</script>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_runtime</span> <span class="o">=</span> <span class="n">runtime</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_default</span> <span class="o">=</span> <span class="n">runtime</span><span class="o">.</span><span class="n">cudaMemcpyKind</span><span class="o">.</span><span class="n">cudaMemcpyDefault</span>
+        <span class="n">err</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_pitch</span> <span class="o">=</span> <span class="n">runtime</span><span class="o">.</span><span class="n">cudaDeviceGetAttribute</span><span class="p">(</span>
+            <span class="n">runtime</span><span class="o">.</span><span class="n">cudaDeviceAttr</span><span class="o">.</span><span class="n">cudaDevAttrMaxPitch</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_device</span><span class="p">()</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="nb">int</span><span class="p">(</span><span class="n">err</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"cudaDeviceGetAttribute failed with error </span><span class="si">{</span><span class="nb">int</span><span class="p">(</span><span class="n">err</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_memcpy_2d</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">dpitch</span><span class="p">,</span> <span class="n">src</span><span class="p">,</span> <span class="n">spitch</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
         <span class="p">(</span><span class="n">err</span><span class="p">,)</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_runtime</span><span class="o">.</span><span class="n">cudaMemcpy2DAsync</span><span class="p">(</span>
@@ -1079,7 +1129,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    mapping rather than by name, so it is never some other toolkit's runtime that</span>
 <span class="sd">    happens to be on the library path."""</span>
 
-    <span class="n">_lib</span> <span class="o">=</span> <span class="n">_symbol</span> <span class="o">=</span> <span class="s2">""</span>
+    <span class="n">_lib</span> <span class="o">=</span> <span class="n">_symbol</span> <span class="o">=</span> <span class="n">_attr_symbol</span> <span class="o">=</span> <span class="s2">""</span>
+    <span class="n">_max_pitch_attr</span> <span class="o">=</span> <span class="mi">0</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">init</span><span class="p">()</span>
@@ -1089,7 +1140,15 @@ window.runMermaid = runMermaid;</script>
             <span class="p">}</span>
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">paths</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">OSError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"expected one </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_lib</span><span class="si">}</span><span class="s2"> mapped by torch, found </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">paths</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-        <span class="n">fn</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="n">paths</span><span class="o">.</span><span class="n">pop</span><span class="p">()),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_symbol</span><span class="p">)</span>
+        <span class="n">lib</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="n">paths</span><span class="o">.</span><span class="n">pop</span><span class="p">())</span>
+        <span class="n">max_pitch</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_int</span><span class="p">()</span>
+        <span class="n">err</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">lib</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_attr_symbol</span><span class="p">)(</span>
+            <span class="n">ctypes</span><span class="o">.</span><span class="n">byref</span><span class="p">(</span><span class="n">max_pitch</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_pitch_attr</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_device</span><span class="p">()</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">err</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_attr_symbol</span><span class="si">}</span><span class="s2"> failed with error </span><span class="si">{</span><span class="n">err</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_max_pitch</span> <span class="o">=</span> <span class="n">max_pitch</span><span class="o">.</span><span class="n">value</span>
+        <span class="n">fn</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">lib</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_symbol</span><span class="p">)</span>
         <span class="n">fn</span><span class="o">.</span><span class="n">restype</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_int</span>
         <span class="n">fn</span><span class="o">.</span><span class="n">argtypes</span> <span class="o">=</span> <span class="p">[</span>
             <span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_size_t</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_size_t</span><span class="p">,</span>
@@ -1109,7 +1168,8 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""libcudart, for torch 2.9, which ships no ``cuda.bindings``."""</span>
 
     <span class="n">name</span> <span class="o">=</span> <span class="s2">"libcudart"</span>
-    <span class="n">_lib</span><span class="p">,</span> <span class="n">_symbol</span> <span class="o">=</span> <span class="s2">"libcudart"</span><span class="p">,</span> <span class="s2">"cudaMemcpy2DAsync"</span></div>
+    <span class="n">_lib</span><span class="p">,</span> <span class="n">_symbol</span> <span class="o">=</span> <span class="s2">"libcudart"</span><span class="p">,</span> <span class="s2">"cudaMemcpy2DAsync"</span>
+    <span class="n">_attr_symbol</span><span class="p">,</span> <span class="n">_max_pitch_attr</span> <span class="o">=</span> <span class="s2">"cudaDeviceGetAttribute"</span><span class="p">,</span> <span class="mi">11</span>  <span class="c1"># cudaDevAttrMaxPitch</span></div>
 
 
 
@@ -1119,7 +1179,8 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""libamdhip64 on ROCm, where ``copy_`` of a strided page blocks the host too."""</span>
 
     <span class="n">name</span> <span class="o">=</span> <span class="s2">"libamdhip64"</span>
-    <span class="n">_lib</span><span class="p">,</span> <span class="n">_symbol</span> <span class="o">=</span> <span class="s2">"libamdhip64"</span><span class="p">,</span> <span class="s2">"hipMemcpy2DAsync"</span></div>
+    <span class="n">_lib</span><span class="p">,</span> <span class="n">_symbol</span> <span class="o">=</span> <span class="s2">"libamdhip64"</span><span class="p">,</span> <span class="s2">"hipMemcpy2DAsync"</span>
+    <span class="n">_attr_symbol</span><span class="p">,</span> <span class="n">_max_pitch_attr</span> <span class="o">=</span> <span class="s2">"hipDeviceGetAttribute"</span><span class="p">,</span> <span class="mi">58</span>  <span class="c1"># hipDeviceAttributeMaxPitch</span></div>
 
 
 
