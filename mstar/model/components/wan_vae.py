@@ -63,8 +63,19 @@ class ChannelsLastUpsample(WanUpsample):
 def to_channels_last(vae: nn.Module) -> None:
     """Channels-last weights and activations for ``vae``'s decode path
     (``post_quant_conv`` and ``decoder``), in place; idempotent. The encoder
-    is left alone."""
-    for root in (getattr(vae, "post_quant_conv", None), getattr(vae, "decoder", None)):
+    is left alone (``encoder_to_channels_last``)."""
+    _to_channels_last(getattr(vae, "post_quant_conv", None), getattr(vae, "decoder", None))
+
+
+def encoder_to_channels_last(vae: nn.Module) -> None:
+    """``to_channels_last`` for the encode path (``encoder`` and
+    ``quant_conv``), in place; idempotent. Not ``is_channels_last``: that
+    describes the decode path."""
+    _to_channels_last(getattr(vae, "encoder", None), getattr(vae, "quant_conv", None))
+
+
+def _to_channels_last(*roots: nn.Module | None) -> None:
+    for root in roots:
         if root is None:
             continue
         for module in root.modules():

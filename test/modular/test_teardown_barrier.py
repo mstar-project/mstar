@@ -66,6 +66,7 @@ def _conductor(requests, drain_ttl_s=120.0):
     c._early_reads_done_deadlines = deque()
     c._early_abort_deadlines = deque()
     c.waiting_queue = []
+    c._client_streams = {}
     c.enable_prof = False
     c.enable_nvtx = False
     c.max_concurrent_requests = None
@@ -283,7 +284,8 @@ def test_ingest_error_before_dispatch_fails_the_request():
     c._ingest_request(_new_request("r1"))
     assert _remove_targets(c, "r1") == {PREPROCESS}
     [failure] = _failures(c, "r1")
-    assert failure.status == 500 and "model hook broke" in failure.error_message
+    assert failure.status == 500
+    assert failure.error_message.startswith("Ingest failed: internal error (error id ")
 
 
 def test_bad_value_registered_but_not_dispatched_is_a_400():
@@ -300,6 +302,18 @@ def test_bad_value_registered_but_not_dispatched_is_a_400():
     assert _remove_targets(c, "r1") == {PREPROCESS}
     [failure] = _failures(c, "r1")
     assert failure.status == 400 and "top_p" in failure.error_message
+
+
+def test_bad_value_before_dispatch_names_no_server_path():
+    c = _conductor({})
+
+    def bad_config(body):
+        raise ValueError("no `vision_config` in /home/alice/models/qwen/config.json")
+    c._do_ingest_request = bad_config
+    c._ingest_request(_new_request("r1"))
+    [failure] = _failures(c, "r1")
+    assert failure.status == 400
+    assert failure.error_message == "no `vision_config` in config.json"
 
 
 def test_ingest_error_after_dispatch_drains_like_a_worker_failure():

@@ -9,7 +9,7 @@ model never imports a sibling model.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import torch
 from torch import nn
@@ -79,16 +79,43 @@ def compile_transformer_forward(
     )
 
 
-def with_inductor_rounding(compiled, *, eager_rounding: bool):
+def with_inductor_rounding(compiled, *, eager_rounding: bool, deterministic: bool = False):
     """Wrap a compiled callable so ``emulate_precision_casts`` is in effect for the
     traces it builds, and only for those. This works with torch.compile's lazy
     compilation, and post-torch 2.12 per-thread config behavior, without introducing
-    a global config change.
+    a global config change. ``deterministic`` also builds them in Inductor's
+    deterministic mode, where this torch has it: no on-device benchmarking that
+    changes numerics, so every process compiles the same kernels.
     """
     import torch._inductor.config as inductor_config
 
+    options = {"emulate_precision_casts": eager_rounding}
+    if deterministic and hasattr(inductor_config, "deterministic"):
+        options["deterministic"] = True
+
     def forward(*args, **kwargs):
-        with inductor_config.patch(emulate_precision_casts=eager_rounding):
+        with inductor_config.patch(**options):
             return compiled(*args, **kwargs)
 
     return forward
+
+
+def compile_blocks(blocks: Iterable[nn.Module], *, autotune: bool = False, **compile_kwargs) -> None:
+    """Compile each block's forward in place, rounding every intermediate where
+    eager does (``emulate_precision_casts``): by default under Inductor's
+    defaults in its deterministic mode, so every process compiles the same
+    kernels; with ``autotune`` under the -O level's options, whose kernel picks
+    are per process. ``compile_kwargs`` go to ``torch.compile`` (static shapes
+    and no full graph unless overridden). For a transformer whose blocks keep
+    an eager call in the middle (a cache write, a ragged attention), so each
+    block traces into graphs around it once.
+    """
+    if autotune:
+        from mstar.engine.accelerator_graph_runner import compile_kwargs as level_kwargs
+
+        compile_kwargs = {**level_kwargs(None), **compile_kwargs}
+    compile_kwargs = {"fullgraph": False, "dynamic": False, **compile_kwargs}
+    for block in blocks:
+        block.forward = with_inductor_rounding(
+            torch.compile(block.forward, **compile_kwargs), eager_rounding=True, deterministic=not autotune,
+        )

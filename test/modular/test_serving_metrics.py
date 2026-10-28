@@ -38,6 +38,7 @@ from mstar.communication import wire
 from mstar.observability import catalog
 from mstar.observability import metrics as metrics_module
 from mstar.observability.recorders import Counter, EdgeTransfers, Gauge, Histogram, MetricSnapshot
+from mstar.streaming.topology import PartitionTopology
 
 TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
@@ -410,14 +411,14 @@ def _in_flight_id(served, client):
                          headers={**_KEY, "content-type": "application/json"}), 413, "/v1/chat/completions"),
     (lambda s, c: c.post("/generate", content=_chunked(2**21),
                          headers={**_KEY, "content-type": "multipart/form-data; boundary=b"}), 413, "/generate"),
-    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 422, "/v1/chat/completions"),
+    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 400, "/v1/chat/completions"),
     (lambda s, c: c.post("/generate", data={"text": "hi", "model_kwargs": "{"}, headers=_KEY), 400, "/generate"),
     (_in_flight_id, 409, "/generate"),
     (lambda s, c: c.get("/no/such/route", headers=_KEY), 404, "unmatched"),
     # The served model has no OpenAI adapter.
     (lambda s, c: c.post("/v1/chat/completions", json=_CHAT, headers=_KEY), 404, "/v1/chat/completions"),
     (lambda s, c: c.get("/generate", headers=_KEY), 405, "/generate"),
-], ids=["401", "401-unmatched", "413-declared", "413-chunked", "422", "400", "409", "404-unmatched",
+], ids=["401", "401-unmatched", "413-declared", "413-chunked", "400-schema", "400", "409", "404-unmatched",
         "404-no-adapter", "405"])
 def test_a_request_refused_before_the_api_server_counts_by_route_template_and_status(
         served, refusing, send, status, route):
@@ -709,6 +710,9 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
         def process_prompt(self, *args, **kwargs):
             return None
 
+        def get_partition_topology(self):
+            return PartitionTopology(partitions=["default"])
+
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
     facade.timing_requested = threading.Event()
@@ -719,8 +723,12 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
         profile_queue=facade.profile_queue, cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(), stop_event=stop,
-        communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
-                                           send=lambda entity, msg: sent.append(msg)),
+        # codec / try_send_bytes: the thread's outbox sends through them
+        communicator=types.SimpleNamespace(
+            get_all_new_messages=lambda: [],
+            codec=types.SimpleNamespace(encode=lambda msg: msg),
+            try_send_bytes=lambda entity, msg: sent.append(msg) or True,
+        ),
         tensor_manager=_StubTensorManager(), model=_Model(),
         timing_requested=facade.timing_requested,
     )
@@ -1007,6 +1015,9 @@ class _MediaModel:
     def max_input_files(self):
         return {"image": 1}
 
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
+
     def load_image(self, filepath, device):
         from mstar.model.base import Model
 
@@ -1058,8 +1069,12 @@ class _RealDataWorker:
             abort_request_queue=facade.abort_request_queue,
             reads_done_queue=facade.reads_done_queue,
             discard_tensor_queue=facade.discard_tensor_queue, stop_event=facade.stop_event,
-            communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
-                                               send=lambda entity, msg: self.sent.append(msg)),
+            # codec / try_send_bytes: the thread's outbox sends through them
+            communicator=types.SimpleNamespace(
+                get_all_new_messages=lambda: [],
+                codec=types.SimpleNamespace(encode=lambda msg: msg),
+                try_send_bytes=lambda entity, msg: self.sent.append(msg) or True,
+            ),
             tensor_manager=facade.tensor_manager, model=self.model, enable_prof=enable_prof,
             timing_requested=facade.timing_requested,
             worker_metrics_requested=facade.worker_metrics_requested,
@@ -1289,6 +1304,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     cfg.write_text(text)
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
+    # sizing torch's pool would outlive the test in this process
+    monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
     return str(cfg)
 
 
