@@ -226,8 +226,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def _take_drawn_seeds(self, request_id: int, bucket_key: Hashable) -> dict[str, torch.Tensor] | None:
         """The ingest-time draw, once. None when there is none or it was drawn for
         another bucket key (a later stage's geometry), which then draws inline."""
-        state = self.request_state(request_id)
-        entry = state.get("seed_draw")
+        state = self.request_states.get(request_id)
+        entry = state.get("seed_draw") if state is not None else None
         if entry is None:
             return None
         state.remove("seed_draw")
