@@ -24,7 +24,7 @@ from mstar.model.lingbot_world.components.dit import (  # noqa: E402
     attended_frames,
 )
 from mstar.model.lingbot_world.components.schedule import make_fast_schedule  # noqa: E402
-from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel  # noqa: E402
+from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
     DIT_ATTN,
     ROLLOUT_LOOP_NAME,
@@ -479,11 +479,28 @@ def test_the_dit_declares_one_ragged_cross_attention(model):
     assert LingBotWorldModel(skip_weight_loading=True, reference_attention=True).get_node_resources() == []
 
 
+SWITCHES = ("reference_attention", "vae_decode_fp32", "vae_decode_channels_last", "vae_decode_compile")
+
+
+@pytest.mark.parametrize("name", SWITCHES)
 @pytest.mark.parametrize("value", ["false", 0, None])
-def test_reference_attention_must_be_a_bool(value):
-    """A yaml "false" is truthy; read as on it would serve the other attention."""
-    with pytest.raises(ValueError, match="reference_attention"):
-        LingBotWorldModel(skip_weight_loading=True, reference_attention=value)
+def test_a_model_kwargs_switch_must_be_a_bool(name, value):
+    """A yaml "false" is truthy; read as on it would serve the opposite setting."""
+    with pytest.raises(ValueError, match=name):
+        LingBotWorldModel(skip_weight_loading=True, **{name: value})
+
+
+def test_model_kwargs_switches_set_the_config():
+    default = LingBotWorldModel(skip_weight_loading=True).config
+    assert (default.reference_attention, default.vae_decode_fp32, default.vae_decode_channels_last,
+            default.vae_decode_compile) == (False, False, True, True)
+    for name in SWITCHES:
+        flipped = LingBotWorldModel(skip_weight_loading=True, **{name: not getattr(default, name)}).config
+        assert getattr(flipped, name) is not getattr(default, name)
+        assert all(getattr(flipped, n) is getattr(default, n) for n in SWITCHES if n != name)
+    reference = LingBotWorldModel(skip_weight_loading=True, **REFERENCE_MODEL_KWARGS).config
+    assert (reference.reference_attention, reference.vae_decode_fp32, reference.vae_decode_channels_last,
+            reference.vae_decode_compile) == (True, True, False, False)
 
 
 def _bare_dit_submodule(model, resources):

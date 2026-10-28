@@ -5,6 +5,15 @@ model: "lingbot_world_1_3b"
 # the UMT5 text length.
 max_seq_len: 512
 
+# Numerics switches (model_kwargs), shown at their defaults. The reference's are
+# reference_attention: true (FA2, needs flash-attn) and the fp32, contiguous,
+# eager decode; with all four the rollout is bit-identical to the reference's.
+# model_kwargs:
+#   reference_attention: false
+#   vae_decode_fp32: false
+#   vae_decode_channels_last: true
+#   vae_decode_compile: true
+
 # One rollout per GPU: the dense K/V and the VAE caches are per request, so the
 # model refuses any other value (LingBotWorldModel.validate_config_yaml).
 max_concurrent_requests: 1

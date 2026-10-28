@@ -77,10 +77,16 @@ class LingBotWorldConfig:
     # FlashInfer's prefill, the cutlass FMHA on Blackwell).
     reference_attention: bool = False
 
-    # The reference decodes in fp32. bf16 is faster on cuDNN >= 9.16 but is not
-    # the reference's numerics.
-    vae_decode_fp32: bool = True
-    vae_decode_channels_last: bool = False
+    # The decode's precision, layout and compile; each settable in model_kwargs.
+    # The reference decodes fp32, contiguous and eager: 291 ms per 16-frame chunk
+    # at 464x832 on a B300. bf16 channels-last compiled (Inductor's deterministic
+    # mode) takes 77 ms, frames 51 dB from the reference decode of the same
+    # latents; fp32 channels-last compiled 135 ms at 71 dB. Nothing in the
+    # rollout reads the decoded frames, so this error stays per frame. The
+    # compile is per output size; the default size is compiled at load.
+    vae_decode_fp32: bool = False
+    vae_decode_channels_last: bool = True
+    vae_decode_compile: bool = True
 
     @property
     def head_dim(self) -> int:

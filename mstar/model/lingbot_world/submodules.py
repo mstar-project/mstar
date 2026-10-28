@@ -187,16 +187,25 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
     disable_torch_compile = True
 
     def __init__(self, dit: LingBotCausalDiT, vae: nn.Module, config: LingBotWorldConfig,
-                 encoder_vae: nn.Module | None = None):
+                 encoder_vae: nn.Module | None = None, warmup_latent_sizes: list[tuple[int, int]] = ()):
         super().__init__()
         self.dit = dit
         self.vae = vae
         self.encoder_vae = encoder_vae
         self.config = config
         self.schedule = make_fast_schedule(config.sample_shift, config.timesteps_index, config.num_train_timesteps)
+        if vae is not None and not config.vae_decode_fp32:
+            # the latents are cast to bf16 for the decode
+            vae.to(torch.bfloat16)
         if vae is not None and config.vae_decode_channels_last:
             wan_vae.to_channels_last(vae)
-        self._decode_step = wan_vae.DecoderStep(vae, compile=False) if vae is not None else None
+        self._decode_step = (
+            wan_vae.DecoderStep(vae, compile=config.vae_decode_compile, deterministic=True)
+            if vae is not None else None
+        )
+        if vae is not None and config.vae_decode_compile:
+            for lat_hw in warmup_latent_sizes:
+                self.warmup_decode(lat_hw)
         self._attention: DitAttention | None = None
         # Debug hook for the parity harness: keep the last chunk's latents and
         # float frames in the request state.
@@ -335,6 +344,17 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             "clock": [torch.full((1,), chunk + 1, dtype=torch.int64, device=device)],
             "video_output": [frames_u8],
         }
+
+    def warmup_decode(self, lat_hw: tuple[int, int]) -> None:
+        """Decode two chunks of zero latents through a fresh stream at
+        ``lat_hw``, so every call signature of the compiled decode is compiled
+        before a request at that size."""
+        cfg = self.config
+        device = next(self.vae.parameters()).device
+        state = {"feat_cache": wan_vae.new_feat_cache(self.vae)}
+        with torch.inference_mode():
+            for k in range(2):
+                self._decode(torch.zeros(cfg.out_dim, cfg.chunk_size, *lat_hw, device=device), state, clip_start=k == 0)
 
     def _decode(self, latents: torch.Tensor, state, clip_start: bool) -> torch.Tensor:
         """``[1, 3, frames, H, W]`` in [-1, 1]: the chunk decoded as the

@@ -49,6 +49,16 @@ from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
+# LingBotWorldConfig switches a deployment sets in model_kwargs
+_CONFIG_KWARGS = ("reference_attention", "vae_decode_fp32", "vae_decode_channels_last", "vae_decode_compile")
+
+# The switches set to the reference's numerics: FA2 attention and the fp32, contiguous, eager decode,
+# with which the rollout is bit-identical to the reference's (test/lingbot_world/run_parity.py).
+REFERENCE_MODEL_KWARGS = {
+    "reference_attention": True, "vae_decode_fp32": True, "vae_decode_channels_last": False,
+    "vae_decode_compile": False,
+}
+
 ENCODE_TEXT_WALK = "encode_text"
 _SCHEDULE = (ENCODE_TEXT_WALK, ROLLOUT_WALK)
 _DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock")
@@ -61,16 +71,18 @@ class LingBotWorldModel(Model):
         cache_dir: str | None = None,
         variant: str = LINGBOT_VARIANT_1_3B,
         skip_weight_loading: bool = False,
-        reference_attention: bool = False,
         **kwargs,
     ):
         if variant != LINGBOT_VARIANT_1_3B:
             raise NotImplementedError(f"LingBot-World variant {variant!r} is not implemented yet.")
-        # a yaml "false" is a truthy string
-        if not isinstance(reference_attention, bool):
-            raise ValueError(f"LingBot-World reference_attention must be true or false, got {reference_attention!r}.")
         self.config = LINGBOT_CONFIGS[variant]()
-        self.config.reference_attention = reference_attention
+        for name in _CONFIG_KWARGS:
+            if name in kwargs:
+                value = kwargs.pop(name)
+                # a yaml "false" is a truthy string
+                if not isinstance(value, bool):
+                    raise ValueError(f"LingBot-World {name} must be true or false, got {value!r}.")
+                setattr(self.config, name, value)
         self.model_path_hf = model_path_hf or LINGBOT_HF_REPOS[variant]
         self.cache_dir = cache_dir
         self.skip_weight_loading = skip_weight_loading
@@ -394,8 +406,11 @@ class LingBotWorldModel(Model):
             if self.config.reference_attention:
                 require_flash_attn()
             dit = build_lingbot_dit(self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir)
+            cfg = self.config
             return LingBotDitSubmodule(
-                dit, self._load_vae().to(device), self.config, encoder_vae=self._load_vae().to(device),
+                dit, self._load_vae().to(device), cfg, encoder_vae=self._load_vae().to(device),
+                warmup_latent_sizes=[self.geometry((cfg.default_height, cfg.default_width),
+                                                   cfg.default_height, cfg.default_width)],
             )
         logger.warning("LingBot-World has no submodule for node %r; running it dummy.", node_name)
         return None

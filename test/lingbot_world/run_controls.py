@@ -31,7 +31,7 @@ from run_parity import DEVICE, drive, frame_stats, fwd_info, same, stats  # noqa
 
 from mstar.model.components import wan_vae  # noqa: E402
 from mstar.model.lingbot_world import submodules  # noqa: E402
-from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel  # noqa: E402
+from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
 from mstar.model.lingbot_world.submodules import first_frame_mask  # noqa: E402
 
 
@@ -81,7 +81,7 @@ def main():
     ref_latents = torch.load(oracle / "latents.pt")
     ref_video = torch.load(oracle / "video.pt")
 
-    model = LingBotWorldModel()
+    model = LingBotWorldModel(**REFERENCE_MODEL_KWARGS)
     cfg = model.config
     cs = cfg.chunk_size
     tensors = model.process_prompt(
