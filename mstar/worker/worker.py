@@ -4152,7 +4152,8 @@ class Worker:
         the same list is cut with it. Two names the forward returned on its own
         get their own lists from the engine and keep their own widths. A row
         whose span is empty has no output under the name: it leaves the row's
-        dict, so nothing is stored, routed or streamed for it.
+        dict, so nothing is stored, routed or streamed for it. Another name
+        bound to the same list stays, with the whole output.
         """
         spans = outputs.host_spans or outputs.output_spans
         per_rid = outputs.per_rid_outputs
