@@ -71,6 +71,7 @@ from mstar.model.qwen3_omni.qwen3_omni_model import image_span
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
@@ -1202,6 +1203,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
 class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
+    _SPANNED = frozenset({"codec_tokens"})
 
     def __init__(
         self,
@@ -1585,24 +1587,41 @@ class TalkerSubmodule(ARNodeSubmodule):
             "new_token": [layer0_codes]
         }
 
+    def _codec_spans(self, fwd_out: NameToTensorList) -> torch.Tensor:
+        """``[bs, 2]``: each row's whole frame, or nothing for an EOS frame,
+        which is loop control and not a codebook index (``spanned_outputs``)."""
+        end = torch.where(
+            fwd_out["new_token"][0] == self.config.talker.codec_eos_token_id,
+            0, fwd_out["codec_tokens"][0].shape[-1],
+        )
+        return torch.stack([torch.zeros_like(end), end], dim=1)
+
+    def spanned_outputs(self, graph_walk: str) -> frozenset[str]:
+        """``codec_tokens`` on the walks that sample a frame."""
+        return self._SPANNED if graph_walk in ("talker_decode", "talker_last_prefill") else frozenset()
+
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | BatchedModelOutput:
         if graph_walk == "talker_prefill":
             return self._forward_prefill(
                 input_embeds=input_embeds
             )
-        return self._forward_decode_like(
+        fwd_out = self._forward_decode_like(
             request_ids=engine_inputs.request_ids,
             talker_sampler=engine_inputs.resources[TALKER_SAMPLER],
             code_pred_sampler=engine_inputs.resources[CODE_PRED_SAMPLER],
             input_embeds=input_embeds,
             is_batched_decode=(graph_walk == "talker_decode"),
             **kwargs
+        )
+        return BatchedModelOutput(
+            per_rid_outputs={engine_inputs.request_ids[0]: fwd_out},
+            output_spans={"codec_tokens": self._codec_spans(fwd_out)},
         )
 
     def forward_batched(
@@ -1663,7 +1682,10 @@ class TalkerSubmodule(ARNodeSubmodule):
                 "new_token": [fwd_out["new_token"][0][i]],
             } for i, rid in enumerate(engine_inputs.request_ids)
         }
-        return outputs
+        return BatchedModelOutput(
+            per_rid_outputs=outputs,
+            output_spans={"codec_tokens": self._codec_spans(fwd_out)},
+        )
 
     def postprocess(
         self, request_id: str,
@@ -1778,8 +1800,8 @@ class Code2WavSubmodule(NodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
 
-    # No capture carries this key, so a batch of terminal flushes runs eager
-    # and skips the decode when none of its windows has a new frame.
+    # No capture carries this key, so a batch made only of context-only
+    # terminal flushes runs eager and skips the decode.
     _CONTEXT_ONLY_KEY = "context_only"
 
     def __init__(self, code2wav_model: Qwen3OmniMoeCode2Wav, config: Qwen3OmniModelConfig):
@@ -1812,17 +1834,16 @@ class Code2WavSubmodule(NodeSubmodule):
         return meta.stream_chunks.get("codec_tokens") if meta is not None else None
 
     @classmethod
-    def _maybe_context_only(
+    def _context_only(
         cls, request_ids, per_request_input_metadata: Mapping[str, InputMetadata] | None,
     ) -> bool:
-        """Whether every window may be a terminal flush that emits no audio:
-        its new items are at most the Talker's codec_eos frame, which ends
-        every stream the Talker stops itself, so a reply whose frames end on a
-        chunk boundary ends with such a flush. The counts can't tell that
-        frame from a real one, so ``preprocess`` checks the decoded frames."""
+        """Whether every window holds context frames only, which emit no
+        audio: a reply whose frames end on a chunk boundary ends with such a
+        terminal flush. Every item is a frame (the Talker's EOS frame has an
+        empty span), so the counts tell."""
         for rid in request_ids:
             chunk = cls._chunk(rid, per_request_input_metadata)
-            if chunk is None or chunk.num_items - chunk.context_items > int(chunk.is_final):
+            if chunk is None or chunk.num_items > chunk.context_items:
                 return False
         return bool(request_ids)
 
@@ -1833,7 +1854,7 @@ class Code2WavSubmodule(NodeSubmodule):
         per_request_input_metadata: Mapping[str, InputMetadata] | None = None,
         **kwargs: Any,
     ) -> Any:
-        if self._maybe_context_only(list(per_request_info), per_request_input_metadata):
+        if self._context_only(list(per_request_info), per_request_input_metadata):
             return self._CONTEXT_ONLY_KEY
         return None
 
@@ -1864,34 +1885,30 @@ class Code2WavSubmodule(NodeSubmodule):
         **kwargs
     ) -> NodeInputs:
         num_quantizers = self.config.code2wav.num_quantizers  # 16
-        codec_eos = self.config.talker.codec_eos_token_id
-        codec_tokens = inputs["codec_tokens"][0]
+        num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
+        # Every item is a frame: the Talker's EOS frame has an empty span.
+        received = inputs.get("codec_tokens")
+        if received:
+            codec_tokens = received[0]
+        else:
+            # a stream that never got a frame (its first was EOS) ends with an empty chunk
+            codec_tokens = torch.zeros(0, num_groups, dtype=torch.long, device=self.get_device())
 
         # Reshape to (num_frames, num_code_groups) if flat
         if codec_tokens.dim() == 1:
-            num_groups = self.config.num_code_groups  # 16 (Qwen3-Omni)
             if codec_tokens.shape[0] % num_groups == 0:
                 codec_tokens = codec_tokens.view(-1, num_groups)
             else:
                 codec_tokens = codec_tokens.unsqueeze(0)
-
-        # Filter out codec_eos frames
-        if codec_tokens.dim() == 2 and codec_tokens.shape[0] > 0:
-            eos_mask = codec_tokens[:, 0] == codec_eos
-            if eos_mask.any():
-                codec_tokens = codec_tokens[~eos_mask]
 
         # Select first num_quantizers codebook layers
         if codec_tokens.shape[-1] > num_quantizers:
             codec_tokens = codec_tokens[..., :num_quantizers]
 
         # The window's leading frames that an earlier window already decoded.
-        # EOS is only ever a stream's last item, but it can be a context item
-        # of the final flush (the previous window's last new item). The filter
-        # above dropped it, so the clamp keeps the context within the frames.
         chunk = (input_metadata.stream_chunks.get("codec_tokens") if input_metadata is not None else None)
         orig_seq_len = codec_tokens.shape[0]
-        context = min(chunk.context_items if chunk is not None else 0, orig_seq_len)
+        context = chunk.context_items if chunk is not None else 0
 
         # pad sequence to full_seqlen for batching
         pad_len = self.full_seqlen - codec_tokens.shape[0]
@@ -1934,10 +1951,8 @@ class Code2WavSubmodule(NodeSubmodule):
         position_ids = torch.stack([
             inp.tensor_inputs["position_ids"] for inp in inputs
         ], dim=0)
-        metadata = engine_inputs.per_request_input_metadata
-        if not engine_inputs.captured and self._maybe_context_only(engine_inputs.request_ids, metadata) and all(
-            inp.kwargs["frames"] <= self._chunk(rid, metadata).context_items
-            for rid, inp in zip(engine_inputs.request_ids, inputs, strict=True)
+        if not engine_inputs.captured and self._context_only(
+            engine_inputs.request_ids, engine_inputs.per_request_input_metadata,
         ):
             return {"codec_tokens": batched_codec_tokens[..., :0], "position_ids": position_ids[..., :0]}
         return {"codec_tokens": batched_codec_tokens, "position_ids": position_ids}
