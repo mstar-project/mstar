@@ -66,9 +66,10 @@ name: Claude Review
 # execution file, and that summary is posted. A review that stopped before it
 # finished gets a "didn't complete" comment listing the inline comments it made
 # (the action posts them even when the run fails), and a handoff is saved as an
-# artifact for 7 days: its progress note, the inline comments it made and the
-# files it read (session.py). The note lists unverified leads, so it stays out
-# of the PR conversation (the artifact can be downloaded, though).
+# artifact for 7 days: the inline comments it made, the files it read, its
+# latest messages and its progress note if it kept one (session.py). These
+# list unverified leads, so they stay out of the PR conversation (the artifact
+# can be downloaded, though).
 # `/review continue` starts a fresh session from that handoff with a fresh turn
 # budget, rather than resuming the old session, which would replay the whole
 # transcript, usually after its prompt cache has expired. Only artifacts made
