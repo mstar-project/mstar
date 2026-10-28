@@ -45,11 +45,15 @@ class build_py_with_configs(build_py):
 # `pip install -e .`.
 rust_extensions = []
 if os.environ.get("CIBUILDWHEEL") == "1":
-    from setuptools_rust import Binding, RustBin, RustExtension
+    from setuptools_rust import Binding, RustBin, RustExtension, Strip
 
+    # --locked: the checked-in Cargo.lock versions, not whatever resolves on
+    # the day (the license notices are collected from rust/server/Cargo.lock).
+    # Stripped: the symbols are unused at runtime and only bloat six wheels.
+    wheel_build = {"cargo_manifest_args": ["--locked"], "strip": Strip.All}
     rust_extensions += [
-        RustExtension("mstar_rust", path="rust/Cargo.toml", binding=Binding.PyO3),
-        RustBin("mstar-server", path="rust/server/Cargo.toml"),
+        RustExtension("mstar_rust", path="rust/Cargo.toml", binding=Binding.PyO3, **wheel_build),
+        RustBin("mstar-server", path="rust/server/Cargo.toml", **wheel_build),
     ]
 
 setup(cmdclass={"build_py": build_py_with_configs}, rust_extensions=rust_extensions)
