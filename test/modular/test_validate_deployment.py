@@ -368,6 +368,19 @@ def test_parallel_ranks_off_their_position_are_refused(tmp_path):
              r"the deployment uses ranks \[1, 2\]; ranks \[1, 2\] are in tensor- or sequence-parallel groups")
 
 
+@pytest.mark.parametrize(("ranks", "refused"), [([1, 0], True), ([2, 3, 0, 1], False)])
+def test_parallel_ranks_out_of_order_are_refused(tmp_path, ranks, refused):
+    """torch orders a group by global rank and the mesh by the config's list,
+    so a gather would come back in a different order than the ranks split by.
+    Only each instance's own ranks need the order: [2, 3, 0, 1] is two
+    ascending replicas."""
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": ranks, "tp_size": 2}])
+    if refused:
+        _refused(_Model(tp_enabled_nodes=["llm"]), cfg, r"out of order")
+    else:
+        _validate(_Model(tp_enabled_nodes=["llm"]), cfg)
+
+
 def test_an_unused_rank_above_the_parallel_ones_is_accepted(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path, [
         {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},

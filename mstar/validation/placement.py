@@ -110,6 +110,15 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
                 f"node_groups[{i}] (nodes {names}) has {len(ranks)} ranks; not "
                 f"divisible by tp_size*sp_size ({tp}*{sp}={tp * sp})."
             )
+        blocks = [ranks[base:base + tp * sp] for base in range(0, len(ranks), tp * sp)]
+        if tp * sp > 1 and any(block != sorted(block) for block in blocks):
+            # torch orders a process group by global rank, the mesh by this
+            # list: out of order, a gather would come back in another order
+            # than the one each rank split its work by
+            yield (
+                f"node_groups[{i}] (nodes {names}) lists its ranks {ranks} out of order; "
+                f"each lockstep instance's {tp * sp} ranks must be ascending."
+            )
         for size, axis, enabled in (
             (tp, "tp", sharding.tp_enabled_nodes), (sp, "sp", sharding.sp_enabled_nodes),
         ):
