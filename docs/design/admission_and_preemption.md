@@ -81,7 +81,7 @@ Rules:
 
 - **Ingest.** A request whose footprint is bigger than its pool gets a 400 at ingest. A request that asks for no length has its default cut to fit the pool (#808).
 - **Queue.** A request joins the runner's waiting list at its first readiness check, in the order requests first ask. It is admitted when it is first among the waiting requests of every pool it asks, and its reservation fits in each, in the free and evictable pages no admitted request has reserved.
-- **Passing.** While the first request of a pool's queue can't start, a request behind it is admitted if part of its prompt is cached on the GPU, running requests keep all of that part from eviction, and its own pages fit, output included. While the first request waits, no request behind it is admitted into the pages such a request frees.
+- **Passing.** While the first request of a pool's queue can't start, a request behind it is admitted if part of its prompt is cached on the GPU, running requests keep all of that part from eviction, and its own pages fit, output included. While the first request waits, no request behind it is admitted into the pages such a request frees. A recurrent pool lets a request pass when a slot is left for the first one.
 - **Size.** A preemptible request reserves its prompt. A guaranteed one, and one admitted past the first request, also reserves its growth.
 - **Inside a reservation.** A grant always succeeds. A failure there is an accounting bug, and the manager raises.
 - **Past a reservation.** A grant takes only from the room, and fails with `AllocationFailed(pages_short=...)` when the room is short.

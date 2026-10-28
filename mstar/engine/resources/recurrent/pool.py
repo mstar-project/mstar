@@ -294,10 +294,15 @@ class RecurrentStatePool(Resource):
                 return None
         return ASKS
 
-    def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+    # a request passing the first waiting one leaves a slot for it
+    passes = True
+
+    def reserve(
+        self, rid: str, node_name: str, graph_walk: str, published: None, passing: bool = False,
+    ) -> int | None:
         with self._lock:
             room = len(self._free) - len(self._reserved)
-            if room <= 0:
+            if room <= int(passing):
                 return room
             self._reserved.add(rid)
             return None
