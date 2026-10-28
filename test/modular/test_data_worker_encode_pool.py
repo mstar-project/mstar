@@ -23,6 +23,9 @@ class _Model:
         self.gates: dict[int, threading.Event] = {}
         self.threads: dict[int, str] = {}
 
+    def stop_token_ids(self):
+        return None
+
     def get_partition_topology(self):
         return PartitionTopology(partitions=["default"])
 
