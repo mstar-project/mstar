@@ -662,7 +662,7 @@ def _to_float_list(raw, target_dim: int) -> list[float]:
 
 def _task_strings(tasks_df) -> dict[int, str]:
     """task_index -> instruction from a lerobot v3.0 meta/tasks.parquet, which keeps the strings in the index."""
-    return dict(zip(tasks_df["task_index"].astype(int), tasks_df.index.astype(str), strict=False))
+    return dict(zip(tasks_df["task_index"].astype(int), tasks_df.index.astype(str), strict=True))
 
 
 def _decode_frames_to_png_and_video(
