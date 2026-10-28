@@ -424,6 +424,10 @@ class StepRunner:
                 continue
             if not asked.ok:
                 logger.warning("Admission for resource %s failed with error: %s", key, asked.reason.message)
+                if entry is not None:
+                    # a request a resource can't serve waits in no queue
+                    del self._waiting[rid]
+                    self._leave(rid, entry.asked)
                 return FullAdmitOutcome(asked, key)
             if entry is None:
                 entry = self._waiting[rid] = _Waiting()
