@@ -103,8 +103,16 @@ def _jit_source() -> tuple[str, str]:
     return name, path
 
 
-@functools.lru_cache(maxsize=1)
+@torch.compiler.assume_constant_result
 def _cuda_op_available() -> bool:
+    """Whether the vendored CUDA op loaded. A constant to dynamo, which traces through
+    ``lru_cache`` and broke the graph at the build's file read in every compiled call, so a
+    tuned config read before the alignment crossed into the next graph as data."""
+    return _build_cuda_op()
+
+
+@functools.lru_cache(maxsize=1)
+def _build_cuda_op() -> bool:
     """JIT-compile and load the vendored CUDA op; return whether it worked.
 
     Cached so compilation is attempted once per process.  A failure (missing
