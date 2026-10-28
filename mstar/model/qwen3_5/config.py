@@ -8,25 +8,27 @@ import json
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+from mstar.model import keys
+
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
 
 # text prefill and decode rows batched in one step (Model.get_combined_graph_walks)
-LLM_MIXED = "mixed"
+LLM_MIXED = keys.MIXED
 # Prompt rows a mixed step may carry: its GDN runs them on the chunked kernel,
 # which gathers and scatters each one's whole state (`GDNMixedWrapper`), and
 # the decode rows on the decode kernel.
 MIXED_MAX_PREFILL_ROWS = 4
 
-# resource keys this model declares
-KV_CACHE = "kv_cache"
+# resource keys this model declares; the shared scaffolds read `keys`' ones
+KV_CACHE = keys.KV_CACHE
 ATTN = "attn"
 GDN_STATE = "gdn_state"
 LINEAR_ATTN = "linear_attn"
-ROPE = "rope"
-SAMPLER = "sampler"
+ROPE = keys.ROPE
+SAMPLER = keys.SAMPLER
 # the ViT tower's cacheless attention, on the `vision_encoder` node
-VISION_ATTN = "vision_attn"
+VISION_ATTN = keys.VISION_ATTN
 
 
 @dataclass

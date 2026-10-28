@@ -762,6 +762,7 @@ def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
     counts, not their sizes."""
+    from mstar.model.multimodal import vision_encoder
     from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     config = Qwen3_5Config(
@@ -772,7 +773,10 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
         linear_value_head_dim=128, linear_conv_kernel_dim=4,
         vocab_size=1024, rms_norm_eps=1e-6, max_position_embeddings=262144,
     )
-    return _bare(Qwen3_5DenseModel, config=config, vision_config=None)
+    return _bare(
+        Qwen3_5DenseModel, config=config, vision_config=None,
+        encoders=(vision_encoder((0,)),),
+    )
 
 
 def _qwen3_omni(name, model_kwargs, tmp_path, monkeypatch):

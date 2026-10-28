@@ -75,10 +75,10 @@ def _stub_model(sub, seen):
         seen["n"] = len(inputs)
         return torch.zeros(3, len(inputs))
 
-    sub.model = SimpleNamespace(model=SimpleNamespace(
-        build_cos_sin=lambda pos, dtype: (pos, pos),
-        embed_tokens=SimpleNamespace(weight=torch.zeros(1)),
-    ))
+    sub.model = SimpleNamespace(
+        embed_dtype=torch.float32,
+        model=SimpleNamespace(build_cos_sin=lambda pos, dtype: (pos, pos)),
+    )
     sub._position_ids_3d = _position_ids_3d
 
 
@@ -139,10 +139,10 @@ def test_in_graph_rope_knob_drops_only_the_staged_tables(monkeypatch):
         resources={SAMPLER: sampler}, request_ids=["r1", "r2"],
         step=SimpleNamespace(ctx=SimpleNamespace(slot_lease=object(), graph_walk="decode")),
     )
-    sub.model = SimpleNamespace(model=SimpleNamespace(
-        build_cos_sin=lambda pos, dtype: (pos, pos),
-        embed_tokens=SimpleNamespace(weight=torch.zeros(1)),
-    ))
+    sub.model = SimpleNamespace(
+        embed_dtype=torch.float32,
+        model=SimpleNamespace(build_cos_sin=lambda pos, dtype: (pos, pos)),
+    )
     sub._position_ids_3d = lambda inputs: torch.zeros(3, len(inputs))
     monkeypatch.delenv("MSTAR_INGRAPH_DECODE_ROPE", raising=False)
     out = LLMSubmodule.preprocess(sub, "decode", leased, rows)
@@ -167,29 +167,32 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture(monkeypatch):
 
     calls = {}
 
-    class _Embed:
-        weight = torch.zeros(1)
+    def build_cos_sin(pos, dtype):
+        calls["built"] = pos
+        return pos, pos
 
-        def __call__(self, ids):
+    class _Decoder:
+        """The decoder contract: embed, the stack, logits."""
+
+        embed_dtype = torch.float32
+        model = SimpleNamespace(build_cos_sin=build_cos_sin)
+
+        def embed(self, ids):
             calls["ids"] = ids.tolist()
             return ids.float()
-
-    class _Inner:
-        embed_tokens = _Embed()
 
         def __call__(self, embeds, label, cos_sin):
             calls["cos"] = cos_sin[0]
             return embeds
 
-        def build_cos_sin(self, pos, dtype):
-            calls["built"] = pos
-            return pos, pos
+        def logits(self, hidden):
+            return hidden
 
     sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
     sampler.sample = lambda rids, logits: ("sampled", list(rids))
     sub = _sub(sampler)
     sub.node_resources[ROPE] = SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20]))
-    sub.model = SimpleNamespace(model=_Inner(), lm_head=lambda h: h)
+    sub.model = _Decoder()
     static_ids, static_cos = torch.tensor([9, 9]), torch.full((3, 2), 7.0)
 
     def run(lease):

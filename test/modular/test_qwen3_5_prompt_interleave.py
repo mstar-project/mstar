@@ -1,10 +1,10 @@
-"""Qwen3.5's multimodal prompt: split at the attachments, scheduled in order.
+"""Qwen3.5's multimodal prompt: one row of ids, each attachment's pad expanded.
 
-The contract `process_prompt` and `_prefill_schedule` share is that the nth
-text segment belongs to the nth text step of the prefill plan. These check the
-two halves agree, and that nothing is lost or duplicated at a seam — the
-segments plus the spans they were split around must rebuild the prompt
-verbatim.
+`process_prompt` renders and tokenizes the prompt once, then expands each
+image's pad to one pad per merged vision token; `_prefill_schedule` hands
+the whole prompt and the tower's inputs to one walk. These check nothing is
+lost or duplicated in the expansion, and that the layout the LLM places
+positions with matches the ids.
 
 Needs the tokenizer, not the weights, so it skips unless QWEN3_5_CKPT is set.
 """
@@ -18,12 +18,12 @@ import torch
 
 from mstar.api_server.openai.adapters import flatten_messages
 from mstar.model.multimodal import (
+    MEDIA_LAYOUT,
     TEXT,
     PromptPart,
     parts_from_modalities,
-    prefill_plan,
+    walk_input_edges,
 )
-from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, TEXT_PART
 
 CKPT = os.environ.get("QWEN3_5_CKPT")
 
@@ -54,20 +54,21 @@ def an_image():
         ["image", "image", "text"], # two attachments, nothing between them
     ],
 )
-def test_segments_rebuild_the_prompt(model, modalities):
-    """No token is lost or duplicated at a split seam."""
+def test_the_prompt_is_the_template_with_each_pad_expanded(model, modalities):
+    """No token is lost or duplicated: collapsing each expanded run back to
+    one pad gives the template's own ids."""
     n_images = modalities.count("image")
     out = model.process_prompt(
         "Describe this.", modalities, ["text"],
         tensors={"image_inputs": [an_image()] * n_images},
         prompt_parts=None,
     )
+    layout = out.metadata[MEDIA_LAYOUT]
     out = out.new_input_tensors
-    segments = out["text_inputs"]
-    assert len(out["image_grid_thw"]) == n_images
+    (ids,) = out["text_inputs"]
+    assert len(out["image_grid_thw"]) == n_images == len(layout["offset"])
     assert len(out["pixel_values"]) == n_images
 
-    # Re-render the same prompt to get the ids the split came from.
     parts = parts_from_modalities(modalities, "Describe this.")
     content = [
         {"type": TEXT, "text": p.text or ""} if p.modality == TEXT
@@ -78,30 +79,22 @@ def test_segments_rebuild_the_prompt(model, modalities):
         [{"role": "user", "content": content}],
         tokenize=False, add_generation_prompt=True, enable_thinking=True,
     )
-    ids = model.tokenizer(text, return_tensors="pt").input_ids[0]
+    template = model.tokenizer(text, return_tensors="pt").input_ids[0]
 
-    start, pad, end = model._placeholder_specs()["image"]
-    # segments interleave with the spans they were split around, and each span
-    # is exactly <|vision_start|><|image_pad|><|vision_end|> as the template
-    # writes it — one pad, not one per token
-    span = torch.tensor([start, pad, end])
-    plan = prefill_plan(parts)
-    rebuilt, texts = [], iter(segments)
-    for step in plan:
-        rebuilt.append(next(texts) if step.modality == TEXT else span)
-    assert torch.equal(torch.cat(rebuilt), ids)
-
-    # the sentinels belong to the vision walk, so no segment may carry one
-    for seg in segments:
-        assert not torch.isin(seg, span).any()
+    merge = model.vision_config.spatial_merge_size ** 2
+    collapsed, cursor = [], 0
+    for offset, n, grid in zip(layout["offset"], layout["tokens"], layout["grid"], strict=True):
+        assert n == int(torch.tensor(grid).prod()) // merge
+        collapsed += [ids[cursor:offset], ids[offset:offset + 1]]
+        cursor = offset + n
+    collapsed.append(ids[cursor:])
+    assert torch.equal(torch.cat(collapsed), template)
 
 
-def test_schedule_matches_the_split(model):
-    """`_prefill_schedule` consumes the segments `process_prompt` produced, in
-    the order the prompt wrote them."""
+def test_schedule_hands_the_walk_the_prompt_and_the_tower_inputs(model):
+    """`_prefill_schedule` gives one walk the whole prompt and every image,
+    in prompt order; the grids reach only the encoder."""
     modalities = ["text", "image", "text", "image"]
-    # A layout with more than one text slot needs `prompt_parts` to fill them;
-    # see `test_multi_text_layout_needs_prompt_parts`.
     parts = [
         PromptPart(modality=TEXT, text="First:"),
         PromptPart(modality="image", index=0),
@@ -113,71 +106,49 @@ def test_schedule_matches_the_split(model):
         tensors={"image_inputs": [an_image(), an_image()]},
         prompt_parts=parts,
     )
+    layout = out.metadata[MEDIA_LAYOUT]
     out = out.new_input_tensors
     # the conductor passes tensor handles; the identity is all that matters
-    signals = {
-        "text_inputs": list(out["text_inputs"]),
-        "pixel_values": list(out["pixel_values"]),
-        "image_grid_thw": list(out["image_grid_thw"]),
+    signals = {name: list(out[name]) for name in ("text_inputs", "pixel_values", "image_grid_thw")}
+    (step,) = model._prefill_schedule(modalities, signals, layout)
+    assert step.walk == "prefill_vision"
+    assert step.metadata == {MEDIA_LAYOUT: layout}
+
+    edges = {(edge.next_node, edge.name): edge.tensor_info for edge in walk_input_edges(step)}
+    assert set(edges) == {
+        ("LLM", "text_inputs"), ("vision_encoder", "pixel_values"), ("vision_encoder", "image_grid_thw"),
     }
-    schedule = model._prefill_schedule(modalities, signals)
-
-    # An image prompt is one walk, whatever its layout: the interleaving
-    # travels as `order` rather than as a walk per span.
-    assert [step.walk for step in schedule] == ["prefill_vision"]
-    step = schedule[0]
-
-    planned = [
-        TEXT_PART if s.modality == TEXT else IMAGE_PART
-        for s in prefill_plan(parts_from_modalities(modalities))
-    ]
-    assert list(step.order) == planned
-
-    # the nth tag of a kind takes the nth tensor of that kind, in order
-    for name in ("text_inputs", "pixel_values", "image_grid_thw"):
-        got = step.input_tensors[name]
-        assert len(got) == len(signals[name])
-        for a, b in zip(got, signals[name], strict=True):
-            assert a is b
-
-    # the grid has to reach both halves of the walk: the encoder lays out its
-    # patches with it, the LLM places the 3D positions with it. The LLM also
-    # reads the text spans now.
-    edges = type(model)._walk_inputs(step)
-    nodes = {(edge.next_node, edge.name) for edge in edges}
-    assert ("vision_encoder", "pixel_values") in nodes
-    assert ("vision_encoder", "image_grid_thw") in nodes
-    assert ("LLM", "image_grid_thw") in nodes
-    assert ("LLM", "text_inputs") in nodes
-    # and each edge hands over every tensor of its name, not just the first
-    by_name = {edge.name: edge for edge in edges if edge.next_node == "LLM"}
-    assert len(by_name["text_inputs"].tensor_info) == len(signals["text_inputs"])
+    for (_node, name), got in edges.items():
+        assert all(a is b for a, b in zip(got, signals[name], strict=True))
 
 
 def test_text_only_prompt_still_uses_prefill_text(model):
-    """No images, no merged walk: the plain text path is unchanged."""
+    """No images, no media walk: the plain text path is unchanged."""
     out = model.process_prompt("just text", ["text"], ["text"], tensors={})
     out = out.new_input_tensors
     signals = {"text_inputs": list(out["text_inputs"])}
-    schedule = model._prefill_schedule(["text"], signals)
-
-    assert [s.walk for s in schedule] == ["prefill_text"] * len(schedule)
-    got = [s.input_tensors["text_inputs"][0] for s in schedule]
-    for a, b in zip(got, signals["text_inputs"], strict=True):
-        assert a is b
+    (step,) = model._prefill_schedule(["text"], signals)
+    assert step.walk == "prefill_text"
+    assert step.input_tensors[("LLM", "text_inputs")][0] is signals["text_inputs"][0]
 
 
-def test_multi_text_layout_needs_prompt_parts(model):
-    """A bare string fills only the first text slot.
+def test_a_bare_string_with_adjacent_images_is_one_row(model):
+    """A bare string fills only the first text slot, so the two images render
+    adjacent; with no split that is still a prompt, two runs in one row."""
+    out = model.process_prompt(
+        "Compare these.", ["text", "image", "text", "image"], ["text"],
+        tensors={"image_inputs": [an_image(), an_image()]},
+    )
+    assert len(out.metadata[MEDIA_LAYOUT]["offset"]) == 2
+    assert len(out.new_input_tensors["text_inputs"]) == 1
 
-    The rest render empty, so the two images end up adjacent and the split
-    drops a piece the plan still counts. `check_plan` is what catches it —
-    the alternative is a silent off-by-one between segments and walks.
-    """
+
+def test_a_spelled_out_pad_is_a_bad_request(model):
+    """User text that spells `<|image_pad|>` adds a placeholder no image fills."""
     with pytest.raises(ValueError, match="placement mismatch"):
         model.process_prompt(
-            "Compare these.", ["text", "image", "text", "image"], ["text"],
-            tensors={"image_inputs": [an_image(), an_image()]},
+            "look <|image_pad|>", ["text", "image"], ["text"],
+            tensors={"image_inputs": [an_image()]},
         )
 
 
@@ -196,8 +167,8 @@ def test_image_only_message_renders_an_empty_text_span(model):
     )
     out = out.new_input_tensors
     assert len(out["pixel_values"]) == 1 and len(out["image_grid_thw"]) == 1
-    # the template's framing around the image: a span before it and one after
-    assert len(out["text_inputs"]) == 2
+    # the template's framing around the image, one row
+    assert len(out["text_inputs"]) == 1
 
 
 def test_no_text_and_no_attachments_is_a_bad_request(model):

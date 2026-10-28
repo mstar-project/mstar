@@ -23,7 +23,9 @@ def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=
 
 
 def _sub():
-    return SimpleNamespace(config=SimpleNamespace(stop_token_ids=frozenset({EOS, 9})))
+    sub = LLMSubmodule.__new__(LLMSubmodule)
+    sub.stop_token_ids = frozenset({EOS, 9})
+    return sub
 
 
 @pytest.mark.parametrize("shape", ["flat", "column"])
@@ -119,7 +121,7 @@ def test_rows_out_of_batch_order_still_map_by_request():
     from mstar.model.submodule_base import HostRows
 
     sub = LLMSubmodule.__new__(LLMSubmodule)
-    sub.config = SimpleNamespace(stop_token_ids={7})
+    sub.stop_token_ids = frozenset({7})
     rows = HostRows(("a", "b", "c"), {"new_token": torch.tensor([1, 7, 1])})
 
     def info(max_tokens, iters=0):

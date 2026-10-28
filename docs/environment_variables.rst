@@ -491,10 +491,12 @@ Worker scheduling
        ``knobs.pre_plan_enabled``.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
-     - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
-       it; a model with its own ladder reads it the same way). A decode step
-       runs at the smallest bucket that holds its rows, so the ladder bounds
-       both the rows per step and the graph memory; narrow it (for example
+     - The decode batch sizes a model whose LLM node is a
+       ``SampledTokenDecoder`` captures as CUDA graphs, read at import in
+       ``mstar/model/components/sampled_token_decoder.py``; other decoders
+       keep their own ladders. A decode step runs at the smallest bucket
+       that holds its rows, so the ladder bounds both the rows per step and
+       the graph memory; narrow it (for example
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
        Qwen3.5 alone.
