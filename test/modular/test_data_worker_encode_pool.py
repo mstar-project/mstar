@@ -12,6 +12,7 @@ import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState, encode_workers
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.streaming.topology import PartitionTopology
 
 
 class _Model:
@@ -21,6 +22,9 @@ class _Model:
     def __init__(self):
         self.gates: dict[int, threading.Event] = {}
         self.threads: dict[int, str] = {}
+
+    def get_partition_topology(self):
+        return PartitionTopology(partitions=["default"])
 
     def gate(self, value: int) -> threading.Event:
         return self.gates.setdefault(value, threading.Event())
