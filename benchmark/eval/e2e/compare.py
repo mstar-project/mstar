@@ -12,6 +12,7 @@ import copy
 import dataclasses
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -24,7 +25,6 @@ from pathlib import Path
 from benchmark.eval.e2e import calibrate, hosts, media, report, stress, trees
 from benchmark.eval.e2e import manifest as mf
 from benchmark.eval.e2e.report import RERUN_TAG
-from mstar.utils.cache_home import user_cache_dir
 
 TOOL_ROOT = Path(__file__).resolve().parents[3]
 POLL_S = 15
@@ -35,7 +35,7 @@ FETCH_EXCLUDE = ("audio/",)   # saved outputs and audio stay on the host; compar
 
 def default_work_dir() -> Path:
     """``$XDG_CACHE_HOME/mstar-eval``, else ``~/.cache/mstar-eval``."""
-    return user_cache_dir() / "mstar-eval"
+    return Path(os.environ.get("XDG_CACHE_HOME") or "~/.cache").expanduser() / "mstar-eval"
 
 
 def gpu_type(name: str) -> str:
