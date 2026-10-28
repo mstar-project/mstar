@@ -146,6 +146,16 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - English speech recognition by an LLM: Canary's FastConformer encoder projected into
        Qwen3-1.7B (LoRA merged at load). Clips up to 40 s; longer uploads are windowed. The
        OpenAI ``prompt`` is ignored. No timestamps.
+   * - ``parakeet``
+     - ``nvidia/parakeet-tdt-0.6b-v3``
+     - FastConformer + token-and-duration transducer, 25 European languages, language detected
+       from the speech. Clips up to 10 min; longer uploads are windowed. No timestamps.
+   * - ``nemotron_asr``
+     - ``nvidia/nemotron-3.5-asr-streaming-0.6b``
+     - Cache-aware streaming FastConformer + RNN-T with a language prompt (``language``: a locale
+       such as ``en-US``, a bare code, or ``auto``); served over whole clips, with the streaming
+       model's chunked attention at its widest lookahead (``lookahead`` in the YAML's
+       ``model_kwargs``). Clips up to 10 min; longer uploads are windowed. No timestamps.
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
@@ -251,8 +261,8 @@ Omnilingual ASR notes
   (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
   fairseq2).
 
-FastConformer ASR (``canary``, ``canary_qwen``) notes
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) notes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
   torchcodec, which needs FFmpeg.
@@ -260,17 +270,27 @@ FastConformer ASR (``canary``, ``canary_qwen``) notes
 - Request fields, the same on ``/v1/audio/transcriptions`` and in ``/generate``'s
   ``model_kwargs``:
 
-  - ``canary``: ``language`` (the speech's, default ``en``; one of bg, hr, cs, da, nl, en,
-    et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk),
+  - ``parakeet``: detects the language from the speech. ``language`` may name one of the 25
+    it knows (bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro,
+    sk, sl, es, sv, ru, uk) and is then ignored; any other is refused.
+  - ``nemotron_asr``: ``language`` is its prompt: a locale from the checkpoint's
+    ``processor_config.json`` (such as ``en-US``), a bare code, or ``auto`` (the default).
+  - ``canary``: ``language`` (the speech's, default ``en``; one of Parakeet's 25),
     ``target_language`` (a translation to or from English; the OpenAI route also takes
     ``task="translate"``) and ``punctuation`` (default on).
   - ``canary_qwen``: English only (checked on the OpenAI route). ``instruction``
     replaces the trained one, "Transcribe the following:"; ``/generate``'s text is unused.
 
-- A request holds up to 40.96 s. ``/v1/audio/transcriptions`` cuts longer uploads (up to
-  30 min) into windows at quiet moments and joins their text. Neither model emits
-  timestamps.
-- Their YAMLs size the KV caches for ``max_concurrent_requests`` (64),
+- A request holds up to 610 s on Parakeet and Nemotron, and 40.96 s on Canary and
+  Canary-Qwen. ``/v1/audio/transcriptions`` cuts longer uploads (up to 30 min) into windows
+  at quiet moments and joins their text. None of the four emits timestamps.
+- Parakeet and Nemotron hold no cache. Each clip's decoder state (the LSTM's, and the
+  cursor) sits in a recurrent state slot from its first decode iteration until the request
+  is torn down; the YAMLs size ``resources.transducer_state.max_slots`` (129) for
+  ``max_concurrent_requests`` (128) and the sink slot, and startup refuses a cap the pool
+  can't hold. A decode iteration is 64 greedy steps, and its tokens stream out as it ends. ``compile_step: false`` in
+  their ``model_kwargs`` decodes with eager kernels instead of the compiled step.
+- Canary's and Canary-Qwen's YAMLs size the KV caches for ``max_concurrent_requests`` (64),
   and startup refuses a cap the caches can't hold.
 - Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
   smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
