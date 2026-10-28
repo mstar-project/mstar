@@ -98,16 +98,29 @@ def _prefill_plan_is_direct(w) -> bool:
     )
 
 
-def _decode_plan_is_direct(w) -> bool:
-    """Whether FlashInfer decode wrapper ``w``'s plan resolved to the one
-    path ``_plan_direct`` reproduces, on a checked FlashInfer version: fa2
-    tensor-core decode under a graph, one query token per row, no window."""
-    return (
-        _direct_plan_supported()
-        and w._backend == "fa2" and w.use_tensor_cores and w.is_cuda_graph_enabled
+# The two FlashInfer decode planners ``_plan_direct`` reproduces: the batch
+# prefill module's (tensor-core decode) and the batch decode module's (CUDA-core
+# decode, which an MHA model such as Whisper takes: the tensor-core kernel pads
+# one query head per KV head to a tile).
+_TENSOR_CORE_DECODE, _CUDA_CORE_DECODE = "tensor_cores", "cuda_cores"
+
+
+def _decode_direct_variant(w) -> str | None:
+    """Which planner FlashInfer decode wrapper ``w``'s plan resolved to, when
+    ``_plan_direct`` reproduces it on a checked FlashInfer version: fa2
+    tensor-core or generic CUDA-core decode, under a graph, one query token per
+    row, no window, no soft cap. None otherwise."""
+    if not (
+        _direct_plan_supported() and w.is_cuda_graph_enabled
         and not getattr(w, "_uses_cudnn", False) and w._jit_module is None
         and getattr(w, "_q_len_per_req", 1) in (None, 1) and w._window_left == -1
-    )
+    ):
+        return None
+    if w.use_tensor_cores:
+        return _TENSOR_CORE_DECODE if w._backend == "fa2" else None
+    if w._backend == "auto" and not w._logits_soft_cap:
+        return _CUDA_CORE_DECODE
+    return None
 
 
 class FlashInferPrefillWrapper:
@@ -460,8 +473,10 @@ class FlashInferDecodeWrapper:
         self.head_dim = head_dim
         self.page_size = page_size
         self.dtype = None
-        # set by the first plan when ``_plan_direct`` may take the later ones
+        # set by the first plan when ``_plan_direct`` may take the later ones,
+        # with where in them the per-step indptr and lengths go
         self._planner_args: list | None = None
+        self._planner_slots: tuple[int, int | None] = (4, 5)
 
         import flashinfer
 
@@ -569,17 +584,32 @@ class FlashInferDecodeWrapper:
 
     def _direct_planner_args(self, n_req: int) -> list | None:
         """FlashInfer's planner arguments for this wrapper, fixed but for the
-        indptr and lengths, when its plan resolved to the one path
-        ``_plan_direct`` reproduces (``_decode_plan_is_direct``); else None.
-        Restating them is what vLLM and SGLang do too, on a pinned FlashInfer
-        (see ``DIRECT_PLAN_FLASHINFER_VERSIONS``). As FlashInfer's own
+        indptr (and, for tensor-core decode, the lengths), when its plan
+        resolved to a path ``_plan_direct`` reproduces
+        (``_decode_direct_variant``); else None. Restating them is what vLLM
+        and SGLang do too, on a pinned FlashInfer (see
+        ``DIRECT_PLAN_FLASHINFER_VERSIONS``). As FlashInfer's own
         ``fast_decode_plan``, the direct path sets no per-step state but the
         plan."""
         w = self.attn_wrapper
-        if not _decode_plan_is_direct(w):
+        variant = _decode_direct_variant(w)
+        if variant is None:
             return None
+        if variant == _CUDA_CORE_DECODE:
+            self._planner_slots = (3, None)
+            return [
+                w._float_workspace_buffer, w._int_workspace_buffer, w._pin_memory_int_workspace_buffer,
+                None,  # indptr
+                n_req, self.num_qo_heads, self.num_kv_heads, self.page_size, True,
+                -1,  # window_left
+                0.0,  # logits_soft_cap
+                self.head_dim, self.head_dim,
+                torch.empty(0, dtype=w._cached_q_data_type),
+                torch.empty(0, dtype=w._cached_kv_data_type),
+            ]
         from flashinfer.utils import _get_range_buf
 
+        self._planner_slots = (4, 5)
         return [
             w._float_workspace_buffer, w._int_workspace_buffer, w._pin_memory_int_workspace_buffer,
             _get_range_buf(n_req + 1, "cpu"), None, None,
@@ -607,8 +637,10 @@ class FlashInferDecodeWrapper:
         if indices.data_ptr() != dst.data_ptr():
             dst.copy_(indices, non_blocking=indices.device == dst.device)
         args = self._planner_args
-        args[4] = indptr
-        args[5] = kv_lens
+        at_indptr, at_lens = self._planner_slots
+        args[at_indptr] = indptr
+        if at_lens is not None:
+            args[at_lens] = kv_lens
         w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable
