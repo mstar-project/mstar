@@ -60,7 +60,7 @@ from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleS
 from mstar.engine.resources.convenience import RaggedAttentionCallable
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.utils.h2d import to_device_queued
+from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
 
@@ -174,8 +174,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def stage_seed(self, tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
         """Seed tensor on ``device`` without stalling the GPU thread, where this
         runs: a pageable copy would hold up the pre-plan and the overlap with the
-        previous step's postprocess (:func:`mstar.utils.h2d.to_device_queued`)."""
-        return to_device_queued(tensor, device)
+        previous step's postprocess (:func:`mstar.utils.h2d.to_device_nonblocking`)."""
+        return to_device_nonblocking(tensor, device)
 
     def seed_loop_back(
         self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, generator: torch.Generator,
@@ -401,7 +401,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                     f"entries for {schedule.num_steps} steps, but "
                     f"{scalar.source} has {tensor.shape[0]}."
                 )
-            staged.setdefault(scalar.source, to_device_queued(tensor, device))
+            staged.setdefault(scalar.source, to_device_nonblocking(tensor, device))
         return staged
 
     def _carried_inputs(

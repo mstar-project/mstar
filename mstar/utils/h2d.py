@@ -83,6 +83,14 @@ class PinnedStager:
         ]
         self._views = [b.numpy() for b in self._bufs]
 
+    def to_device(self, values: Sequence | np.ndarray | torch.Tensor, device: torch.device) -> torch.Tensor:
+        """A new ``device`` tensor holding ``values`` (a sequence, an array or a CPU tensor, any
+        shape) in this stager's dtype, through ``copy_``: one non-blocking H2D, no stream drain."""
+        host = np.asarray(values, dtype=self._np_dtype)
+        out = torch.empty(host.shape, dtype=self.dtype, device=device)
+        self.copy_(out, host.reshape(-1))
+        return out
+
     def copy_(
         self,
         dst: torch.Tensor,
@@ -138,8 +146,8 @@ class PinnedStager:
                 mirror.record(key, values)
 
 
-def to_device_queued(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
-    """``tensor`` on ``device`` without a host stall.
+def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """``tensor`` on ``device`` without the host waiting.
 
     A copy from pageable memory blocks the calling thread until it retires, so on
     the GPU thread it waits out the step still running there. This writes the

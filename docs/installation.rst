@@ -89,8 +89,13 @@ interactive shell and check GPU access:
      -v /dev/dri/by-path:/dev/dri/by-path:ro \
      -p 8000:8000 \
      -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+     -v mstar-cache:/root/.cache/mstar \
      mstar:xpu
    python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
+
+The ``mstar-cache`` volume keeps compiled kernels across containers. It is a named volume
+rather than ``$HOME/.cache/mstar`` because the container runs as root, and root-owned files
+there would stop a later native run from writing its cache.
 
 Inside the container, serve BAGEL using the TP2 deployment with three Intel GPUs:
 one for the encoders and decoder, and two for the LLM.
@@ -129,7 +134,8 @@ Model families and some output formats need extra packages, exposed as pip *extr
        when installing both.
    * - ``.[qwen3_omni]``
      - Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and
-       ``ninja`` (speeds up the JIT build of the vendored MoE align kernel).
+       ``ninja`` (speeds up the JIT build of the vendored MoE align kernel). It needs
+       ``transformers>=5.18``, whose ``transformers.vision_utils`` the vision encoder uses.
        **Also needs** ``flash-attn``, which is installed separately —
        see `flash-attn (Qwen3-Omni, LingBot-World)`_.
    * - ``.[orpheus]``
@@ -148,6 +154,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
+   * - ``.[glm]``
+     - GLM runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
+       (speeds up the JIT build of the vendored MoE align kernel).
    * - ``.[waypoint]``
      - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
        and ``tensordict`` for reference validation. The pinned TAEHV implementation
@@ -155,6 +165,12 @@ Model families and some output formats need extra packages, exposed as pip *extr
        package metadata allows ``m-star`` to be published on PyPI. **Also needs**
        ``flash-attn-4``, which is installed separately —
        see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_.
+   * - ``.[asr]``
+     - Speech recognition models: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``einops``, ``soundfile`` (WAV / FLAC / OGG / MP3 uploads), ``torchcodec``
+       (FFmpeg-backed decoding of the other formats), ``huggingface-hub``,
+       ``mooncake-transfer-engine``, and ``datasets`` / ``jiwer`` for
+       ``benchmark/asr_eval.py``.
    * - ``.[audio]``
      - ``soundfile`` — only needed to return **non-WAV** audio containers (mp3/flac/…)
        from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
@@ -280,8 +296,9 @@ its dependencies:
 
 ``qwen-tts`` pins ``transformers==4.57.3`` and ``accelerate==1.12.0``. Installed with
 them, it can't share an environment with ``diffusers>=0.40`` (Wan 2.2, Cosmos3,
-FLUX.2 [klein]), which needs ``huggingface-hub>=1.23``, or with OmniVoice, which needs
-``transformers>=5.3``, and installing it after them downgrades their dependencies.
+FLUX.2 [klein]), which needs ``huggingface-hub>=1.23``, or with OmniVoice
+(``transformers>=5.3``) or Qwen3-Omni (``transformers>=5.18``). Installing it after them
+downgrades their dependencies.
 mstar reads only the speech-tokenizer source files and runs them under transformers
 4.57.3 or 5.x, so the package's own requirements are not needed. ``pip check`` still
 lists them (``transformers==4.57.3``, ``accelerate==1.12.0``, ``gradio``, ``sox`` and
