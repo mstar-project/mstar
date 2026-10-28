@@ -16,6 +16,7 @@
 #   usage: .github/review/replay.sh <pr-number> [outfile]
 #   MODE=thorough for the on-demand mode (default: light)
 #   MAX_TURNS=<n> for the turn cap (default: 40, as in the workflow)
+#   (a replay that reaches the cap prints nothing; rerun it with a larger MAX_TURNS)
 #   HEAD=<full sha> to review the PR as it was at an earlier commit, e.g. the one a
 #   human reviewer flagged a bug on; existing comments are then left out so the
 #   reviewer can't read the answer
