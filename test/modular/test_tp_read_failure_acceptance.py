@@ -59,6 +59,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.utils.ipc_format import WorkerMessageType
 
 HERE = Path(__file__).resolve().parent
@@ -620,13 +621,9 @@ class _Reads:
 def _tp_group(rank):
     import torch.distributed as dist
 
-    from mstar.distributed.all_reduce import AllReduce
-    from mstar.distributed.communication import CommGroup
-
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
     group.device_group = group.cpu_group = dist.group.WORLD
     group.initialized = True
-    group._all_reduce = AllReduce(group.device_group)
     return group
 
 
@@ -653,8 +650,9 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w.parallel_groups = SimpleNamespace(
         barrier_all=dist.barrier,
         restore_default_timeout=lambda: None,
-        get_tp_config_for_node=lambda node: group,
-        get_sp_config_for_node=lambda node: SimpleNamespace(world_size=1),
+        get_joint_group_for_node=lambda node: JointGroups(
+            tp_group=group, sp_group=CommGroup.trivial(), instance=group,
+        ),
         get_instance_rank_for_node=lambda node: rank,
         get_instance_world_size_for_node=lambda node: 2,
     )

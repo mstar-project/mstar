@@ -8,6 +8,7 @@ from functools import cache, partial
 from typing import Any, Callable, Collection, Iterator, Mapping, NamedTuple
 
 import torch
+import torch.distributed as dist
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups
@@ -97,30 +98,20 @@ def autocast_scope(dtype: torch.dtype | None, device_type: str):
 
 
 def agree_across_ranks(
-    comm_group: JointGroups | None, values: list[int], device: torch.device,
-    reduce: Callable[..., torch.Tensor],
+    comm_group: JointGroups | None, values: list[int], op: dist.ReduceOp,
 ) -> list[int]:
-    """Reduce each of ``values`` over every rank of the joint group with
-    ``reduce``. `torch.amin` ANDs flags and `torch.amax` takes the largest.
+    """Reduce each of ``values`` over every rank of the node's lockstep
+    instance with ``op``, on the host. ``MIN`` ANDs flags and ``MAX`` takes
+    the largest.
 
     Capture failure is per-rank: a rank that keeps a graph another rank
     dropped replays it while the other runs eager, which hangs as soon as the
     captured region holds a collective. Callers pass an order derived from the
     configs, which are identical on every rank.
     """
-    groups = [] if comm_group is None else [
-        comm_group.tp_group, comm_group.sp_group
-    ]
-    if not values or all(group.world_size == 1 for group in groups):
+    if not values or comm_group is None or comm_group.world_size == 1:
         return values
-    gathered = torch.tensor(values, dtype=torch.int64, device=device)
-    for group in groups:
-        if group.world_size > 1:
-            # all_gather is rank-major, so dim 0 runs over the ranks
-            gathered = reduce(group.all_gather(gathered, dim=0).reshape(
-                group.world_size, -1
-            ), dim=0)
-    return gathered.tolist()
+    return comm_group.instance.host_all_reduce(values, op)
 
 
 #: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
@@ -847,8 +838,7 @@ class AcceleratorGraphRunner:
         for spec in self.prepare_for_capture():
             # the warm-up may hold collectives; every rank sizes these specs, in
             # config order, as it does the captures
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.instance.barrier()
             free = torch.cuda.mem_get_info(self._device)[0]
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
@@ -883,7 +873,7 @@ class AcceleratorGraphRunner:
         all, and plan on the same kind of cost. With no forward and no barrier:
         sizing ran the forwards, and a capture runs no collective.
         """
-        if not agree_across_ranks(self._comm_group, [int(wanted)], self._device, torch.amax)[0]:
+        if not agree_across_ranks(self._comm_group, [int(wanted)], dist.ReduceOp.MAX)[0]:
             return self._capture_costs
         for spec in self.prepare_for_capture():
             if spec.slot != 0 or spec.bucket not in self._lent:
@@ -939,7 +929,7 @@ class AcceleratorGraphRunner:
         buckets = list(dict.fromkeys(spec.bucket for spec in slot_specs))
         costs = dict(zip(buckets, agree_across_ranks(self._comm_group, [
             self._capture_costs[bucket].graph if sized and bucket in planned else 0 for bucket in buckets
-        ], self._device, torch.amax), strict=True))
+        ], dist.ReduceOp.MAX), strict=True))
 
         # bucket -> slot index -> (spec, captured slot). Registration is
         # deferred to a whole bucket at a time: its slots are double buffers of
@@ -951,8 +941,7 @@ class AcceleratorGraphRunner:
                 continue
             # every rank barriers once per spec, pass or fail — a rank that
             # stopped early here would leave the others waiting
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.instance.barrier()
 
             try:
                 slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
@@ -1036,7 +1025,7 @@ class AcceleratorGraphRunner:
         agreed = agree_across_ranks(
             self._comm_group,
             [len(captured.get(key, ())) == self._num_slots for key in order],
-            self._device, torch.amin,
+            dist.ReduceOp.MIN,
         )
         return {key for key, ok in zip(order, agreed, strict=True) if ok}
 
@@ -1795,8 +1784,7 @@ class PiecewiseAcceleratorGraphRunner:
         for shape in shapes:
             for slot in range(self._num_slots):
                 if self._comm_group is not None:
-                    self._comm_group.tp_group.barrier()
-                    self._comm_group.sp_group.barrier()
+                    self._comm_group.instance.barrier()
                 free = torch.cuda.mem_get_info(self._device)[0]
                 try:
                     with self._warmed(shape, slot, self.NUM_WARMUP) as warmed:
@@ -1832,7 +1820,7 @@ class PiecewiseAcceleratorGraphRunner:
     def size_lent_captures(self, wanted: bool) -> dict[BucketKey, CaptureCost]:
         """Capture every shape a lender sized, thrown away, if ``wanted`` here
         or on another rank; see `AcceleratorGraphRunner.size_lent_captures`."""
-        if not agree_across_ranks(self._comm_group, [int(wanted)], self._device, torch.amax)[0]:
+        if not agree_across_ranks(self._comm_group, [int(wanted)], dist.ReduceOp.MAX)[0]:
             return self._capture_costs
         for shape in self.prepare_for_capture():
             bucket = self._bucket(shape)
@@ -1894,12 +1882,12 @@ class PiecewiseAcceleratorGraphRunner:
         sized = planned is not None
         planned_everywhere = agree_across_ranks(
             self._comm_group, [not sized or self._bucket(shape) in planned for shape in ordered],
-            self._device, torch.amin,
+            dist.ReduceOp.MIN,
         )
         costs = agree_across_ranks(self._comm_group, [
             self._capture_costs[self._bucket(shape)].graph if sized and ok else 0
             for shape, ok in zip(ordered, planned_everywhere, strict=True)
-        ], self._device, torch.amax)
+        ], dist.ReduceOp.MAX)
         captured = [False] * len(ordered)
         for i in sorted(range(len(ordered)), key=lambda i: -costs[i]):
             shape = ordered[i]
@@ -1912,8 +1900,7 @@ class PiecewiseAcceleratorGraphRunner:
                 # warmup forward. Every rank walks all the slots even after a
                 # failure here, or the barrier counts diverge and they hang.
                 if self._comm_group is not None:
-                    self._comm_group.tp_group.barrier()
-                    self._comm_group.sp_group.barrier()
+                    self._comm_group.instance.barrier()
                 try:
                     self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)
                 except Exception:
@@ -1934,7 +1921,7 @@ class PiecewiseAcceleratorGraphRunner:
         # `ordered` comes from the config, so every rank agrees on the order
         for shape, ok in zip(
             ordered,
-            agree_across_ranks(self._comm_group, captured, self._device, torch.amin),
+            agree_across_ranks(self._comm_group, captured, dist.ReduceOp.MIN),
             strict=True,
         ):
             if ok:

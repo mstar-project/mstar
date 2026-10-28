@@ -12,14 +12,15 @@ committed or sent, and every rank runs the same collectives.
   (``test_tp_read_failure_acceptance.py``) with a ``prepare_inputs`` that runs a
   collective per text part, as Qwen3.5's vocab-parallel embedding does, and
   with a step whose every row failed.
-- TP4 and TP2 x SP2: four real gloo ranks run the check itself.
+- TP4 and TP2 x SP2: four real gloo ranks run the check itself, on the
+  instance group ``GlobalParallelConfig`` ranks and ``init_dist`` creates;
+  ``JointGroups.broadcast`` runs on the same four ranks.
 - The follower's scheduling (serial and ``MSTAR_TP_ASYNC_SCHED``) and rank 0's
   marking run the real ``MicroScheduler`` and ``Worker`` methods on stubs.
 """
 
 from __future__ import annotations
 
-import datetime
 import multiprocessing as mp
 import os
 import queue
@@ -152,44 +153,49 @@ def test_a_step_whose_every_row_failed_runs_empty_on_every_rank(tmp_path, monkey
     assert run.elapsed < clean.elapsed + acc.COLLECTIVE_S, (run.summary(), clean.summary())
 
 
-# ── the check itself at TP4 and TP2 x SP2 (four gloo ranks) ───────────────
+# ── the check itself over a four-rank instance (four gloo ranks) ──────────
 
 ROWS = (10, 11, 12, 13)
 
 
-def _groups(rank, layout):
-    """This rank's TP and SP groups: ``tp4`` is one group of four; ``tp2sp2``
-    puts ranks {0,1} and {2,3} in TP groups and {0,2} and {1,3} in SP groups."""
+def _four_rank_groups(rank, sizes, port):
+    """This rank's groups of a four-rank instance, as ``GlobalParallelConfig``
+    lays them out and the real ``init_dist`` creates them, over gloo."""
+    import hashlib
+
     import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
 
-    from mstar.distributed.communication import CommGroup
+    from mstar.distributed.communication import GlobalParallelConfig
+    from mstar.model.base import WorkerGraph
 
-    def group(members, pg):
-        g = CommGroup(my_global_rank=rank, my_group_rank=members.index(rank), group_members=members)
-        g.device_group = g.cpu_group = pg
-        return g
+    wg = WorkerGraph(
+        section=SimpleNamespace(get_nodes=lambda: {NODE: None}), graph_walks=set(),
+        ranks=[0, 1, 2, 3], **sizes,
+    )
+    workers = [f"worker_{r}" for r in range(4)]
+    groups = GlobalParallelConfig({NODE: wg}, workers, dist_timeout_s=10).per_worker_config[workers[rank]]
+    init = dist.init_process_group
+    # torch binds a world to an accelerator only: it refuses a CPU device_id
+    dist.init_process_group = lambda device_id, **kwargs: init(**kwargs)
+    # Until upstream PR #705 lands, a non-member makes no gloo twin of an axis
+    # group, so the twins' members count their groups differently and torch's
+    # names for them differ: name a group by its ranks alone. A group of one
+    # rank (a non-member's stand-in) keeps torch's name, unique in its process.
+    hash_ranks = c10d._hash_ranks_to_str
+    c10d._hash_ranks_to_str = lambda ranks: hash_ranks(ranks) if len(ranks) == 1 else (
+        hashlib.sha1(("ranks:" + "_".join(map(str, ranks))).encode()).hexdigest()
+    )
+    groups.init_dist(init_method=f"tcp://127.0.0.1:{port}", device=torch.device("cpu"))
+    return groups
 
-    if layout == "tp4":
-        return group([0, 1, 2, 3], dist.group.WORLD), CommGroup.trivial()
-    pgs = {m: dist.new_group(list(m)) for m in ((0, 1), (2, 3), (0, 2), (1, 3))}
-    tp = next(m for m in ((0, 1), (2, 3)) if rank in m)
-    sp = next(m for m in ((0, 2), (1, 3)) if rank in m)
-    return group(list(tp), pgs[tp]), group(list(sp), pgs[sp])
 
-
-def _check_rank(rank, layout, failed_here, store, out):
+def _check_rank(rank, sizes, port, failed_here, out):
     import torch.distributed as dist
     try:
-        dist.init_process_group(
-            "gloo", init_method=f"file://{store}", rank=rank, world_size=4,
-            timeout=datetime.timedelta(seconds=10),
-        )
-        tp, sp = _groups(rank, layout)
         w = Worker.__new__(Worker)
+        w.parallel_groups = _four_rank_groups(rank, sizes, port)
         w.scheduler = SimpleNamespace(read_failed_rids=set(failed_here))
-        w.parallel_groups = SimpleNamespace(
-            get_tp_config_for_node=lambda node: tp, get_sp_config_for_node=lambda node: sp,
-        )
         # a follower that could not read a row left it out; the others hold it
         rows = [r for r in ROWS if r not in failed_here]
         batch = ExecutingBatch(
@@ -204,19 +210,27 @@ def _check_rank(rank, layout, failed_here, store, out):
         out.put((rank, "crash", traceback.format_exc()))
 
 
-@pytest.mark.parametrize("layout", ["tp4", "tp2sp2"])
-def test_every_rank_takes_out_the_rows_any_rank_could_not_read(tmp_path, layout):
-    """Rank 2's read of row 11 and rank 3's of row 13 failed. Every rank, rank
-    0 and rank 1 included, takes out both rows and fails both, and keeps the
-    other two in rank 0's order. Under TP2 x SP2 rank 1 shares no group with
-    rank 2, so it learns of row 11 only through the SP pass."""
+def _broadcast_rank(rank, sizes, port, out):
+    import torch.distributed as dist
+    try:
+        joint = _four_rank_groups(rank, sizes, port).get_joint_group_for_node(NODE)
+        out.put((rank, joint.broadcast(torch.full((3,), 10.0 + rank)).tolist()))
+        dist.destroy_process_group()
+    except BaseException:
+        out.put((rank, "crash", traceback.format_exc()))
+
+
+def _run_four_ranks(target, args) -> dict:
+    """Run ``target(rank, *args(rank, port), out)`` on four spawned ranks, each
+    of which puts ``(rank, *result)`` on ``out``; return the results by rank."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
-    failed = {2: {11}, 3: {13}}
-    procs = [
-        ctx.Process(target=_check_rank, args=(r, layout, failed.get(r, set()), tmp_path / "store", out))
-        for r in range(4)
-    ]
+    procs = [ctx.Process(target=target, args=(r, *args(r, port), out)) for r in range(4)]
     for p in procs:
         p.start()
     results = {}
@@ -231,9 +245,30 @@ def test_every_rank_takes_out_the_rows_any_rank_could_not_read(tmp_path, layout)
         if p.is_alive():
             p.kill()
     assert sorted(results) == [0, 1, 2, 3], results
-    for rank, rest in results.items():
+    for rest in results.values():
         assert rest[0] != "crash", rest[1]
+    return results
+
+
+@pytest.mark.parametrize("sizes", [{"tp_size": 4}, {"tp_size": 2, "sp_size": 2}], ids=["tp4", "tp2sp2"])
+def test_every_rank_takes_out_the_rows_any_rank_could_not_read(sizes):
+    """Rank 2's read of row 11 and rank 3's of row 13 failed. Every rank, rank
+    0 and rank 1 included, takes out both rows and fails both, and keeps the
+    other two in rank 0's order. Under TP2 x SP2 rank 1 shares no axis group
+    with rank 2: the vote runs on the instance's own gloo group."""
+    failed = {2: {11}, 3: {13}}
+    results = _run_four_ranks(_check_rank, lambda r, port: (sizes, port, failed.get(r, set())))
+    for rank, rest in results.items():
         assert rest == [[10, 12], [11, 13]], (rank, rest)
+
+
+@pytest.mark.parametrize("sizes", [{"tp_size": 2, "sp_size": 2}], ids=["tp2sp2"])
+def test_a_joint_broadcast_reaches_every_rank_from_instance_rank_0(sizes):
+    """Each rank starts with its own tensor, and ends with instance rank 0's:
+    one broadcast per axis carries it to ranks that share no axis group with
+    rank 0."""
+    results = _run_four_ranks(_broadcast_rank, lambda r, port: (sizes, port))
+    assert results == {rank: [[10.0] * 3] for rank in range(4)}
 
 
 # ── a follower builds rank 0's step without the rows it could not read ────

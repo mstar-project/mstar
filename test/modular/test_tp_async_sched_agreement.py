@@ -2,8 +2,8 @@
 
 The flag is per-rank env. A leader without it never sends a decision the
 async follower waits for; a leader with it sends heads a serial follower
-cannot always build. ``Worker._verify_tp_async_sched_agrees`` all_gathers
-the per-node verdict at startup and refuses a mismatch.
+cannot always build. ``Worker._verify_tp_async_sched_agrees`` reduces
+the per-node verdict over the instance at startup and refuses a mismatch.
 """
 
 import sys
@@ -11,34 +11,33 @@ import types
 from pathlib import Path
 
 import pytest
-import torch
+import torch.distributed as dist
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.distributed.communication import JointGroups  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
 
 class _Group:
-    """A CommGroup stand-in whose all_gather returns preset per-rank values."""
+    """A CommGroup stand-in whose ranks hold preset values, one each."""
 
-    def __init__(self, members, gathered):
+    def __init__(self, members, values):
         self.world_size = len(members)
         self.group_members = list(members)
-        self._gathered = gathered
+        self._values = values
 
-    def all_gather(self, input_, dim=0):
-        return torch.tensor(self._gathered, dtype=input_.dtype)
+    def host_all_reduce(self, values, op):
+        return [(min if op == dist.ReduceOp.MIN else max)(self._values)]
 
 
-def _worker(node, *, async_on, tp_group, sp_group=None):
-    groups = types.SimpleNamespace(
-        get_tp_config_for_node=lambda n: tp_group,
-        get_sp_config_for_node=lambda n: sp_group or _Group([0], [int(async_on)]),
-    )
+def _worker(node, *, async_on, instance):
+    """The check reads only the node's lockstep instance group."""
+    joint = JointGroups(tp_group=None, sp_group=None, instance=instance)
+    groups = types.SimpleNamespace(get_joint_group_for_node=lambda n: joint)
     return types.SimpleNamespace(
         parallel_nodes={node},
         parallel_groups=groups,
-        device="cpu",
         _tp_async_for=lambda n: async_on,
     )
 
@@ -48,23 +47,11 @@ def _check(worker):
 
 
 def test_agreeing_ranks_pass():
-    _check(_worker("thinker", async_on=True, tp_group=_Group([0, 1], [1, 1])))
-    _check(_worker("thinker", async_on=False, tp_group=_Group([0, 1], [0, 0])))
+    _check(_worker("thinker", async_on=True, instance=_Group([0, 1], [1, 1])))
+    _check(_worker("thinker", async_on=False, instance=_Group([0, 1], [0, 0])))
 
 
-def test_non_parallel_group_is_skipped():
-    _check(_worker("thinker", async_on=True, tp_group=_Group([0], [1])))
-
-
-def test_tp_mismatch_is_refused():
+def test_mismatch_is_refused():
     with pytest.raises(RuntimeError, match="disagrees"):
-        _check(_worker("thinker", async_on=True, tp_group=_Group([0, 1], [1, 0])))
+        _check(_worker("thinker", async_on=True, instance=_Group([0, 1], [1, 0])))
 
-
-def test_sp_mismatch_is_refused():
-    with pytest.raises(RuntimeError, match="disagrees"):
-        _check(_worker(
-            "dit", async_on=True,
-            tp_group=_Group([0], [1]),
-            sp_group=_Group([0, 1], [1, 0]),
-        ))

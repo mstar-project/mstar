@@ -9,7 +9,6 @@ FlashInfer's one-kernel all-reduce. ``AllReduce.new`` picks one.
 import logging
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -42,26 +41,14 @@ def _all_ranks_agree(flag: bool, cpu_group) -> bool:
     return bool(t.item())
 
 
-def flagged_on_any_rank(flags: Sequence[bool], groups: Iterable["CommGroup"]) -> list[bool]:
-    """Per entry, OR ``flags`` across the ranks of each group in ``groups`` in
-    turn: one gloo all-reduce (MAX) each, skipping a group of one rank. Over a
-    TP group and then an SP group, an entry ends up set on every rank of the
-    grid if any rank set it. Every rank passes the same number of entries, in
-    the same order. CPU tensors: it waits on the other ranks, never on a device."""
-    t = torch.tensor(list(flags), dtype=torch.int32)
-    for group in groups:
-        if group.world_size > 1:
-            dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group.cpu_group)
-    return [bool(f) for f in t.tolist()]
-
-
 class AllReduce:
     """NCCL for every message, and the fallback of the backends below."""
 
     mode = "nccl"
 
-    def __init__(self, device_group):
-        self.device_group = device_group
+    def __init__(self, group: "CommGroup"):
+        # the group, not its process group: init_dist sets that after this is built
+        self.group = group
 
     @classmethod
     def new(
@@ -74,22 +61,21 @@ class AllReduce:
         memory up."""
         mode = (mode or "nccl").strip().lower()
         if mode == "nccl":
-            return AllReduce(group.device_group)
+            return AllReduce(group)
         backend_cls = SYMM_BACKENDS.get(mode)
         if backend_cls is None:
             raise ValueError(f"tp_allreduce={mode!r} is not one of {['nccl', *SYMM_BACKENDS]}")
         max_kb = DEFAULT_SYMM_MAX_KB if max_kb is None else int(max_kb)
         if (group.world_size == 1 or group.device_group is None or max_kb <= 0
                 or not torch.cuda.is_available()):
-            return AllReduce(group.device_group)
+            return AllReduce(group)
         backend = None
         try:
             if backend_cls is FlashInferAllReduce:
                 backend = FlashInferAllReduce(group, max_kb * 1024)
             else:
                 backend = backend_cls(
-                    group.device_group, torch.device("cuda", torch.cuda.current_device()),
-                    max_kb * 1024,
+                    group, torch.device("cuda", torch.cuda.current_device()), max_kb * 1024,
                 )
         except Exception as exc:  # noqa: BLE001 — fall back to NCCL, loudly
             logger.warning(
@@ -101,7 +87,7 @@ class AllReduce:
         if not _all_ranks_agree(backend is not None, group.cpu_group):
             if backend is not None:
                 logger.warning("all-reduce %s: another rank could not set it up; using NCCL", mode)
-            return AllReduce(group.device_group)
+            return AllReduce(group)
         if group.rank == 0:
             logger.info(
                 "all-reduce %s for messages up to %d KiB, ranks %s",
@@ -116,7 +102,7 @@ class AllReduce:
         return torch.empty(shape, dtype=dtype, device=device)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        dist.all_reduce(input_, group=self.device_group)
+        dist.all_reduce(input_, group=self.group._device_pg())
         return input_
 
 
@@ -127,12 +113,12 @@ class SymmMemAllReduce(AllReduce, ABC):
     the buffer itself). The kernels' reduction order differs from NCCL's, so
     bf16 results can differ at the last bit."""
 
-    def __init__(self, device_group, device: torch.device, max_bytes: int):
+    def __init__(self, group: "CommGroup", device: torch.device, max_bytes: int):
         import torch.distributed._symmetric_memory as symm
 
-        super().__init__(device_group)
+        super().__init__(group)
         self.max_bytes = max_bytes
-        self.group_name = device_group.group_name
+        self.group_name = group.device_group.group_name
         symm.enable_symm_mem_for_group(self.group_name)
         # Raw byte buffer; viewed per dtype at call time.
         self._buf = symm.empty(max_bytes, dtype=torch.uint8, device=device)
@@ -213,8 +199,8 @@ class MultimemAllReduce(SymmMemAllReduce):
 
     mode = "symm_multimem"
 
-    def __init__(self, device_group, device: torch.device, max_bytes: int):
-        super().__init__(device_group, device, max_bytes)
+    def __init__(self, group: "CommGroup", device: torch.device, max_bytes: int):
+        super().__init__(group, device, max_bytes)
         # Without NVLS the kernel raises at its first call; fail here instead,
         # where ``AllReduce.new`` falls back to NCCL.
         if not self._handle.multicast_ptr:
@@ -244,7 +230,7 @@ class FlashInferAllReduce(AllReduce):
     def __init__(self, group: "CommGroup", max_bytes: int):
         from mstar.distributed.ar_fusion import create_workspace
 
-        super().__init__(group.device_group)
+        super().__init__(group)
         self.world_size = group.world_size
         self.ws_id = create_workspace(
             group.rank, group.world_size, group.cpu_group, 1, max_bytes // 2, torch.bfloat16,

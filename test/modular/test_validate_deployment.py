@@ -383,7 +383,7 @@ def test_node_in_two_parallel_groups_on_one_worker_is_refused(tmp_path):
         {"node_names": ["llm"], "ranks": [0, 1], "tp_size": 2, "graph_walks": ["prefill"]},
         {"node_names": ["llm"], "ranks": [0, 2], "tp_size": 2, "graph_walks": ["decode"]},
     ])
-    _refused(_Model(tp_enabled_nodes=["llm"]), cfg, r"Node llm already has a comm group assigned for worker 0")
+    _refused(_Model(tp_enabled_nodes=["llm"]), cfg, r"Node llm already has a tp comm group assigned for worker 0")
 
 
 def test_resource_over_nodes_of_different_parallel_shapes_is_refused(tmp_path):

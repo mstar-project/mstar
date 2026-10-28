@@ -360,7 +360,7 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
         if spec.resource_key == KV_CACHE:
             spec.apply_yaml_overrides(max_num_pages=max_num_pages)
 
-    groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+    groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
     transfer = TransferEngineInfo("h", "h", LocalTransferEngine("h"))
     specs_by_key = {spec.resource_key: spec for spec in specs}
     resources = {
@@ -1093,7 +1093,7 @@ def _run_accelerator_graph_denoise(ctx):
     _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
     groups = JointGroups(
-        tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(),
+        tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial(),
     )
     # The runner's autocast scope is the engine's: none for a node that pins
     # its own precision (the DiT forwards run native bf16), else the model's.

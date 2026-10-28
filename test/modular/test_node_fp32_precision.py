@@ -17,6 +17,7 @@ sys.path.insert(0, ".")
 
 import mstar.engine.engine as engine_module  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.submodule_base import ARNodeSubmodule, NodeInputs, NodeSubmodule, TokenStop  # noqa: E402
@@ -54,18 +55,11 @@ class _Recorder(NodeSubmodule):
         return {"y": [x @ self.weight]}
 
 
-class _Rank:
-    world_size = 1
-
-    def barrier(self):
-        pass
-
-
 class _Groups:
     """A single-rank worker: no node is sharded."""
 
     def get_joint_group_for_node(self, node):
-        return type("_Joint", (), {"world_size": 1, "tp_group": _Rank(), "sp_group": _Rank()})()
+        return JointGroups(CommGroup.trivial(), CommGroup.trivial(), CommGroup.trivial())
 
     def get_instance_world_size_for_node(self, node):
         return 1

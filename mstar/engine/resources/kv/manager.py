@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import (
@@ -3595,34 +3596,29 @@ class KVManager(AttentionResource):
         )
 
     def post_warmup_validate(self):
-        """Assert ``num_free_pages`` is identical across every TP rank
+        """Assert ``num_free_pages`` is identical across every rank of the
+        instance
 
         Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
         but not another), allocator-init bugs, and any future code path
         that adds requests asymmetrically before ``warmup`` returns. The
-        ``all_gather`` itself is synchronizing, so no extra barrier is
+        all-reduces themselves are synchronizing, so no extra barrier is
         needed on the success path.
         """
         if self._comm_group.world_size == 1:
             return
-        local_free = self._arena.num_free
-        local_t = torch.tensor(
-            [local_free], dtype=torch.int64, device=self._device,
-        )
-
-        for group in [
-            self._comm_group.tp_group, self._comm_group.sp_group
-        ]:
-            gathered = group.all_gather(local_t, dim=0)
-            values = gathered.cpu().tolist()
-            if any(v != values[0] for v in values):
-                raise RuntimeError(
-                    f"KV cache {self.name!r} has asymmetric num_free_pages "
-                    f"across TP ranks: {values}. v1 requires symmetric "
-                    "allocator state; check the YAML for per-rank-divergent "
-                    "max_num_pages / cpu_offload_pages, and any model code "
-                    "that calls add_request before warmup completes."
-                )
+        local = [self._arena.num_free]
+        instance = self._comm_group.instance
+        low = instance.host_all_reduce(local, dist.ReduceOp.MIN)
+        high = instance.host_all_reduce(local, dist.ReduceOp.MAX)
+        if low != high:
+            raise RuntimeError(
+                f"KV cache {self.name!r} has asymmetric num_free_pages "
+                f"across the ranks of its instance (from {low[0]} to {high[0]}). v1 requires "
+                "symmetric allocator state; check the YAML for per-rank-divergent "
+                "max_num_pages / cpu_offload_pages, and any model code "
+                "that calls add_request before warmup completes."
+            )
 
     def cleanup(self):
         self._transfer.cleanup()

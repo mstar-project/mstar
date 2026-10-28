@@ -173,7 +173,8 @@ Communication
        Workers on CUDA set ``0`` unless you set it.
    * - ``GLOO_SOCKET_IFNAME``
      - ``lo``
-     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+     - PyTorch's variable for the Gloo groups next to each parallel group
+       and for each lockstep instance.
        Same rule: the conductor sets ``lo`` for its workers unless you set
        it, so Gloo does not listen on the address the hostname resolves to.
 

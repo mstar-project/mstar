@@ -149,7 +149,7 @@ class ReferenceTests(unittest.TestCase):
         resources = {key: build_resource(spec, EngineResourceInfo(
             device=torch.device("cuda"), kv_dtype=torch.bfloat16,
             transfer_engine_info=transfer,
-            joint_comm_group=JointGroups(group, CommGroup.trivial()) if group else None,
+            joint_comm_group=JointGroups(group, CommGroup.trivial(), group) if group else None,
             dependencies={dependency: specs[dependency] for dependency in spec.depends_on()},
         )) for key, spec in specs.items()}
         runner = StepRunner(resources)

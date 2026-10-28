@@ -67,15 +67,20 @@ def _two_tp_groups() -> WorkerParallelGroups:
 def test_init_dist_threads_timeout_into_world_and_every_subgroup(monkeypatch):
     calls = _capture_process_group_calls(monkeypatch)
     groups = _two_tp_groups()
+    # a lockstep instance no axis group spans gets a gloo group of its own,
+    # which every warmup capture barrier waits on
+    groups.node_to_instance_comm["llm"] = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1, 2, 3])
+    groups.node_to_instance_groups["llm"] = frozenset({(0, 1, 2, 3)})
     groups.dist_timeout_s = 3600
     groups.init_dist(device=torch.device("cpu"))
 
     expected = timedelta(seconds=3600)
     assert calls["store"] == [expected]
     assert [c["timeout"] for c in calls["init"]] == [expected]
-    # ``new_group`` runs once per rank tuple on every rank, members or not,
-    # for the device group and its gloo twin.
-    assert [c["timeout"] for c in calls["new_group"]] == [expected] * 4
+    # ``new_group`` runs once for the instance, then once per rank tuple on
+    # every rank, members or not, for the device group and its gloo twin.
+    assert [c["timeout"] for c in calls["new_group"]] == [expected] * 5
+    assert calls["new_group"][0]["ranks"] == [0, 1, 2, 3]
 
 
 def test_init_dist_without_timeout_leaves_torch_default(monkeypatch):

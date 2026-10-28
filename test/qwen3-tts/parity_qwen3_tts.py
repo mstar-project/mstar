@@ -217,7 +217,7 @@ class MStarTalkerDriver:
             config = getattr(spec, "config", None)   # sampler specs carry none
             if config is not None and hasattr(config, "max_num_pages"):
                 spec.apply_yaml_overrides(max_num_pages=max_num_pages)
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         transfer = TransferEngineInfo("h", "h", LocalTransferEngine("h"))
         self.resources = {
             spec.resource_key: build_resource(

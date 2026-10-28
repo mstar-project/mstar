@@ -21,7 +21,9 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+import torch.distributed as dist
 
+from mstar.distributed.communication import JointGroups
 from mstar.engine import accelerator_graph_runner
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_runner import (
@@ -75,7 +77,7 @@ class _StubMeasuredRunner:
         self._lent = set()
         self._executables = {}
         group = SimpleNamespace(world_size=1, barrier=lambda: None)
-        self._comm_group = SimpleNamespace(tp_group=group, sp_group=group)
+        self._comm_group = JointGroups(tp_group=group, sp_group=group, instance=group)
         self.warmed: list[tuple[BucketKey, int]] = []
         self.forwards: list[int] = []
 
@@ -235,7 +237,7 @@ def test_a_tp_group_sizes_its_buckets_again_together(measured, wanted, peer_want
         _bucket("decode", bs, bs): CaptureCost(bs * _MIB, 2 * bs * _MIB, 0, 2) for bs in (16, 8, 4, 2)
     }
     runner = _StubMeasuredRunner(torch.device("cpu"), walk)
-    runner._comm_group.tp_group = _PeerGroup([peer_wanted])
+    runner._comm_group.instance = _PeerGroup([peer_wanted])
     runner.size_captures()
 
     costs = _sized(runner.size_lent_captures(wanted))
@@ -745,8 +747,9 @@ class _PeerGroup:
     def barrier(self):
         pass
 
-    def all_gather(self, tensor, dim=0):
-        return torch.cat([tensor, torch.tensor(self._peer, dtype=tensor.dtype)])
+    def host_all_reduce(self, values, op):
+        reduce = min if op == dist.ReduceOp.MIN else max
+        return [reduce(int(mine), int(peer)) for mine, peer in zip(values, self._peer, strict=True)]
 
 
 class _StubPlannedRunner:
@@ -765,8 +768,9 @@ class _StubPlannedRunner:
         self._submodule_name = "Thinker"
         self._num_slots = 1
         self._buckets = {}
-        self._comm_group = SimpleNamespace(
-            tp_group=_PeerGroup(peer), sp_group=SimpleNamespace(world_size=1, barrier=lambda: None),
+        peer_group = _PeerGroup(peer)
+        self._comm_group = JointGroups(
+            tp_group=peer_group, sp_group=SimpleNamespace(world_size=1), instance=peer_group,
         )
         self._dummy_rows = SimpleNamespace(release_all=lambda: None)
         self._graph_backend = SimpleNamespace(

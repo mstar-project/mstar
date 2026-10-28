@@ -951,7 +951,7 @@ class BaseSampler(ABC):
         tp_group = getattr(self, "tp_group", None)
         if tp_group is None or tp_group.world_size == 1:
             return tokens
-        return tp_group.broadcast(tokens, src=0)
+        return tp_group.broadcast(tokens)
 
     @abstractmethod
     def sample(

@@ -21,7 +21,9 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+import torch.distributed as dist
 
+from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType, geometric_batch_sizes
 from mstar.engine.accelerator_graph_runner import (
@@ -48,11 +50,9 @@ class _Group:
     def barrier(self):
         self.count += 1
 
-    def all_gather(self, tensor, dim=0):
-        del dim
-        peer = torch.tensor(self._peer, dtype=tensor.dtype, device=tensor.device)
-        # rank-major, matching CommGroup.all_gather
-        return torch.cat([tensor, peer])
+    def host_all_reduce(self, values, op):
+        reduce = min if op == dist.ReduceOp.MIN else max
+        return [reduce(int(mine), int(peer)) for mine, peer in zip(values, self._peer, strict=True)]
 
 
 class _FakeRunner:
@@ -84,9 +84,7 @@ class _FakeRunner:
         self._blocked_buckets = []
         self._executables = {}
         self.barrier = _Group(peer_flags)
-        self._comm_group = SimpleNamespace(
-            tp_group=self.barrier, sp_group=self.barrier
-        )
+        self._comm_group = JointGroups(tp_group=self.barrier, sp_group=self.barrier, instance=self.barrier)
         self.declared: list = []
         self._dummy_rows = SimpleNamespace(
             released=False,
@@ -175,9 +173,7 @@ def test_every_rank_barriers_once_per_spec_whatever_happens():
     clean.warmup_and_capture()
     failed.warmup_and_capture()
 
-    assert failed.barrier.count == clean.barrier.count == 2 * len(_specs(
-        walks=("decode", "prefill")
-    ))
+    assert failed.barrier.count == clean.barrier.count == len(_specs(walks=("decode", "prefill")))
 
 
 def test_a_bucket_another_rank_dropped_is_dropped_here_too():
