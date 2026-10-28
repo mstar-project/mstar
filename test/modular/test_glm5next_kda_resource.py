@@ -17,13 +17,12 @@ import torch
 
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.linear_attn.kda import SpecBlocks
+from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.glm5_next.components.attention import Glm5NextKdaAttention
 from mstar.model.glm5_next.config import KDA, KDA_STATE, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
-from mstar.model.glm5_next.kda import TorchKDAKernels
 
 LAYER = 1  # the second KDA layer's blocks: a layer index that is not 0
 
@@ -142,7 +141,7 @@ def test_verify_blocks_decode_only_the_accepted_tokens():
         step = steps.open({"r": 3}, "decode", speculative=True)
         assert kda.current_plan().is_verify
         got = layer.forward_paged(block, LAYER)
-        kda.set_prefix_len(SpecBlocks.of(pool, LAYER), torch.tensor([accepted]))
+        layer.mix.set_prefix_len(torch.tensor([accepted]))
         steps.close(*step)
         r, c = rec.clone(), conv.clone()
         for j in range(3):

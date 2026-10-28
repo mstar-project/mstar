@@ -8,12 +8,13 @@ import torch
 import torch.nn.functional as F
 
 from mstar.engine.resources.linear_attn.kda import KDAPlan, SpecBlocks
+from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components.attention import Glm5NextKdaAttention
-from mstar.model.glm5_next.kda import Glm5NextKdaConfig, TorchKDAKernels
+from mstar.model.glm5_next.kda import Glm5NextKdaConfig
 
 
 def _layer(cfg, device, dtype, seed=0):
@@ -74,7 +75,7 @@ def _verify(bundle, layer, x, pool, plan):
 
 
 def _after_verdict(pool, slots, accepted):
-    """``KDAManager.set_prefix_len``: the accepted tokens and the token after them."""
+    """``KDACallable.set_prefix_len``: the accepted tokens and the token after them."""
     spec = SpecBlocks.of(pool, 0)
     spec.prefix_len[slots, 0] = (accepted + 1).to(torch.int32)
     spec.side[slots, 0] = 1 - spec.side[slots, 0]

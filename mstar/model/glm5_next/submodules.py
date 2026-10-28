@@ -27,10 +27,11 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.linear_attn.kda import SpecBlocks
+from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.config import (
@@ -45,7 +46,6 @@ from mstar.model.glm5_next.config import (
     SAMPLER,
     Glm5NextModelConfig,
 )
-from mstar.model.glm5_next.kda import TorchKDAKernels
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -118,6 +118,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self._keep_stager = PinnedStager(torch.float32)
         # capture slot (None: eager) -> the pinned verdict table and step number the host reads
         self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
+        # the KDA pool and resource, which settle each verify step's accepted drafts
+        self._kda: KDACallable | None = None
 
     @property
     def _dsa(self):
@@ -140,8 +142,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         super().bind_node_resources(resources)
         # The fused kernels where they run; the torch reference elsewhere.
         kda = resources.get(KDA)
-        if kda is not None and (kda.kernels is None or not _fused_kda(self.config)):
+        if kda is not None and not _fused_kda(self.config):
             kda.set_kernels(TorchKDAKernels())
+        self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
 
     # -- CUDA-graph configs ----------------------------------------------
 
@@ -607,7 +610,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         per block row, then the accepted count) goes to the host's mailbox; returns the next
         input token per row."""
         lm, k, block = self.language_model, self.mtp_k, self.mtp_block
-        pool, kda = engine_inputs.resources[KDA_STATE], engine_inputs.resources[KDA]
+        pool = engine_inputs.resources[KDA_STATE]
         rows = pool.addressing()
         n = rows.num_rows
 
@@ -629,7 +632,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block], verdict[:, block]
-        kda.set_prefix_len(SpecBlocks.of(pool, 0), accepted)
+        self._kda.set_prefix_len(accepted)
 
         # The host's copy: the verdict first, then its step number.
         verdicts, seq = self._mailboxes[self._mailbox_key(engine_inputs)]

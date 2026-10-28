@@ -21,7 +21,7 @@ Four kernels, the first two chunk-parallel: ``_kda_conv_kernel`` (the causal con
 l2norm factors and the gates' in-chunk cumsum), ``_kda_intra_kernel`` (A, Aqk, the solve, W, U),
 ``_kda_scan_kernel`` (serial over each span's chunks, state in place in the slot pool) and
 ``_kda_out_norm_kernel`` (output gate + gated RMSNorm). The math and the bf16 rounding points
-follow the model's torch reference; ``PrefillConfig`` holds the
+follow the torch reference in ``kda_torch``; ``PrefillConfig`` holds the
 tile and precision choices.
 """
 from __future__ import annotations

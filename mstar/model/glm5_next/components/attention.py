@@ -8,12 +8,12 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.dsa import paged
 from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.engine.resources.kv.manager import KVManager
-from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, SpecBlocks
-from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.linear_attn.kda import KDAParams
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import RMSNorm
 from mstar.model.glm5_next.config import ATTN, DSA, KDA, KDA_STATE, KV_CACHE, LABEL, Glm5NextModelConfig
@@ -360,19 +360,15 @@ class Glm5NextKdaAttention(Glm5NextLinearAttention):
         super().__init__(local, dtype=dtype)
         self.total_qkv_dim = self.total_num_heads * self.head_dim
         self._attach_weight_loaders()
-        # Engine resources, bound once at load (NodeSubmodule.bind_node_resources).
-        self.pool: RecurrentStatePool | None = None
-        self.kda: KDAManager | None = None
+        # The KDA resource and its pool, bound once at load (NodeSubmodule.bind_node_resources).
+        self.mix: KDACallable | None = None
         self._params: KDAParams | None = None
-        self._spec: SpecBlocks | None = None
 
     def bind_resources(self, resources: dict) -> None:
-        self.pool = resources[KDA_STATE]
-        self.kda = resources[KDA]
-        self._spec = None
+        self.mix = KDACallable(resources[KDA_STATE], resources[KDA])
         # The conv tail is read alongside the projected activations, so the
         # pool must hold them in the dtype the layer was loaded in.
-        pool_dtype = self.pool.config.blocks["conv"].dtype
+        pool_dtype = self.mix.conv_dtype
         proj_dtype = self.q_proj.weight.dtype
         if pool_dtype != proj_dtype:
             raise RuntimeError(
@@ -406,7 +402,7 @@ class Glm5NextKdaAttention(Glm5NextLinearAttention):
     def forward_paged(self, hidden_states: torch.Tensor, layer: int) -> torch.Tensor:
         """``(T, hidden)`` through the KDA resource, state in the pool's ``layer``
         blocks (its index among the KDA layers)."""
-        if self.kda is None or self._in_proj_weight is None:
+        if self.mix is None or self._in_proj_weight is None:
             raise RuntimeError(
                 "Glm5NextKdaAttention needs its engine resources bound and "
                 "process_weights_after_loading run before a forward"
@@ -417,19 +413,10 @@ class Glm5NextKdaAttention(Glm5NextLinearAttention):
         p, h, d = self.qkv_dim, self.num_heads, self.head_dim
         qkv, beta = proj[:, :3 * p], proj[:, 3 * p:3 * p + h]
         f_a, g_a = proj[:, 3 * p + h:3 * p + h + d], proj[:, 3 * p + h + d:3 * p + h + 2 * d]
-        plan = self.kda.current_plan()
-        spec = None
-        if plan.is_verify:
-            # the layer's speculative blocks: the last block's inputs to replay
-            if self._spec is None:
-                self._spec = SpecBlocks.of(self.pool, layer)
-            spec = self._spec
-        out = self.kda.run(
-            qkv, f_a, beta, self.pool.block("conv", layer),
-            self.pool.block("state", layer), self.params(), gate=g_a, spec=spec,
-        )
+        out = self.mix(qkv, f_a, beta, self.params(), gate=g_a, layer_idx=layer)
         if self.tp_size == 1:
             return self.o_proj(out)
+        plan = self.mix.current_plan()
         if plan.is_decode or plan.is_verify:
             # o_proj writes its partial straight into the all-reduce buffer
             buf = self.comm_group.all_reduce_buffer(
