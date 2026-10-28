@@ -96,8 +96,11 @@ def pools_hold_concurrency(
     cap = config.get("max_concurrent_requests")
     if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap < 1):
         return [f"max_concurrent_requests must be a positive int; got {cap!r}"]
-    # the byte sizes don't matter here
-    demands = [d for d in pool_demands(specs, torch.bfloat16, model=model) if d.units is not None]
+    # the byte sizes don't matter here; an unsized pool is sized at startup, and the
+    # conductor takes its request count as the cap when there is none
+    demands = [
+        d for d in pool_demands(specs, torch.bfloat16, model=model) if d.units is not None and not d.unsized
+    ]
     if not demands:
         return []
     if cap is None:

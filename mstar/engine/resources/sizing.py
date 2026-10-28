@@ -3,8 +3,8 @@
 A pool is a resource that allocates its storage up front as equal units: a paged
 KV cache's pages, a recurrent or bounded pool's slots, a ring's sessions. Its
 config says what a unit costs and what one request holds, so the arithmetic runs
-on declarations, in the conductor before any worker exists as well as in the
-engine's startup report.
+on declarations: in the conductor before any worker exists, and in the engine
+before anything is allocated.
 
 Kept free of the managers, like the configs that implement it.
 """
@@ -31,6 +31,19 @@ class PoolConfig(ABC):
     pool_unit: ClassVar[str]
     #: the ``resources:`` key that sizes the pool
     size_key: ClassVar[str]
+    #: whether the engine sizes the pool from memory when neither the model nor the
+    #: deployment did
+    derivable: ClassVar[bool] = True
+
+    @property
+    def sized(self) -> bool:
+        """Whether the model or the deployment set the size. An unsized pool holds a
+        default until the engine sizes it (``size_pool``)."""
+        return True
+
+    def size_pool(self, units: int) -> None:
+        """Take the engine's size for an unsized pool."""
+        raise NotImplementedError(f"{type(self).__name__} is not sized by the engine")
 
     @property
     @abstractmethod
@@ -73,6 +86,8 @@ class PoolDemand(NamedTuple):
     per_request: int
     max_seq_len: int | None
     host_units: int = 0
+    # the engine sizes it from memory: neither the model nor the deployment did
+    unsized: bool = False
 
     @property
     def requests(self) -> int | None:
@@ -152,6 +167,7 @@ def pool_demands(
             per_request=per_request,
             max_seq_len=length,
             host_units=pool.host_units,
+            unsized=pool.derivable and not pool.sized,
         ))
     return demands
 
@@ -173,6 +189,23 @@ def requests_within(demands: Sequence[PoolDemand], budget: int) -> int:
     if per_request <= 0:
         return 0
     return max(budget - fixed, 0) // per_request
+
+
+def requests_for_unsized(demands: Sequence[PoolDemand], budget: int) -> int:
+    """Requests the unsized pools hold, sized alike, in what ``budget`` bytes leave after
+    the sized pools. A store with no pool takes its per-request bytes from the same budget."""
+    left = budget - sum(d.nbytes for d in demands if d.units is not None and not d.unsized)
+    return requests_within([d for d in demands if d.unsized or d.units is None], left)
+
+
+def default_capture_reserve(total: int) -> int:
+    """What unsized pools leave of a ``total``-byte device for graph capture, the largest
+    eager step and the workspaces built after them, unless ``capture_reserve_gib`` says.
+
+    What that takes depends on the model's capture buckets, not on the device: 3 to 15 GiB
+    on an H100 for the models measured (Qwen3-TTS's 15 GiB the most), and the startup
+    report gives each deployment its own figure."""
+    return max(4 * 2**30, total // 4)
 
 
 def units_for(demand: PoolDemand, requests: int) -> int:

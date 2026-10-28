@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
 
+# what an unsized paged pool holds when nothing sizes it from memory
+DEFAULT_MAX_NUM_PAGES = 2048
+
+
 class KVLayout(Enum):
     NHD = "NHD"
     # Multi-head Latent Attention: one compressed latent per token per layer,
@@ -92,7 +96,9 @@ class PagedKVConfig(KVConfig, PoolConfig):
     size_key: ClassVar[str] = "max_num_pages"
 
     max_seq_len: int
-    max_num_pages: int = 2048
+    # None: the engine sizes the pool from memory at startup; built without that (off
+    # CUDA, or in a test) it holds DEFAULT_MAX_NUM_PAGES
+    max_num_pages: int | None = None
     page_size: int = 128
     layout: KVLayout = KVLayout.NHD
     # pages of pinned host memory to keep for offloading; 0 disables it
@@ -107,8 +113,13 @@ class PagedKVConfig(KVConfig, PoolConfig):
     # MLA: whether num_qo_heads was given. Unset it defaults to the one latent KV head, which
     # the attention backend would plan; a cache only stored (index keys) needs no query heads
     qo_heads_given: bool = field(default=False, init=False, repr=False, compare=False)
+    # whether the model or the deployment set max_num_pages
+    pool_sized: bool = field(default=True, init=False, repr=False, compare=False)
 
     def __post_init__(self):
+        self.pool_sized = self.max_num_pages is not None
+        if self.max_num_pages is None:
+            self.max_num_pages = DEFAULT_MAX_NUM_PAGES
         if self.layout == KVLayout.MLA:
             if self.kv_lora_rank is None or self.qk_rope_head_dim is None:
                 raise ValueError("KVLayout.MLA needs kv_lora_rank and qk_rope_head_dim")
@@ -128,6 +139,13 @@ class PagedKVConfig(KVConfig, PoolConfig):
     @property
     def pool_units(self) -> int:
         return self.max_num_pages
+
+    @property
+    def sized(self) -> bool:
+        return self.pool_sized
+
+    def size_pool(self, units: int) -> None:
+        self.max_num_pages = units
 
     @property
     def reserved_units(self) -> int:
@@ -159,6 +177,8 @@ class PagedKVConfig(KVConfig, PoolConfig):
         prefix_cache_tp: bool | None = None,
     ) -> None:
         """How much cache this deployment gets, and how it is cut up."""
+        if max_num_pages is not None:
+            self.pool_sized = True
         for name, value in (
             ("max_num_pages", max_num_pages),
             ("page_size", page_size),
@@ -191,6 +211,8 @@ class RingKVConfig(KVConfig, PoolConfig):
 
     pool_unit: ClassVar[str] = "session"
     size_key: ClassVar[str] = "num_sessions"
+    # resident sessions are a real-time budget, not a memory one
+    derivable: ClassVar[bool] = False
 
     tokens_per_frame: int
     layers: tuple[RingKVLayerConfig, ...]

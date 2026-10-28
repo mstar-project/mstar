@@ -60,6 +60,17 @@ def refuse_combined_walks_across_tp_groups(
             )
 
 
+def workers_on_device(model_config: dict, device: torch.device) -> int:
+    """How many of the deployment's worker ranks run on ``device``: ``rank_devices`` can put
+    several on one GPU (as ``worker_device`` places them), and pools sized from memory split
+    it between them."""
+    if device.index is None:
+        return 1
+    ranks = {int(rank) for group in model_config.get("node_groups") or [] for rank in group.get("ranks") or ()}
+    rank_devices = {int(r): int(i) for r, i in (model_config.get("rank_devices") or {}).items()}
+    return max(sum(rank_devices.get(rank, rank) == device.index for rank in ranks), 1)
+
+
 @dataclass
 class EngineManager:
     """Owns the worker's engine.
@@ -138,6 +149,8 @@ class EngineManager:
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
         _refuse_split_combined_walks(submodules, model)
 
+        reserve = model_config.get("capture_reserve_gib")
+        sharing = workers_on_device(model_config, device)
         engine = Engine(
             graph_runtime=graph_runtime,
             autocast_dtype=autocast_dtype,
@@ -145,6 +158,8 @@ class EngineManager:
             enable_profile=enable_prof,
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
+            capture_reserve=None if reserve is None else int(reserve * 2**30),
+            device_share=None if sharing == 1 else 1 / sharing,
         )
         engine.load_model(
             submodules,
@@ -158,6 +173,11 @@ class EngineManager:
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
         return cls(engine=engine, node_names=set(node_names))
+
+    @property
+    def pool_concurrency(self) -> int | None:
+        """Requests the pools hold at once if the engine sized any from memory, else None."""
+        return self.engine.derived_concurrency
 
     def warmup_all(self) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region."""

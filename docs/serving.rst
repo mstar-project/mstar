@@ -249,11 +249,18 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        conductor's queue, except a live call (open client input), which is refused with
        a 503. Startup refuses a cap that a KV cache or state pool cannot hold at its
        per-request bound, and each worker logs what its pools hold (``Pools[`` lines;
-       see "Pool sizing" in :doc:`adding_models`).
+       see "Pool sizing" in :doc:`adding_models`). Unset, it is what the pools sized from
+       memory hold at their ``max_seq_len``, if any were.
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
-       whatever is free.
+       whatever is free, and pools sized from memory split the GPU evenly between the
+       workers ``rank_devices`` puts on it.
+   * - ``capture_reserve_gib``
+     - *(optional)* GiB that pools sized from memory leave free for CUDA-graph capture,
+       the largest eager step and the buffers built after the pools. Default: a quarter of
+       the GPU, at least 4 GiB. The startup report gives what this deployment used
+       (``Pools[`` lines), and a worker warns after capture when it was too little.
    * - ``mps``
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their

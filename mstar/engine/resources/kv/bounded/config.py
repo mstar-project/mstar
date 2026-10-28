@@ -23,6 +23,10 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
 
+# what an unsized pool holds when nothing sizes it from memory
+DEFAULT_MAX_SLOTS = 32
+
+
 class SinkWindow(NamedTuple):
     """Keep the stream's first ``sink`` and last ``window`` entries. With
     ``window_includes_step`` the window counts the step's own tokens, so a step
@@ -47,7 +51,8 @@ class BoundedKVConfig(PoolConfig):
     max_source_len: int
     # source length -> what that request keeps, or one policy for every length
     retention: Callable[[int], SinkWindow] | SinkWindow
-    max_slots: int = 32
+    # None: the engine sizes the pool from memory; DEFAULT_MAX_SLOTS where nothing does
+    max_slots: int | None = None
     # the shortest source prefix a request may have: the slots also hold the part
     # of a sink its source doesn't cover, which is largest for the shortest source
     min_source_len: int = 0
@@ -64,8 +69,13 @@ class BoundedKVConfig(PoolConfig):
     # several tokens is causal within itself (a streaming conformer's
     # ``att_context_size=[left, 0]``). Needs no sink and the stream in order.
     query_window: int | None = None
+    # whether the model or the deployment set max_slots
+    pool_sized: bool = field(default=True, init=False, repr=False, compare=False)
 
     def __post_init__(self):
+        self.pool_sized = self.max_slots is not None
+        if self.max_slots is None:
+            self.max_slots = DEFAULT_MAX_SLOTS
         if self.max_slots < 1:
             raise ValueError(f"max_slots must be >= 1, got {self.max_slots}")
         if not 0 <= self.min_source_len <= self.max_source_len:
@@ -114,6 +124,13 @@ class BoundedKVConfig(PoolConfig):
     def pool_units(self) -> int:
         return self.max_slots
 
+    @property
+    def sized(self) -> bool:
+        return self.pool_sized
+
+    def size_pool(self, units: int) -> None:
+        self.max_slots = units
+
     def unit_bytes(self, kv_dtype: torch.dtype, num_shards: int = 1) -> int:
         """One slot's K and V rows in every layer. Bounded KV does not shard."""
         del num_shards
@@ -139,6 +156,7 @@ class BoundedKVSpec(NodeResourceSpec):
             if max_slots < 1:
                 raise ValueError(f"max_slots must be >= 1, got {max_slots}")
             self.config.max_slots = max_slots
+            self.config.pool_sized = True
 
 
 class StreamPosition(NamedTuple):

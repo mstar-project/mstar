@@ -493,7 +493,8 @@ The spec types are:
    * - ``KVSpec(config=PagedKVConfig(...))``
      - A paged KV cache. ``KVConfig`` is the abstract base for common model geometry;
        ``PagedKVConfig`` adds ``max_seq_len`` and five fields that
-       a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
+       a deployment can tune: ``max_num_pages`` (unset, sized from memory; see
+       `Pool sizing`_), ``page_size``, ``cpu_offload_pages``
        (the number of pinned host pages used for offload; 0 disables offload),
        ``prefix_cache`` and ``prefix_cache_salt``. ``layout=KVLayout.MLA`` stores one
        Multi-head Latent Attention latent per token in place of K and V. It needs
@@ -1779,6 +1780,20 @@ Startup uses these in two places:
   requests fit) and what the memory still free past the largest eager step would hold if it
   went to the pools as well, split so one request count fits every pool. Search the log
   for ``Pools[``.
+
+A pool whose size neither the model nor the deployment sets (``max_num_pages`` or
+``max_slots`` left out) is sized from memory on CUDA. Once the weights are loaded, the
+engine takes what the worker may still allocate (``gpu_memory_fraction`` of the GPU, or an
+even share among the workers on it), keeps ``capture_reserve_gib`` for capture, subtracts
+the pools that are sized, and gives the rest to the unsized pools in proportion to what a
+request takes of each, so one request count N fits all of them. Every rank of a TP/SP
+instance takes the least N any of them holds, so their pools match. Without a
+``max_concurrent_requests``, the conductor takes N as the cap. Off CUDA, an unsized pool
+holds its default (2048 pages, 256 recurrent slots, 32 bounded slots). A ring's
+``num_sessions`` is never sized from memory: resident sessions are a real-time budget.
+
+So a model declares its pools without a size, and sets one only where the size is a fact
+of the model rather than of the machine.
 
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~

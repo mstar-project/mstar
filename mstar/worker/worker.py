@@ -4652,7 +4652,10 @@ class Worker:
             "conductor",
             ConductorMessage(
                 message_type=ConductorMessageType.SETUP_DONE,
-                body=SetupDone(worker_id=self.worker_id),
+                body=SetupDone(
+                    worker_id=self.worker_id,
+                    max_concurrent_requests=self.engine_manager.pool_concurrency,
+                ),
             ),
         )
 

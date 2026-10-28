@@ -281,6 +281,8 @@ class WorkerGraphsDone(MessageBody):
 @dataclass
 class SetupDone(MessageBody):
     worker_id: str
+    # requests the pools it sized from memory hold at once; None if it sized none
+    max_concurrent_requests: int | None = None
 
 
 @dataclass

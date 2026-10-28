@@ -21,6 +21,7 @@ from mstar.engine.resources.sizing import (
     concurrency,
     memory_allows,
     pool_demands,
+    requests_for_unsized,
     requests_within,
     units_for,
 )
@@ -30,10 +31,13 @@ CPU = torch.device("cpu")
 
 
 def _paged(**kwargs) -> PagedKVConfig:
-    return PagedKVConfig(
-        num_layers=3, num_kv_heads=4, num_qo_heads=16, head_dim=16, max_seq_len=1000, page_size=16,
-        max_num_pages=9, **kwargs,
-    )
+    return PagedKVConfig(**{
+        "num_layers": 3, "num_kv_heads": 4, "num_qo_heads": 16, "head_dim": 16, "max_seq_len": 1000,
+        "page_size": 16, "max_num_pages": 9, **kwargs,
+    })
+
+
+CTX_PAGES = 1 + 30 * 63  # 30 requests of 1000 tokens
 
 
 def _model(labels=None, bound=None):
@@ -164,8 +168,7 @@ def test_concurrency_and_what_memory_holds():
 
 
 def test_the_engine_logs_each_pool_and_the_requests_they_hold(caplog):
-    engine = Engine.__new__(Engine)
-    engine._device = CPU
+    engine = _engine()
     engine._pools = pool_demands([KVSpec("kv", {"n"}, _paged())], torch.bfloat16)
     with caplog.at_level(logging.INFO, logger="mstar.engine.engine"):
         engine._log_pools(None)
@@ -223,3 +226,207 @@ def test_a_slot_count_with_none_to_hand_out_is_refused_from_yaml(disable_sink_sl
     spec.apply_yaml_overrides(max_slots=low)
     with pytest.raises(ValueError, match=f"max_slots must be an int >= {low}"):
         spec.apply_yaml_overrides(max_slots=low - 1)
+
+
+# ── sizing the unsized pools ────────────────────────────────────────────────
+
+
+def test_an_unsized_pool_holds_its_default_until_the_engine_sizes_it():
+    from mstar.engine.resources.kv.bounded.config import DEFAULT_MAX_SLOTS as BOUNDED_SLOTS
+    from mstar.engine.resources.kv.config import DEFAULT_MAX_NUM_PAGES
+    from mstar.engine.resources.recurrent.config import DEFAULT_MAX_SLOTS
+
+    paged = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64)
+    assert (paged.max_num_pages, paged.sized) == (DEFAULT_MAX_NUM_PAGES, False)
+    spec = KVSpec("kv", {"n"}, paged)
+    spec.apply_yaml_overrides(page_size=64)
+    assert not paged.sized
+    spec.apply_yaml_overrides(max_num_pages=100)
+    assert (paged.max_num_pages, paged.sized) == (100, True)
+    assert _paged().sized  # set by the model
+    state = RecurrentStateConfig(num_layers=1, blocks=DeltaNetGeometry(1, 1, 8, 8, 4).to_blocks())
+    assert (state.max_slots, state.sized) == (DEFAULT_MAX_SLOTS, False)
+    bounded = BoundedKVConfig(
+        num_layers=1, num_heads=1, head_dim=8, rows_per_request=1, max_source_len=0, retention=SinkWindow(0, 4),
+    )
+    assert (bounded.max_slots, bounded.sized) == (BOUNDED_SLOTS, False)
+    # a ring's sessions are a real-time budget, so nothing sizes them from memory
+    ring = RingKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, tokens_per_frame=128, layers=(RingKVLayerConfig(2, 2, 1),),
+    )
+    [demand] = pool_demands([KVSpec("ring", {"n"}, ring)], torch.bfloat16)
+    assert not demand.unsized
+
+
+def test_unsized_pools_split_what_the_sized_ones_leave():
+    sized = PoolDemand("a", "page", "max_num_pages", unit_bytes=100, units=11, reserved=1, per_request=5,
+                       max_seq_len=80)
+    kv = PoolDemand("kv", "page", "max_num_pages", unit_bytes=100, units=2048, reserved=1, per_request=4,
+                    max_seq_len=64, unsized=True)
+    state = PoolDemand("state", "slot", "max_slots", unit_bytes=50, units=256, reserved=1, per_request=1,
+                       max_seq_len=None, unsized=True)
+    # 1100 bytes go to the sized pool and 150 to the reserved units; a request takes 450
+    assert requests_for_unsized([sized, kv, state], 1100 + 150 + 9 * 450 + 449) == 9
+    assert (units_for(kv, 9), units_for(state, 9)) == (37, 10)
+
+
+def _unsized_specs():
+    return [
+        KVSpec("kv", {"n"}, PagedKVConfig(
+            num_layers=3, num_kv_heads=4, num_qo_heads=16, head_dim=16, max_seq_len=1000, page_size=16,
+        )),
+        RecurrentStateSpec("state", {"n"}, RecurrentStateConfig(
+            num_layers=1, blocks=DeltaNetGeometry(2, 2, 8, 8, 4).to_blocks(state_dtype=torch.float32),
+        )),
+        KVSpec("ctx", {"n"}, _paged(max_num_pages=CTX_PAGES)),  # sized by the model
+    ]
+
+
+def _engine() -> Engine:
+    engine = Engine.__new__(Engine)
+    engine._device = CPU
+    engine.derived_concurrency = None
+    return engine
+
+
+def test_the_engine_sizes_the_unsized_pools_for_one_request_count(caplog):
+    specs = _unsized_specs()
+    kv, state, ctx = (spec.config for spec in specs)
+    page, slot = kv.unit_bytes(torch.bfloat16), state.unit_bytes(torch.bfloat16)
+    request = 63 * page + slot
+    budget = CTX_PAGES * ctx.unit_bytes(torch.bfloat16) + page + slot + 20 * request + request - 1
+    engine = _engine()
+    with caplog.at_level(logging.INFO, logger="mstar.engine.engine"):
+        engine._size_pools(specs, dict.fromkeys(("kv", "state", "ctx")), torch.bfloat16, None, lambda: budget)
+    assert (kv.max_num_pages, state.max_slots, ctx.max_num_pages) == (1 + 20 * 63, 21, CTX_PAGES)
+    assert engine.derived_concurrency == 20
+    # a sized pool that holds fewer caps the count the conductor gets
+    specs = _unsized_specs()
+    specs[2].config.max_num_pages = 1 + 5 * 63
+    engine._size_pools(specs, dict.fromkeys(("kv", "state", "ctx")), torch.bfloat16, None, lambda: budget)
+    assert engine.derived_concurrency == 5
+    assert "kv sized to 1261 pages for 20 requests at once" in caplog.text
+
+
+def test_a_budget_that_holds_no_request_fails_startup():
+    specs = _unsized_specs()
+    with pytest.raises(RuntimeError, match=r"pools left unsized \(kv, state\) hold no request"):
+        _engine()._size_pools(specs, dict.fromkeys(("kv", "state", "ctx")), torch.bfloat16, None, lambda: 10**5)
+
+
+def _size_on_rank(rank, budgets, store, out):
+    """One rank of a TP2 instance sizing its pools from its own budget."""
+    import datetime
+    import traceback
+
+    import torch.distributed as dist
+
+    from mstar.distributed.communication import CommGroup, JointGroups
+
+    try:
+        dist.init_process_group(
+            "gloo", init_method=f"file://{store}", rank=rank, world_size=2,
+            timeout=datetime.timedelta(seconds=20),
+        )
+        tp = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
+        tp.device_group = tp.cpu_group = dist.group.WORLD
+        group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial())
+        specs = _unsized_specs()
+        try:
+            _engine()._size_pools(specs, dict.fromkeys(("kv", "state", "ctx"), group), torch.bfloat16, None,
+                                  lambda: budgets[rank])
+            out.put((rank, [spec.config.pool_units for spec in specs]))
+        except RuntimeError as e:
+            out.put((rank, f"refused: {e}"))
+        dist.destroy_process_group()
+    except BaseException:
+        out.put((rank, "crash " + traceback.format_exc()))
+
+
+def _two_ranks(tmp_path, budgets):
+    import multiprocessing as mp
+    import queue
+
+    ctx = mp.get_context("spawn")
+    out = ctx.Queue()
+    procs = [ctx.Process(target=_size_on_rank, args=(r, budgets, tmp_path / "store", out)) for r in range(2)]
+    for p in procs:
+        p.start()
+    results = {}
+    try:
+        for _ in procs:
+            rank, result = out.get(timeout=60)
+            results[rank] = result
+    except queue.Empty:
+        pass
+    for p in procs:
+        p.join(timeout=10)
+        if p.is_alive():
+            p.kill()
+    assert sorted(results) == [0, 1], results
+    return results
+
+
+def test_lockstep_ranks_take_the_least_count_either_holds(tmp_path):
+    """Rank 1 has less memory free; both ranks of the TP2 instance size their pools for
+    what rank 1 holds, so the two pools match page for page. The pools shard across the
+    two ranks, so a page here is half of one on a single rank."""
+    kv, state, _ = (spec.config for spec in _unsized_specs())
+    request = 63 * kv.unit_bytes(torch.bfloat16, 2) + state.unit_bytes(torch.bfloat16, 2)
+    fixed = CTX_PAGES * _paged().unit_bytes(torch.bfloat16, 2) + kv.unit_bytes(torch.bfloat16, 2) + \
+        state.unit_bytes(torch.bfloat16, 2)
+    results = _two_ranks(tmp_path, [fixed + 30 * request, fixed + 12 * request])
+    assert results[0] == results[1] == [1 + 12 * 63, 13, CTX_PAGES], results
+
+
+def test_a_rank_that_holds_no_request_fails_the_whole_instance(tmp_path):
+    """Rank 0 alone could hold requests; it still fails, after the reduction, rather
+    than build pools rank 1 never will and wait on it at the first collective."""
+    kv, state, _ = (spec.config for spec in _unsized_specs())
+    request = 63 * kv.unit_bytes(torch.bfloat16, 2) + state.unit_bytes(torch.bfloat16, 2)
+    results = _two_ranks(tmp_path, [10**9 + 30 * request, 10**3])
+    assert all(str(result).startswith("refused: the pools left unsized") for result in results.values()), results
+
+
+@pytest.mark.parametrize("rank_devices, device, expected", [
+    (None, "cuda:0", 1),
+    ({0: 0, 1: 0}, "cuda:0", 2),
+    ({1: 0}, "cuda:1", 0 + 1),  # rank 1 moved to GPU 0, so nothing else is on GPU 1
+    (None, "cpu", 1),
+])
+def test_workers_sharing_a_device_split_it(rank_devices, device, expected):
+    from mstar.worker.engine_manager import workers_on_device
+
+    config = {"node_groups": [{"node_names": ["a"], "ranks": [0]}, {"node_names": ["b"], "ranks": [1]}]}
+    if rank_devices is not None:
+        config["rank_devices"] = rank_devices
+    assert workers_on_device(config, torch.device(device)) == expected
+
+
+def test_the_conductor_caps_requests_at_what_the_sized_pools_hold(caplog):
+    from mstar.conductor.conductor import Conductor
+    from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, SetupDone
+
+    def conductor(cap, counts):
+        c = Conductor.__new__(Conductor)
+        c.worker_ids = [f"w{i}" for i in range(len(counts))]
+        c.max_concurrent_requests = cap
+        c._startup_message_backlog = []
+        c._poll_worker_liveness = lambda: None
+        messages = [ConductorMessage(ConductorMessageType.SETUP_DONE, SetupDone(w, n))
+                    for w, n in zip(c.worker_ids, counts, strict=True)]
+        c.communicator = SimpleNamespace(get_all_new_messages=lambda: messages)
+        c._wait_for_workers_ready()
+        return c.max_concurrent_requests
+
+    assert conductor(None, [40, None, 12]) == 12
+    assert conductor(None, [None]) is None
+    assert conductor(8, [40]) == 8
+    with caplog.at_level(logging.WARNING, logger="mstar.conductor.conductor"):
+        assert conductor(64, [40]) == 64
+    assert "max_concurrent_requests 64 is more than the 40 requests" in caplog.text
+
+
+def test_the_startup_check_leaves_an_unsized_pool_to_the_engine():
+    spec = KVSpec("kv", {"n"}, PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=1 << 20))
+    assert pools_hold_concurrency([spec], _model(), {"max_concurrent_requests": 64}) == []

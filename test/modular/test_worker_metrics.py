@@ -330,7 +330,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w.tp_async_sched, w.is_tp_follower = False, False
     w._in_flight_rids = set()
     w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
-    w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
+    w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng, pool_concurrency=None)
     w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
     w.wakeup_event = SimpleNamespace(register_future=stub)
     w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")

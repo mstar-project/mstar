@@ -664,7 +664,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w.tensor_manager = tm
     w._graph_runtime = graph
     w.engine_manager = SimpleNamespace(
-        get_engine=lambda node: engine, warmup_all=lambda: None,
+        get_engine=lambda node: engine, warmup_all=lambda: None, pool_concurrency=None,
         remove_request=engine.remove_request, evictable_nodes=lambda: (),
     )
     w.request_state = graph

@@ -2078,16 +2078,34 @@ class Conductor:
         logger.info(
             "Conductor waiting for %d worker(s) to finish setup", len(pending)
         )
+        held: list[int] = []
         while pending:
             for message in self.communicator.get_all_new_messages():
                 if message.message_type == ConductorMessageType.SETUP_DONE:
                     pending.discard(message.body.worker_id)
+                    if message.body.max_concurrent_requests is not None:
+                        held.append(message.body.max_concurrent_requests)
                 else:
                     self._startup_message_backlog.append(message)
             if pending:
                 self._poll_worker_liveness()
                 time.sleep(0.01)
         logger.info("Conductor: all %d worker(s) ready", len(self.worker_ids))
+        if held:
+            self._cap_at_sized_pools(min(held))
+
+    def _cap_at_sized_pools(self, held: int) -> None:
+        """Default ``max_concurrent_requests`` to what the pools workers sized from memory
+        hold at once, so the requests past them wait here rather than on a worker."""
+        if self.max_concurrent_requests is None:
+            self.max_concurrent_requests = held
+            logger.info("Conductor: max_concurrent_requests %d, what the sized pools hold", held)
+        elif self.max_concurrent_requests > held:
+            logger.warning(
+                "Conductor: max_concurrent_requests %d is more than the %d requests the pools "
+                "sized from memory hold at their max_seq_len; past that, requests wait on the workers",
+                self.max_concurrent_requests, held,
+            )
 
     def _route_message(
         self, message, done_partition_forwards: list[tuple[str, str, bool]],
