@@ -1081,6 +1081,29 @@ class Cosmos3OmniTransformer(nn.Module):
             gen_seq = layer.forward_gen(gen_seq, cos, sin, attend, seq_sizes)
         return gather_sequence(sp, gen_seq, seq_sizes)
 
+    def gen_layers_batched(self, gen_seq, cos, sin):
+        """The generation layer stack and final norm over ``denoise_step_batched``'s
+        cross-request pack, against the attention it bound. Apart from that
+        method, so the submodule can compile it alone: only the pack's length
+        depends on the batch, so with that length dynamic one compile serves
+        every batch size and mix of resolutions, while the per-request parts
+        around it run eager."""
+        attend = self._gen_attend
+        sp = self.sp_group
+        if sp.world_size == 1:
+            for i, layer in enumerate(self.layers):
+                attend.set_layer_idx(i)
+                gen_seq = layer.forward_gen(gen_seq, cos, sin, attend)
+            return self.norm_moe_gen(gen_seq)
+        seq_sizes = sp_seq_split(gen_seq.shape[0], sp.world_size)
+        gen_seq = scatter_sequence(sp, gen_seq, seq_sizes)
+        cos = scatter_sequence(sp, cos, seq_sizes)
+        sin = scatter_sequence(sp, sin, seq_sizes)
+        for i, layer in enumerate(self.layers):
+            attend.set_layer_idx(i)
+            gen_seq = layer.forward_gen(gen_seq, cos, sin, attend, seq_sizes)
+        return self.norm_moe_gen(gather_sequence(sp, gen_seq, seq_sizes))
+
     def denoise_step(
         self,
         latents: torch.Tensor,
@@ -1328,8 +1351,8 @@ class Cosmos3OmniTransformer(nn.Module):
         all_gen = torch.cat(gen_seqs + gen_seqs, dim=0)
         cos = torch.cat(cos_cond + cos_uncond, dim=0)
         sin = torch.cat(sin_cond + sin_uncond, dim=0)
-        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, label, attn)
-        gen_out = self.norm_moe_gen(all_gen)
+        self._gen_attend.bind_step(attn=attn, label=label)
+        gen_out = self.gen_layers_batched(all_gen, cos, sin)
 
         sizes = [g.shape[0] for g in gen_seqs]
         total = sum(sizes)

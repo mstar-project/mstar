@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -277,6 +278,23 @@ class GenStepInfo:
     retention: Mapping[str, RetentionPolicy] | None = None
 
 
+class _WarmupAttention:
+    """What ``Cosmos3DiTSubmodule.warmup_compiles`` binds in place of the
+    attention resource: no plan to read, a zero output of the query's size."""
+
+    requires_kv_write = False
+
+    def set_default_label(self, label: str) -> None:
+        del label
+
+    def set_default_layer_idx(self, layer_idx: int) -> None:
+        del layer_idx
+
+    def run(self, q: torch.Tensor, **kwargs) -> torch.Tensor:
+        del kwargs
+        return torch.zeros_like(q)
+
+
 class Cosmos3DiTSubmodule(ARNodeSubmodule):
     """Dual-pathway DiT node (understanding tower + generation denoiser)."""
 
@@ -341,12 +359,52 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 self.transformer.denoise_step_batched_cfg, **kwargs,
             )
             if config.compile_denoise_batched:
-                # One graph per batch composition: dynamo unrolls the
-                # per-request loop, so the first batch of each size compiles.
-                self.transformer.denoise_step_batched = torch.compile(
-                    self.transformer.denoise_step_batched, **kwargs,
+                # Only the cross-request step's layer stack, with the pack
+                # length dynamic: one compile, built by `warmup_compiles`
+                # before the first request, serves every batch size and mix of
+                # resolutions. The per-request patchify, rotary and unpatchify
+                # around it run eager.
+                self.transformer.gen_layers_batched = torch.compile(
+                    self.transformer.gen_layers_batched, **{**kwargs, "dynamic": True},
                 )
             logger.info("Cosmos3 denoise compute torch.compile enabled (%s)", config.denoise_compile_mode)
+
+    def warmup_compiles(self) -> None:
+        """Build the compiled cross-request layer stack before the first
+        request: one two-request step at the default size, through
+        ``denoise_step_batched`` with a stand-in attention, since no request
+        has planned one yet. The attention call is a graph break, so what the
+        stand-in returns never enters a compiled graph, and the graph does not
+        depend on the size it was built at."""
+        if not (self.config.compile_denoise and self.config.compile_denoise_batched) or self.transformer is None:
+            return
+        cfg = self.config
+        frames = cfg.num_frames_video if cfg.video_size_default is not None else 1
+        width, height = (int(x) for x in (cfg.video_size_default or cfg.image_size_default))
+        device = self.get_device()
+        static = self._build_static(
+            [0] * 8, height, width, num_frames=frames, fps=24.0, has_image_condition=False, device=device,
+        )
+        row = {
+            "latents": torch.zeros(
+                self._latent_shape(height, width, frames), device=device,
+                dtype=self.transformer.proj_in.weight.dtype,
+            ),
+            "vision_timesteps": torch.zeros(static["num_noisy_vision_tokens"], device=device),
+            "position_ids_cond": static["vision_mrope_ids"],
+            "position_ids_uncond": static["vision_mrope_ids"],
+            "vision_token_shapes": static["vision_token_shapes"],
+            "vision_noisy_frame_indexes": static["vision_noisy_frame_indexes"],
+            "vision_mse_loss_indexes": static["mse_gen_indexes"],
+        }
+        t0 = time.perf_counter()
+        # as `forward_batched` runs it: native dtype, no autocast
+        with torch.autocast(device_type=device.type, enabled=False):
+            self.transformer.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
+        logger.info(
+            "Cosmos3 cross-request layer stack compiled in %.1f s (%dx%dx%d, two requests)",
+            time.perf_counter() - t0, width, height, frames,
+        )
 
     def to(self, *args, **kwargs):
         # The engine casts this submodule to bf16; the timestep embedder must stay

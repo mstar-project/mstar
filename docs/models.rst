@@ -1007,27 +1007,30 @@ result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
 request at a time when outputs must be bitwise repeatable.
 
 The denoise step is compiled (``compile_denoise``) in Inductor's deterministic
-mode by default (``denoise_compile_mode: deterministic``): kernel configs are
-picked by rule, so a seed gives the same video from every server process.
-``default`` is torch.compile's own defaults, and ``level`` takes the ``mstar
-serve -O`` level's options (``-O2``: max-autotune).
+mode by default (``denoise_compile_mode: deterministic``, the engine's compile
+mode of that name): kernel configs are picked by rule, so a seed gives the same
+video from every server process. ``default`` is torch.compile's own defaults,
+and ``level`` takes the ``mstar serve -O`` level's options (``-O2``:
+max-autotune).
 
 Video clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
 one decoder call per latent, channels-last, in the decode dtype (bf16 with
-cuDNN >= 9.16, otherwise fp32; see above), on the node's own decoder-only copy
-of the VAE. The first two calls (the clip-start latent and the one after it)
+cuDNN >= 9.16, otherwise fp32; see above), on the decoder-only copy of the VAE
+the channels-last decoders on a GPU share. The first two calls (the clip-start latent and the one after it)
 run eager; every later call is compiled in Inductor's deterministic mode. An
 image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
 is faster for a single frame. False decodes everything with the compiled stock
 ``vae.decode`` on the shared instance.
 
 Two or more requests at the same denoise step run one cross-request forward
-(``max_gen_batch_size``, default 8), compiled with the same mode
-(``compile_denoise_batched``) for video, image and sound; the action step runs
-eager. At 832x480x121 one request's guidance pair is
-24k tokens, which already fills the GPU's GEMM and attention throughput, so a
-batch of N costs N single steps: batching keeps requests in step rather than
-adding throughput. The first batch of each size compiles on arrival.
+(``max_gen_batch_size``, default 8) for video, image and sound; the action step
+runs eager. With ``compile_denoise_batched`` (default on) its layer stack is
+compiled with the same mode, once, while the server starts, with the packed
+length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
+per-request patchify, rotary tables and unpatchify around it run eager. At
+832x480x121 one request's guidance pair is 24k tokens, which already fills the
+GPU's GEMM and attention throughput, so a batch of N costs about N single
+steps: batching keeps requests in step rather than adding throughput.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
