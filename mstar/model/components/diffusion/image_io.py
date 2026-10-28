@@ -8,7 +8,6 @@ patchified 2x2 into ``[B, 4C, H/2, W/2]`` and packed to tokens ``[B, (H/2)(W/2),
 from __future__ import annotations
 
 import io
-import os
 import struct
 import zlib
 from concurrent.futures import ThreadPoolExecutor
