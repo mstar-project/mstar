@@ -28,6 +28,7 @@ MODEL_USAGE = {"input_tokens": "inputTokens", "cache_creation_input_tokens": "ca
 PROGRESS = re.compile(r"[#*_\s]*progress[*_\s]*:", re.IGNORECASE)
 NOTE_CHARS = 6000
 LAST_TEXT_CHARS = 3000
+ELIDED = " [...] "
 
 
 def load(paths):
@@ -158,8 +159,8 @@ def handoff(messages, root, diff_paths, previous=None):
                 key = b.get("id") or f"no-id-{len(comments)}"
                 comments[key] = {
                     "id": key, "path": inp.get("path"), "line": inp.get("line") or inp.get("startLine"),
-                    "body": str(inp.get("body", "")).strip().split("\n")[0][:160], "status": status,
-                    "error": first_line(res.get("content"))[:200] if status == "failed" else "",
+                    "body": shorten(str(inp.get("body", "")).strip().split("\n")[0], 160), "status": status,
+                    "error": shorten(first_line(res.get("content")), 200) if status == "failed" else "",
                 }
             elif kind == "tool_use" and b.get("name") == "Read" and inp.get("file_path"):
                 path = str(inp["file_path"])
@@ -175,10 +176,20 @@ def handoff(messages, root, diff_paths, previous=None):
         "comments": list(comments.values()),
         "reads": sorted(reads),
         "not_opened": [p for p in diff_paths if p not in opened],
-        "note": (note or prev.get("note") or "")[:NOTE_CHARS],
-        "last_text": (last_text or prev.get("last_text") or "")[-LAST_TEXT_CHARS:],
+        "note": shorten(note or prev.get("note") or "", NOTE_CHARS),
+        "last_text": shorten(last_text or prev.get("last_text") or "", LAST_TEXT_CHARS),
         "seen_assistant": any(map(from_api, messages)),
     }
+
+
+def shorten(text, limit):
+    """``text`` in at most ``limit`` characters, its middle dropped. The cuts fall on whitespace,
+    so a credential the workflow redacts afterwards is either whole or gone, never a fragment its
+    patterns miss."""
+    if len(text) <= limit:
+        return text
+    keep = (limit - len(ELIDED)) // 2
+    return re.sub(r"\S+$", "", text[:keep]).rstrip() + ELIDED + re.sub(r"^\S+", "", text[-keep:]).lstrip()
 
 
 def result_text(content):

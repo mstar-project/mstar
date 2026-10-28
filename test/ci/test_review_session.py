@@ -167,6 +167,15 @@ class TestHandoff(unittest.TestCase):
                      assistant("m2", text("Progress was slow on this file."))], ROOT, [])
         self.assertEqual(h["note"], "**Progress:** P1 `a.py:3`, verified", "prose would replace the real note")
 
+    def test_a_long_note_keeps_its_end_and_cuts_between_words(self):
+        token = "ghs_" + "A" * 36
+        note = "Progress: " + " ".join([token] * 400) + " left: b.py"
+        h = handoff([assistant("m1", text(note))], ROOT, [])
+        self.assertTrue(h["note"].endswith("left: b.py"), "what is left would be cut off")
+        for kept in (h["note"], h["last_text"]):
+            self.assertLessEqual(set(kept.split()), {"Progress:", token, "[...]", "left:", "b.py"},
+                                 "a cut inside a credential leaves a fragment the redaction misses")
+
     def test_diff_paths_skip_deleted_files_and_hunk_lines(self):
         diff = ("diff --git a/x b/x\n--- a/x\n+++ /dev/null\ndiff --git a/y b/y\n--- a/y\n+++ b/y\n"
                 "@@ -1 +1,2 @@\n+++ b/not-a-file\n")
