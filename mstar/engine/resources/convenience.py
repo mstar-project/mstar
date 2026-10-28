@@ -1,3 +1,5 @@
+from typing import NamedTuple
+
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
@@ -8,6 +10,7 @@ from mstar.engine.resources.attn.ragged.base import (
 )
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
+from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, KDAPlan, SpecBlocks
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
 
@@ -126,6 +129,92 @@ class LinearAttnCallable:
             a_log=a_log,
             dt_bias=dt_bias,
         )
+
+
+class _KDALayerBlocks(NamedTuple):
+    conv: torch.Tensor
+    state: torch.Tensor
+    spec: SpecBlocks | None  # the speculative blocks, on a pool that keeps them
+
+
+class KDACallable:
+    """:class:`LinearAttnCallable` for Kimi delta attention: the layer hands over
+    its projections and ``KDAParams``, and this resolves the layer's conv and state
+    blocks and, for a verify step, its speculative blocks, so neither the layer
+    nor the manager holds the pool. ``set_prefix_len`` settles a verify step.
+
+    Same cursor protocol (``bind_step`` once per stack, ``set_layer_idx`` per KDA
+    layer, counting KDA layers only); a ``layer_idx`` argument supersedes the
+    cursor.
+    """
+
+    def __init__(self, pool: RecurrentStatePool, attn: KDAManager | None = None):
+        self.pool = pool
+        self.attn = attn
+        self._layer_idx = 0
+        # layer -> its block views: the pool's tensors never move, so once per layer
+        self._blocks: dict[int, _KDALayerBlocks] = {}
+
+    @torch.compiler.disable
+    def bind_step(self, label: str, attn: KDAManager | None = None) -> None:
+        if attn is not None:
+            self.attn = attn
+        assert self.attn is not None, (
+            "no KDA resource: pass `attn` here or at construction"
+        )
+        self.attn.set_default_label(label)
+
+    @property
+    def label(self) -> str:
+        return self.attn.default_label
+
+    @property
+    def conv_dtype(self) -> torch.dtype:
+        """The conv window's dtype in the pool. The kernels read the window beside
+        the projected activations, so a layer checks its projections against it."""
+        return self.pool.block("conv", 0).dtype
+
+    @torch.compiler.disable
+    def set_layer_idx(self, layer_idx: int) -> None:
+        self._layer_idx = layer_idx
+        self.attn.set_default_layer_idx(layer_idx)
+
+    def current_plan(self) -> KDAPlan:
+        """This step's plan under the bound label: whether it decodes or verifies."""
+        return self.attn.current_plan()
+
+    @torch.compiler.disable
+    def __call__(
+        self,
+        qkv: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, params: KDAParams,
+        gate: torch.Tensor | None = None, layer_idx: int | None = None,
+    ) -> torch.Tensor:
+        """``KDAManager.run`` on this layer's blocks; see it for the shapes."""
+        layer = self._layer_idx if layer_idx is None else layer_idx
+        blocks = self._blocks.get(layer)
+        if blocks is None:
+            blocks = self._blocks[layer] = _KDALayerBlocks(
+                self.pool.block("conv", layer), self.pool.block("state", layer),
+                SpecBlocks.of(self.pool, layer) if self.attn.speculative_tokens else None,
+            )
+        return self.attn.run(
+            qkv, g, beta, blocks.conv, blocks.state, params, gate=gate, spec=blocks.spec,
+        )
+
+    @torch.compiler.disable
+    def set_prefix_len(self, accepted: torch.Tensor) -> None:
+        """After a verify step, ``accepted [rows]`` each row's accepted drafts: its
+        first ``accepted + 1`` tokens (the drafts and the token after them) are the
+        prefix the next step replays, from the side this step wrote. Device ops at
+        the plan's slot ids, so a captured step records them; padding rows write
+        the sink. Every layer shares the count and the side."""
+        plan = self.current_plan()
+        rows = plan.num_rows
+        slots = plan.slot_ids[:rows].long()
+        count = (accepted[:rows] + 1).to(torch.int32).unsqueeze(1)
+        prefix_len, side = self.pool.block("spec_len"), self.pool.block("spec_side")
+        prefix_len.index_copy_(0, slots, count)
+        side.index_copy_(0, slots, 1 - side.index_select(0, slots))
 
 
 class RaggedAttentionCallable:
