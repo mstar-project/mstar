@@ -399,14 +399,14 @@ def test_subsampling_kernel_matches_eager_ops():
 
 @_needs_gpu
 @pytest.mark.parametrize("causal", [False, True], ids=["offline", "causal"])
-def test_triton_encoder_matches_eager_and_single_requests(causal, monkeypatch):
+def test_triton_encoder_matches_eager_and_single_requests(causal, monkeypatch, torch_flag):
     """The whole encoder on the GPU, fp32 without TF32: the Triton path
     agrees with the eager one, and a padded batch gives each row what it
     gets alone."""
     from mstar.model.components import fastconformer_kernels
 
-    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch_flag(torch.backends.cudnn, "allow_tf32", False)
+    torch_flag(torch.backends.cuda.matmul, "allow_tf32", False)
     torch.manual_seed(16)
     config = _causal_config(3) if causal else FastConformerConfig.from_hf(TINY)
     enc = FastConformerEncoder(config).eval().cuda()

@@ -30,6 +30,7 @@ Text-only mode:
 
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from jinja2 import TemplateError
@@ -61,6 +62,7 @@ from mstar.model.base import (
     KVLabel,
     LabelLayout,
     Model,
+    PrefixKeys,
     ProcessPromptOutput,
     Span,
     TensorAndMetadata,
@@ -133,6 +135,19 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
         logger.warning("Error downloading from HuggingFace: %s", str(e))
         return repo_id
     return str(Path(local_dir))
+
+
+class ImageSpan(NamedTuple):
+    length: int
+    advance: int
+
+
+def image_span(grid_thw: torch.Tensor, merge_size: int) -> ImageSpan:
+    """An image's tokens share one temporal position and sit on the merged
+    grid, so it advances the position by the grid's longer side."""
+    t, h, w = (int(n) for n in grid_thw)
+    h, w = h // merge_size, w // merge_size
+    return ImageSpan(t * h * w + 2, max(h, w) + 2)
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +327,14 @@ class Qwen3OmniModel(Model):
                 top_p=model_kwargs.get("code_predictor_top_p", 0.8),
             )
         }
+
+    def checkpoint_path(self) -> str:
+        return self.local_dir
+
+    def _audio_frames(self, seqlens: torch.Tensor) -> torch.Tensor:
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
+
+        return _get_feat_extract_output_lengths(seqlens, n_window=self.config.audio_encoder.n_window)
 
     def _get_max_talker_output_tokens(self, **model_kwargs):
         return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
@@ -1284,12 +1307,9 @@ class Qwen3OmniModel(Model):
         The Talker prefills every step's rows except those of a system or earlier
         assistant turn. It then prefills its assistant prefix, and writes a row per decode step.
         """
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
-
         from mstar.model.qwen3_omni.submodules import TalkerSubmodule, talker_text_mask
 
         merge = self.config.vision.spatial_merge_size
-        grids = {"image": tensors["image_grid_thw"], "video": tensors["video_grid_thw"]}
         thinker, talker, position = [], [], 0
         for step in plan:
             if step.modality == TEXT:
@@ -1298,12 +1318,16 @@ class Qwen3OmniModel(Model):
                 kept = int(talker_text_mask(ids, self.config).sum())
             elif step.modality == "audio":
                 # the encoder's rows between two sentinels
-                rows = int(_get_feat_extract_output_lengths(tensors["audio_seqlens"][step.index])) + 2
+                rows = int(self._audio_frames(tensors["audio_seqlens"][step.index])) + 2
                 span = Span("digest", "prefill_audio", rows, rows, ("audio", step.index))
                 kept = rows
+            elif step.modality == "image":
+                image = image_span(tensors["image_grid_thw"][step.index], merge)
+                span = Span("digest", "prefill_vision", image.length, image.advance, ("image", step.index))
+                kept = image.length
             else:
-                grid = grids[step.modality][step.index]
-                per_grid = tensors["video_second_per_grid"][step.index].item() if step.modality == "video" else None
+                grid = tensors["video_grid_thw"][step.index]
+                per_grid = tensors["video_second_per_grid"][step.index].item()
                 rows = int(grid.prod()) // merge ** 2 + 2
                 # the walk moves the counter one past its end sentinel, which follows the grid's largest position
                 positions = get_rope_index_vision(
@@ -1311,14 +1335,18 @@ class Qwen3OmniModel(Model):
                     spatial_merge_size=merge, seconds_per_grid=per_grid,
                 )
                 advance = int(positions.max()) + 2 - position
-                span = Span("digest", "prefill_vision", rows, advance, (step.modality, step.index))
+                span = Span("digest", "prefill_vision", rows, advance, ("video", step.index))
                 kept = rows
             thinker.append(span)
             talker.append(Span("rows", "talker_prefill", kept, kept, "thinker_states"))
             position += span.advance
         prefix = TalkerSubmodule.TALKER_LAST_PREFILL_TOKENS_PER_REQ
+        # A prompt with a video keys only its leading text, since keying past it has never been run or tested.
+        video = any(step.modality == "video" for step in plan)
         return {
-            THINKER_KV: {"main": LabelLayout(spans=tuple(thinker), growth=(("thinker_decode_loop", 1),))},
+            THINKER_KV: {"main": LabelLayout(
+                spans=tuple(thinker), growth=(("thinker_decode_loop", 1),), keyed_spans=1 if video else None,
+            )},
             TALKER_KV: {"main": LabelLayout(
                 spans=(*talker, Span("rows", "talker_last_prefill", prefix, prefix, "thinker_states")),
                 growth=(("talker_decode_loop", 1),),
@@ -1332,9 +1360,12 @@ class Qwen3OmniModel(Model):
         }
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        """The Thinker keys its prompt by text ids, each image and audio clip by
+        file, and its replies as they decode."""
         return {
             THINKER_KV: {"main": KVLabel(
                 growth=(("thinker_decode", "thinker_decode_loop"),),
+                keys=PrefixKeys("text_inputs", ("prefill_text", "prefill_vision", "prefill_audio"), growth=True),
             )},
             TALKER_KV: {"main": KVLabel(
                 growth=(("talker_decode", "talker_decode_loop"),),
