@@ -347,6 +347,7 @@ def test_whole_clip_decoder_keeps_its_default_layout_and_cudnn_flag(monkeypatch)
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Config()
     cfg.vae_decode_cudnn_benchmark = True
+    cfg.vae_decode_fast = False  # the stock whole-clip path; the fast one is tested below
     assert cfg.vae_decode_channels_last
     vae = _tiny_vae()
     sub = Cosmos3VAEDecoderSubmodule(vae, cfg)
@@ -359,6 +360,27 @@ def test_whole_clip_decoder_keeps_its_default_layout_and_cudnn_flag(monkeypatch)
     with torch.no_grad():
         ref = vae.decode(sub._vae_input(stream)).sample
     assert torch.equal(video, (ref / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8))
+
+
+def test_fast_whole_clip_decode_matches_stock_decode(monkeypatch) -> None:
+    """vae_decode_fast decodes a whole clip through the shared decoder,
+    channels-last, on the node's own VAE: the frames of the stock decode."""
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    ref_vae = _tiny_vae()
+    stream = _stream(5)
+    stock = Cosmos3VAEDecoderSubmodule(ref_vae, Cosmos3Config(vae_decode_fast=False))
+    stock._decode_dtype_cached = torch.float32
+    want = stock._decode_pixels(stream)
+    fast_vae = _tiny_vae()
+    fast_vae.load_state_dict(ref_vae.state_dict())
+    cfg = Cosmos3Config()
+    assert cfg.vae_decode_fast
+    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    fast = Cosmos3VAEDecoderSubmodule(fast_vae, cfg)
+    assert is_channels_last(fast_vae)
+    got = fast._decode_pixels(stream)
+    assert got.shape == want.shape
+    assert (got.int() - want.int()).abs().max() <= 1
 
 
 @pytest.mark.parametrize("enabled", [False, True])

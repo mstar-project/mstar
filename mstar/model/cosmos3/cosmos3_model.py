@@ -1835,9 +1835,14 @@ class Cosmos3Model(Model):
                 vae=self._build_encode_vae(device), config=self.config
             )
         if node_name == VAE_DECODER_NODE:
-            return Cosmos3VAEDecoderSubmodule(
-                vae=self._build_vae(device), config=self.config
+            # The fast decode converts its VAE to channels-last in place, so it
+            # takes a decoder-only copy rather than the shared instance.
+            vae = (
+                self._build_decoder_only_vae(device)
+                if self.config.vae_decode_fast
+                else self._build_vae(device)
             )
+            return Cosmos3VAEDecoderSubmodule(vae=vae, config=self.config)
         if node_name == VAE_DECODER_AR_NODE:
             # Shares the decoder VAE weights unless it decodes channels-last,
             # which converts the VAE in place; only the streaming chunk state

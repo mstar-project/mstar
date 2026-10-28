@@ -409,7 +409,8 @@ def test_vae_decode_bf16_warmup(monkeypatch) -> None:
 
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")  # keep _decode the raw stub
     vae = _StubVAE()
-    sub = Cosmos3VAEDecoderSubmodule(vae, Cosmos3Config())
+    # the stock compiled-decode path (vae_decode_fast routes around it)
+    sub = Cosmos3VAEDecoderSubmodule(vae, Cosmos3Config(vae_decode_fast=False))
     sub._decode_compiled = True
     sub._decode_dtype_cached = torch.bfloat16
 
@@ -749,3 +750,52 @@ if __name__ == "__main__":
     if NANO_DIR.exists():
         test_process_prompt_emits_cond_and_uncond()
     print("PASS")
+
+
+def test_vae_decode_fast_routes_whole_clips_through_the_shared_decoder(monkeypatch) -> None:
+    """With vae_decode_fast the whole-clip node decodes through
+    wan_vae.decode_causal from an empty cache, channels-last."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.components import wan_vae
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderSubmodule
+
+    class _StubVAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+            self.decoder = torch.nn.Identity()
+            self.config = SimpleNamespace(latents_mean=[0.0] * 4, latents_std=[1.0] * 4)
+
+        def decode(self, z):  # the stock path, never taken here
+            raise AssertionError("stock vae.decode called")
+
+    calls = []
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    monkeypatch.setattr(wan_vae, "to_channels_last", lambda vae: calls.append("channels_last"))
+    monkeypatch.setattr(wan_vae, "new_feat_cache", lambda vae: [])
+
+    def fake_decode_causal(vae, z, feat_cache, step, *, clip_start, latents_per_call=1):
+        calls.append(("decode_causal", clip_start, feat_cache == []))
+        t = 1 + (z.shape[2] - 1) * 4
+        return torch.zeros(1, 3, t, 8, 8, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(wan_vae, "decode_causal", fake_decode_causal)
+    sub = Cosmos3VAEDecoderSubmodule(_StubVAE(), Cosmos3Config())
+    sub._decode_dtype_cached = torch.bfloat16
+    out = sub.forward("video_gen", None, torch.zeros(1, 4, 3, 8, 8, dtype=torch.bfloat16))
+    assert calls == ["channels_last", ("decode_causal", True, True)]
+    assert out["video_output"][0].shape == (1, 3, 9, 8, 8)
+    assert out["video_output"][0].dtype == torch.uint8
+
+
+def test_vae_decode_fast_must_be_a_bool() -> None:
+    import pytest
+
+    from mstar.model.cosmos3.config import Cosmos3Config
+
+    with pytest.raises(ValueError, match="vae_decode_fast must be true or false"):
+        Cosmos3Config(vae_decode_fast="false").check_streaming_decode()

@@ -383,6 +383,12 @@ class Cosmos3Config:
     # sharing the whole-clip decoder's, which keeps the default layout: a fixed
     # ~1.03 GiB of bf16 weights (Wan2.2 VAE) in a process hosting both nodes.
     vae_decode_channels_last: bool = True
+    # Decode a whole clip (the non-windowed video and image walks) with the
+    # shared Wan VAE decoder: the same per-latent decoder calls as
+    # ``vae.decode`` from an empty cache, channels-last and compiled per call in
+    # Inductor's deterministic mode, on a decoder-only copy of the VAE (~1 GiB
+    # bf16). False decodes with the compiled stock ``vae.decode``.
+    vae_decode_fast: bool = True
     # Let cuDNN time its conv algorithms for each new streaming-decode shape
     # (once, then cached) instead of its heuristic pick. Same math, but the
     # timed pick can differ between server launches, and so can the frames
@@ -540,7 +546,8 @@ class Cosmos3Config:
         reinterpret silently: a non-boolean switch (a yaml ``"false"`` is
         truthy), a negative warm-stream cap (read as no cap), or more latents
         per call than the default window holds (read as one call per window)."""
-        for name in ("windowed_decode_warm_cache", "vae_decode_channels_last", "vae_decode_cudnn_benchmark"):
+        for name in ("windowed_decode_warm_cache", "vae_decode_channels_last", "vae_decode_cudnn_benchmark",
+                     "vae_decode_fast"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")

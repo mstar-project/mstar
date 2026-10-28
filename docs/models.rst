@@ -997,6 +997,11 @@ picked by rule, so a seed gives the same video from every server process.
 ``default`` is torch.compile's own defaults, and ``level`` takes the ``mstar
 serve -O`` level's options (``-O2``: max-autotune).
 
+Whole clips decode through the shared Wan VAE decoder (``vae_decode_fast``):
+bf16, channels-last, one compiled decoder call per latent in Inductor's
+deterministic mode, on the node's own decoder-only copy of the VAE. False
+decodes with the compiled stock ``vae.decode`` on the shared instance.
+
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``
