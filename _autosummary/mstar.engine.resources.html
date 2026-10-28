@@ -253,6 +253,7 @@
 <li class="toctree-l3 current active has-children"><a class="current reference internal" href="#">mstar.engine.resources</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
@@ -300,6 +301,12 @@
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.glm52.html">mstar.model.glm52</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.glm52.components.html">mstar.model.glm52.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.glm52.config.html">mstar.model.glm52.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.glm52.weight_loader.html">mstar.model.glm52.weight_loader</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -416,6 +423,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.fp8_block.html">mstar.utils.fp8_block</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.generation_kwargs.html">mstar.utils.generation_kwargs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.h2d.html">mstar.utils.h2d</a></li>
@@ -747,6 +755,18 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.CrossAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec.resource_class</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSAConfig"><code class="docutils literal notranslate"><span class="pre">DSAConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSAConfig.kv_cache"><code class="docutils literal notranslate"><span class="pre">DSAConfig.kv_cache</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSAConfig.topk"><code class="docutils literal notranslate"><span class="pre">DSAConfig.topk</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSASpec"><code class="docutils literal notranslate"><span class="pre">DSASpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSASpec.config"><code class="docutils literal notranslate"><span class="pre">DSASpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSASpec.depends_on"><code class="docutils literal notranslate"><span class="pre">DSASpec.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSASpec.resource_class"><code class="docutils literal notranslate"><span class="pre">DSASpec.resource_class</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSAStep"><code class="docutils literal notranslate"><span class="pre">DSAStep</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.FullAdmitOutcome"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.FullAdmitOutcome.failed_resource"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.failed_resource</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.FullAdmitOutcome.ok"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.ok</span></code></a></li>
@@ -1630,6 +1650,82 @@ resource stays free of the manager and its kernels.</p>
 <cite>AttentionManager</cite>, whose <cite>build</cite> picks a backend subclass.</p>
 </dd></dl>
 
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.DSAConfig">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">DSAConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">topk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/dsa/config.html#DSAConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.DSAConfig" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>kv_cache</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>topk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.DSAConfig.kv_cache">
+<span class="sig-name descname"><span class="pre">kv_cache</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.DSAConfig.kv_cache" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.DSAConfig.topk">
+<span class="sig-name descname"><span class="pre">topk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.DSAConfig.topk" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.DSASpec">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">DSASpec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resource_key</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="mstar.engine.resources.dsa.config.html#mstar.engine.resources.dsa.config.DSAConfig" title="mstar.engine.resources.dsa.config.DSAConfig"><span class="pre">mstar.engine.resources.dsa.config.DSAConfig</span></a></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/dsa/config.html#DSASpec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.DSASpec" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>resource_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.engine.resources.dsa.config.html#mstar.engine.resources.dsa.config.DSAConfig" title="mstar.engine.resources.dsa.config.DSAConfig"><em>DSAConfig</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.DSASpec.config">
+<span class="sig-name descname"><span class="pre">config</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.dsa.config.html#mstar.engine.resources.dsa.config.DSAConfig" title="mstar.engine.resources.dsa.config.DSAConfig"><span class="pre">DSAConfig</span></a></span><a class="headerlink" href="#mstar.engine.resources.DSASpec.config" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.DSASpec.depends_on">
+<span class="sig-name descname"><span class="pre">depends_on</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/dsa/config.html#DSASpec.depends_on"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.DSASpec.depends_on" title="Link to this definition">#</a></dt>
+<dd><p>Keys whose specs this one builds against; the engine resolves them
+into <code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.dependencies</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.DSASpec.resource_class">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resource_class</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><span class="pre">type</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.DSASpec.resource_class" title="Link to this definition">#</a></dt>
+<dd><p>What builds this spec. Imported inside the property, so declaring a
+resource stays free of the manager and its kernels.</p>
+<p>The builder, not necessarily the class built: an attention spec names
+<cite>AttentionManager</cite>, whose <cite>build</cite> picks a backend subclass.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.DSAStep">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">DSAStep</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">segments</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><span class="pre">mstar.engine.resources.step.Segment</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/dsa/config.html#DSAStep"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.DSAStep" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.ResourceStep" title="mstar.engine.resources.step.ResourceStep"><code class="xref py py-class docutils literal notranslate"><span class="pre">ResourceStep</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>segments</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.Segment" title="mstar.engine.resources.step.Segment"><em>Segment</em></a><em>, </em><em>...</em><em>] </em><em>| </em><em>None</em>)</p>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py class">
@@ -4627,28 +4723,31 @@ conductor validates a deployment.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.base.html#module-mstar.engine.resources.base" title="mstar.engine.resources.base"><code class="xref py py-obj docutils literal notranslate"><span class="pre">base</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.kv.html#module-mstar.engine.resources.kv" title="mstar.engine.resources.kv"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.dsa.html#module-mstar.engine.resources.dsa" title="mstar.engine.resources.dsa"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dsa</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.position.html#module-mstar.engine.resources.position" title="mstar.engine.resources.position"><code class="xref py py-obj docutils literal notranslate"><span class="pre">position</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.kv.html#module-mstar.engine.resources.kv" title="mstar.engine.resources.kv"><code class="xref py py-obj docutils literal notranslate"><span class="pre">kv</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.recurrent.html#module-mstar.engine.resources.recurrent" title="mstar.engine.resources.recurrent"><code class="xref py py-obj docutils literal notranslate"><span class="pre">recurrent</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.position.html#module-mstar.engine.resources.position" title="mstar.engine.resources.position"><code class="xref py py-obj docutils literal notranslate"><span class="pre">position</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.rms_norm.html#module-mstar.engine.resources.rms_norm" title="mstar.engine.resources.rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rms_norm</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.recurrent.html#module-mstar.engine.resources.recurrent" title="mstar.engine.resources.recurrent"><code class="xref py py-obj docutils literal notranslate"><span class="pre">recurrent</span></code></a></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.rms_norm.html#module-mstar.engine.resources.rms_norm" title="mstar.engine.resources.rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rms_norm</span></code></a></p></td>
 <td><p>Backend-neutral RMSNorm operator.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.runner.html#module-mstar.engine.resources.runner" title="mstar.engine.resources.runner"><code class="xref py py-obj docutils literal notranslate"><span class="pre">runner</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.runner.html#module-mstar.engine.resources.runner" title="mstar.engine.resources.runner"><code class="xref py py-obj docutils literal notranslate"><span class="pre">runner</span></code></a></p></td>
 <td><p>sequencing for resource call cycle</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.sampler.html#module-mstar.engine.resources.sampler" title="mstar.engine.resources.sampler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.sampler.html#module-mstar.engine.resources.sampler" title="mstar.engine.resources.sampler"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sampler</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.spec.html#module-mstar.engine.resources.spec" title="mstar.engine.resources.spec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.spec.html#module-mstar.engine.resources.spec" title="mstar.engine.resources.spec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec</span></code></a></p></td>
 <td><p>Resource declarations models hand to the engine.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.step.html#module-mstar.engine.resources.step" title="mstar.engine.resources.step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">step</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.step.html#module-mstar.engine.resources.step" title="mstar.engine.resources.step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">step</span></code></a></p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -4791,6 +4890,18 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.CrossAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec.resource_class</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSAConfig"><code class="docutils literal notranslate"><span class="pre">DSAConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSAConfig.kv_cache"><code class="docutils literal notranslate"><span class="pre">DSAConfig.kv_cache</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSAConfig.topk"><code class="docutils literal notranslate"><span class="pre">DSAConfig.topk</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSASpec"><code class="docutils literal notranslate"><span class="pre">DSASpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSASpec.config"><code class="docutils literal notranslate"><span class="pre">DSASpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSASpec.depends_on"><code class="docutils literal notranslate"><span class="pre">DSASpec.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSASpec.resource_class"><code class="docutils literal notranslate"><span class="pre">DSASpec.resource_class</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.DSAStep"><code class="docutils literal notranslate"><span class="pre">DSAStep</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.FullAdmitOutcome"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.FullAdmitOutcome.failed_resource"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.failed_resource</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.FullAdmitOutcome.ok"><code class="docutils literal notranslate"><span class="pre">FullAdmitOutcome.ok</span></code></a></li>

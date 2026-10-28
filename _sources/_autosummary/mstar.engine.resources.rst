@@ -30,6 +30,7 @@ mstar.engine.resources
    attn
    base
    convenience
+   dsa
    kv
    linear_attn
    position

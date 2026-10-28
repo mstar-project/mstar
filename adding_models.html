@@ -252,6 +252,7 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.recurrent.html">mstar.engine.resources.recurrent</a></li>
@@ -299,6 +300,12 @@
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.glm52.html">mstar.model.glm52</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.glm52.components.html">mstar.model.glm52.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.glm52.config.html">mstar.model.glm52.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.glm52.weight_loader.html">mstar.model.glm52.weight_loader</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -415,6 +422,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.fp8_block.html">mstar.utils.fp8_block</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.generation_kwargs.html">mstar.utils.generation_kwargs</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
@@ -1158,10 +1166,10 @@ the same resource, they share one object. For example, BAGEL’s <code class="do
 branch nodes share one KV pool. A node that no spec names receives no resources. Such a
 node was called “stateless” in earlier versions.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">depends_on()</span></code> returns the keys of other specs that this spec is built against.
-<code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code> and <code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code> depend on the <code class="docutils literal notranslate"><span class="pre">kv_cache</span></code> key they name. If a
-spec names a dependency that the model does not declare, loading fails immediately,
-rather than during a forward pass. <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> is the one attention spec
-that depends on nothing: it names no cache, because it has none.</p></li>
+<code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code>, <code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code> and <code class="docutils literal notranslate"><span class="pre">DSASpec</span></code> depend on the <code class="docutils literal notranslate"><span class="pre">kv_cache</span></code> key they
+name. If a spec names a dependency that the model does not declare, loading fails
+immediately, rather than during a forward pass. <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> is the one
+attention spec that depends on nothing: it names no cache, because it has none.</p></li>
 </ul>
 <p>The spec types are:</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -1227,14 +1235,28 @@ fallback, which cannot be captured in a CUDA graph.
 own included. It needs the FlashInfer backend and causal attention, and the
 pages behind the window stay allocated.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">DSASpec(config=DSAConfig(kv_cache=...,</span> <span class="pre">topk=...))</span></code></p></td>
+<td><p>DeepSeek sparse attention (DSA) over the named <code class="docutils literal notranslate"><span class="pre">KVLayout.MLA</span></code> cache. A step
+declares <code class="docutils literal notranslate"><span class="pre">DSAStep()</span></code>, and the resource takes each request’s rows from the KV plan.
+The model’s indexer layers store their index keys (<code class="docutils literal notranslate"><span class="pre">store_keys</span></code>) and pick each
+query’s top <code class="docutils literal notranslate"><span class="pre">topk</span></code> positions by the indexer’s score (<code class="docutils literal notranslate"><span class="pre">select</span></code>); a layer that
+reuses an earlier layer’s pick reads it with <code class="docutils literal notranslate"><span class="pre">shared_selection</span></code>. <code class="docutils literal notranslate"><span class="pre">attend</span></code> runs
+absorbed MLA over just the picked latents. The keys sit in per-request buffers
+outside the paged pool and the selection runs per request on the host, so the
+resource is eager only, a prompt must fit in <code class="docutils literal notranslate"><span class="pre">topk</span></code> and past <code class="docutils literal notranslate"><span class="pre">topk</span></code> a request
+decodes one row per step. Once one row of a batch passes <code class="docutils literal notranslate"><span class="pre">topk</span></code>, every row of it
+attends its pick. GLM-5.2 declares it under <code class="docutils literal notranslate"><span class="pre">dsa_long_context</span></code>. Planned: the keys
+move onto the MLA cache’s pages under its page table, so the allocator, eviction and
+prefix caching cover them, and selection gets fixed-shape buffers so decode captures.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
 <td><p>Attention over a paged context that is written once and never extended.
 <code class="docutils literal notranslate"><span class="pre">backend</span></code> defaults to <code class="docutils literal notranslate"><span class="pre">AttnBackend.AUTO</span></code>. Only FlashInfer is implemented.
 A step whose rows each query one token runs FlashInfer’s decode kernel, and
 <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code> picks its variant as for <code class="docutils literal notranslate"><span class="pre">AttentionConfig</span></code>.
 See <a class="reference internal" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
 <td><p>Cacheless (ragged) varlen self-attention over the segments packed into one
 forward. Nothing is paged, and nothing carries to the next step.
 <code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> and
@@ -1246,25 +1268,29 @@ two CUDA-graph ceilings <code class="docutils literal notranslate"><span class="
 <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs FA3 <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm)
 and falls back to FlashInfer if that kernel is missing. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
 <td><p>The cross-attention counterpart: one span of each request attends another
 (<code class="docutils literal notranslate"><span class="pre">RaggedCrossAttentionStep(pairs=...)</span></code>). Same config. See <a class="reference internal" href="#cross-attention-between-spans">Cross-attention
 between spans</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec(config=RaggedAttentionConfig(...),</span> <span class="pre">block_size=...)</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedBlockCausalAttentionSpec(config=RaggedAttentionConfig(...),</span> <span class="pre">block_size=...)</span></code></p></td>
 <td><p>Block-causal self-attention within each span (<code class="docutils literal notranslate"><span class="pre">AttentionStep(causal=False)</span></code>): causal
 between <code class="docutils literal notranslate"><span class="pre">block_size</span></code>-token blocks, bidirectional within one. Same config. See
 <a class="reference internal" href="#block-causal-attention-within-spans">Block-causal attention within spans</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Position tracking and RoPE. <code class="docutils literal notranslate"><span class="pre">scheme</span></code> is <code class="docutils literal notranslate"><span class="pre">PosScheme.SEQUENTIAL</span></code> or
 <code class="docutils literal notranslate"><span class="pre">PosScheme.BLOCK</span></code>. The RoPE parameters are set here: <code class="docutils literal notranslate"><span class="pre">rope_theta</span></code>,
 <code class="docutils literal notranslate"><span class="pre">rope_scale</span></code>, and the Llama-3.1 parameters <code class="docutils literal notranslate"><span class="pre">low_freq_factor</span></code>,
-<code class="docutils literal notranslate"><span class="pre">high_freq_factor</span></code> and <code class="docutils literal notranslate"><span class="pre">old_context_len</span></code>. A model with learned position
+<code class="docutils literal notranslate"><span class="pre">high_freq_factor</span></code> and <code class="docutils literal notranslate"><span class="pre">old_context_len</span></code>. Layers rotate with
+<code class="docutils literal notranslate"><span class="pre">apply_qk(q,</span> <span class="pre">k,</span> <span class="pre">label)</span></code>. <code class="docutils literal notranslate"><span class="pre">pos_ids=</span></code> rotates at positions the model passes
+instead of the label’s plan, and <code class="docutils literal notranslate"><span class="pre">k=None</span></code> rotates one tensor. <code class="docutils literal notranslate"><span class="pre">interleave</span></code>
+selects GPT-J pairing, <code class="docutils literal notranslate"><span class="pre">rotary_dim</span></code> a partial rotation, and <code class="docutils literal notranslate"><span class="pre">rope_table_dtype</span></code>
+a cos/sin table built once (GLM-5.2 uses float32). A model with learned position
 embeddings also declares this spec, because it needs the position counter. Such a
 model never applies RoPE.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
 <td><p>A sampler with its own per-request parameter buffers, philox stream, and optional
 seen-token mask. <code class="docutils literal notranslate"><span class="pre">enable_repetion_penalty</span></code> declares a capability, not an
 intention. It selects which kernel variant is recorded into the captured graph.
@@ -1276,7 +1302,7 @@ Whether the penalty runs on a given step is decided from the
 decode loop keeps on the device beside its last sampled token. See
 <a class="reference internal" href="#device-loop-back">Device loop-back</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec(config=RecurrentStateConfig(...))</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec(config=RecurrentStateConfig(...))</span></code></p></td>
 <td><p>Fixed-size per-request state that carries between steps (an LSTM’s <code class="docutils literal notranslate"><span class="pre">h</span></code> and
 <code class="docutils literal notranslate"><span class="pre">c</span></code>, a cursor, a conv tail, a Mamba or gated-DeltaNet layer’s conv window and SSM
 state, a streaming encoder’s caches): one slot per request and label, <code class="docutils literal notranslate"><span class="pre">blocks</span></code>
@@ -1354,20 +1380,24 @@ node samples.</p></td>
 <td><p>The three or four specs above, plus a second <code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> for the encoder context
 and a <code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code> over that second cache.</p></td>
 </tr>
-<tr class="row-even"><td><p>A node that carries per-request state between steps of a loop (an RNN-T
+<tr class="row-even"><td><p>An LLM with DeepSeek sparse attention (GLM-5.2)</p></td>
+<td><p>The specs above over an MLA cache (<code class="docutils literal notranslate"><span class="pre">KVLayout.MLA</span></code>, <code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER_MLA</span></code>),
+plus a <code class="docutils literal notranslate"><span class="pre">DSASpec</span></code> over the same cache.</p></td>
+</tr>
+<tr class="row-odd"><td><p>A node that carries per-request state between steps of a loop (an RNN-T
 decoder, recurrent attention)</p></td>
 <td><p>A <code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec</span></code>, read and written with <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p>A node that samples with two different sets of parameters</p></td>
+<tr class="row-even"><td><p>A node that samples with two different sets of parameters</p></td>
 <td><p>Two <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> objects that both name the node, under different keys.</p></td>
 </tr>
-<tr class="row-even"><td><p>An encoder tower that attends within the segments of one packed forward</p></td>
+<tr class="row-odd"><td><p>An encoder tower that attends within the segments of one packed forward</p></td>
 <td><p>A <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code>, and nothing else. No <code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> and no
 <code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code>: there is no cache to page and no counter to advance. Needed
 only if the tower’s attention must run inside a CUDA graph; see
 <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p>ViT, VAE or audio encoder, codec decoder, projection stage, combine stage</p></td>
+<tr class="row-even"><td><p>ViT, VAE or audio encoder, codec decoder, projection stage, combine stage</p></td>
 <td><p>Usually nothing. Declare no spec that names the node, unless the node needs the
 row above.</p></td>
 </tr>
