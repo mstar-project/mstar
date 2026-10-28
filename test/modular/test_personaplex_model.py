@@ -240,13 +240,14 @@ def test_data_worker_emits_requested_modalities(with_text, reverse_ready):
         def dereference(self, uuid):
             self.released.append(uuid)
 
-    worker = types.SimpleNamespace(
-        tensor_manager=ReadyTensors(), model=model, out_queue=SimpleQueue(),
-        request_model_kwargs={},
-        tensor_uuid_to_metadata_per_request={},
-        request_output_state={}, enable_nvtx=False,
-    )
-    worker._queue_completed_output = types.MethodType(PreprocessWorkerThread._queue_completed_output, worker)
+    worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    worker.tensor_manager = ReadyTensors()
+    worker.model = model
+    worker.out_queue = SimpleQueue()
+    worker.request_model_kwargs = {}
+    worker.tensor_uuid_to_metadata_per_request = {}
+    worker.request_output_state = {}
+    worker.enable_nvtx = False
     worker._fail_request = lambda _rid, exc, _stage, **_kw: pytest.fail(f"data worker failed: {exc}")
     for edge in edges:
         PreprocessWorkerThread._read_result_tensor(worker, ResultTensors(
