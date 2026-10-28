@@ -2395,6 +2395,7 @@ def default_preprocess_threads(cpus: int | None = None) -> int:
 
         cpus = usable_cpus()
     return max(1, min(4, cpus // 4))
+    
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
