@@ -639,8 +639,8 @@ def test_rollout_harness_requires_worker_schedule_interleaving_and_cleanup_marke
             "DEBUG Executing: dit graph_walk=rollout ('rid-b',)",
             "DEBUG Executing: dit graph_walk=rollout ('rid-a',)",
             "DEBUG Executing: dit graph_walk=rollout ('rid-b',)",
-            "INFO Request cleanup complete: rid-a",
-            "INFO Request cleanup complete: rid-b",
+            "DEBUG Request cleanup complete: rid-a",
+            "DEBUG Request cleanup complete: rid-b",
         ]
     )
 

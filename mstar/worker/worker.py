@@ -1069,7 +1069,10 @@ class Worker:
         self._pending_removes.pop(request_id, None)
 
         laps.lap("misc")
-        logger.info("Request cleanup complete: %s", body.request_id)
+        # DEBUG: once per request on the main thread, it cost as much as the
+        # engine's own removal (test/waypoint/serve_rollout.py, which waits on
+        # it, runs the server at DEBUG)
+        logger.debug("Request cleanup complete: %s", body.request_id)
         laps.lap("log")
 
         # Last: frees the handle for reuse, so nothing above may run after it.
