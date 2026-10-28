@@ -40,9 +40,11 @@ on:
 permissions:
   contents: read
 
-# A newer push supersedes a PR or manual run; a release run is never cancelled.
+# A newer PR or manual run on the same ref cancels one in progress. Release
+# runs have their own group, so neither of those can cancel one; a release run
+# is never cancelled in progress, though a newer one still replaces a pending one.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
@@ -67,10 +69,10 @@ jobs:
           tool: cargo-about@0.9.2
       # The licenses of the crates and vendored C/C++ compiled into the wheel,
       # shipped in its dist-info/licenses (setuptools' default LICEN[CS]E*
-      # glob). Fails on any license rust/about.toml does not accept. Until a
-      # maintainer signs off on libzmq's LGPL-3.0-or-later that includes
-      # libzmq, so PR and manual runs, which publish nothing, accept that one
-      # license in a copy of the config and stay strict about every other.
+      # glob). Fails on any license rust/about.toml does not accept, which until
+      # a maintainer signs off includes libzmq's LGPL-3.0-or-later. PR and
+      # manual runs, which publish nothing, accept that one license in a copy
+      # of the config and stay strict about every other.
       - name: Collect third-party licenses
         run: |
           config=rust/about.toml
