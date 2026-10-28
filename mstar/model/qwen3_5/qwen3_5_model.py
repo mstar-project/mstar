@@ -19,7 +19,6 @@ from mstar.engine.resources.linear_attn.config import (
 )
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
-from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.multimodal import (
@@ -43,7 +42,6 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTN,
     ROPE,
-    SAMPLER,
     VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
@@ -70,6 +68,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         "vocab.json",
         "tokenizer.json",
         "merges.txt",
+        "generation_config.json",
     )
 
     def __init__(
@@ -173,12 +172,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                     splits=(MIXED_SPLIT,),
                 ),
             ),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes={"LLM"},
-                vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
-                enable_min_p=bool(self.sampling_defaults.get("min_p")),
-            ),
+            self._sampler_spec(self.config.vocab_size),
             *self._vision_resources(),
         ]
 

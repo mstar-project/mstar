@@ -327,7 +327,9 @@ group of sliding-window layers releasing the pages behind its window; see #855
 and #379), so the sliding layers hold their whole history: at 32k tokens about
 3.4x the KV the model needs, which costs concurrent requests, not
 correctness. Sampling defaults to the checkpoint's (temperature 1,
-top_p 0.95, top_k 64). ``reasoning_effort`` (``low``, ``medium``, ``high``,
+top_p 0.95, top_k 64); a request's ``min_p`` above 0 is refused (a 400)
+unless the checkpoint's generation_config sets a ``min_p``, which turns the
+sampler's min-p filter on. ``reasoning_effort`` (``low``, ``medium``, ``high``,
 ``xhigh``; default ``high``) sets the template's reasoning strength, and
 ``enable_thinking: false`` means ``low``, as the template has no off: the model
 still reasons, at the template's lowest strength. The reply
@@ -391,9 +393,12 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
-``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
-a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
-via ``extra_body``.
+``top_k``, ``min_p``, ``repetition_penalty``, ``penalize_prompt`` and
+``enable_thinking`` (default true; the template opens a ``<think>`` block) are
+read by the model but are not OpenAI fields — pass them via ``extra_body``.
+Sampling defaults to the checkpoint's generation_config, under whatever the
+request sets; a request's ``min_p`` above 0 is refused (a 400) unless the
+checkpoint sets a ``min_p``, which turns the sampler's min-p filter on.
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::

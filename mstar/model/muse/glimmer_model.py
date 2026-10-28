@@ -20,12 +20,10 @@ from mstar.engine.resources.attn.ragged.config import (
 )
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
-from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.multimodal import PromptPart, messages_from_parts, vision_encoder
 from mstar.model.multimodal_decoder import (
     MIXED_SPLIT,
-    SAMPLING_KEYS,
     MediaIntake,
     MultimodalDecoderModel,
     PreparedMedia,
@@ -35,7 +33,6 @@ from mstar.model.muse.config import (
     ATTN_SLIDING,
     KV_CACHE,
     ROPE,
-    SAMPLER,
     VISION_ATTN,
     MuseGlimmerConfig,
     MuseGlimmerVisionConfig,
@@ -49,7 +46,6 @@ from mstar.model.muse.processing import (
     preprocess_image,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import load_generation_defaults
 from mstar.utils.fast_tokenize import encode_ids
 
 logger = logging.getLogger(__name__)
@@ -95,10 +91,6 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                 f"token {self.config.image_token_id}"
             )
         self._bos_id = self.tokenizer.bos_token_id
-        # temperature 1, top_p 0.95 and top_k 64 for the 30B
-        self.sampling_defaults = {
-            k: v for k, v in load_generation_defaults(self.local_dir).items() if k in SAMPLING_KEYS
-        }
         self._processor = self._read_processor_config()
 
     def _read_processor_config(self) -> dict:
@@ -165,12 +157,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                 resource_key=ROPE, nodes={"LLM"},
                 config=PositionConfig(kv_cache=KV_CACHE, rope_theta=cfg.rope_theta),
             ),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes={"LLM"},
-                vocab_size=cfg.vocab_size,
-                enable_repetion_penalty=True,
-                enable_min_p=bool(self.sampling_defaults.get("min_p")),
-            ),
+            self._sampler_spec(cfg.vocab_size),
             RaggedAttentionSpec(
                 resource_key=VISION_ATTN, nodes={"vision_encoder"},
                 config=RaggedAttentionConfig(

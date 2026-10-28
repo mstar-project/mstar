@@ -2357,12 +2357,14 @@ through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, a
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, which is
 also the request's output budget), the KV label and its one-span layout (``kv_labels``,
 ``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
-the request's ``SAMPLING_KEYS`` over the model's ``sampling_defaults``; a model's
-``SamplerSpec`` sets ``enable_min_p`` only where ``sampling_defaults`` has a
+the request's ``SAMPLING_KEYS`` over ``sampling_defaults``, which ``__init__`` reads
+from the checkpoint's ``generation_config.json``), the LLM's ``SamplerSpec``
+(``_sampler_spec``, whose min-p filter is on only where the checkpoint defaults
 ``min_p``, so a request's ``min_p > 0`` is otherwise refused at admission), sharding, the
 submodule cache and where the files come from. A model sets ``NAME`` and
-``METADATA_FILES`` and writes ``__init__`` (setting ``config``, ``tokenizer``, ``media``
-and any ``sampling_defaults``), its resources (``MIXED_SPLIT`` is the attention
+``METADATA_FILES`` (with ``generation_config.json``) and writes ``__init__`` (setting
+``config``, ``tokenizer`` and ``media``), its resources (the sampler from
+``_sampler_spec``; ``MIXED_SPLIT`` is the attention
 resources' split of a mixed step), ``_prompt_ids`` and ``_create_submodule``. ``media`` holds a ``MediaIntake`` per attachment modality: its
 ``MediaEncoder`` (modalities may share one), its placeholder ``pad`` id, the sentinels
 a template leaves to its processor, how many placeholders an attachment fills

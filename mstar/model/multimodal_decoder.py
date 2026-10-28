@@ -4,13 +4,14 @@ An ``LLM`` node (a `SampledTokenDecoder`) behind the model's media encoders,
 on `mstar.model.multimodal`'s walks. The base owns what every such model
 writes the same way: the walks and the mixed text step, the decode loop's
 cap, media intake, the KV label and layout, the prefill walk, the
-forward-pass args, the sampler's request config, sharding, the submodule
+forward-pass args, the sampler (its spec, and each request's config over
+the checkpoint's generation_config defaults), sharding, the submodule
 cache, and where the files come from. A model sets `NAME` and
 `METADATA_FILES`, and writes its own ``__init__`` (calling this one, then
 setting ``config``, with ``max_position_embeddings`` and ``stop_token_ids``,
-``tokenizer``, ``media``, a `MediaIntake` per attachment modality, and any
-``sampling_defaults``), resources, ``_prompt_ids`` (render and tokenize) and
-``_create_submodule``.
+``tokenizer`` and ``media``, a `MediaIntake` per attachment modality),
+resources (the LLM's sampler from `_sampler_spec`), ``_prompt_ids`` (render
+and tokenize) and ``_create_submodule``.
 
 Not in ``multimodal.py``: ``mstar.model.base`` imports that module, so a
 `Model` subclass there would be a circular import.
@@ -31,7 +32,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources.sampler.config import SamplingReqConfig
+from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.graph.base import GraphSection, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
@@ -57,11 +58,9 @@ from mstar.model.multimodal import (
     text_combined_walks,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
+from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens, load_generation_defaults
 
-# the sampling knobs a request may set. A model's SamplerSpec enables the
-# min-p filter only where ``sampling_defaults`` sets min_p, so elsewhere a
-# min_p > 0 is refused at admission rather than dropped
+# the sampling knobs a request may set
 SAMPLING_KEYS = (
     "temperature", "top_p", "top_k", "min_p",
     "repetition_penalty", "penalize_prompt", "ignore_eos",
@@ -128,9 +127,8 @@ class MultimodalDecoderModel(Model):
 
     # one per attachment modality the model takes, set by its `__init__`
     media: tuple[MediaIntake, ...] = ()
-    # the checkpoint's sampling defaults, under whatever a request sets; a
-    # model's `__init__` may set its own. Read by `get_node_resources` (the
-    # sampler's min-p filter) as well as per request
+    # the checkpoint's sampling defaults, under whatever a request sets (set
+    # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
     _text_detokenizer: TextChunkDetokenizer | None = None
 
@@ -140,6 +138,9 @@ class MultimodalDecoderModel(Model):
         self.local_dir = self._resolve_model_metadata()
         # so weights are materialized at most once per node
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        self.sampling_defaults = {
+            k: v for k, v in load_generation_defaults(self.local_dir).items() if k in SAMPLING_KEYS
+        }
 
     def _resolve_model_metadata(self) -> str:
         local_path = Path(self.model_path_hf)
@@ -346,6 +347,16 @@ class MultimodalDecoderModel(Model):
     # -----------------------------------------------------------------------
     # Sampling
     # -----------------------------------------------------------------------
+
+    def _sampler_spec(self, vocab_size: int) -> SamplerSpec:
+        """The LLM's sampler. Its min-p filter is on only where the checkpoint
+        defaults min_p; elsewhere a request's min_p > 0 is refused at
+        admission (a 400), not dropped."""
+        return SamplerSpec(
+            resource_key=SAMPLER, nodes={"LLM"}, vocab_size=vocab_size,
+            enable_repetion_penalty=True,
+            enable_min_p=bool(self.sampling_defaults.get("min_p")),
+        )
 
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
