@@ -1,9 +1,11 @@
-"""``RecurrentStatePool.gather`` / ``scatter_``: a forward reads and writes its
-rows' slots through the step's addressing rather than indexing ``block()``.
+"""``RecurrentStatePool.gather`` / ``scatter_``, and ``write_new_`` /
+``reader`` for a block that holds a sequence per request: a forward reads and
+writes its rows' slots through the step's addressing rather than indexing
+``block()``.
 
 The CPU cases drive admit / plan / commit by hand, eagerly and through a
-replay's per-bucket buffers with padding rows. The CUDA case captures a graph
-over the replay addressing and replays it for different batches.
+replay's per-bucket buffers with padding rows. The CUDA cases capture a graph
+over the replay addressing and replay it for different batches.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepConte
 
 MAX_SLOTS = 6  # 5 usable, slot 0 is the sink
 SHAPE = (2, 8)
+SEQ = (10, 3)  # a sequence block: 10 entries of 3 a slot
 
 
 def build_pool(device: str = "cpu") -> RecurrentStatePool:
@@ -33,6 +36,7 @@ def build_pool(device: str = "cpu") -> RecurrentStatePool:
             blocks={
                 "h": RecurrentBlockConfig(shape=SHAPE, dtype=torch.float32),
                 "cursor": RecurrentBlockConfig(shape=(1,), dtype=torch.int64),
+                "seq": RecurrentBlockConfig(shape=SEQ, dtype=torch.float32),
             },
             max_slots=MAX_SLOTS,
         ),
@@ -71,6 +75,10 @@ def slot_of(pool: RecurrentStatePool, rid: str) -> int:
 
 def rows_of(n: int, base: float) -> torch.Tensor:
     return base + torch.arange(n * SHAPE[0] * SHAPE[1], dtype=torch.float32).view(n, *SHAPE)
+
+
+def seq_of(n: int, base: float) -> torch.Tensor:
+    return base + torch.arange(n * SEQ[1], dtype=torch.float32).view(n, SEQ[1])
 
 
 def advance(pool: RecurrentStatePool, inc: torch.Tensor) -> None:
@@ -242,6 +250,8 @@ def test_a_pool_without_a_sink_refuses_gather_and_scatter():
         pool.gather("h")
     with pytest.raises(ValueError, match="'no_sink_state' has no sink slot"):
         pool.scatter_("h", rows_of(2, 0.0))
+    with pytest.raises(ValueError, match="'no_sink_state' has no sink slot"):
+        pool.reader("h")
 
 
 def test_a_block_in_the_engine_dtype_takes_each_engines_own():
@@ -259,6 +269,45 @@ def test_a_block_in_the_engine_dtype_takes_each_engines_own():
     ]
     assert [pool.block("h", 0).dtype for pool in pools] == [torch.bfloat16, torch.float16]
     assert config.blocks["h"].dtype is None
+
+
+def test_a_request_writes_its_sequence_once_and_reads_entries_by_index():
+    """``write_new_`` writes a row's sequence on its request's first step and
+    leaves it on later ones, whatever they are handed; ``reader().at`` reads
+    each row's own entries, in the step's row order."""
+    pool = build_pool()
+    a, b = seq_of(4, 100.0), seq_of(7, 200.0)
+    step, ctx = eager(["a", "b"])
+    plan(pool, step, ctx)
+    pool.write_new_("seq", [a, b], layer_idx=1)
+    got = pool.reader("seq", layer_idx=1).at(torch.tensor([[0, 3], [6, 2]]))
+    torch.testing.assert_close(got, torch.stack([a[[0, 3]], b[[6, 2]]]))
+    assert bool((pool.block("seq", 0) == 0).all()), "layer 0 untouched"
+    pool.commit(step, ctx)
+
+    c = seq_of(SEQ[0], 300.0)
+    step, ctx = eager(["b", "c", "a"])
+    plan(pool, step, ctx)
+    nan = float("nan")
+    pool.write_new_("seq", [torch.full((7, SEQ[1]), nan), c, torch.full((4, SEQ[1]), nan)], layer_idx=1)
+    reader = pool.reader("seq", layer_idx=1)
+    torch.testing.assert_close(reader.at(torch.tensor([[6], [9], [0]])), torch.stack([b[[6]], c[[9]], a[[0]]]))
+    # an index past the slot's length reads its last entry
+    torch.testing.assert_close(reader.at(torch.tensor([[1], [12], [1]]))[1], c[[9]])
+    pool.commit(step, ctx)
+
+
+def test_padding_rows_write_no_sequence_and_read_the_sink():
+    pool = build_pool()
+    step, ctx = replay(["a"], bs=4)
+    plan(pool, step, ctx)
+    pool.write_new_("seq", [seq_of(2, 1.0), *[seq_of(3, -1.0)] * 3])
+    assert bool((pool.block("seq", 0)[SINK_SLOT] == 0).all()), "a padding row writes nothing"
+    reader = pool.reader("seq")
+    assert reader.slots.tolist() == [slot_of(pool, "a"), SINK_SLOT, SINK_SLOT, SINK_SLOT]
+    torch.testing.assert_close(reader.at(torch.tensor([[1]] * 4))[0], seq_of(2, 1.0)[[1]])
+    with pytest.raises(ValueError, match="holds 10 entries a slot; got 11"):
+        pool.write_new_("seq", [seq_of(SEQ[0] + 1, 0.0)])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
@@ -302,4 +351,44 @@ def test_a_captured_graph_addresses_the_rows_each_replay_plans():
             i, j = slot_of(ref, rid), slot_of(pool, rid)
             torch.testing.assert_close(pool.block("h", 1)[j], ref.block("h", 1)[i])
             assert pool.block("cursor", 0)[j].item() == ref.block("cursor", 0)[i].item()
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
+def test_a_captured_reader_reads_the_rows_each_replay_plans():
+    """A graph captured over a bucket's addressing reads, on each replay, the
+    sequences of the requests that replay planned, written by ``write_new_``
+    before it."""
+    pool = build_pool("cuda")
+    bs = 4
+    index = torch.zeros(bs, 2, dtype=torch.long, device="cuda")
+    out = torch.zeros(bs, 2, SEQ[1], device="cuda")
+
+    def read():
+        out.copy_(pool.reader("seq").at(index))
+
+    step, ctx = replay([], bs=bs, capture=True)
+    plan(pool, step, ctx)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            read()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        read()
+
+    lengths = dict(zip("abcd", (3, 10, 1, 6), strict=True))
+    seqs = {rid: seq_of(n, 100.0 * (i + 1)).cuda() for i, (rid, n) in enumerate(lengths.items())}
+    for real in (["a", "b"], ["c"], ["b", "d", "a", "c"], ["d", "a"]):
+        step, ctx = replay(real, bs=bs)
+        plan(pool, step, ctx)
+        pool.write_new_("seq", [seqs[rid] for rid in real])
+        ends = [[0, seqs[rid].shape[0] - 1] for rid in real]
+        index.copy_(torch.tensor(ends + [[0, 0]] * (bs - len(real))))
+        graph.replay()
+        expected = torch.stack([seqs[rid][end] for rid, end in zip(real, ends, strict=True)])
+        torch.testing.assert_close(out[: len(real)], expected)
+        pool.commit(step, ctx)
     torch.cuda.synchronize()

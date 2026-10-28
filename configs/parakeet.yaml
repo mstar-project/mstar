@@ -1,8 +1,9 @@
 model: "parakeet"
 max_seq_len: 8192
-# A request holds one decoder state slot from its first decode iteration until
-# it is torn down; the pool holds max_concurrent_requests of them plus its sink
-# slot, and the conductor queues the rest.
+# A request holds one slot, its decoder state and encoder output (14.9 MiB),
+# from its first decode iteration until it is torn down; the pool holds
+# max_concurrent_requests of them plus its sink slot, and the conductor queues
+# the rest.
 max_concurrent_requests: 128
 resources:
   transducer_state:

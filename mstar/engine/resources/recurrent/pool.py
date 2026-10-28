@@ -11,6 +11,7 @@ import logging
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -66,6 +67,22 @@ class RecurrentAddressing:
     host_has_state: Sequence[bool] | None = None
     # scatter_'s int64 copy of slot_indices, keyed by whether a graph capture made it
     scatter_index: dict[bool, torch.Tensor] = field(default_factory=dict, compare=False, repr=False)
+
+
+class SlotReader(NamedTuple):
+    """One layer of a block that holds a sequence per request, in this step's
+    rows' slots (``RecurrentStatePool.reader``). Plain tensors, so a compiled
+    step can take it as an input."""
+
+    block: torch.Tensor  # [max_slots, length, *rest]
+    slots: torch.Tensor  # [rows] int64, each row's slot (the sink for a padding row)
+
+    def at(self, index: torch.Tensor) -> torch.Tensor:
+        """Entries ``index`` ``[rows, k]`` of each row's sequence ->
+        ``[rows, k, *rest]``; an index past the block's length reads its last entry."""
+        length = self.block.shape[1]
+        flat = self.slots[:, None] * length + index.clamp(max=length - 1)
+        return self.block.flatten(0, 1).index_select(0, flat.reshape(-1)).view(*index.shape, *self.block.shape[2:])
 
 
 class RecurrentStatePool(Resource):
@@ -187,6 +204,47 @@ class RecurrentStatePool(Resource):
         if index is None:
             index = rows.scatter_index[capturing] = rows.slot_indices[: rows.num_rows].long()
         self._blocks[name][layer_idx].index_copy_(0, index, value)
+
+    def write_new_(
+        self, name: str, values: Sequence[torch.Tensor], layer_idx: int = 0, *, label: str = "main",
+    ) -> None:
+        """Write ``values[i]`` ``[n, *shape[1:]]`` into the first ``n`` entries
+        of block ``name`` in the slot of this step's row ``i``, for each row with
+        no saved state (its request's first step); every other row, and a
+        padding row, is skipped. ``values`` may stop before the padding rows.
+
+        For a block that holds a sequence per request, written once and then
+        read a few entries at a time with ``reader`` (an encoder's output, say).
+        Eager, before the forward (``preprocess``): it addresses the slots
+        through the plan's host copy, so a graph never records it."""
+        rows = self.addressing(label)
+        block = self._blocks[name][layer_idx]
+        pad = self.pad_index
+        dst, src = [], []
+        for slot, has_state, value in zip(rows.host_slot_indices, rows.host_has_state, values, strict=False):
+            if has_state or slot == pad:
+                continue
+            if value.shape[0] > block.shape[1]:
+                raise ValueError(
+                    f"recurrent state pool {self._name!r} block {name!r} holds {block.shape[1]} "
+                    f"entries a slot; got {value.shape[0]}"
+                )
+            dst.append(block[slot, : value.shape[0]])
+            src.append(value)
+        if dst:
+            # one launch for the step's rows: a copy_ each cost 0.6 ms of host time at 64 rows
+            torch._foreach_copy_(dst, src)
+
+    def reader(self, name: str, layer_idx: int = 0, *, label: str = "main") -> SlotReader:
+        """Block ``name`` in this step's rows' slots under ``label``, for a
+        forward to read a few entries of each row's sequence (``SlotReader.at``)
+        through the step's plan, as ``gather`` reads; padding rows read the
+        sink, which a pool without one refuses. One per forward: a captured
+        graph records the plan's buffers, and a replay reads its own plan."""
+        if self.config.disable_sink_slot:
+            self._need_sink("reader")
+        rows = self.addressing(label)
+        return SlotReader(self._blocks[name][layer_idx], rows.slot_indices[: rows.num_rows].long())
 
     def _need_sink(self, op: str) -> None:
         # Without a sink, rows with no slot address NO_SLOT, which index_select

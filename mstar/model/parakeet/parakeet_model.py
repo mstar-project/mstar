@@ -11,8 +11,8 @@ frames to skip; Nemotron conditions every frame on a language prompt.
 Architecture (2 nodes, single partition):
     audio_encoder — log-mel + FastConformer, batched
     transducer    — greedy decoding, a chunk of steps per loop iteration,
-                    batched; each request's decoder state in a recurrent
-                    state slot
+                    batched; each request's decoder state and encoder output
+                    in a recurrent state slot
 
 Graph walk:
     transcribe — audio_encoder -> a transducer loop over the encoder output:
@@ -28,13 +28,14 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec
-from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
+from mstar.engine.resources.recurrent import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
+    FRAMES,
     NUM_FRAMES,
     PROMPT_ID,
     TRANSDUCER_STATE,
@@ -85,14 +86,21 @@ class ParakeetModel(Model):
         return int(self.config.encoder.output_lengths(num_samples // HOP_LENGTH))
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        # no cache and no sampler (decoding is greedy): the decoder state is all
+        # no cache and no sampler (decoding is greedy): a slot per request holds
+        # the decoder state and the clip's encoder output, written once by the
+        # first decode iteration
+        transducer = self.config.transducer
+        frames = RecurrentBlockConfig(
+            # the longest clip's frames, in the engine's dtype, which the encoder runs in
+            (self._num_frames(int(self.MAX_AUDIO_SECONDS * SAMPLE_RATE)), transducer.encoder_hidden_size), None,
+        )
         return [
             RecurrentStateSpec(
                 resource_key=TRANSDUCER_STATE, nodes={"transducer"},
                 config=RecurrentStateConfig(
                     # the LSTM's layers are in h's and c's shape
                     num_layers=1,
-                    blocks=self.config.transducer.state_blocks(),
+                    blocks={**transducer.state_blocks(), FRAMES: frames},
                     # + 1 for the pool's sink slot
                     max_slots=self.MAX_CONCURRENT_REQUESTS + 1,
                 ),

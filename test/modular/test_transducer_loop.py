@@ -4,11 +4,13 @@ declare_step -> admit -> plan -> preprocess -> forward_batched -> commit ->
 check_stop, per step.
 
 Requests of 1, 5, 17 and 30 frames join and leave at different iterations, in
-both frame buckets (small ones here), in eager steps and in steps padded to a
-capture bucket as a replay is. A stopped request rides along in one more
-iteration, and emits nothing. Each request's tokens must equal the one-request
-reference loop's. On CUDA a captured graph, replayed through the engine's runner,
-must emit what the eager steps do.
+one batch, in eager steps and in steps padded to a capture bucket as a replay
+is. A request's first iteration writes its frames into its slot; the later
+ones are handed frames of NaN, so a step that read anything but its slot
+would emit garbage. A stopped request rides along in one more iteration, and
+emits nothing. Each request's tokens must equal the one-request reference
+loop's. On CUDA a captured graph, replayed through the engine's runner, must
+emit what the eager steps do.
 """
 from __future__ import annotations
 
@@ -34,13 +36,12 @@ from mstar.model.parakeet.config import (
     ParakeetModelConfig,
 )
 from mstar.model.parakeet.parakeet_model import ParakeetModel
-from mstar.model.parakeet.submodules import TransducerSubmodule, _batch_sizes
+from mstar.model.parakeet.submodules import CAPTURE_BATCH_SIZES, TransducerSubmodule
 from mstar.model.submodule_base import BatchedModelOutput, HostRows, ModelInputsFromEngine
 
-BUCKETS = (8, 32)
 # steps an iteration, fewer than the node's CHUNK, so that requests span several iterations
 TEST_CHUNK = 16
-# (iteration the request joins at, its frames): 1 and 5 in the narrow bucket, 17 and 30 in the wide one
+# (iteration the request joins at, its frames)
 ARRIVALS = ((0, 17), (0, 1), (1, 30), (2, 5), (2, 30), (3, 1), (3, 17), (5, 5), (6, 30), (8, 1))
 # 5 usable, fewer than the requests: slots are freed and handed out again
 MAX_SLOTS = 6
@@ -124,16 +125,15 @@ class Harness:
         (spec,) = model.get_node_resources()
         spec.apply_yaml_overrides(max_slots=max_slots)
         self.device = torch.device(device)
-        self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=self.device))
+        # the engine's dtype, which the frames block takes, is the encoder's: fp32 here
+        self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=self.device, kv_dtype=torch.float32))
         self.resources = {TRANSDUCER_STATE: self.pool}
         self.runner = StepRunner(self.resources, node_resources={"transducer": [TRANSDUCER_STATE]})
-        self.node = TransducerSubmodule(head, compile_step=compile_step, frame_buckets=BUCKETS, chunk=TEST_CHUNK)
+        self.node = TransducerSubmodule(head, compile_step=compile_step, chunk=TEST_CHUNK)
         # as the engine does at load
         self.node.requires_grad_(False)
         self.node.bind_node_resources(self.resources)
-        self.configs = {
-            cfg.additional_key_info: cfg for cfg in self.node.get_accelerator_graph_configs(self.device)
-        }
+        (self.config,) = self.node.get_accelerator_graph_configs(self.device)
         self.precision = node_fp32_precision("transducer", self.node)
         # each request's encoder output, which the loop re-injects every iteration
         self.states: dict[int, torch.Tensor] = {}
@@ -171,8 +171,17 @@ class Harness:
         infos = {
             rid: _info(rid, self.states[rid].shape[0], self.iterations[rid], self.prompts[rid]) for rid in rids
         }
-        inputs = [self.node.prepare_inputs(WALK, infos[rid], {"encoder_states": [self.states[rid]]}) for rid in rids]
+        inputs = [
+            self.node.prepare_inputs(WALK, infos[rid], {"encoder_states": [self._reinjected(rid)]}) for rid in rids
+        ]
         return infos, inputs
+
+    def _reinjected(self, rid: int) -> torch.Tensor:
+        """The encoder output the loop hands an iteration: the clip on the
+        first, NaN of its shape after, which only a step that read the frames
+        anywhere but its slot would see."""
+        states = self.states[rid]
+        return states if self.iterations[rid] == 0 else torch.full_like(states, float("nan"))
 
     def iterate(self, rids: list[int], padded_to: int | None = None, runner=None) -> tuple[dict, set]:
         """One decode iteration of one capture group: eager, padded to a
@@ -180,14 +189,12 @@ class Harness:
         directly), or replayed by ``runner``. -> each request's tokens, and the
         requests check_stop ends."""
         infos, inputs = self._decode_inputs(rids)
-        bucket = self.node.cg_key_info(WALK, infos)
-        assert bucket == inputs[0].resource_step_info
         if runner is not None:
-            out = self._replay(runner, rids, infos, inputs, bucket)
+            out = self._replay(runner, rids, infos, inputs)
         elif padded_to is not None:
-            lease = SlotLease(slot=0, bucket=BucketKey(WALK, padded_to, padded_to, bucket))
-            padding = [dummy_rid_handle(f"__cg_transducer_{bucket}_slot0_{i}__") for i in range(len(rids), padded_to)]
-            inputs = [*inputs, *self.configs[bucket].get_node_inputs(len(padding), 0)]
+            lease = SlotLease(slot=0, bucket=BucketKey(WALK, padded_to, padded_to))
+            padding = [dummy_rid_handle(f"__cg_transducer_slot0_{i}__") for i in range(len(rids), padded_to)]
+            inputs = [*inputs, *self.config.get_node_inputs(len(padding), 0)]
             ctx = StepContext(request_ids=list(rids), graph_walk=WALK, slot=0, capture=False, slot_lease=lease)
             ctx.set_padded_rids([*rids, *padding])
             out = self._drive(WALK, inputs, infos, ctx)
@@ -204,12 +211,12 @@ class Harness:
             self.iterations[rid] += 1
         return dict(zip(rids, tokens.tolist(), strict=True)), set(stops)
 
-    def _replay(self, cg, rids, infos, inputs, bucket):
+    def _replay(self, cg, rids, infos, inputs):
         """The engine's ``_exec_single`` under a lease: pad, declare, admit, plan,
         preprocess, stage and replay, commit, release."""
-        lease = cg.lease_slot(WALK, bs=len(rids), slot=self.slot, num_tokens=len(rids), cg_key_info=bucket)
+        lease = cg.lease_slot(WALK, bs=len(rids), slot=self.slot, num_tokens=len(rids))
         self.slot += 1
-        assert lease is not None, f"no capture for {len(rids)} rows of bucket {bucket}"
+        assert lease is not None, f"no capture for {len(rids)} rows"
         padded = cg.pad_inputs(lease, inputs)
         ctx = StepContext(request_ids=list(rids), graph_walk=WALK, slot=lease.slot, capture=False,
                           slot_lease=lease)
@@ -231,8 +238,8 @@ class Harness:
 def _run(harness: Harness, clips, mode, runner=None, arrivals=ARRIVALS, prompts=None) -> dict[int, list[int]]:
     """Every request of ``arrivals`` through its decode loop. A request joins
     when a slot is free (the conductor's queue), each iteration runs one step
-    per frame bucket, and a request check_stop ends runs one more iteration
-    whose tokens are dropped."""
+    over every live request, and a request check_stop ends runs one more
+    iteration whose tokens are dropped."""
     prompts = prompts or [None] * len(arrivals)
     out: dict[int, list[int]] = {}
     waiting = list(range(len(arrivals)))
@@ -250,14 +257,14 @@ def _run(harness: Harness, clips, mode, runner=None, arrivals=ARRIVALS, prompts=
             out.update({rid: [] for rid in joining})
         if not live and not waiting:
             break
-        groups: dict[int | None, list[int]] = {}
-        for rid in live:
-            groups.setdefault(harness.node._bucket(harness.states[rid].shape[0]), []).append(rid)
         newly_stopped = set()
-        for group, (bucket, rids) in enumerate(sorted(groups.items())):
+        # the micro-scheduler's batches: at most MAX_BATCH_SIZE rows a step
+        width = harness.node.MAX_BATCH_SIZE
+        for group, start in enumerate(range(0, len(live), width)):
+            rids = live[start:start + width]
             padded_to = None
             if mode == "replay" or (mode == "mixed" and (iteration + group) % 2 == 0):
-                padded_to = next(bs for bs in _batch_sizes(bucket) if bs >= len(rids))
+                padded_to = next(bs for bs in CAPTURE_BATCH_SIZES if bs >= len(rids))
             tokens, stops = harness.iterate(rids, padded_to=padded_to, runner=runner)
             for rid in rids:
                 if rid in stopped:
@@ -341,7 +348,7 @@ def test_the_loop_cap_covers_the_most_steps_a_clip_takes():
     model.config = ParakeetModelConfig("parakeet_rnnt", FastConformerConfig(), cfg)
     assert model.get_loop_caps(**{NUM_FRAMES: 30}) == {DECODE_LOOP: cfg.decode_iterations(30)}
     assert model.get_loop_caps() == {}
-    node = TransducerSubmodule(head, compile_step=False, frame_buckets=BUCKETS)
+    node = TransducerSubmodule(head, compile_step=False)
     info = _info(0, 30, iterations=cfg.decode_iterations(30) - 1)
     assert node.check_stop(0, info, {"active": [torch.tensor([True])]}) == set()
     assert node.check_stop(0, info, {"active": [torch.tensor([False])]}) == {DECODE_LOOP}
@@ -351,11 +358,10 @@ def test_the_loop_cap_covers_the_most_steps_a_clip_takes():
 @pytest.mark.parametrize("durations", [[0, 1, 2, 3, 4], []], ids=["tdt", "rnnt"])
 @pytest.mark.parametrize("bs", [1, 3, 64])
 def test_captured_iterations_match_eager(durations, bs):
-    """The engine's runner captures one graph per frame bucket and batch size
-    over the pool's capture addressing and replays it for batches of
-    different requests: the same tokens as eager steps of the compiled step.
-    ``bs`` requests of the wide bucket start together; two narrow ones join
-    later."""
+    """The engine's runner captures one graph per batch size over the pool's
+    capture addressing and replays it for batches of different requests: the
+    same tokens as eager steps of the compiled step. ``bs`` requests start
+    together; two short ones join later."""
     import gc
 
     from mstar.distributed.communication import CommGroup, JointGroups

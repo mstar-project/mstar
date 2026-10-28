@@ -14,6 +14,7 @@ from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
+    FRAMES,
     NUM_FRAMES,
     PROMPT_ID,
     TRANSDUCER_STATE,
@@ -96,7 +97,11 @@ def test_graph_and_process_prompt(tmp_path, nemotron):
     (pool,) = model.get_node_resources()
     assert isinstance(pool, RecurrentStateSpec) and pool.resource_key == TRANSDUCER_STATE
     assert pool.nodes == {"transducer"} and pool.config.usable_slots == model.MAX_CONCURRENT_REQUESTS
-    assert pool.config.blocks.keys() == {"h", "c", "dec_out", "cursor", "symbols"}
+    assert pool.config.blocks.keys() == {"h", "c", "dec_out", "cursor", "symbols", FRAMES}
+    # the longest clip's encoder output, in the engine's dtype
+    longest = model.config.encoder.output_lengths(int(model.MAX_AUDIO_SECONDS * 16_000) // 160)
+    block = pool.config.blocks[FRAMES]
+    assert block.shape == (longest, ENCODER["hidden_size"]) and block.dtype is None
     out = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(8000)]},
                                language="de")
     tensors = out.new_input_tensors

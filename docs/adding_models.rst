@@ -611,8 +611,13 @@ The spec types are:
        ``pool.scatter_(name, value)``; both follow the step's plan, so there is no
        addressing to fetch, and eager and captured steps reach the same slots. A row with
        no saved state (a request's first step, or a padding row) reads ``start``, zeros
-       when none is given. ``gather`` / ``scatter_`` need the sink, so leave
-       ``disable_sink_slot`` unset. Parakeet's transducer decode is the example.
+       when none is given. A block that holds a sequence per request (an encoder's
+       output, shape ``(max length, ...)``) is written once, on the request's first step,
+       with ``pool.write_new_(name, values)`` in ``preprocess``, and the forward reads a
+       few entries of each row's at a time with ``pool.reader(name).at(index)``.
+       ``gather`` / ``scatter_`` / ``reader`` need the sink, so leave
+       ``disable_sink_slot`` unset. Parakeet's transducer decode is the example: its
+       slots hold the decoder state and the clip's encoder output.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:

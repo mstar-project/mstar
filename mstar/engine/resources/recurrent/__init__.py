@@ -12,6 +12,7 @@ from mstar.engine.resources.recurrent.pool import (
     SINK_SLOT,
     RecurrentAddressing,
     RecurrentStatePool,
+    SlotReader,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "RecurrentStatePool",
     "RecurrentStateSpec",
     "RecurrentStep",
+    "SlotReader",
 ]

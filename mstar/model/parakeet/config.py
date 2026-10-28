@@ -16,8 +16,9 @@ from mstar.model.utils import GRANARY_LANGUAGES, base_language
 SUPPORTED_MODEL_TYPES = ("parakeet_tdt", "parakeet_rnnt", "nemotron3_5_asr")
 
 WALK, DECODE_LOOP = "transcribe", "decode_loop"
-# each request's decoding state between iterations of the decode loop
-TRANSDUCER_STATE = "transducer_state"
+# each request's decoding state between iterations of the decode loop, and its
+# encoder output (the FRAMES block), which the decode steps read at their cursors
+TRANSDUCER_STATE, FRAMES = "transducer_state", "frames"
 # model_kwargs and step_metadata keys, from process_prompt: the clip's encoder
 # frames, and Nemotron's language prompt
 NUM_FRAMES, PROMPT_ID = "num_frames", "prompt_id"
