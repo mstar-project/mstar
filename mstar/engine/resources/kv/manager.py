@@ -3656,29 +3656,21 @@ class KVManager(AttentionResource):
         Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
         but not another), allocator-init bugs, and any future code path
         that adds requests asymmetrically before ``warmup`` returns. The
-        ``all_gather`` itself is synchronizing, so no extra barrier is
-        needed on the success path.
+        vote itself is synchronizing, so no extra barrier is needed on the
+        success path.
         """
         if self._comm_group.world_size == 1:
             return
-        local_free = self._arena.num_free
-        local_t = torch.tensor(
-            [local_free], dtype=torch.int64, device=self._device,
-        )
-
-        for group in [
-            self._comm_group.tp_group, self._comm_group.sp_group
-        ]:
-            gathered = group.all_gather(local_t, dim=0)
-            values = gathered.cpu().tolist()
-            if any(v != values[0] for v in values):
-                raise RuntimeError(
-                    f"KV cache {self.name!r} has asymmetric num_free_pages "
-                    f"across TP ranks: {values}. v1 requires symmetric "
-                    "allocator state; check the YAML for per-rank-divergent "
-                    "max_num_pages / cpu_offload_pages, and any model code "
-                    "that calls add_request before warmup completes."
-                )
+        free = self._arena.num_free
+        lo, neg_hi = self._comm_group.agree([free, -free])
+        if lo != -neg_hi:
+            raise RuntimeError(
+                f"KV cache {self.name!r} has asymmetric num_free_pages "
+                f"across TP ranks: min {lo}, max {-neg_hi}. v1 requires symmetric "
+                "allocator state; check the YAML for per-rank-divergent "
+                "max_num_pages / cpu_offload_pages, and any model code "
+                "that calls add_request before warmup completes."
+            )
 
     def cleanup(self):
         self._transfer.cleanup()
