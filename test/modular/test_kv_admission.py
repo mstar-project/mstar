@@ -66,8 +66,26 @@ def _laid_out(kv, rid: str, tokens: list[int], keyed: bool = False) -> None:
     kv.ingest_request(rid, KVReqConfig(prefix_keys=keys, kv_layout=_layout(len(tokens))))
 
 
+_RUNNERS: dict[int, tuple[KVManager, StepRunner]] = {}
+
+
+def _runner(kv) -> StepRunner:
+    """The runner that admits for ``kv``, as the engine's does."""
+    if id(kv) not in _RUNNERS or _RUNNERS[id(kv)][0] is not kv:
+        _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv}, node_resources={NODE: ["kv"]}))
+    return _RUNNERS[id(kv)][1]
+
+
 def _ready(kv, rid: str, published: PublishedKVInfo | None = None) -> bool:
-    return kv.admit_retrieve(rid, NODE, WALK, published).ready
+    """A readiness check as the scheduler makes it, after it takes whatever has since been admitted."""
+    runner = _runner(kv)
+    mine = None if published is None else {"kv": published}
+    runner.admit_waiting(lambda other, node: mine if other == rid else None)
+    return runner.admit_retrieve(rid, NODE, WALK, mine).ready
+
+
+def _remove(kv, rid: str) -> None:
+    _runner(kv).remove_request(rid)
 
 
 def _probe(kv, rid: str, tokens: int) -> CachedPrefix | None:
@@ -82,7 +100,7 @@ def test_a_page_filed_after_a_lost_race_keeps_the_winners_pages_evictable():
     shared = list(range(48))
     _laid_out(kv, "a", shared, keyed=True)
     _grow(kv, "a", 48)
-    kv.remove_request("a")
+    _remove(kv, "a")
     evictable = set(kv._index.evictable())
 
     # "b" writes the same three pages without probing, so it loses the race for them, then files its fourth page
@@ -105,7 +123,7 @@ def test_nothing_passes_the_head_of_the_queue():
     kv = _queued()
 
     assert not _ready(kv, "short"), "a later request took the room the head waits for"
-    kv.remove_request("a")
+    _remove(kv, "a")
     assert _ready(kv, "long") and _ready(kv, "short"), "the queue didn't move once the head fit"
 
 
@@ -113,7 +131,7 @@ def test_removing_the_head_makes_the_next_request_the_head():
     kv = _queued()
     assert not _ready(kv, "short")
 
-    kv.remove_request("long")
+    _remove(kv, "long")
 
     assert _ready(kv, "short"), "a request that left still heads the queue"
 
@@ -122,17 +140,17 @@ def test_a_prompt_bigger_than_the_pool_fails_as_it_joins():
     kv = _manager(max_num_pages=4)
     _laid_out(kv, "a", list(range(64)))
 
-    outcome = kv.admit_retrieve("a", NODE, WALK, None)
+    outcome = _runner(kv).admit_retrieve("a", NODE, WALK)
 
     assert isinstance(outcome.reason, AdmitRuntimeError), "a request that can never fit holds the queue"
-    assert not kv._waiting
+    assert not _runner(kv)._waiting and not kv._asks
 
 
 def _cached(kv, tokens: list[int], held: bool) -> None:
     """Index ``tokens``, held by a live request or by the index alone."""
     _seed(kv, tokens)
     if not held:
-        kv.remove_request("seed")
+        _remove(kv, "seed")
 
 
 def test_a_held_hit_that_turns_evictable_before_the_probe_leaves_other_allotments_alone():
@@ -142,7 +160,7 @@ def test_a_held_hit_that_turns_evictable_before_the_probe_leaves_other_allotment
     _laid_out(kv, "a", tokens, keyed=True)
     assert _ready(kv, "a") and kv._allotments["a"].pages == 1
     # the hit pages "a" was credited for go back to the index alone, and "b" is allotted the room that frees
-    kv.remove_request("seed")
+    _remove(kv, "seed")
     _laid_out(kv, "b", list(range(500, 500 + kv._room() * PAGE_SIZE)))
     assert _ready(kv, "b") and kv._room() == 0
 
@@ -162,7 +180,7 @@ def test_a_hit_on_a_page_only_the_index_holds_is_allotted_as_if_fresh():
 
     # "a" hits 4 cached pages and writes 1, but "x" may evict them
     assert not _ready(kv, "a"), "the head was admitted into room its cache hit had to come from"
-    kv.remove_request("x")
+    _remove(kv, "x")
     assert _ready(kv, "a") and kv._allotments["a"].pages == 5
 
 
@@ -225,7 +243,7 @@ def test_a_repeat_whose_allotment_is_spent_leaves_its_image_end_to_the_walk():
     kv.ingest_request("c", _config([TEXT, IMAGE, list(range(400, 405))]))
     _probe(kv, "c", len(TEXT))
     assert _ready(kv, RID) and kv._allotments[RID].pages == 1
-    kv.remove_request("c")
+    _remove(kv, "c")
     _laid_out(kv, "b", list(range(kv._room() * PAGE_SIZE)))
     assert _ready(kv, "b") and kv._room() == 0
 
@@ -327,7 +345,7 @@ def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node
         assert not runner.admit_retrieve(rid, NODE, WALK).ready
 
     assert self_kv._allotments.keys() == {"r"}, "a request the cross pool holds back kept its self pool allotment"
-    assert next(iter(self_kv._waiting)) == "c", "\"d\" passed \"c\" in the self pool's queue"
+    assert runner._queues["kv_cache"][0] == "c", "\"d\" passed \"c\" in the self pool's queue"
     decode = self_kv.admit(KVStep(segments=(Segment("r", "main", 1),)), _ctx("r"))
     assert decode.ok, "requests waiting on the cross pool kept the room the running request decodes into"
 
@@ -350,7 +368,7 @@ def test_only_the_leaders_pool_holds_a_request_back_and_none_above_one_rank():
             _laid_out(kv, rid, list(range(80)))
 
         assert _ready(kv, "a") and _ready(kv, "b") is not holds, f"{node}'s pool at world size {world_size} decided"
-        assert holds or not (kv._allotments or kv._waiting), "a pool that doesn't decide kept admission state"
+        assert holds or not (kv._allotments or kv._asks), "a pool that doesn't decide kept admission state"
 
 
 def test_an_allotment_covers_only_the_labels_its_workers_nodes_open():
@@ -450,7 +468,7 @@ def _drive(kv, rng: random.Random, ops: int) -> list[str]:
             assert kv._allotments[rid].remaining == left, f"reload {rid} changed the unused part of its allotment"
             live[rid][0] = "running"
         elif op == "remove":
-            kv.remove_request(rid)
+            _remove(kv, rid)
             del live[rid]
         else:
             continue
@@ -470,7 +488,7 @@ def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
     for op in ("committed", "rolled back", "dropped", "refused", "reset", "offload", "reload", "remove"):
         assert sum(line.startswith(op) for line in log) >= 10, f"seed {SEED}: too few {op!r} to say anything"
     for rid in list(kv._streams):
-        kv.remove_request(rid)
+        _remove(kv, rid)
     host._land(kv)
     assert kv._unused == 0 and kv._arena.num_free + len(kv._index.evictable()) == 19, (
         f"seed {SEED}: pages or allotments outlived every request that held them"
@@ -501,7 +519,7 @@ def test_a_copy_from_the_host_waits_for_the_join_and_comes_out_of_the_allotment(
         assert not _ready(kv, rid)
     assert kv._host_copies == [], "a request still in the queue started a copy from the host"
 
-    kv.remove_request("big")
+    _remove(kv, "big")
     assert not _ready(kv, "b") and kv._host_copies, "\"b\" didn't start its copy once admitted"
     pages = kv._allotments["b"].pages
     assert kv._room() == room - pages, "the copy took room past \"b\"'s allotment"
@@ -517,7 +535,7 @@ def _full_of_cache_with_a_prefix_on_the_host():
     # four are the leaves an eviction takes first
     kv._index.evict(2)
     host._serve(kv, "c", list(range(500, 500 + 15 * host.PAGE_SIZE)))
-    kv.remove_request("c")
+    _remove(kv, "c")
     assert kv._arena.num_free == 0 and kv._index.num_pages() == 19
     return kv
 
@@ -563,7 +581,7 @@ def test_a_reload_counts_the_evictable_index_pages_it_keeps_as_room():
 def test_a_grant_that_evicts_counts_the_pages_the_host_has_no_copy_of():
     kv = host._manager(max_num_pages=8)
     host._serve(kv, "a", host.A_PROMPT + [1])
-    kv.remove_request("a")
+    _remove(kv, "a")
 
     host._serve(kv, "b", list(range(500, 500 + 3 * host.PAGE_SIZE)))
 

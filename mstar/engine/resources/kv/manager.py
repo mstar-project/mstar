@@ -2,7 +2,7 @@ import itertools
 import logging
 import os
 import threading
-from collections import Counter, OrderedDict
+from collections import Counter
 from collections.abc import Callable, Collection
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
@@ -47,6 +47,7 @@ from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
+    ASKS,
     AdmitFailedReason,
     AdmitOutcome,
     AdmitRuntimeError,
@@ -65,8 +66,17 @@ logger = logging.getLogger(__name__)
 # an admitted request's pages.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
-_WAIT = AdmitOutcome(ok=True, ready=False, held_back=True)
-_ADMITTED = AdmitOutcome(ok=True, admitted=True)
+
+class RoomMark(NamedTuple):
+    """A request `reserve` couldn't fit, and what it was measured against: the room, the pages the index
+    had filed, and how many of them were evictable."""
+    rid: str
+    node_name: str
+    graph_walk: str
+    published: "PublishedKVInfo | None"
+    room: int
+    filed: int
+    evictable: int
 
 
 @dataclass
@@ -319,7 +329,7 @@ class KVPageCounts(NamedTuple):
 class Allotment:
     """Pages an admitted request may take from free and evictable pages: its prompt, less the
     cache hits another request holds. ``remaining`` is its share of `KVManager._unused`, and
-    ``prompt`` is the request's prompt in pages, which `requeue` puts back in `_waiting`."""
+    ``prompt`` is the request's prompt in pages, which `unreserve` puts back in `_asks`."""
     pages: int
     remaining: int = 0
     prompt: int = 0
@@ -596,15 +606,15 @@ class KVManager(AttentionResource):
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
-        # Only a deciding pool keeps allotments and a queue. With more than one rank none decides.
+        # Only a deciding pool asks and keeps allotments. With more than one rank none decides.
         # Rank 0 would allot at readiness, after the step goes to the other ranks and before its
         # admit, so a grant could pass on one rank and fail on another.
         self._decides = self._world_size == 1 and leads
         # An allotment covers the labels `_nodes` open.
-        # `_waiting` is the queue in the order requests first asked, each with its prompt's pages.
+        # `_asks` holds the prompt pages of each request that asked and has no allotment yet.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         self._nodes = nodes
-        self._waiting: OrderedDict[str, int] = OrderedDict()
+        self._asks: dict[str, int] = {}
         self._allotments: dict[str, Allotment] = {}
         self._unused = 0
         if _DEBUG_ASSERTS and tp_cache:
@@ -1545,18 +1555,12 @@ class KVManager(AttentionResource):
         if self._host_copies:
             with self._lock:
                 self._land_host_copies()
-        joined = False
-        if self._decides and rid not in self._allotments:
-            held_back = self._hold_back(rid, node_name, graph_walk, published)
-            if held_back is not None:
-                return held_back
-            joined = True
         fetching = self._fetch_from_host(rid, node_name, graph_walk, published)
         if published is None:
             if fetching is None:
-                return _ADMITTED if joined else ADMIT_OK
+                return ADMIT_OK
             with self._lock:
-                return AdmitOutcome(ok=True, ready=self._check_ready(rid, fetching)[0], admitted=joined)
+                return AdmitOutcome(ok=True, ready=self._check_ready(rid, fetching)[0])
 
         if published.world_size != self._world_size:
             # terminal for this request, not for the worker serving it
@@ -3373,7 +3377,7 @@ class KVManager(AttentionResource):
             allotment = self._allotments.pop(rid, None)
             if allotment is not None:
                 self._unused -= allotment.remaining
-            self._waiting.pop(rid, None)
+            self._asks.pop(rid, None)
             if rid in self._streams:
                 for stream in self._streams[rid].values():
                     self._release_lease(rid, stream)
@@ -3556,56 +3560,83 @@ class KVManager(AttentionResource):
 
     # Admission
 
-    def _hold_back(
-        self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
-    ) -> AdmitOutcome | None:
-        """Return the outcome that holds ``rid`` back, or None once it has an allotment."""
-        with self._lock:
-            if rid not in self._waiting and (failed := self._enqueue(rid)) is not None:
-                return failed
-            if next(iter(self._waiting)) != rid:
-                return _WAIT
-            chains = [] if self._index is None else [
-                stream.chain for stream in self._streams[rid].values()
-                if stream.chain is not None and stream.chain.rooted is None
-            ]
-        # Requests are queued and removed on one thread only, so ``rid`` is still first in `_waiting`
-        # once the lock is taken again.
-        for chain in chains:
-            self._root_chain(chain)
-        with self._lock:
-            whole, charged = self._hit(rid, node_name, graph_walk, published)
-            need = self._waiting[rid] - whole
-            if need + charged > self._room():
-                return _WAIT
-            self._allotments[rid] = Allotment(pages=need + charged, prompt=self._waiting.pop(rid))
-            self._recount(rid)
-            return None
-
-    def _enqueue(self, rid: str) -> AdmitOutcome | None:
-        """Queue ``rid``, or return why it can never be admitted.
+    def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        """`ASKS` until ``rid`` has an allotment, or why it can never be admitted.
 
         A request that can't fit even in an empty pool fails here, and not after
         waiting behind every request ahead of it.
         """
-        overrides = self._overrides[rid]
-        prompt = overrides.pages(self._nodes, dict.fromkeys(overrides.loop_caps or (), 0), self.config.page_size)
-        capacity = self.config.request_pages
-        if prompt > capacity:
-            return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                f"KV {self.name}: request {rid} needs {prompt} pages for its prompt, "
-                f"and the pool has {capacity} for requests"
-            ))
-        self._waiting[rid] = prompt
-        return None
+        if not self._decides or rid in self._allotments:
+            return None
+        with self._lock:
+            if rid not in self._asks:
+                overrides = self._overrides[rid]
+                prompt = overrides.pages(
+                    self._nodes, dict.fromkeys(overrides.loop_caps or (), 0), self.config.page_size,
+                )
+                capacity = self.config.request_pages
+                if prompt > capacity:
+                    return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
+                        f"KV {self.name}: request {rid} needs {prompt} pages for its prompt, "
+                        f"and the pool has {capacity} for requests"
+                    ))
+                self._asks[rid] = prompt
+        return ASKS
 
-    def requeue(self, rid: str) -> None:
+    def reserve(
+        self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
+    ) -> RoomMark | None:
+        """Allot ``rid`` its prompt, less the cache hits another request holds."""
+        with self._lock:
+            if self._host_copies:
+                self._land_host_copies()
+            chains = [] if self._index is None else [
+                stream.chain for stream in self._streams[rid].values()
+                if stream.chain is not None and stream.chain.rooted is None
+            ]
+        # Requests ask and are removed on one thread only, so ``rid`` still asks once the lock is
+        # taken again.
+        for chain in chains:
+            self._root_chain(chain)
+        with self._lock:
+            pages, room = self._need(rid, node_name, graph_walk, published), self._room()
+            if pages > room:
+                return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
+            self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid))
+            self._recount(rid)
+            return None
+
+    def unreserve(self, rid: str) -> None:
         with self._lock:
             allotment = self._allotments.pop(rid)
             self._unused -= allotment.remaining
-            self._waiting[rid] = allotment.prompt
-            # back to the front of `_waiting`, so no later request passes ``rid``
-            self._waiting.move_to_end(rid, last=False)
+            self._asks[rid] = allotment.prompt
+
+    def grew_since(self, mark: RoomMark) -> bool:
+        """A newly filed page can raise a waiting request's hit, and a hit page another request
+        takes from the evictable set comes out of that request's allotment, not this one's."""
+        filed, evictable = self._index_counts()
+        room = self._arena.num_free + evictable - self._unused
+        grew = room > mark.room or filed != mark.filed or evictable < mark.evictable
+        if _DEBUG_ASSERTS and not grew and mark.rid in self._asks:
+            with self._lock:
+                pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
+                assert pages > self._room(), (
+                    f"KV {self.name}: {mark.rid} fits now, but nothing `grew_since` reads has moved "
+                    "since it didn't, so nothing would admit it"
+                )
+        return grew
+
+    def _need(
+        self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
+    ) -> int:
+        """The pages ``rid``'s allotment would take now. Caller holds the lock."""
+        whole, charged = self._hit(rid, node_name, graph_walk, published)
+        return self._asks[rid] - whole + charged
+
+    def _index_counts(self) -> tuple[int, int]:
+        """The pages the index has ever filed, and how many it holds evictable."""
+        return (0, 0) if self._index is None else (self._index.filed, len(self._index.evictable()))
 
     def _hit(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
@@ -3703,7 +3734,7 @@ class KVManager(AttentionResource):
     def _recount(self, rid: str) -> None:
         """Bring ``rid``'s share of `_unused` up to date after its pages or its allotment change.
 
-        A stale count would let the first request in `_waiting` be admitted into room an admitted request still needs.
+        A stale count would let a waiting request be admitted into room an admitted request still needs.
         """
         allotment = self._allotments.get(rid)
         if allotment is None:
