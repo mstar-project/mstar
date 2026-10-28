@@ -2034,12 +2034,23 @@ class Engine:
         spans: dict[str, torch.Tensor], num_rows: int,
     ) -> dict[str, torch.Tensor]:
         """The step's spans narrowed to its real rows (a replay pads past
-        them), refusing a span on an output the walk does not declare."""
-        undeclared = spans.keys() - submodule.spanned_outputs(graph_walk)
+        them), refusing a span on an output the walk does not declare and a
+        step that spans some declared outputs but not all: the per-request
+        path merges one forward's spans into another's by name, so every
+        forward on a walk has to return the same names."""
+        declared = submodule.spanned_outputs(graph_walk)
+        undeclared = spans.keys() - declared
         if undeclared:
             raise ValueError(
                 f"{type(submodule).__name__} returned spans for {sorted(undeclared)} "
                 f"on walk {graph_walk!r}, which spanned_outputs does not declare"
+            )
+        missing = declared - spans.keys()
+        if missing:
+            raise ValueError(
+                f"{type(submodule).__name__} returned spans for {sorted(spans)} on walk "
+                f"{graph_walk!r} but none for {sorted(missing)}: a step that returns spans "
+                f"returns one for every output spanned_outputs declares"
             )
         for name, span in spans.items():
             if span.dim() != 2 or span.shape[1] != 2 or span.shape[0] < num_rows:

@@ -212,12 +212,20 @@ class BatchedModelOutput:
                 self.row_outputs = {}
             self.row_outputs.update(other.row_outputs)
         # Unlike the stop buffers, spans cannot be dropped on a merge: a row
-        # left without its span would leave the step uncut.
+        # left without its span would leave the step uncut. Both sides span
+        # the same names (the engine checks a step against its declaration),
+        # so the rows concatenate name by name.
         if other.output_spans:
             if not self.output_spans:
                 self.output_spans = dict(other.output_spans)
                 self.span_request_ids = other.span_request_ids
             else:
+                if other.output_spans.keys() != self.output_spans.keys():
+                    raise ValueError(
+                        f"cannot merge spans for {sorted(self.output_spans)} with spans "
+                        f"for {sorted(other.output_spans)}: every forward of a step spans "
+                        f"the same outputs"
+                    )
                 self.output_spans = {
                     name: torch.cat([span, other.output_spans[name]])
                     for name, span in self.output_spans.items()

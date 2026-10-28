@@ -255,6 +255,32 @@ def test_spans_are_merged_in_request_order():
     assert a.output_spans["audio"].tolist() == [[1, 4], [0, 2]]
 
 
+def test_a_merge_of_spans_on_different_outputs_is_refused():
+    """A later forward's span on another name must not reach the store uncut,
+    nor fail the step with a KeyError on a name the first forward lacks."""
+    a = BatchedModelOutput(output_spans={"audio": torch.tensor([[1, 4]])}, span_request_ids=(7,))
+    b = BatchedModelOutput(
+        output_spans={"audio": torch.tensor([[0, 2]]), "level": torch.tensor([[0, 1]])},
+        span_request_ids=(9,),
+    )
+    with pytest.raises(ValueError, match="every forward of a step spans the same outputs"):
+        a.update(b)
+
+
+def test_a_step_spanning_only_some_declared_outputs_fails():
+    """Declaring two spanned outputs and spanning one would leave the other
+    uncut on some rows once per-request forwards are merged by name."""
+    class _Partial(_SpanningVocoder):
+        def spanned_outputs(self, graph_walk):
+            return frozenset({"audio", "level"})
+
+    engine, _ = _engine(_Partial())
+    batch = _batch({1: SAMPLES[1]})
+    engine.prepare_inputs(batch)
+    with pytest.raises(ValueError, match=r"but none for \['level'\]"):
+        engine.exec_and_postprocess(batch)
+
+
 class _Graph:
     def __init__(self, section):
         self.section = section

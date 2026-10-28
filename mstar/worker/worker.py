@@ -4090,7 +4090,9 @@ class Worker:
         (``NodeSubmodule.spanned_outputs``). Called once the step's completion
         event has fired, so the spans staged behind the step are on the host.
         The cut is a view, and it replaces the tensor in its list in place, so
-        an output the submodule also put under a second name is cut there too.
+        a second name that ``postprocess`` or ``unpack_packed_outputs`` gave
+        the same list is cut with it. Two names the forward returned on its own
+        get their own lists from the engine and keep their own widths.
         """
         spans = outputs.host_spans or outputs.output_spans
         per_rid = outputs.per_rid_outputs
