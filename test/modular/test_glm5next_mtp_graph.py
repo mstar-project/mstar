@@ -351,7 +351,7 @@ def test_long_context_captured_verify_matches_eager_and_greedy(greedy_long, gree
         assert split is None or split >= 4, (rid, split, eager[rid], greedy_long[batch][rid])
     ahead, _ = eng.generate(_prompts(lengths, seed=3), captured_decode=True, preplan=True)
     assert ahead == graph, ("preplanned", ahead, "graph", graph)
-    if batch in greedy_long_captured:  # a captured prefill seeds _mtp_len too
+    if batch in greedy_long_captured:  # a captured prefill seeds MTP_LEN too
         full, _ = eng.generate(_prompts(lengths, seed=3), captured_decode=True,
                                captured_prefill=True)
         for rid in eager:

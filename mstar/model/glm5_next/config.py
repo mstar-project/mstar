@@ -24,9 +24,10 @@ KDA_STATE = "kda_state"    # recurrent pool: the conv and delta-rule state of th
 KDA = "kda"                # the KDA linear attention run against KDA_STATE
 DSA = "dsa"                # dsa_long_context: the k-pool DSA over KV_CACHE's index planes
 # KDA_STATE blocks held per request with MTP: the MTP state that drafts the next
-# step's first token, and that draft
+# step's first token, and that draft; under mtp_trims, the request's tokens in cache
 MTP_HIDDEN = "mtp_hidden"
 MTP_DRAFT = "mtp_draft"
+MTP_LEN = "mtp_len"
 # The one cache stream label glm5_next uses (single-label model).
 LABEL = "main"
 
