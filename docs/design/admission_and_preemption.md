@@ -1,7 +1,3 @@
----
-orphan: true
----
-
 # Preemption under KV pressure
 
 Since M* has no admission control today, requests take pages as they prefill and decode, and free them only when they finish. Once every running request in a full pool needs another page, none can finish, and all wait until clients time out (#307).
@@ -76,7 +72,7 @@ Why this shape:
 # per pool, under the KV lock
 _allotments   # each admitted request's Allotment, its reservation
 _unused       # pages reserved but not yet used, summed over requests
-_waiting      # the queue, in arrival order (§3.1)
+_asks         # the pages each request that asked and has no reservation asks for
 ```
 
 The code calls a reservation an `Allotment`, since `manager.py` already uses "reservation" for an admit's unwind record.
@@ -84,11 +80,11 @@ The code calls a reservation an `Allotment`, since `manager.py` already uses "re
 Rules:
 
 - **Ingest.** A request whose footprint is bigger than its pool gets a 400 at ingest. A request that asks for no length has its default cut to fit the pool (#808).
-- **Queue.** A request joins its pool's queue at its first readiness check. Only the head is admitted, once its reservation fits in the free and evictable pages no admitted request has reserved.
+- **Queue.** A request joins the runner's waiting list at its first readiness check, by its arrival number (§3.1), or behind every numbered request in the order it first asks when it has none. A request that is dropped or moves to the host asks again at once, at its arrival. It is admitted when it is first among the waiting requests of every pool it asks, and its reservation fits in each, in the free and evictable pages no admitted request has reserved.
 - **Size.** A preemptible request reserves its prompt. A guaranteed one also reserves its growth.
 - **Inside a reservation.** A grant always succeeds. A failure there is an accounting bug, and the manager raises.
 - **Past a reservation.** A grant takes only from the room, and fails with `AllocationFailed(pages_short=...)` when the room is short.
-- **Across pools.** A node's pools admit a request together. When one pool holds the head back, the others give back what they reserved for it.
+- **Across pools.** A request takes its reservation in every pool its node asks, the recurrent pool's slot included, or in none, and nothing is retrieved for it before then. A waiting request is asked again only after a pool it waits on has grown.
 
 ```
 room = free + evictable - _unused
@@ -117,7 +113,7 @@ Why this shape:
 
 Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker moves victims to the host or drops them, moves or drops the request itself, or makes it wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
 
-Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request that finds no free slot waits for one, as it does today.
+Only KV pages trigger it. Qwen3.5’s recurrent state pool and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can't use.
 
 
 ### 3.1 Arrival numbers
@@ -238,7 +234,7 @@ Lifecycle:
 
 ### 5.2 The return check
 
-Once per scheduling pass, the worker offers each dropped request at the head of its pool's queue to this check, in place of the fit check:
+A dropped request asks again when it is dropped, and the runner admits it from its arrival position as any request, with this check in place of the fit check:
 
 ```
 need(V) = for each label, the pages V's kept history fills, plus 1,
@@ -248,9 +244,9 @@ return when _unused + need(V) <= free + evictable,
        with every hit charged as fresh
 ```
 
-When it passes, V reserves `need(V)` and its rebuild row is queued.
+When it passes, V reserves `need(V)`, and the worker queues its rebuild row. The drop counts the history from the tokens V's KV held and the sample its next step writes.
 
-A request on the host returns through `KVManager.can_reload` and `reload` instead, once it is first in the queue and its return reservation fits. That reservation is its pages plus one page per stream, capped at its footprint, or its queued prompt if that is larger. It makes that reservation as its pages are copied back. The readiness check for its next step reloads it, and so does `Worker._reload_from_host` once per scheduling pass, since that step may not come before the request's REMOVE.
+A request on the host asks again when it moves there, and is admitted the same way. Its return reservation covers the pages its reload takes, plus one page per stream, capped at its footprint, or its queued prompt if that is larger. The readiness check for its next step then reloads it within that reservation. Once admitted it holds no newer request back, so a next step that comes only after its REMOVE costs nothing but the reservation.
 
 Why this shape:
 

@@ -242,6 +242,8 @@ def test_a_full_ring_pool_holds_the_request_that_waits_and_runs_the_rest():
     w = _worker()
     w.scheduler = SimpleNamespace(held=[])
     w.scheduler.hold_requests = w.scheduler.held.extend
+    w.scheduler.limit_batch = lambda *args: None
+    w.scheduler.could_refill = lambda *args: False
     w.engine_manager = SimpleNamespace(
         get_engine=lambda node: SimpleNamespace(evictable=lambda n: False),
     )

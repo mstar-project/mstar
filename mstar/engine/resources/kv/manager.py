@@ -2,11 +2,11 @@ import itertools
 import logging
 import os
 import threading
-from collections import Counter, OrderedDict
+from collections import Counter
 from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field, replace
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -23,6 +23,7 @@ from mstar.engine.resources.base import (
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import (
+    KVLayout,
     KVReqConfig,
     KVSpec,
     KVStep,
@@ -48,6 +49,7 @@ from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
+    ASKS,
     AdmitFailedReason,
     AdmitOutcome,
     AdmitRuntimeError,
@@ -56,8 +58,10 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
+from mstar.utils.profiler import PhaseLaps
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +70,19 @@ logger = logging.getLogger(__name__)
 # an admitted request's pages.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
-_WAIT = AdmitOutcome(ok=True, ready=False, held_back=True)
-_ADMITTED = AdmitOutcome(ok=True, admitted=True)
 _NOT_READY = AdmitOutcome(ok=True, ready=False)
+
+
+class RoomMark(NamedTuple):
+    """A request `reserve` couldn't fit, and what it was measured against: the room, the pages the index
+    had filed, and how many of them were evictable."""
+    rid: str
+    node_name: str
+    graph_walk: str
+    published: "PublishedKVInfo | None"
+    room: int
+    filed: int
+    evictable: int
 
 
 @dataclass
@@ -247,6 +261,8 @@ class CacheStream:
     # a failed retrieve, latched: the future is consumed once, but every later
     # readiness check has to keep reporting the stream as unusable
     read_error: BaseException | None = None
+    # what a client may see of it (no server paths or internal text)
+    read_error_text: str = ""
     # None while the stream is unkeyed, and once its keys stop describing it
     chain: PrefixChain | None = None
     # pages the index matched for this stream and is holding for it, from the
@@ -319,13 +335,15 @@ class KVPageCounts(NamedTuple):
 
 @dataclass(slots=True)
 class Allotment:
-    """Pages an admitted request may take from free and evictable pages: its pages in `_waiting`, less
-    the cache hits another request holds. Nothing is taken off for a guaranteed request. ``remaining``
-    is its share of `KVManager._unused`, and ``prompt`` is those pages, which `requeue` puts back in
-    `_waiting`."""
+    """Pages an admitted request may take from free and evictable pages: the pages it asked for, less the
+    cache hits another request holds. Nothing is taken off for a guaranteed request. ``remaining`` is its
+    share of `KVManager._unused`, and ``prompt`` is the pages it asked for, which `unreserve` puts back in
+    `_asks`. An allotment for a request on the host covers its reload, and ``returning`` is the pages
+    beyond it, which the reload leaves on top of what the request then holds."""
     pages: int
     remaining: int = 0
     prompt: int = 0
+    returning: int | None = None
 
 
 @dataclass(slots=True)
@@ -441,6 +459,9 @@ class KVPlanState:
     token_to_page: torch.Tensor
     token_to_cache: torch.Tensor
     total_tokens: int | None = None
+    # an eager-write state a pre-plan built on its own stream: the writer waits
+    # on it (the replay's plan-done wait comes after an eager write)
+    ready: Any = None
 
     def copy_(self, other: "KVPlanState", capture_len: int):
         """Stage a step's addressing into this captured state.
@@ -576,7 +597,8 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
-        self._dropped: set[str] = set()
+        # dropped request -> the pages it asks to return with
+        self._dropped: dict[str, int] = {}
         # (node, walk) -> (label, stop buffer name) per request, for the
         # decode-step chain extension; dropped with the request
         self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
@@ -613,7 +635,7 @@ class KVManager(AttentionResource):
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
         # Every rank of a leading pool keeps the allotments and earmarks and refuses a grant past the room.
-        # Rank 0 alone decides: it queues, allots and chooses victims, and the other ranks replay its moves,
+        # Rank 0 alone decides: it asks, takes allotments and chooses victims, and the other ranks replay its moves,
         # so each rank admits a step from the same counts.
         self._counts = leads
         self._decides = leads and self._rank == 0
@@ -621,13 +643,13 @@ class KVManager(AttentionResource):
         # set by the engine on rank 0 of a TP node
         self.journal: Callable[..., None] | None = None
         # An allotment covers the labels `_nodes` open.
-        # `_waiting` is the queue in arrival order, each request with the pages `_enqueue` counted, which its allotment
-        #   is sized from.
+        # `_asks` holds the pages `ask` counted for each request that asked and has no allotment yet, which its
+        #   allotment is sized from.
         # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
-        self._waiting: OrderedDict[str, int] = OrderedDict()
+        self._asks: dict[str, int] = {}
         self._allotments: dict[str, Allotment] = {}
         self._unused = 0
         # Preemption state.
@@ -661,6 +683,18 @@ class KVManager(AttentionResource):
             PinnedIndexRing() if kv_pinned_indptrs() and torch.cuda.is_available() else None
         )
         self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
+        # A read-only step (every segment span 0, e.g. a decoder attending an
+        # encoder context it wrote at prefill) plans the same as the last one
+        # while its segments are the same and nothing touched their streams:
+        # (key, plan). The epoch moves with `_plan_epoch`, and when a stream of
+        # one of the cached step's real rows changes (`_readonly_rows`).
+        self._readonly_epoch = 0
+        self._readonly_plan: tuple | None = None
+        self._readonly_rows: frozenset | None = None
+        # (slot, label) -> the plan output whose state that slot's static
+        # buffers hold, so a reused plan skips re-staging them
+        self._staged_outputs: dict[tuple, KVPlanOutput] = {}
+        self._empty_locations: torch.Tensor | None = None
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
 
@@ -1588,13 +1622,7 @@ class KVManager(AttentionResource):
         if self._host_copies:
             with self._lock:
                 self._land_host_copies()
-        joined = False
-        if self._decides and rid not in self._allotments:
-            held_back = self._hold_back(rid, node_name, graph_walk, published)
-            if held_back is not None:
-                return held_back
-            joined = True
-        elif (
+        if (
             self._decides
             and (rid in self._short or (self._world_size > 1 and (rid in self._victims or rid in self._earmarks)))
             and self.waits(rid)
@@ -1603,9 +1631,9 @@ class KVManager(AttentionResource):
         fetching = self._fetch_from_host(rid, node_name, graph_walk, published)
         if published is None:
             if fetching is None:
-                return _ADMITTED if joined else ADMIT_OK
+                return ADMIT_OK
             with self._lock:
-                return AdmitOutcome(ok=True, ready=self._check_ready(rid, fetching)[0], admitted=joined)
+                return AdmitOutcome(ok=True, ready=self._check_ready(rid, fetching)[0])
 
         if published.world_size != self._world_size:
             # terminal for this request, not for the worker serving it
@@ -1898,9 +1926,7 @@ class KVManager(AttentionResource):
                 # A replay's padding rows reserve nothing: they run against
                 # SINK_PAGE (see `_sequence_views`). Pages for them would fail
                 # to allocate on a near-full arena and hold the batch.
-                if segment.span == 0 or self._on_sink(ctx, segment.request_id) or (
-                    sink and (segment.request_id, segment.label) in sink
-                ):
+                if not self._reserves(ctx, sink, segment):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 seq_len = segment.span + stream.stored_len
@@ -1915,7 +1941,9 @@ class KVManager(AttentionResource):
                     segment.request_id, segment.label, seq_len,
                 )
                 if not alloc_res.success:
-                    return AdmitOutcome(ok=False, reason=alloc_res.error)
+                    return AdmitOutcome(
+                        ok=False, reason=self._sized_refusal(step, ctx, alloc_res.error),
+                    )
                 if alloc_res.new_pages:
                     self._admit_reserved_pages.setdefault(
                         (segment.request_id, segment.label), []
@@ -1928,7 +1956,7 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
-                if self._on_sink(ctx, segment.request_id) or (sink and (segment.request_id, segment.label) in sink):
+                if self._sinks(ctx, sink, segment):
                     continue
                 stream = self._streams.get(
                     segment.request_id, {}
@@ -1945,6 +1973,81 @@ class KVManager(AttentionResource):
         # retention is applied at commit (see `_apply_retention`)
 
         return ADMIT_OK
+
+    def _sized_refusal(
+        self, step: KVStep, ctx: StepContext, error: AdmitFailedReason,
+    ) -> AdmitFailedReason:
+        """``error`` with the step's ``rows_fit`` and ``rows_fit_alone`` filled
+        in, or a terminal refusal naming a request of the step that needs more
+        pages than the whole pool has, the one ``error`` names first: no
+        eviction can make that fit, so retrying it only spins until the client
+        gives up. Caller holds ``_lock``.
+
+        A request's footprint is every distinct page it would hold after the
+        step: the ones its streams hold already, counted once where labels or
+        requests share them, plus the ones `admit` would still reserve for each
+        stream. A segment that runs against the sink holds and needs nothing,
+        and a span-0 one needs nothing beyond what it holds, as in `admit`. The
+        pool is every page but the sink, cached prefixes included, since those
+        can be evicted. ``rows_sized`` is how many real rows were counted.
+        """
+        if not isinstance(error, AllocationFailed):
+            return error
+        page_size = self.config.page_size
+        sink = step.sink
+        held: dict[str, set[int]] = {}
+        needed: dict[tuple[str, str], int] = {}
+        for segment in step.segments:
+            rid = segment.request_id
+            if self._on_sink(ctx, rid):
+                continue
+            # a row with every label on the sink still counts as a row that fits
+            rows_pages = held.setdefault(rid, set())
+            if self._sinks(ctx, sink, segment):
+                continue
+            stream = self._streams.get(rid, {}).get(segment.label)
+            pages = () if stream is None else stream.page_indices
+            rows_pages.update(pages)
+            if not self._reserves(ctx, sink, segment):
+                continue
+            stored = 0 if stream is None else stream.stored_len
+            key = (rid, segment.label)
+            more = -(-(stored + segment.span) // page_size) - len(pages)
+            needed[key] = max(needed.get(key, 0), more)
+        extra: dict[str, int] = {}
+        for (rid, _), more in needed.items():
+            extra[rid] = extra.get(rid, 0) + max(more, 0)
+        capacity = self.config.max_num_pages - 1
+        rows = list(held)
+        # every row, not only the named one: a row refused ahead of one that
+        # fills the pool names itself, and the eviction then takes the filler,
+        # the only row holding pages
+        for rid in sorted(rows, key=lambda rid: rid != error.request_id):
+            own = len(held[rid]) + extra.get(rid, 0)
+            if own > capacity:
+                # the client reads this text, and the rid is the worker's
+                # handle, not an id it sent
+                return AdmitRuntimeError(
+                    message=(
+                        f"The request needs {own} pages of {self.name} for this "
+                        f"step, more than the {capacity} the pool holds; raise "
+                        "max_num_pages or shorten the request."
+                    ),
+                    request_ids=frozenset({rid}),
+                )
+        if error.request_id in rows:
+            error.rows_fit = rows.index(error.request_id)
+        resident: set[int] = set()
+        new = alone = 0
+        for rid in rows:
+            resident |= held[rid]
+            new += extra.get(rid, 0)
+            if len(resident) + new > capacity:
+                break
+            alone += 1
+        error.rows_fit_alone = alone
+        error.rows_sized = len(rows)
+        return error
 
     def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
         """Give back the pages this admit freshly acquired, and clear the
@@ -2100,6 +2203,12 @@ class KVManager(AttentionResource):
             total_tokens=total_tokens
         )
 
+    def _empty_plan_state(self) -> KVPlanState:
+        empty = self._empty_locations
+        if empty is None:
+            empty = self._empty_locations = torch.empty(0, dtype=torch.long, device=self._device)
+        return KVPlanState(token_to_page=empty, token_to_cache=empty, total_tokens=0)
+
     def _decode_plan_state(self, views: list[SequenceView]) -> KVPlanState:
         """Write addressing for a step appending one token per request.
 
@@ -2150,8 +2259,11 @@ class KVManager(AttentionResource):
 
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
-        ctx: StepContext, lease,
+        ctx: StepContext, lease, eager_write: bool = False,
     ):
+        if eager_write:
+            # written outside the graph (KVStep.eager_write): never staged
+            lease = None
         for label, indptrs in plan_output.items():
             if indptrs.is_decode and lease is not None:
                 # Straight into the captured buffers in one H2D per buffer:
@@ -2166,23 +2278,34 @@ class KVManager(AttentionResource):
                     lease.bucket.num_tokens,
                     pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
                 )
+                self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
                     self._preplan_states[label] = plan_state
                 else:
                     self._current_plan_states[label] = plan_state
                 continue
+            total_tokens = None if indptrs.is_decode else indptrs.get_total_len()
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(indptrs.views)
+            elif total_tokens == 0:
+                # every segment span 0 (a decoder reading the encoder context
+                # it wrote at prefill): nothing is written, so there is no
+                # addressing to upload and unpack
+                plan_state = self._empty_plan_state()
             else:
                 indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
                 plan_state = self._compute_plan_state(
                     indptrs.cuda_indptrs,
-                    total_tokens=indptrs.get_total_len()
+                    total_tokens=total_tokens,
                 )
             if lease is not None:
                 static_state = self._static_plan_state(lease.slot, label)
                 static_state.copy_(plan_state, lease.bucket.num_tokens)
                 plan_state = static_state
+                self._staged_outputs[(lease.slot, label)] = indptrs
+            elif eager_write and ctx.is_preplan and plan_state.token_to_page.is_cuda:
+                plan_state.ready = torch.cuda.Event()
+                plan_state.ready.record()
             if ctx.is_preplan:
                 self._preplan_states[label] = plan_state
             else:
@@ -2197,10 +2320,48 @@ class KVManager(AttentionResource):
             views=views,
         )
 
+    @staticmethod
+    def _is_readonly(step: KVStep, ctx: StepContext) -> bool:
+        # no sink rows: they change the views without changing the segments
+        # the reuse key holds; the read-only steps that repeat have none
+        return (
+            not ctx.is_preplan and not ctx.capture and bool(step.segments)
+            and not step.pre_forks and not step.post_forks and not step.sink
+            and all(seg.span == 0 for seg in step.segments)
+        )
+
+    def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple:
+        lease = ctx.slot_lease
+        return (
+            tuple(step.segments), lease.bucket if lease is not None else None,
+            self._plan_epoch, self._readonly_epoch,
+        )
+
+    def _reuse_readonly_plan(self, step: KVStep, ctx: StepContext) -> "KVPlanOutputs | None":
+        """The last read-only step's plan, when this step is the same read-only
+        step over untouched streams. Its views and indptrs are reused as they
+        are, and a slot whose static buffers already hold it is not re-staged."""
+        cached = self._readonly_plan
+        if cached is None or not self._is_readonly(step, ctx) or cached[0] != self._readonly_key(step, ctx):
+            return None
+        res = cached[1]
+        lease = ctx.slot_lease
+        if lease is not None and all(
+            self._staged_outputs.get((lease.slot, label)) is out for label, out in res.items()
+        ):
+            for label in res:
+                self._current_plan_states[label] = self._static_plan_state(lease.slot, label)
+        else:
+            self._setup_plan_states(res, ctx, lease)
+        return res
+
     def _touch_plan_cache(self, rid: str | None = None) -> None:
         """A stream of ``rid`` (any stream, when None) changed other than by a
-        commit: the plan cache no longer describes the streams if it holds
-        that request."""
+        commit: the plan caches no longer describe the streams if they hold
+        that request. A padding row's reset after a replay holds nothing."""
+        rows = self._readonly_rows
+        if rows is not None and (rid is None or rid in rows):
+            self._readonly_epoch += 1
         cache = self._decode_plan_cache
         if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
             self._plan_epoch += 1
@@ -2501,6 +2662,9 @@ class KVManager(AttentionResource):
             "KV preplan is already pending; clear_preplan before planning a "
             "different step ahead"
         )
+        laps = PhaseLaps(
+            "res.pre_plan.kv_cache." if ctx.is_preplan else "res.plan.kv_cache."
+        )
         self.reset_default_cursors()
         if self._preplanned:
             if self._preplan_key == self._plan_key(step, ctx):
@@ -2516,12 +2680,17 @@ class KVManager(AttentionResource):
                 self._preplan_marked = []
                 # the promoted step runs; the plan cache still describes it
                 self.clear_preplan(promoted=True)
+                laps.lap("promote")
                 return res
             # A different step reached the GPU thread before the one planned
             # ahead (e.g. a new request's prefill while a decode step sits
             # pre-planned): it must not be served the staged plan's pages.
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
+
+        reused = self._reuse_readonly_plan(step, ctx)
+        if reused is not None:
+            return reused
 
         # Forks run ahead of the views, which record length and generation;
         # staging only reads what the fork will land.
@@ -2534,9 +2703,11 @@ class KVManager(AttentionResource):
 
         if self._indptr_ring is not None:
             self._indptr_ring.begin_plan()
+        laps.lap("forks")
         res = None
         if self._plan_cache_mode and not pending:
             res = self._fast_decode_plan(step, ctx)
+            laps.lap("fast_decode" if res is not None else "fast_decode_miss")
         if res is None or self._plan_cache_mode == 2:
             full = KVPlanOutputs(
                 {
@@ -2562,7 +2733,15 @@ class KVManager(AttentionResource):
                 res = full
                 if self._plan_cache_mode and not pending:
                     self._remember_decode_plan(step, ctx, res)
-        self._setup_plan_states(res, ctx, ctx.slot_lease)
+            laps.lap("full")
+        self._setup_plan_states(res, ctx, ctx.slot_lease, eager_write=step.eager_write)
+        laps.lap("setup_states")
+        if self._is_readonly(step, ctx):
+            # the rows first: a touch from here on invalidates the entry
+            self._readonly_rows = frozenset(
+                seg.request_id for seg in step.segments if not ctx.is_padding_row(seg.request_id)
+            )
+            self._readonly_plan = (self._readonly_key(step, ctx), res)
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
             self._preplanned = True
@@ -2588,6 +2767,20 @@ class KVManager(AttentionResource):
             if not KVManager._on_sink(ctx, rid)
             and (step.fork_rids is None or rid in step.fork_rids)
         ]
+
+    @staticmethod
+    def _sinks(ctx: StepContext, sink: frozenset, segment: Segment) -> bool:
+        """Whether ``segment`` runs against SINK_PAGE: its row does (see
+        `_on_sink`), or the step puts its label there."""
+        return KVManager._on_sink(ctx, segment.request_id) or bool(
+            sink and (segment.request_id, segment.label) in sink
+        )
+
+    @staticmethod
+    def _reserves(ctx: StepContext, sink: frozenset, segment: Segment) -> bool:
+        """Whether `admit` reserves pages for ``segment``: it writes tokens,
+        and not against the sink. `_sized_refusal` counts the same ones."""
+        return bool(segment.span) and not KVManager._sinks(ctx, sink, segment)
 
     @staticmethod
     def _on_sink(ctx: StepContext, rid) -> bool:
@@ -2641,6 +2834,9 @@ class KVManager(AttentionResource):
                 self._plan_epoch += 1
         if not step.commit:
             self._plan_epoch += 1
+        rows = self._readonly_rows
+        if rows is not None and any(seg.span and seg.request_id in rows for seg in step.segments):
+            self._readonly_epoch += 1
         # the index only sees real rows of a non-capture step; checked once
         index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
@@ -2916,8 +3112,13 @@ class KVManager(AttentionResource):
                 raise RuntimeError(refusal)
             # under the lock, so no other step allocates between the two counts
             free, room = self._arena.num_free, self._room()
+            # It returns with its history (the tokens its KV held, released ones included, and the sample its
+            # next step writes) and one page more, at most its footprint.
+            streams = self._streams[rid].values()
+            history = -(-(max(stream.stored_len + stream.released for stream in streams) + 1) // self.config.page_size)
+            returns = sum(self._one_more(history, stream.footprint) for stream in streams)
             self.reset_request(rid, free=True)
-            self._dropped.add(rid)
+            self._dropped[rid] = returns
             self._vacate(rid, room)
             return self._arena.num_free - free
 
@@ -2966,7 +3167,7 @@ class KVManager(AttentionResource):
             return walk
 
     def land_rebuild(self, rid: str) -> None:
-        self._dropped.discard(rid)
+        self._dropped.pop(rid, None)
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns the device pages
@@ -3158,26 +3359,39 @@ class KVManager(AttentionResource):
         )
 
     def can_reload(self, rid: str) -> bool:
-        """Whether `_room` covers the pages ``rid``'s reload takes plus the pages `_return_pages` counts for it. A
-        request in `_waiting` must also be first there."""
+        """Whether `_reload_room` covers the pages ``rid``'s reload takes. A request that asks again after
+        its move to the host reloads only once admitted."""
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
-            if rid in self._waiting and next(iter(self._waiting)) != rid:
+            if self._decides and rid in self._asks:
                 return False
-            needed = self._return_pages(rid)
-            evictable = () if self._index is None else self._index.evictable()
-            for state in self._cpu_pool.offloaded[rid].values():
-                run = self._index.pages_for(state.keys) if self._index is not None else []
-                # the reload retains these, so an evictable one takes room as a copied page does
-                needed += len(state.cpu_page_indices) - len(run) + sum(page in evictable for page in run)
-            return needed <= self._room()
+            return self._reload_pages(rid) <= self._reload_room(rid)
+
+    def _reload_room(self, rid: str) -> int:
+        """The room ``rid``'s reload may take: its allotment as well when it was allotted for the reload, and
+        otherwise the room alone, since the offload took the pages off the allotment and the reload puts them
+        back."""
+        allotment = self._allotments.get(rid)
+        if allotment is not None and allotment.returning is not None:
+            return self._allowance(rid)
+        return self._room()
+
+    def _reload_pages(self, rid: str) -> int:
+        """The pages ``rid``'s reload takes: those the index no longer holds, and those it holds evictable."""
+        needed = 0
+        evictable = () if self._index is None else self._index.evictable()
+        for state in self._cpu_pool.offloaded[rid].values():
+            run = self._index.pages_for(state.keys) if self._index is not None else []
+            # the reload retains these, so an evictable one takes room as a copied page does
+            needed += len(state.cpu_page_indices) - len(run) + sum(page in evictable for page in run)
+        return needed
 
     def _return_pages(self, rid: str) -> int:
-        """The pages a request in `_waiting` is allotted beyond what it reloads, or 0 outside `_waiting`. Its whole
-        allotment is its prompt or, when larger, the sum of `_one_more` over each stream's reloaded pages, as
-        `readmit` counts a dropped request's history."""
-        prompt = self._waiting.get(rid)
+        """The pages a request that asks again after its move to the host is allotted beyond what it reloads,
+        or 0 for any other request. Its whole allotment is its prompt or, when larger, the sum of `_one_more`
+        over each stream's reloaded pages, as a drop counts the request's history."""
+        prompt = self._asks.get(rid)
         if prompt is None:
             return 0
         reloaded = grown = 0
@@ -3198,19 +3412,14 @@ class KVManager(AttentionResource):
         Keyed pages the index still holds are taken from it, and the rest come
         from the host. False when the device can't fit them right now; nothing
         moves in that case, so the caller can evict further and try again.
-        A request in `_waiting` reloads only when it is first there, and is allotted its reloaded pages plus
-        the pages `_return_pages` counts.
+        A request that asks again after its move to the host reloads only once admitted.
         """
         self._touch_plan_cache(rid)
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
-            if self._decides and rid in self._waiting and next(iter(self._waiting)) != rid:
+            if self._decides and rid in self._asks:
                 return False
-            # reserved before any page moves, so every rank adds the reloaded pages to the same allotment
-            queued = rid in self._waiting
-            if queued:
-                self._reserve(rid, self._return_pages(rid))
             states = dict(self._cpu_pool.offloaded[rid])
             # a reload is a hit, so `lookup` marks the pages recently used
             runs = {
@@ -3222,13 +3431,11 @@ class KVManager(AttentionResource):
             needed = sum(len(state.cpu_page_indices) - len(runs[label]) for label, state in states.items())
             # retaining the runs already took their evictable pages out of the room, so the check runs
             # even when the index holds every page
-            fits = not self._decides or needed <= self._room()
+            fits = not self._decides or needed <= self._reload_room(rid)
             pages = self._grant(rid, ", ".join(states), needed, 0) if fits else None
             if pages is None:
                 for run in runs.values():
                     self._arena.release(run)
-                if queued:
-                    self.requeue(rid)
                 return False
             allotment = self._allotments.get(rid)
             copies = PageCopies(gpu=pages, cpu=[])
@@ -3237,7 +3444,7 @@ class KVManager(AttentionResource):
                 stream = self._ensure_label(rid, label)
                 at = len(copies.cpu)
                 stream.page_indices = run + pages[at:at + len(state.cpu_page_indices) - len(run)]
-                if allotment is not None:
+                if allotment is not None and allotment.returning is None:
                     # the offload took them off the allotment
                     allotment.pages += len(stream.page_indices)
                 stream.stored_len = state.stored_len
@@ -3245,6 +3452,9 @@ class KVManager(AttentionResource):
                 stream.released = state.released
                 stream.protected_prefix = state.protected_prefix
                 copies.cpu.extend(state.cpu_page_indices[len(run):])
+            if allotment is not None and allotment.returning is not None:
+                allotment.pages, allotment.returning = self._held(rid) + allotment.returning, None
+                self._recount(rid)
         # The streams stay marked offloaded while the copies are queued outside
         # the lock, so nothing extends or claims their pages.
         self._cpu_pool.copy_in(self.kv_cache.tensor, copies)
@@ -3564,7 +3774,7 @@ class KVManager(AttentionResource):
             allotment = self._allotments.pop(rid, None)
             if allotment is not None:
                 self._unused -= allotment.remaining
-            self._waiting.pop(rid, None)
+            self._asks.pop(rid, None)
             if rid in self._streams:
                 for stream in self._streams[rid].values():
                     self._release_lease(rid, stream)
@@ -3577,7 +3787,7 @@ class KVManager(AttentionResource):
             self._forget_reservations(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
-            self._dropped.discard(rid)
+            self._dropped.pop(rid, None)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
             self._settle(rid, self._room() - room)
@@ -3679,8 +3889,8 @@ class KVManager(AttentionResource):
             )
             if self._index is not None:
                 self._index.assert_evictable()
-            for rid in self._waiting:
-                on_host = self._cpu_pool is not None and self._cpu_pool.is_offloaded(rid)
+            for rid in self._asks:
+                on_host = self._on_host(rid)
                 if rid in self._dropped or on_host:
                     held = [
                         page for stream in self._streams[rid].values()
@@ -3731,29 +3941,21 @@ class KVManager(AttentionResource):
         Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
         but not another), allocator-init bugs, and any future code path
         that adds requests asymmetrically before ``warmup`` returns. The
-        ``all_gather`` itself is synchronizing, so no extra barrier is
-        needed on the success path.
+        vote itself is synchronizing, so no extra barrier is needed on the
+        success path.
         """
         if self._comm_group.world_size == 1:
             return
-        local_free = self._arena.num_free
-        local_t = torch.tensor(
-            [local_free], dtype=torch.int64, device=self._device,
-        )
-
-        for group in [
-            self._comm_group.tp_group, self._comm_group.sp_group
-        ]:
-            gathered = group.all_gather(local_t, dim=0)
-            values = gathered.cpu().tolist()
-            if any(v != values[0] for v in values):
-                raise RuntimeError(
-                    f"KV cache {self.name!r} has asymmetric num_free_pages "
-                    f"across TP ranks: {values}. v1 requires symmetric "
-                    "allocator state; check the YAML for per-rank-divergent "
-                    "max_num_pages / cpu_offload_pages, and any model code "
-                    "that calls add_request before warmup completes."
-                )
+        free = self._arena.num_free
+        lo, neg_hi = self._comm_group.agree([free, -free])
+        if lo != -neg_hi:
+            raise RuntimeError(
+                f"KV cache {self.name!r} has asymmetric num_free_pages "
+                f"across TP ranks: min {lo}, max {-neg_hi}. v1 requires symmetric "
+                "allocator state; check the YAML for per-rank-divergent "
+                "max_num_pages / cpu_offload_pages, and any model code "
+                "that calls add_request before warmup completes."
+            )
 
     def cleanup(self):
         self._transfer.cleanup()
@@ -3767,41 +3969,23 @@ class KVManager(AttentionResource):
 
     # Admission
 
-    def _hold_back(
-        self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
-    ) -> AdmitOutcome | None:
-        """Return the outcome that holds ``rid`` back, or None once it has an allotment."""
-        with self._lock:
-            if rid not in self._waiting and (failed := self._enqueue(rid)) is not None:
-                return failed
-            if next(iter(self._waiting)) != rid:
-                return _WAIT
-            chains = [] if self._index is None else [
-                stream.chain for stream in self._streams[rid].values()
-                if stream.chain is not None and stream.chain.rooted is None
-            ]
-        # Requests are queued and removed on one thread only, so ``rid`` is still first in `_waiting`
-        # once the lock is taken again.
-        for prefix_chain in chains:
-            self._root_chain(prefix_chain)
-        with self._lock:
-            # A guaranteed request takes no cache hit off its allotment, since the request holding a hit page can
-            # release it and the index evict it before the lease.
-            whole = charged = 0
-            if not self._overrides[rid].guaranteed:
-                whole, charged = self._hit(rid, node_name, graph_walk, published)
-            need = self._waiting[rid] - whole
-            if need + charged > self._room():
-                return _WAIT
-            self._reserve(rid, need + charged)
-            return None
-
-    def _enqueue(self, rid: str) -> AdmitOutcome | None:
-        """Queue ``rid``, or return why it can never be admitted.
+    def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        """`ASKS` until ``rid`` has an allotment, or why it can never be admitted.
 
         A request that can't fit even in an empty pool fails here, and not after
         waiting behind every request ahead of it.
         """
+        if not self._decides or rid in self._allotments:
+            return None
+        with self._lock:
+            failed = self._ask(rid)
+        return ASKS if failed is None else failed
+
+    def _ask(self, rid: str) -> AdmitOutcome | None:
+        """Count the pages ``rid`` asks for into `_asks`, or return why it can never be admitted. Caller holds
+        the lock."""
+        if rid in self._asks:
+            return None
         overrides = self._overrides[rid]
         caps = dict.fromkeys(overrides.loop_caps or (), 0)
         if overrides.guaranteed:
@@ -3813,22 +3997,95 @@ class KVManager(AttentionResource):
                 f"KV {self.name}: request {rid} needs {pages} pages to be admitted, "
                 f"and the pool has {capacity} for requests"
             ))
-        self._queue(rid, pages)
+        self._asks[rid] = pages
         return None
 
-    def _queue(self, rid: str, prompt: int) -> None:
-        """Keep `_waiting` in arrival order. A request without an arrival number goes behind every
-        numbered one."""
-        last = next(reversed(self._waiting), None)
-        self._waiting[rid] = prompt
-        place = self._place(rid)
-        if last is not None and self._place(last) > place:
-            for later in [other for other in self._waiting if self._place(other) > place]:
-                self._waiting.move_to_end(later)
+    def reserve(
+        self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
+    ) -> RoomMark | None:
+        """Allot ``rid`` its prompt, less the cache hits another request holds, or what it returns with
+        from a drop or the host."""
+        with self._lock:
+            if self._host_copies:
+                self._land_host_copies()
+            chains = [] if self._index is None or self._returning(rid) else [
+                stream.chain for stream in self._streams[rid].values()
+                if stream.chain is not None and stream.chain.rooted is None
+            ]
+        # Requests ask and are removed on one thread only, so ``rid`` still asks once the lock is
+        # taken again.
+        for prefix_chain in chains:
+            self._root_chain(prefix_chain)
+        with self._lock:
+            pages, room = self._need(rid, node_name, graph_walk, published), self._room()
+            if pages > room:
+                return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
+            self._reserve(rid, pages)
+            return None
 
-    def _place(self, rid: str) -> tuple[bool, int]:
-        arrival = self._overrides[rid].arrival
-        return arrival is None, arrival or 0
+    def _reserve(self, rid: str, pages: int) -> None:
+        """Allot ``rid`` ``pages``. A request on the host is allotted its reload as well, which then leaves
+        `_return_pages` on top of what it holds."""
+        returning = self._return_pages(rid) if self._on_host(rid) else None
+        self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid), returning=returning)
+        self._recount(rid)
+        if self.journal is not None:
+            self.journal(MoveKind.RESERVE, rid, pages)
+
+    def unreserve(self, rid: str) -> None:
+        with self._lock:
+            allotment = self._allotments.pop(rid)
+            self._unused -= allotment.remaining
+            self._asks[rid] = allotment.prompt
+            if self.journal is not None:
+                self.journal(MoveKind.UNRESERVE, rid, 0)
+
+    def grew_since(self, mark: RoomMark) -> bool:
+        """A newly filed page can raise a waiting request's hit, and a hit page another request
+        takes from the evictable set comes out of that request's allotment, not this one's."""
+        filed, evictable = self._index_counts()
+        room = self._arena.num_free + evictable - self._unused
+        grew = room > mark.room or filed != mark.filed or evictable < mark.evictable
+        if _DEBUG_ASSERTS and not grew and mark.rid in self._asks:
+            with self._lock:
+                pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
+                assert pages > self._room(), (
+                    f"KV {self.name}: {mark.rid} fits now, but nothing `grew_since` reads has moved "
+                    "since it didn't, so nothing would admit it"
+                )
+        return grew
+
+    def _need(
+        self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
+    ) -> int:
+        """The pages ``rid``'s allotment would take now. Caller holds the lock.
+
+        A dropped request is charged every cache hit as a fresh page, since nothing is leased before its
+        rebuild. When the rebuild's probe hits a page another request holds, the hit costs nothing, so
+        that page of the allotment is left for the request's growth.
+        """
+        dropped = self._dropped.get(rid)
+        if dropped is not None:
+            return dropped
+        if self._on_host(rid):
+            return self._reload_pages(rid) + self._return_pages(rid)
+        if self._overrides[rid].guaranteed:
+            # A guaranteed request takes no cache hit off its allotment, since the request holding a hit page can
+            # release it and the index evict it before the lease.
+            return self._asks[rid]
+        whole, charged = self._hit(rid, node_name, graph_walk, published)
+        return self._asks[rid] - whole + charged
+
+    def _on_host(self, rid: str) -> bool:
+        return self._cpu_pool is not None and self._cpu_pool.is_offloaded(rid)
+
+    def _returning(self, rid: str) -> bool:
+        """Whether ``rid`` asks again after a drop or a move to the host."""
+        return rid in self._dropped or self._on_host(rid)
+
+    def _index_counts(self) -> tuple[int, int]:
+        """The pages the index has ever filed, and how many it holds evictable."""
+        return (0, 0) if self._index is None else (self._index.filed, len(self._index.evictable()))
 
     # Preemption
 
@@ -3917,24 +4174,6 @@ class KVManager(AttentionResource):
         if self.journal is not None and victims:
             self.journal(MoveKind.OFFLOAD, rid, 0, victims)
 
-    def readmit(self, rid: str, history: int) -> bool:
-        """Allot dropped ``rid`` enough pages for its ``history`` kept tokens and one page more, at most its footprint.
-        False until ``rid`` is first in `_waiting` and those pages fit the room.
-
-        Every cache hit is charged as a fresh page, since nothing is leased here. When the rebuild's probe
-        hits a page another request holds, the hit costs nothing, so that page of the allotment is left for
-        the request's growth.
-        """
-        with self._lock:
-            if next(iter(self._waiting), None) != rid:
-                return False
-            pages = -(-history // self.config.page_size)
-            need = sum(self._one_more(pages, stream.footprint) for stream in self._streams[rid].values())
-            if need > self._room():
-                return False
-            self._reserve(rid, need)
-            return True
-
     def log_counts(self, tp_seq: int) -> None:
         """Called after a step's admit, for comparing with the other ranks' lines. The cached count can move
         with the step's commit, so compare it across ranks only once they are idle."""
@@ -3951,14 +4190,6 @@ class KVManager(AttentionResource):
 
     def moves_to_host(self, rid: str) -> bool:
         return rid in self._hosted
-
-    def head_on_host(self) -> str | None:
-        """The request first in `_waiting` if it waits on the host, or None."""
-        if not self._decides or self._cpu_pool is None or not self._waiting:
-            return None
-        with self._lock:
-            rid = next(iter(self._waiting), None)
-            return rid if rid is not None and self._cpu_pool.is_offloaded(rid) else None
 
     def arrival(self, rid: str) -> int | None:
         overrides = self._overrides.get(rid)
@@ -4040,14 +4271,14 @@ class KVManager(AttentionResource):
             self._allot(earmark.rid, min(earmark.pages, earmark.freed))
 
     def _vacate(self, rid: str, room: int) -> None:
-        """Release ``rid``'s leases, give up its allotment and queue ``rid`` at its arrival, once a drop or a move
+        """Release ``rid``'s leases and give up its allotment, so that ``rid`` asks again, once a drop or a move
         to the host has freed its pages. ``room`` is `_room` as it was before the drop or the move."""
         for stream in self._streams[rid].values():
             self._release_lease(rid, stream)
         allotment = self._allotments.pop(rid, None)
         if allotment is not None:
             self._unused -= allotment.remaining
-            self._queue(rid, allotment.prompt)
+            self._asks[rid] = allotment.prompt
         self._short.pop(rid, None)
         self._ran_short.pop(rid, None)
         self._settle(rid, self._room() - room)
@@ -4057,22 +4288,6 @@ class KVManager(AttentionResource):
         allotment = self._allotments[rid]
         allotment.pages = max(allotment.pages, self._held(rid)) + pages
         self._recount(rid)
-
-    def requeue(self, rid: str) -> None:
-        with self._lock:
-            allotment = self._allotments.pop(rid)
-            self._unused -= allotment.remaining
-            self._waiting[rid] = allotment.prompt
-            # back to the front of `_waiting`, so no later request passes ``rid``
-            self._waiting.move_to_end(rid, last=False)
-            if self.journal is not None:
-                self.journal(MoveKind.UNRESERVE, rid, 0)
-
-    def _reserve(self, rid: str, pages: int) -> None:
-        self._allotments[rid] = Allotment(pages=pages, prompt=self._waiting.pop(rid))
-        self._recount(rid)
-        if self.journal is not None:
-            self.journal(MoveKind.RESERVE, rid, pages)
 
     @property
     def counts(self) -> bool:
@@ -4094,7 +4309,7 @@ class KVManager(AttentionResource):
             elif kind == MoveKind.RESERVE:
                 if rid in self._allotments:
                     raise RuntimeError(f"KV {self.name}: rank 0 reserved {rid}, which already holds an allotment here")
-                if rid not in self._waiting and (failed := self._enqueue(rid)) is not None:
+                if (failed := self._ask(rid)) is not None:
                     raise RuntimeError(failed.reason.message)
                 self._reserve(rid, count)
             elif kind == MoveKind.OFFLOAD:
@@ -4106,7 +4321,7 @@ class KVManager(AttentionResource):
                     self._victims[rid] = None
                 self._host(rid, victims)
             elif kind == MoveKind.UNRESERVE:
-                self.requeue(rid)
+                self.unreserve(rid)
 
     def _hit(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
@@ -4213,7 +4428,7 @@ class KVManager(AttentionResource):
     def _recount(self, rid: str) -> None:
         """Bring ``rid``'s share of `_unused` up to date after its pages or its allotment change.
 
-        A stale count would let the first request in `_waiting` be admitted into room an admitted request still needs.
+        A stale count would let a waiting request be admitted into room an admitted request still needs.
         """
         allotment = self._allotments.get(rid)
         if allotment is None:
@@ -4245,16 +4460,17 @@ class KVManager(AttentionResource):
                 future.result()
             except Exception as e:
                 stream.read_error = e
+                stream.read_error_text, _ = client_error_text(
+                    e, f"KV retrieve for request {rid} label {label!r} failed", log=logger,
+                )
             else:
                 stream.read_pending = False
         if stream.host_copy is not None and stream.host_copy.landed:
             stream.host_copy = None
             stream.read_pending = stream.read_future is not None
         if stream.read_error is not None:
-            err = stream.read_error
             return False, AdmitRuntimeError(
-                f"KV retrieve for request {rid} label {label!r} failed: "
-                f"{type(err).__name__}: {err}"
+                f"KV retrieve for request {rid} label {label!r} failed: {stream.read_error_text}"
             )
         return not stream.read_pending, None
 
@@ -4451,6 +4667,25 @@ class KVManager(AttentionResource):
         self._default_layer_idx = 0
 
     @torch.compiler.disable
+    def write_target(self, layer_idx: int = None, label: str = None):
+        """Where this step's K/V go, for a layer that writes them itself in a
+        fused kernel instead of calling ``write_kv``: ``(layer cache, page of
+        each token, slot in page of each token, tokens to write)``. NHD only."""
+        if layer_idx is None:
+            layer_idx = self._default_layer_idx
+        if label is None:
+            label = self._default_label
+        if self.kv_cache.layout != KVLayout.NHD:
+            raise NotImplementedError(f"write_target is not implemented for layout {self.kv_cache.layout}")
+        state = self._current_plan_states[label]
+        if state.ready is not None:
+            torch.cuda.current_stream().wait_event(state.ready)
+        return (
+            self.kv_cache.tensor[layer_idx], state.token_to_page, state.token_to_cache,
+            int(state.total_tokens),
+        )
+
+    @torch.compiler.disable
     def layer_view(self, layer_idx: int=None) -> torch.Tensor:
         """layer pages as needed by attention kernel
 
@@ -4505,7 +4740,11 @@ class KVManager(AttentionResource):
         if label is None:
             label = self._default_label
         plan_state = self._current_plan_states[label]
-        n = plan_state.total_tokens
+        if plan_state.ready is not None:
+            torch.cuda.current_stream(k.device).wait_event(plan_state.ready)
+        # an eager write may carry only the real rows; the padding rows' tokens
+        # come last in the plan (on SINK_PAGE) and are skipped
+        n = min(plan_state.total_tokens, k.shape[0])
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
             k=k[:n], v=None if v is None else v[:n],

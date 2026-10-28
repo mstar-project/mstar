@@ -388,7 +388,9 @@ def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cach
     leader = SimpleNamespace(parallel_nodes={NODE}, _prefix_cache_open=lambda node: cache_open)
 
     def spec(node, yield_away):
-        return SimpleNamespace(is_yield_away=yield_away, node_batch=SimpleNamespace(node_name=node))
+        return SimpleNamespace(
+            is_yield_away=yield_away, node_batch=SimpleNamespace(node_name=node, read_check_rids=None),
+        )
 
     assert Worker._plans_ahead(leader, spec(NODE, True)) is not cache_open, "only the cache reads page ids"
     assert Worker._plans_ahead(leader, spec(NODE, False)), "the head is pre-planned on every rank"
@@ -405,7 +407,7 @@ def test_a_hit_counts_alike_on_rank_0_and_on_the_follower_that_adopts_it(guarant
     _cache(ranks, "a", shared)
     for kv in ranks:
         kv.ingest_request("b", replace(_config([prompt]), guaranteed=guaranteed))
-    assert leader.admit_retrieve("b", NODE, WALK, None).ready
+    assert StepRunner({"kv": leader}, node_resources={NODE: ["kv"]}).admit_retrieve("b", NODE, WALK).ready
     follower.replay(MoveKind.RESERVE, "b", leader._allotments["b"].pages, [])
 
     assert _follow(follower, _send(leader, "b"))

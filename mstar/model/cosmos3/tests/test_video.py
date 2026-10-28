@@ -211,6 +211,12 @@ def _video_parity(mode: str) -> None:
     dpipe, mpipe, snap = ctx["dpipe"], ctx["mpipe"], ctx["snap"]
     dev, dtype = ctx["device"], ctx["dtype"]
     is_i2v = mode == "i2v"
+    if is_i2v:
+        from diffusers.pipelines.cosmos import pipeline_cosmos3_omni
+
+        if not hasattr(pipeline_cosmos3_omni, "_preprocess_conditioning_image"):
+            print("  (skipped i2v parity: diffusers before 0.40 stretches the conditioning image, mstar crops it)")
+            return
     asset = os.path.join(snap, "assets", "example_i2v_prompt.json" if is_i2v else "example_t2v_prompt.json")
     with open(asset) as f:
         prompt = json.load(f)["temporal_caption"]

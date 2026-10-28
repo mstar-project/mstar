@@ -1,4 +1,5 @@
-"""Server turn detection for ``/v1/realtime`` (OpenAI's ``server_vad``).
+"""Server turn detection for ``/v1/realtime`` (OpenAI's ``server_vad`` and
+``semantic_vad``).
 
 ``TurnSegmenter`` cuts a 16 kHz stream into turns from a per-frame speech
 probability, and returns what to do in stream order: start a turn, add audio
@@ -10,7 +11,10 @@ drops the start of the next utterance, and each sample is committed exactly once
 The probability comes from Silero VAD (MIT), its 2 MB ONNX export run by
 onnxruntime on one CPU thread, about 0.15 ms per 32 ms frame. Its weights are
 read from disk only: ``MSTAR_SILERO_VAD_PATH``, else the copy bundled with
-the ``silero-vad`` package (``pip install 'mstar[vad]'``).
+the ``silero-vad`` package (``pip install 'mstar[vad]'``). ``semantic_vad`` adds
+Pipecat's Smart Turn v3 (BSD-2), an 8 MB ONNX model that judges from the audio
+whether a pause ends the turn; without it (or onnxruntime), or with a file
+that is not that model, ``semantic_vad`` is refused with an error event.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import functools
 import importlib.util
 import logging
 import os
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Protocol
@@ -64,6 +69,131 @@ class ServerVAD:
 
     def view(self) -> dict:
         return {"type": "server_vad", **asdict(self)}
+
+
+@dataclass(frozen=True)
+class SemanticVAD:
+    """OpenAI's ``semantic_vad``: a pause asks an end-of-turn model whether
+    the speaker is done; ``eagerness`` sets the pause, the confidence needed
+    and the longest silence that ends a turn regardless (``EAGERNESS``)."""
+
+    eagerness: str = "auto"
+    create_response: bool = True
+    interrupt_response: bool = True
+
+    def view(self) -> dict:
+        return {"type": "semantic_vad", **asdict(self)}
+
+
+# eagerness -> (pause before asking the model, P(end of turn) that commits,
+# silence that always ends the turn), in ms. Every pause is shorter than
+# server_vad's 500 ms window; the silences are OpenAI's 8, 4 and 2 s limits.
+EAGERNESS = {
+    "low": (400, 0.7, 8000),
+    "medium": (300, 0.5, 4000),
+    "high": (200, 0.3, 2000),
+    "auto": (300, 0.5, 4000),
+}
+SEMANTIC_THRESHOLD = 0.5     # Silero speech threshold for semantic_vad
+SEMANTIC_PREFIX_MS = 300
+SMART_TURN_SECONDS = 8       # the model hears the last 8 s of the turn
+SMART_TURN_REPO, SMART_TURN_FILE = "pipecat-ai/smart-turn-v3", "smart-turn-v3.2-cpu.onnx"
+
+
+class SmartTurn:
+    """Pipecat Smart Turn v3 (BSD-2, 8 MB int8 ONNX on CPU): P(the speaker
+    has finished) from the last 8 s of a turn, about 45 ms a call on one
+    thread. Stateless, so one instance serves every session."""
+
+    def __init__(self, path: Path):
+        import onnxruntime as ort
+        from transformers import WhisperFeatureExtractor
+
+        so = ort.SessionOptions()
+        so.inter_op_num_threads = so.intra_op_num_threads = 1
+        self._session = ort.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
+        self._features = WhisperFeatureExtractor(chunk_length=SMART_TURN_SECONDS)
+        # another ONNX file loads fine and then fails on a session's first pause
+        inputs = {i.name: i.type for i in self._session.get_inputs()}
+        if inputs != _SMART_TURN_INPUTS:
+            raise _NotSmartTurnError(f"its inputs are {inputs}, not {_SMART_TURN_INPUTS}")
+        shapes = [np.shape(o) for o in self._run(np.zeros(0, dtype=np.float32))]
+        if shapes[:1] != [(1, 1)]:
+            raise _NotSmartTurnError(f"its outputs have shapes {shapes}, not [(1, 1)]")
+
+    def _run(self, audio: np.ndarray) -> list:
+        n = SMART_TURN_SECONDS * SAMPLE_RATE
+        audio = np.asarray(audio, dtype=np.float32)[-n:]
+        audio = np.pad(audio, (n - audio.size, 0))   # the reference pads at the front
+        features = self._features(audio, sampling_rate=SAMPLE_RATE, return_tensors="np", padding="max_length",
+                                  max_length=n, truncation=True, do_normalize=True).input_features
+        return self._session.run(None, {"input_features": features.astype(np.float32)})
+
+    def __call__(self, audio: np.ndarray) -> float:
+        return float(self._run(audio)[0][0][0])
+
+
+_SMART_TURN_INPUTS = {"input_features": "tensor(float)"}
+
+
+class _NotSmartTurnError(ValueError):
+    """The file loads, but its inputs or outputs are not Smart Turn v3's."""
+
+
+def smart_turn_weights() -> Path | None:
+    """``MSTAR_SMART_TURN_PATH``, else the file in the local Hugging Face
+    cache (``hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx``);
+    never downloaded here."""
+    path = os.environ.get("MSTAR_SMART_TURN_PATH")
+    if path:
+        return Path(path)
+    try:
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(SMART_TURN_REPO, SMART_TURN_FILE, local_files_only=True))
+    except Exception:  # noqa: BLE001 — not cached, or no huggingface_hub
+        return None
+
+
+_smart_turn_problem = "no Smart Turn model is loaded"
+
+
+def smart_turn_problem() -> str:
+    """Why ``smart_turn()`` gave None, in words safe to send a client (no paths)."""
+    return _smart_turn_problem
+
+
+@functools.lru_cache(maxsize=1)
+def smart_turn() -> Callable[[np.ndarray], float] | None:
+    """The shared end-of-turn model, or None (with one warning, and the
+    reason in ``smart_turn_problem``): semantic_vad is then refused."""
+    global _smart_turn_problem
+    _smart_turn_problem = "no Smart Turn model is loaded"
+    path = smart_turn_weights()
+    if path is None or not path.is_file():
+        logger.warning("semantic_vad is unavailable: no Smart Turn weights%s (set MSTAR_SMART_TURN_PATH "
+                       "or hf download %s %s)", f" at {path}" if path else "", SMART_TURN_REPO, SMART_TURN_FILE)
+        _smart_turn_problem = "no Smart Turn weights on this server"
+        return None
+    try:
+        return SmartTurn(path)
+    except Exception as exc:  # noqa: BLE001 — missing onnxruntime/transformers or a bad file
+        logger.warning("semantic_vad is unavailable: cannot load Smart Turn from %s (%s: %s); "
+                       "it needs mstar[vad] and the %s file", path, type(exc).__name__, exc, SMART_TURN_FILE)
+        if isinstance(exc, ImportError):
+            _smart_turn_problem = "onnxruntime or transformers is not installed"
+        elif isinstance(exc, _NotSmartTurnError):
+            _smart_turn_problem = "the Smart Turn file is not the expected model"
+        else:
+            _smart_turn_problem = "the Smart Turn model did not load"
+        return None
+
+
+def report_availability() -> None:
+    """Load the turn detection models once at startup, so a missing one is a
+    startup warning rather than a surprise in the first session."""
+    if silero_factory() is not None:
+        smart_turn()
 
 
 class SileroVAD:
@@ -155,29 +285,45 @@ def silero_factory() -> Callable[[], SpeechProbability] | None:
 
 
 class TurnSegmenter:
-    """Splits a 16 kHz stream into turns (OpenAI ``server_vad`` semantics).
+    """Splits a 16 kHz stream into turns (OpenAI ``server_vad`` and
+    ``semantic_vad`` semantics).
 
     ``feed`` takes audio of any length and returns operations in stream
     order: ``("speech_started", audio_start_ms)``, ``("audio", samples)`` for
-    the open turn, ``("speech_stopped", audio_end_ms)``, ``("commit",)``.
+    the open turn, ``("speech_stopped", audio_end_ms)``, ``("commit",)``,
+    and ``("end_of_turn_failed", exc)`` when the end-of-turn model raises.
     Times are milliseconds from the start of the session's audio. A turn
     starts on a frame at or above ``threshold`` and takes up to
     ``prefix_padding_ms`` of the audio before it; it ends after the frame
     that brings ``silence_duration_ms`` of whole frames, counted from a frame
     below ``threshold - HYSTERESIS`` (included) with none at or above
     ``threshold`` since, whatever that last frame's probability (the frames
-    belong to the turn). A turn holds at most ``max_turn_samples``: it is
+    belong to the turn). With ``semantic_vad`` the silence that always ends
+    a turn is the eagerness' longest, and each pause that reaches the
+    eagerness' shorter pause asks ``end_of_turn`` (once per pause) over the
+    turn's last 8 s; a probability at or above the eagerness' threshold ends
+    the turn there. A turn holds at most ``max_turn_samples``: it is
     committed before the frame that would pass that, and in mid-speech the
     next turn starts with that frame. Audio between turns, beyond the
     prefix, is in no turn. A partial frame waits for the next ``feed``.
     """
 
-    def __init__(self, vad: SpeechProbability, cfg: ServerVAD, max_turn_samples: int, pos: int = 0):
+    def __init__(self, vad: SpeechProbability, cfg: ServerVAD | SemanticVAD, max_turn_samples: int,
+                 pos: int = 0, end_of_turn: Callable[[np.ndarray], float] | None = None):
         self.vad, self.cfg = vad, cfg
         self.max_turn = max_turn_samples
-        self._prefix_cap = cfg.prefix_padding_ms * SAMPLE_RATE // 1000
-        self._silence_cap = cfg.silence_duration_ms * SAMPLE_RATE // 1000
-        self._neg = max(cfg.threshold - HYSTERESIS, 0.01)
+        self._eot = None
+        if isinstance(cfg, SemanticVAD):
+            pause_ms, self._eot_threshold, silence_ms = EAGERNESS[cfg.eagerness]
+            self.threshold, prefix_ms = SEMANTIC_THRESHOLD, SEMANTIC_PREFIX_MS
+            self._eot, self._pause_cap = end_of_turn, pause_ms * SAMPLE_RATE // 1000
+            # the turn's last 8 s, for end_of_turn (frames, plus the prefix as one piece)
+            self._recent: deque = deque(maxlen=SMART_TURN_SECONDS * SAMPLE_RATE // FRAME + 1)
+        else:
+            self.threshold, prefix_ms, silence_ms = cfg.threshold, cfg.prefix_padding_ms, cfg.silence_duration_ms
+        self._prefix_cap = prefix_ms * SAMPLE_RATE // 1000
+        self._silence_cap = silence_ms * SAMPLE_RATE // 1000
+        self._neg = max(self.threshold - HYSTERESIS, 0.01)
         self._rest = np.zeros(0, dtype=np.float32)   # the partial frame
         self._pos = pos                              # stream index of _rest[0]
         self._prefix = np.zeros(0, dtype=np.float32)
@@ -206,23 +352,45 @@ class TurnSegmenter:
             if mid_speech:
                 self._open(start, ops)
         if not self.speaking:
-            if p < self.cfg.threshold:
+            if p < self.threshold:
                 if self._prefix_cap:
                     self._prefix = np.concatenate([self._prefix, frame])[-self._prefix_cap:]
                 return
             self._open(start, ops)
         ops.append(("audio", frame))
         self._turn += FRAME
+        paused = self._silence
         # the hysteresis of Silero's VADIterator: a frame below threshold -
         # HYSTERESIS starts the silence, one at or above threshold cancels it,
         # and one in between leaves it running
-        if p >= self.cfg.threshold:
+        if p >= self.threshold:
             self._silence = 0
         elif p < self._neg or self._silence:
             self._silence += FRAME
         # at least one silent frame, so silence_duration_ms 0 does not end a turn mid-speech
-        if self._silence and self._silence >= self._silence_cap:
+        done = bool(self._silence) and self._silence >= self._silence_cap
+        if self._eot is not None:
+            # a copy: a view would keep the whole append it came in alive
+            self._recent.append(frame.copy())
+            if not done and paused < self._pause_cap <= self._silence:
+                done = self._ask_end_of_turn(ops)
+        if done:
             self._stop(start + FRAME, ops)
+
+    def _ask_end_of_turn(self, ops: list) -> bool:
+        """Whether ``end_of_turn`` says the turn is over. If the model raises
+        (onnxruntime, the feature extractor), the error goes out as an
+        ``("end_of_turn_failed", exc)`` operation and this segmenter stops
+        asking: its turns then end at the eagerness' longest silence, the
+        limit that already ends a turn regardless. The frame is counted
+        before the call, so the stream state stays whole either way."""
+        try:
+            return self._eot(np.concatenate(self._recent)) >= self._eot_threshold
+        except Exception as exc:  # noqa: BLE001 — any model failure; the session goes on
+            ops.append(("end_of_turn_failed", exc))
+            self._eot = None
+            self._recent.clear()
+            return False
 
     def _open(self, start: int, ops: list) -> None:
         """Start a turn at stream index ``start``, with the prefix padding
@@ -234,11 +402,16 @@ class TurnSegmenter:
         ops.append(("speech_started", samples_to_ms(start - prefix.size)))
         if prefix.size:
             ops.append(("audio", prefix))
+        if self._eot is not None:
+            self._recent.clear()
+            self._recent.append(prefix.copy())
 
     def _stop(self, end: int, ops: list) -> None:
         ops.append(("speech_stopped", samples_to_ms(end)))
         ops.append(("commit",))
         self.speaking, self._silence, self._turn = False, 0, 0
+        if self._eot is not None:
+            self._recent.clear()
 
     def end_turn(self) -> list[tuple]:
         """A client commit: an open turn takes the partial frame and stops
@@ -267,6 +440,8 @@ class TurnSegmenter:
         self._rest = np.zeros(0, dtype=np.float32)
         self._prefix = np.zeros(0, dtype=np.float32)
         self.speaking, self._silence, self._turn = False, 0, 0
+        if self._eot is not None:
+            self._recent.clear()
         self.vad.reset()
 
     def shift(self, n: int) -> None:

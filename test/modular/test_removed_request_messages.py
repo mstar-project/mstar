@@ -85,7 +85,7 @@ def _worker(is_tp_follower=False) -> Worker:
     w.request_state = RequestStateManager(node_to_partition={NODE: "default"})
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: [NODE],
-        add_request=lambda rid, cfgs: None,
+        add_request=lambda rid, cfgs, info=None: None,
         remove_request=lambda rid: None,
     )
     w.wire_rids_cleared = []

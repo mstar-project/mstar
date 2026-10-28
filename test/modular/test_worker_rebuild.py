@@ -126,7 +126,7 @@ def test_a_request_its_kept_ids_cant_rebuild_is_guaranteed_in_its_pools(monkeypa
     kv, w._my_consumer_connections, w._unprocessed_messages = _pool(), [], {}
     w._graph_runtime.add_request, w._graph_runtime.get_sharding_config = lambda request_id, **kw: int(request_id), id
     w.engine_manager.evictable_nodes = list
-    w.engine_manager.add_request = lambda rid, configs: kv.ingest_request(rid, configs["kv"])
+    w.engine_manager.add_request = lambda rid, configs, info=None: kv.ingest_request(rid, configs["kv"])
     w.request_state.add_request, w.request_state.per_request_info = lambda rid, info: None, defaultdict(dict)
     w.tensor_manager.register_request, w.tensor_manager.start_read_tensors = lambda *a: None, lambda *a, **k: []
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)

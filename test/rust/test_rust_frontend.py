@@ -7,6 +7,7 @@ extension is installed and the server binary is built
 import contextlib
 import json
 import socket
+import sysconfig
 import tempfile
 import threading
 import time
@@ -452,12 +453,13 @@ def test_upload_filename_traversal_is_contained(tmp_path):
     assert ".." not in os.path.basename(path)
 
 
-def _generate(port, urlencoded: bool, timeout=30):
+def _generate(port, urlencoded: bool, fields=None, timeout=30):
     """POST /generate with either content type; returns (status, ndjson)."""
     import urllib.parse
 
-    fields = {"text": "hi", "output_modalities": "text",
-              "streaming": "false", "model_kwargs": '{"foo": 1}'}
+    if fields is None:
+        fields = {"text": "hi", "output_modalities": "text",
+                  "streaming": "false", "model_kwargs": '{"foo": 1}'}
     if urlencoded:
         data = urllib.parse.urlencode(fields).encode()
         ctype = "application/x-www-form-urlencoded"
@@ -512,6 +514,18 @@ def test_generate_accepts_both_content_types(stack):
     texts = [s["text"] for s in stub.submitted]
     assert texts.count("hi") == 2, stub.submitted
     assert all(s["mk"] == {"foo": 1} for s in stub.submitted)
+
+
+@pytest.mark.parametrize("urlencoded", [False, True])
+def test_generate_treats_an_empty_request_id_as_none(stack, urlencoded):
+    """Like the Python /generate: each request gets a fresh id, so two with
+    ``request_id=""`` never collide on ``""``."""
+    port, stub, _bridge, _proc = stack
+    for streaming in ("true", "false"):
+        fields = {"text": "hi", "streaming": streaming, "request_id": ""}
+        assert _generate(port, urlencoded, fields)[0] == 200
+    rids = [s["rid"] for s in stub.submitted]
+    assert len(rids) == 2 and "" not in rids and rids[0] != rids[1]
 
 
 _FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42FAKE-MP4-BYTES"
@@ -1045,3 +1059,16 @@ def test_images_n_cap_follows_the_env():
         out = _post_json(port, "/v1/images/generations",
                          {"model": "cosmos3", "prompt": "x", "n": 2})
         assert len(out["data"]) == 2
+
+
+def test_the_running_environment_s_binary_wins_over_one_on_path(tmp_path, monkeypatch):
+    # An unactivated venv's python must not launch an older mstar-server that
+    # happens to be on $PATH against its own bridge code.
+    scripts, elsewhere = tmp_path / "venv-bin", tmp_path / "on-path"
+    for d in (scripts, elsewhere):
+        d.mkdir()
+        (d / "mstar-server").touch(mode=0o755)
+    monkeypatch.delenv("MSTAR_SERVER_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(elsewhere))
+    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(scripts))
+    assert find_server_binary() == str(scripts / "mstar-server")

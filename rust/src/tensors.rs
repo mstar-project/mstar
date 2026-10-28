@@ -1,7 +1,7 @@
 //! Port of `TensorBookkeeping`: per-uuid reference state and descriptors.
 //!
 //! Never sees a tensor. `TensorStore` stays Python because freeing a record
-//! inside a `py.allow_threads` section would drop a `Py<PyAny>` without the
+//! inside a `py.detach` section would drop a `Py<PyAny>` without the
 //! GIL; everything here is integers and interned strings, so it can be held
 //! across one.
 //!

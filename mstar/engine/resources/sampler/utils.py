@@ -18,9 +18,9 @@ Usage:
 import logging
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -30,6 +30,9 @@ import triton.language as tl
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import sampler_slots
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.sampler.config import LoopbackState
 
 logger = logging.getLogger(__name__)
 
@@ -1794,6 +1797,57 @@ class Buffer:
 
 
 @dataclass
+class RowBuffer:
+    """``Buffer`` for a per-request row of ``width`` values (a declared
+    ``LoopbackState``): ``buf`` ``[cg_slots, max_bs, width]`` is the per-step
+    row a captured forward writes, ``master`` ``[capacity, width]`` the slot
+    cache commit scatters it to and the next step gathers from."""
+    buf: torch.Tensor
+    master: torch.Tensor
+    default: torch.Tensor  # [width], on the device
+    _slot_views: dict = field(default_factory=dict)
+
+    @classmethod
+    def allocate(
+        cls, max_bs: int, capacity: int, device: torch.device,
+        dtype: torch.dtype, default: tuple, cg_slots: int = 1,
+    ) -> "RowBuffer":
+        row = torch.tensor(default, dtype=dtype, device=device)
+        return cls(
+            buf=row.repeat(cg_slots, max_bs, 1),
+            master=row.repeat(capacity, 1),
+            default=row,
+        )
+
+    def grow_master(self, new_capacity: int) -> None:
+        new = self.default.repeat(new_capacity, 1)
+        new[: self.master.shape[0]].copy_(self.master)
+        self.master = new
+
+    def reset_row(self, slot: int) -> None:
+        self.master[slot].copy_(self.default)
+
+    def slot_view(self, cg_slot: int, bs: int) -> torch.Tensor:
+        """This slot's per-step rows, memoized (see ``Buffer.slot_view``)."""
+        key = (cg_slot, bs)
+        view = self._slot_views.get(key)
+        if view is None:
+            view = self._slot_views[key] = self.buf[cg_slot, :bs]
+        return view
+
+    def scatter(
+        self, idx_view: torch.Tensor, real_bs: int, cg_slot: int,
+        keep: torch.Tensor | None = None,
+    ) -> None:
+        """The per-step rows to their slots, real rows only; ``keep`` as in
+        ``Buffer.scatter``."""
+        rows = self.slot_view(cg_slot, real_bs)
+        if keep is not None:
+            rows = torch.where(keep.view(-1, 1), rows, self.master[idx_view])
+        self.master.index_copy_(0, idx_view, rows)
+
+
+@dataclass
 class HostBuffer:
     """Storage for one per-request scalar sampling parameter that only changes
     on a config update (temperature, top-k, top-p, seed, penalty).
@@ -1941,6 +1995,10 @@ class SamplerBuffers:
     # Per-request min-p; allocated only for submodules whose spec enables it,
     # so every other node's captured sampler is unchanged.
     min_p: "HostBuffer | None" = None
+    # The node's declared loop-back states (``SamplerSpec.loopback_state``),
+    # kept by slot like ``last_token``: written per step by the forward,
+    # scattered by commit, gathered by the next step.
+    loopback: dict[str, RowBuffer] = field(default_factory=dict)
     # Generation-aware processors, each allocated only when the spec enables
     # it. The per-request settings are static rows like the ones above; the
     # per-step state (count, recent tokens) is the resource's
@@ -1992,6 +2050,10 @@ class SamplerBuffers:
     # thread, default stream) drains it.
     _pending_offset_reset: set[int] = field(default_factory=set, repr=False)
     _offset_reset_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Slots whose loop-back state rows go back to their defaults before they
+    # are next read or written (a registration; reset on the gpu thread, under
+    # the offset lock).
+    _pending_loopback_reset: set[int] = field(default_factory=set, repr=False)
     # Host master-row writes vs their regrow; a plan-thread write between copy and swap was lost.
     _host_master_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Last-known config per rid — change-detect for ``update_request_config``
@@ -2036,6 +2098,7 @@ class SamplerBuffers:
         enable_top_p_first: bool = False,
         ingraph_scatter: bool = False,
         slots: int | None = None,
+        loopback_state: "Mapping[str, LoopbackState] | None" = None,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
@@ -2085,6 +2148,12 @@ class SamplerBuffers:
             tp_group=tp_group,
             seen_tokens=seen_tokens,
             min_p=mk(torch.float32, 0.0) if enable_min_p else None,
+            loopback={
+                name: RowBuffer.allocate(
+                    max_batch_size, rows, device, state.dtype, state.default, cg_slots,
+                )
+                for name, state in (loopback_state or {}).items()
+            },
             history=history,
             window=mk(torch.int32, 0) if windowed else None,
             window_penalty=mk(torch.float32, 1.0) if windowed else None,
@@ -2215,6 +2284,8 @@ class SamplerBuffers:
         self.last_token.grow_master(rows)
         if self.seen_tokens is not None:
             self.seen_tokens.grow_master(rows)
+        for buf in self.loopback.values():
+            buf.grow_master(rows)
         self._device_capacity = cap
 
     def register_request(
@@ -2235,6 +2306,9 @@ class SamplerBuffers:
         self._rid_to_slot[rid] = slot
         # CPU-only; every GPU write for this slot is deferred to the next gather.
         self._pending_init.add(slot)
+        if self.loopback:
+            with self._offset_reset_lock:
+                self._pending_loopback_reset.add(slot)
         self._cached_config[rid] = (
             sampling_config if sampling_config is not None else SamplingConfig()
         )
@@ -2528,3 +2602,48 @@ class SamplerBuffers:
 
     def has_slot(self, rid: str) -> bool:
         return rid in self._rid_to_slot
+
+    # ------------------------------------------------------------------
+    # Declared loop-back state: the same lifecycle as the last token
+    # ------------------------------------------------------------------
+    def _sync_loopback(self) -> None:
+        """Grow the device masters and reset the rows of newly registered
+        slots, on the gpu thread, before a loop-back row is read or written."""
+        self._sync_device_capacity()
+        if not self._pending_loopback_reset:
+            return
+        with self._offset_reset_lock:
+            resets, self._pending_loopback_reset = self._pending_loopback_reset, set()
+        for slot in resets:
+            for buf in self.loopback.values():
+                buf.reset_row(slot)
+
+    def gather_loopback(self, name: str, cg_slot: int, padded_bs: int) -> torch.Tensor:
+        """``[padded_bs, width]`` rows of state ``name`` for the batch staged
+        on ``cg_slot``, as ``gather_last_tokens``."""
+        self._sync_loopback()
+        return self.loopback[name].master.index_select(
+            0, self._slot_idx_gpu[cg_slot, :padded_bs]
+        )
+
+    def loopback_for(self, name: str, request_ids: list[str]) -> torch.Tensor:
+        """Rows of state ``name`` of registered requests, for an eager step."""
+        self._sync_loopback()
+        return self.loopback[name].master.index_select(0, self._slots_of(request_ids))
+
+    def write_loopback(self, name: str, request_ids: list[str], values: torch.Tensor) -> None:
+        """Eager-step write of state ``name``'s rows by request."""
+        if not request_ids:
+            return
+        self._sync_loopback()
+        master = self.loopback[name].master
+        master.index_copy_(0, self._slots_of(request_ids), values.to(master.dtype))
+
+    def scatter_loopback(
+        self, name: str, cg_slot: int = 0, keep: torch.Tensor | None = None,
+    ) -> None:
+        """Persist state ``name``'s per-step rows on ``cg_slot`` to their
+        slots, as ``scatter_last_token``."""
+        self._sync_loopback()
+        idx, real_bs = self._scatter_idx(cg_slot)
+        self.loopback[name].scatter(idx, real_bs, cg_slot, keep=keep)

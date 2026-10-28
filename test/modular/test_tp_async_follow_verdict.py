@@ -637,7 +637,7 @@ def _plan_thread(commit, done):
     )
     w = types.SimpleNamespace(
         worker_id="w1", parallel_nodes={NODE}, engine_manager=types.SimpleNamespace(get_engine=lambda node: engine),
-        _span=lambda name: contextlib.nullcontext(), _reset_skip_plan_flags=lambda batch: None,
+        _span=lambda name, cpu=None: contextlib.nullcontext(), _reset_skip_plan_flags=lambda batch: None,
     )
     pending = types.SimpleNamespace(
         node_name=NODE, node_batch=types.SimpleNamespace(commit_done=commit),

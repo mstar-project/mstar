@@ -234,6 +234,9 @@ class ScheduleTPNode(MessageBody):
     page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
     # the step's rebuild rows, which run ahead of ``request_ids`` and aren't taken from a ready queue
     rebuild_ids: list[str] = field(default_factory=list)
+    # A row of the step takes an input a follower reads from elsewhere: every
+    # rank agrees on whose read failed before preparing the step
+    read_check: bool = False
 
 
 @dataclass
@@ -261,6 +264,17 @@ class ConductorMessageType(Enum):
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
     ENABLE_METRICS = "enable_metrics"
+    CLIENT_STREAM_INPUT = "client_stream_input"
+
+
+@dataclass
+class ClientStreamInput(MessageBody):
+    """The next chunk of a running request's client streams (see
+    ``mstar.streaming.topology.CLIENT``): stored tensors by edge name, and
+    the streams that end after it. An ended stream takes no more chunks."""
+    request_id: str
+    signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
+    ended: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -274,6 +288,10 @@ class NewRequestConductor(MessageBody):
     # The client's request_id. ``request_id`` is the API server's key for this
     # one submission, never reused; the seed still derives from the client's.
     client_request_id: str | None = None
+    # For a model with client streams, the opening's own client input: its
+    # first chunk and the streams it ends, forwarded once the request is
+    # admitted. A stream it leaves open makes it a live call.
+    client_input: ClientStreamInput | None = None
     streaming: bool = False
 
 
