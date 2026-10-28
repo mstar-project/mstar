@@ -23,7 +23,7 @@ from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, MTP_LEN, SAMPLER, Glm5NextModelConfig
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -514,7 +514,7 @@ def _generate_long(engine, sub, prompts, max_tokens):
                 assert kv._streams[rid]["main"].stored_len == host[rid], (rid, step)
                 assert sub.request_state(rid).get("context") == host[rid], (rid, step)
                 slot = pool._slots[rid]["main"].index
-                assert int(sub._mtp_len[slot]) == rows[rid], (rid, step)
+                assert int(pool.block(MTP_LEN)[slot, 0]) == rows[rid], (rid, step)
         live = [rid for rid in live if not stops.get(rid)]
     for rid in prompts:
         engine.remove_request(rid)
@@ -581,8 +581,8 @@ def test_long_context_decode_stops_while_the_next_block_fits():
     _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit, step,
           ignore_eos=True)
     assert sub.request_state("r").get("context") <= limit
-    slot = engine._resources[KDA_STATE]._slots["r"]["main"].index
-    assert int(sub._mtp_len[slot]) <= limit
+    pool = engine._resources[KDA_STATE]
+    assert int(pool.block(MTP_LEN)[pool._slots["r"]["main"].index, 0]) <= limit
     engine.remove_request("r")
 
 

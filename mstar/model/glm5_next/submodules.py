@@ -28,14 +28,14 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.paged import attn_lens_device
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.linear_attn import kda_triton
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.linear_attn.kda import SpecBlocks
+from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.recurrent.pool import SINK_SLOT
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.config import (
     ATTN,
@@ -46,10 +46,10 @@ from mstar.model.glm5_next.config import (
     LABEL,
     MTP_DRAFT,
     MTP_HIDDEN,
+    MTP_LEN,
     SAMPLER,
     Glm5NextModelConfig,
 )
-from mstar.model.glm5_next.kda import TorchKDAKernels
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -113,9 +113,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         # MTP: a decode step verifies the last token and k drafts per request
         self.mtp_k = config.mtp_num_draft_tokens
         self._mtp_seq = 0
-        # mtp_trims: each KDA slot's tokens in cache, on device (_trim_on_device), and the
-        # sink page's last row, masked, that a row's spare sparse entries attend
-        self._mtp_len: torch.Tensor | None = None
+        # mtp_trims: the sink page's last row, masked, that a row's spare sparse entries attend
         self._pad_slot: int | None = None
         self._pad_kpe: torch.Tensor | None = None
         # accepted-draft counts since the last log line: a histogram over 0..k
@@ -127,6 +125,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self._keep_stager = PinnedStager(torch.float32)
         # capture slot (None: eager) -> the pinned verdict table and step number the host reads
         self._mailboxes: dict[int | None, tuple[torch.Tensor, torch.Tensor]] = {}
+        # the KDA pool and resource, which settle each verify step's accepted drafts
+        self._kda: KDACallable | None = None
 
     @property
     def _dsa(self):
@@ -154,16 +154,15 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         super().bind_node_resources(resources)
         if self.config.mtp_trims and KV_CACHE in resources:
             kv, size = resources[KV_CACHE], resources[KV_CACHE].kv_cache.page_size
-            self._mtp_len = torch.zeros(resources[KDA_STATE].config.max_slots, dtype=torch.long,
-                                        device=self.lm_head.weight.device)
             # nothing writes the sink page's last row in a decode step: padding rows take
             # its first k + 1
             self._pad_slot = SINK_PAGE * size + size - 1
             self._pad_kpe = kv.kv_cache.tensor[:, SINK_PAGE, size - 1, self.config.kv_lora_rank:]
         # The fused kernels where they run; the torch reference elsewhere.
         kda = resources.get(KDA)
-        if kda is not None and (kda.kernels is None or not _fused_kda(self.config)):
+        if kda is not None and not _fused_kda(self.config):
             kda.set_kernels(TorchKDAKernels())
+        self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
 
     # -- CUDA-graph configs ----------------------------------------------
 
@@ -627,28 +626,26 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> None:
         """The next step's draft seed in each row's slot: the MTP state and d1, the draft for
         the token after ``prev`` (the step's next input). A prefill's ``ends`` (device: each
-        request's tokens in cache) start ``_mtp_len`` under mtp_trims."""
+        request's tokens in cache) start its ``MTP_LEN`` under mtp_trims."""
         pool = engine_inputs.resources[KDA_STATE]
-        rows = pool.addressing()
         pool.scatter_(MTP_HIDDEN, hidden, None)
         pool.scatter_(MTP_DRAFT, self._draft_tokens(hidden, prev)[:, None], None)
-        if ends is not None and self._mtp_len is not None:
-            self._mtp_len.index_copy_(0, rows.slot_indices[: rows.num_rows].long(), ends.long())
+        if ends is not None and self.config.mtp_trims:
+            pool.scatter_(MTP_LEN, ends[:, None], None)
 
     def _trim_on_device(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
         """mtp_trims: move this verify step's block to each request's true rows. The host
         plans every block after the last one's whole block, as with holes, and never takes
         rows back, so its cache, and every rank's, moves the same whatever was accepted;
-        ``_mtp_len`` (each slot's tokens in cache, advanced by every verify on device) gives
+        ``MTP_LEN`` (each slot's tokens in cache, advanced by every verify on device) gives
         the true rows, and the rows' positions and the cache slots their latents and index
         keys go to follow them. A captured step keeps its plan, made for the longest rows, and
         masks each row's spare entries; an eager one replans exact rows. Returns each
-        request's ``_mtp_len``."""
+        request's ``MTP_LEN``."""
         ctx, kv = self._dsa_ctx, engine_inputs.resources[KV_CACHE]
-        slots = engine_inputs.resources[KDA].current_plan().slot_ids.long()
-        # padding requests: the sink page's first rows, as planned (no host value: it captures)
-        self._mtp_len[SINK_SLOT:SINK_SLOT + 1].zero_()
-        base = self._mtp_len.index_select(0, slots)
+        # a padding request reads 0 (the sink holds no state): the sink page's first rows,
+        # as planned
+        base = engine_inputs.resources[KDA_STATE].gather(MTP_LEN, None)[:, 0]
         pos = (base[:, None] + torch.arange(self.mtp_block, device=base.device)).view(-1)
         size = ctx.page_size
         pages, offsets = kv.write_slots(LABEL)
@@ -688,7 +685,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         per block row, then the accepted count) goes to the host's mailbox; returns the next
         input token per row."""
         lm, k, block = self.language_model, self.mtp_k, self.mtp_block
-        pool, kda = engine_inputs.resources[KDA_STATE], engine_inputs.resources[KDA]
+        pool = engine_inputs.resources[KDA_STATE]
         rows = pool.addressing()
         n = rows.num_rows
 
@@ -715,9 +712,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         accepted = (drafts == target[:, :k]).long().cumprod(1).sum(1)
         verdict = self._broadcast(torch.cat([target, accepted[:, None]], 1))
         target, accepted = verdict[:, :block], verdict[:, block]
-        kda.set_prefix_len(SpecBlocks.of(pool, 0), accepted)
+        self._kda.set_prefix_len(accepted)
         if base is not None:  # mtp_trims: the next block starts after the accepted rows
-            self._mtp_len.index_copy_(0, rows.slot_indices[: rows.num_rows].long(), base + accepted + 1)
+            pool.scatter_(MTP_LEN, (base + accepted + 1)[:, None], None)
 
         # The host's copy: the verdict first, then its step number.
         verdicts, seq = self._mailboxes[self._mailbox_key(engine_inputs)]
