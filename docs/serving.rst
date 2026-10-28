@@ -50,7 +50,8 @@ mstar serve
        search. Qwen3.5-0.8B on an H200 with an empty cache started in 170 s / 320 s /
        1,294 s at the same throughput; Qwen3-TTS was 25-30% slower at ``-O0`` (c=1).
        Use ``-O2`` for numbers quoted against other engines. Compiles a model runs itself
-       (e.g. a diffusion VAE decode) keep their own mode.
+       keep their own mode, except that ``-O0`` also compiles the DiT scaffold's VAE decode
+       without autotuning.
    * - ``--config``
      - model default
      - Override the resolved default config with a path to your own YAML.

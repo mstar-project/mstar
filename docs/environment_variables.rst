@@ -640,4 +640,6 @@ Compilation
        (read by :func:`mstar.engine.accelerator_graph_runner.compile_level`).
        ``0``: torch.compile's default mode. ``1``: coordinate descent tuning.
        ``2``: ``max-autotune-no-cudagraphs``. A capture config that names its
-       own ``compile_mode`` keeps it.
+       own ``compile_mode`` keeps it. The DiT scaffold's VAE decode takes
+       max-autotune at ``1`` and ``2`` and torch.compile's default mode at ``0``
+       (``decode_utils.VAE_COMPILE_MODES``).

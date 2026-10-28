@@ -1358,7 +1358,9 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    process, so set it to ``false`` for bit-exact, repeatable output — which is how the
    parity suite runs. The compiled decode is warmed at load for the ``capture_sizes``
    grids and the decode batch sizes; any other latent shape decodes eagerly rather than
-   paying a 40 to 100 s autotune inside a request. Memory cuts the other way: the eager
+   paying a 40 to 100 s autotune inside a request. At ``mstar serve -O0`` the decode compiles
+   without autotuning: on an H100 it warms in 90 to 100 s instead of 520 to 610 s at a cold
+   start, and decodes 1024² in 40.6 ms instead of 31. Memory cuts the other way: the eager
    decode of an 8-image batch at 1024² allocates about 40 GiB of activations, for served
    peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
    36 to 44 GiB compiled.
