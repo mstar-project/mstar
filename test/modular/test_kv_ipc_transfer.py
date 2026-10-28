@@ -11,13 +11,17 @@ import torch
 
 from mstar.engine.resources.kv import page_copier
 from mstar.engine.resources.kv.cache import KVCache
-from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
 from mstar.engine.resources.kv.transfer import KVReadInfo, _contiguous_runs, _layers_by_page
 
 
 def _config(**kwargs):
     defaults = dict(num_layers=3, num_kv_heads=2, head_dim=4, max_seq_len=32, max_num_pages=4, page_size=8)
     return PagedKVConfig(**{**defaults, **kwargs})
+
+
+def _mla_config():
+    return _config(layout=KVLayout.MLA, kv_lora_rank=8, qk_rope_head_dim=4)
 
 
 def test_reads_group_by_page_and_token_range():
@@ -53,6 +57,18 @@ def test_layer_rows_is_one_view_a_page_or_one_each_for_k_and_v():
     assert all(view[0].is_contiguous() for view in (whole, k, v))
 
 
+def test_layer_rows_under_mla_is_one_view_whole_or_partial():
+    cache = KVCache(_mla_config(), torch.device("cpu"))
+    cache.tensor.copy_(torch.arange(cache.tensor.numel()).view_as(cache.tensor))
+
+    [whole] = cache.layer_rows(0, 3, 1, 0, 8)
+    [part] = cache.layer_rows(1, 3, 2, 3, 6)
+
+    assert torch.equal(whole, cache.tensor[:, 1])
+    assert torch.equal(part, cache.tensor[1:3, 2, 3:6])
+    assert all(view[0].is_contiguous() for view in (whole, part))
+
+
 def _copiers():
     if not torch.cuda.is_available():
         return [pytest.param(None, marks=pytest.mark.skip(reason="needs a GPU"))]
@@ -65,24 +81,60 @@ def _copiers():
     return out
 
 
-@pytest.mark.parametrize("copier", _copiers())
-def test_copy_rows_copies_exactly_the_view(copier):
-    src = KVCache(_config(), torch.device("cuda"))
-    dst = KVCache(_config(), torch.device("cuda"))
+def _copy_whole_and_partial_pages(copier, config):
+    """Page 1 whole into page 3, then tokens [2, 7) of page 2 into page 0 over
+    layers [1, 3); returns the destination and what it should hold."""
+    src = KVCache(config, torch.device("cuda"))
+    dst = KVCache(config, torch.device("cuda"))
+    expected = KVCache(config, torch.device("cuda"))
     src.tensor.normal_()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
 
-    for d, s in zip(dst.layer_rows(0, 3, 3, 0, 8), src.layer_rows(0, 3, 1, 0, 8), strict=True):
-        copier.copy_rows(d, s, stream)
-    for d, s in zip(dst.layer_rows(1, 3, 0, 2, 7), src.layer_rows(1, 3, 2, 2, 7), strict=True):
-        copier.copy_rows(d, s, stream)
+    for args in ((0, 3, 3, 1, 0, 8), (1, 3, 0, 2, 2, 7)):
+        lo, hi, dst_page, src_page, start, end = args
+        dst_views = dst.layer_rows(lo, hi, dst_page, start, end)
+        src_views = src.layer_rows(lo, hi, src_page, start, end)
+        for d, s, e in zip(
+            dst_views, src_views, expected.layer_rows(lo, hi, dst_page, start, end), strict=True,
+        ):
+            copier.copy_rows(d, s, stream)
+            e.copy_(s)
     stream.synchronize()
+    return dst.tensor, expected.tensor
 
-    expected = torch.zeros_like(dst.tensor)
-    expected[:, 3] = src.tensor[:, 1]
-    expected[1:3, 0, :, 2:7] = src.tensor[1:3, 2, :, 2:7]
-    assert torch.equal(dst.tensor, expected)
+
+@pytest.mark.parametrize("config", [_config, _mla_config], ids=["nhd", "mla"])
+@pytest.mark.parametrize("copier", _copiers())
+def test_copy_rows_copies_exactly_the_view(copier, config):
+    got, expected = _copy_whole_and_partial_pages(copier, config())
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.parametrize("copier", [
+    p for p in _copiers() if not isinstance(p.values[0], page_copier.TorchCopier)
+])
+def test_pitches_over_the_device_max_copy_one_row_at_a_time(copier, monkeypatch):
+    heights = []
+    memcpy_2d = copier._memcpy_2d
+
+    def spy(dst, dpitch, src, spitch, width, height, stream):
+        heights.append(height)
+        return memcpy_2d(dst, dpitch, src, spitch, width, height, stream)
+
+    monkeypatch.setattr(copier, "_memcpy_2d", spy)
+    monkeypatch.setattr(copier, "_max_pitch", 1)
+    got, expected = _copy_whole_and_partial_pages(copier, _config())
+    assert torch.equal(got, expected)
+    assert heights and set(heights) == {1}
+
+    device = torch.arange(3 * 4 * 6, dtype=torch.float32, device="cuda").view(3, 4, 6)
+    host = torch.zeros(3, 2, 6).pin_memory()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    copier.copy(host, [1, 0], device, [0, 2], stream)
+    stream.synchronize()
+    assert torch.equal(host[:, 1], device[:, 0].cpu()) and torch.equal(host[:, 0], device[:, 2].cpu())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA IPC needs a GPU")
