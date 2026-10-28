@@ -61,6 +61,17 @@ def test_a_node_loads_only_its_own_tensors_and_all_of_them(tmp_path):
         load_gr00t_n17_weights(_StateEncoderNode(extra=True), "state_encoder", tmp_path)
 
 
+def test_a_tensor_under_the_nodes_prefix_that_lands_nowhere_is_refused(tmp_path):
+    """A renamed module would load everything else and serve that part at its init."""
+    save_file({
+        "action_head.state_encoder.layer1.W": torch.zeros(2, 3, 4),
+        "action_head.state_encoder.layer1.b": torch.zeros(2, 4),
+        "action_head.state_encoder.layer2.W": torch.zeros(2, 4, 5),
+    }, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match=r"1 tensor\(s\) matched no parameter.*layer2\.W"):
+        load_gr00t_n17_weights(_StateEncoderNode(), "state_encoder", tmp_path)
+
+
 def _expected_shapes(c: Gr00tN17Config) -> dict[str, tuple[int, ...]]:
     """Shapes the config implies for one tensor of each kind (``N`` = any index)."""
     t, v, dit, br = c.text, c.vision, c.dit, c.bridge

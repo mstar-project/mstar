@@ -87,7 +87,7 @@ def load_gr00t_n17_weights(
     path: str | Path,
     device: torch.device | str = "cpu",
 ) -> set[str]:
-    """Load one node's tensors, strictly: every parameter must get one."""
+    """Load one node's tensors, strictly: every parameter gets one, every tensor lands."""
     root, _ = NODE_PREFIXES[node]
     remap, arrived = _remapper(node), set()
 
@@ -113,4 +113,14 @@ def load_gr00t_n17_weights(
     )
     if missing:
         raise ValueError(f"{node}: {len(missing)} parameter(s) got no weight, e.g. {missing[:5]}")
+    # `load_weights_into` only logs a key that matches no parameter; under this node's
+    # prefixes that is a renamed or missing module whose trained weights go unused.
+    stacked = _LLM_STACKED if node == "LLM" else []
+    unexpected = sorted(
+        name for name in arrived - {None}
+        if next((name.replace(r.source_suffix, r.target_suffix) for r in stacked if r.source_suffix in name), name)
+        not in loaded
+    )
+    if unexpected:
+        raise ValueError(f"{node}: {len(unexpected)} tensor(s) matched no parameter, e.g. {unexpected[:5]}")
     return loaded
