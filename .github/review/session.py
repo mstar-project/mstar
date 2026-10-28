@@ -74,9 +74,10 @@ def from_api(m):
 
 
 def usage(messages):
-    """API calls (one per API response), token counts and the run's result fields. Tokens come
-    from the result's per-model counts, which cover every call the session made; only a run that
-    ended without a result (a timeout, a cancel) has them summed from its messages."""
+    """API calls (one per API response in ``messages``), token counts and the run's result fields.
+    Tokens come from the result's per-model counts, which cover every call the session made, some
+    of them not in ``messages``; only a run that ended without a result (a timeout, a cancel) has
+    them summed from its messages."""
     calls = {}
     for m in messages:
         if not from_api(m):
