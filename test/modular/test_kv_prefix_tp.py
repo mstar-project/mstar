@@ -289,12 +289,12 @@ def test_the_serving_config_turns_on_prefix_cache_tp():
     assert kv.enable_prefix_cache(ROOT, WALKS), "the serving config's prefix_cache_tp never reached the pool"
 
 
-def test_host_offload_or_a_pool_on_more_than_one_tp_group_is_refused_at_load(monkeypatch):
+def test_host_offload_or_a_pool_on_more_than_one_node_group_is_refused_at_load(monkeypatch):
     # the real host pool pins memory, which needs a device
     monkeypatch.setattr(manager_mod, "CPUPagePool", lambda **kwargs: None)
     with pytest.raises(ValueError, match="cpu_offload_pages=4"):
         _manager(0, cpu_offload_pages=4)
-    with pytest.raises(ValueError, match="on one TP group"):
+    with pytest.raises(ValueError, match="in one node group"):
         _manager(0, shared=True)
 
 

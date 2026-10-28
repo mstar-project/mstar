@@ -291,19 +291,23 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
     nowhere else to ride.
     """
 
-    __slots__ = ("pre_forks", "post_forks")
+    __slots__ = ("pre_forks", "post_forks", "windowed")
 
     def __init__(
         self,
         mapping: dict[str, KVPlanOutput] | None = None,
         pre_forks: tuple[tuple[str, str], ...] = (),
         post_forks: tuple[tuple[str, str], ...] = (),
+        windowed: "KVPlanOutputs | None" = None,
     ):
         super().__init__(mapping or {})
         # applied by `plan`; the consumer mirrors them at plan time
         self.pre_forks = pre_forks
         # applied by `commit`, after this step's spans land
         self.post_forks = post_forks
+        # the same labels' plans over each stream's `window`, for a pool with one
+        # (`PagedKVConfig.groups`); only an attention with the window reads them
+        self.windowed = windowed
 
 
 # Page the padding tail of a captured step scatters into. Reserved at

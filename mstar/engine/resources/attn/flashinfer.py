@@ -48,6 +48,14 @@ class FlashInferManager(AttentionManager):
         self._dtype = dtype
         # FlashInfer counts preceding positions; M* counts the current token too.
         self._window_left = -1 if sliding_window is None else sliding_window - 1
+        # The group of the pool's layers this reads (`PagedKVConfig.groups`): a windowed
+        # attention reads the last, the one keeping the window if the pool has one. Reading
+        # each stream's `window`, its plans are the pool's `windowed` ones.
+        groups = kv_config.groups
+        self._group = groups[-1 if sliding_window is not None else 0]
+        self._windowed = self._group is not groups[0]
+        # the layers it may run, where the pool's layers are in more than one group
+        self._layers = frozenset(self._group.layers) if len(groups) > 1 else None
 
         # label to plan state
         self._current_plan_states: dict[str, AttentionWrapper] = {}
@@ -66,8 +74,8 @@ class FlashInferManager(AttentionManager):
             num_qo_heads=kv_config.num_qo_heads,
             num_kv_heads=kv_config.num_kv_heads,
             head_dim=kv_config.head_dim,
-            page_size=kv_config.page_size,
-            max_num_pages=kv_config.max_num_pages,
+            page_size=self._group.page_size,
+            max_num_pages=kv_config.num_units,
             device=device,
             backend=backend,
             sm_scale=sm_scale,
@@ -85,6 +93,18 @@ class FlashInferManager(AttentionManager):
             return super().fingerprint()
         # the window and scale shape every later layer's K/V
         return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
+
+    @torch.compiler.disable
+    def set_default_layer_idx(self, layer_idx: int) -> None:
+        # The layer index is a cursor each forward sets, so it can't be checked at bind. Eager
+        # forwards only (a replay runs no Python): warmup's raise a miswired layer at startup.
+        if self._layers is not None and layer_idx not in self._layers:
+            raise ValueError(
+                f"layer {layer_idx} of KV {self._kv_cache_name!r} attends through an attention "
+                f"{'with' if self._group.retention else 'without'} its sliding_window, but is "
+                f"{'not ' if self._group.retention else ''}one of its sliding_layers"
+            )
+        self._default_layer_idx = layer_idx
 
     def _cg_wrapper(
         self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
@@ -114,7 +134,7 @@ class FlashInferManager(AttentionManager):
         buffer = self._workspaces.get(label, lease.slot)
         kv_kwargs = {
             **self._wrapper_kv_kwargs,
-            "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config),
+            "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config, self._group),
         }
         split = self._splits.get(bucket.graph_walk)
         if split is not None:
@@ -209,6 +229,8 @@ class FlashInferManager(AttentionManager):
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
+        if self._windowed:
+            plan_outputs = plan_outputs.windowed
 
         # a preplan leases a different cg slot, so its wrappers and workspaces
         # are disjoint from the ones the in-flight forward reads

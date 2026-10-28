@@ -32,11 +32,15 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(H.manager_mod, "KVTransferManager", H._StubTransfer)
 
 
-def _manager(mode: int) -> KVManager:
+def _manager(mode: int, sliding: tuple[int, ...] = ()) -> KVManager:
+    # with layer 0 full and layers 1 and 2 sliding, those slide in PAGE-token pages
+    geometry = dict(num_layers=1, page_size=PAGE)
+    if sliding:
+        page = 2 * PAGE if len(sliding) < 3 else PAGE
+        geometry = dict(num_layers=3, page_size=page, sliding_window=6, sliding_layers=sliding)
     kv = KVManager(
         cfg=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512,
-            max_num_pages=256, page_size=PAGE,
+            num_kv_heads=1, head_dim=8, max_seq_len=512, max_num_pages=256, **geometry,
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
@@ -72,8 +76,8 @@ def _decode(kv: KVManager, rids: tuple[str, ...], slot: int, pad: int = 0, commi
     return res, step, ctx
 
 
-def _flat(res):
-    out = {}
+def _flat(res, page: int = PAGE):
+    out = {"windowed": None if res.windowed is None else _flat(res.windowed)}
     for label, o in res.items():
         ind = o.cpu_indptrs
         out[label] = (
@@ -81,20 +85,20 @@ def _flat(res):
             ind.qo_indptr.tolist(), ind.paged_kv_indptr.tolist(), ind.paged_kv_indices.tolist(),
             ind.paged_kv_last_page_len.tolist(), ind.kv_lens.tolist(),
             [v.page_idxs[-1] for v in o.views],
-            [(v.last_page_len(PAGE) or PAGE) - 1 for v in o.views],
+            [(v.last_page_len(page) or page) - 1 for v in o.views],
         )
     return out
 
 
-def _run(mode: int, steps: int, pad: int):
-    kv = _manager(mode)
+def _run(mode: int, steps: int, pad: int, sliding: tuple[int, ...] = ()):
+    kv = _manager(mode, sliding)
     _prefill(kv, "a", 5)
     _prefill(kv, "b", 7)
     _prefill(kv, "c", 4)
     plans = []
     for t in range(steps):
         res, _, _ = _decode(kv, ("a", "b", "c"), slot=t % 2, pad=pad)
-        plans.append(_flat(res))
+        plans.append(_flat(res, kv.config.page_size))
         for o in res.values():
             if o.decode_pages is not None:
                 assert o.decode_pages.tolist() == plans[-1]["main"][6]
@@ -110,6 +114,16 @@ def test_cached_decode_plans_match_the_full_ones(pad):
     assert fast == full
     # the first decode step plans from the streams, every later one off it
     assert kv.plan_cache_stats == {"hit": 11, "miss": 0, "mismatch": 0}
+
+
+@pytest.mark.parametrize("sliding", [(1, 2), (0, 1, 2)], ids=["some", "every"])
+def test_cached_decode_plans_follow_a_window(sliding):
+    """The sliding layers' plans off the cached one match the full ones while each
+    window releases a page every few steps, and a release costs no miss."""
+    _, full = _run(0, 20, 1, sliding)
+    kv, fast = _run(1, 20, 1, sliding)
+    assert fast == full
+    assert kv.plan_cache_stats == {"hit": 19, "miss": 0, "mismatch": 0}
 
 
 def test_verify_mode_sees_no_difference():

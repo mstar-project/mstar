@@ -70,6 +70,7 @@ from mstar.engine.resources import (
     apply_yaml_overrides,
 )
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
+from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
@@ -540,7 +541,7 @@ class NemotronDuplexModel(Model):
             max_seq_len=nano.max_position_embeddings,
             num_qo_heads=nano.num_attention_heads,
             # a session holds its prompt and every frame for life (no eviction)
-            max_num_pages=self.nano_kv_pages(PagedKVConfig.page_size),
+            max_num_pages=self.nano_kv_pages(DEFAULT_PAGE_SIZE),
         )
         return [
             RecurrentStateSpec(
@@ -612,7 +613,7 @@ class NemotronDuplexModel(Model):
                     # the sliding window plus the speaker warm-up, rounded up
                     max_seq_len=eartts.sliding_window + 512,
                     num_qo_heads=eartts.num_attention_heads,
-                    max_num_pages=self.talker_kv_pages(PagedKVConfig.page_size),
+                    max_num_pages=self.talker_kv_pages(DEFAULT_PAGE_SIZE),
                 ),
             ),
             AttentionSpec(
