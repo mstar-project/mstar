@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from collections.abc import Mapping
 from pathlib import Path
 
