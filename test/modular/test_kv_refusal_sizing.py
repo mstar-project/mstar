@@ -54,17 +54,12 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _manager(max_num_pages: int) -> KVManager:
+def _manager(max_num_pages: int, **config) -> KVManager:
     return KVManager(
-        cfg=PagedKVConfig(
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=8,
-            max_seq_len=4096,
-            max_num_pages=max_num_pages,
-            page_size=PAGE_SIZE,
-            cpu_offload_pages=0,
-        ),
+        cfg=PagedKVConfig(**{
+            "num_layers": 1, "num_kv_heads": 1, "head_dim": 8, "max_seq_len": 4096,
+            "max_num_pages": max_num_pages, "page_size": PAGE_SIZE, "cpu_offload_pages": 0, **config,
+        }),
         name="kv",
         joint_comm_group=None,
         transfer_engine_info=None,
@@ -150,6 +145,29 @@ def test_a_growing_request_counts_the_pages_it_holds():
     outcome = _admit(mgr, {"long": 1})
 
     assert isinstance(outcome.reason, AdmitRuntimeError)
+
+
+def test_a_window_pool_sizes_a_refusal_in_its_own_pages():
+    """Layer 0 is full and layers 1 and 2 slide, so a page of the pool holds a page of layer 0
+    or half a page of layers 1 and 2: 8 pages of every layer are 24, 23 usable. A request that
+    needs 21 while another holds 3 is retried, and a row whose label has no stream yet counts
+    its window's pages too, so the pool alone holds only the first row."""
+    mgr = _manager(8, num_layers=3, sliding_window=4096, sliding_layers=(1, 2))
+    assert _admit(mgr, {"old": PAGE_SIZE}, commit=True).ok
+    mgr.ingest_request("big")
+    mgr.ingest_request("new")
+    step = KVStep(segments=(Segment("big", "main", 7 * PAGE_SIZE), Segment("new", "aux", PAGE_SIZE)))
+    ctx = _ctx("big", "new")
+
+    outcome = mgr.admit(step, ctx)
+    mgr.rollback_admit(step, ctx)
+
+    assert isinstance(outcome.reason, AllocationFailed)
+    assert (outcome.reason.rows_fit, outcome.reason.rows_fit_alone) == (0, 1)
+    # 8 pages of layer 0 and 16 of the sliding layers: the pool's 24, past its 23
+    outcome = _admit(mgr, {"huge": 8 * PAGE_SIZE})
+    assert isinstance(outcome.reason, AdmitRuntimeError)
+    assert "needs 8 pages of kv for this step, more than the 7" in outcome.reason.message
 
 
 class _FailingWorker(_EvictingWorker):

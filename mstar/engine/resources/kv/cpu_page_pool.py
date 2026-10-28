@@ -13,7 +13,7 @@ trip; which request to evict, and when, is the worker's decision.
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -23,7 +23,7 @@ from mstar.engine.resources.kv.page_copier import make_page_copier
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.kv.manager import PageArena
+    from mstar.engine.resources.kv.manager import PageArena, WindowStream
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,15 @@ class OffloadedStream:
     released: int = 0
     protected_prefix: int = 0
     keys: list[bytes] = field(default_factory=list)
+    # the stream's `window`, on host pages; it never carries keys
+    window: "WindowStream | None" = None
+
+    @property
+    def host_pages(self) -> list[int]:
+        """Every host page the record holds, its window's included."""
+        if self.window is None:
+            return self.cpu_page_indices
+        return self.cpu_page_indices + self.window.page_indices
 
 
 class PageCopies(NamedTuple):
@@ -68,7 +77,7 @@ class CPUPagePool:
         # same layout as the device cache, on pinned memory so the copies can
         # be async
         self.cpu_kv_cache = torch.empty(
-            config.num_layers,
+            kv_cache.tensor.shape[0],
             arena.allocator.max_num_pages,
             *kv_cache.tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
             dtype=kv_cache.dtype,
@@ -111,11 +120,15 @@ class CPUPagePool:
         position: int,
         released: int = 0,
         protected_prefix: int = 0,
+        window: "WindowStream | None" = None,
     ) -> PageCopies | None:
-        """None when the host can't hold the stream even after evicting cached pages."""
+        """None when the host can't hold the stream even after evicting cached pages.
+        ``window`` is a copy of the stream's `window`, placed with it or not at all."""
         # retained before evicting, so the eviction passes over them
         found = self.retain_run(keys)
-        n_pages = len(gpu_page_indices) - len(found)
+        window_pages = [] if window is None else window.page_indices
+        n_own = len(gpu_page_indices) - len(found)
+        n_pages = n_own + len(window_pages)
         cpu_pages = self.arena.acquire(n_pages)
         if cpu_pages is None:
             self.index.evict(n_pages - self.arena.num_free)
@@ -125,14 +138,15 @@ class CPUPagePool:
             self._log_refusal(rid, label, n_pages)
             return None
         self.offloaded.setdefault(rid, {})[label] = OffloadedStream(
-            cpu_page_indices=found + cpu_pages,
+            cpu_page_indices=found + cpu_pages[:n_own],
             stored_len=stored_len,
             position=position,
             released=released,
             protected_prefix=protected_prefix,
             keys=list(keys),
+            window=None if window is None else replace(window, page_indices=cpu_pages[n_own:]),
         )
-        return PageCopies(gpu=gpu_page_indices[len(found):], cpu=cpu_pages)
+        return PageCopies(gpu=gpu_page_indices[len(found):] + window_pages, cpu=cpu_pages)
 
     def insert_keys(self, rid: str, label: str) -> None:
         """Call this only after the placed stream's copies are queued."""
@@ -206,7 +220,7 @@ class CPUPagePool:
         """
         state = self.pop(rid, label)
         if state is not None:
-            self.arena.release(state.cpu_page_indices)
+            self.arena.release(state.host_pages)
 
     def sync(self) -> None:
         """Order the current stream behind the pending copies.
@@ -220,7 +234,7 @@ class CPUPagePool:
 
     def remove_request(self, rid: str) -> None:
         for state in self.offloaded.pop(rid, {}).values():
-            self.arena.release(state.cpu_page_indices)
+            self.arena.release(state.host_pages)
 
     @property
     def num_free_pages(self) -> int:

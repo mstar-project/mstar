@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -76,13 +77,21 @@ class KVConfig(ABC):
         """
 
 
+DEFAULT_PAGE_SIZE = 128
+# The fewest tokens a page of either group holds when the page size is derived: a window
+# keeps up to a page past it, and a smaller page adds page-table entries and plan work a token.
+MIN_GROUP_PAGE = 64
+
+
 @dataclass(kw_only=True)
 class PagedKVConfig(KVConfig):
     """Fixed-size pages, appended to as a sequence grows. The default."""
 
     max_seq_len: int
     max_num_pages: int = 2048
-    page_size: int = 128
+    # None: DEFAULT_PAGE_SIZE, or with full and sliding layers the smallest whole page
+    # for both (`_default_page_size`)
+    page_size: int | None = None
     layout: KVLayout = KVLayout.NHD
     # pages of pinned host memory to keep for offloading; 0 disables it
     cpu_offload_pages: int = 0
@@ -96,6 +105,11 @@ class PagedKVConfig(KVConfig):
     # MLA: whether num_qo_heads was given. Unset it defaults to the one latent KV head, which
     # the attention backend would plan; a cache only stored (index keys) needs no query heads
     qo_heads_given: bool = field(default=False, init=False, repr=False, compare=False)
+    # The layers (KV indices) whose attention sees only the last ``sliding_window``
+    # positions, as their attention spec's ``sliding_window`` says. Declared, the pool
+    # keeps about a window of K/V per request for them and frees the rest.
+    sliding_window: int | None = None
+    sliding_layers: tuple[int, ...] = ()
 
     def __post_init__(self):
         if self.layout == KVLayout.MLA:
@@ -107,6 +121,78 @@ class PagedKVConfig(KVConfig):
             self.num_kv_heads = 1
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
+        if self.page_size is None:
+            self.page_size = self._default_page_size()
+        _ = self.groups  # refuses a bad window here rather than at first use
+
+    def _default_page_size(self) -> int:
+        """With F full and S sliding layers, a page of (S / g)·k tokens of the full layers is
+        (F / g)·k of the sliding ones, g = gcd(F, S): the smallest k with both at least
+        MIN_GROUP_PAGE."""
+        sliding = len(set(self.sliding_layers))
+        full = self.num_layers - sliding
+        if not sliding or full <= 0:
+            return DEFAULT_PAGE_SIZE
+        g = math.gcd(full, sliding)
+        return sliding // g * -(-MIN_GROUP_PAGE * g // min(full, sliding))
+
+    @property
+    def groups(self) -> tuple["KVGroup", ...]:
+        """The layers cut by page size and retention: each stream's own group first, then,
+        with full and sliding layers both, the window's. Built from the fields on each call,
+        so a caller that tells groups apart by identity takes them once."""
+        everything = tuple(range(self.num_layers))
+        if self.sliding_window is None and not self.sliding_layers:
+            return (KVGroup(everything, self.page_size),)
+        if self.sliding_window is None or not self.sliding_layers:
+            raise ValueError("sliding_window and sliding_layers are declared together")
+        sliding = self.sliding_layers
+        if self.sliding_window <= 0:
+            raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
+        if self.layout != KVLayout.NHD:
+            raise ValueError(f"sliding_layers needs the NHD layout, not {self.layout.value}")
+        if len(set(sliding)) != len(sliding) or not all(0 <= i < self.num_layers for i in sliding):
+            raise ValueError(f"sliding_layers {sliding} are not distinct layers of {self.num_layers}")
+        full = tuple(i for i in everything if i not in sliding)
+        page_size = self.page_size
+        if full:
+            # A sliding page is the same bytes as a full one, so both groups draw from one arena.
+            step = len(sliding) // math.gcd(len(full), len(sliding))
+            if self.page_size % step:
+                raise ValueError(
+                    f"page_size {self.page_size} with {len(full)} full and {len(sliding)} sliding "
+                    f"layers gives the sliding layers {self.page_size * len(full) / len(sliding):g}-token "
+                    f"pages; use a multiple of {step}"
+                )
+            page_size = self.page_size * len(full) // len(sliding)
+        # The window in whole pages: a stream releases its front pages past it at commit.
+        # Where every layer slides, each stream keeps the window itself.
+        window = KVGroup(
+            sliding if full else everything, page_size,
+            RetentionPolicy(context_budget=-(-self.sliding_window // page_size) * page_size),
+        )
+        return (KVGroup(full, self.page_size), window) if full else (window,)
+
+    def units(self, pages: int) -> int:
+        """Arena pages in the bytes of ``pages`` pages of every layer. An arena page holds one
+        page of a group's layers, which with full and sliding layers is less than all of them."""
+        return pages * self.num_layers // self._unit_layers
+
+    def pages_of(self, units: int, round_up: bool = False) -> int:
+        """``units`` arena pages in pages of every layer, as ``max_num_pages`` counts them,
+        rounded down (what they hold), or with ``round_up`` up (what holds them)."""
+        if round_up:
+            return -(-units * self._unit_layers // self.num_layers)
+        return units * self._unit_layers // self.num_layers
+
+    @property
+    def _unit_layers(self) -> int:
+        # the layers an arena page holds a page of: the full ones, or every layer
+        return self.num_layers - len(self.sliding_layers) or self.num_layers
+
+    @property
+    def num_units(self) -> int:
+        return self.units(self.max_num_pages)
 
     @property
     def latent_dim(self) -> int:
@@ -136,6 +222,7 @@ class PagedKVConfig(KVConfig):
         ):
             if value is not None:
                 setattr(self, name, value)
+        _ = self.groups  # refuses a page size the sliding layers can't split
 
 
 @dataclass(frozen=True)
@@ -422,6 +509,15 @@ class RetentionPolicy:
             raise ValueError(f"context_budget must be > 0, got {self.context_budget}")
         if self.protected_prefix < 0:
             raise ValueError(f"protected_prefix must be >= 0, got {self.protected_prefix}")
+
+
+@dataclass(frozen=True)
+class KVGroup:
+    """Layers of a paged pool that share a page size and a retention (`PagedKVConfig.groups`)."""
+    layers: tuple[int, ...]
+    page_size: int
+    # applied at each commit: what the group's attention can no longer read goes back to the pool
+    retention: RetentionPolicy | None = None
 
 
 @dataclass(frozen=True)

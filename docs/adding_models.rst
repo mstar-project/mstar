@@ -500,6 +500,28 @@ The spec types are:
        ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
        ``head_dim`` to their sum. Every rank holds the whole latent; only
        ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
+       ``sliding_window=N`` with ``sliding_layers=(...)`` (KV layer indices, the ones
+       ``set_layer_idx`` takes) keeps only about the last ``N`` tokens of those layers
+       per request and returns the rest to the pool, so long requests take far fewer
+       pages. Their attention spec declares the same ``sliding_window`` (startup refuses
+       a mismatch, a pool no attention reads with its window, and a layer bound to the
+       other kind of attention), and every attention over the cache must be FlashInfer
+       with ``flashinfer_backend`` ``auto`` or ``fa2``, or ``fa3`` on SM90; from SM100
+       ``auto`` runs ``fa2``. With full layers too, the sliding layers' pages hold
+       ``page_size × full layers / sliding layers`` tokens, which must be whole. Left
+       unset, ``page_size`` is the smallest whole choice whose pages of either group hold
+       at least 64 tokens (192 for 13 full and 39 sliding layers, 184 for 16 and 46); a
+       ``page_size`` in the YAML must be a multiple of ``sliding layers / gcd(full,
+       sliding)``. A window is kept in whole pages of its layers plus up to one more, so
+       with few sliding layers among many full ones (1984-token sliding pages at 31 full
+       and 1 sliding) a short window saves little. ``max_num_pages``,
+       ``cpu_offload_pages`` and the page metrics keep counting pages of every layer.
+       A pool with ``sliding_layers`` doesn't fork, open a prefix cache (set
+       ``prefix_cache: false`` if the model keys labels), serve a node on another
+       instance (replicas of one node group are fine) or take cross attention yet, one
+       with full layers too doesn't hand out ``write_slots``, and one where every layer
+       slides protects no prefix (``protect_prefix``, a step's ``retention``); each of
+       these is refused.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
        ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
@@ -536,8 +558,9 @@ The spec types are:
        64-wide rope part, or none from FlashInfer 0.6.18; any other shape runs a torch
        fallback, which cannot be captured in a CUDA graph.
        ``sliding_window=N`` lets each query attend to the last ``N`` positions, its
-       own included. It needs the FlashInfer backend and causal attention, and the
-       pages behind the window stay allocated.
+       own included. It needs the FlashInfer backend and causal attention. The pages
+       behind the window stay allocated unless the cache declares the same window and
+       the layers that use it (``PagedKVConfig.sliding_layers``).
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
      - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache. A step
        declares ``DSAStep()``, and the resource takes each request's rows from the KV plan.
