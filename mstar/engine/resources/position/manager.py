@@ -66,6 +66,13 @@ class PositionManager(Resource):
             )
         raise ValueError(f"Unknown position backend {spec.config.backend!r}")
 
+    def fusable_rope_theta(self, head_dim: int) -> float | None:
+        """The theta of the RoPE ``apply_qk`` applies, when that is plain
+        rotate-half RoPE over the whole ``head_dim`` (not interleaved, no
+        scaling, no RoPE dtype), which a layer may apply in a fused kernel of
+        its own instead; None otherwise."""
+        return None
+
 
 class RopeManager(PositionManager):
     """rotary position on top flashinfer in-place kernels"""
@@ -123,6 +130,12 @@ class RopeManager(PositionManager):
             rotary_dim = config.rotary_dim or head_dim
             if rotary_dim is None:
                 raise ValueError("rope_table_dtype needs PositionConfig.rotary_dim or the KV cache's head_dim")
+            if device.type == "cuda" and rotary_dim % 16:
+                # FlashInfer's cos/sin-cache kernel moves 16 elements a thread: a narrower
+                # rotation reads past each head and returns garbage, without an error
+                raise ValueError(
+                    f"rope_table_dtype needs a rotary_dim that is a multiple of 16 on CUDA, "
+                    f"not {rotary_dim}")
             self._rope_table = self._build_rope_cache(
                 rotary_dim,
                 config.rope_scale,
@@ -148,6 +161,14 @@ class RopeManager(PositionManager):
         # `clear_preplan` can put the targets back. Unlike KV's, these forks are
         # staged: a counter is host-only, so copying it early races nothing.
         self._preplan_fork_undo: list[tuple[str, str, int | None]] = []
+
+    def fusable_rope_theta(self, head_dim: int) -> float | None:
+        cfg = self._config
+        plain = (
+            cfg.rope_scale == 1.0 and not cfg.interleave and cfg.rope_dtype is None
+            and not cfg.llama31_params and cfg.rotary_dim in (None, head_dim)
+        )
+        return float(cfg.rope_theta) if plain else None
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -525,17 +546,26 @@ class RopeManager(PositionManager):
     def apply_qk(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        label: str,
+        k: torch.Tensor | None,
+        label: str | None = None,
         rotary_dim: int | None = None,
         interleave: bool | None = None,
         rope_scale: float | None = None,
         rope_theta: float | None = None,
         rope_dtype: torch.dtype | None = None,
+        pos_ids: torch.Tensor | None = None,
         **kwargs,
     ):
-        pos_ids = self._current_pos_ids[label]
+        """Rotate ``q`` and ``k`` at ``label``'s planned positions, or at ``pos_ids``, one per
+        row, for a model that threads positions itself (an offset, or a slice of the step).
+        ``k=None`` rotates ``q`` alone and returns ``(q, None)``."""
+        if pos_ids is None:
+            pos_ids = self._current_pos_ids[label]
         config = self._config
+        alone = k is None
+        if alone:
+            # the kernel rotates a (q, k) pair; a one-head scratch key stands in
+            k = q.new_zeros(q.shape[0], 1, q.shape[-1])
 
         orig_dtype = q.dtype
         rope_dtype = rope_dtype if rope_dtype is not None else config.rope_dtype
@@ -598,7 +628,7 @@ class RopeManager(PositionManager):
             rope_theta,
             **llama31_params,
         )
-        return q.to(orig_dtype), k.to(orig_dtype)
+        return q.to(orig_dtype), None if alone else k.to(orig_dtype)
 
 
 # TODO: mrope / 3D positions (qwen omni, cosmos), learned position embeddings

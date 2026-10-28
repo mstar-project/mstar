@@ -36,6 +36,7 @@ from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep, keep_final_chunk_samples
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
@@ -77,7 +78,7 @@ from mstar.model.submodule_base import (
     device_loopback_enabled,
 )
 from mstar.utils.knobs import ingraph_decode_rope
-from mstar.utils.profiler import PHASE_PERIOD, phase_record
+from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
 logger = logging.getLogger(__name__)
 
@@ -394,35 +395,7 @@ class LLMSubmodule(ARNodeSubmodule):
         )
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
-        """``[3, total_tokens]`` for the step, in packed request order.
-
-        A pure-text step is the position resource's planned 1D positions
-        broadcast across the three grids (a view, no copy). An image's grids
-        do not advance together, so a request with `custom_pos_ids` supplies
-        its own and the step concatenates, using the resource's slice for text.
-        """
-        total_tokens = sum(inp.input_seq_len for inp in inputs)
-        pos_ids = self.node_resources[ROPE].pos_ids("main")
-        assert pos_ids is not None, (
-            "position resource has no plan for this step; `plan` must run "
-            "before `preprocess`"
-        )
-        if not any(inp.custom_pos_ids is not None for inp in inputs):
-            return pos_ids[:total_tokens].unsqueeze(0).expand(3, -1)
-
-        parts: list[torch.Tensor] = []
-        offset = 0
-        for inp in inputs:
-            span = inp.input_seq_len
-            if inp.custom_pos_ids is not None:
-                parts.append(inp.custom_pos_ids.float())
-            else:
-                parts.append(
-                    pos_ids[offset:offset + span].float()
-                    .unsqueeze(0).expand(3, -1)
-                )
-            offset += span
-        return torch.cat(parts, dim=1)
+        return mrope_position_ids(self.node_resources[ROPE].pos_ids("main"), inputs)
 
     def preprocess(
         self,
@@ -455,10 +428,7 @@ class LLMSubmodule(ARNodeSubmodule):
                     for i, inp in enumerate(inputs)
                 ])
             elif routed:
-                ids.index_copy_(
-                    0, torch.tensor(routed, device=ids.device),
-                    torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
-                )
+                sampler.overwrite_rows(routed, (ids, torch.cat([inputs[i].input_ids for i in routed])))
             out["input_ids"] = ids
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
@@ -472,10 +442,13 @@ class LLMSubmodule(ARNodeSubmodule):
                 [inp.input_embeds for inp in inputs], dim=0,
             )
 
+        laps = PhaseLaps("engine.preprocess.")
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
+        laps.lap("position_ids")
         cos, sin = self.model.model.build_cos_sin(
             position_ids_3d, dtype=self.model.model.embed_tokens.weight.dtype,
         )
+        laps.lap("cos_sin")
         out["cos_3d"] = cos
         out["sin_3d"] = sin
         return out
@@ -709,22 +682,9 @@ class LLMSubmodule(ARNodeSubmodule):
         """``check_stop`` for every request off one ``tolist``."""
         if step_walk is not None and step_walk != "decode":
             return {}  # as check_stop: only a decode row's stop ends decode_loop
-        tokens = host_rows.buffers.get("new_token")
-        if not torch.is_tensor(tokens) or tokens.dim() == 0:
+        pairs = host_rows.first_values("new_token", request_ids)
+        if pairs is None:
             return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        rows = host_rows.request_ids
-        if len(rows) >= len(request_ids) and all(
-            a == b for a, b in zip(request_ids, rows, strict=False)
-        ):
-            # the common case: the batch in forward order, no row map needed
-            pairs = zip(request_ids, values, strict=False)
-        else:
-            row_of = {rid: i for i, rid in enumerate(rows)}
-            pairs = (
-                (rid, values[i]) for rid in request_ids
-                if (i := row_of.get(rid)) is not None and i < len(values)
-            )  # no row, no output: the per-request path skips it too
         stop_ids = self.config.stop_token_ids
         stops: dict[str, set[str]] = {}
         mixed = step_walk is None

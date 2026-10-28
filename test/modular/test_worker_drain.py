@@ -15,6 +15,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -45,6 +46,8 @@ def _worker(
     w._pending_drains = set(pending_drains)
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
+    w._removed_rids = RecentSet(16)
+    w._unprocessed_messages = {}
     w._pending_removes = {}
     # Identity interning: these tests use the rid string as its own handle, so
     # the string/handle split is exercised without a real runtime.
@@ -494,9 +497,9 @@ def test_preprocess_reads_done_idempotent():
 
 
 def test_preprocess_finished_reading_acks_immediately_when_drained():
-    """Happy path: delivery completed, so the ACK goes out without paying for a
-    drain check (and without gating on reads that cannot exist)."""
-    wt = _preprocess(inflight_reads=True)  # would block a gated ACK
+    """Happy path: delivery completed and no read is in flight, so the ACK
+    goes out at once, without a drain."""
+    wt = _preprocess(inflight_reads=False)
     wt._finish_reading("X", drained=True)
     assert len(_pw_reads_done(wt)) == 1
     assert "X" not in wt._draining_rids

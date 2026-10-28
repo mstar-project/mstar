@@ -55,10 +55,11 @@ def _batch(seq: int, rids: list[int]):
         node_name=NODE, graph_walk=WALK, tp_seq=seq,
         request_to_worker_graph={rid: 0 for rid in rids},
         chunk_ranges={}, incomplete_node_rids=set(),
+        rids_by_walk=lambda: {WALK: list(rids)},
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
-        launch_started_event=None,
+        launch_started_event=None, read_check_rids=None,
     )
     return scheduled, executing
 
@@ -83,6 +84,9 @@ class _Scheduler:
         self.steps = [STEP_N] + ([[HANDLES["kept"]]] if serial else [])
         self.last_consumed_tp_seq = -1
 
+    def drop_chunk_lookahead(self, rids, node_name=None):
+        """A step that is abandoned forgets the chunks it was cut for."""
+
     def get_next_batch(self, request_state, **kwargs):
         if self.last_consumed_tp_seq + 1 >= len(self.steps):
             return None
@@ -97,6 +101,10 @@ class _Scheduler:
 
     def take_admit_errors(self):
         return {}
+
+    def clear_batch_limit(self, node_name, graph_walk, rows, walks=()):
+        # an admitted step lifts its refusal limit; this stub has none
+        del node_name, graph_walk, rows, walks
 
     def clear_rid(self, rid, wire_rid):
         pass
@@ -124,6 +132,7 @@ def _rank(
     w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
+    w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
     w._stream_buffer_rids, w.streaming_buffers, w._last_active = set(), {}, {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)

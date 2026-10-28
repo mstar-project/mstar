@@ -837,6 +837,8 @@ class LLMSubmodule(ARNodeSubmodule):
         # on the step (`cg_key_info`) so a replay lands on its own bucket.
         return [
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="decode",
                 additional_key_info=False,
                 single_request_inputs=ARNodeInputs(
@@ -845,6 +847,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             ),
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="decode",
                 additional_key_info=True,
                 single_request_inputs=ARNodeInputs(
@@ -854,6 +858,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             ),
             PackedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="prefill_text",
                 # decode rows of a mixed step are one-token segments
                 replay_graph_walks=["prefill_text", MIXED_TEXT],

@@ -30,12 +30,6 @@ def _piecewise(mode):
     )
 
 
-def test_config_mode_defaults_to_the_historical_autotune():
-    assert compile_kwargs(None) == {
-        "fullgraph": False, "dynamic": False, "mode": "max-autotune-no-cudagraphs",
-    }
-
-
 def test_config_names_its_own_mode():
     assert compile_kwargs("default") == {"fullgraph": False, "dynamic": False}
     assert compile_kwargs("max-autotune-no-cudagraphs")["mode"] == "max-autotune-no-cudagraphs"

@@ -17,10 +17,21 @@ import inspect
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch import nn
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    _get_feat_extract_output_lengths,
+    chunk_and_pad_features,
+    get_audio_cu_seqlens,
+    get_valid_indices,
+)
+from transformers.vision_utils import (
+    get_vision_cu_seqlens,
+    get_vision_interpolation_indices_and_weights,
+    get_vision_position_ids,
+)
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -42,6 +53,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
@@ -64,6 +76,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_SAMPLER,
     Qwen3OmniModelConfig,
 )
+from mstar.model.qwen3_omni.qwen3_omni_model import image_span
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -128,12 +141,19 @@ class AudioEncoderSubmodule(NodeSubmodule):
     Runs once per request (not batched across requests).
     """
 
+    marks_dynamic_dims = True
+
     def __init__(self, audio_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
         self.audio_encoder = audio_encoder
         self.config = config
         # Older transformers take return_dict; newer ones dropped it.
         self._encoder_takes_return_dict = _accepts_kwarg(audio_encoder.forward, "return_dict")
+        n_window = audio_encoder.n_window
+        # the length of a full attention window, since no clip's window is longer
+        self._max_seqlen = _get_feat_extract_output_lengths(2 * n_window, n_window) * (
+            audio_encoder.n_window_infer // (2 * n_window)
+        )
 
     def prepare_inputs(
         self,
@@ -144,21 +164,31 @@ class AudioEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         # Edge name from graph walk is "audio_features"
         audio_features = inputs["audio_features"][0]
-        audio_seqlens = inputs.get("audio_seqlens", [None])[0]
+        audio_seqlens = inputs["audio_seqlens"][0]
 
-        return NodeInputs(
-            tensor_inputs={
-                "audio_features": audio_features,
-                "audio_seqlens": audio_seqlens,
-            }
-        )
+        # Built outside the compiled forward, since these helpers read the clip's length on the
+        # host, which would compile a graph for every length.
+        encoder = self.audio_encoder
+        padded_feature, chunk_lengths = chunk_and_pad_features(audio_features, audio_seqlens, encoder.n_window)
+        tensor_inputs = {
+            "padded_feature": padded_feature,
+            "chunk_lengths": chunk_lengths,
+            "valid_indices": get_valid_indices(chunk_lengths, encoder.n_window),
+            "cu_seqlens": get_audio_cu_seqlens(chunk_lengths, audio_seqlens, encoder.n_window_infer, encoder.n_window),
+        }
+        for name in ("chunk_lengths", "valid_indices", "cu_seqlens"):
+            torch._dynamo.mark_dynamic(tensor_inputs[name], 0)
+        # A clip shorter than one chunk is padded only to its own length, so the frame dimension of
+        # `padded_feature` varies too. Some clips give a dimension of size 1 inside the encoder, which torch
+        # specializes, so `mark_dynamic` would raise for them.
+        torch._dynamo.maybe_mark_dynamic(padded_feature, 0)
+        torch._dynamo.maybe_mark_dynamic(padded_feature, 2)
+        return NodeInputs(tensor_inputs=tensor_inputs)
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        audio_features: torch.Tensor,
-        audio_seqlens: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> NameToTensorList:
         """Run the audio encoder and return embeddings.
@@ -166,14 +196,10 @@ class AudioEncoderSubmodule(NodeSubmodule):
         Returns:
             {"audio_embeds": [tensor of shape (audio_tokens, hidden_size)]}
         """
-        logger.debug(
-            "Running AudioEncoder with audio_features shape=%s",
-            audio_features.shape,
-        )
         extra_kwargs = {"return_dict": True} if self._encoder_takes_return_dict else {}
         audio_out = self.audio_encoder(
-            audio_features,
-            feature_lens=audio_seqlens,
+            max_seqlen=self._max_seqlen,
+            **kwargs,
             **extra_kwargs,
         )
         audio_embeds = getattr(audio_out, "last_hidden_state", audio_out)
@@ -199,6 +225,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
 
     Runs once per request (not batched across requests).
     """
+
+    marks_dynamic_dims = True
 
     def __init__(self, vision_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
@@ -235,12 +263,24 @@ class VisionEncoderSubmodule(NodeSubmodule):
         if grid_thw.dim() == 1:
             grid_thw = grid_thw.unsqueeze(0)  # (1, 3)
 
-        return NodeInputs(
-            tensor_inputs={
-                "pixel_values": pixel_values,
-                "grid_thw": grid_thw,
-            }
+        # Built outside the compiled forward, since these helpers call `.tolist()` on the
+        # grid, which would compile a graph for every image size.
+        encoder = self.vision_encoder
+        interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+            grid_thw, num_grid_per_side=encoder.num_grid_per_side, mode=encoder.interpolation_mode,
+            align_corners=encoder.interpolation_align_corners, spatial_merge_size=encoder.spatial_merge_size,
         )
+        tensor_inputs = {
+            "pixel_values": pixel_values,
+            "grid_thw": grid_thw,
+            "interp_indices": interp_indices,
+            "interp_weights": interp_weights,
+            "position_ids": get_vision_position_ids(grid_thw, encoder.spatial_merge_size),
+            "cu_seqlens": get_vision_cu_seqlens(grid_thw),
+        }
+        for name in ("pixel_values", "interp_indices", "interp_weights", "position_ids", "cu_seqlens"):
+            torch._dynamo.mark_dynamic(tensor_inputs[name], 0)
+        return NodeInputs(tensor_inputs=tensor_inputs)
 
     def forward(
         self,
@@ -267,6 +307,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
         encoder_output = self.vision_encoder(
             pixel_values,
             grid_thw=grid_thw,
+            # each video frame is its own segment, and a call encodes one item, so this is one frame's patches
+            max_seqlen=pixel_values.shape[0] // (kwargs["cu_seqlens"].shape[0] - 1),
+            **kwargs,
         )
 
         if isinstance(encoder_output, tuple):
@@ -302,6 +345,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
     stream to the Talker partition.  ``thinker_decode`` additionally
     produces ``logits`` for text token sampling.
     """
+
+    cuts_tensor_inputs = True
 
     # Default MRoPE section for head_dim=128: [24, 20, 20]
     MROPE_SECTION = [24, 20, 20]
@@ -454,24 +499,16 @@ class ThinkerSubmodule(ARNodeSubmodule):
             text_ids = inputs["text_inputs"][0].to(device)  # (seq_len,)
             embeds = self.model.model.embed_tokens(text_ids)
             seq_len = text_ids.shape[0]
-
-            # Compute 3D MRoPE position IDs for a pure-text span.  Each
-            # prefill graph walk is single-modality so we use the simple
-            # per-modality helper instead of the full HF parser.
-            #
-            # ``start_pos`` is the next MRoPE position for this request,
-            # carried forward across walks by the stream's position counter
-            # (advanced by the runner's commit of each declared step).
-            pos_ids = get_rope_index_text(seq_len, start_pos, device)
             masks_for_talker = torch.stack([
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
                 talker_text_mask(text_ids, self.config) # text inclusion
             ])
+            # A text row leaves its positions to the plan, which starts from the
+            # counter a cache hit has already moved.
             return ARNodeInputs(
                 input_seq_len=seq_len,
                 input_embeds=embeds,
                 input_ids=text_ids,
-                custom_pos_ids=pos_ids,
                 tensor_inputs={
                     "masks_for_talker": masks_for_talker
                 }
@@ -551,7 +588,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
             # Sentinel token positions (text-like).
             start_pos_ids = get_rope_index_text(1, start_pos, device)
-            end_pos_base = float(vision_pos_ids.max().item()) + 1
+            if seconds_per_grid is None:
+                # Use the prompt layout's helper, so the cache and this walk move the position by the same amount.
+                end_pos_base = start_pos + image_span(grid_thw, self.config.vision.spatial_merge_size).advance - 1
+            else:
+                end_pos_base = float(vision_pos_ids.max().item()) + 1
             end_pos_ids = get_rope_index_text(1, end_pos_base, device)
 
             pos_ids = torch.cat(
@@ -584,24 +625,21 @@ class ThinkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_TOKENS = 1024
 
     def split_inputs(
-        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
-        inputs: ARNodeInputs, start: int, end: int,
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs,
+        start: int,
+        end: int,
     ) -> ARNodeInputs:
-        tensor_inputs = inputs.tensor_inputs
-        unknown = tensor_inputs.keys() - {"masks_for_talker", "deepstack", "mrope_pos_advance"}
-        if unknown:
-            raise NotImplementedError(f"Thinker cannot cut tensor inputs {sorted(unknown)}")
-        cut = super().split_inputs(
-            graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end,
-        )
-        cut.tensor_inputs = {}
-        if (masks := tensor_inputs.get("masks_for_talker")) is not None:
-            cut.tensor_inputs["masks_for_talker"] = masks[:, start:end]  # (2, seq)
-        if (deepstack := tensor_inputs.get("deepstack")) is not None:
-            cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in deepstack]  # (seq, hidden)
-        if "mrope_pos_advance" in tensor_inputs:
-            # the whole span's; declare_step applies it on the final chunk
-            cut.tensor_inputs["mrope_pos_advance"] = tensor_inputs["mrope_pos_advance"]
+        tensors = inputs.tensor_inputs
+        cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
+        cut.tensor_inputs = {"masks_for_talker": tensors["masks_for_talker"][:, start:end]}
+        if graph_walk == "prefill_vision":
+            cut.tensor_inputs["deepstack"] = [layer[start:end] for layer in tensors["deepstack"]]
+            cut.tensor_inputs["mrope_pos_advance"] = tensors["mrope_pos_advance"]
+        elif graph_walk == "prefill_audio":
+            cut.tensor_inputs["mrope_pos_advance"] = inputs.input_seq_len
         return cut
 
     def declare_step(
@@ -631,19 +669,21 @@ class ThinkerSubmodule(ARNodeSubmodule):
         }
 
         pos_advance = None
-        if "prefill_vision" in row_walks:
-            # A vision row's 3D-grid MRoPE span is larger than its token count,
-            # so it advances the counter by its own; other rows by their span.
-            # A chunk's positions were cut from the whole span's, so only a
-            # vision row's final chunk advances the counter.
+        if graph_walk != "thinker_decode" and any("mrope_pos_advance" in inp.tensor_inputs for inp in inputs):
+            # A vision row's 3D-grid MRoPE span differs from its token count, and
+            # a cut audio row moves past its whole clip, so each advances the
+            # counter by its own `mrope_pos_advance`. That value is the WHOLE
+            # span's, and a chunk's positions were cut from it, so a chunked row
+            # applies it once, on its final chunk. A row without one advances by
+            # the span it just ran, which is per chunk.
             pos_advance = tuple(
-                (int(inp.tensor_inputs.get("mrope_pos_advance", 0)) if inp.is_final_chunk else 0)
-                if walk == "prefill_vision" else inp.input_seq_len
-                for inp, walk in zip(inputs, row_walks, strict=True)
+                (int(inp.tensor_inputs["mrope_pos_advance"]) if inp.is_final_chunk else 0)
+                if "mrope_pos_advance" in inp.tensor_inputs else inp.input_seq_len
+                for inp in inputs
             )
         return SubmoduleStep(
             # must match `cg_key_info`, which picked the leased capture
-            cg_key_info=self.DEEPSTACK_KEY if pos_advance is not None else None,
+            cg_key_info=self.DEEPSTACK_KEY if "prefill_vision" in row_walks else None,
             segments=[
                 Segment(
                     request_id=rid,
@@ -672,14 +712,13 @@ class ThinkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]: # input name to tensor
+        self.model.maybe_log_expert_load(synthetic=engine_inputs.synthetic)
         device = self.get_device()
         # Concatenate across requests
         input_embeds = torch.cat([
             inp.input_embeds for inp in inputs
         ], dim=0)
-        position_ids_3d = torch.cat([
-            inp.custom_pos_ids for inp in inputs
-        ], dim=1)  # (3, total_tokens)
+        position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
         seq_lens = [
             inp.input_seq_len for inp in inputs
         ]
@@ -704,6 +743,16 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # ``forward_batched``/``forward`` reassemble the list from kwargs.
             extra_inputs = self._deepstack_inputs(inputs, input_embeds.dtype, device)
 
+        if self.model.mask_padding:
+            # Real rows lead the bucket; the captured MoE skips the rest.
+            # A fill kernel, so no H2D copy.
+            num_valid = engine_inputs.real_seq_len
+            if num_valid is None:
+                num_valid = input_embeds.shape[0]
+            extra_inputs["num_valid_tokens"] = torch.full(
+                (1,), num_valid, dtype=torch.int64, device=device,
+            )
+
         return {
             "input_embeds": input_embeds,
             "cos_3d": cos_3d,
@@ -716,6 +765,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
             },
             **extra_inputs
         }
+
+    def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
+        return mrope_position_ids(self.node_resources[THINKER_POS].pos_ids("main"), inputs)
 
     def _deepstack_inputs(
         self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
@@ -808,6 +860,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             mrope_section=mrope_section,
             deepstack_visual_embeds=deepstack,
             label="main",
+            num_valid_tokens=kwargs.get("num_valid_tokens"),
         )
 
         result: NameToTensorList = {}
@@ -997,6 +1050,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             mrope_section=mrope_section,
             deepstack_visual_embeds=deepstack,
             label="main",
+            num_valid_tokens=kwargs.get("num_valid_tokens"),
         )
 
         request_ids = engine_inputs.request_ids
@@ -1770,13 +1824,6 @@ class Code2WavSubmodule(NodeSubmodule):
         super().__init__()
         self.code2wav = code2wav_model
         self.config = config
-        # Per-request set of request_ids that have already emitted their first
-        # audio chunk. The first chunk has no prior audio to overlap with, so
-        # its output must NOT be trimmed — the left-context trim only applies
-        # to subsequent chunks. Matches HF chunked_decode's ``context_size =
-        # left_context_size if start_index - left_context_size > 0 else start_index``
-        # logic, where the first iteration has context_size=0.
-        self._first_chunk_emitted: set[str] = set()
 
         # Pre-compute the total upsample factor. HF defines this as
         # ``np.prod(upsample_rates + upsampling_ratios)`` — both tuples
@@ -1789,12 +1836,13 @@ class Code2WavSubmodule(NodeSubmodule):
             total_upsample *= r
         self.total_upsample = total_upsample
 
-        self.full_seqlen = self.config.code2wav.codec_left_context_frames + \
-            self.config.code2wav.codec_chunk_frames
-
-    def cleanup_request(self, request_id):
-        super().cleanup_request(request_id)
-        self._first_chunk_emitted.discard(request_id)
+        # Every window, from the ramp's first few frames to a steady
+        # context + chunk window, is zero-padded to this one shape. The
+        # vocoder is causal, so the padding changes only the look-ahead
+        # samples that ``postprocess`` drops, and the convs keep the input
+        # lengths of a full window (bf16 cuDNN convs go wrong at some other
+        # odd lengths on B200).
+        self.full_seqlen = self.config.code2wav.codec_max_window
 
     @staticmethod
     def _chunk(rid, per_request_input_metadata: Mapping[str, InputMetadata] | None):
@@ -1807,10 +1855,9 @@ class Code2WavSubmodule(NodeSubmodule):
     ) -> bool:
         """Whether every window may be a terminal flush that emits no audio:
         its new items are at most the Talker's codec_eos frame, which ends
-        every stream the Talker stops itself, so a reply of
-        k * codec_chunk_frames frames ends with such a flush. The counts can't
-        tell that frame from a real one, so ``preprocess`` checks the decoded
-        frames."""
+        every stream the Talker stops itself, so a reply whose frames end on a
+        chunk boundary ends with such a flush. The counts can't tell that
+        frame from a real one, so ``preprocess`` checks the decoded frames."""
         for rid in request_ids:
             chunk = cls._chunk(rid, per_request_input_metadata)
             if chunk is None or chunk.num_items - chunk.context_items > int(chunk.is_final):
@@ -1851,6 +1898,7 @@ class Code2WavSubmodule(NodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        input_metadata: InputMetadata | None = None,
         **kwargs
     ) -> NodeInputs:
         num_quantizers = self.config.code2wav.num_quantizers  # 16
@@ -1875,8 +1923,15 @@ class Code2WavSubmodule(NodeSubmodule):
         if codec_tokens.shape[-1] > num_quantizers:
             codec_tokens = codec_tokens[..., :num_quantizers]
 
-        # pad sequence to full_seqlen for batching
+        # The window's leading frames that an earlier window already decoded.
+        # EOS is only ever a stream's last item, but it can be a context item
+        # of the final flush (the previous window's last new item). The filter
+        # above dropped it, so the clamp keeps the context within the frames.
+        chunk = (input_metadata.stream_chunks.get("codec_tokens") if input_metadata is not None else None)
         orig_seq_len = codec_tokens.shape[0]
+        context = min(chunk.context_items if chunk is not None else 0, orig_seq_len)
+
+        # pad sequence to full_seqlen for batching
         pad_len = self.full_seqlen - codec_tokens.shape[0]
         if pad_len > 0:
             pad = torch.zeros((
@@ -1887,15 +1942,15 @@ class Code2WavSubmodule(NodeSubmodule):
 
         # Transpose to (Q, T)
         codec_tokens = codec_tokens.T  # (Q, T)
-        # The frame count rides with this pass rather than in request state,
-        # so postprocess reads this window's count even if the request's next
-        # window is prepared first.
+        # The window's geometry rides with this pass rather than in request
+        # state: the engine may prepare a request's next window before it
+        # postprocesses this one.
         return NodeInputs(
             tensor_inputs={
                 "codec_tokens": codec_tokens,
                 "position_ids": torch.arange(codec_tokens.shape[1], device=codec_tokens.device)
             },
-            kwargs={"frames": orig_seq_len},
+            kwargs={"frames": orig_seq_len, "context": context},
         )
 
     def preprocess(
@@ -1935,14 +1990,13 @@ class Code2WavSubmodule(NodeSubmodule):
     ) -> dict[str, NameToTensorList]:
         """Decode a batch of padded windows to untrimmed int16 PCM.
 
-        The Talker→Code2Wav StreamBuffer uses ``LeftContextChunkPolicy``:
-        the first popped chunk for a request contains ``codec_chunk_frames``
-        fresh frames with no overlap; every subsequent chunk contains
-        ``codec_chunk_frames + codec_left_context_frames`` frames where the
-        leading ``codec_left_context_frames`` are overlap from the previous
-        chunk's tail. The overlap lets the vocoder warm up at chunk
-        boundaries; ``postprocess`` cuts each request's new audio out of the
-        window.
+        The Talker→Code2Wav StreamBuffer uses ``ScheduledLeftContextChunkPolicy``:
+        chunk k for a request carries ``codec_chunk_schedule[k]`` new frames
+        (``codec_chunk_frames`` once the schedule runs out) behind up to
+        ``codec_left_context_frames`` frames an earlier chunk delivered, so
+        the first chunk has no overlap. The overlap lets the vocoder warm up
+        at chunk boundaries; ``postprocess`` cuts each request's new audio
+        out of the window.
 
         A zero-frame batch (terminal flushes with no new frames, see
         ``preprocess``) decodes nothing and emits empty chunks.
@@ -2010,12 +2064,10 @@ class Code2WavSubmodule(NodeSubmodule):
         if "audio_chunk" not in outputs:
             return
         if inputs is None:
-            raise ValueError("Code2Wav postprocess needs the pass's inputs for its frame count")
+            raise ValueError("Code2Wav postprocess needs the pass's inputs for its window geometry")
 
         orig_seq_len = int(inputs.kwargs["frames"])
-        cfg_ctx = self.config.code2wav.codec_left_context_frames
-        left_context_size = 0 if request_id not in self._first_chunk_emitted else cfg_ctx
-        self._first_chunk_emitted.add(request_id)
+        left_context_size = int(inputs.kwargs["context"])
         audio = outputs["audio_chunk"][0].reshape(-1)
         if audio.numel() == 0:
             outputs["audio_chunk"][0] = audio

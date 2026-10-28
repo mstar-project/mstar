@@ -103,6 +103,7 @@ def _engine_with(submodule, policies=None):
     engine = Engine.__new__(Engine)
     engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={})}
     engine._keyed_walks = {}
+    engine._resources = {}
     engine._chunking = ChunkingManagement(engine._submodules)
     engine._chunking.set_policies(policies or {})
     return engine

@@ -178,6 +178,14 @@ class AllocationFailed(AdmitFailedReason):
     pages_short: int
     label: str
     request_id: str
+    # How many of the step's requests, in its order, the free pages held, and
+    # how many the pool would hold with nothing else resident, out of the
+    # ``rows_sized`` it counted; None when the resource does not say. The
+    # worker sizes the retry from them. A row the prefix cache served whole
+    # runs no step, so it is in the worker's batch but not in ``rows_sized``.
+    rows_fit: int | None = None
+    rows_fit_alone: int | None = None
+    rows_sized: int | None = None
 
 
 @dataclass

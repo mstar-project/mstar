@@ -452,12 +452,13 @@ def test_upload_filename_traversal_is_contained(tmp_path):
     assert ".." not in os.path.basename(path)
 
 
-def _generate(port, urlencoded: bool, timeout=30):
+def _generate(port, urlencoded: bool, fields=None, timeout=30):
     """POST /generate with either content type; returns (status, ndjson)."""
     import urllib.parse
 
-    fields = {"text": "hi", "output_modalities": "text",
-              "streaming": "false", "model_kwargs": '{"foo": 1}'}
+    if fields is None:
+        fields = {"text": "hi", "output_modalities": "text",
+                  "streaming": "false", "model_kwargs": '{"foo": 1}'}
     if urlencoded:
         data = urllib.parse.urlencode(fields).encode()
         ctype = "application/x-www-form-urlencoded"
@@ -512,6 +513,18 @@ def test_generate_accepts_both_content_types(stack):
     texts = [s["text"] for s in stub.submitted]
     assert texts.count("hi") == 2, stub.submitted
     assert all(s["mk"] == {"foo": 1} for s in stub.submitted)
+
+
+@pytest.mark.parametrize("urlencoded", [False, True])
+def test_generate_treats_an_empty_request_id_as_none(stack, urlencoded):
+    """Like the Python /generate: each request gets a fresh id, so two with
+    ``request_id=""`` never collide on ``""``."""
+    port, stub, _bridge, _proc = stack
+    for streaming in ("true", "false"):
+        fields = {"text": "hi", "streaming": streaming, "request_id": ""}
+        assert _generate(port, urlencoded, fields)[0] == 200
+    rids = [s["rid"] for s in stub.submitted]
+    assert len(rids) == 2 and "" not in rids and rids[0] != rids[1]
 
 
 _FAKE_MP4 = b"\x00\x00\x00\x18ftypmp42FAKE-MP4-BYTES"

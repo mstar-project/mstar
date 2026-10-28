@@ -163,3 +163,27 @@ def test_another_loop_is_not_mistaken_for_a_chunk_loop():
         max_iters=8, outputs=[],
     )
     assert Worker._chunk_loops_in([_wg(decode)]) == frozenset()
+
+
+def test_a_row_the_cache_served_whole_still_ends_its_loop():
+    """The prefix cache can serve a chunkable walk entirely, and then the node
+    never runs: no forward, no chunk, no output. Its Loop is still in the
+    graph and still has to be ended, or the request holds its state until
+    max_iters.
+
+    Postprocess reconciles the scheduled batch down to ``request_ids |
+    cached_rids`` before the stop, so a served row is still there -- and it
+    carries no chunk range, nothing having been cut for it, which is the same
+    shape as a row that ran whole.
+    """
+    stops, mid = _run({1: "prefill"})
+    assert stops == {1: {chunk_loop_name(NODE, "prefill")}}
+    assert not mid, "nothing is mid-prefill: there was nothing left to prefill"
+
+
+def test_a_cache_served_row_is_ended_even_beside_a_chunked_one():
+    """A served row shares its step with rows that did run; the served one
+    ends, the one mid-prefill does not."""
+    stops, mid = _run({1: "prefill", 2: "prefill"}, {2: (0, 4, 10)})
+    assert stops == {1: {chunk_loop_name(NODE, "prefill")}}
+    assert mid == {2}

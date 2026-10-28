@@ -23,6 +23,7 @@ from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.utils.profiler import PhaseLaps
 
 
 class FlashInferManager(AttentionManager):
@@ -35,12 +36,16 @@ class FlashInferManager(AttentionManager):
         backend: str="auto",
         splits: tuple[CombinedSplit, ...] = (),
         max_rows_in_combined: Mapping[str, int | None] | None = None,
+        decode_tensor_cores: bool = True,
+        sliding_window: int | None = None,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
         self._max_rows_in_combined = max_rows_in_combined or {}
         self._device = device
         self._dtype = dtype
+        # FlashInfer counts preceding positions; M* counts the current token too.
+        self._window_left = -1 if sliding_window is None else sliding_window - 1
 
         # label to plan state
         self._current_plan_states: dict[str, AttentionWrapper] = {}
@@ -64,6 +69,7 @@ class FlashInferManager(AttentionManager):
             device=device,
             backend=backend
         )
+        self._decode_tensor_cores = decode_tensor_cores
 
         self._workspaces = WorkspacePool(device)
 
@@ -111,6 +117,7 @@ class FlashInferManager(AttentionManager):
                 max_prefill_rows=split.max_prefill_rows(
                     self._max_rows_in_combined, num_rows,
                 ),
+                use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
         elif bucket.bs == bucket.num_tokens and not force_prefill:
@@ -118,6 +125,7 @@ class FlashInferManager(AttentionManager):
                 workspace_buffer=buffer,
                 batch_size=num_rows,
                 accelerator_graph=True,
+                use_tensor_cores=self._decode_tensor_cores,
                 **kv_kwargs,
             )
         else:
@@ -143,11 +151,16 @@ class FlashInferManager(AttentionManager):
         key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            cls = FlashInferDecodeWrapper if is_decode else FlashInferPrefillWrapper
-            wrapper = self._eager_plan_states[key] = cls(
-                workspace_buffer=self._workspaces.get(label, slot),
-                **self._wrapper_kv_kwargs,
-            )
+            workspace = self._workspaces.get(label, slot)
+            if is_decode:
+                wrapper = FlashInferDecodeWrapper(
+                    workspace_buffer=workspace,
+                    use_tensor_cores=self._decode_tensor_cores,
+                    **self._wrapper_kv_kwargs,
+                )
+            else:
+                wrapper = FlashInferPrefillWrapper(workspace_buffer=workspace, **self._wrapper_kv_kwargs)
+            self._eager_plan_states[key] = wrapper
         return wrapper
 
     @property
@@ -164,6 +177,8 @@ class FlashInferManager(AttentionManager):
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         refuse_context_only(step, type(self).__name__)
+        if self._window_left >= 0 and not step.causal:
+            raise ValueError("sliding_window requires causal attention")
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
@@ -190,6 +205,7 @@ class FlashInferManager(AttentionManager):
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
+        laps = PhaseLaps("res.pre_plan.attn." if ctx.is_preplan else "res.plan.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             if lease is not None:
@@ -201,12 +217,14 @@ class FlashInferManager(AttentionManager):
                 )
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
 
+            kwargs = indptrs.to_kwargs_dict()
+            laps.lap("wrapper")
             # TODO: cache the latest plan state
             wrapper.plan(
-                causal=step.causal,
-                dtype=self._dtype,
-                **indptrs.to_kwargs_dict()
+                causal=step.causal, dtype=self._dtype, window_left=self._window_left,
+                **kwargs,
             )
+            laps.lap("wrapper_plan")
             plan_states[label] = wrapper
 
         self._preplanned = ctx.is_preplan

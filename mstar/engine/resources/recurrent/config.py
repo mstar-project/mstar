@@ -7,7 +7,6 @@ layer, so capacity is a slot count and a fork is a fixed-size copy.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from math import prod
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,16 +23,22 @@ class RecurrentBlockConfig:
     """One per-slot, per-layer tensor block.
 
     ``shape`` is opaque to the pool. ``shard_dims`` names the axes divided
-    across ranks.
+    across ranks. A ``dtype`` of None is the engine's compute dtype (what its
+    KV caches store), resolved by ``resolved_dtype`` and never written back.
     """
 
     shape: tuple[int, ...]
-    dtype: torch.dtype
+    dtype: torch.dtype | None
     shard_dims: tuple[int, ...] = ()
 
     def __post_init__(self):
         self.shape = tuple(self.shape)
         self._unsharded_shape = self.shape
+
+    def resolved_dtype(self, kv_dtype: torch.dtype | None) -> torch.dtype:
+        """The dtype the pool stores this block in; a resource planned against
+        the pool reads it here rather than from ``dtype``."""
+        return self.dtype or kv_dtype or torch.get_default_dtype()
 
     def shard(self, num_shards: int) -> None:
         from mstar.distributed.utils import divide
@@ -42,14 +47,6 @@ class RecurrentBlockConfig:
         for dim in self.shard_dims:
             shape[dim] = divide(self._unsharded_shape[dim], num_shards)
         self.shape = tuple(shape)
-
-    @property
-    def numel(self) -> int:
-        return prod(self.shape)
-
-    @property
-    def nbytes(self) -> int:
-        return self.numel * torch.empty((), dtype=self.dtype).element_size()
 
 
 class RecurrentGeometry(ABC):
@@ -91,7 +88,7 @@ class DeltaNetGeometry(RecurrentGeometry):
 
     def to_blocks(
         self,
-        state_dtype: torch.dtype = torch.float32,
+        state_dtype: torch.dtype | None = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
     ) -> dict[str, RecurrentBlockConfig]:
         """Pool blocks for this geometry; head counts are pre-sharding."""
@@ -183,7 +180,7 @@ class Mamba2Geometry(RecurrentGeometry):
 
     def to_blocks(
         self,
-        state_dtype: torch.dtype = torch.float32,
+        state_dtype: torch.dtype | None = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
     ) -> dict[str, RecurrentBlockConfig]:
         """Pool blocks for this geometry; head counts pre-sharding (heads and
@@ -275,14 +272,6 @@ class RecurrentStateConfig:
         resource can both shard the shared config."""
         for block in self.blocks.values():
             block.shard(num_shards)
-
-    @property
-    def slot_bytes(self) -> int:
-        return self.num_layers * sum(b.nbytes for b in self.blocks.values())
-
-    @property
-    def total_bytes(self) -> int:
-        return self.slot_bytes * self.max_slots
 
 
 @dataclass
