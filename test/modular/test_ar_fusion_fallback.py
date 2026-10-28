@@ -73,11 +73,10 @@ def test_every_rank_agrees_on_backend(tmp_path, fails, expected):
         assert leaked == "", f"rank {rank} kept {leaked}"
 
 
-
 def test_a_second_width_on_a_shared_group_keeps_the_nccl_path(monkeypatch):
     """Two lockstep nodes of one instance share its group. The workspace is
-    sized for the first width set up; an input of another width takes NCCL
-    rather than overrunning it."""
+    built for the first width and dtype set up; an input of another width or
+    dtype takes NCCL rather than overrunning it."""
     import torch
 
     from mstar.distributed import ar_fusion
@@ -93,9 +92,10 @@ def test_a_second_width_on_a_shared_group_keeps_the_nccl_path(monkeypatch):
     monkeypatch.setattr(group, "all_reduce", lambda x: used.append("nccl") or x)
     assert group.init_allreduce_fusion(16, torch.float32)
     assert not group.init_allreduce_fusion(8, torch.float32)
+    assert not group.init_allreduce_fusion(16, torch.bfloat16)
 
-    for hidden in (16, 8):
-        x = torch.ones(4, hidden)
-        group.allreduce_add_rmsnorm(x, torch.zeros_like(x), torch.ones(hidden), 1e-6)
+    for hidden, dtype in ((16, torch.float32), (8, torch.float32), (16, torch.bfloat16)):
+        x = torch.ones(4, hidden, dtype=dtype)
+        group.allreduce_add_rmsnorm(x, torch.zeros_like(x), torch.ones(hidden, dtype=dtype), 1e-6)
 
-    assert used == [16, "nccl"]
+    assert used == [16, "nccl", "nccl"]

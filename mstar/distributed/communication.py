@@ -1,3 +1,4 @@
+import logging
 import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ from torch.distributed.distributed_c10d import _set_pg_timeout
 
 from mstar.distributed.all_reduce import AllReduce
 from mstar.distributed.utils import resolve_dist_timeout
+
+logger = logging.getLogger(__name__)
 
 
 def default_group_timeout(backend: str) -> timedelta:
@@ -84,6 +87,7 @@ class CommGroup:
         self._ar_fusion_ws: int | None = None
         self._ar_fusion_max_tokens = 0
         self._ar_fusion_hidden = 0
+        self._ar_fusion_dtype: torch.dtype | None = None
         # NCCL until ``init_all_reduce`` sets up the deployment's backend
         self._all_reduce = AllReduce(self.device_group)
 
@@ -162,19 +166,29 @@ class CommGroup:
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
         """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs; other inputs keep the NCCL path. Collective: every
-        member calls it at the same point. Returns whether it is available
-        for ``hidden``, which is only the first width set up: every lockstep
-        node of an instance shares its group."""
-        if self.world_size == 1 or self._ar_fusion_ws is not None:
-            return self._ar_fusion_ws is not None and self._ar_fusion_hidden == hidden
+        hidden]`` inputs of ``dtype``; other inputs keep the NCCL path.
+        Collective: every member calls it at the same point. Returns whether it
+        is available for ``(hidden, dtype)``. Every lockstep node of an
+        instance shares its group, which keeps one workspace: the first one
+        built (a failed build leaves the next caller to try)."""
+        if self.world_size == 1:
+            return False
+        if self._ar_fusion_ws is not None:
+            if (self._ar_fusion_hidden, self._ar_fusion_dtype) == (hidden, dtype):
+                return True
+            logger.warning(
+                "all-reduce fusion is set up for hidden %d %s on TP ranks %s; inputs of "
+                "hidden %d %s take NCCL all-reduce + separate norm",
+                self._ar_fusion_hidden, self._ar_fusion_dtype, self.group_members, hidden, dtype,
+            )
+            return False
         from mstar.distributed.ar_fusion import create_workspace
 
         self._ar_fusion_ws = create_workspace(
             self, max_tokens, hidden, dtype,
         )
         self._ar_fusion_max_tokens = max_tokens if self._ar_fusion_ws is not None else 0
-        self._ar_fusion_hidden = hidden
+        self._ar_fusion_hidden, self._ar_fusion_dtype = hidden, dtype
         return self._ar_fusion_ws is not None
 
     def allreduce_add_rmsnorm(
@@ -187,6 +201,7 @@ class CommGroup:
         if (self._ar_fusion_ws is not None
                 and x.shape[0] <= self._ar_fusion_max_tokens
                 and x.shape[-1] == self._ar_fusion_hidden
+                and x.dtype == self._ar_fusion_dtype
                 and x.is_contiguous() and residual.is_contiguous()):
             from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 
