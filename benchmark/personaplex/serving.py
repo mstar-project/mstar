@@ -7,6 +7,7 @@ not asserted. Batched correctness is checked offline by ``batch.py``.
 """
 
 import argparse
+import asyncio
 import base64
 import concurrent.futures
 import hashlib
@@ -19,6 +20,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 import wave
 from pathlib import Path
 
@@ -47,7 +49,7 @@ def holds_agent_frame(tensor):
     return tensor.get("name") == "agent_frame" or list(tensor.get("dims") or []) == AGENT_FRAME_DIMS
 
 
-def verify_ownership_observations(rows, completed):
+def verify_ownership_observations(rows, completed, completed_request_ids=None):
     """Each request's decoder steps end holding no agent frame, before its own hard cleanup.
 
     The decoder consumes a request's frames chunk by chunk, so after an earlier
@@ -64,6 +66,8 @@ def verify_ownership_observations(rows, completed):
         if r["event"] in ("after_decoder_inputs_consumed", "before_hard_cleanup") and r.get("entity") in entities:
             timelines.setdefault((r.get("entity"), r["rid"]), []).append(r)
     held, lifetimes = [], 0  # lifetimes: request lifetimes (cleanups) with decoder evidence
+    observed = {}
+    expected = None if completed_request_ids is None else set(completed_request_ids)
     for (entity, rid), events in timelines.items():
         last = None
         for event in sorted(events, key=lambda e: (e["time"], e["event"] == "before_hard_cleanup")):
@@ -72,7 +76,11 @@ def verify_ownership_observations(rows, completed):
                 continue
             if last is not None:
                 lifetimes += 1
-                if any(holds_agent_frame(t) for t in last["tensors"]):
+                wire_id = last.get("request_id")
+                if expected is not None:
+                    assert wire_id and wire_id == event.get("request_id"), "Missing or inconsistent wire request ID"
+                    observed[wire_id] = observed.get(wire_id, 0) + 1
+                if (expected is None or wire_id in expected) and any(holds_agent_frame(t) for t in last["tensors"]):
                     held.append(rid)
             last = None
         assert last is None, f"Decoder observation for handle {rid} on {entity} has no later hard cleanup"
@@ -80,6 +88,22 @@ def verify_ownership_observations(rows, completed):
     assert lifetimes >= completed, (
         f"Missing decoder observations: {lifetimes} request lifetimes for {completed} completions")
     assert not held, f"Decoder observations still hold agent frames for handles {held}"
+    if expected is not None:
+        missing = [rid for rid in expected if observed.get(rid) != 1]
+        assert not missing, f"Completed HTTP requests need exactly one decoder lifetime: {missing}"
+
+
+def verify_engine_cleanup(rows, request_ids):
+    """Check request state and reclaimable pages after engine teardown, including post-audio aborts."""
+    cleaned = {}
+    for row in rows:
+        if row["event"] == "after_engine_cleanup":
+            cleaned[row.get("request_id")] = row
+    for request_id in request_ids:
+        assert request_id in cleaned, f"Missing engine cleanup for HTTP request {request_id}"
+        row = cleaned[request_id]
+        assert not row["remaining_node_states"], f"Node state survives cleanup: {row}"
+        assert not any(row["reclaimable_pages"].values()), f"Request still holds reclaimable KV pages: {row}"
 
 
 def server_config(settings, root, max_batch_size):
@@ -281,6 +305,7 @@ class Lifecycle:
     def request(self, entry, index, with_text=True, cancel=False, options=None, expect_bad=False):
         output = self.server.root / f"response-{index}.json"
         kwargs = {"voice": "NATF2", "greedy": True, **(options or {})}
+        request_id = str(uuid.uuid4())
         command = [
             "curl",
             "-sS",
@@ -297,6 +322,8 @@ class Lifecycle:
             "streaming=false",
             "-F",
             "model_kwargs=" + json.dumps(kwargs),
+            "-F",
+            "request_id=" + request_id,
             "-o",
             str(output),
             "-w",
@@ -310,6 +337,7 @@ class Lifecycle:
             "exit": result.returncode,
             "http": result.stdout,
             "cancelled": cancel,
+            "request_id": request_id,
         }
         (self.server.root / f"response-{index}.stderr").write_text(result.stderr)
         if cancel:
@@ -319,6 +347,7 @@ class Lifecycle:
         else:
             assert result.returncode == 0 and result.stdout == "200", row
             response = json.loads(output.read_text())
+            assert response["request_id"] == request_id
             outputs = response["outputs"]
             assert set(outputs) == ({"audio", "text"} if with_text else {"audio"}), row
             chunks = outputs["audio"]
@@ -335,6 +364,49 @@ class Lifecycle:
             assert row["matches_control"] or not self.exact, "Concurrent/recovery output differs from isolated control"
         write_json(self.server.root / f"request-{index}.json", row)
         return row
+
+    def cancel_after_audio(self, entry):
+        """Disconnect a real streamed request only after receiving nonempty audio."""
+        import aiohttp
+
+        request_id = str(uuid.uuid4())
+        index, self.index = self.index, self.index + 1
+
+        async def receive():
+            form = aiohttp.FormData()
+            for name, value in {
+                "input_modalities": "audio", "output_modalities": "audio,text", "streaming": "true",
+                "model_kwargs": json.dumps({"voice": "NATF2", "greedy": True}), "request_id": request_id,
+            }.items():
+                form.add_field(name, value)
+            with Path(entry["path"]).open("rb") as audio:
+                form.add_field("files", audio, filename="input.wav", content_type="audio/wav")
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+                    async with session.post(self.server.url + "/generate", data=form) as response:
+                        response.raise_for_status()
+                        async for line in response.content:
+                            event = json.loads(line)
+                            assert not event.get("error"), event
+                            if event.get("modality") == "audio" and event.get("data"):
+                                pcm = base64.b64decode(event["data"], validate=True)
+                                if pcm:
+                                    assert event["metadata"] == {"sample_rate": 24000, "num_channels": 1}
+                                    return len(pcm) // 2, time.time()
+            raise AssertionError("Stream ended without audio; cancellation was not exercised")
+
+        before = self.cleanup_count()
+        samples, disconnected = asyncio.run(receive())
+        with wave.open(entry["path"], "rb") as audio:
+            assert 0 < samples < audio.getnframes(), "Cancellation needs a partial audio response"
+        row = {"index": index, "request_id": request_id, "input": entry["id"], "cancelled": True,
+               "after_first_audio": True, "first_chunk_samples": samples, "disconnect_initiated_at": disconnected}
+        self.rows.append(row)
+        write_json(self.server.root / f"request-{index}.json", row)
+        self.drain(before, 1)
+        cleanup = [r for r in self.events() if r["event"] == "before_hard_cleanup"
+                   and r.get("request_id") == request_id]
+        assert cleanup and max(r["time"] for r in cleanup) >= disconnected, (
+            "Request finished before disconnect; mid-stream cancellation not established")
 
     def group(self, entries, cancel_first=False):
         before = self.cleanup_count()
@@ -358,6 +430,8 @@ class Lifecycle:
             self.group([self.entries[i % len(self.entries)] for i in range(concurrency)])
             self.group([self.entries[-1]], cancel_first=True)
             self.group([self.entries[0]])
+        self.cancel_after_audio(max(self.entries, key=lambda e: e.get("duration_s", 0)))
+        self.group([self.entries[0]])  # Successful recovery after a post-audio disconnect.
         if not smoke:
             invalid = self.server.root / "malformed.wav"
             invalid.write_bytes(b"this is not audio")
@@ -419,7 +493,10 @@ def main():
             run.run(smoke=args.mode != "lifecycle")
             if args.mode == "soak":
                 run.soak(1200)
-            verify_ownership_observations(run.events(), sum("samples" in row for row in run.rows))
+            completed = [row["request_id"] for row in run.rows if "samples" in row]
+            verify_ownership_observations(run.events(), len(completed), completed)
+            verify_engine_cleanup(run.events(), completed + [row["request_id"] for row in run.rows
+                                                             if row.get("after_first_audio")])
             compared = [row for row in run.rows if "matches_control" in row]
             outcome.update(status="PASS", requests=run.rows,
                            matching_control=sum(row["matches_control"] for row in compared), compared=len(compared))

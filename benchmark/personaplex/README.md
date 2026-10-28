@@ -27,7 +27,7 @@ own subprocess with a timeout, and records every command, log and result:
 | `parity-<clip>-resources` | The same, on the served path (paged KV + FlashInfer); then NVIDIA again under PyTorch's math SDPA kernel | As above, without the negative control. Near-tied token choices can flip here; the first divergence is recorded with its logit margin, next to how far NVIDIA moves against itself under the other kernel |
 | `batch-resources` | Direct LM calls with paged KV and FlashInfer: each clip alone, then 2 and 4 requests batched with staggered starts and two voices; no HTTP or worker scheduling | Every emitted token matches the request run alone; otherwise the first differing choice is recorded with both runs' margins. LM step time per batch size is reported |
 | `judge` | Whisper transcripts of each served-path parity stage's input, NVIDIA and M* audio | Informational: the agents' word error rate, not a quality score |
-| `lifecycle-python`, `lifecycle-rust` | A real server on each graph runtime, one request per step (`max_batch_size` 1): each clip alone, then 1, 2 and 4 concurrent requests, cancellation by a 1.5-second client timeout, then malformed, empty, over-length and invalid-option requests, each followed by a normal one | Concurrent and post-cancellation outputs are byte-identical to the same request run alone, bad input gets a 4xx, and each observed request lifetime's final decoder snapshot before hard cleanup holds no agent frame |
+| `lifecycle-python`, `lifecycle-rust` | A real server on each graph runtime, one request per step (`max_batch_size` 1): each clip alone, then 1, 2 and 4 concurrent requests, timeout and post-first-audio cancellations, then malformed, empty, over-length and invalid-option requests, each followed by a normal one | Concurrent/recovery outputs match isolated controls; bad input gets a 4xx; successful HTTP IDs each have a final decoder observation with no agent frame; engine teardown releases request node state and reclaimable pages |
 | `soak-rust` | 20 minutes of mixed short/long requests with periodic cancellations, batched | Every response is well formed, the request tensor store drains, and idle allocated GPU memory does not grow; agreement with the isolated control is recorded |
 | `warm-rust` | `benchmark.runner` per clip at concurrency 1, 2 and 4, batched: 3 warm-up waves and 10 measured requests | Every measured request completes; a compile detected during measurement invalidates the cell, which is retried once |
 
@@ -126,8 +126,9 @@ streamed delivery; `benchmark.runner` remains the throughput harness.
 - Ten requests per benchmark cell make the percentiles descriptive only.
 - The soak covers 20 minutes of one request mix; it is not proof against every
   leak.
-- The cancellation timeout does not establish that decoding began before the
-  client disconnected. Cancellation after an audio chunk arrives remains untested
-  by the lifecycle harness.
-- The ownership gate counts request lifetimes with decoder evidence but does
-  not match them individually to successful HTTP requests.
+- Lifecycle checks include a streamed request disconnected after its first nonempty
+  audio chunk, followed by recovery. Earlier timeout-based cancellations remain too.
+- The ownership gate correlates successful HTTP request IDs with decoder lifetimes,
+  including recycled worker handles. Engine teardown observations check node state
+  and reclaimable pages for successful requests and post-audio cancellations.
+  This bounded observation is not proof against every possible resource leak.

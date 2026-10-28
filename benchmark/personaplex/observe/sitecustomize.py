@@ -5,6 +5,19 @@ import os
 import time
 from pathlib import Path
 
+
+def track_request_ids(runtime_class, identities):
+    """Record wire IDs when the runtime assigns its recyclable worker-local handle."""
+    original = runtime_class.add_request
+
+    def added(self, request_id, *args, **kwargs):
+        handle = original(self, request_id, *args, **kwargs)
+        identities[handle] = request_id
+        return handle
+
+    runtime_class.add_request = added
+
+
 if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
     import torch
 
@@ -12,6 +25,8 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
     from mstar.graph.runtime.python import PythonGraphRuntime
 
     root = Path(os.environ["PERSONAPLEX_OWNERSHIP_ROOT"])
+    wire_ids = {}
+    track_request_ids(PythonGraphRuntime, wire_ids)
 
     def snapshot(manager, event, rid=None, **extra):
         store = manager.tensor_store
@@ -35,6 +50,7 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
             pid=os.getpid(),
             time=time.time(),
             rid=rid,
+            request_id=wire_ids.get(rid, rid if isinstance(rid, str) else None),
             entity=manager.my_entity_id,
             tensors=rows,
             total_tensors=len(store._uuid_to_rid),
@@ -59,6 +75,7 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
     if os.environ.get("PERSONAPLEX_LIVE_BACKEND") == "rust":
         from mstar.graph.runtime.rust import RustGraphRuntime
 
+        track_request_ids(RustGraphRuntime, wire_ids)
         pending_decoder_rids = set()
         rust_consumed = RustGraphRuntime.cleanup_consumed_inputs
 
@@ -99,9 +116,30 @@ if os.environ.get("PERSONAPLEX_OWNERSHIP_OBSERVE") == "1":
         snapshot(self, "before_hard_cleanup", request_id)
         result = original_force(self, request_id)
         snapshot(self, "after_hard_cleanup", request_id)
+        wire_ids.pop(request_id, None)
         return result
 
     TensorCommunicationManager.force_cleanup_request = forced
+
+    from mstar.engine.engine import Engine
+
+    original_remove = Engine.remove_request
+
+    def engine_removed(self, request_id):
+        result = original_remove(self, request_id)
+        row = {
+            "event": "after_engine_cleanup", "entity": "worker_engine", "pid": os.getpid(),
+            "time": time.time(), "rid": request_id, "request_id": wire_ids.get(request_id),
+            "remaining_node_states": [name for name, management in self._submodules.items()
+                                      if request_id in management.submodule.request_states],
+            "reclaimable_pages": {name: resource.reclaimable(request_id)
+                                  for name, resource in self._resources.items()},
+        }
+        with (root / ("ownership-events-" + str(os.getpid()) + ".jsonl")).open("a") as output:
+            output.write(json.dumps(row) + "\n")
+        return result
+
+    Engine.remove_request = engine_removed
 
 if os.environ.get("PERSONAPLEX_EAGER_CONTROL") == "1":
     # A control server for graph-vs-eager comparisons: the LM declares no

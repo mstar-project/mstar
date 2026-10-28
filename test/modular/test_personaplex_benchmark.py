@@ -288,9 +288,13 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
 
     from mstar.communication.arena import ArenaShmCommunicationManager
     from mstar.communication.tensors import TensorCommunicationManager
+    from mstar.engine.engine import Engine
     from mstar.graph.runtime.python import PythonGraphRuntime
 
     class StubRustRuntime:
+        def add_request(self, request_id, *args, **kwargs):
+            return 7
+
         def cleanup_consumed_inputs(self, node_name, rids, wg_ids):
             return [], []
 
@@ -302,6 +306,8 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
         (TensorCommunicationManager, "cleanup_collectable"),
         (TensorCommunicationManager, "force_cleanup_request"),
         (PythonGraphRuntime, "cleanup_consumed_inputs"),
+        (PythonGraphRuntime, "add_request"),
+        (Engine, "remove_request"),
     ):
         monkeypatch.setattr(cls, name, cls.__dict__[name])
     arena_calls = []
@@ -317,6 +323,7 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
         bookkeeping=types.SimpleNamespace(_ref_info={}), _uuid_to_rid={5: 7},
     )
     manager = types.SimpleNamespace(tensor_store=store, uuid_to_edge_name={}, my_entity_id="worker_0")
+    assert StubRustRuntime().add_request("wire-request") == 7
     StubRustRuntime().cleanup_consumed_inputs("MimiDecoder", [7], [0])
     ArenaShmCommunicationManager.cleanup_collectable(manager, [5], [True])
 
@@ -324,6 +331,103 @@ def test_rust_ownership_observer_fires_through_shm_arena_cleanup(tmp_path, monke
     rows = [json.loads(line) for path in tmp_path.glob("ownership-events-*.jsonl")
             for line in path.read_text().splitlines()]
     assert [(row["event"], row["rid"]) for row in rows] == [("after_decoder_inputs_consumed", 7)]
+    assert rows[0]["request_id"] == "wire-request"
+
+
+def test_ownership_gate_correlates_http_ids_and_recycled_handles():
+    rows = []
+    for wire_id, start in (("first", 10), ("second", 20)):
+        rows.extend([
+            {**_ownership("after_decoder_inputs_consumed", 0, start), "request_id": wire_id},
+            {**_ownership("before_hard_cleanup", 0, start + 1), "request_id": wire_id},
+        ])
+    verify_ownership_observations(rows, 2, ["first", "second"])
+    # A cancelled third request cannot substitute for a missing successful HTTP request.
+    with pytest.raises(AssertionError, match="Completed HTTP requests"):
+        verify_ownership_observations(rows, 2, ["first", "missing"])
+    rows[-1]["request_id"] = "wrong-lifetime"
+    with pytest.raises(AssertionError, match="inconsistent wire"):
+        verify_ownership_observations(rows, 2, ["first", "second"])
+
+
+def test_engine_cleanup_gate_requires_wire_id_state_and_page_release():
+    from benchmark.personaplex.serving import verify_engine_cleanup
+
+    row = {"event": "after_engine_cleanup", "request_id": "http-id",
+           "remaining_node_states": [], "reclaimable_pages": {"lm_kv": 0}}
+    verify_engine_cleanup([row], ["http-id"])
+    with pytest.raises(AssertionError, match="Missing engine cleanup"):
+        verify_engine_cleanup([row], ["another-http-id"])
+    with pytest.raises(AssertionError, match="Node state survives"):
+        verify_engine_cleanup([{**row, "remaining_node_states": ["MimiDecoder"]}], ["http-id"])
+    with pytest.raises(AssertionError, match="reclaimable KV"):
+        verify_engine_cleanup([{**row, "reclaimable_pages": {"lm_kv": 1}}], ["http-id"])
+
+
+def test_cancelled_stream_may_hold_inflight_frames_but_completed_stream_must_not():
+    rows = [
+        {**_ownership("after_decoder_inputs_consumed", 0, 10, [(1, 8, 1)]), "request_id": "cancelled"},
+        {**_ownership("before_hard_cleanup", 0, 11), "request_id": "cancelled"},
+        {**_ownership("after_decoder_inputs_consumed", 0, 20), "request_id": "completed"},
+        {**_ownership("before_hard_cleanup", 0, 21), "request_id": "completed"},
+    ]
+    verify_ownership_observations(rows, 1, ["completed"])
+    rows[2]["tensors"] = [{"dims": [1, 8, 1]}]
+    with pytest.raises(AssertionError, match="still hold agent frames"):
+        verify_ownership_observations(rows, 1, ["completed"])
+
+
+def test_post_audio_cancellation_closes_a_real_http_stream(tmp_path):
+    """Exercise the client disconnect boundary; the test server is not a worker/model."""
+    import re
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from types import SimpleNamespace
+
+    from benchmark.personaplex.serving import Lifecycle
+
+    closed = threading.Event()
+    events = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            wire_id = re.search(rb'name="request_id"\r\n\r\n([^\r]+)', body)[1].decode()
+            payload = json.dumps({"modality": "audio", "data": base64.b64encode(bytes(1920)).decode(),
+                                  "metadata": {"sample_rate": 24000, "num_channels": 1}}).encode() + b"\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+            self.wfile.flush()
+            self.connection.settimeout(5)
+            assert self.connection.recv(1) == b""  # The client closed without waiting for the stream's end.
+            events.append({"event": "before_hard_cleanup", "request_id": wire_id, "time": time.time()})
+            closed.set()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    lifecycle = Lifecycle(SimpleNamespace(url=f"http://127.0.0.1:{server.server_port}", root=tmp_path), [], True)
+    lifecycle.events = lambda: events
+    lifecycle.drain = lambda *_: closed.wait(5)
+    manifest = _manifest(tmp_path)
+    entry = LocalAudioDataset(manifest, 1, RequestType.A2S).entries[0]
+    try:
+        lifecycle.cancel_after_audio(entry)
+        assert closed.is_set()
+        assert lifecycle.rows[0]["after_first_audio"] is True
+        assert lifecycle.rows[0]["first_chunk_samples"] == 960
+        assert events[0]["request_id"] == lifecycle.rows[0]["request_id"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_timing_summary_measures_frames_against_the_80ms_budget():

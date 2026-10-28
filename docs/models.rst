@@ -1437,7 +1437,7 @@ Status, checked with the released checkpoint against NVIDIA's reference
 implementation on GH200 and H100 GPUs:
 
 - With dense attention, M* reproduces NVIDIA's greedy tokens exactly and its
-  audio to within 5e-7. The served path uses FlashInfer paged attention, whose
+  audio to within 5.1e-7 on the measured clips. The served path uses FlashInfer paged attention, whose
   different rounding flips near-tied token choices (first flips at logit
   margins of 0 to 0.0625, at most one bfloat16 step), so a long greedy
   trajectory departs from NVIDIA's after some frames. NVIDIA's own code moves
@@ -1455,7 +1455,7 @@ implementation on GH200 and H100 GPUs:
   12.1 at four and 30 to 32 at 32, against 1.2 to 1.3, 4.0 to 4.5 and 19 to 21
   with the graphs and the depformer cut both off, in one container. The eager
   step is bound by CPU overhead (``benchmark/worker_phases``), so its speed
-  also varies between hosts (a second host ran 15 to 25% slower). Streaming
+  also varies between hosts (a second host ran approximately 13 to 30% slower across the measured cells). Streaming
   the audio costs an estimated 0 to 8% of that throughput, more at higher
   concurrency; 16 concurrent streamed requests played back without underruns
   (the whole clip uploaded at once, not live input).
