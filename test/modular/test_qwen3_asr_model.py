@@ -33,7 +33,7 @@ from mstar.model.qwen3_asr.config import (  # noqa: E402
 from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel  # noqa: E402
 from mstar.model.qwen3_asr.submodules import Qwen3ASREncoderSubmodule, Qwen3ASRLLMSubmodule  # noqa: E402
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
-from mstar.model.submodule_base import HostRows, ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import END_PARTITION, HostRows, ModelInputsFromEngine  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -391,7 +391,8 @@ def test_llm_check_stop():
                               "dynamic_loop_iter_counts": {"decode_loop": decoded}})()
 
     word, im_end, eot = ({"new_token": [torch.tensor([t])]} for t in (1234, IM_END, EOT))
-    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == set()
+    # a stop token first ends the request: there is no decode loop yet
+    assert sub.check_stop("r", info(PREFILL_WALK, 0), im_end) == {END_PARTITION}
     assert sub.check_stop("r", info(DECODE_WALK, 0), im_end) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), eot) == {"decode_loop"}
     assert sub.check_stop("r", info(DECODE_WALK, 0), word) == set()
@@ -429,6 +430,7 @@ def test_llm_check_stop_batched_agrees_with_per_request():
             per_request[rid] = got
     assert batched == per_request == {
         "im_end": {"decode_loop"}, "eot": {"decode_loop"}, "budget": {"decode_loop"},
+        "prefill": {END_PARTITION},
     }
     assert sub.check_stop_batched(["word"], infos, HostRows(("word",), {})) is None
 

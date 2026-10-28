@@ -8,7 +8,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.model.submodule_base import ARNodeInputs, HostRows, NodeInputs
+from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows, NodeInputs
 
 
 class TokenStepNode:
@@ -64,6 +64,14 @@ class TokenStepNode:
         decoded = request_info.dynamic_loop_iter_counts.get(self.DECODE_LOOP, 0) + 1
         return (not ignore_eos and token in self.stop_token_ids) or decoded >= request_info.max_tokens
 
+    def _stop_names(self, token: int, request_info: CurrentForwardPassInfo) -> set[str]:
+        """``check_stop``'s answer for one row: a decode row stops the loop,
+        and a prompt walk's row, which runs before the loop exists, ends the
+        partition."""
+        if not self._stops(token, request_info):
+            return set()
+        return {self.DECODE_LOOP} if request_info.graph_walk == self.DECODE_WALK else {END_PARTITION}
+
     def check_stop(
         self,
         request_id: str,
@@ -74,7 +82,7 @@ class TokenStepNode:
         tokens = outputs.get("text_inputs") or outputs.get("new_token")
         if not tokens:
             return set()
-        return {self.DECODE_LOOP} if self._stops(tokens[0].item(), request_info) else set()
+        return self._stop_names(tokens[0].item(), request_info)
 
     def check_stop_batched(
         self,
@@ -83,10 +91,12 @@ class TokenStepNode:
         host_rows: HostRows,
         step_walk: str | None = None,
     ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``. The base default
-        ignores ``step_walk``, so prefill's token can end the decode loop too;
-        subclasses may narrow that."""
+        """``check_stop`` for every request off one ``tolist``."""
         pairs = host_rows.first_values("new_token", request_ids)
         if pairs is None:
             return None
-        return {rid: {self.DECODE_LOOP} for rid, token in pairs if self._stops(token, request_infos[rid])}
+        stops = {}
+        for rid, token in pairs:
+            if names := self._stop_names(token, request_infos[rid]):
+                stops[rid] = names
+        return stops

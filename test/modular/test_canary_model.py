@@ -352,7 +352,7 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
     node = _tiny_node()
 
     def info(ignore_eos=False, decoded=0, max_tokens=100):
-        return SimpleNamespace(resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
+        return SimpleNamespace(graph_walk="decode", resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)},
                                dynamic_loop_iter_counts={"decode_loop": decoded}, max_tokens=max_tokens)
 
     infos = {"eos": info(), "ignored": info(ignore_eos=True), "limit": info(decoded=9, max_tokens=10), "go": info()}

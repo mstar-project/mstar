@@ -280,7 +280,8 @@ def test_llm_node_caps_captures_and_names():
     (capture,) = node.get_accelerator_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == "decode" and capture.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
     info = SimpleNamespace(
-        resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)}, dynamic_loop_iter_counts={}, max_tokens=100,
+        graph_walk="decode", resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)},
+        dynamic_loop_iter_counts={}, max_tokens=100,
     )
     assert [node.check_stop("a", info, {"new_token": [torch.tensor([t])]}) for t in (11, 12, 3)] == [
         {"decode_loop"}, {"decode_loop"}, set(),

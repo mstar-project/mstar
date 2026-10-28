@@ -32,7 +32,7 @@ from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule, Comm
 from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
 from mstar.model.command_a_plus.tests.test_weight_loading import checkpoint
 from mstar.model.multimodal import PromptPart
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
 
@@ -98,20 +98,11 @@ class NodeTests(unittest.TestCase):
             self.assertEqual("decode_input" in output, continues)
             self.assertIn("new_token", output)
 
-    def test_eos_from_prefill_ends_the_reply_at_the_first_decode_step(self):
-        for ignore_eos, ends in ((False, True), (True, False)):
+    def test_eos_from_prefill_ends_the_partition(self):
+        for ignore_eos, stop in ((False, {END_PARTITION}), (True, set())):
             with self.subTest(ignore_eos=ignore_eos):
                 prefill = {"new_token": [torch.tensor([3])]}
-                self.assertEqual(self.node.check_stop("a", info(ignore_eos=ignore_eos), prefill), set())
-                request = info("decode", ignore_eos=ignore_eos)
-                decode = {"new_token": [torch.tensor([7])]}
-                self.node.postprocess("a", request, decode)
-                self.assertEqual("new_token" not in decode, ends)
-                self.assertEqual(self.node.check_stop("a", request, decode), {"decode_loop"} if ends else set())
-        self.assertEqual(self.node._ended_at_prefill, set())
-        self.node.check_stop("a", info(), {"new_token": [torch.tensor([3])]})
-        self.node.cleanup_request("a")
-        self.assertEqual(self.node._ended_at_prefill, set())
+                self.assertEqual(self.node.check_stop("a", info(ignore_eos=ignore_eos), prefill), stop)
 
     def test_decode_stop_counts_prefill_token_and_respects_ignore_eos(self):
         for token, maximum, index, ignore_eos, stops in (
