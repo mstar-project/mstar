@@ -31,11 +31,15 @@ from mstar.engine.resources.attn.ragged.config import (
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.draft_verify.config import (
     DRAFT_VERIFY,
+    NGRAM,
+    DraftConfig,
     DraftPolicy,
     DraftVerifySpec,
+    ProposeStep,
     VerifyStep,
     with_draft_verify,
 )
+from mstar.engine.resources.draft_verify.drafter import Drafter, Drafts, draft_verify_step
 from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
     KVConfig,
@@ -99,7 +103,10 @@ __all__ = [
     "CrossAttentionConfig",
     "CrossAttentionSpec",
     "DRAFT_VERIFY",
+    "DraftConfig",
     "DraftPolicy",
+    "Drafter",
+    "Drafts",
     "DraftVerifySpec",
     "DSAConfig",
     "DSASpec",
@@ -109,6 +116,7 @@ __all__ = [
     "KVReqConfig",
     "KVSpec",
     "KVStep",
+    "NGRAM",
     "NodeResourceSpec",
     "PagedKVConfig",
     "PosBackend",
@@ -116,6 +124,7 @@ __all__ = [
     "PositionConfig",
     "PositionSpec",
     "PositionStep",
+    "ProposeStep",
     "PublishedInfo",
     "RaggedAttentionConfig",
     "RaggedAttentionSpec",
@@ -141,6 +150,7 @@ __all__ = [
     "VerifyStep",
     "apply_yaml_overrides",
     "cross_label",
+    "draft_verify_step",
     "resolve_spec_dependencies",
     "topo_sort",
     "with_draft_verify",

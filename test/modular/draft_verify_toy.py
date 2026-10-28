@@ -8,7 +8,9 @@ attention skipped, so the target agrees with it often but not always. ``corrupt`
 wrong token at every position divisible by it, and ``skew`` at some others on ranks above 0, so
 a test controls where verify steps reject; ``oracle``, one request's whole stream by position,
 drafts every token right. With ``sampled_drafts`` the head samples its drafts instead
-(``draft_sample``) and hands verify the distributions they came from.
+(``draft_sample``) and hands verify the distributions they came from. With ``proposer="ngram"``
+the head is unused: the engine's n-gram proposer drafts (``DraftVerifyResource.propose``), from
+the prompts the prefill steps declare.
 
 ``ToyAttention`` is a dense reference over the KV resource's pages for CPU runs; on a GPU the
 toy runs the FlashInfer attention resource, which a graph can capture.
@@ -27,6 +29,7 @@ from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import (
     DRAFT_VERIFY,
+    NGRAM,
     AttentionConfig,
     AttentionSpec,
     AttentionStep,
@@ -41,16 +44,19 @@ from mstar.engine.resources import (
     PositionConfig,
     PositionSpec,
     PositionStep,
+    ProposeStep,
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
     Segment,
     StepContext,
     SubmoduleStep,
+    draft_verify_step,
     with_draft_verify,
 )
 from mstar.engine.resources.base import AttentionResource, RewindKind
 from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.resources.draft_verify.ngram import NgramSpec
 from mstar.engine.resources.kv.config import PrefixSpan, StreamLayout
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, BatchedModelOutput
@@ -158,7 +164,8 @@ class ToySubmodule(ARNodeSubmodule):
     """``k`` drafts per verify step; ``k=0`` decodes one token a step through the sampler."""
 
     def __init__(self, k: int = 3, corrupt: int = 0, skew: int = 0, attn_scale: float = 0.6,
-                 seed: int = SEED, capture_batch_sizes=(1, 2, 4), sampled_drafts: bool = False):
+                 seed: int = SEED, capture_batch_sizes=(1, 2, 4), sampled_drafts: bool = False,
+                 proposer: str | None = None):
         super().__init__()
         gen = torch.Generator().manual_seed(seed)
         self.embed = nn.Embedding(VOCAB, HIDDEN)
@@ -170,6 +177,7 @@ class ToySubmodule(ARNodeSubmodule):
             p.data = torch.randn(p.shape, generator=gen) * std / (1 if "embed" in name else p.shape[-1] ** 0.5)
         self.k, self.corrupt, self.skew = k, corrupt, skew
         self.sampled_drafts = sampled_drafts
+        self.proposer = proposer
         self.rank = 0
         self.logit_skew = 0.0
         self.oracle: torch.Tensor | None = None
@@ -189,7 +197,7 @@ class ToySubmodule(ARNodeSubmodule):
     def get_draft_policy(self, graph_walk):
         if graph_walk != "decode" or not self.k:
             return None
-        return DraftPolicy(max_drafts=self.k, stop_ids=frozenset({STOP}))
+        return DraftPolicy(max_drafts=self.k, stop_ids=frozenset({STOP}), proposer=self.proposer)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
         ids = inputs["text_inputs"][0].reshape(-1).to(torch.long)
@@ -205,6 +213,11 @@ class ToySubmodule(ARNodeSubmodule):
         policy = self.get_draft_policy(graph_walk)
         if policy is None:
             steps[SAMPLER] = SamplerStep(apply_penalty=False)
+        if self.proposer is not None and graph_walk == "prefill":
+            # the prompt is the history the proposer looks drafts up in
+            steps[self.proposer] = ProposeStep(
+                history={rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)},
+            )
         step = SubmoduleStep(
             steps=steps,
             segments=[Segment(rid, "main", inp.input_seq_len) for rid, inp in zip(request_ids, inputs, strict=True)],
@@ -273,6 +286,10 @@ class ToySubmodule(ARNodeSubmodule):
             dv = res[DV]
             positions = pos[: n * self.block].view(n, self.block)
             rids = list(engine_inputs.request_ids)
+            if self.proposer is not None:
+                # an engine-side proposer drafts; the shared step takes its block
+                target = lambda ids: self._skewed(self._trunk(ids, positions.reshape(-1)))  # noqa: E731
+                return BatchedModelOutput(row_outputs={"text_inputs": draft_verify_step(dv, rids, input_ids, target)})
             drafts, draft_probs = self._draft(input_ids, positions, dv, rids)
             block = dv.block_ids(input_ids, dv.agree(drafts))
             logits = self._skewed(self._trunk(block.view(-1), positions.reshape(-1)))
@@ -296,7 +313,7 @@ class ToySubmodule(ARNodeSubmodule):
 
 def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True,
           kv_heads: int = HEADS, sampled_verify: bool = False,
-          argmax_prefill: bool | None = None) -> list[NodeResourceSpec]:
+          argmax_prefill: bool | None = None, ngram: dict | None = None) -> list[NodeResourceSpec]:
     # ``kv_heads`` before sharding: a lockstep test gives each rank every head.
     # ``argmax_prefill``: the prefill's token is the argmax, so it draws nothing (on CPU always,
     # where the real draw has no kernel).
@@ -320,6 +337,9 @@ def specs(attn: str = "toy", max_num_pages: int = 256, draft_verify: bool = True
             kv_cache=KV, backend=AttnBackend(attn))))
     if draft_verify:
         out.append(DraftVerifySpec(resource_key=DV, nodes={NODE}, sampler=SAMPLER))
+    if ngram is not None:
+        # ``ngram``: the NgramSpec's settings (max_drafts, min_ngram, max_ngram, table_bits)
+        out.append(NgramSpec(resource_key=NGRAM, nodes={NODE}, **ngram))
     return out
 
 
@@ -375,6 +395,8 @@ def engine(sub: ToySubmodule, device, attn: str = "toy", comm=None, warmup: bool
     kv_dtype = kv_dtype or dtype
     sub.attn_dtype = kv_dtype
     eng = Engine(None, autocast_dtype=None)
+    if sub.proposer == NGRAM and "ngram" not in spec_kwargs:
+        spec_kwargs["ngram"] = {"max_drafts": sub.k}
     eng.load_model(
         submodules={NODE: sub}, specs=specs(attn, draft_verify=bool(sub.k), **spec_kwargs),
         parallel_groups=_Group(comm), device=device,

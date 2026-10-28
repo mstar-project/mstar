@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.engine.resources.base import Resource, RewindKind
 from mstar.engine.resources.draft_verify.config import DraftPolicy
+from mstar.engine.resources.draft_verify.proposer import DraftProposer
 from mstar.engine.resources.draft_verify.resource import DraftVerifyResource
 from mstar.engine.resources.sampler.resource import SamplerResource
 
@@ -55,6 +56,19 @@ def verify_walk(
             "would stay in them; draft verify rewinds paged KV and sequential positions, and "
             "settles GDN state, so far"
         )
+    proposer = None
+    if policy.proposer is not None:
+        proposer = resources.get(policy.proposer)
+        if not isinstance(proposer, DraftProposer):
+            raise ValueError(
+                f"{where}, drafting with the proposer {policy.proposer!r}, which the node "
+                f"{'declares as a ' + type(proposer).__name__ if proposer is not None else 'lacks'}"
+            )
+        if proposer.max_drafts != policy.max_drafts:
+            raise ValueError(
+                f"{where} with {policy.max_drafts} drafts a step, but its proposer "
+                f"{policy.proposer!r} drafts {proposer.max_drafts}"
+            )
     if walk in combined_walks:
         raise ValueError(
             f"{where}, which a combined walk batches with others; a verify row needs a step of its own walk"
@@ -71,4 +85,7 @@ def verify_walk(
             res.require_lookahead(policy.loop, policy.lookahead)
     dv.bind_sampler(sampler)
     dv.bind_settlers([res for res in resources.values() if res.rewind_kind is RewindKind.DEVICE])
+    if proposer is not None:
+        dv.bind_proposer(proposer)
+        proposer.bind_verifier(dv)
     return VerifyWalk(dv, policy, dv.sampler_key)
