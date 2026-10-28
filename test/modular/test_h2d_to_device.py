@@ -44,3 +44,22 @@ def test_a_non_contiguous_input_is_copied_correctly(accelerator_device):
 def test_an_empty_tensor_arrives_with_its_shape(accelerator_device):
     got = to_device_nonblocking(torch.empty(0, 3), accelerator_device)
     assert got.shape == (0, 3) and got.device == accelerator_device
+
+
+def test_a_pinned_input_is_queued_as_it_is(accelerator_device, monkeypatch):
+    # (address, non_blocking) of every copy issued from host memory
+    copies: list[tuple[int, bool]] = []
+    to = torch.Tensor.to
+
+    def spy(self, *args, **kwargs):
+        if self.device.type == "cpu":
+            copies.append((self.data_ptr(), kwargs.get("non_blocking", False)))
+        return to(self, *args, **kwargs)
+
+    tensor = torch.arange(1 << 16, dtype=torch.float32).pin_memory()
+    monkeypatch.setattr(torch.Tensor, "to", spy)
+    got = to_device_nonblocking(tensor, accelerator_device)
+    torch.accelerator.synchronize(accelerator_device)
+    # no second host copy: the device copy is queued from the caller's own buffer
+    assert copies == [(tensor.data_ptr(), True)]
+    assert torch.equal(got.cpu(), tensor)

@@ -155,7 +155,9 @@ def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> t
     would split it over the intra-op pool, where a descheduled thread holds up the
     GPU thread) and queues one non-blocking copy from it on the current stream.
     torch's caching host allocator keeps the pinned buffer until that copy has
-    retired, so nothing is written over an in-flight source.
+    retired, so nothing is written over an in-flight source. A tensor that is
+    already pinned is queued as it is, so it has to stay untouched until the
+    stream has run the copy.
 
     The result is valid on the stream the copy was issued on; another stream has
     to wait on it, as for any async copy. The host tensor is read as it is, so the
@@ -165,6 +167,8 @@ def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> t
     device = torch.device(device)
     if tensor.device.type != "cpu" or not DeviceCapability.of(device).is_accelerator:
         return tensor.to(device)
+    if tensor.is_pinned():
+        return tensor.to(device, non_blocking=True)
     source = tensor if tensor.is_contiguous() else tensor.contiguous()
     pinned = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
     if source.numel():
