@@ -179,6 +179,8 @@ def _groups(rank, layout):
 
 def _check_rank(rank, layout, failed_here, store, out):
     import torch.distributed as dist
+
+    from mstar.distributed.communication import JointGroups
     try:
         dist.init_process_group(
             "gloo", init_method=f"file://{store}", rank=rank, world_size=4,
@@ -188,7 +190,7 @@ def _check_rank(rank, layout, failed_here, store, out):
         w = Worker.__new__(Worker)
         w.scheduler = SimpleNamespace(read_failed_rids=set(failed_here))
         w.parallel_groups = SimpleNamespace(
-            get_tp_config_for_node=lambda node: tp, get_sp_config_for_node=lambda node: sp,
+            get_joint_group_for_node=lambda node: JointGroups(tp_group=tp, sp_group=sp),
         )
         # a follower that could not read a row left it out; the others hold it
         rows = [r for r in ROWS if r not in failed_here]

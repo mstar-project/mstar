@@ -89,8 +89,13 @@ interactive shell and check GPU access:
      -v /dev/dri/by-path:/dev/dri/by-path:ro \
      -p 8000:8000 \
      -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+     -v mstar-cache:/root/.cache/mstar \
      mstar:xpu
    python -c "import torch; print(torch.xpu.is_available(), torch.xpu.device_count())"
+
+The ``mstar-cache`` volume keeps compiled kernels across containers. It is a named volume
+rather than ``$HOME/.cache/mstar`` because the container runs as root, and root-owned files
+there would stop a later native run from writing its cache.
 
 Inside the container, serve BAGEL using the TP2 deployment with three Intel GPUs:
 one for the encoders and decoder, and two for the LLM.
