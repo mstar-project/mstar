@@ -17,9 +17,10 @@ Not in ``multimodal.py``: ``mstar.model.base`` imports that module, so a
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple
 
 import torch
@@ -58,8 +59,10 @@ from mstar.model.multimodal import (
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import TextChunkDetokenizer, drop_stop_tokens
 
-# the sampling knobs a request may set
-SAMPLING_KEYS = ("temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos")
+# the sampling knobs a request may set. A model's SamplerSpec enables the
+# min-p filter only where ``sampling_defaults`` sets min_p, so elsewhere a
+# min_p > 0 is refused at admission rather than dropped
+SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "ignore_eos")
 
 # A mixed step's prompt rows (as many as `max_rows_in_combined` lets in) take
 # the prefill kernels, its decode rows the decode ones; for the ``splits`` of
@@ -122,6 +125,10 @@ class MultimodalDecoderModel(Model):
 
     # one per attachment modality the model takes, set by its `__init__`
     media: tuple[MediaIntake, ...] = ()
+    # the checkpoint's sampling defaults, under whatever a request sets; a
+    # model's `__init__` may set its own. Read by `get_node_resources` (the
+    # sampler's min-p filter) as well as per request
+    sampling_defaults: Mapping[str, object] = MappingProxyType({})
     _text_detokenizer: TextChunkDetokenizer | None = None
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None):
@@ -130,8 +137,6 @@ class MultimodalDecoderModel(Model):
         self.local_dir = self._resolve_model_metadata()
         # so weights are materialized at most once per node
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
-        # the checkpoint's sampling defaults, under whatever a request sets
-        self.sampling_defaults: dict = {}
 
     def _resolve_model_metadata(self) -> str:
         local_path = Path(self.model_path_hf)

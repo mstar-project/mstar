@@ -2357,7 +2357,9 @@ through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, a
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, which is
 also the request's output budget), the KV label and its one-span layout (``kv_labels``,
 ``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
-the request's ``SAMPLING_KEYS`` over the model's ``sampling_defaults``), sharding, the
+the request's ``SAMPLING_KEYS`` over the model's ``sampling_defaults``; a model's
+``SamplerSpec`` sets ``enable_min_p`` only where ``sampling_defaults`` has a
+``min_p``, so a request's ``min_p > 0`` is otherwise refused at admission), sharding, the
 submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting ``config``, ``tokenizer``, ``media``
 and any ``sampling_defaults``), its resources (``MIXED_SPLIT`` is the attention

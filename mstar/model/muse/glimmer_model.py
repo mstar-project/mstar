@@ -169,6 +169,7 @@ class MuseGlimmerModel(MultimodalDecoderModel):
                 resource_key=SAMPLER, nodes={"LLM"},
                 vocab_size=cfg.vocab_size,
                 enable_repetion_penalty=True,
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
             RaggedAttentionSpec(
                 resource_key=VISION_ATTN, nodes={"vision_encoder"},

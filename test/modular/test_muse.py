@@ -642,11 +642,23 @@ def test_the_checkpoint_sampling_defaults_apply_under_the_request(model_dir):
     from mstar.model.muse.glimmer_model import MuseGlimmerModel
 
     model = MuseGlimmerModel(str(model_dir))
-    # the sampler has no min-p filter, so a min_p it passed on would be refused at ingest
-    cfg = model.get_request_resource_configs({}, {"temperature": 0.0, "min_p": 0.1})[SAMPLER]
+    cfg = model.get_request_resource_configs({}, {"temperature": 0.0})[SAMPLER]
     assert (cfg.temperature, cfg.top_p, cfg.top_k) == (0.0, 0.95, 64)
     specs = {spec.resource_key: spec for spec in model.get_node_resources()}
     cfg.validate(specs[SAMPLER])
+    # the checkpoint sets no min_p, so the sampler has no min-p filter and a
+    # request's min_p is refused at admission, not dropped
+    with pytest.raises(ValueError, match="min_p"):
+        model.get_request_resource_configs({}, {"min_p": 0.1})[SAMPLER].validate(specs[SAMPLER])
+    # one that does turns the filter on, and a request's min_p overrides it
+    gen = json.loads((model_dir / "generation_config.json").read_text())
+    (model_dir / "generation_config.json").write_text(json.dumps({**gen, "min_p": 0.05}))
+    model = MuseGlimmerModel(str(model_dir))
+    (spec,) = [s for s in model.get_node_resources() if s.resource_key == SAMPLER]
+    assert model.get_request_resource_configs({}, {})[SAMPLER].min_p == 0.05
+    cfg = model.get_request_resource_configs({}, {"min_p": 0.2})[SAMPLER]
+    cfg.validate(spec)
+    assert (spec.enable_min_p, cfg.min_p) == (True, 0.2)
     assert set(specs) == {KV_CACHE, ATTN_SLIDING, ATTN_FULL, ROPE, "sampler", "vision_attn"}
     assert set(model.get_graph_walk_graphs()) == {"prefill_text", "prefill_vision", "decode"}
 
