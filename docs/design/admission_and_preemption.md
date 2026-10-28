@@ -133,20 +133,23 @@ A number set by each worker won't work, since requests reach workers on separate
 
 Say request R's grant is short by `pages_short` pages, one for a decode row. A request frees the pages only it holds, alone or with the index, plus the unused part of its reservation.
 
-- **Candidates.** The preemptible requests that arrived after R, newest first. Each fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
+- **Candidates.** The preemptible requests that arrived after R and aren't already victims, newest first. Each fits whole in the host pool, or has a drop that isn't refused for a lasting reason (§4). The host's room is its free pages and the cached pages it can evict, and each victim chosen for the host takes from it in turn.
 - **Victims.** The fewest leading candidates that together free at least `pages_short`, minus any whose move wouldn't change what the set frees.
 
 Then:
 
 1. If the victims free enough, the worker earmarks `pages_short` for R (§3.3), and moves each victim to the host or drops it (§4).
-2. Otherwise, if R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
+2. Otherwise, if no newer victim is still to move, R can move to the host or be dropped, and that frees any page, R gives up its pages and is requeued.
 3. Otherwise, R waits until the pool's room grows past what its failed grant saw.
+
+While R's victims, or R itself, haven't moved yet, R waits for those moves and chooses no other victims.
 
 The choice is one `KVManager.preempt` call under the pool's lock.
 
 Why this shape:
 
 - **Newest first.** No request loses its pages so that a newer request gets a page. vLLM's FCFS policy preempts the last entry in `running`, which is where a resumed request sits.
+- **A victim frees its pages for one request.** If a second request could choose it too, the two earmarks would count the same pages, and the first would never be met. So a second request passes over it, and waits for the room its move makes rather than moving itself.
 - **R is its own victim only as a last resort.** If even that frees nothing, every page is held by older or guaranteed requests, and those finish.
 - **A waiting request watches the room.** The pool records the room each failed grant saw, so no timer decides when to retry.
 - **Not the least recently active request.** Today's offload picks it, but it can be the oldest request in the pool, so nothing guarantees progress.
