@@ -356,7 +356,6 @@ class Qwen3OmniModel(Model):
             ChunkingPolicy(
                 walks=("prefill_text", "prefill_audio", "prefill_vision"),
                 chunkable=True, max_batch_tokens=budget,
-                max_chunks=self.config.thinker_text.max_position_embeddings,
                 # the Talker conditions on the whole prompt, so it needs every
                 # chunk's states, not just the last one's
                 accumulated_outputs=frozenset({"thinker_states", "thinker_mask"}),

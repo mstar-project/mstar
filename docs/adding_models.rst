@@ -1073,8 +1073,9 @@ declared chunkable whose node was left unwrapped is refused at startup.
 - ``Model.get_chunking_policies()`` returns ``{node: (ChunkingPolicy, ...)}``, each policy
   naming the ``walks`` it covers: ``chunkable=True``; ``max_batch_tokens``, the step's
   budget (a combined walk that carries chunked rows sets one too, since its steps run
-  under it); ``max_chunks``, the chunk Loop's runaway guard, for which the model's longest
-  prompt is always safe; ``accumulated_outputs`` for an output edge a consumer needs every
+  under it); ``max_chunks``, the chunk Loop's runaway guard, which defaults to no practical
+  cap and which a model normally leaves alone, since a cap below a prompt's chunk count
+  reports the prompt done early; ``accumulated_outputs`` for an output edge a consumer needs every
   chunk of, which then arrives as one item per chunk (any other edge carries the final
   chunk's tensors alone, earlier chunks' dropped as the loop advances);
   ``reuses_cached_prefix`` when a row may have to write a
