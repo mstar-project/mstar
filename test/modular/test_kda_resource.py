@@ -2,17 +2,20 @@
 
 What the manager owns is the plan: which rows run, which walk they take, and
 the token layout its kernel bundle asked for, staged where a captured graph
-will read it. The math is the bundle's, so a recording bundle stands in here.
-
-CPU-only: nothing here launches a kernel.
+will read it. The math is the bundle's, so a recording bundle stands in here;
+``KDACallable`` hands the bundle each layer's blocks. The torch reference bundle
+runs at the end, and once on CUDA to show it never waits on the host.
 """
 
 from __future__ import annotations
+
+import contextlib
 
 import pytest
 import torch
 
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnBackend,
     LinearAttnConfig,
@@ -21,6 +24,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
 )
 from mstar.engine.resources.linear_attn.kda import KDAManager, KDAParams, SpecBlocks
+from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import (
     TritonKDAKernels,
     _merged_row,
@@ -78,11 +82,11 @@ def specs(heads=HEADS, v_heads=HEADS, backend=LinearAttnBackend.TRITON, speculat
     return pool, kda
 
 
-def build(**kwargs) -> tuple[RecurrentStatePool, KDAManager]:
+def build(device=CPU, **kwargs) -> tuple[RecurrentStatePool, KDAManager]:
     pool_spec, kda_spec = specs(**kwargs)
-    pool = build_resource(pool_spec, EngineResourceInfo(device=CPU))
+    pool = build_resource(pool_spec, EngineResourceInfo(device=device))
     kda = build_resource(kda_spec, EngineResourceInfo(
-        device=CPU, dependencies={POOL: pool_spec},
+        device=device, dependencies={POOL: pool_spec},
     ))
     return pool, kda
 
@@ -95,6 +99,12 @@ def plan(pool, kda, rids, spans, ctx, speculative=False):
     assert pool.admit(pool_step, ctx).ok
     ctx.plan_results[POOL] = pool.plan(pool_step, ctx)
     return kda.plan(LinearAttnStep(segments=segments, speculative=speculative), ctx)["main"]
+
+
+def commit(pool, rids, spans, ctx):
+    """The pool's commit of the step just planned: its rows' slots now have state."""
+    segments = tuple(Segment(rid, "main", n) for rid, n in zip(rids, spans, strict=True))
+    pool.commit(RecurrentStep(segments=segments), ctx)
 
 
 def params(h=HEADS, d=DIM):
@@ -121,8 +131,8 @@ def test_builds_off_the_pool():
     pool, kda = build()
     assert isinstance(kda, KDAManager) and kda.depends_on() == {POOL}
     assert kda.geometry.num_v_heads == HEADS and kda.geometry.head_k_dim == DIM
-    # no CUDA: no default bundle, the model installs its reference
-    assert kda.kernels is None
+    # no CUDA: the torch reference
+    assert isinstance(kda.kernels, TorchKDAKernels)
     # the config's GDN default is taken as the one KDA backend there is
     _, kda = build(backend=LinearAttnBackend.FLASHINFER)
     assert kda.config.backend is LinearAttnBackend.TRITON
@@ -139,14 +149,14 @@ def test_refuses_a_pool_without_a_sink():
         build(sink=False)
 
 
-def test_no_default_bundle_at_an_unvalidated_head_dim(monkeypatch):
+def test_the_torch_reference_at_an_unvalidated_head_dim(monkeypatch):
     from mstar.engine.resources.linear_attn import kda as kda_mod
 
     monkeypatch.setattr(kda_mod.kda_triton, "_HAS_TRITON", True)
     monkeypatch.setattr(kda_mod.kda_triton, "TritonKDAKernels", lambda: "bundle")
     cuda = torch.device("cuda")
     assert kda_mod._default_kernels(cuda, 128) == "bundle"
-    assert kda_mod._default_kernels(cuda, 16) is None
+    assert isinstance(kda_mod._default_kernels(cuda, 16), TorchKDAKernels)
 
 
 def test_prefill_plan_stages_the_bundles_layout():
@@ -231,30 +241,85 @@ def test_run_hands_the_bundle_this_steps_plan():
     assert got is p and got_conv is conv and got_state is state and got_gate is gate
 
 
+def _ptr(t):
+    return t.data_ptr(), tuple(t.shape)
+
+
+def test_the_callable_hands_the_bundle_each_layers_blocks():
+    """The layer names no block: the callable resolves its conv and state, by the cursor or
+    an explicit index, and a pool without speculative blocks has none to hand over."""
+    pool, kda = build()
+    kda.set_kernels(rec := _Recorder())
+    p = plan(pool, kda, ["a"], [4], eager(["a"]))
+    mix = KDACallable(pool, kda)
+    assert mix.conv_dtype == pool.block("conv", 0).dtype
+    assert mix.current_plan() is p
+    gate = torch.zeros(4, DIM)
+    args = (torch.zeros(4, 3 * HEADS * DIM), torch.zeros(4, DIM), torch.zeros(4, HEADS), params())
+    mix(*args, gate=gate, layer_idx=2)
+    mix.set_layer_idx(1)
+    mix(*args, gate=gate)
+    for (got, conv, state, got_gate), layer in zip(rec.runs, (2, 1), strict=True):
+        assert got is p and got_gate is gate
+        assert _ptr(conv) == _ptr(pool.block("conv", layer))
+        assert _ptr(state) == _ptr(pool.block("state", layer))
+    assert mix._blocks[1].spec is None
+
+
 def test_a_speculative_step_runs_verify_blocks():
     pool, kda = build(speculative_tokens=2)
     assert kda.speculative_tokens == 2
     kda.set_kernels(rec := _Recorder())
+    mix = KDACallable(pool, kda)
+    # each request's prefill commits before its first verify step
+    ctx = eager(["a", "b"])
+    plan(pool, kda, ["a", "b"], [4, 2], ctx)
+    commit(pool, ["a", "b"], [4, 2], ctx)
+    layouts = len(rec.layouts)
     p = plan(pool, kda, ["a", "b"], [3, 3], eager(["a", "b"], walk="decode"), speculative=True)
     assert p.is_verify and p.block == 3 and not p.is_decode
-    assert p.layout is None and rec.layouts == []
-    spec = SpecBlocks.of(pool, 1)
-    assert spec.prefix.shape == (6, 2, 3, 3 * HEADS * DIM) and spec.prefix_len.shape == (6, 1)
+    assert p.layout is None and len(rec.layouts) == layouts
     gate = torch.zeros(6, DIM)
-    kda.run(torch.zeros(6, 3 * HEADS * DIM), torch.zeros(6, DIM), torch.zeros(6, HEADS),
-            pool.block("conv", 1), pool.block("state", 1), params(), gate=gate, spec=spec)
-    assert rec.verifies == [(p, spec, gate)] and rec.runs == []
+    mix(torch.zeros(6, 3 * HEADS * DIM), torch.zeros(6, DIM), torch.zeros(6, HEADS), params(),
+        gate=gate, layer_idx=1)
+    ((got, spec, got_gate),) = rec.verifies
+    assert got is p and got_gate is gate and rec.runs == []
+    want = SpecBlocks.of(pool, 1)
+    assert spec.prefix.shape == (6, 2, 3, 3 * HEADS * DIM) and spec.prefix_len.shape == (6, 1)
+    assert [_ptr(t) for t in spec] == [_ptr(t) for t in want]
 
     # the verdicts: a keeps one of its two drafts, b none; the next step reads the other side
     slots = [pool._slots[r]["main"].index for r in "ab"]
-    kda.set_prefix_len(spec, torch.tensor([1, 0]))
-    assert spec.prefix_len[slots, 0].tolist() == [2, 1]
-    assert spec.side[slots, 0].tolist() == [1, 1]
-    kda.set_prefix_len(spec, torch.tensor([2, 2]))
-    assert spec.prefix_len[slots, 0].tolist() == [3, 3]
-    assert spec.side[slots, 0].tolist() == [0, 0]
+    mix.set_prefix_len(torch.tensor([1, 0]))
+    assert want.prefix_len[slots, 0].tolist() == [2, 1]
+    assert want.side[slots, 0].tolist() == [1, 1]
+    commit(pool, ["a", "b"], [3, 3], ctx)
+    plan(pool, kda, ["a", "b"], [3, 3], eager(["a", "b"], walk="decode"), speculative=True)
+    mix.set_prefix_len(torch.tensor([2, 2]))
+    assert want.prefix_len[slots, 0].tolist() == [3, 3]
+    assert want.side[slots, 0].tolist() == [0, 0]
     # every layer shares the count
-    assert SpecBlocks.of(pool, 0).prefix_len is spec.prefix_len
+    assert SpecBlocks.of(pool, 0).prefix_len.data_ptr() == want.prefix_len.data_ptr()
+
+
+def test_set_prefix_len_leaves_the_slots_outside_the_step():
+    """A captured verify bucket's padding row writes the sink; another request's slot,
+    not in the step, keeps its count and side."""
+    pool, kda = build(speculative_tokens=2)
+    kda.set_kernels(_Recorder())
+    mix = KDACallable(pool, kda)
+    ctx = eager(["a", "c"])
+    plan(pool, kda, ["a", "c"], [2, 2], ctx)
+    commit(pool, ["a", "c"], [2, 2], ctx)
+    spec = SpecBlocks.of(pool, 0)
+    a, c = (pool._slots[r]["main"].index for r in "ac")
+    spec.prefix_len[c], spec.side[c] = 2, 1
+    plan(pool, kda, ["a", "pad"], [3, 3],
+         leased(["a"], ["a", "pad"], bs=2, tokens=6, walk="decode"), speculative=True)
+    mix.set_prefix_len(torch.tensor([1, 2]))
+    assert (spec.prefix_len[a, 0].item(), spec.side[a, 0].item()) == (2, 1)
+    assert (spec.prefix_len[c, 0].item(), spec.side[c, 0].item()) == (2, 1)
+    assert spec.prefix_len[SINK_SLOT, 0].item() == 3
 
 
 def test_a_verify_step_fits_the_pools_blocks():
@@ -269,6 +334,97 @@ def test_a_verify_step_fits_the_pools_blocks():
     with pytest.raises(ValueError, match="SpecBlocks"):
         kda.run(torch.zeros(3, 3 * HEADS * DIM), torch.zeros(3, DIM), torch.zeros(3, HEADS),
                 pool.block("conv", 0), pool.block("state", 0), params())
+
+
+# --- the torch reference bundle -------------------------------------------------
+
+
+def _torch_params(device, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    h, d = HEADS, DIM
+
+    def rand(*shape, scale=0.3):
+        return (torch.randn(*shape, generator=gen) * scale).to(device)
+
+    return KDAParams(
+        conv_weight=rand(3 * h * d, 4), A_log=rand(h), dt_bias=rand(h * d), lower_bound=-5.0,
+        num_heads=h, head_dim=d, scale=d ** -0.5,
+    )
+
+
+def _torch_inputs(tokens, device, seed=1):
+    gen = torch.Generator().manual_seed(seed)
+    h, d = HEADS, DIM
+    return (
+        torch.randn(tokens, 3 * h * d, generator=gen).to(device, torch.bfloat16),
+        torch.randn(tokens, h * d, generator=gen).to(device),
+        torch.randn(tokens, h, generator=gen).to(device),
+    )
+
+
+def _prefill_then_decode(pool, kda, rids, spans, p, device, guard=contextlib.nullcontext):
+    """A prefill step over ``spans``, then one decode token per row; the outputs. Only the
+    layer calls run under ``guard()``."""
+    mix = KDACallable(pool, kda)
+    prompt = _torch_inputs(sum(spans), device)
+    token = _torch_inputs(len(rids), device, seed=2)
+    ctx = eager(rids)
+    plan(pool, kda, rids, spans, ctx)
+    with guard():
+        first = mix(*prompt, p, layer_idx=1)
+    commit(pool, rids, spans, ctx)
+    ctx = eager(rids, walk="decode")
+    plan(pool, kda, rids, [1] * len(rids), ctx)
+    with guard():
+        second = mix(*token, p, layer_idx=1)
+    commit(pool, rids, [1] * len(rids), ctx)
+    return first, second
+
+
+def test_the_torch_bundle_keeps_each_row_in_its_own_slot():
+    """Two prompts in one step compute and leave behind what each would alone, in another
+    slot: the prefill reads and writes every row's slot by its device id."""
+    p = _torch_params(CPU)
+    qkv, g, beta = _torch_inputs(8, CPU)
+    pool, kda = build()
+    plan(pool, kda, ["x", "y"], [5, 3], eager(["x", "y"]))
+    together = KDACallable(pool, kda)(qkv, g, beta, p, layer_idx=1)
+    for rid, rows in (("x", slice(0, 5)), ("y", slice(5, 8))):
+        alone, akda = build()
+        plan(alone, akda, [rid], [rows.stop - rows.start], eager([rid]))
+        out = KDACallable(alone, akda)(qkv[rows], g[rows], beta[rows], p, layer_idx=1)
+        torch.testing.assert_close(out, together[rows], rtol=0, atol=0)
+        mine, theirs = pool._slots[rid]["main"].index, alone._slots[rid]["main"].index
+        for name in ("conv", "state"):
+            torch.testing.assert_close(pool.block(name, 1)[mine], alone.block(name, 1)[theirs],
+                                       rtol=0, atol=0)
+    assert pool.block("state", 0).abs().sum() == 0  # another layer's blocks are untouched
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype")
+def test_the_torch_bundle_never_waits_on_the_host():
+    """The reference prefill and decode on CUDA under sync debugging: no step reads a
+    device value back (the prefill once read its slot ids with ``.tolist()``)."""
+    cuda = torch.device("cuda")
+    pool, kda = build(device=cuda)
+    assert isinstance(kda.kernels, TorchKDAKernels)  # head dim 16: no fused kernels
+
+    @contextlib.contextmanager
+    def no_sync():
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            yield
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+
+    got = _prefill_then_decode(pool, kda, ["x", "y"], [70, 3], _torch_params(cuda), cuda, no_sync)
+    ref_pool, ref_kda = build()
+    want = _prefill_then_decode(ref_pool, ref_kda, ["x", "y"], [70, 3], _torch_params(CPU), CPU)
+    for a, b in zip(got, want, strict=True):
+        torch.testing.assert_close(a.cpu(), b, rtol=2e-2, atol=2e-2)
 
 
 # --- the Triton bundle's host side ---------------------------------------------

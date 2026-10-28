@@ -469,7 +469,7 @@ def test_layer_schedule_honored():
         else:
             assert isinstance(layer.self_attn, Glm5NextKdaAttention)
             assert layer.kda_pos == cfg.kda_layer_indices.index(idx)
-            assert layer.self_attn.pool is h.pool and layer.self_attn.kda is h.kda
+            assert layer.self_attn.mix.pool is h.pool and layer.self_attn.mix.attn is h.kda
         if idx < cfg.first_k_dense_replace:
             assert isinstance(layer.mlp, Glm5NextGatedMLP)
         else:
@@ -514,8 +514,8 @@ def test_kda_layers_hold_no_per_slot_state():
     slots = h.pool.config.max_slots
     kda_layers = [layer for layer in h.lm.model.layers if layer.is_linear_attention]
     assert len(kda_layers) > 1
-    assert len({id(layer.self_attn.pool) for layer in kda_layers}) == 1
-    assert len({id(layer.self_attn.kda) for layer in kda_layers}) == 1
+    assert len({id(layer.self_attn.mix.pool) for layer in kda_layers}) == 1
+    assert len({id(layer.self_attn.mix.attn) for layer in kda_layers}) == 1
     for module in h.lm.modules():
         tensors = [*module.parameters(recurse=False), *module.buffers(recurse=False),
                    *(v for v in vars(module).values() if isinstance(v, torch.Tensor))]
