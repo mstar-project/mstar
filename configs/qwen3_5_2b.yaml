@@ -1,5 +1,8 @@
 model: "qwen3_5_2b"
 max_seq_len: 32768
+# Requests past the cap wait in the conductor. The sampler's in-graph scatter
+# needs one: its slot rows are sized once, for twice the cap (sampler_slots).
+max_concurrent_requests: 256
 node_groups:
   # Text, images and video. Colocated: the
   # encoder runs once per request, then idles.

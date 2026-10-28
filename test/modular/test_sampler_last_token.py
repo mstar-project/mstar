@@ -153,12 +153,25 @@ def test_ingraph_scatter_rows_land_by_slot_and_padding_hits_the_trash_row():
     assert got[:2] == [22, 21] and got[2] == got[3] == bufs.last_token.master[0].item()
 
 
-def test_ingraph_scatter_masters_never_grow():
-    bufs = _ingraph(max_bs=2, slots=2)
-    bufs.register_request("a")
-    bufs.register_request("b")
+def test_ingraph_scatter_graph_masters_never_grow():
+    """The two masters a captured graph indexes are allocated in full and
+    kept; the others start small and grow up to them, and a registration
+    past them is refused."""
+    bufs = SamplerBuffers.allocate(
+        max_batch_size=2, device=torch.device("cpu"), vocab_size=16,
+        ingraph_scatter=True, slots=4,
+    )
+    offset, last_token = bufs.offset.master, bufs.last_token.master
+    assert offset.shape[0] == last_token.shape[0] == 5
+    assert bufs.temperature.master.shape[0] == bufs.seen_tokens.master.shape[0] == 3
+    for rid in ("a", "b", "c", "d"):
+        bufs.register_request(rid)
+    bufs.write_last_tokens(["d"], torch.tensor([7]))  # a gpu-thread access grows the device rows
+    assert bufs.temperature.master.shape[0] == bufs.seen_tokens.master.shape[0] == 5
+    assert bufs.offset.master is offset and bufs.last_token.master is last_token
+    assert bufs.last_tokens_for(["d"]).tolist() == [7]
     with pytest.raises(RuntimeError, match="MSTAR_SAMPLER_SLOTS"):
-        bufs.register_request("c")
+        bufs.register_request("e")
     # the default path still grows
     plain = SamplerBuffers.allocate(max_batch_size=2, device=torch.device("cpu"))
     for rid in ("a", "b", "c"):
@@ -179,3 +192,30 @@ def test_capture_padding_rows_take_no_slot():
     assert bufs.last_tokens_for([-2, "a"]).tolist() == [
         bufs.last_token.master[0].item(), 5,
     ]
+
+
+def test_the_startup_check_wants_a_cap_that_fits_the_graph_masters(monkeypatch):
+    from mstar.engine.engine import Engine
+    from mstar.engine.resources.sampler.resource import SamplerResource
+
+    monkeypatch.delenv("MSTAR_SAMPLER_INGRAPH_SCATTER", raising=False)
+    monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "1")
+    monkeypatch.setenv("MSTAR_SAMPLER_SLOTS", "64")
+    res = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=torch.device("cpu"))
+    monkeypatch.setattr(res, "can_capture", lambda: True)
+    # a node that takes its tokens on the host never scatters in graph
+    assert res.admission_problem(None) is None
+    res.enable_device_loopback_reader()
+    assert "set max_concurrent_requests to at most 32" in res.admission_problem(None)
+    assert res.admission_problem(32) is None
+    assert "`knobs: {sampler_slots: 66}`" in res.admission_problem(33)
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "0")
+    assert res.admission_problem(None) is None
+
+    # the worker's engine refuses to start on it
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    engine = Engine.__new__(Engine)
+    engine._resources = {"sampler": res}
+    engine.check_admission(32)
+    with pytest.raises(ValueError, match="resource sampler: .*sampler_ingraph_scatter: false"):
+        engine.check_admission(None)

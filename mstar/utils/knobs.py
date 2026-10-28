@@ -76,20 +76,22 @@ def device_loopback_enabled() -> bool:
 
 def sampler_ingraph_scatter() -> bool:
     """``sampler_ingraph_scatter`` / ``MSTAR_SAMPLER_INGRAPH_SCATTER`` (default
-    off): the captured sampler gathers its RNG offsets from the slot masters
+    on): the captured sampler gathers its RNG offsets from the slot masters
     and scatters the advanced offsets and the sampled tokens back inside the
     graph, so a replayed step issues none of those launches on the gpu thread
     (each is a GIL release the main thread's postprocess can win). Padding
-    rows then address a trash master row, and the masters are allocated once
-    for ``sampler_slots`` concurrent requests, since a captured graph holds
-    their addresses."""
-    return _setting("sampler_ingraph_scatter", "0") == "1"
+    rows then address a trash master row, and the offset and last-token
+    masters are allocated once for ``sampler_slots`` concurrent requests,
+    since a captured graph holds their addresses; a worker refuses to start
+    a deployment whose ``max_concurrent_requests`` doesn't fit them."""
+    return _setting("sampler_ingraph_scatter", "1") == "1"
 
 
 def sampler_slots() -> int:
-    """``sampler_slots`` / ``MSTAR_SAMPLER_SLOTS`` (default 4096): master rows
-    allocated up front when the in-graph scatter is on (see
-    ``sampler_ingraph_scatter``)."""
+    """``sampler_slots`` / ``MSTAR_SAMPLER_SLOTS`` (default 4096): request rows
+    of the masters a captured graph indexes when the in-graph scatter is on
+    (see ``sampler_ingraph_scatter``); room for a ``max_concurrent_requests``
+    of half that."""
     return int(_setting("sampler_slots", "4096"))
 
 

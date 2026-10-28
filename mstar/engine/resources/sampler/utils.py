@@ -2015,6 +2015,9 @@ class SamplerBuffers:
     # Request rows of the device masters; lags ``_master_capacity`` until the gpu thread grows them.
     _device_capacity: int = field(default=0, repr=False)
     ingraph_scatter: bool = False
+    # With ``ingraph_scatter``: request rows of the offset and last-token masters, which
+    # the captured graphs index and so never grow; the other masters grow up to it.
+    _ingraph_capacity: int = field(default=0, repr=False)
     # Master row 0, never given to a request, so its config stays SamplingConfig().
     # Padding rows, unregistered rids and capture rows read it; in graph they write it.
     _trash_slot: ClassVar[int] = 0
@@ -2103,9 +2106,11 @@ class SamplerBuffers:
         """Allocate sampling buffers for ``max_batch_size``.
 
         The masters hold the trash row (row 0, ``_trash_slot``) plus one row per
-        request. With ``ingraph_scatter`` that is ``slots`` request rows (the
-        knob's 4096 by default), allocated once: the captured graphs keep their
-        addresses, so they never grow.
+        request, ``max_batch_size`` to start with, doubling as registrations
+        outgrow them. With ``ingraph_scatter`` the offset and last-token masters
+        hold ``slots`` request rows (the knob's 4096 by default), allocated
+        once: the captured graphs keep their addresses, so those two never grow,
+        and the others grow up to them.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
         repetition penalty. ``history`` (with ``stop_ids`` and
@@ -2117,10 +2122,12 @@ class SamplerBuffers:
         """
         pinned = DeviceCapability.of(device).pin_memory
         cap = max_batch_size
+        ingraph_cap = 0
         if ingraph_scatter:
-            cap = max(max_batch_size, slots if slots is not None else sampler_slots())
+            ingraph_cap = max(max_batch_size, slots if slots is not None else sampler_slots())
         # row 0 is the trash row; requests take rows 1..cap
         rows = cap + 1
+        graph_rows = max(cap, ingraph_cap) + 1
 
         def mk(dtype: torch.dtype, default: float) -> HostBuffer:
             return HostBuffer.allocate(
@@ -2143,8 +2150,8 @@ class SamplerBuffers:
             top_p=mk(torch.float32, 1.0),
             seed=mk(torch.long, 0),
             rep_penalty=mk(torch.float32, 1.0),
-            offset=Buffer.allocate(max_batch_size, rows, device, torch.long, 0, 1),
-            last_token=Buffer.allocate(max_batch_size, rows, device, torch.long, 0, cg_slots),
+            offset=Buffer.allocate(max_batch_size, graph_rows, device, torch.long, 0, 1),
+            last_token=Buffer.allocate(max_batch_size, graph_rows, device, torch.long, 0, cg_slots),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
             min_p=mk(torch.float32, 0.0) if enable_min_p else None,
@@ -2164,6 +2171,7 @@ class SamplerBuffers:
             _master_capacity=cap,
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
+            _ingraph_capacity=ingraph_cap,
             cg_slots=cg_slots,
             _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
             _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
@@ -2259,11 +2267,15 @@ class SamplerBuffers:
         ``_init_slot`` cannot land in the old array; device masters grow on the gpu thread.
         """
         if self.ingraph_scatter:
-            raise RuntimeError(
-                f"more than {self._master_capacity} concurrent requests on the "
-                "sampler with the in-graph scatter on; raise MSTAR_SAMPLER_SLOTS "
-                "or set MSTAR_SAMPLER_INGRAPH_SCATTER=0"
-            )
+            # the startup check (SamplerResource.admission_problem) keeps a capped
+            # deployment below this
+            if self._master_capacity >= self._ingraph_capacity:
+                raise RuntimeError(
+                    f"more than {self._ingraph_capacity} concurrent requests on the "
+                    "sampler with the in-graph scatter on; raise MSTAR_SAMPLER_SLOTS "
+                    "or set MSTAR_SAMPLER_INGRAPH_SCATTER=0"
+                )
+            new_capacity = min(new_capacity, self._ingraph_capacity)
         rows = new_capacity + 1  # plus the trash row
         with self._host_master_lock:
             for buf in self._scalar_buffers():
@@ -2280,8 +2292,10 @@ class SamplerBuffers:
         if self._device_capacity >= cap:
             return
         rows = cap + 1  # plus the trash row
-        self.offset.grow_master(rows)
-        self.last_token.grow_master(rows)
+        if not self.ingraph_scatter:
+            # with it on, these two were allocated at their full size
+            self.offset.grow_master(rows)
+            self.last_token.grow_master(rows)
         if self.seen_tokens is not None:
             self.seen_tokens.grow_master(rows)
         for buf in self.loopback.values():

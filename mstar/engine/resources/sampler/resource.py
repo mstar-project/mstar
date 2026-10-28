@@ -23,7 +23,7 @@ from mstar.engine.resources.sampler.utils import (
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
-from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
+from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter, sampler_slots
 from mstar.utils.profiler import PhaseLaps
 
 
@@ -536,6 +536,32 @@ class SamplerResource(Resource):
         synchronous host-to-device copy per step, and a node that takes its
         tokens on the host would pay it for nothing. Honours the knob."""
         self._keep_last_token = device_loopback_enabled()
+
+    def admission_problem(self, max_concurrent_requests: int | None) -> str | None:
+        """With the in-graph scatter, a captured graph indexes the offset and
+        last-token masters, so they are sized once for ``sampler_slots``
+        requests and a registration past them fails. Each request keeps its
+        row until the worker tears it down, which waits for the steps still
+        running it, so a finished request and the one admitted after it hold
+        rows at the same time: a cap gets two rows a request."""
+        if not (self._keep_last_token and sampler_ingraph_scatter() and self.can_capture()):
+            return None
+        rows = sampler_slots()
+        off = "or set `knobs: {sampler_ingraph_scatter: false}`"
+        if max_concurrent_requests is None:
+            return (
+                f"the sampler's in-graph scatter (on by default) has rows for {rows} "
+                "requests, and with no max_concurrent_requests a burst can outgrow them; "
+                f"set max_concurrent_requests to at most {rows // 2}, {off}"
+            )
+        if 2 * max_concurrent_requests > rows:
+            return (
+                f"max_concurrent_requests={max_concurrent_requests} needs "
+                f"{2 * max_concurrent_requests} rows for the sampler's in-graph scatter, "
+                f"which has {rows}; set `knobs: {{sampler_slots: "
+                f"{2 * max_concurrent_requests}}}`, lower max_concurrent_requests, {off}"
+            )
+        return None
 
     @property
     def has_slot_masters(self) -> bool:

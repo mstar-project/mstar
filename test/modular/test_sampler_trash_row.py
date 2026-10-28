@@ -37,18 +37,18 @@ def _bufs(ingraph: bool, max_bs: int = 4, slots: int = 8) -> SamplerBuffers:
 def test_no_request_is_given_row_zero(ingraph):
     bufs = _bufs(ingraph)
     cap = bufs._master_capacity
-    assert bufs.offset.master.shape[0] == cap + 1
+    # with the knob on, the two masters a captured graph indexes are allocated in full
+    graph_rows = 8 + 1 if ingraph else cap + 1
+    assert bufs.offset.master.shape[0] == graph_rows
     for i in range(cap):
         bufs.register_request(f"r{i}")
     assert sorted(bufs._rid_to_slot.values()) == list(range(1, cap + 1))
-    if ingraph:
-        return
     # growing keeps row 0 out of the free list and hands out new rows only
     bufs.register_request("extra")
     assert bufs._master_capacity == 2 * cap
     assert bufs.temperature.master.shape[0] == 2 * cap + 1
     # the device masters follow on the gpu thread's next gather
-    assert bufs.offset.master.shape[0] == cap + 1
+    assert bufs.offset.master.shape[0] == graph_rows
     bufs._sync_device_capacity()
     assert bufs.offset.master.shape[0] == 2 * cap + 1
     assert bufs.last_token.master.shape[0] == 2 * cap + 1

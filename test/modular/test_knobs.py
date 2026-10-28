@@ -36,3 +36,11 @@ def test_env_then_config_then_default(monkeypatch):
 def test_a_malformed_block_fails_the_startup_check(bad):
     with pytest.raises(ValueError):
         knobs.check(bad)
+
+
+def test_the_in_graph_sampler_scatter_is_on_by_default(monkeypatch):
+    assert knobs.sampler_ingraph_scatter() is True and knobs.sampler_slots() == 4096
+    knobs.configure({"sampler_ingraph_scatter": False})
+    assert knobs.sampler_ingraph_scatter() is False
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "1")
+    assert knobs.sampler_ingraph_scatter() is True

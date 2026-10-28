@@ -595,6 +595,18 @@ class Engine:
                     if enable is not None:
                         enable()
 
+    def check_admission(self, max_concurrent_requests: int | None) -> None:
+        """Refuse, at startup, a deployment that can admit more requests at
+        once than a resource sized up front holds (``Resource.admission_problem``),
+        instead of failing requests once traffic grows past it."""
+        problems = [
+            f"resource {key}: {problem}"
+            for key, resource in self._resources.items()
+            if (problem := resource.admission_problem(max_concurrent_requests)) is not None
+        ]
+        if problems:
+            raise ValueError("; ".join(problems))
+
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
         from mstar.engine.resources.kv.manager import KVManager

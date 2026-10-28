@@ -114,6 +114,13 @@ class Resource(ABC):
     def can_capture(self) -> bool:
         return True
 
+    def admission_problem(self, max_concurrent_requests: int | None) -> str | None:
+        """Why this resource can't serve a deployment that admits up to
+        ``max_concurrent_requests`` requests at once (None: no cap), if it
+        can't. For state allocated once at startup for a fixed number of
+        requests; the worker refuses to start on any answer."""
+        return None
+
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
