@@ -71,15 +71,15 @@ _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
 
 class RoomMark(NamedTuple):
-    """A request `reserve` couldn't fit, and what it was measured against: the room, the pages the index
-    had filed, and how many of them were evictable."""
+    """A request `reserve` couldn't fit, and what it was measured against: the room, and the pages the
+    index had filed and requests had taken out of the evictable set."""
     rid: str
     node_name: str
     graph_walk: str
     published: "PublishedKVInfo | None"
     room: int
     filed: int
-    evictable: int
+    taken: int
 
 
 @dataclass
@@ -3857,18 +3857,25 @@ class KVManager(AttentionResource):
 
     def grew_since(self, mark: RoomMark) -> bool:
         """A newly filed page can raise a waiting request's hit, and a hit page another request
-        takes from the evictable set comes out of that request's allotment, not this one's."""
-        filed, evictable = self._index_counts()
-        room = self._arena.num_free + evictable - self._unused
-        grew = room > mark.room or filed != mark.filed or evictable < mark.evictable
-        if _DEBUG_ASSERTS and not grew and mark.rid in self._asks:
-            with self._lock:
+        takes from the evictable set comes out of that request's allotment, not this one's. Neither
+        moves the room, so the index counts both. The counts only rise, so two changes between passes
+        can't cancel out."""
+        if not _DEBUG_ASSERTS:
+            return self._grew_since(mark)
+        # under the lock, so a page freed on the GPU thread between the two reads can't trip it
+        with self._lock:
+            grew = self._grew_since(mark)
+            if not grew and mark.rid in self._asks:
                 pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
                 assert pages > self._room(), (
                     f"KV {self.name}: {mark.rid} fits now, but nothing `grew_since` reads has moved "
                     "since it didn't, so nothing would admit it"
                 )
-        return grew
+            return grew
+
+    def _grew_since(self, mark: RoomMark) -> bool:
+        filed, taken = self._index_counts()
+        return self._room() > mark.room or filed != mark.filed or taken != mark.taken
 
     def _need(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
@@ -3878,8 +3885,9 @@ class KVManager(AttentionResource):
         return self._asks[rid] - whole + charged
 
     def _index_counts(self) -> tuple[int, int]:
-        """The pages the index has ever filed, and how many it holds evictable."""
-        return (0, 0) if self._index is None else (self._index.filed, len(self._index.evictable()))
+        """The pages the index has ever filed, and the pages requests have ever taken out of its
+        evictable set."""
+        return (0, 0) if self._index is None else (self._index.filed, self._index.taken)
 
     def may_pass(self) -> bool:
         with self._lock:
