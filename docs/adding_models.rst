@@ -584,7 +584,10 @@ The spec types are:
        ``apply_qk(q, k, label)``. ``pos_ids=`` rotates at positions the model passes
        instead of the label's plan, and ``k=None`` rotates one tensor. ``interleave``
        selects GPT-J pairing, ``rotary_dim`` a partial rotation, and ``rope_table_dtype``
-       a cos/sin table built once (GLM-5.2 uses float32). A model with learned position
+       a cos/sin table built once (GLM-5.2 uses float32). ``yarn=YarnScaling(...)`` builds
+       that table with YaRN frequencies (DeepSeek-V3's form; Kimi K2.x, DeepSeek-V4.1) and needs
+       ``rope_table_dtype``; its ``attention_factor`` is stated per checkpoint, and
+       ``yarn_mscale`` gives the softmax-scale correction. A model with learned position
        embeddings also declares this spec, because it needs the position counter. Such a
        model never applies RoPE.
    * - ``SamplerSpec(vocab_size=..., enable_repetion_penalty=...)``

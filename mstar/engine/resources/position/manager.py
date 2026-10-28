@@ -22,6 +22,7 @@ from mstar.engine.resources.position.config import (
     PositionSpec,
     PositionStep,
     PosScheme,
+    YarnScaling,
 )
 from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
@@ -90,6 +91,12 @@ class RopeManager(PositionManager):
         self._max_seq_len = max_seq_len
         self._rope_cache_key: tuple | None = None
         self._rope_cache: torch.Tensor | None = None
+        if config.yarn is not None:
+            if config.llama31_params or config.rope_scale != 1.0:
+                raise ValueError("YaRN RoPE scales its own frequencies: leave rope_scale at 1 "
+                                 "and the Llama 3.1 factors unset")
+            if device.type != "xpu" and config.rope_table_dtype is None:
+                raise ValueError("YaRN RoPE rotates from a cos/sin table: set rope_table_dtype")
         if device.type == "xpu":
             if config.llama31_params:
                 raise NotImplementedError(
@@ -120,6 +127,7 @@ class RopeManager(PositionManager):
                 config.rope_scale,
                 config.rope_theta,
                 cache_dtype,
+                config.yarn,
             )
         # CUDA rotates from this table instead of in-kernel angles when set.
         self._rope_table: torch.Tensor | None = None
@@ -140,6 +148,7 @@ class RopeManager(PositionManager):
                 config.rope_scale,
                 config.rope_theta,
                 config.rope_table_dtype,
+                config.yarn,
             ).float()
             self._rope_table_key = (rotary_dim, config.rope_scale, config.rope_theta)
 
@@ -165,7 +174,7 @@ class RopeManager(PositionManager):
         cfg = self._config
         plain = (
             cfg.rope_scale == 1.0 and not cfg.interleave and cfg.rope_dtype is None
-            and not cfg.llama31_params and cfg.rotary_dim in (None, head_dim)
+            and not cfg.llama31_params and cfg.yarn is None and cfg.rotary_dim in (None, head_dim)
         )
         return float(cfg.rope_theta) if plain else None
 
@@ -507,6 +516,7 @@ class RopeManager(PositionManager):
         rope_scale: float,
         rope_theta: float,
         dtype: torch.dtype,
+        yarn: YarnScaling | None = None,
     ) -> torch.Tensor:
         positions = (
             torch.arange(
@@ -516,21 +526,27 @@ class RopeManager(PositionManager):
             )
             / rope_scale
         )
-        inv_freq = 1.0 / (
-            rope_theta
-            ** (
-                torch.arange(
-                    0,
-                    rotary_dim,
-                    2,
-                    device=self._device,
-                    dtype=torch.float32,
+        if yarn is not None:
+            inv_freq = yarn.inv_freq(rotary_dim, rope_theta, device=self._device)
+        else:
+            inv_freq = 1.0 / (
+                rope_theta
+                ** (
+                    torch.arange(
+                        0,
+                        rotary_dim,
+                        2,
+                        device=self._device,
+                        dtype=torch.float32,
+                    )
+                    / rotary_dim
                 )
-                / rotary_dim
             )
-        )
         freqs = torch.outer(positions, inv_freq)
-        return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype)
+        cos, sin = freqs.cos(), freqs.sin()
+        if yarn is not None and yarn.attention_factor != 1.0:
+            cos, sin = cos * yarn.attention_factor, sin * yarn.attention_factor
+        return torch.cat((cos, sin), dim=-1).to(dtype)
 
     def apply_qk(
         self,

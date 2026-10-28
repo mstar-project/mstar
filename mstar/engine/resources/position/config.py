@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -24,6 +25,53 @@ class PosBackend(Enum):
 class PosScheme(Enum):
     SEQUENTIAL = "sequential"
     BLOCK = "block"
+
+
+def yarn_mscale(factor: float, mscale: float = 1.0) -> float:
+    """YaRN's magnitude correction for a context stretched ``factor`` times: ``0.1 * mscale *
+    ln(factor) + 1`` (1 when nothing is stretched). DeepSeek-V3-family models also square it into
+    their softmax scale: ``qk_head_dim ** -0.5 * yarn_mscale(factor, mscale_all_dim) ** 2``."""
+    return 1.0 if factor <= 1 else 0.1 * mscale * math.log(factor) + 1.0
+
+
+@dataclass(frozen=True)
+class YarnScaling:
+    """YaRN RoPE (DeepSeek-V3's form; Kimi K2.x, DeepSeek-V4.1's compressed layers, YaRN drafters).
+
+    Frequencies whose wavelength fits ``beta_fast`` turns into the training context
+    (``original_max_position_embeddings``) are kept, those under ``beta_slow`` turns are divided
+    by ``factor``, and a linear ramp crosses the band between. ``attention_factor`` multiplies the
+    cos/sin table, which checkpoints set differently, so it is stated rather than defaulted: 1 for
+    DeepSeek-V4.1 and for Kimi K2.x (``yarn_mscale(f, mscale) / yarn_mscale(f, mscale_all_dim)``
+    with both 1), ``yarn_mscale(f)`` for a Hugging Face ``rope_type: yarn`` config that names
+    neither. Needs ``rope_table_dtype``: the kernels rotate from the table.
+    """
+
+    factor: float
+    original_max_position_embeddings: int
+    beta_fast: float = 32.0
+    beta_slow: float = 1.0
+    attention_factor: float = 1.0
+
+    def inv_freq(self, rotary_dim: int, theta: float, device=None) -> torch.Tensor:
+        """The ``rotary_dim // 2`` frequencies, in fp32."""
+        exponents = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim
+        freq_extra = 1.0 / (theta ** exponents)
+        freq_inter = 1.0 / (self.factor * theta ** exponents)
+
+        def turns_dim(turns: float) -> float:
+            # the dim whose wavelength completes ``turns`` rotations over the training context
+            return (rotary_dim * math.log(self.original_max_position_embeddings
+                                          / (turns * 2 * math.pi))) / (2 * math.log(theta))
+
+        low = max(math.floor(turns_dim(self.beta_fast)), 0)
+        high = min(math.ceil(turns_dim(self.beta_slow)), rotary_dim - 1)
+        if low == high:
+            high += 0.001  # one-dim band: avoid the division by zero
+        ramp = ((torch.arange(rotary_dim // 2, dtype=torch.float32, device=device) - low)
+                / (high - low)).clamp(0, 1)
+        keep = 1.0 - ramp
+        return freq_inter * (1 - keep) + freq_extra * keep
 
 
 @dataclass
@@ -52,6 +100,9 @@ class PositionConfig:
     low_freq_factor: float | None = None
     high_freq_factor: float | None = None
     old_context_len: int | None = None
+
+    # YaRN frequencies and table scale (rotates from the rope_table_dtype table only)
+    yarn: YarnScaling | None = None
 
     @property
     def llama31_params(self) -> dict[str, float]:
