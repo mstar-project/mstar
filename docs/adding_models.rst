@@ -493,7 +493,8 @@ The spec types are:
    * - ``KVSpec(config=PagedKVConfig(...))``
      - A paged KV cache. ``KVConfig`` is the abstract base for common model geometry;
        ``PagedKVConfig`` adds ``max_seq_len`` and five fields that
-       a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
+       a deployment can tune: ``max_num_pages`` (unset, sized for
+       ``max_concurrent_requests``; see `Pool sizing`_), ``page_size``, ``cpu_offload_pages``
        (the number of pinned host pages used for offload; 0 disables offload),
        ``prefix_cache`` and ``prefix_cache_salt``. ``layout=KVLayout.MLA`` stores one
        Multi-head Latent Attention latent per token in place of K and V. It needs
@@ -1779,6 +1780,22 @@ Startup uses these in two places:
   requests fit) and what the memory still free past the largest eager step would hold if it
   went to the pools as well, split so one request count fits every pool. Search the log
   for ``Pools[``.
+
+A pool whose size neither the model nor the deployment sets (``max_num_pages`` or
+``max_slots`` left out) is sized for the deployment's demand: ``max_concurrent_requests``
+requests, each holding a stream per label at the serving config's top-level
+``max_seq_len`` (a label without growth, such as an encoder's context, at its pool's own),
+plus the reserved units. On CUDA the engine then checks the pools against what the worker
+may allocate once its weights are loaded (``gpu_memory_fraction`` of the GPU, or an even
+share among the workers on it), less ``capture_reserve_gib``, and refuses to start if they
+don't fit, naming the overrun and the cap that would fit. Every rank of a TP/SP instance
+takes the instance's worst overrun, so they refuse together. Without a cap, or for a pool
+with ``cpu_offload_pages`` (which can make room instead), an unsized pool keeps its default
+(2048 pages, 256 recurrent slots, 32 bounded slots). A ring's ``num_sessions`` is never
+sized this way.
+
+So a model declares its pools without a size, and sets one only where the size is a fact
+of the model rather than of the machine.
 
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~

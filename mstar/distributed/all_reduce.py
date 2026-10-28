@@ -42,17 +42,24 @@ def _all_ranks_agree(flag: bool, cpu_group) -> bool:
     return bool(t.item())
 
 
-def flagged_on_any_rank(flags: Sequence[bool], groups: Iterable["CommGroup"]) -> list[bool]:
-    """Per entry, OR ``flags`` across the ranks of each group in ``groups`` in
-    turn: one gloo all-reduce (MAX) each, skipping a group of one rank. Over a
-    TP group and then an SP group, an entry ends up set on every rank of the
-    grid if any rank set it. Every rank passes the same number of entries, in
-    the same order. CPU tensors: it waits on the other ranks, never on a device."""
-    t = torch.tensor(list(flags), dtype=torch.int32)
+def reduced_on_every_rank(
+    values: Sequence[int], groups: Iterable["CommGroup"], op: dist.ReduceOp,
+) -> list[int]:
+    """Per entry, ``op`` over ``values`` across the ranks of each group in ``groups``
+    in turn: one gloo all-reduce each, skipping a group of one rank. Over a TP
+    group and then an SP group, every rank of the grid ends with the same entries.
+    Every rank passes the same number of entries, in the same order. CPU tensors:
+    it waits on the other ranks, never on a device."""
+    t = torch.tensor(list(values), dtype=torch.int64)
     for group in groups:
         if group.world_size > 1:
-            dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group.cpu_group)
-    return [bool(f) for f in t.tolist()]
+            dist.all_reduce(t, op=op, group=group.cpu_group)
+    return t.tolist()
+
+
+def flagged_on_any_rank(flags: Sequence[bool], groups: Iterable["CommGroup"]) -> list[bool]:
+    """Per entry, whether any rank of the grid set it (see ``reduced_on_every_rank``)."""
+    return [bool(f) for f in reduced_on_every_rank([int(f) for f in flags], groups, dist.ReduceOp.MAX)]
 
 
 class AllReduce:

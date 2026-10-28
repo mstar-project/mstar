@@ -23,6 +23,7 @@ class DSAConfig(PoolConfig):
 
     pool_unit: ClassVar[str] = "token"
     size_key: ClassVar[str] = ""
+    derivable: ClassVar[bool] = False
 
     # the paged MLA cache: a step's rows come from its plan, the attended latents from its pages
     kv_cache: str

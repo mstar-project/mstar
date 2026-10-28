@@ -3,8 +3,8 @@
 A pool is a resource that allocates its storage up front as equal units: a paged
 KV cache's pages, a recurrent or bounded pool's slots, a ring's sessions. Its
 config says what a unit costs and what one request holds, so the arithmetic runs
-on declarations, in the conductor before any worker exists as well as in the
-engine's startup report.
+on declarations: in the conductor before any worker exists, and in the engine
+before anything is allocated.
 
 Kept free of the managers, like the configs that implement it.
 """
@@ -31,6 +31,19 @@ class PoolConfig(ABC):
     pool_unit: ClassVar[str]
     #: the ``resources:`` key that sizes the pool
     size_key: ClassVar[str]
+    #: whether the engine sizes the pool for the deployment's requests when neither the
+    #: model nor the deployment sized it
+    derivable: ClassVar[bool] = True
+
+    @property
+    def sized(self) -> bool:
+        """Whether the model or the deployment set the size. An unsized pool holds a
+        default until the engine sizes it (``size_pool``)."""
+        return True
+
+    def size_pool(self, units: int) -> None:
+        """Take the engine's size for an unsized pool."""
+        raise NotImplementedError(f"{type(self).__name__} is not sized by the engine")
 
     @property
     @abstractmethod
@@ -73,6 +86,8 @@ class PoolDemand(NamedTuple):
     per_request: int
     max_seq_len: int | None
     host_units: int = 0
+    # the engine sizes it from memory: neither the model nor the deployment did
+    unsized: bool = False
 
     @property
     def requests(self) -> int | None:
@@ -119,6 +134,7 @@ def pool_demands(
     kv_dtype: torch.dtype,
     num_shards: Callable[[NodeResourceSpec], int] = lambda spec: 1,
     model: "Model | None" = None,
+    request_len: int | None = None,
 ) -> list[PoolDemand]:
     """Every pool among ``specs``, in declaration order.
 
@@ -126,6 +142,10 @@ def pool_demands(
     ``kv_labels`` (CFG's conditional and unconditional ones, say), each at the
     pool's ``max_seq_len``. A model that knows a tighter bound says so in
     ``Model.pool_units_per_request``.
+
+    An unsized pool is sized for the deployment's requests: with ``request_len``
+    (the serving config's ``max_seq_len``), a label that grows holds that many
+    tokens, and a label that doesn't (an encoder's context) what its pool declares.
     """
     by_key = {spec.resource_key: spec for spec in specs}
     labels = model.kv_labels() if model is not None else {}
@@ -138,10 +158,15 @@ def pool_demands(
         unit_bytes = pool.unit_bytes(kv_dtype, num_shards(spec))
         if pool.pool_units is None and unit_bytes == 0:
             continue  # a growing store that declares no size
+        unsized = pool.derivable and not pool.sized
+        declared = labels.get(spec.resource_key, {})
+        # the length of each stream a request holds: one per declared label (at least one)
+        streams = [length] * max(len(declared), 1)
+        if unsized and request_len is not None and declared:
+            streams = [request_len if label.growth else length for label in declared.values()]
         per_request = model.pool_units_per_request(spec) if model is not None else None
         if per_request is None:
-            streams = max(len(labels.get(spec.resource_key, ())), 1)
-            per_request = streams * pool.units_per_request(length)
+            per_request = sum(pool.units_per_request(n) for n in streams)
         demands.append(PoolDemand(
             key=spec.resource_key,
             unit=pool.pool_unit,
@@ -150,8 +175,9 @@ def pool_demands(
             units=pool.pool_units,
             reserved=pool.reserved_units,
             per_request=per_request,
-            max_seq_len=length,
+            max_seq_len=max(streams, key=lambda n: n or 0),
             host_units=pool.host_units,
+            unsized=unsized,
         ))
     return demands
 
@@ -173,6 +199,24 @@ def requests_within(demands: Sequence[PoolDemand], budget: int) -> int:
     if per_request <= 0:
         return 0
     return max(budget - fixed, 0) // per_request
+
+
+def requests_for_unsized(demands: Sequence[PoolDemand], budget: int) -> int:
+    """Requests the unsized pools could hold, sized alike, in what ``budget`` bytes leave
+    after the sized pools. A store with no pool takes its per-request bytes from the same budget."""
+    left = budget - sum(d.nbytes for d in demands if d.units is not None and not d.unsized)
+    return requests_within([d for d in demands if d.unsized or d.units is None], left)
+
+
+def default_capture_reserve(total: int) -> int:
+    """What pools sized for the deployment's requests must leave of a ``total``-byte device
+    for graph capture, the largest eager step and the workspaces built after them, unless
+    ``capture_reserve_gib`` says.
+
+    What that takes depends on the model's capture buckets, not on the device: 3 to 15 GiB
+    on an H100 for the models measured (Qwen3-TTS's 15 GiB the most), and the startup
+    report gives each deployment its own figure."""
+    return max(4 * 2**30, total // 4)
 
 
 def units_for(demand: PoolDemand, requests: int) -> int:

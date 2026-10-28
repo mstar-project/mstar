@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
 
+# what an unsized pool holds when nothing sizes it from memory
+DEFAULT_MAX_SLOTS = 256
+
+
 @dataclass
 class RecurrentBlockConfig:
     """One per-slot, per-layer tensor block.
@@ -251,8 +255,9 @@ class RecurrentStateConfig(PoolConfig):
     blocks: dict[str, RecurrentBlockConfig] = field(default_factory=dict)
 
     # Slots in the pool, including the sink if any. A request holds one per
-    # label, so this bounds concurrent requests times labels.
-    max_slots: int = 256
+    # label, so this bounds concurrent requests times labels. None: the engine
+    # sizes the pool from memory; DEFAULT_MAX_SLOTS where nothing does.
+    max_slots: int | None = None
 
     # Whether padding rows address a real sink slot or a -1 sentinel. Kernels
     # disagree on -1: FlashInfer's fp32 GDN decode skips it, its bf16 path
@@ -261,8 +266,13 @@ class RecurrentStateConfig(PoolConfig):
     #
     # TODO: derive this from (backend, dtype, ...) automatically.
     disable_sink_slot: bool = False
+    # whether the model or the deployment set max_slots
+    pool_sized: bool = field(default=True, init=False, repr=False, compare=False)
 
     def __post_init__(self):
+        self.pool_sized = self.max_slots is not None
+        if self.max_slots is None:
+            self.max_slots = DEFAULT_MAX_SLOTS
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
         if not self.disable_sink_slot and self.max_slots < 2:
@@ -279,6 +289,13 @@ class RecurrentStateConfig(PoolConfig):
     @property
     def pool_units(self) -> int:
         return self.max_slots
+
+    @property
+    def sized(self) -> bool:
+        return self.pool_sized
+
+    def size_pool(self, units: int) -> None:
+        self.max_slots = units
 
     @property
     def reserved_units(self) -> int:
@@ -326,6 +343,7 @@ class RecurrentStateSpec(NodeResourceSpec):
                     f"{'' if self.config.disable_sink_slot else ' (slot 0 is the sink)'}; got {max_slots!r}"
                 )
             self.config.max_slots = max_slots
+            self.config.pool_sized = True
         if state_dtype is not None:
             try:
                 dtype = getattr(torch, state_dtype)

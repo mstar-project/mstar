@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
 import torch
+import torch.distributed as dist
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
+from mstar.distributed.all_reduce import reduced_on_every_rank
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
@@ -38,7 +40,17 @@ from mstar.engine.resources import (
 from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.sizing import PoolDemand, concurrency, describe, memory_allows, pool_demands
+from mstar.engine.resources.sizing import (
+    PoolDemand,
+    concurrency,
+    default_capture_reserve,
+    describe,
+    memory_allows,
+    pool_demands,
+    requests_for_unsized,
+    spec_pool,
+    units_for,
+)
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -79,6 +91,28 @@ if TYPE_CHECKING:
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
+
+
+def _shards_in(groups: Mapping[str, "JointGroups | None"]) -> Callable[[NodeResourceSpec], int]:
+    """A spec's rank count in its lockstep instance."""
+    return lambda spec: 1 if groups[spec.resource_key] is None else groups[spec.resource_key].world_size
+
+
+def _out_of_memory(e: BaseException | None) -> bool:
+    """Whether a device allocation failure is somewhere in ``e``'s chain."""
+    while e is not None:
+        if isinstance(e, torch.OutOfMemoryError):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def _instance(group: "JointGroups | None") -> tuple | None:
+    """The ranks of a lockstep instance, the same on each of them; None for one rank."""
+    if group is None or group.world_size == 1:
+        return None
+    return (tuple(group.tp_group.group_members), tuple(group.sp_group.group_members))
+
 
 # Block the GPU thread on its step's outputs before returning (1-step launch
 # bound vs the worker's default 2-step). Off by default: it kills the
@@ -467,10 +501,27 @@ class Engine:
         enable_profile: bool=False,
         gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
+        capture_reserve: int | None = None,
+        device_share: float | None = None,
+        max_concurrent_requests: int | None = None,
+        max_seq_len: int | None = None,
     ):
         assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
             f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
         )
+        # the deployment's demand, which sizes the pools neither the model nor the YAML
+        # sized: this many requests of this many tokens
+        self._max_concurrent_requests = max_concurrent_requests
+        self._max_seq_len = max_seq_len
+        # what those pools must leave for capture and the largest eager step (None:
+        # `default_capture_reserve`), and the share of the device they may take with no
+        # gpu_memory_fraction (the workers sharing it split it)
+        self._capture_reserve = capture_reserve
+        self._device_share = device_share
+        # the reserve the last sizing kept, for the error when capture runs out
+        self._reserve_kept = 0
+        # whether this engine sized any pool for the deployment's requests
+        self._sized_for_demand = False
         self._device = None
         self._device_capability = device_capability
         self._autocast_dtype = autocast_dtype
@@ -524,23 +575,25 @@ class Engine:
 
         self._classify_tp_roles(node_names, parallel_groups)
 
+        # A spec is a logical resource identity and may span replicas on
+        # different workers (for example BAGEL's three CFG branches).
+        # This Engine constructs only the local instance, whose consumers
+        # validate_deployment checked share one parallel group.
+        local = [
+            (spec, nodes, parallel_groups.get_joint_group_for_node(next(iter(nodes))))
+            for spec in specs if (nodes := spec.nodes & node_names)
+        ]
+        groups = {spec.resource_key: group for spec, _, group in local}
+        kv_dtype = kv_cache_type or torch.get_default_dtype()
+        # off CUDA (XPU, or a CPU test standing in for a GPU) an unsized pool keeps its default
         if device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
             self._free_before_resources = torch.cuda.mem_get_info(device)[0]
-        shards: dict[str, int] = {}
-        for spec in specs:
-            relevant_nodes = spec.nodes & node_names
-            if len(relevant_nodes) == 0:
-                continue # resource not needed
-
-            # A spec is a logical resource identity and may span replicas on
-            # different workers (for example BAGEL's three CFG branches).
-            # This Engine constructs only the local instance, whose consumers
-            # validate_deployment checked share one parallel group.
-            joint_comm_group = parallel_groups.get_joint_group_for_node(
-                next(iter(relevant_nodes))
+            self._size_pools_for_demand(
+                [spec for spec, _, _ in local], groups, kv_dtype, model, lambda: self._pool_budget(device),
             )
-            shards[spec.resource_key] = 1 if joint_comm_group is None else joint_comm_group.world_size
+
+        for spec, relevant_nodes, joint_comm_group in local:
             self._resources[spec.resource_key] = build_resource(
                 spec,
                 EngineResourceInfo(
@@ -566,8 +619,7 @@ class Engine:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
             self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
         self._pools = pool_demands(
-            [spec for spec in specs if spec.resource_key in shards],
-            kv_cache_type or torch.get_default_dtype(), lambda spec: shards[spec.resource_key], model,
+            [spec for spec, _, _ in local], kv_dtype, _shards_in(groups), model, self._max_seq_len,
         )
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
@@ -608,6 +660,76 @@ class Engine:
                     enable = getattr(resource, "enable_device_loopback_reader", None)
                     if enable is not None:
                         enable()
+
+    def _pool_budget(self, device: torch.device) -> int:
+        """Bytes this worker's unsized pools may take: what it may still allocate once the
+        weights are on the device (``_free_before_resources``), less the capture reserve."""
+        free, total = self._free_before_resources, torch.cuda.mem_get_info(device)[1]
+        share = self._gpu_memory_fraction or self._device_share
+        if share is not None:
+            free = min(free, int(share * total) - torch.cuda.memory_reserved(device))
+        reserve = default_capture_reserve(total) if self._capture_reserve is None else self._capture_reserve
+        self._reserve_kept = reserve
+        logger.info(
+            "Pools[%s]: %.2f GiB to allocate after the weights%s, %.2f GiB of it kept for capture",
+            device, free / 2**30, "" if share is None else f" (a {share:.2f} share)", reserve / 2**30,
+        )
+        return free - reserve
+
+    def _size_pools_for_demand(
+        self, specs: list[NodeResourceSpec], groups: dict[str, JointGroups | None],
+        kv_dtype: torch.dtype, model: "Model | None", budget: Callable[[], int],
+    ) -> None:
+        """Size every pool neither the model nor the deployment sized for the deployment's
+        ``max_concurrent_requests`` requests of ``max_seq_len`` tokens, and refuse the boot
+        if the pools then need more than ``budget()`` bytes.
+
+        With no cap there is no demand to size for, so such a pool keeps its default, as
+        does one with ``cpu_offload_pages``, which can make room instead of holding every
+        request at full length. The sizes depend on the declarations alone, so they match
+        on every rank of a lockstep instance; the check reads each rank's memory, so every
+        rank takes the instance's worst overrun, and every reduction runs before anything
+        raises.
+        """
+        cap = self._max_concurrent_requests
+        demands = pool_demands(specs, kv_dtype, _shards_in(groups), model, self._max_seq_len)
+        unsized = [d for d in demands if d.unsized and not d.can_evict]
+        if cap is None or not unsized:
+            if any(d.unsized for d in demands):
+                logger.info(
+                    "Pools[%s]: %s keep their default size: %s", self._device,
+                    ", ".join(d.key for d in demands if d.unsized),
+                    "the config sets no max_concurrent_requests" if cap is None else "they offload to the host",
+                )
+            return
+        by_key = {spec.resource_key: spec for spec in specs}
+        for d in unsized:
+            spec_pool(by_key[d.key]).size_pool(units_for(d, cap))
+        self._sized_for_demand = True
+        demands = pool_demands(specs, kv_dtype, _shards_in(groups), model, self._max_seq_len)
+        need = sum(d.nbytes for d in demands) + cap * sum(d.request_bytes for d in demands if d.units is None)
+        room = budget()
+        over = need - room
+        instances = {_instance(groups[d.key]): groups[d.key] for d in unsized}
+        for _, group in sorted(instances.items(), key=lambda item: item[0] or ()):
+            if group is not None:
+                over = reduced_on_every_rank([over], (group.tp_group, group.sp_group), dist.ReduceOp.MAX)[0]
+        if over > 0:
+            # the pools that offload keep their size, so only the ones sized here shrink
+            fits = requests_for_unsized([d._replace(unsized=d.unsized and not d.can_evict) for d in demands], room)
+            raise RuntimeError(
+                f"max_concurrent_requests {cap} at max_seq_len {self._max_seq_len} needs "
+                f"{need / 2**30:.2f} GiB of pools ({', '.join(d.key for d in unsized)} sized for it), "
+                f"{over / 2**30:.2f} GiB more than this worker can give them after the weights and "
+                f"capture_reserve_gib ({self._reserve_kept / 2**30:.1f} GiB); lower max_concurrent_requests "
+                f"(here {fits} would fit) or max_seq_len, or size the pools under resources:"
+            )
+        for d in demands:
+            if d.unsized and not d.can_evict:
+                logger.info(
+                    "Pools[%s]: %s sized to %d %ss for %d requests at max_seq_len %s", self._device,
+                    d.key, d.units, d.unit, cap, d.max_seq_len,
+                )
 
     def paged_kv_caches(self) -> list[PagedKVCache]:
         """Every paged KV cache this engine built, with the nodes that use it."""
@@ -669,6 +791,18 @@ class Engine:
         return None if submodule.disable_autocast else self._autocast_dtype
 
     def warmup(self) -> None:
+        try:
+            self._warmup()
+        except RuntimeError as e:
+            if not self._sized_for_demand or not _out_of_memory(e):
+                raise
+            raise RuntimeError(
+                f"{e}\nThe pools sized for max_concurrent_requests left too little for capture and the "
+                f"largest eager step; raise capture_reserve_gib above {self._reserve_kept / 2**30:.1f} "
+                "(the startup check then refuses a cap that doesn't fit), or lower max_concurrent_requests"
+            ) from e
+
+    def _warmup(self) -> None:
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
         piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
@@ -757,15 +891,19 @@ class Engine:
         pools too, the largest eager step's share kept back."""
         if not self._pools:
             return
+        sized_here = self._sized_for_demand
         for demand in self._pools:
-            logger.info("Pools[%s] %s", self._device, describe(demand))
+            note = "" if not demand.unsized else (
+                " (sized for max_concurrent_requests)" if sized_here and not demand.can_evict else " (unsized: default)"
+            )
+            logger.info("Pools[%s] %s%s", self._device, describe(demand), note)
         held = concurrency(self._pools)
         if plan is None:
             logger.info("Pools[%s]: %s requests at once", self._device, held)
             return
         free, total = torch.cuda.mem_get_info(self._device)
         if self._free_before_resources is not None:
-            # what a pool sized from memory has to leave: everything but the pools that the
+            # what pools sized for the demand have to leave: everything but the pools that the
             # boot allocated after the weights, and the largest eager step's room
             beside = self._free_before_resources - free - sum(d.nbytes for d in self._pools)
             logger.info(
@@ -775,10 +913,16 @@ class Engine:
             )
         if self._gpu_memory_fraction is not None:
             free = min(free, int(self._gpu_memory_fraction * total) - torch.cuda.memory_reserved(self._device))
+        spare = free - plan.floor
         logger.info(
-            "Pools[%s]: %s requests at once; %s", self._device, held,
-            memory_allows(self._pools, free - plan.floor),
+            "Pools[%s]: %s requests at once; %s", self._device, held, memory_allows(self._pools, spare),
         )
+        if sized_here and spare < 0:
+            logger.warning(
+                "Pools[%s]: the pools sized for max_concurrent_requests left %.0f MiB after capture, "
+                "%.0f MiB short of the largest eager step; raise capture_reserve_gib by at least %.1f",
+                self._device, free / 2**20, -spare / 2**20, -spare / 2**30,
+            )
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],

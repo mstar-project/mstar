@@ -236,7 +236,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``model``
      - Registry key of the model (see :doc:`models`).
    * - ``max_seq_len``
-     - Maximum sequence length (sizes the KV cache).
+     - Maximum sequence length. With ``max_concurrent_requests``, it sizes the KV caches
+       the config leaves unsized; a request is still held to its cache's own limit.
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
@@ -249,11 +250,20 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        conductor's queue, except a live call (open client input), which is refused with
        a 503. Startup refuses a cap that a KV cache or state pool cannot hold at its
        per-request bound, and each worker logs what its pools hold (``Pools[`` lines;
-       see "Pool sizing" in :doc:`adding_models`).
+       see "Pool sizing" in :doc:`adding_models`). Set, it also sizes the pools the config
+       leaves unsized: this many requests at ``max_seq_len``, refused at startup if they
+       don't fit the GPU.
    * - ``gpu_memory_fraction``
      - *(optional)* The share of its GPU each worker may hold once CUDA-graph capture is
        done, for workers that share a GPU (see below). Unset, capture plans against
-       whatever is free.
+       whatever is free, and the check on pools sized for ``max_concurrent_requests``
+       splits the GPU evenly between the workers ``rank_devices`` puts on it.
+   * - ``capture_reserve_gib``
+     - *(optional)* GiB that pools sized for ``max_concurrent_requests`` must leave free
+       for CUDA-graph capture, the largest eager step and the buffers built after the pools.
+       Default: a quarter of the GPU, at least 4 GiB. The startup report gives what this
+       deployment used (``Pools[`` lines), and a worker warns after capture when it was too
+       little.
    * - ``mps``
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their

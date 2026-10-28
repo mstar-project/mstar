@@ -96,8 +96,13 @@ def pools_hold_concurrency(
     cap = config.get("max_concurrent_requests")
     if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap < 1):
         return [f"max_concurrent_requests must be a positive int; got {cap!r}"]
-    # the byte sizes don't matter here
-    demands = [d for d in pool_demands(specs, torch.bfloat16, model=model) if d.units is not None]
+    # the byte sizes don't matter here. With a cap, a worker sizes an unsized pool for it
+    # (one that offloads keeps its default) and checks it against its memory; with none,
+    # every pool keeps its size and the warning below names them all
+    demands = [
+        d for d in pool_demands(specs, torch.bfloat16, model=model)
+        if d.units is not None and (cap is None or not d.unsized or d.can_evict)
+    ]
     if not demands:
         return []
     if cap is None:
