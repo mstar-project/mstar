@@ -4109,13 +4109,14 @@ class KVManager(AttentionResource):
         """Choose the requests to move off the device so that ``rid`` gets the ``pages_short`` pages its grant ran
         short of, and earmark the pages they free for ``rid``.
 
-        The victims are the newest requests that arrived after ``rid``, taken until their moves cover the shortage.
-        A victim the host can take whole moves there, and `moves_to_host` returns True for it. Any other victim is
-        dropped. When all the newer requests free less than the shortage, return ``[rid]`` alone with no earmark if
-        moving ``rid`` frees pages. Otherwise return an empty list, and ``rid`` waits until the room grows. It also
-        returns an empty list when pages released since the grant ran short cover the shortage. None when the pool
-        doesn't decide or ``rid`` has no arrival number. ``droppable`` returns whether a request can be dropped
-        once every step holding it has landed.
+        The victims are the newest requests that arrived after ``rid`` and aren't already victims, taken until
+        their moves cover the shortage. A victim the host can take whole moves there, and `moves_to_host` returns
+        True for it. Any other victim is dropped. When the newer requests that aren't victims free less than the
+        shortage, return ``[rid]`` alone with no earmark if moving ``rid`` frees pages and no newer victim is still
+        to move. Otherwise return an empty list, and ``rid`` waits until the room grows. It also returns an empty
+        list when pages released since the grant ran short cover the shortage, and while ``rid`` or a victim chosen
+        for it hasn't moved yet. None when the pool doesn't decide or ``rid`` has no arrival number. ``droppable``
+        returns whether a request can be dropped once the steps it has launched land.
         """
         if not self._decides:
             return None
@@ -4127,14 +4128,17 @@ class KVManager(AttentionResource):
             room, then = self._room(), self._ran_short.pop(rid, None)
             if then is not None:
                 pages_short -= max(0, room - then)
-                if pages_short <= 0:
-                    return []
+            if pages_short <= 0 or rid in self._earmarks or rid in self._victims:
+                return []
             newer = sorted(
                 (other for other, overrides in self._overrides.items()
                  if overrides.arrival is not None and overrides.arrival > arrival
                  and self._holds(other)),
                 key=lambda other: self._overrides[other].arrival, reverse=True,
             )
+            # a victim not yet moved frees its pages for the request it was chosen for
+            moving = any(other in self._victims for other in newer)
+            newer = [other for other in newer if other not in self._victims]
             on_host = 0 if self._cpu_pool is None else self._cpu_pool.room()
             left, hosted = on_host, set()
             victims: list[str] = []
@@ -4151,7 +4155,7 @@ class KVManager(AttentionResource):
             else:
                 pages = self._host_pages(rid)
                 to_host = pages is not None and pages <= on_host
-                if (to_host or droppable(rid)) and self._frees([rid]) > 0:
+                if not moving and (to_host or droppable(rid)) and self._frees([rid]) > 0:
                     self._victims[rid] = None
                     if to_host:
                         self._hosted.add(rid)
