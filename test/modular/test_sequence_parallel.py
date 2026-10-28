@@ -4,7 +4,8 @@
 splits, and of several tensors at once against one at a time; and
 ``ulysses_attention`` over sharded tokens against one rank attending the whole
 sequence (with fewer key/value heads than query heads too), for the
-``[S, H, D]`` and ``[B, S, H, D]`` layouts.
+``[S, H, D]`` and ``[B, S, H, D]`` layouts; and the Wan2.2 DiT under Ulysses
+against the same DiT on one rank.
 """
 
 from __future__ import annotations
@@ -118,3 +119,46 @@ def _several_at_once(rank, world, total, batched):
 @pytest.mark.parametrize("world,total", [(2, 6), (3, 11)], ids=["2-even", "3-uneven"])
 def test_all_to_all_of_several_tensors_matches_one_at_a_time(tmp_path, world, total, batched):
     _run(_several_at_once, world, tmp_path / "store", total, batched)
+
+
+def _wan_dit(rank, world, grid, out_path):
+    from mstar.model.wan22.components.dit import Wan22DiT
+    from mstar.model.wan22.config import Wan22Config
+
+    config = Wan22Config(
+        num_attention_heads=6, attention_head_dim=12, num_layers=2, ffn_dim=32,
+        in_channels=4, out_channels=4, text_dim=8, freq_dim=16, rope_max_seq_len=16,
+    )
+    torch.manual_seed(0)
+    dit = Wan22DiT(config, sp_group=_group(rank, world))
+    for param in dit.parameters():
+        torch.nn.init.normal_(param, std=0.2)
+    gen = torch.Generator().manual_seed(1)
+    frames, height, width = grid
+    latents = torch.randn(1, 4, frames, height, width, generator=gen)
+    tokens = frames * (height // 2) * (width // 2)
+    timestep = torch.rand(1, tokens, generator=gen) * 1000
+    text = torch.randn(1, 5, 8, generator=gen)
+    with torch.no_grad():
+        out = dit(latents, timestep, text)
+    if rank == 0:
+        torch.save(out, out_path)
+
+
+@pytest.mark.parametrize("grid", [(2, 4, 4), (3, 2, 6)], ids=["even", "uneven"])
+def test_wan_dit_under_ulysses_matches_one_rank(tmp_path, grid):
+    """Each SP rank keeps its slice of the tokens, their RoPE and per-token
+    timesteps, and the gathered output is the one-rank DiT's (8 and 9
+    tokens: an even and an uneven split over two ranks)."""
+    _run(_wan_dit, 1, tmp_path / "one", grid, str(tmp_path / "one.pt"))
+    _run(_wan_dit, 2, tmp_path / "two", grid, str(tmp_path / "two.pt"))
+    torch.testing.assert_close(torch.load(tmp_path / "two.pt"), torch.load(tmp_path / "one.pt"))
+
+
+def test_wan_dit_refuses_an_sp_size_that_does_not_divide_its_heads():
+    from mstar.model.wan22.components.dit import Wan22DiT
+    from mstar.model.wan22.config import Wan22Config
+
+    config = Wan22Config(num_attention_heads=6, attention_head_dim=12, num_layers=1, ffn_dim=32)
+    with torch.device("meta"), pytest.raises(ValueError, match="sp_size"):
+        Wan22DiT(config, sp_group=CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1, 2, 3]))

@@ -28,13 +28,22 @@ bidirectional video DiT with 3D RoPE would have to override all of it. The
 two-linear MLPs ARE the shared ``components.mlp.MLP``.
 """
 
+import functools
 import math
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.distributed.communication import CommGroup
 from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
+from mstar.model.components.distributed.sequence_parallel import (
+    gather_sequence,
+    scatter_sequence,
+    sp_seq_split,
+    ulysses_attention,
+)
 from mstar.model.components.mlp import MLP
 from mstar.model.wan22.config import Wan22Config
 
@@ -171,7 +180,7 @@ class Wan22DiTAttention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attn_fn: RaggedAttentionFn | None = None,
+        attend: Callable[..., torch.Tensor] = joint_attention,
     ) -> torch.Tensor:
         kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
         query = self.q_norm(self.q_proj(hidden_states))
@@ -187,8 +196,9 @@ class Wan22DiTAttention(nn.Module):
             key = _apply_rotary_emb(key, *rotary_emb)
 
         # Bidirectional, no mask: SDPA (the reference's dispatch_attention_fn
-        # native path) without a ragged callable, one segment per row with one.
-        out = joint_attention(query, key, value, ragged=attn_fn)
+        # native path) by default; the DiT passes self-attention its ragged and
+        # Ulysses ``attend``.
+        out = attend(query, key, value)
         return self.o_proj(out.flatten(2, 3))
 
 
@@ -249,7 +259,7 @@ class Wan22DiTBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         timestep_proj: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        self_attn_fn: RaggedAttentionFn | None = None,
+        self_attend: Callable[..., torch.Tensor] = joint_attention,
     ) -> torch.Tensor:
         # [1, 1, 6, dim] + [B, seq, 6, dim] -> six [B, seq, dim] fp32 tensors.
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -259,7 +269,7 @@ class Wan22DiTBlock(nn.Module):
         c_shift_msa, c_scale_msa, c_gate_msa = c_shift_msa.squeeze(2), c_scale_msa.squeeze(2), c_gate_msa.squeeze(2)
 
         norm_hidden = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
-        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb, attn_fn=self_attn_fn)
+        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb, attend=self_attend)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         norm_hidden = self.norm2(hidden_states.float()).type_as(hidden_states)
@@ -277,10 +287,21 @@ class Wan22DiT(nn.Module):
     ``weight_loader.build_wan22_dit`` (meta -> ``cast_serving_dtypes`` ->
     ``to_empty(device)`` -> checkpoint load). ``fuse_ffn_gelu`` runs every
     FFN GELU in its GEMM's epilogue (``MLP.gelu_epilogue``), the serving
-    numerics; off, the module is the reference port."""
+    numerics; off, the module is the reference port.
 
-    def __init__(self, config: Wan22Config, fuse_ffn_gelu: bool = False):
+    ``sp_group`` runs it under Ulysses sequence parallelism: each rank keeps a
+    contiguous slice of the post-patchify tokens, self-attention all-to-alls
+    them around the kernel, and the slices are gathered before unpatchify."""
+
+    def __init__(self, config: Wan22Config, fuse_ffn_gelu: bool = False, sp_group: CommGroup | None = None):
         super().__init__()
+        self.sp_group = sp_group or CommGroup.trivial()
+        if config.num_attention_heads % self.sp_group.world_size:
+            # Ulysses gives each rank an equal share of the heads
+            raise ValueError(
+                f"sp_size {self.sp_group.world_size} must divide the dit's "
+                f"{config.num_attention_heads} attention heads"
+            )
         if config.qk_norm != "rms_norm_across_heads" or not config.cross_attn_norm:
             # These two config facts are baked into Wan22DiTAttention /
             # Wan22DiTBlock (across-heads q/k RMSNorm, affine norm2 before
@@ -349,19 +370,30 @@ class Wan22DiT(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        # every per-token tensor is cut to this rank's tokens (a no-op on one rank)
+        sp = self.sp_group
+        seq_sizes = sp_seq_split(hidden_states.shape[1], sp.world_size)
+        hidden_states, timestep, *rotary_emb = (
+            scatter_sequence(sp, x, seq_sizes, dim=1) for x in (hidden_states, timestep, *rotary_emb)
+        )
+        self_attend = functools.partial(
+            ulysses_attention, sp, run_attention=functools.partial(joint_attention, ragged=self_attn_fn),
+            seq_sizes=seq_sizes, seq_dim=1, head_dim=2,
+        )
+
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
             timestep, encoder_hidden_states
         )
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attn_fn)
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attend)
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
         # bf16 temb promotes), then project and unpatchify.
         shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
         shift, scale = shift.squeeze(2), scale.squeeze(2)
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states = gather_sequence(sp, self.proj_out(hidden_states), seq_sizes, dim=1)
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)

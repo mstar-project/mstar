@@ -160,11 +160,12 @@ class Wan22Model(Model):
         ]
 
     def get_default_sharding_config(self) -> ShardingConfig:
-        # CFG-parallel: the dit's two guidance branches split over cfg_size
-        # ranks, which all-gather the noise predictions (see Wan22DitSubmodule).
-        # Signals stay replicated: no shard_dim entries.
+        # The dit's two guidance branches split over cfg_size ranks, which
+        # all-gather the noise predictions (see Wan22DitSubmodule), and its
+        # tokens over sp_size (Ulysses, see Wan22DiT). Signals stay replicated:
+        # no shard_dim entries.
         return ShardingConfig(
-            groups=[], tp_enabled_nodes=set(), shard_dim={},
+            groups=[], tp_enabled_nodes=set(), shard_dim={}, sp_enabled_nodes={"dit"},
             cfg_enabled_nodes={"dit": Wan22DitSubmodule.CFG_BRANCHES},
         )
 
@@ -719,19 +720,21 @@ class Wan22Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, cfg_group=None,
+        autocast_dtype: torch.dtype | None = None, sp_group=None, cfg_group=None,
     ) -> torch.nn.Module | None:
         # ``autocast_dtype`` exists for interface parity only: weights load in the
-        # checkpoint's own dtypes. ``cfg_group`` reaches the dit only.
+        # checkpoint's own dtypes. ``sp_group`` and ``cfg_group`` reach the dit only.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, cfg_group=cfg_group)
+        submodule = self._create_submodule(node_name, device, sp_group=sp_group, cfg_group=cfg_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Wan2.2 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str = "cpu", cfg_group=None) -> NodeSubmodule | None:
+    def _create_submodule(
+        self, node_name: str, device: str = "cpu", sp_group=None, cfg_group=None,
+    ) -> NodeSubmodule | None:
         """Construct one node's submodule from the checkpoint.
 
         The wrapped components load on CPU and the EngineManager moves them; the
@@ -768,7 +771,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
                 # serving numerics, like the compile: the reference gates build with compile_dit off
-                fuse_ffn_gelu=self.config.compile_dit,
+                fuse_ffn_gelu=self.config.compile_dit, sp_group=sp_group,
             )
             return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
