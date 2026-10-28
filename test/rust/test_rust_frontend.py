@@ -1076,9 +1076,12 @@ class _GatedKeyedStub(_KeyedStub):
             self.running.discard(key)
             yield _Chunk("error", b"bad input", {"status": 400})
             return
+        # the first chunk opens the stream (its 200); the request stays in flight until the gate
+        chunks = super()._stream(key)
+        yield await anext(chunks)
         while not self.gate.is_set():
             await asyncio.sleep(0.01)
-        async for chunk in super()._stream(key):
+        async for chunk in chunks:
             yield chunk
 
 
@@ -1125,7 +1128,7 @@ def test_refusals_reach_the_api_server_registry():
         assert call("GET", "/no/such/route") == 404
         assert call("GET", "/generate") == 405
         assert call("POST", "/v1/chat/completions", b"x" * 2**21) == 413
-        assert call("POST", "/v1/chat/completions", b"{not json") == 422
+        assert call("POST", "/v1/chat/completions", b"{not json") == 400
         assert call("POST", "/generate", generate("B", model_kwargs="{"), ctype=form) == 400
         assert call("POST", "/generate", generate("F", text="fail", streaming="false"), ctype=form) == 400
         streams = [open_stream("X")]
@@ -1148,7 +1151,7 @@ def test_refusals_reach_the_api_server_registry():
                 if s.name == "mstar_http_refusals_total" and s.labels["model_name"] == "qwen3_omni"}
     assert refusals == {
         ("/v1/chat/completions", "401"): 1, ("unmatched", "401"): 1, ("unmatched", "404"): 1,
-        ("/generate", "405"): 1, ("/v1/chat/completions", "413"): 1, ("/v1/chat/completions", "422"): 1,
+        ("/generate", "405"): 1, ("/v1/chat/completions", "413"): 1, ("/v1/chat/completions", "400"): 1,
         ("/generate", "400"): 1, ("/generate", "409"): 1, ("/v1/chat/completions", "503"): 1,
     }
     assert stub.n == 3, "a refused request reached the backend"
