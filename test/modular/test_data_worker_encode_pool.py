@@ -77,7 +77,10 @@ class _Comm:
 
 
 @pytest.fixture
-def worker():
+def worker(monkeypatch):
+    # The tests hold one encode on a gate while another finishes, so two
+    # threads whatever the host's CPUs.
+    monkeypatch.setattr("mstar.api_server.data_worker.encode_workers", lambda: 2)
     wt = PreprocessWorkerThread(
         in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
         profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
