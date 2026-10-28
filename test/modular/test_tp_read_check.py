@@ -511,7 +511,7 @@ def _leader(tmp_path, streamed=()):
     w.worker_id = "w0"
     w.parallel_nodes, w.parallel_leader_nodes = {NODE}, {NODE}
     w.is_tp_follower, w.enable_nvtx = False, False
-    w._tp_broadcast_seq = 0
+    w._tp_broadcast_seq, w._tp_followers, w._victims = 0, {}, {}
     w.sent = []
     w.communicator = SimpleNamespace(
         send=lambda dest, msg=None: w.sent.append((dest, decode(encode(msg)))),

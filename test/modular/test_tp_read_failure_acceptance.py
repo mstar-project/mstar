@@ -676,7 +676,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w.parallel_leader_nodes = {NODE} if rank == 0 else set()
     w.is_tp_follower = rank != 0
     w.tp_async_sched, w.tp_async_nodes = False, None
-    w._tp_broadcast_seq = 0
+    w._tp_broadcast_seq, w._tp_followers = 0, {}
     w._tp_nospec = RecentSet(64)
     w._tp_leader_gap_warned = False
     w.scheduler = MicroScheduler(w.engine_manager, parallel_leader_nodes=w.parallel_leader_nodes)

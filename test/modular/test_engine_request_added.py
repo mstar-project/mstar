@@ -39,7 +39,7 @@ def _engine(*submodules):
     log = []
     engine._runner = _Runner(log)
     engine._resources = {}
-    engine._loopback_steps = {}
+    engine._loopback_steps, engine._resident_delta = {}, {}
     engine._submodules = {
         name: SimpleNamespace(submodule=_Submodule(log, name, raises)) for name, raises in submodules
     }
