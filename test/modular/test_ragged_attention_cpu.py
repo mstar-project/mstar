@@ -205,20 +205,25 @@ def test_nodes_sharing_a_resource_must_agree_on_splitting_heads():
         _load_heads("ragged", {"a": True, "b": False})
 
 
-def test_resource_info_built_without_head_shards_shards_over_its_group():
+@pytest.mark.parametrize(("axis", "heads"), [("tp", 2), ("sp", 2), ("cfg", 4)])
+def test_resource_info_built_without_head_shards_shards_over_its_group(axis, heads):
     """Built outside the engine (a reference test, the checkpoint validator),
-    an ``EngineResourceInfo`` over a two-rank group gives one rank's heads."""
+    an ``EngineResourceInfo`` over a two-rank TP or SP group gives one rank's
+    heads; a CFG group's ranks each run whole branches, every head."""
+    from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources import RaggedAttentionConfig, RaggedAttentionSpec
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
+    pair = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+    axes = {f"{a}_group": pair if a == axis else CommGroup.trivial() for a in ("tp", "sp", "cfg")}
     spec = RaggedAttentionSpec(
         resource_key="by_hand", nodes={"encoder"},
         config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=64),
     )
     mgr = build_resource(spec, EngineResourceInfo(
-        device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=SimpleNamespace(world_size=2),
+        device=torch.device("cpu"), kv_dtype=torch.bfloat16, joint_comm_group=JointGroups(instance=pair, **axes),
     ))
-    assert mgr._kwargs["num_qo_heads"] == 2
+    assert mgr._kwargs["num_qo_heads"] == heads
 
 
 def test_a_dropped_manager_leaves_the_op_registry():

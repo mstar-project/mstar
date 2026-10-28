@@ -111,14 +111,16 @@ class EngineManager:
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
-            # Sequence parallelism is opt-in per node; only forward the SP
-            # group when this node actually participates in one, so models
-            # that don't support SP keep their existing get_submodule call.
-            # Likewise ``moe_parallel``, only for a node group's ``ep_config``.
+            # Sequence and CFG parallelism are opt-in per node; only forward
+            # their groups when this node actually participates in one, so
+            # models that support neither keep their existing get_submodule
+            # call. Likewise ``moe_parallel``, only for a node group's
+            # ``ep_config``.
             extra = {}
             joint = parallel_groups.get_joint_group_for_node(name)
-            if joint.sp_group.world_size > 1:
-                extra["sp_group"] = joint.sp_group
+            for key, group in (("sp_group", joint.sp_group), ("cfg_group", joint.cfg_group)):
+                if group.world_size > 1:
+                    extra[key] = group
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(

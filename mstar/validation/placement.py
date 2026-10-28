@@ -1,10 +1,11 @@
 """Placement checks: walks and partitions, ``node_groups``, the worker graphs
 they divide into, and the parallel groups each worker is handed."""
 
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
-from mstar.distributed.base import ShardingConfig
+from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, node_group_axis_sizes
 from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
@@ -46,7 +47,7 @@ def _node_group_entry_problem(i: int, group: Any) -> str | None:
             return f"node_groups[{i}]: {key} must be a list of names; got {names!r}"
     if not all(_is_count(rank, 0) for rank in group["ranks"]):
         return f"node_groups[{i}]: ranks must be integers >= 0; got {group['ranks']!r}"
-    for key in ("tp_size", "sp_size"):
+    for key in (f"{axis}_size" for axis in PARALLEL_AXES):
         if not _is_count(group.get(key, 1), 1):
             return f"node_groups[{i}]: {key} must be an integer >= 1; got {group[key]!r}"
     return None
@@ -104,28 +105,36 @@ def _node_group_shapes(model: Model, node_groups: list[dict]) -> Iterator[str]:
     sharding = model.get_default_sharding_config()
     for i, group in enumerate(node_groups):
         names, ranks = group["node_names"], group["ranks"]
-        tp, sp = group.get("tp_size", 1), group.get("sp_size", 1)
-        if len(ranks) % (tp * sp):
+        sizes = node_group_axis_sizes(group)
+        instance = math.prod(sizes.values())
+        if len(ranks) % instance:
             yield (
                 f"node_groups[{i}] (nodes {names}) has {len(ranks)} ranks; not "
-                f"divisible by tp_size*sp_size ({tp}*{sp}={tp * sp})."
+                f"divisible by its instance size ({sizes}: {instance})."
             )
-        blocks = [ranks[base:base + tp * sp] for base in range(0, len(ranks), tp * sp)]
-        if tp * sp > 1 and any(block != sorted(block) for block in blocks):
+        blocks = [ranks[base:base + instance] for base in range(0, len(ranks), instance)]
+        if instance > 1 and any(block != sorted(block) for block in blocks):
             # torch orders a process group by global rank, the mesh by this
             # list: out of order, a gather would come back in another order
             # than the one each rank split its work by
             yield (
                 f"node_groups[{i}] (nodes {names}) lists its ranks {ranks} out of order; "
-                f"each lockstep instance's {tp * sp} ranks must be ascending."
+                f"each lockstep instance's {instance} ranks must be ascending."
             )
-        for size, axis, enabled in (
-            (tp, "tp", sharding.tp_enabled_nodes), (sp, "sp", sharding.sp_enabled_nodes),
-        ):
+        for axis, size in sizes.items():
+            enabled = getattr(sharding, f"{axis}_enabled_nodes")
             if size > 1 and any(node not in enabled for node in names):
                 yield (
                     f"node_groups[{i}] has {axis}_size {size} and contains nodes not "
                     f"in {axis}_enabled_nodes {sorted(enabled)}: {names}"
+                )
+        cfg = sizes["cfg"]
+        for node in names:
+            branches = sharding.cfg_enabled_nodes.get(node)
+            if cfg > 1 and branches is not None and branches % cfg:
+                yield (
+                    f"node_groups[{i}] has cfg_size {cfg}, which does not divide the "
+                    f"{branches} guidance branches {node!r} runs."
                 )
 
 
@@ -333,7 +342,7 @@ def _worker_parallelism(
 ) -> Iterator[str]:
     """What each worker would check of its own ``WorkerParallelGroups``, on the
     same groups the conductor hands it: at most one lockstep-parallel node per
-    worker, and every resource spec's nodes on one TP x SP shape and, on each
+    worker, and every resource spec's nodes on one parallel shape and, on each
     worker, in one parallel group. Over every node placed on the worker; the
     engine checked only nodes it built a submodule for, so a dummy run (no
     weights) skipped the resource checks."""
@@ -348,8 +357,8 @@ def _worker_parallelism(
     })
     if misplaced:
         yield (
-            f"the deployment uses ranks {ranks}; ranks {misplaced} are in tensor- or "
-            "sequence-parallel groups, which need every lower rank in use too."
+            f"the deployment uses ranks {ranks}; ranks {misplaced} are in parallel "
+            "groups, which need every lower rank in use too."
         )
         return
     worker_ids = [f"worker_{rank}" for rank in ranks]
@@ -386,12 +395,12 @@ def _worker_parallelism(
         if not any_worker.all_have_compatible_parallel_shape(spec.nodes):
             yield (
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
-                "must use the same TP x SP shape across replicas"
+                "must use the same parallel shape across replicas"
             )
         for wid, nodes in deployed.items():
             local = spec.nodes & nodes
             if local and not per_worker[wid].all_in_same_group(sorted(local)):
                 yield (
                     f"Resource spec {spec.resource_key} local nodes {sorted(local)} "
-                    f"on {wid} must all be in the same parallel (tp x sp) group"
+                    f"on {wid} must all be in the same parallel group"
                 )

@@ -59,9 +59,9 @@ class EngineResourceInfo:
     device: torch.device
     joint_comm_group: JointGroups | None = None
     # how many ways the node's ranks split its attention heads; each builder
-    # sizes head counts by it. None means every rank of ``joint_comm_group``
-    # (1 without one); the engine passes the node's own count
-    # (``NodeSubmodule.splits_heads``).
+    # sizes head counts by it. None means its TP and SP ranks (1 without a
+    # ``joint_comm_group``): CFG ranks never split heads. The engine passes
+    # the node's own count (``NodeSubmodule.splits_heads``).
     head_shards: int | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16
@@ -80,7 +80,9 @@ class EngineResourceInfo:
     def __post_init__(self):
         if self.head_shards is None:
             group = self.joint_comm_group
-            object.__setattr__(self, "head_shards", 1 if group is None else group.world_size)
+            object.__setattr__(
+                self, "head_shards", 1 if group is None else group.tp_group.world_size * group.sp_group.world_size,
+            )
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)

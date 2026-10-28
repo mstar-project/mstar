@@ -170,13 +170,14 @@ You must implement these abstract methods:
    Encode a finished output tensor to bytes for the client: ``utf-8`` for text, PNG for
    images, raw PCM for audio, and so on.
 
-``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
+``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None, cfg_group=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
    weights here, on ``device``. Return ``None`` for dummy mode.
 
    ``tp_group`` and ``sp_group`` are the node's tensor-parallel and sequence-parallel
    communicators when the node is sharded. Pass ``tp_group`` to the parallel-linear
-   constructors. See :ref:`Step 6 <tensor-parallelism>`.
+   constructors. See :ref:`Step 6 <tensor-parallelism>`. ``cfg_group`` is passed only to a
+   node whose group sets ``cfg_size > 1``; see `Guidance (CFG) parallelism`_.
 
    ``moe_parallel`` is the node group's ``ep_config``, parsed into a
    ``MoeParallelConfig``. It is passed only to an EP-enabled node whose group sets one,
@@ -1857,6 +1858,35 @@ Two separate mechanisms split work across the TP group. Keep them distinct:
 If a node group has ``tp_size > 1`` and names a node that is not in ``tp_enabled_nodes``,
 loading fails. See ``configs/qwen3omni_thinker_tp2.yaml`` for an example with several node
 types.
+
+.. _Guidance (CFG) parallelism:
+
+Guidance (CFG) parallelism
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A diffusion node that runs its classifier-free-guidance branches as one batch can split
+them over a node group's ``cfg_size`` ranks, a mesh axis of its own beside ``tp_size``
+and ``sp_size`` (see :doc:`serving`). Declare the node and the most branches it runs in
+``cfg_enabled_nodes``; placement refuses a ``cfg_size`` that doesn't divide that count:
+
+.. code-block:: python
+
+   def get_default_sharding_config(self):
+       return ShardingConfig(
+           groups=[], tp_enabled_nodes=set(), shard_dim={},
+           cfg_enabled_nodes={"dit": 2},
+       )
+
+The submodule receives ``cfg_group`` from ``get_submodule``, takes its rows of the branch
+batch with ``my_rows(cfg_group, branches)``
+(``mstar/model/components/distributed/sequence_parallel.py``), and after the forward
+reassembles them with ``cfg_group.all_gather(out, dim=0)``. Every rank then runs the same
+guidance combine and solver step on replicated latents. CFG ranks keep every attention
+head; only TP and SP ranks split them. The ranks run in lockstep on the same requests, so
+any per-request resource the node declares must stay the same shape on every rank, and a
+node with ``cfg_size > 1`` can't hold a paged KV cache (the engine refuses one at
+start-up): branches that hold different KV (BAGEL's text and image branches) are separate
+graph walks on separate node groups instead. ``Wan22DitSubmodule`` is the reference.
 
 .. _Expert parallelism (MoE):
 

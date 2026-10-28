@@ -552,23 +552,22 @@ class Worker:
             node_to_partition=node_to_partition,
         )
 
-        # The lockstep unit for a node is its whole instance: the tensor-parallel
-        # row composed with the sequence-parallel column. Exactly one rank per
-        # instance — instance rank 0, i.e. rank 0 in BOTH its TP and SP comm
-        # groups — leads scheduling and broadcasts ScheduleTPNode to the rest;
-        # every other instance rank follows. Keying the leader off the TP rank
-        # alone would elect one leader per TP row (e.g. ranks 0 and 2 of a
-        # tp2*sp2 instance), racing the followers and desyncing the per-step
-        # graph walk.
+        # The lockstep unit for a node is its whole instance, every parallel
+        # axis at once. Exactly one rank per instance — instance rank 0 —
+        # leads scheduling and broadcasts ScheduleTPNode to the rest; every
+        # other instance rank follows. Keying the leader off one axis's rank
+        # alone would elect one leader per row of the others (e.g. ranks 0 and
+        # 2 of a tp2*sp2 instance), racing the followers and desyncing the
+        # per-step graph walk.
         self.parallel_leader_nodes = set([
             node for node in node_names
             if self.parallel_groups.get_instance_rank_for_node(node) == 0
         ])
 
         # A node is lockstep-scheduled when its instance spans more than one rank,
-        # i.e. tp_size * sp_size > 1. Pure sequence-parallel nodes (tp_size 1,
-        # sp_size > 1) count too: their attention all-to-all requires the whole
-        # instance to step together. v1 allows at most one per worker, which
+        # on any axis. Pure sequence- or CFG-parallel nodes (tp_size 1) count
+        # too: their all-to-alls and gathers require the whole instance to step
+        # together. v1 allows at most one per worker, which
         # validate_deployment checks in the conductor.
         self.parallel_nodes = set([
             node for node in node_names

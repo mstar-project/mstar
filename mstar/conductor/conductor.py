@@ -533,7 +533,7 @@ class Conductor:
         }
 
         # Set up worker graph TP ranks; validate_deployment checked each worker
-        # graph belongs to one sharding group of its tp_size.
+        # graph belongs to one sharding group of its instance size.
         self.streaming_consumers = set()
         self.node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
 
@@ -582,7 +582,7 @@ class Conductor:
                         continue
                     wg = self.node_walk_to_wg[(node, walk)]
                     # The instance rank is the worker's index within the
-                    # lockstep instance (0..tp*sp-1), used by the
+                    # lockstep instance (0..instance size - 1), used by the
                     # replicated-signal fanout (so exactly one rank — index 0
                     # — forwards a replicated tensor to a downstream node).
                     for ranks in wg._instance_ranks:
@@ -957,10 +957,10 @@ class Conductor:
         """
         result = {}
         for wg_id, wg in self.worker_graphs.items():
-            # Route to a whole instance (the lockstep unit): every rank of a
-            # tp*sp instance runs the request together, so its TP all-reduce
-            # and SP all-to-all collectives stay in sync. Picking a single TP
-            # row here would desync the SP all-to-all across rows.
+            # Route to a whole instance (the lockstep unit): every rank of an
+            # instance runs the request together, so the collectives of each
+            # of its axes stay in sync. Picking a single TP row here would
+            # desync the SP all-to-all across rows.
             result[wg_id] = [f"worker_{r}" for r in wg.replica_ranks[replicas[wg._group_id]]]
         return result
 

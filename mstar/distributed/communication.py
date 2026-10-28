@@ -353,6 +353,7 @@ class JointGroups:
     tp_group: CommGroup
     sp_group: CommGroup
     instance: CommGroup
+    cfg_group: CommGroup = field(default_factory=CommGroup.trivial)
 
     @property
     def rank(self):
@@ -378,16 +379,16 @@ class JointGroups:
 class WorkerParallelGroups:
     """Per-worker view of the parallelism comm groups in the run.
 
-    Tensor parallelism and sequence parallelism are orthogonal axes of the
-    same device mesh, so a node may carry one comm group of each. The
-    combined TP x SP block is the node's lockstep *instance* — the unit the
-    conductor routes a request to — exposed via
-    ``get_instance_rank_for_node`` / ``get_instance_world_size_for_node``.
+    The parallel axes (``PARALLEL_AXES``) are orthogonal axes of one device
+    mesh, so a node may carry one comm group of each. The whole block is the
+    node's lockstep *instance* — the unit the conductor routes a request to —
+    exposed via ``get_instance_rank_for_node`` /
+    ``get_instance_world_size_for_node``.
     """
 
     num_workers: int
     global_rank: int
-    # True iff any worker in the run uses TP or SP. Set by
+    # True iff any worker in the run has a parallel axis. Set by
     # GlobalParallelConfig from the global worker-graph view so all ranks
     # agree.
     any_parallelism: bool = False
@@ -446,7 +447,7 @@ class WorkerParallelGroups:
         """Initialize the NCCL world group and per-node parallel subgroups.
 
         Every worker calls ``dist.init_process_group`` when *any* worker
-        in the run participates in TP or SP (``self.any_parallelism``) —
+        in the run has a parallel axis (``self.any_parallelism``) —
         otherwise ranks with no local parallelism would skip the call and
         the participating ranks would hang waiting for them.
 

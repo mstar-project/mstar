@@ -16,7 +16,13 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.distributed.base import PARALLEL_AXES, ShardingConfig, ShardingGroup, mesh_groups
+from mstar.distributed.base import (
+    PARALLEL_AXES,
+    ShardingConfig,
+    ShardingGroup,
+    mesh_groups,
+    node_group_axis_sizes,
+)
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.sampler.utils import SamplingConfig
@@ -196,13 +202,15 @@ class WorkerGraph:
     ranks: list[int] = field(default_factory=list)
     tp_size: int = 1
     sp_size: int = 1
+    cfg_size: int = 1
 
     # ``ranks`` tile into lockstep instances (instances tile for data
     # parallelism), each a row-major mesh over ``PARALLEL_AXES``.
     # ``_axis_ranks`` holds each axis's comm groups (tp: sharded heads and
-    # weights, all-reduce; sp: Ulysses all-to-all); ``_instance_ranks`` are the
-    # whole instances (the conductor's lockstep routing unit — every rank of an
-    # instance runs a request together).
+    # weights, all-reduce; sp: Ulysses all-to-all; cfg: one share of the
+    # guidance branches each); ``_instance_ranks`` are the whole instances
+    # (the conductor's lockstep routing unit — every rank of an instance runs
+    # a request together).
     _axis_ranks: dict[str, list[list[int]]] = field(default_factory=dict)
     _instance_ranks: list[list[int]] = field(default_factory=list)
     _group_id: int = field(default=-1)  # original index into config's node_groups
@@ -282,8 +290,7 @@ def _divide_into_worker_graphs(
                 consumes_stream=graph.consumes_stream,
                 _group_id=group_idx,
                 ranks=ng["ranks"],
-                tp_size=ng.get("tp_size", 1),
-                sp_size=ng.get("sp_size", 1),
+                **{f"{axis}_size": size for axis, size in node_group_axis_sizes(ng).items()},
             )
         ]
 
@@ -528,16 +535,13 @@ class Model(ABC):
                     f"Node group with ep_config contains nodes not in "
                     f"ep_enabled_nodes {sharding_config.ep_enabled_nodes}: {ng['node_names']}"
                 )
-            tp = ng.get("tp_size", 1)
-            sp = ng.get("sp_size", 1)
-            instance_size = tp * sp
+            instance_size = math.prod(node_group_axis_sizes(ng).values())
             if instance_size <= 1:
                 continue
-            # The sharding group is the lockstep unit — tp*sp workers routed
-            # together. TP shards weights via shard_dim-driven fanout; SP is
-            # in-module (replicated signals, no shard_dim) but its ranks must
-            # still run each request together, so the group spans the whole
-            # instance.
+            # The sharding group is the lockstep unit — the whole instance's
+            # workers, routed together. TP shards weights via shard_dim-driven
+            # fanout; SP and CFG are in-module (replicated signals, no
+            # shard_dim) but their ranks must still run each request together.
             groups.append(ShardingGroup(
                 nodes=set(ng["node_names"]),
                 tp_size=instance_size,
@@ -796,7 +800,7 @@ class Model(ABC):
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
-        moe_parallel: "MoeParallelConfig | None" = None,
+        moe_parallel: "MoeParallelConfig | None" = None, cfg_group=None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
 
@@ -811,6 +815,12 @@ class Model(ABC):
         participates in a non-trivial SP group, so models without SP support
         never receive it. Models that support SP forward it to their
         attention so it can all-to-all the sequence around the kernel.
+
+        ``cfg_group`` is the node's classifier-free-guidance comm group, for
+        a node in ``cfg_enabled_nodes`` whose group sets ``cfg_size > 1``
+        (passed only then): each rank runs its ``my_rows(cfg_group,
+        branches)`` share of the branches and ``cfg_group.all_gather``
+        reassembles them. Nothing else about the node changes.
 
         ``moe_parallel`` is the node group's ``ep_config``: TP or EP for the
         node's routed experts. Passed only for a node in ``ep_enabled_nodes``

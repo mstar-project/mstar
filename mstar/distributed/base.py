@@ -5,10 +5,17 @@ from dataclasses import dataclass, field
 
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
 
-# The mesh axes of a node's lockstep instance, outermost first. An instance's
-# ranks are row-major over them, so the innermost axis, whose collectives run
-# most often, spans adjacent ranks.
-PARALLEL_AXES = ("sp", "tp")
+# The mesh axes of a node's lockstep instance, outermost first, each set by a
+# node group's ``<axis>_size``: cfg splits classifier-free-guidance branches,
+# sp the sequence (Ulysses), tp the weights and heads. An instance's ranks are
+# row-major over them, so the innermost axis, whose collectives run most
+# often, spans adjacent ranks.
+PARALLEL_AXES = ("cfg", "sp", "tp")
+
+
+def node_group_axis_sizes(node_group: Mapping) -> dict[str, int]:
+    """A ``node_groups`` entry's size on every mesh axis (1 when unset)."""
+    return {axis: node_group.get(f"{axis}_size", 1) for axis in PARALLEL_AXES}
 
 
 def mesh_groups(block: Sequence[int], sizes: Mapping[str, int]) -> dict[str, list[list[int]]]:
@@ -83,11 +90,16 @@ class ShardingConfig:
     # activations in-module (an all-to-all around attention) rather than
     # weights, so it adds no shard_dim entries — signals stay replicated
     # across the instance — but it does widen the node's ShardingGroup: the
-    # group is the lockstep unit, spanning the whole tp*sp instance. This
-    # set itself only gates config validation.
+    # group is the lockstep unit, spanning the whole instance. This set
+    # itself only gates config validation.
     sp_enabled_nodes: set[str] = field(default_factory=set)
     # Nodes whose routed experts honour a node group's ``ep_config``; gates validation.
     ep_enabled_nodes: set[str] = field(default_factory=set)
+    # Nodes that split their classifier-free-guidance branches over a node
+    # group's ``cfg_size`` ranks, each to the most branches it runs (which
+    # cfg_size must divide). Like SP: no shard_dim entries, the whole
+    # instance one ShardingGroup. Gates validation only.
+    cfg_enabled_nodes: dict[str, int] = field(default_factory=dict)
 
     def clone_empty(self):
         return ShardingConfig(
@@ -96,6 +108,7 @@ class ShardingConfig:
             shard_dim=self.shard_dim,
             sp_enabled_nodes=self.sp_enabled_nodes,
             ep_enabled_nodes=self.ep_enabled_nodes,
+            cfg_enabled_nodes=self.cfg_enabled_nodes,
         )
 
     def get_sharding_group(
@@ -109,6 +122,7 @@ class ShardingConfig:
         self.tp_enabled_nodes = set(self.tp_enabled_nodes)
         self.sp_enabled_nodes = set(self.sp_enabled_nodes)
         self.ep_enabled_nodes = set(self.ep_enabled_nodes)
+        self.cfg_enabled_nodes = dict(self.cfg_enabled_nodes)
         self._setup_done = False
 
     def assert_stream_consumer_compatibility(self, streaming_consumers: set[str]):

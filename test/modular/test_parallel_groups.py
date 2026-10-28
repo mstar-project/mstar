@@ -168,17 +168,20 @@ def test_global_config_exposes_remote_replica_shapes_to_every_worker():
     )
 
 
-@pytest.mark.parametrize(("sizes", "groups"), [
-    ({"tp_size": 2}, [(0, 1), (2, 3)]),
-    ({"tp_size": 2, "sp_size": 2}, [(0, 1), (0, 2), (1, 3), (2, 3)]),
+@pytest.mark.parametrize(("sizes", "groups", "rank_1"), [
+    ({"tp_size": 2}, [(0, 1), (2, 3)], {"tp": [0, 1]}),
+    ({"tp_size": 2, "sp_size": 2}, [(0, 1), (0, 2), (1, 3), (2, 3)], {"tp": [0, 1], "sp": [1, 3]}),
+    # cfg is outermost: [cfg][sp][tp]
+    ({"cfg_size": 2, "sp_size": 2}, [(0, 1), (0, 2), (1, 3), (2, 3)], {"sp": [0, 1], "cfg": [1, 3]}),
+    ({"cfg_size": 2, "tp_size": 2}, [(0, 1), (0, 2), (1, 3), (2, 3)], {"tp": [0, 1], "cfg": [1, 3]}),
 ])
-def test_every_rank_of_an_instance_holds_the_whole_instance_as_one_group(sizes, groups):
+def test_every_rank_of_an_instance_holds_the_whole_instance_as_one_group(sizes, groups, rank_1):
     """Every agreement site (barriers, capture votes, the KV symmetry check,
     the read-check vote) runs one host-side collective on
-    ``JointGroups.instance``, so it must span every axis, and rank it in the
-    order the conductor and the leader election use: the instance's ranks as
-    listed. The instance is not one of the world's device groups: it takes
-    no NCCL communicator."""
+    ``JointGroups.instance``, so it must span every axis, cfg included, and
+    rank it in the order the conductor and the leader election use: the
+    instance's ranks as listed. The instance is not one of the world's device
+    groups: it takes no NCCL communicator."""
     wg = WorkerGraph(
         section=SimpleNamespace(get_nodes=lambda: {"dit": None}),
         graph_walks=set(), ranks=[0, 1, 2, 3], **sizes,
@@ -192,6 +195,9 @@ def test_every_rank_of_an_instance_holds_the_whole_instance_as_one_group(sizes, 
         assert joint.instance.group_members == block
         assert joint.rank == block.index(rank)
         assert view.world_parallel_groups == groups
+    joint = config.per_worker_config["worker-1"].get_joint_group_for_node("dit")
+    for axis in ("cfg", "sp", "tp"):
+        assert getattr(joint, f"{axis}_group").group_members == rank_1.get(axis, [1])
 
 
 def test_a_lockstep_instance_refuses_a_device_collective():

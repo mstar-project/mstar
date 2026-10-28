@@ -262,7 +262,8 @@ def test_every_rank_takes_out_the_rows_any_rank_could_not_read(sizes):
         assert rest == [[10, 12], [11, 13]], (rank, rest)
 
 
-@pytest.mark.parametrize("sizes", [{"tp_size": 2, "sp_size": 2}], ids=["tp2sp2"])
+@pytest.mark.parametrize("sizes", [{"tp_size": 2, "sp_size": 2}, {"cfg_size": 2, "sp_size": 2}],
+                         ids=["tp2sp2", "cfg2sp2"])
 def test_a_joint_broadcast_reaches_every_rank_from_instance_rank_0(sizes):
     """Each rank starts with its own tensor, and ends with instance rank 0's:
     one broadcast per axis carries it to ranks that share no axis group with

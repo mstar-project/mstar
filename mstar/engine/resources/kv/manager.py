@@ -640,6 +640,15 @@ class KVManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
+        group = info.joint_comm_group
+        if group is not None and group.cfg_group.world_size > 1:
+            # its rank math (prefix publishing, transfer slices) takes every
+            # instance rank for a head shard, which a CFG rank isn't
+            raise ValueError(
+                f"KV {spec.resource_key}: a node with cfg_size > 1 can't hold a paged KV "
+                "cache, since its CFG ranks run different branches. Give such a node its "
+                "branches as graph walks on separate node groups, as BAGEL does."
+            )
         # before the cache is allocated: it is sized off the head counts
         spec.config.shard(info.head_shards)
         return cls(

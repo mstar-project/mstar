@@ -239,8 +239,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - Maximum sequence length (sizes the KV cache).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
-       ``ep_config`` block picks TP or EP for the group's MoE experts.
+       scoped to specific ``graph_walks`` and/or parallelized with ``tp_size``,
+       ``sp_size`` and ``cfg_size``. An ``ep_config`` block picks TP or EP for the
+       group's MoE experts.
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -321,7 +322,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        Unset keeps PyTorch's default throughout. Raise it only where weight load,
        JIT or CUDA-graph capture can exceed that default.
    * - ``tp_allreduce``
-     - *(optional)* Small-message all-reduce path of every TP and SP group:
+     - *(optional)* Small-message all-reduce path of every TP, SP and CFG group:
        ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
        any other value fails at startup. ``flashinfer`` sends 2-D bf16 CUDA messages
        up to ``tp_allreduce_max_kb`` through FlashInfer's one-kernel all-reduce.
@@ -475,6 +476,25 @@ A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1
 weight loaders then shard parameters automatically, with no model-code changes. See
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
+
+**Sequence and guidance parallelism.** ``sp_size`` splits a node's token sequence over
+that many ranks (Ulysses: an all-to-all around attention), and ``cfg_size`` splits its
+classifier-free-guidance branches, each rank running its share of them and the noise
+predictions gathered every step. Each needs the model to declare the node SP- or
+CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for Wan2.2).
+The axes compose: a group's ``ranks`` form lockstep instances of
+``cfg_size * sp_size * tp_size`` ranks, laid out ``[cfg][sp][tp]`` (TP on adjacent ranks),
+each instance's ranks listed in ascending order, and the conductor routes each request to
+one whole instance:
+
+.. code-block:: yaml
+
+   model: "wan22"
+   max_seq_len: 512
+   node_groups:
+     - {node_names: [text_encoder, vae_encoder, vae_decoder], ranks: [0]}
+     # one guidance branch per rank
+     - {node_names: [dit], ranks: [0, 1], cfg_size: 2}
 
 **Expert parallelism.** By default a TP group shards every MoE expert along its
 intermediate dimension. An ``ep_config`` block on the node group instead gives each rank

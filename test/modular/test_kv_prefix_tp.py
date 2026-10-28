@@ -298,6 +298,21 @@ def test_host_offload_or_a_pool_on_more_than_one_tp_group_is_refused_at_load(mon
         _manager(0, shared=True)
 
 
+def test_a_pool_on_a_cfg_parallel_node_is_refused_at_build():
+    """Its rank math takes every instance rank for a head shard; a CFG rank
+    runs another branch on every head."""
+    from mstar.distributed.communication import CommGroup, JointGroups
+    from mstar.engine.resources.base import EngineResourceInfo
+
+    pair = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+    joint = JointGroups(CommGroup.trivial(), CommGroup.trivial(), instance=pair, cfg_group=pair)
+    spec = KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=4, page_size=PAGE_SIZE,
+    ))
+    with pytest.raises(ValueError, match="cfg_size"):
+        KVManager.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
+
+
 def _diverged() -> tuple[KVManager, KVManager]:
     ranks = leader, follower = _manager(0), _manager(1)
     x, y = _tokens(3 * PAGE_SIZE, seed=16), _tokens(2 * PAGE_SIZE, seed=17)
