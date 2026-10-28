@@ -661,12 +661,8 @@ def _to_float_list(raw, target_dim: int) -> list[float]:
 
 
 def _task_strings(tasks_df) -> dict[int, str]:
-    """task_index -> instruction from a lerobot meta/tasks.parquet.
-
-    lerobot v3.0 (droid_100) keeps the strings in the index; older exports have a "task" column.
-    """
-    texts = tasks_df["task"] if "task" in tasks_df.columns else tasks_df.index.to_series()
-    return dict(zip(tasks_df["task_index"].astype(int), texts.astype(str), strict=False))
+    """task_index -> instruction from a lerobot v3.0 meta/tasks.parquet, which keeps the strings in the index."""
+    return dict(zip(tasks_df["task_index"].astype(int), tasks_df.index.astype(str), strict=False))
 
 
 def _decode_frames_to_png_and_video(
