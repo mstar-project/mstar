@@ -1172,6 +1172,24 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">wg_state_registry</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span></div>
 
 
+<div class="viewcode-block" id="WorkerGraphIO.is_idle">
+<a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.is_idle">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_idle</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""No node holds an input or is in flight, and no loop is mid-run:</span>
+<span class="sd">        the state a pass leaves behind once the graph completes and resets."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">wg_state_registry</span><span class="o">.</span><span class="n">_num_completed_entities</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">_in_flight</span> <span class="ow">or</span> <span class="n">node</span><span class="o">.</span><span class="n">ready_signals</span><span class="o">.</span><span class="n">ready_names</span>
+                    <span class="ow">or</span> <span class="n">node</span><span class="o">.</span><span class="n">ready_next_iter</span><span class="o">.</span><span class="n">ready_names</span>
+                    <span class="ow">or</span> <span class="n">node</span><span class="o">.</span><span class="n">speculative_signals</span><span class="o">.</span><span class="n">ready_names</span><span class="p">):</span>
+                <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">return</span> <span class="nb">all</span><span class="p">(</span>
+            <span class="n">loop</span><span class="o">.</span><span class="n">curr_iter</span> <span class="o">==</span> <span class="mi">0</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">loop</span><span class="o">.</span><span class="n">_ingested_external_inputs</span>
+            <span class="k">for</span> <span class="n">loop</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">loops</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+        <span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="WorkerGraphIO.register_communication_info">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.register_communication_info">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_communication_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">communication_manager</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>

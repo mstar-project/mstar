@@ -671,6 +671,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.continue_after_producer_done"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.continue_after_producer_done()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.continues_in"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.continues_in()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.next_chunk_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.prime"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.prime()</span></code></a></li>
@@ -680,6 +681,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.continue_after_producer_done"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.continue_after_producer_done()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.continues_in"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.continues_in()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.next_chunk_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.window_size()</span></code></a></li>
@@ -776,6 +778,21 @@ by its own model logic, not by the StreamBuffer.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.ChunkPolicy.continues_in">
+<span class="sig-name descname"><span class="pre">continues_in</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">consumer_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#ChunkPolicy.continues_in"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.ChunkPolicy.continues_in" title="Link to this definition">#</a></dt>
+<dd><p>Whether empty chunks keep coming, after the producer is done, while
+the consumer is in <code class="docutils literal notranslate"><span class="pre">consumer_walk</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>consumer_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.streaming.chunk_policy.ChunkPolicy.is_ready">
 <span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">is_ready</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">buffer_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#ChunkPolicy.is_ready"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.ChunkPolicy.is_ready" title="Link to this definition">#</a></dt>
 <dd><p>Return True if the buffer has enough items for a chunk.</p>
@@ -859,8 +876,10 @@ the buffer retains older items so the chunk contains the full window.</p>
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>chunk_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of items per chunk.</p></li>
-<li><p><strong>continue_after_done</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>) – if True, keep producing empty chunks after
-the producer finishes and all buffered items are consumed.</p></li>
+<li><p><strong>continue_after_done</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>) – if True, keep producing empty chunks after
+the producer finishes and all buffered items are consumed. A set
+of consumer walks does so only while the consumer is in one of
+them; in its other walks the stream just waits.</p></li>
 </ul>
 </dd>
 </dl>
@@ -880,6 +899,21 @@ by its own model logic, not by the StreamBuffer.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.FixedChunkPolicy.continues_in">
+<span class="sig-name descname"><span class="pre">continues_in</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">consumer_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#FixedChunkPolicy.continues_in"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.continues_in" title="Link to this definition">#</a></dt>
+<dd><p>Whether empty chunks keep coming, after the producer is done, while
+the consumer is in <code class="docutils literal notranslate"><span class="pre">consumer_walk</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>consumer_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1318,6 +1352,7 @@ the buffer retains older items so the chunk contains the full window.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.continue_after_producer_done"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.continue_after_producer_done()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.continues_in"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.continues_in()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.next_chunk_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.prime"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.prime()</span></code></a></li>
@@ -1327,6 +1362,7 @@ the buffer retains older items so the chunk contains the full window.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.continue_after_producer_done"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.continue_after_producer_done()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.continues_in"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.continues_in()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.next_chunk_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.FixedChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy.window_size()</span></code></a></li>

@@ -2873,6 +2873,30 @@ such a consumer sharing its worker graph with another top-level node or <code cl
 stream-consuming walk split over worker graphs, unless every consumer also waits on a
 non-streamed input and all the walk’s worker graphs run on the same workers. That input
 must arrive once per pass (from the conductor, say); startup cannot check this.</p>
+<p>A consumer whose walk should follow the producer’s progress, rather than a count fixed at
+ingest, is <em>producer-triggered</em>: the producer decides the consumer’s walk. Set the same
+<code class="docutils literal notranslate"><span class="pre">consumer_walk</span></code> function on every connection into the consumer, all from one producer
+partition. The producer worker calls it for each row of a pass that emits on those edges,
+with a <code class="docutils literal notranslate"><span class="pre">ProducerWalkCtx</span></code>: the walk that row ran (its own, even in a step that mixed
+walks), the node that just completed, the iteration each enclosing dynamic loop is on,
+and the producer’s full <code class="docutils literal notranslate"><span class="pre">CurrentForwardPassInfo</span></code> (<code class="docutils literal notranslate"><span class="pre">step_metadata</span></code> and all; the hook
+runs on the producer). The row’s streamed items run under the walk it returns. The
+context is reused across calls, so a hook must not keep it.</p>
+<ul class="simple">
+<li><p>Each streamed item carries its assigned walk, and a chunk never spans two walks, so
+these connections need a <code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy</span></code>. A client stream cannot set
+<code class="docutils literal notranslate"><span class="pre">consumer_walk</span></code>.</p></li>
+<li><p>The consumer’s worker switches walk before popping a chunk, and only once the partition
+has no pass under way. The conductor learns each pass’s walk from the worker’s
+<code class="docutils literal notranslate"><span class="pre">WORKER_GRAPHS_DONE</span></code>.</p></li>
+<li><p>A walk the consumer enters on its own, with conductor inputs, takes effect when they
+arrive, so send them only once the stream has moved the consumer through the walk
+before it.</p></li>
+</ul>
+<p>Qwen3-Omni’s Talker (<code class="docutils literal notranslate"><span class="pre">_talker_walk</span></code>) is the reference: Thinker prefill passes run
+<code class="docutils literal notranslate"><span class="pre">talker_prefill</span></code>, the first decode iteration runs <code class="docutils literal notranslate"><span class="pre">talker_last_prefill</span></code>, and later
+ones run <code class="docutils literal notranslate"><span class="pre">talker_decode</span></code>; the conductor feeds <code class="docutils literal notranslate"><span class="pre">talker_decode</span></code> its first input once
+<code class="docutils literal notranslate"><span class="pre">talker_last_prefill</span></code> has run.</p>
 <section id="streams-from-the-client">
 <h3>Streams from the client<a class="headerlink" href="#streams-from-the-client" title="Link to this heading">#</a></h3>
 <p>A model that listens while it runs (a full-duplex speech model, say) takes its live input

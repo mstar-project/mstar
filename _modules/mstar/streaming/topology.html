@@ -964,8 +964,9 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.chunk_policy</span><span class="w"> </span><span class="kn">import</span> <span class="n">ChunkPolicy</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.chunk_policy</span><span class="w"> </span><span class="kn">import</span> <span class="n">ChunkPolicy</span><span class="p">,</span> <span class="n">FixedChunkPolicy</span>
 
 
 <div class="viewcode-block" id="StreamingGraphEdge">
@@ -1011,6 +1012,27 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="ProducerWalkCtx">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.ProducerWalkCtx">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ProducerWalkCtx</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The producer's state for one pass that emits on a walk-driving edge.</span>
+
+<span class="sd">    The producer worker refills one instance for every call, since the hook</span>
+<span class="sd">    runs per request on every emitting step: valid only during the call.</span>
+<span class="sd">    """</span>
+    <span class="n">producer_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
+    <span class="c1"># The node whose completed pass emitted the items</span>
+    <span class="n">node</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
+    <span class="c1"># Dynamic loop name -&gt; the iteration this pass ran, for the loops it is in;</span>
+    <span class="c1"># the graph's own count, so every node and worker of the producer agrees</span>
+    <span class="n">loop_iters</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># The producer's forward-pass info for this pass (step_metadata and all);</span>
+    <span class="c1"># the hook runs on the producer, so nothing here crosses the wire</span>
+    <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+
 <div class="viewcode-block" id="Connection">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.Connection">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1022,7 +1044,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">to_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">edge_name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">chunk_policy_factory</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[],</span> <span class="n">ChunkPolicy</span><span class="p">]</span>
-    <span class="n">limits</span><span class="p">:</span> <span class="n">ClientStreamLimits</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+    <span class="n">limits</span><span class="p">:</span> <span class="n">ClientStreamLimits</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Set on the connections into a producer-triggered partition. The</span>
+    <span class="c1"># producer worker calls it for each pass that emits on the edge, and the</span>
+    <span class="c1"># pass's items run under the consumer walk it returns: the producer, which</span>
+    <span class="c1"># owns the consumer's walk, decides it, and the consumer only applies it.</span>
+    <span class="n">consumer_walk</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">ProducerWalkCtx</span><span class="p">],</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -1046,12 +1073,66 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"the client only produces streams; </span><span class="si">{</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2"> flows into it"</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">conn</span><span class="o">.</span><span class="n">limits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">conn</span><span class="o">.</span><span class="n">from_partition</span> <span class="o">!=</span> <span class="n">CLIENT</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2"> has limits but is not a client stream"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">conn</span><span class="o">.</span><span class="n">consumer_walk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">conn</span><span class="o">.</span><span class="n">from_partition</span> <span class="o">==</span> <span class="n">CLIENT</span><span class="p">:</span>
+                <span class="c1"># the hook runs on the producer worker, and the client has none</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"client stream </span><span class="si">{</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2"> cannot drive its consumer's walk"</span><span class="p">)</span>
 
 <div class="viewcode-block" id="PartitionTopology.client_connections">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology.client_connections">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">client_connections</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Connection</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""The streams the client feeds."""</span>
         <span class="k">return</span> <span class="p">[</span><span class="n">conn</span> <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">connections</span> <span class="k">if</span> <span class="n">conn</span><span class="o">.</span><span class="n">from_partition</span> <span class="o">==</span> <span class="n">CLIENT</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="PartitionTopology.producer_triggered_partitions">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology.producer_triggered_partitions">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">producer_triggered_partitions</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Partitions whose graph walk the stream drives, not the conductor."""</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span> <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">connections</span>
+            <span class="k">if</span> <span class="n">conn</span><span class="o">.</span><span class="n">consumer_walk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="PartitionTopology.walk_drivers">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology.walk_drivers">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">walk_drivers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Connection</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Producer-triggered partition -&gt; the connection whose consumer_walk</span>
+<span class="sd">        decides its walk (any one of them; check_walk_driving_connections</span>
+<span class="sd">        makes them agree)."""</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span><span class="p">:</span> <span class="n">conn</span> <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">connections</span>
+            <span class="k">if</span> <span class="n">conn</span><span class="o">.</span><span class="n">consumer_walk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="PartitionTopology.check_walk_driving_connections">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology.check_walk_driving_connections">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_walk_driving_connections</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A producer-triggered partition has one authority over its walk: all</span>
+<span class="sd">        its incoming connections come from one producer and share one</span>
+<span class="sd">        consumer_walk, so every edge's items agree on the walk. Its chunks</span>
+<span class="sd">        must not overlap either, since a chunk runs under exactly one walk."""</span>
+        <span class="n">drivers</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">walk_drivers</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">connections</span><span class="p">:</span>
+            <span class="n">driver</span> <span class="o">=</span> <span class="n">drivers</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">driver</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">conn</span><span class="o">.</span><span class="n">from_partition</span> <span class="o">!=</span> <span class="n">driver</span><span class="o">.</span><span class="n">from_partition</span>
+                    <span class="ow">or</span> <span class="n">conn</span><span class="o">.</span><span class="n">consumer_walk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">driver</span><span class="o">.</span><span class="n">consumer_walk</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"Partition </span><span class="si">{</span><span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span><span class="si">!r}</span><span class="s2"> is producer-triggered, "</span>
+                    <span class="sa">f</span><span class="s2">"so its incoming edge </span><span class="si">{</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2"> must come from "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">driver</span><span class="o">.</span><span class="n">from_partition</span><span class="si">!r}</span><span class="s2"> and share edge "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">driver</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2">'s consumer_walk"</span>
+                <span class="p">)</span>
+            <span class="n">policy</span> <span class="o">=</span> <span class="n">conn</span><span class="o">.</span><span class="n">chunk_policy_factory</span><span class="p">()</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">policy</span><span class="p">,</span> <span class="n">FixedChunkPolicy</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"Edge </span><span class="si">{</span><span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="si">!r}</span><span class="s2"> drives its consumer's walk, so it "</span>
+                    <span class="sa">f</span><span class="s2">"needs non-overlapping chunks (FixedChunkPolicy), not "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">policy</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span></div>
 </div>
 
 

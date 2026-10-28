@@ -678,6 +678,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.get_node"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.get_node()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.ingest_for_speculation"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.ingest_for_speculation()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.ingest_input"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.ingest_input()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.is_idle"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.is_idle()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.mark_node_complete"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.mark_node_complete()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.ready_for_streaming"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.ready_for_streaming</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.ready_node_names"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.ready_node_names</span></code></a></li>
@@ -830,6 +831,18 @@ routing or StreamBuffer re-queue).</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.graph.graph_io.WorkerGraphIO.is_idle">
+<span class="sig-name descname"><span class="pre">is_idle</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/graph_io.html#WorkerGraphIO.is_idle"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.graph_io.WorkerGraphIO.is_idle" title="Link to this definition">#</a></dt>
+<dd><p>No node holds an input or is in flight, and no loop is mid-run:
+the state a pass leaves behind once the graph completes and resets.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.graph.graph_io.WorkerGraphIO.mark_node_complete">
 <span class="sig-name descname"><span class="pre">mark_node_complete</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/graph_io.html#WorkerGraphIO.mark_node_complete"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.graph_io.WorkerGraphIO.mark_node_complete" title="Link to this definition">#</a></dt>
 <dd><p>Signal that a node has finished executing.</p>
@@ -950,6 +963,7 @@ Every call site is on a per-request path where DEBUG is off.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.get_node"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.get_node()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.ingest_for_speculation"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.ingest_for_speculation()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.ingest_input"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.ingest_input()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.is_idle"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.is_idle()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.mark_node_complete"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.mark_node_complete()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.ready_for_streaming"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.ready_for_streaming</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.graph_io.WorkerGraphIO.ready_node_names"><code class="docutils literal notranslate"><span class="pre">WorkerGraphIO.ready_node_names</span></code></a></li>

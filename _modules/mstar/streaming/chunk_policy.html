@@ -1042,6 +1042,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        by its own model logic, not by the StreamBuffer.</span>
 <span class="sd">        """</span>
         <span class="k">return</span> <span class="kc">False</span></div>
+
+
+<div class="viewcode-block" id="ChunkPolicy.continues_in">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.continues_in">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">continues_in</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">consumer_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether empty chunks keep coming, after the producer is done, while</span>
+<span class="sd">        the consumer is in ``consumer_walk``."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">continue_after_producer_done</span><span class="p">()</span></div>
 </div>
 
 
@@ -1151,10 +1159,14 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    Args:</span>
 <span class="sd">        chunk_size: number of items per chunk.</span>
 <span class="sd">        continue_after_done: if True, keep producing empty chunks after</span>
-<span class="sd">            the producer finishes and all buffered items are consumed.</span>
+<span class="sd">            the producer finishes and all buffered items are consumed. A set</span>
+<span class="sd">            of consumer walks does so only while the consumer is in one of</span>
+<span class="sd">            them; in its other walks the stream just waits.</span>
 <span class="sd">    """</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">continue_after_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">continue_after_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_chunk_size</span> <span class="o">=</span> <span class="n">chunk_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span> <span class="o">=</span> <span class="n">continue_after_done</span>
@@ -1180,6 +1192,14 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="FixedChunkPolicy.continue_after_producer_done">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy.continue_after_producer_done">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">continue_after_producer_done</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="FixedChunkPolicy.continues_in">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy.continues_in">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">continues_in</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">consumer_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">consumer_walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span></div>
 </div>
 

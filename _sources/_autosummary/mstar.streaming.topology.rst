@@ -26,6 +26,7 @@ mstar.streaming.topology
       ClientStreamLimits
       Connection
       PartitionTopology
+      ProducerWalkCtx
       StreamingGraphEdge
    
    
