@@ -829,6 +829,16 @@ def _canary_qwen(name, model_kwargs, tmp_path, monkeypatch):
     ))
 
 
+def _parakeet(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.components.fastconformer import FastConformerConfig
+    from mstar.model.components.transducer import TransducerConfig
+    from mstar.model.parakeet.config import ParakeetModelConfig
+    from mstar.model.parakeet.parakeet_model import ParakeetModel
+    # Nemotron ASR conditions the transducer on a language prompt
+    transducer = TransducerConfig(num_prompts=128 if name == "nemotron_asr" else 0)
+    return _bare(ParakeetModel, config=ParakeetModelConfig(name, FastConformerConfig(), transducer))
+
+
 def _default(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs)
 
@@ -847,6 +857,7 @@ _FACTORIES = {
     "KokoroModel": _kokoro,
     "LTX25Model": _ltx2_5,
     "OrpheusModel": _orpheus,
+    "ParakeetModel": _parakeet,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
