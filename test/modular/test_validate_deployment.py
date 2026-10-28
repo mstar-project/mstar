@@ -398,9 +398,8 @@ def test_lockstep_nodes_in_different_instances_on_one_worker_are_refused(b, tmp_
     cfg = _cfg(tmp_path, [{"node_names": ["a"], **_TP2}, {"node_names": ["b"], **b}])
     assert _problems(_Model(_a_then_b, tp_enabled_nodes=["a", "b"]), cfg) == [
         f"Lockstep-parallel nodes on worker_{rank} are in different lockstep instances: "
-        f"a on TP ranks [0, 1], SP ranks None; b on TP ranks {b['ranks']}, SP ranks None. "
-        "A worker's lockstep nodes must share one instance: the same ranks, in the "
-        "same order, with the same tp_size and sp_size."
+        f"a on TP ranks [0, 1]; b on TP ranks {b['ranks']}. A worker's lockstep nodes must "
+        "share one instance: the same TP and SP groups, of the same ranks in the same order."
         for rank in (0, 1)
     ]
 

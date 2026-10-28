@@ -320,8 +320,12 @@ def _sharding_groups(
                     )
 
 
-def _members(group) -> list[int] | None:
-    return group.group_members if group.world_size > 1 else None
+def _placement(groups, node: str) -> str:
+    """``node``'s TP and SP ranks on a worker, leaving out an axis of one rank."""
+    axes = (("TP", groups.get_tp_config_for_node(node)), ("SP", groups.get_sp_config_for_node(node)))
+    return f"{node} on " + ", ".join(
+        f"{axis} ranks {group.group_members}" for axis, group in axes if group.world_size > 1
+    )
 
 
 def _worker_parallelism(
@@ -370,15 +374,11 @@ def _worker_parallelism(
         # A worker leads or follows one instance, whose steps go out as one
         # ordered stream from its rank 0, so its lockstep nodes share it.
         if not groups.all_in_same_group(parallel_nodes):
-            placed = "; ".join(
-                f"{node} on TP ranks {_members(groups.get_tp_config_for_node(node))}, "
-                f"SP ranks {_members(groups.get_sp_config_for_node(node))}"
-                for node in parallel_nodes
-            )
+            placed = "; ".join(_placement(groups, node) for node in parallel_nodes)
             yield (
                 f"Lockstep-parallel nodes on {wid} are in different lockstep instances: "
                 f"{placed}. A worker's lockstep nodes must share one instance: the same "
-                "ranks, in the same order, with the same tp_size and sp_size."
+                "TP and SP groups, of the same ranks in the same order."
             )
 
     all_nodes = set().union(*deployed.values())
