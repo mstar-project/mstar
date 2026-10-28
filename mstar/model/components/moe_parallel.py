@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.moe import ExpertParallelSparseMoeBlock, ParallelSparseMoeBlock
+from mstar.model.components.moe import ParallelSparseMoeBlock
 
 logger = logging.getLogger(__name__)
 
@@ -67,35 +67,27 @@ def instantiate_moe_block(
     router: nn.Module | None = None,
     comm_group: CommGroup | None = None,
     moe_parallel: MoeParallelConfig | None = None,
-) -> ParallelSparseMoeBlock | ExpertParallelSparseMoeBlock:
+) -> ParallelSparseMoeBlock:
     """The routed-expert block ``moe_parallel`` asks for; TP when None.
 
     ``comm_group`` is the node's TP group; EP picks its group from it.
     """
     moe_parallel = moe_parallel or MoeParallelConfig()
-    if moe_parallel.parallel == "tp":
-        return ParallelSparseMoeBlock(
-            hidden_size=hidden_size,
-            num_experts=num_experts,
-            num_experts_per_tok=num_experts_per_tok,
-            moe_intermediate_size=moe_intermediate_size,
-            norm_topk_prob=norm_topk_prob,
-            router=router,
-            comm_group=comm_group,
-        )
-    ep_group = moe_parallel.resolve_ep_group(comm_group)
-    return ExpertParallelSparseMoeBlock(
+    ep = moe_parallel.parallel == "ep"
+    group = moe_parallel.resolve_ep_group(comm_group) if ep else comm_group
+    return ParallelSparseMoeBlock(
         hidden_size=hidden_size,
         num_experts=num_experts,
         num_experts_per_tok=num_experts_per_tok,
         moe_intermediate_size=moe_intermediate_size,
         norm_topk_prob=norm_topk_prob,
         router=router,
-        comm_group=ep_group,
+        comm_group=group,
+        expert_parallel=ep,
         # Counts are identical on every rank, so only rank 0 keeps them.
         track_expert_load=(
-            moe_parallel.log_expert_load_every > 0
-            and (ep_group is None or ep_group.rank == 0)
+            ep and moe_parallel.log_expert_load_every > 0
+            and (group is None or group.rank == 0)
         ),
     )
 
@@ -128,10 +120,10 @@ class MoeParallelMixin:
         positions = torch.arange(hidden_states.shape[0], device=hidden_states.device)
         return positions < num_valid_tokens
 
-    def _tracked_moe_blocks(self) -> list[tuple[str, ExpertParallelSparseMoeBlock]]:
+    def _tracked_moe_blocks(self) -> list[tuple[str, ParallelSparseMoeBlock]]:
         return [
             (name, module) for name, module in self.named_modules()
-            if isinstance(module, ExpertParallelSparseMoeBlock) and module.track_expert_load
+            if isinstance(module, ParallelSparseMoeBlock) and module.track_expert_load
         ]
 
     @torch.compiler.disable

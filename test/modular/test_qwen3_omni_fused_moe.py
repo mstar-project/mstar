@@ -23,7 +23,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.model.components import GatedMLP, SparseMoeBlock, SparseMoeBlockWithSharedExpert
+from mstar.model.components import GatedMLP, ParallelSparseMoeBlock
 from mstar.model.components.moe import dispatch_experts_fused as _dispatch_experts_fused
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="fused MoE requires CUDA")
@@ -116,7 +116,7 @@ def test_thinker_block_parity(num_tokens):
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    block = SparseMoeBlock(
+    block = ParallelSparseMoeBlock(
         hidden_size=hidden,
         num_experts=num_experts,
         num_experts_per_tok=top_k,
@@ -158,7 +158,7 @@ def test_talker_block_parity(num_tokens):
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    block = SparseMoeBlockWithSharedExpert(
+    block = ParallelSparseMoeBlock(
         hidden_size=hidden,
         num_experts=num_experts,
         num_experts_per_tok=top_k,

@@ -15,11 +15,8 @@ from mstar.model.components.linear import FusedColumnLinear
 from mstar.model.components.linear_attn import GatedDeltaNet, GDNProjLayout
 from mstar.model.components.mlp import MLP, FusedGatedMLP, GatedMLP
 from mstar.model.components.moe import (
-    ExpertParallelSparseMoeBlock,
+    FusedExperts,
     ParallelSparseMoeBlock,
-    ParallelSparseMoeBlockWithSharedExpert,
-    SparseMoeBlock,
-    SparseMoeBlockWithSharedExpert,
     TopKRouter,
     dispatch_experts_fused,
 )
@@ -39,14 +36,11 @@ __all__ = [
     "FusedGatedMLP",
     "MLP",
     "GatedMLP",
-    "ExpertParallelSparseMoeBlock",
+    "FusedExperts",
     "MoeParallelConfig",
     "MoeParallelMixin",
     "instantiate_moe_block",
     "ParallelSparseMoeBlock",
-    "ParallelSparseMoeBlockWithSharedExpert",
-    "SparseMoeBlock",
-    "SparseMoeBlockWithSharedExpert",
     "TopKRouter",
     "dispatch_experts_fused",
     "AdaRMSNorm",

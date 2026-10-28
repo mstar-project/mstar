@@ -1384,7 +1384,7 @@ class Qwen3OmniModel(Model):
         from mstar.distributed.base import ShardingConfig
 
         # Talker LLM (attention + MoE-with-shared-expert) is TP-capable
-        # via the same ``ParallelAttention`` / ``ParallelSparseMoeBlock*``
+        # via the same ``ParallelAttention`` / ``ParallelSparseMoeBlock``
         # parts as the Thinker. The internal CodePredictor is intentionally
         # left at TP=1 (replicated weights, deterministic sampler) — see
         # ``_create_talker_submodule``. ``shard_dim`` stays empty because
