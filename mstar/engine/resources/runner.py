@@ -11,7 +11,7 @@ import logging
 from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
-from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource, RewindKind
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
@@ -113,6 +113,10 @@ class StepRunner:
         self._staged: tuple | None = None
         # (step key, ready) of the last pre_admit whose stage is still up
         self._pre_admitted: tuple | None = None
+        # draft-verify resource -> the resources of its nodes that rewind; empty without one
+        self._rewinders = self._draft_verify_rewinders(node_resources)
+        # keyset -> [(draft-verify resource, the step's resources it rewinds)]
+        self._rewind_cache: dict[frozenset[str], list[tuple[Resource, list[Resource]]]] = {}
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
@@ -231,6 +235,45 @@ class StepRunner:
         """Tell the node's resources that the cache served this walk whole."""
         for key in self._sweep(self._node_order, self._order, node_name):
             self._resources[key].complete_cached_walk(rid, node_name, graph_walk)
+
+    def _draft_verify_rewinders(
+        self, node_resources: Mapping[str, Collection[str]] | None,
+    ) -> dict[str, list[str]]:
+        from mstar.engine.resources.draft_verify.resource import DraftVerifyResource
+
+        out: dict[str, list[str]] = {}
+        for key, resource in self._resources.items():
+            if not isinstance(resource, DraftVerifyResource):
+                continue
+            if node_resources is None:
+                shared = set(self._resources)
+            else:
+                shared = set().union(*(keys for keys in node_resources.values() if key in keys))
+            out[key] = [
+                k for k in self._order
+                if k in shared and self._resources[k].rewind_kind is RewindKind.HOST
+            ]
+        return out
+
+    def _rewind(self, step: SubmoduleStep) -> None:
+        """Take back the rejected rows of the step's requests' last verify steps, on every
+        resource of the step that rewinds, before any of them admits the step. Each verdict
+        is taken once and never given back, so a step admitted again, or a dropped pre-plan,
+        finds nothing more. The same verdict on every rank of a lockstep instance, rewound at
+        the same point of the same step, keeps their streams alike."""
+        keyset = frozenset(step.keys())
+        hooks = self._rewind_cache.get(keyset)
+        if hooks is None:
+            hooks = self._rewind_cache[keyset] = [
+                (self._resources[dv], [self._resources[k] for k in keys if k in keyset])
+                for dv, keys in self._rewinders.items()
+                if any(k in keyset for k in keys)
+            ]
+        for dv, targets in hooks:
+            verdicts = dv.settle(step.ctx.request_ids)
+            if verdicts is not None:
+                for target in targets:
+                    target.rewind(verdicts)
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -432,6 +475,8 @@ class StepRunner:
         the step reserved.
         """
         staged_key = self._drop_stale_preplan(step)
+        if self._rewinders:
+            self._rewind(step)
         # A step whose ``pre_admit`` ran a step ahead, and whose stage is still
         # up for it, skips the resources that sweep covered: each would only
         # find its own reservation and no-op (0.1 ms of Python per step at
@@ -512,6 +557,8 @@ class StepRunner:
 
         Unwound on refusal exactly as ``admit`` is.
         """
+        if self._rewinders:
+            self._rewind(step)
         ready = True
         admitted: list[str] = []
         for key in self._preplan_keys_for(step):

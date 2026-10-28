@@ -604,7 +604,13 @@ The spec types are:
        ``enable_top_p_first`` are capabilities of the same kind. See
        ``SamplingReqConfig`` above. ``loopback_state`` declares per-request state a
        decode loop keeps on the device beside its last sampled token. See
-       `Device loop-back`_.
+       `Device loop-back`_. ``draft_verify`` marks the sampler of a node that verifies
+       drafts, which refuses a request a greedy verify can't serve. See
+       `Draft-verify decoding`_.
+   * - ``DraftVerifySpec(sampler=...)``
+     - Carries a verify step's verdict from the forward to the host, for a node whose
+       decode walk verifies drafts (speculative decoding). ``sampler`` names the node's
+       sampler, which verifies. See `Draft-verify decoding`_.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
@@ -1312,6 +1318,39 @@ address rows the same way, and the model never sees a slot index.
    that frame once per layer and exceeds the recompile limit. The shared ``Attention``
    layer creates one callable per layer. That is safe only because the callable is never
    passed into a traced function.
+
+Draft-verify decoding
+~~~~~~~~~~~~~~~~~~~~~
+
+A decode walk can draft ``k`` tokens per step and verify them in the same forward
+(speculative decoding: MTP heads, a DSpark or EAGLE drafter). The model keeps its
+drafter's forward. The engine owns the rest: the verdict, taking the rejected rows back
+out of every resource, the tokens each request emits, and the stop.
+
+- ``get_draft_policy(graph_walk)`` returns a ``DraftPolicy`` for the walk, or None (the
+  default) for plain decoding: ``max_drafts`` (``k``), the ``stop_ids`` that end a reply,
+  the ``loop`` the stop ends and the ``emit`` signal the tokens go out on. It is asked
+  once per walk, when the engine loads the node.
+- ``prepare_inputs`` gives a decode row ``input_seq_len = policy.block`` (``k + 1``) and
+  one input id, the last emitted token. The capture config does the same, so a decode
+  bucket holds ``block`` tokens per row.
+- ``declare_step`` wraps the decode step in ``with_draft_verify(step, policy)``, which adds
+  the ``VerifyStep``. A verify step declares no ``SamplerStep``.
+- The forward drafts ``[n, k]`` tokens and hands them to the node's
+  ``DraftVerifyResource``: ``agree`` (rank 0's drafts on a lockstep instance), then
+  ``block_ids`` (``[n, k + 1]``), the target over those rows, and ``verify(request_ids,
+  block, logits)``. Its ``next_inputs`` are the loop-back edge, produced for every row.
+- The model's ``get_node_resources`` declares a ``DraftVerifySpec`` on the node and
+  ``SamplerSpec(draft_verify=True)``. Its layout for the label the walk grows declares
+  ``lookahead=policy.lookahead`` (``2k + 1``, see `Paged KV layouts`_).
+
+Each verify step commits its whole block. Before the request's next step admits, the
+runner takes the rejected rows back from every resource of the node that declares
+``rewind_kind = RewindKind.HOST`` (paged KV and positions so far). A resource that
+declares no ``rewind_kind`` keeps the node from loading, as does a combined walk over the
+verifying walk or a prefix-cache key on its labels. Verification is greedy for now:
+``temperature``, ``repetition_penalty`` and ``min_tokens`` are refused. The tiny model in
+``test/modular/draft_verify_toy.py`` is the reference consumer.
 
 Loading weights
 ~~~~~~~~~~~~~~~

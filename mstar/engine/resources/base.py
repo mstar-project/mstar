@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -18,7 +19,22 @@ if TYPE_CHECKING:
         AcceleratorGraphConfig,
         PiecewiseAcceleratorGraphConfig,
     )
+    from mstar.engine.resources.draft_verify.config import VerdictBatch
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
+
+
+class RewindKind(Enum):
+    """What a resource keeps per token, as a draft-verify node's rewind sees it.
+
+    A verify step commits its whole block of ``k + 1`` rows, and the verdict
+    takes the rejected ones back (``Resource.rewind``). A resource on a node
+    that verifies drafts has to say which of these it is, or the node refuses
+    to load.
+    """
+    # nothing per token: planned from another resource, or per request only
+    NONE = "none"
+    # a host length the rewind moves back (paged KV, positions)
+    HOST = "host"
 
 
 @dataclass(frozen=True)
@@ -116,6 +132,19 @@ class Resource(ABC):
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
+
+    # what a verify step's rejected rows leave here; None (undeclared) keeps the
+    # resource off a node that verifies drafts
+    rewind_kind: RewindKind | None = None
+
+    def rewind(self, verdicts: VerdictBatch) -> None:
+        """Take back each row's rejected tail of its last verify step.
+
+        Called by the runner for a ``HOST`` resource, before the request's next
+        step is admitted on any resource, once per verdict. Never undone: a
+        discarded pre-plan does not bring the rejected rows back.
+        """
+        raise NotImplementedError(f"{type(self).__name__} declares no rewind")
 
     def enable_prefix_cache(self, root: bytes, walks: dict[str, KeyedWalks] | None = None) -> bool:
         """Open whatever this resource keeps across requests, under ``root``;

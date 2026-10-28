@@ -62,6 +62,9 @@ class SamplerSpec(NodeResourceSpec):
     min_tokens_stop_ids: tuple[int, ...] = ()
     # Allows ``top_p_first`` / ``top_p_min_keep``.
     enable_top_p_first: bool = False
+    # The node's decode verifies drafts (``NodeSubmodule.get_draft_policy``), greedily for
+    # now, so a request whose sampling a greedy verify would change is refused.
+    draft_verify: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -127,6 +130,12 @@ class SamplingReqConfig(ResourceReqConfig):
                 raise ValueError(f"{name} must be a boolean; got {value!r}")
         if spec is None:
             return
+        if spec.draft_verify:
+            problem = draft_verify_problem(
+                self.temperature or 0, self.repetition_penalty or 1, self.min_tokens or 0,
+            )
+            if problem is not None:
+                raise ValueError(problem)
         # refused here, not ignored: the node's sampler has no such filter
         if self.min_p and not spec.enable_min_p:
             raise ValueError("this model does not support min_p; send 0 or leave it unset")
@@ -136,6 +145,27 @@ class SamplingReqConfig(ResourceReqConfig):
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )
+
+
+def draft_verify_problem(temperature: float, repetition_penalty: float, min_tokens: int) -> str | None:
+    """Why a greedy draft verify can't serve these settings, if it can't. The verify keeps a
+    draft only where it is the target's argmax, so temperature must be 0; a penalty or a
+    min-tokens floor would move that argmax by the tokens before each draft, which the verify
+    does not see."""
+    asked = []
+    if temperature != 0:
+        asked.append(f"temperature={temperature}")
+    if repetition_penalty != 1:
+        asked.append(f"repetition_penalty={repetition_penalty}")
+    if min_tokens:
+        asked.append(f"min_tokens={min_tokens}")
+    if not asked:
+        return None
+    return (
+        f"this model decodes with draft verification (speculative decoding), which is greedy-only "
+        f"so far, but the request asks for {', '.join(asked)}; send temperature=0 with no "
+        "repetition_penalty or min_tokens"
+    )
 
 
 def derive_seed(seed: int, stream: str) -> int:

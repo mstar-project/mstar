@@ -3,6 +3,7 @@
 has ownership of per-(request,label) position counter"""
 
 from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -12,6 +13,7 @@ from mstar.engine.resources.base import (
     EngineResourceInfo,
     PublishedInfo,
     Resource,
+    RewindKind,
 )
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.kv.keys import fingerprint
@@ -27,6 +29,9 @@ from mstar.engine.resources.position.rope import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.draft_verify.config import VerdictBatch
 
 
 @dataclass
@@ -204,6 +209,18 @@ class RopeManager(PositionManager):
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
+
+    @property
+    def rewind_kind(self) -> RewindKind | None:
+        # a block scheme moves by a fixed step per block, not per token
+        return RewindKind.HOST if self._config.scheme != PosScheme.BLOCK else None
+
+    def rewind(self, verdicts: "VerdictBatch") -> None:
+        """Take each row's rejected drafts back off its stream's position, beside the KV
+        length: a verify step advanced it by its whole block."""
+        for rid, label, rejected in zip(*verdicts, strict=True):
+            counters = self._counters.setdefault(rid, {})
+            counters[label] = max(0, counters.get(label, 0) - rejected)
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,

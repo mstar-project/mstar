@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
+from mstar.engine.resources.draft_verify.config import VerdictBatch
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -32,11 +33,6 @@ K = 3  # drafts per verify step
 PROMPT = 49  # the prompt plus the cap ends on a page, so a write k slots past it takes one more
 MAX_TOKENS = 32
 CAPS = {"decode_loop": MAX_TOKENS - 1}  # the prefill emits the first token
-
-# the trim, KVManager.correct_len, arrives with #388 and moves into DV-1's rewind
-needs_trim = pytest.mark.skipif(
-    not hasattr(KVManager, "correct_len"), reason="no KVManager.correct_len to trim with (#388)",
-)
 
 
 def _manager() -> KVManager:
@@ -80,15 +76,12 @@ def _verify_to_the_cap(kv: KVManager, accepted: int) -> int:
         held = max(held, _step(kv, "decode", K + 1))
         emitted += min(accepted + 1, MAX_TOKENS - emitted)
         if accepted < K:
-            kv.correct_len("r", "main", accepted - K)
+            kv.rewind(VerdictBatch(["r"], ["main"], [K - accepted]))
     return held
 
 
 @pytest.mark.parametrize("debug", [False, True], ids=["always_on", "debug_asserts"])
-@pytest.mark.parametrize(
-    "accepted", [pytest.param(0, marks=needs_trim), pytest.param(1, marks=needs_trim), K],
-    ids=["accept0", "accept1", "acceptK"],
-)
+@pytest.mark.parametrize("accepted", [0, 1, K], ids=["accept0", "accept1", "acceptK"])
 def test_a_verify_loop_to_its_cap_holds_its_footprint(accepted, debug, monkeypatch, caplog):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", debug)
     kv = _manager()

@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -19,6 +19,7 @@ from mstar.engine.resources.base import (
     EngineResourceInfo,
     KeyedWalks,
     PublishedInfo,
+    RewindKind,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import (
@@ -60,6 +61,9 @@ from mstar.utils.client_errors import client_error_text
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 from mstar.utils.profiler import PhaseLaps
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.draft_verify.config import VerdictBatch
 
 logger = logging.getLogger(__name__)
 
@@ -484,6 +488,9 @@ class _DecodePlanCache:
 
 class KVManager(AttentionResource):
     prefix_skip_safe = True
+    rewind_kind = RewindKind.HOST
+    # (loop, slots): a layout growing in a draft-verify loop must declare at least this lookahead
+    _lookahead_floor: tuple[str, int] | None = None
 
     def __init__(
         self,
@@ -1467,6 +1474,8 @@ class KVManager(AttentionResource):
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
+        if self._lookahead_floor is not None and overrides is not None and overrides.kv_layout:
+            self._check_lookahead(overrides)
         self._touch_plan_cache(rid)
         if rid in self._chain_drained:
             # the handle comes back while steps under its old name still wait
@@ -1488,6 +1497,24 @@ class KVManager(AttentionResource):
                     self._lay_out(rid, label, stream)
                 if stream.chain is None:
                     self._seed_keys(rid, label, stream)
+
+    def require_lookahead(self, loop: str, slots: int) -> None:
+        """Refuse a request whose layout grows in ``loop`` with less than ``slots`` of
+        lookahead: a draft-verify node's verify steps write that far past the kept tokens,
+        and a shorter footprint would let admission reserve too few pages."""
+        floor = self._lookahead_floor
+        if floor is not None and floor[0] == loop:
+            slots = max(slots, floor[1])
+        self._lookahead_floor = (loop, slots)
+
+    def _check_lookahead(self, overrides: KVReqConfig) -> None:
+        loop, slots = self._lookahead_floor
+        for label, layout in overrides.kv_layout.items():
+            if layout.lookahead < slots and any(name == loop for name, _ in layout.growth):
+                raise ValueError(
+                    f"KV {self.name}: label {label!r} grows in {loop!r}, which verifies drafts, "
+                    f"but its layout declares a lookahead of {layout.lookahead}, not {slots}"
+                )
 
     def _lay_out(self, rid: str, label: str, stream: CacheStream) -> None:
         """A label the request doesn't open gets a footprint of 0, so the pages a batch writes
@@ -2677,6 +2704,63 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._preplan_states = {}
         self._cached_plan_output = None
+
+    def rewind(self, verdicts: "VerdictBatch") -> None:
+        """Take each row's rejected drafts back off its stream's length. The pages stay with
+        the stream, so the next verify step writes over the rejected rows, except where they
+        were on a sealed page (`_drop_sealed_tail`). The generation moves, so an offload
+        claimed against the old length fails its guard."""
+        for rid in dict.fromkeys(verdicts.request_ids):
+            self._touch_plan_cache(rid)
+        with self._lock:
+            for rid, label, rejected in zip(*verdicts, strict=True):
+                self._take_back(rid, label, rejected)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+
+    def _take_back(self, rid: str, label: str, rejected: int) -> None:
+        stream = self._streams.get(rid, {}).get(label)
+        if stream is None:
+            raise KeyError(f"KV {self.name}: no stream {label!r} for request {rid} to rewind")
+        # an admitted step's addressing was planned from the old length
+        assert not stream.step_in_flight, (
+            f"KV {self.name}: rewind of {rid}/{label} between admit and commit"
+        )
+        if rejected <= 0:
+            return
+        stream.stored_len = max(0, stream.stored_len - rejected)
+        stream.generation += 1
+        stream.reset_generation += 1
+        if stream.offloaded:
+            # its host copy is what a reload restores; no device pages to drop
+            held = None if self._cpu_pool is None else self._cpu_pool.offloaded.get(rid, {}).get(label)
+            if held is not None:
+                held.stored_len = max(0, held.stored_len - rejected)
+            return
+        self._drop_sealed_tail(rid, label, stream)
+
+    def _drop_sealed_tail(self, rid: str, label: str, stream: CacheStream) -> None:
+        """The next write must not land on a sealed page its other owners still read.
+        Pages from the write position on are dropped, and the one the length ends inside
+        is replaced by a copy."""
+        page_size = self.config.page_size
+        first = stream.stored_len // page_size
+        tail = stream.page_indices[first:]
+        if not self._arena.any_sealed(tail):
+            return
+        keep: list[int] = []
+        if stream.stored_len % page_size:
+            keep = self._arena.acquire(1)
+            if keep is None:
+                raise RuntimeError(
+                    f"KV {self.name}: no free page to copy the sealed page "
+                    f"{rid}/{label} rewound into"
+                )
+            self._arena.copy_pages(tail[:1], keep)
+        self._arena.release(tail)
+        stream.page_indices[first:] = keep
+        # its keys and cursor name pages this stream no longer holds
+        stream.chain = None
 
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams

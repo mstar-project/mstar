@@ -6,12 +6,13 @@ from dataclasses import asdict
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource, RewindKind
 from mstar.engine.resources.sampler.config import (
     LoopbackState,
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
+    draft_verify_problem,
 )
 from mstar.engine.resources.sampler.utils import (
     AcceleratorGraphableSampler,
@@ -29,6 +30,8 @@ from mstar.utils.profiler import PhaseLaps
 
 class SamplerResource(Resource):
     prefix_skip_safe = True
+    # a greedy verify draws nothing and marks no token seen
+    rewind_kind = RewindKind.NONE
 
     def can_capture(self) -> bool:
         return DeviceCapability.of(self._device).graph_backend is not None
@@ -46,8 +49,10 @@ class SamplerResource(Resource):
         max_repetition_window: int = 0,
         min_tokens_stop_ids: tuple[int, ...] = (),
         enable_top_p_first: bool = False,
+        draft_verify: bool = False,
     ):
         self._track_seen_tokens = enable_repetion_penalty
+        self._draft_verify = draft_verify
         self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
         self._vocab_size = vocab_size if self._track_seen_tokens else None
@@ -149,7 +154,12 @@ class SamplerResource(Resource):
             max_repetition_window=spec.max_repetition_window,
             min_tokens_stop_ids=tuple(spec.min_tokens_stop_ids),
             enable_top_p_first=spec.enable_top_p_first,
+            draft_verify=spec.draft_verify,
         )
+
+    @property
+    def verifies_drafts(self) -> bool:
+        return self._draft_verify
 
     def build_accelerator_graph_buffers(
         self, slots, max_bs: int, max_seq_len: int
@@ -198,6 +208,13 @@ class SamplerResource(Resource):
         # Read off the resolved config rather than `overrides`, so a request
         # that leaves the penalty unset takes the same default the sampler will.
         resolved = self._sampler._sampling_config[rid]
+        if self._draft_verify:
+            problem = draft_verify_problem(
+                resolved.temperature, resolved.repetition_penalty, resolved.min_tokens,
+            )
+            if problem is not None:
+                self._sampler.remove_request(rid)
+                raise ValueError(problem)
         # written so NaN fails too; NaN would also slip past the `> 0` check below
         if not 0.0 <= resolved.min_p <= 1.0:
             self._sampler.remove_request(rid)
@@ -528,6 +545,30 @@ class SamplerResource(Resource):
         ):
             bufs.write_last_tokens(request_ids, tokens)
         return tokens
+
+    # Out of the caller's compiled frame, as `sample`; capturable.
+    @torch.compiler.disable
+    def verify(
+        self, request_ids: list[int], block: torch.Tensor, logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedy verification of a draft block. ``block`` is ``[n, k + 1]``, each row the
+        last emitted token and its ``k`` drafts, and ``logits`` the target's ``[n * (k + 1), V]``
+        over those rows. Returns the target's token at every row, ``[n, k + 1]``, and how many
+        leading drafts equal it, ``[n]``: a row emits ``tokens[:accepted + 1]``.
+
+        On a lockstep instance every rank keeps rank 0's: each rank rewinds its cache and feeds
+        its next step by the verdict, so an argmax near-tie read apart on two ranks would leave
+        their streams apart. ``request_ids`` names the rows, for a verify that samples (later);
+        the requests were refused at ingest unless greedy."""
+        del request_ids
+        n, width = block.shape
+        target = logits.argmax(-1).view(n, width)
+        accepted = (block[:, 1:] == target[:, :-1]).long().cumprod(1).sum(1)
+        verdict = torch.cat([target, accepted[:, None]], 1)
+        group = self._comm_group
+        if group is not None and group.world_size > 1:
+            verdict = group.broadcast(verdict, src=0)
+        return verdict[:, :width], verdict[:, width]
 
     def enable_device_loopback_reader(self) -> None:
         """A node of this sampler declares it reads its last sampled tokens
