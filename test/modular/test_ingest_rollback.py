@@ -53,7 +53,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     )
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: [],
-        add_request=lambda rid, cfg: (_ for _ in ()).throw(RuntimeError("over capacity")),
+        add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
     )
     w.request_state = SimpleNamespace(add_request=lambda rid, info: None)
     w.tensor_manager = SimpleNamespace(

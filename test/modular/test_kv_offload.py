@@ -873,6 +873,7 @@ def test_copier_falls_through_to_the_next_that_works(monkeypatch, caplog):
 
     class _Wrong(page_copier._Memcpy2DCopier):
         name = "wrong"
+        _max_pitch = 1 << 62
 
         def _memcpy_2d(self, dst, dpitch, src, spitch, width, height, stream):
             return 0  # claims success, copies nothing

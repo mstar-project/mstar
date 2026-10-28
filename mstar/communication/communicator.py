@@ -285,16 +285,20 @@ def make_communicator(*args, nonblocking_send: bool = False, **kwargs) -> BaseCo
             # A support bundle must be able to tell what a mesh was running,
             # and an old wheel left in an env must not silently take over
             # the whole mesh under AUTO after an upgrade.
+            # The path says which copy loaded: a maturin-built mstar-rust
+            # package shadows the module an mstar-ai Linux wheel ships.
             version = getattr(mstar_rust, "__version__", "<pre-versioning>")
             logger.info(
-                "control mesh transport: rust %s (MSTAR_RUST_ZMQ=%s)",
-                version, choice)
+                "control mesh transport: rust %s from %s (MSTAR_RUST_ZMQ=%s)",
+                version, mstar_rust.__file__, choice)
             if version != EXPECTED_MSTAR_RUST_VERSION:
                 logger.warning(
-                    "mstar_rust version %s does not match this tree's "
-                    "expected %s — a stale wheel may be shadowing the "
-                    "vendored rust/ build (rebuild with `maturin develop "
-                    "--release`)", version, EXPECTED_MSTAR_RUST_VERSION)
+                    "mstar_rust version %s at %s does not match the expected "
+                    "%s: in a checkout, rebuild it with `maturin develop "
+                    "--release -m rust/Cargo.toml`; in a pip install, upgrade "
+                    "mstar-ai and `pip uninstall mstar-rust` if a leftover "
+                    "build is shadowing the wheel's copy",
+                    version, mstar_rust.__file__, EXPECTED_MSTAR_RUST_VERSION)
             if not nonblocking_send or hasattr(mstar_rust.ZmqCommunicator, "try_send"):
                 return RustZMQCommunicator(*args, **kwargs)
             # built before try_send: every send the outbox makes would fail.
