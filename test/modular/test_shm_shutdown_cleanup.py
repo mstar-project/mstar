@@ -50,6 +50,13 @@ def _launch_token(monkeypatch):
     monkeypatch.setenv(TOKEN_ENV, "a1" * 8)
 
 
+def _shutdown(p) -> None:
+    """The real ``Conductor.shutdown``, on a conductor whose only worker is ``p``."""
+    c = Conductor.__new__(Conductor)
+    c._worker_processes, c._mps = [p], None
+    c.shutdown()
+
+
 class _DeploymentCommunicator(BaseCommunicator):
     """No mesh traffic; the protocol and prefix give the file namespace."""
 
@@ -179,7 +186,8 @@ def _state(pid: int) -> str | None:
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[0]
-    except FileNotFoundError:
+    # a process exiting mid-read can fail the read with ESRCH instead
+    except (FileNotFoundError, ProcessLookupError):
         return None
 
 
@@ -215,7 +223,7 @@ def test_a_worker_stopped_with_requests_in_flight_leaves_no_tensor_files(tmp_pat
             # SIGTERM follows at once.
             os.kill(p.pid, signal.SIGINT)
     finally:
-        Conductor.shutdown(SimpleNamespace(_worker_processes=[p]))
+        _shutdown(p)
         if arena:
             # its segments' namespace lock, which outlives the deployment until a later startup sweeps it
             ns = _deployment_namespace(_DeploymentCommunicator(prefix))
@@ -239,7 +247,7 @@ def test_without_a_launch_token_a_stopped_worker_leaves_its_files(tmp_path, monk
         held = _namespace_files(shm_dir, prefix)
         assert len(held) == N_IN_FLIGHT
     finally:
-        Conductor.shutdown(SimpleNamespace(_worker_processes=[p]))
+        _shutdown(p)
     assert _namespace_files(shm_dir, prefix) == held
 
 
@@ -433,3 +441,134 @@ def test_a_stop_during_cleanup_neither_cuts_the_unlinks_nor_hides_the_workers_er
     with pytest.raises(RuntimeError, match="step failed"):
         _run_worker(_Crashed())
     assert calls == ["unlink", "unlink"]
+
+
+def test_a_launcher_set_token_is_kept_with_a_warning(monkeypatch, caplog):
+    """A fixed value (a systemd ``Environment=`` line, a pod template shared by
+    replicas) comes back on every restart, and with it #767's race; it is kept,
+    since separately started processes must agree on it, but said out loud."""
+    monkeypatch.setenv(MINTED_ENV, "")
+    with caplog.at_level("WARNING", logger="mstar.communication.tensors"):
+        assert ensure_deployment_token() == "a1" * 8
+    assert [r for r in caplog.records if TOKEN_ENV in r.getMessage() and "new for every launch" in r.getMessage()]
+    caplog.clear()
+    monkeypatch.delenv(TOKEN_ENV)
+    with caplog.at_level("WARNING", logger="mstar.communication.tensors"):
+        minted = ensure_deployment_token()
+        assert ensure_deployment_token() != minted  # an inherited minted one is replaced
+    assert not caplog.records
+
+
+def test_a_stopped_worker_gets_its_signal_handlers_back_for_teardown():
+    """The unlinks run with SIGTERM and SIGINT ignored; teardown after them
+    does not, so a second stop still ends a teardown that hangs."""
+    calls = []
+
+    def _term(_signum, _frame):
+        raise SystemExit(0)
+
+    class _Manager:
+        names_unique_per_launch = True
+
+        def unlink_owned_files(self):
+            calls.append((signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)))
+
+    class _Stopped:
+        tensor_manager = _Manager()
+
+        def run(self):
+            raise SystemExit(0)
+
+    old = signal.signal(signal.SIGTERM, _term), signal.getsignal(signal.SIGINT)
+    try:
+        with pytest.raises(SystemExit):
+            _run_worker(_Stopped())
+        assert calls == [(signal.SIG_IGN, signal.SIG_IGN)]
+        assert signal.getsignal(signal.SIGTERM) is _term
+        assert signal.getsignal(signal.SIGINT) is old[1]
+    finally:
+        signal.signal(signal.SIGTERM, old[0])
+        signal.signal(signal.SIGINT, old[1])
+
+
+class _HungTeardownWorker(_InFlightWorker):
+    """Stops on SIGTERM, then hangs in teardown: ``threading._shutdown`` joins a
+    thread that never ends, so the conductor's SIGKILL ends the process and the
+    arena's exit-time finalizer never runs."""
+
+    def run(self):
+        threading.Thread(target=time.sleep, args=(600,), daemon=False).start()
+        super().run()
+
+
+@pytest.mark.skipif(importlib.util.find_spec("mstar_rust") is None, reason="needs mstar_rust")
+def test_a_worker_killed_in_a_hung_teardown_leaves_no_arena_segments(tmp_path):
+    shm_dir, prefix = _dirs(tmp_path)
+    ns = _deployment_namespace(_DeploymentCommunicator(prefix))
+
+    def _segments():
+        return sorted(n for n in os.listdir("/dev/shm") if n.startswith(f"mstar_{ns}_arena_"))
+
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    p = ctx.Process(target=_spawned_worker, args=(shm_dir, prefix, True, ready, _HungTeardownWorker))
+    p.start()
+    try:
+        assert ready.wait(120), "worker did not start"
+        assert _segments(), "the arena grew no segment"
+        _shutdown(p)
+        assert p.exitcode == -signal.SIGKILL, "the teardown did not hang"
+        left = _segments()
+    finally:
+        if p.is_alive():
+            p.kill()
+        for n in _segments():
+            os.unlink(f"/dev/shm/{n}")
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f"/dev/shm/mstar_{ns}.lock")
+    assert left == []
+    assert _namespace_files(shm_dir, prefix) == []
+
+
+def test_a_stop_while_the_handlers_are_saved_still_unlinks_and_keeps_the_error(monkeypatch):
+    """The conductor's SIGTERM right after a Ctrl-C can land while ``_run_worker``
+    reads the handlers it will put back; the unlinks still run, and so does a
+    stop right after the handlers are back, without hiding ``run()``'s error."""
+    getsignal, setsignal = signal.getsignal, signal.signal
+    stops = {"get": 1, "restore": 1}
+    calls = []
+
+    def _get(s):
+        if stops["get"]:
+            stops["get"] -= 1
+            raise SystemExit(0)    # the SIGTERM, mid-snapshot
+        return getsignal(s)
+
+    def _set(s, h):
+        setsignal(s, h)
+        if h is not signal.SIG_IGN and stops["restore"]:
+            stops["restore"] -= 1
+            raise SystemExit(0)    # another, right after the first handler is back
+
+    class _Manager:
+        names_unique_per_launch = True
+
+        def unlink_owned_files(self):
+            calls.append("unlink")
+
+    class _Crashed:
+        tensor_manager = _Manager()
+
+        def run(self):
+            raise RuntimeError("step failed")
+
+    old = getsignal(signal.SIGTERM), getsignal(signal.SIGINT)
+    monkeypatch.setattr(signal, "getsignal", _get)
+    monkeypatch.setattr(signal, "signal", _set)
+    try:
+        with pytest.raises(RuntimeError, match="step failed"):
+            _run_worker(_Crashed())
+        assert calls == ["unlink"] and stops == {"get": 0, "restore": 0}
+    finally:
+        setsignal(signal.SIGTERM, old[0])
+        setsignal(signal.SIGINT, old[1])

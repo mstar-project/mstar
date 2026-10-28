@@ -23,7 +23,7 @@ from test_kv_prefix_layout_lease import _Node as _LayoutNode
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _grow, _keys, _layout, _manager, _seed, _StubTransfer
 
 from mstar.engine.resources import StepRunner
-from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import PageAllocator
 from mstar.engine.resources.kv.config import (
@@ -38,7 +38,14 @@ from mstar.engine.resources.kv.config import (
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PageArena, PublishedKVInfo
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
-from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
+from mstar.engine.resources.recurrent.config import (
+    RecurrentBlockConfig,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+    RecurrentStep,
+)
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.step import ASKS, AdmitRuntimeError, Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
 
 SEED = 20261022
@@ -68,8 +75,26 @@ def _laid_out(kv, rid: str, tokens: list[int], keyed: bool = False) -> None:
     kv.ingest_request(rid, KVReqConfig(prefix_keys=keys, kv_layout=_layout(len(tokens))))
 
 
+_RUNNERS: dict[int, tuple[KVManager, StepRunner]] = {}
+
+
+def _runner(kv) -> StepRunner:
+    """The runner that admits for ``kv``, as the engine's does."""
+    if id(kv) not in _RUNNERS or _RUNNERS[id(kv)][0] is not kv:
+        _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv}, node_resources={NODE: ["kv"]}))
+    return _RUNNERS[id(kv)][1]
+
+
 def _ready(kv, rid: str, published: PublishedKVInfo | None = None) -> bool:
-    return kv.admit_retrieve(rid, NODE, WALK, published).ready
+    """A readiness check as the scheduler makes it, after it takes whatever has since been admitted."""
+    runner = _runner(kv)
+    mine = None if published is None else {"kv": published}
+    runner.admit_waiting(lambda other, node: mine if other == rid else None)
+    return runner.admit_retrieve(rid, NODE, WALK, mine).ready
+
+
+def _remove(kv, rid: str) -> None:
+    _runner(kv).remove_request(rid)
 
 
 def _probe(kv, rid: str, tokens: int) -> CachedPrefix | None:
@@ -84,7 +109,7 @@ def test_a_page_filed_after_a_lost_race_keeps_the_winners_pages_evictable():
     shared = list(range(48))
     _laid_out(kv, "a", shared, keyed=True)
     _grow(kv, "a", 48)
-    kv.remove_request("a")
+    _remove(kv, "a")
     evictable = set(kv._index.evictable())
 
     # "b" writes the same three pages without probing, so it loses the race for them, then files its fourth page
@@ -107,7 +132,7 @@ def test_a_request_with_nothing_cached_never_passes_the_head():
     kv = _queued()
 
     assert not _ready(kv, "short"), "a later request took the room the head waits for"
-    kv.remove_request("a")
+    _remove(kv, "a")
     assert _ready(kv, "long") and _ready(kv, "short"), "the queue didn't move once the head fit"
 
 
@@ -115,7 +140,7 @@ def test_removing_the_head_makes_the_next_request_the_head():
     kv = _queued()
     assert not _ready(kv, "short")
 
-    kv.remove_request("long")
+    _remove(kv, "long")
 
     assert kv._head_wait is None, "the removed head's last ask would still decide who passes the next one"
     assert _ready(kv, "short"), "a request that left still heads the queue"
@@ -129,9 +154,9 @@ def _prefill(kv, rid: str, tokens: list[int]) -> None:
     _grow(kv, rid, len(tokens) - (prefix.tokens if prefix else 0))
 
 
-def _passing(free: int, head: int):
+def _passing(free: int, head: int, kv=None):
     """"r" runs on ``HELD``, "fill" runs on tokens from 2000 and leaves ``free`` pages, and "head" waits."""
-    kv = _manager(max_num_pages=16)
+    kv = _manager(max_num_pages=16) if kv is None else kv
     kv._cpu_pool = host._HostPool(64)
     _prefill(kv, "r", HELD + list(range(1000, 1008)))
     _prefill(kv, "fill", list(range(2000, 2000 + (kv._room() - free) * PAGE_SIZE)))
@@ -165,32 +190,63 @@ def test_the_pages_a_request_that_passed_frees_go_to_the_head(leave):
 
     assert not _ready(kv, "q"), "a request passed a head that the room now covers"
     assert _ready(kv, "head"), "the head waits though the room, the page kept for it included, covers it"
-    assert kv._head_wait is None, "the admitted head's wait would decide who passes the next head"
+    assert getattr(kv._head_wait, "rid", None) != "head", "the admitted head's wait would decide who passes next"
+
+
+class _Slots(Resource):
+    """A pool that lets a request pass and has no slot for ``refused``."""
+
+    passes = True
+
+    def __init__(self, refused: str):
+        self.refused, self.held = refused, set()
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+    def ask(self, rid, node_name, graph_walk):
+        return None if rid in self.held else ASKS
+
+    def reserve(self, rid, node_name, graph_walk, published, passing=False):
+        if rid == self.refused:
+            return 0
+        self.held.add(rid)
+        return None
+
+    def unreserve(self, rid):
+        self.held.discard(rid)
+
+    def grew_since(self, mark):
+        return False
 
 
 def test_a_request_that_passed_goes_back_behind_the_head_when_another_pool_holds_it_back():
-    kv = _passing(free=1, head=2)
+    kv = _manager(max_num_pages=16)
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "slots": _Slots("p")}, node_resources={NODE: ["kv", "slots"]}))
+    kv = _passing(free=1, head=2, kv=kv)
     _laid_out(kv, "p", HELD + list(range(4000, 4008)), keyed=True)
-    assert _ready(kv, "p")
-    kv.requeue("p")
-    assert _ready(kv, "p") and kv._head_wait is not None, "a requeued request took the place of the head it passed"
+
+    assert not _ready(kv, "p"), "p passed though the other pool had no slot for it"
+    assert "p" not in kv._allotments and "p" in kv._asks, "the KV kept what it gave a request another pool held back"
+    assert kv._head_wait.rid == "head", "a request held back while passing took the place of the head it passed"
 
 
 def test_a_prompt_bigger_than_the_pool_fails_as_it_joins():
     kv = _manager(max_num_pages=4)
     _laid_out(kv, "a", list(range(64)))
 
-    outcome = kv.admit_retrieve("a", NODE, WALK, None)
+    outcome = _runner(kv).admit_retrieve("a", NODE, WALK)
 
     assert isinstance(outcome.reason, AdmitRuntimeError), "a request that can never fit holds the queue"
-    assert not kv._waiting
+    assert not _runner(kv)._waiting and not kv._asks
 
 
 def _cached(kv, tokens: list[int], held: bool) -> None:
     """Index ``tokens``, held by a live request or by the index alone."""
     _seed(kv, tokens)
     if not held:
-        kv.remove_request("seed")
+        _remove(kv, "seed")
 
 
 def test_a_held_hit_that_turns_evictable_before_the_probe_leaves_other_allotments_alone():
@@ -200,7 +256,7 @@ def test_a_held_hit_that_turns_evictable_before_the_probe_leaves_other_allotment
     _laid_out(kv, "a", tokens, keyed=True)
     assert _ready(kv, "a") and kv._allotments["a"].pages == 1
     # the hit pages "a" was credited for go back to the index alone, and "b" is allotted the room that frees
-    kv.remove_request("seed")
+    _remove(kv, "seed")
     _laid_out(kv, "b", list(range(500, 500 + kv._room() * PAGE_SIZE)))
     assert _ready(kv, "b") and kv._room() == 0
 
@@ -220,7 +276,7 @@ def test_a_hit_on_a_page_only_the_index_holds_is_allotted_as_if_fresh():
 
     # "a" hits 4 cached pages and writes 1, but "x" may evict them
     assert not _ready(kv, "a"), "the head was admitted into room its cache hit had to come from"
-    kv.remove_request("x")
+    _remove(kv, "x")
     assert _ready(kv, "a") and kv._allotments["a"].pages == 5
 
 
@@ -238,6 +294,43 @@ def test_a_hit_on_a_page_another_request_holds_costs_nothing():
     # one page is free, and "a" has it allotted for its prompt
     assert not _ready(kv, "c"), "the lease of pages another request holds was counted as pages taken"
     _grow(kv, "a", 80 - prefix.tokens)
+
+
+def test_a_hit_page_another_request_takes_lets_the_head_in():
+    """The other request pays for the page out of its own allotment, so the head's need drops while
+    the room stays where it was."""
+    kv = _manager(max_num_pages=9)
+    tokens = list(range(80))
+    _cached(kv, tokens, held=False)
+    _laid_out(kv, "b", tokens, keyed=True)
+    _laid_out(kv, "a", tokens + list(range(900, 932)), keyed=True)
+    assert _ready(kv, "b") and not _ready(kv, "a")
+    room = kv._room()
+
+    _probe(kv, "b", 80)
+
+    assert kv._room() == room and _ready(kv, "a"), "the head waits for room it no longer needs"
+
+
+def test_a_request_with_no_recurrent_slot_keeps_no_kv_pages():
+    """Qwen3.5 runs a KV pool and a recurrent pool on one node. A request the KV admitted with no slot
+    free would fail its first step, and its allotment would keep room from the requests running."""
+    kv = _manager(max_num_pages=9)
+    state = RecurrentStatePool.build(
+        RecurrentStateSpec(resource_key="state", nodes={NODE}, config=RecurrentStateConfig(
+            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)}, max_slots=2,
+        )),
+        EngineResourceInfo(device=torch.device("cpu")),
+    )
+    runner = StepRunner({"kv": kv, "state": state}, node_resources={NODE: ["kv", "state"]})
+    for rid in ("r0", "r1"):
+        _laid_out(kv, rid, list(range(16)))
+        state.ingest_request(rid)
+    assert runner.admit_retrieve("r0", NODE, WALK).ready
+    assert state.admit(RecurrentStep(segments=(Segment("r0", "main", 16),)), _ctx("r0")).ok
+
+    assert runner.admit_retrieve("r1", NODE, WALK).queued
+    assert "r1" not in kv._allotments, "a request with no slot kept the KV pages it was allotted"
 
 
 def test_a_later_grant_cannot_take_the_heads_cached_hits():
@@ -283,7 +376,7 @@ def test_a_repeat_whose_allotment_is_spent_leaves_its_image_end_to_the_walk():
     kv.ingest_request("c", _config([TEXT, IMAGE, list(range(400, 405))]))
     _probe(kv, "c", len(TEXT))
     assert _ready(kv, RID) and kv._allotments[RID].pages == 1
-    kv.remove_request("c")
+    _remove(kv, "c")
     _laid_out(kv, "b", list(range(kv._room() * PAGE_SIZE)))
     assert _ready(kv, "b") and kv._room() == 0
 
@@ -385,7 +478,7 @@ def test_a_request_one_pool_holds_back_keeps_no_allotment_in_another_on_its_node
         assert not runner.admit_retrieve(rid, NODE, WALK).ready
 
     assert self_kv._allotments.keys() == {"r"}, "a request the cross pool holds back kept its self pool allotment"
-    assert next(iter(self_kv._waiting)) == "c", "\"d\" passed \"c\" in the self pool's queue"
+    assert runner._queues["kv_cache"][0] == "c", "\"d\" passed \"c\" in the self pool's queue"
     decode = self_kv.admit(KVStep(segments=(Segment("r", "main", 1),)), _ctx("r"))
     assert decode.ok, "requests waiting on the cross pool kept the room the running request decodes into"
 
@@ -408,7 +501,7 @@ def test_only_the_leaders_pool_holds_a_request_back_and_none_above_one_rank():
             _laid_out(kv, rid, list(range(80)))
 
         assert _ready(kv, "a") and _ready(kv, "b") is not holds, f"{node}'s pool at world size {world_size} decided"
-        assert holds or not (kv._allotments or kv._waiting), "a pool that doesn't decide kept admission state"
+        assert holds or not (kv._allotments or kv._asks), "a pool that doesn't decide kept admission state"
 
 
 def test_an_allotment_covers_only_the_labels_its_workers_nodes_open():
@@ -508,7 +601,7 @@ def _drive(kv, rng: random.Random, ops: int) -> list[str]:
             assert kv._allotments[rid].remaining == left, f"reload {rid} changed the unused part of its allotment"
             live[rid][0] = "running"
         elif op == "remove":
-            kv.remove_request(rid)
+            _remove(kv, rid)
             del live[rid]
         else:
             continue
@@ -528,7 +621,7 @@ def test_allotments_never_exceed_the_free_and_evictable_pages(monkeypatch):
     for op in ("committed", "rolled back", "dropped", "refused", "reset", "offload", "reload", "remove"):
         assert sum(line.startswith(op) for line in log) >= 10, f"seed {SEED}: too few {op!r} to say anything"
     for rid in list(kv._streams):
-        kv.remove_request(rid)
+        _remove(kv, rid)
     host._land(kv)
     assert kv._unused == 0 and kv._arena.num_free + len(kv._index.evictable()) == 19, (
         f"seed {SEED}: pages or allotments outlived every request that held them"
@@ -559,7 +652,7 @@ def test_a_copy_from_the_host_waits_for_the_join_and_comes_out_of_the_allotment(
         assert not _ready(kv, rid)
     assert kv._host_copies == [], "a request still in the queue started a copy from the host"
 
-    kv.remove_request("big")
+    _remove(kv, "big")
     assert not _ready(kv, "b") and kv._host_copies, "\"b\" didn't start its copy once admitted"
     pages = kv._allotments["b"].pages
     assert kv._room() == room - pages, "the copy took room past \"b\"'s allotment"
@@ -575,7 +668,7 @@ def _full_of_cache_with_a_prefix_on_the_host():
     # four are the leaves an eviction takes first
     kv._index.evict(2)
     host._serve(kv, "c", list(range(500, 500 + 15 * host.PAGE_SIZE)))
-    kv.remove_request("c")
+    _remove(kv, "c")
     assert kv._arena.num_free == 0 and kv._index.num_pages() == 19
     return kv
 
@@ -621,7 +714,7 @@ def test_a_reload_counts_the_evictable_index_pages_it_keeps_as_room():
 def test_a_grant_that_evicts_counts_the_pages_the_host_has_no_copy_of():
     kv = host._manager(max_num_pages=8)
     host._serve(kv, "a", host.A_PROMPT + [1])
-    kv.remove_request("a")
+    _remove(kv, "a")
 
     host._serve(kv, "b", list(range(500, 500 + 3 * host.PAGE_SIZE)))
 

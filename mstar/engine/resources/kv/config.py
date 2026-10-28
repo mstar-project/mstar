@@ -513,6 +513,12 @@ class StreamLayout:
 class KVStep(ResourceStep):
     # write: bool # @nsagan: opting to remove this for now bc it's dead code
     commit: bool = True
+    # The step writes this cache's planned tokens eagerly, outside any captured
+    # graph (e.g. in ``preprocess``, before the replay). Its addressing stays an
+    # ordinary plan state rather than the slot's static buffers, which are sized
+    # for the bucket's in-graph tokens: a decoder prefill whose encoder context
+    # is far longer than its prompt can then replay a graph sized by the prompt.
+    eager_write: bool = False
 
     # e.g., for batched CFG
     combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)

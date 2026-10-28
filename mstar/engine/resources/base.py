@@ -220,10 +220,34 @@ class Resource(ABC):
         """
         return ADMIT_OK
 
-    def requeue(self, rid: str) -> None:
-        """Undo what `admit_retrieve` reserved for ``rid`` in the same sweep, because another
-        resource on the node returned an outcome with ``held_back`` set."""
+    # Admission. A resource with limited capacity answers for it, and the runner decides who
+    # gets it and when: one order across resources, a request takes all it asks or none, and
+    # nothing is retrieved for it before then.
+
+    def ask(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        """`ASKS` while ``rid`` waits for this resource's capacity to start on ``node_name``, None
+        when it needs none, or the outcome that fails it when it can never fit."""
+        return None
+
+    # whether a request may pass the first one waiting for this resource while that one can't start
+    passes = False
+
+    def reserve(
+        self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
+        passing: bool = False,
+    ) -> object | None:
+        """Take what ``rid`` asked for and return None, or return a mark of what it didn't fit
+        against for `grew_since`. ``passing`` asks for ``rid`` behind a first request that can't
+        start, on a resource that `passes`."""
+        return None
+
+    def unreserve(self, rid: str) -> None:
+        """Give back what `reserve` took, because another resource ``rid`` asks didn't fit."""
         return
+
+    def grew_since(self, mark: object) -> bool:
+        """Whether a request that didn't fit against ``mark`` may fit now."""
+        return True
 
     # Step lifecycle
 

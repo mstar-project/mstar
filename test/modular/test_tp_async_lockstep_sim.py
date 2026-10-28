@@ -72,3 +72,46 @@ def test_b2_retract_is_refuted_on_structural_cancel():
 def test_b2_waste_matches_design_prediction():
     # expected run-ahead cost: one wasted forward per request end at B=1
     assert _run("B2_VOID", "clean-3step").max_waste == 1
+
+
+# --- a follower's input read failing after rank 0 scheduled the row ----------
+# Model: tp_read_check_sim.py. It explores every order of the follower's read
+# outcome, rank 0's scheduling and the lockstep step.
+
+try:
+    from .tp_read_check_sim import explore as explore_read_check
+except ImportError:  # collected without package context
+    from tp_read_check_sim import explore as explore_read_check
+
+
+def test_the_read_check_holds_for_every_input_kind():
+    """Every rank takes out the rows whose read failed before preparing the
+    step: no interleaving hangs, every step runs the same collectives on both
+    ranks, and only the request whose read failed fails."""
+    for kind in ("data", "shape", "prepare"):
+        res = explore_read_check("CHECK", kind)
+        assert res.ok, (kind, res.violations[:1])
+
+
+def test_scheduling_from_rank_0s_reads_alone_hangs_the_instance():
+    """A step rank 0 broadcast can need a read that then fails on the
+    follower, which can never run it."""
+    for kind in ("data", "shape", "prepare"):
+        res = explore_read_check("NONE", kind)
+        assert any(v == "live" for v, _ in res.violations), kind
+
+
+def test_zero_fill_desyncs_the_step_when_the_input_sets_its_length():
+    """Zeros of the advertised shape keep a data input's step whole, but an
+    input the step derives its length from (image_grid_thw) gives the follower
+    a different step than rank 0's."""
+    assert explore_read_check("ZERO", "data").ok
+    assert any(v == "lockstep" for v, _ in explore_read_check("ZERO", "shape").violations)
+
+
+def test_a_capture_input_row_desyncs_the_step_when_prepare_runs_a_collective():
+    """The walk's capture input at rank 0's length fixes the length, but rank 0
+    prepared the real row, and a prepare that runs a collective for it (a text
+    part's vocab-parallel embedding) has no partner on the follower."""
+    assert explore_read_check("CAPTURE", "shape").ok
+    assert any(v == "lockstep" for v, _ in explore_read_check("CAPTURE", "prepare").violations)

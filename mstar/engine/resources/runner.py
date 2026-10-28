@@ -7,26 +7,38 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 
 from __future__ import annotations
 
+import bisect
+import itertools
 import logging
 from collections.abc import Callable, Collection, Mapping
-from time import perf_counter
+from dataclasses import dataclass, field
 from typing import Any
 
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
-from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
-    ADMIT_OK,
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
+    FULL_ADMIT_QUEUED,
     FullAdmitOutcome,
     SubmoduleStep,
 )
-from mstar.utils.profiler import PHASE_PERIOD, phase_record, range_pop, range_push
+from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
 
-def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
+@dataclass(slots=True)
+class _Waiting:
+    """A waiting request: the node and walk that asked each resource it waits for, and every node
+    whose readiness check waits on it."""
+    asked: dict[str, tuple[str, str]] = field(default_factory=dict)
+    nodes: set[str] = field(default_factory=set)
+
+
+def topo_sort(resources: Mapping[str, Resource | NodeResourceSpec]) -> tuple[str, ...]:
+    """Keys in dependency order; built resources at load, their specs when the
+    conductor validates a deployment."""
     deps: dict[str, set[str]] = {
         key: set(resource.depends_on()) for key, resource in resources.items()
     }
@@ -100,6 +112,23 @@ class StepRunner:
         # name every node, including one that owns nothing — an absent node
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
+        self._ask_order = [key for key in self._order if type(self._resources[key]).ask is not Resource.ask]
+        self._node_ask_order = self._per_node(node_resources, self._ask_order)
+        # Admission state, see `Resource.ask`.
+        # `_arrival` numbers each request in the order it first asked.
+        # `_waiting` holds what each waiting request asked.
+        # `_queues` holds, per resource, the requests waiting for it in arrival order.
+        # `_short` maps each resource whose first waiting request didn't fit to the mark it didn't fit against.
+        # `_admitted` holds the nodes each request was admitted on.
+        # `_started` holds, for a request admitted during one node's check, the other nodes waiting on
+        # it, which `admit_waiting` reports so their parked checks resume.
+        self._arrivals = itertools.count()
+        self._arrival: dict[str, int] = {}
+        self._waiting: dict[str, _Waiting] = {}
+        self._queues: dict[str, list[str]] = {key: [] for key in self._ask_order}
+        self._short: dict[str, object] = {}
+        self._admitted: dict[str, set[str]] = {}
+        self._started: dict[str, set[str]] = {}
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
         self._trail_order = [
             key for key in self._order if self._resources[key].page_trail() is not None
@@ -333,6 +362,15 @@ class StepRunner:
             self._resources[key].ingest_capture_row(rid)
 
     def remove_request(self, rid: str) -> None:
+        entry = self._waiting.pop(rid, None)
+        if entry is not None:
+            for key in entry.asked:
+                self._queues[key].remove(rid)
+                # the queue may have a new first request, which hasn't been tried
+                self._short.pop(key, None)
+        self._admitted.pop(rid, None)
+        self._started.pop(rid, None)
+        self._arrival.pop(rid, None)
         for key in self._order:
             self._resources[key].remove_request(rid)
 
@@ -340,7 +378,7 @@ class StepRunner:
         self, rid: str, node_name: str, graph_walk: str,
         published: Mapping[str, PublishedInfo] | None = None,
     ) -> FullAdmitOutcome:
-        """bring published state in
+        """bring published state in, once `node_name`'s resources have admitted the request
 
         gives `ready=False` when still has inflights; shortcircuit on failure
 
@@ -350,7 +388,11 @@ class StepRunner:
         node ends up gated on — and able to allocate against — another node's
         cache.
         """
-        ready, held_back, admitted = True, False, ()
+        if node_name not in self._admitted.get(rid, ()):
+            waits = self._admit(rid, node_name, graph_walk, published)
+            if waits is not None:
+                return waits
+        ready = True
         for key in self._sweep(
             self._node_retrieve_order, self._retrieve_order, node_name
         ):
@@ -364,18 +406,143 @@ class StepRunner:
                     key, outcome.reason.message
                 )
                 return FullAdmitOutcome(outcome, key)
-            if outcome is not ADMIT_OK:
-                ready = ready and outcome.ready
-                held_back = held_back or outcome.held_back
-                if outcome.admitted:
-                    admitted += (key,)
-        if held_back:
-            # otherwise room reserved for a request that is still waiting is kept from the requests already running
-            for key in admitted:
-                self._resources[key].requeue(rid)
+            ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
+    def _admit(
+        self, rid: str, node_name: str, graph_walk: str, published: Mapping[str, PublishedInfo] | None,
+    ) -> FullAdmitOutcome | None:
+        """None once ``rid`` is admitted on ``node_name``, else why it waits or fails."""
+        entry = self._waiting.get(rid)
+        waits = False
+        for key in self._sweep(self._node_ask_order, self._ask_order, node_name):
+            if entry is not None and key in entry.asked:
+                waits = True
+                continue
+            asked = self._resources[key].ask(rid, node_name, graph_walk)
+            if asked is None:
+                continue
+            if not asked.ok:
+                logger.warning("Admission for resource %s failed with error: %s", key, asked.reason.message)
+                return FullAdmitOutcome(asked, key)
+            if entry is None:
+                entry = self._waiting[rid] = _Waiting()
+                self._arrival.setdefault(rid, next(self._arrivals))
+            entry.asked[key] = (node_name, graph_walk)
+            bisect.insort(self._queues[key], rid, key=self._arrival.__getitem__)
+            waits = True
+        if not waits:
+            self._admitted.setdefault(rid, set()).add(node_name)
+            return None
+        entry.nodes.add(node_name)
+        tried = all(self._queues[key][0] == rid and key not in self._short for key in entry.asked)
 
+        def mine(node: str) -> Mapping[str, PublishedInfo] | None:
+            return published if node == node_name else None
+
+        # a request that isn't first may pass a first request that can't start
+        nodes = self._reserve(rid, mine) if tried else self._pass(rid, mine)
+        if nodes:
+            if nodes - {node_name}:
+                self._started.setdefault(rid, set()).update(nodes - {node_name})
+            return None
+        return FULL_ADMIT_QUEUED
+
+    def _reserve(
+        self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None],
+        passing: Collection[str] = (),
+    ) -> set[str] | None:
+        """Take everything waiting ``rid`` asked for and return the nodes waiting on it, or take
+        nothing and return None. ``published_of`` gives what ``rid`` published for a node's
+        resources, and ``passing`` names the resources where ``rid`` passes the first request."""
+        entry = self._waiting[rid]
+        taken: list[str] = []
+        for key, (node_name, graph_walk) in entry.asked.items():
+            published = published_of(node_name)
+            args = (rid, node_name, graph_walk, None if published is None else published.get(key))
+            reserve = self._resources[key].reserve
+            mark = reserve(*args, passing=True) if key in passing else reserve(*args)
+            if mark is not None:
+                for done in taken:
+                    self._resources[done].unreserve(rid)
+                if key not in passing:
+                    self._short[key] = mark
+                return None
+            taken.append(key)
+        del self._waiting[rid]
+        for key in entry.asked:
+            queue = self._queues[key]
+            if queue[0] == rid:
+                queue.pop(0)
+            else:
+                queue.remove(rid)
+        self._admitted.setdefault(rid, set()).update(entry.nodes)
+        return entry.nodes
+
+    def admit_waiting(
+        self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
+    ) -> list[tuple[str, str]]:
+        """Admit each waiting request that is now first in every queue it is in and fits, and return
+        the (node, rid) pairs that may start. ``published_of(rid, node)`` gives what the request
+        published for that node's resources.
+
+        Nothing is tried until a resource whose first waiting request didn't fit has grown, so a pass
+        that freed nothing costs one `Resource.grew_since` for each such resource.
+        """
+        started = []
+        if self._started:
+            started = [(node, rid) for rid, nodes in self._started.items() for node in nodes]
+            self._started.clear()
+        if not self._waiting:
+            return started
+        if self._short:
+            for key, mark in self._short.items():
+                if self._resources[key].grew_since(mark):
+                    break
+            else:
+                return started
+            self._short.clear()
+        admitted = True
+        while admitted:
+            admitted = False
+            for queue in self._queues.values():
+                if not queue:
+                    continue
+                rid = queue[0]
+                entry = self._waiting[rid]
+                if any(self._queues[key][0] != rid or key in self._short for key in entry.asked):
+                    continue
+                nodes = self._reserve(rid, lambda node, rid=rid: published_of(rid, node))
+                if nodes:
+                    started.extend((node, rid) for node in nodes)
+                    admitted = True
+        if self._short:
+            for rid in sorted(self._waiting, key=self._arrival.__getitem__):
+                if rid in self._waiting and (nodes := self._pass(rid, lambda node, rid=rid: published_of(rid, node))):
+                    started.extend((node, rid) for node in nodes)
+        return started
+
+    def _pass(
+        self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None],
+    ) -> set[str] | None:
+        """Admit ``rid`` past the first request of each queue it waits behind, when that request can't
+        start and the queue's resource `passes`, and ``rid`` is first wherever else it waits. Return the
+        nodes waiting on it, or None."""
+        passing = []
+        for key in self._waiting[rid].asked:
+            first = self._queues[key][0]
+            if first == rid:
+                if key in self._short:
+                    return None
+            elif self._resources[key].passes and self._blocked(first):
+                passing.append(key)
+            else:
+                return None
+        return self._reserve(rid, published_of, passing) if passing else None
+
+    def _blocked(self, rid: str) -> bool:
+        """Whether ``rid`` is first in a queue whose resource it didn't fit."""
+        return any(key in self._short and self._queues[key][0] == rid for key in self._waiting[rid].asked)
 
     # ── Pre-plan bookkeeping ─────────────────────────────────────────────
     #
@@ -456,12 +623,12 @@ class StepRunner:
                 continue
             if self._nvtx:
                 range_push(f"res.admit.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.admit.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.admit.{key}", t0)
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
@@ -502,12 +669,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.plan.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.plan.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.plan.{key}", t0)
                 if self._nvtx:
                     range_pop()
         return results
@@ -525,9 +692,12 @@ class StepRunner:
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_admit.{key}")
+            t0 = phase_start()
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
+                if t0 is not None:
+                    phase_end(f"res.pre_admit.{key}", t0)
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
@@ -553,12 +723,12 @@ class StepRunner:
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_plan.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.pre_plan.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.pre_plan.{key}", t0)
                 if self._nvtx:
                     range_pop()
         self._staged = self._step_key(step)
@@ -569,12 +739,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.commit.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 self._resources[key].commit(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.commit.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.commit.{key}", t0)
                 if self._nvtx:
                     range_pop()
 
