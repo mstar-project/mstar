@@ -12,11 +12,10 @@ import itertools
 import logging
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
-from time import perf_counter
 from typing import Any
 
 from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
-from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
@@ -24,7 +23,7 @@ from mstar.engine.resources.step import (
     FullAdmitOutcome,
     SubmoduleStep,
 )
-from mstar.utils.profiler import PHASE_PERIOD, phase_record, range_pop, range_push
+from mstar.utils.profiler import phase_end, phase_start, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +36,9 @@ class _Waiting:
     nodes: set[str] = field(default_factory=set)
 
 
-def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
+def topo_sort(resources: Mapping[str, Resource | NodeResourceSpec]) -> tuple[str, ...]:
+    """Keys in dependency order; built resources at load, their specs when the
+    conductor validates a deployment."""
     deps: dict[str, set[str]] = {
         key: set(resource.depends_on()) for key, resource in resources.items()
     }
@@ -584,12 +585,12 @@ class StepRunner:
                 continue
             if self._nvtx:
                 range_push(f"res.admit.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.admit.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.admit.{key}", t0)
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
@@ -630,12 +631,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.plan.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.plan.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.plan.{key}", t0)
                 if self._nvtx:
                     range_pop()
         return results
@@ -653,9 +654,12 @@ class StepRunner:
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_admit.{key}")
+            t0 = phase_start()
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
+                if t0 is not None:
+                    phase_end(f"res.pre_admit.{key}", t0)
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
@@ -681,12 +685,12 @@ class StepRunner:
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_plan.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.pre_plan.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.pre_plan.{key}", t0)
                 if self._nvtx:
                     range_pop()
         self._staged = self._step_key(step)
@@ -697,12 +701,12 @@ class StepRunner:
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.commit.{key}")
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
+            t0 = phase_start()
             try:
                 self._resources[key].commit(step.get(key), step.ctx)
             finally:
-                if PHASE_PERIOD:
-                    phase_record(f"res.commit.{key}", perf_counter() - t0)
+                if t0 is not None:
+                    phase_end(f"res.commit.{key}", t0)
                 if self._nvtx:
                     range_pop()
 

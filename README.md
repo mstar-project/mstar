@@ -72,13 +72,9 @@ Qwen3-TTS also needs `uv pip install --no-deps "qwen-tts==0.1.1"` (see `docs/ins
 
 To enable flash-attn support (required for Qwen3-Omni, recommended for BAGEL),
 ```bash
-# torch built for CUDA 12.x (cu12)
+# torch 2.10 built for CUDA 13.x (cu13); on a cu12 torch, build from source (docs/installation.rst)
 uv pip install \
-  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
-
-# torch built for CUDA 13.x (cu13)
-uv pip install \
-  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+  "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
 Other models: `mstar serve flux2_klein` · `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve kokoro` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
@@ -170,8 +166,10 @@ The ZeroMQ control mesh can run over a Rust transport (vendored in [`rust/`](rus
 pyzmq — wire-compatible, selectable per process with `MSTAR_RUST_ZMQ` (default `AUTO`).
 Note what AUTO-by-default means: on any machine where the extension is built, the whole
 mesh switches to the Rust transport with no configuration change — each process logs its
-choice at startup (`control mesh transport: ...`), and `MSTAR_RUST_ZMQ=0` pins pyzmq. Build it with
-[maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
+choice at startup (`control mesh transport: ...`), and `MSTAR_RUST_ZMQ=0` pins pyzmq. Build it
+with [maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
+The Linux wheels of `mstar-ai` on PyPI carry it, with libzmq 4.3.4 statically linked under
+LGPL-3.0-or-later and its static-linking exception ([PACKAGING.md](PACKAGING.md) has where its source is).
 See the [installation docs](https://m-star.org/mstar/installation.html) and
 [environment variables](https://m-star.org/mstar/environment_variables.html).
 

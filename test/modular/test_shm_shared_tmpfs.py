@@ -118,3 +118,21 @@ def test_a_dead_deployments_files_are_swept_and_a_live_ones_kept(monkeypatch):
         assert f"mstar_{dead}.lock" not in left
         assert {f"mstar_{live}_worker_0_1", f"mstar_{live}.lock"} <= left
         assert f"mstar_{mgr._shm_namespace}.lock" in left
+
+
+def test_the_namespace_is_the_sha1_of_the_token_and_the_real_conductor_endpoint(monkeypatch, tmp_path):
+    """Pinned because tools outside the server rebuild it to find a server's
+    files (``benchmark/eval/e2e/stress.py``'s ``server_namespaces``)."""
+    import hashlib
+
+    from mstar.communication.tensors import _deployment_namespace
+
+    real = tmp_path / "ipc"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    comm = _Communicator(str(tmp_path / "link") + "/")
+    endpoint = f"ipc://{os.path.realpath(real / 'conductor.ipc')}"
+    monkeypatch.setenv(TOKEN_ENV, "a1" * 8)
+    assert _deployment_namespace(comm) == hashlib.sha1(f"{'a1' * 8}\0{endpoint}".encode()).hexdigest()[:12]
+    monkeypatch.delenv(TOKEN_ENV)
+    assert _deployment_namespace(comm) == hashlib.sha1(endpoint.encode()).hexdigest()[:12]

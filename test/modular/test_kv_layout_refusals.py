@@ -4,6 +4,7 @@ default cut to the pool instead."""
 
 from __future__ import annotations
 
+import re
 import sys
 from types import SimpleNamespace
 
@@ -16,7 +17,22 @@ from mstar.conductor.conductor import Conductor
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.graph.base import GraphNode, Loop
 from mstar.model.base import KVLabel, LabelLayout, Span
-from mstar.worker.engine_manager import _refuse_undeclared_pools, _refuse_unknown_walks
+from mstar.validation.resources import _undeclared_pools, _unknown_prefix_walks
+
+
+def _raise_first(problems):
+    """The checks report every problem; these tests look at one."""
+    for problem in problems:
+        raise ValueError(problem)
+
+
+def _refuse_undeclared_pools(specs, model):
+    _raise_first(_undeclared_pools(specs, model))
+
+
+def _refuse_unknown_walks(model):
+    _raise_first(_unknown_prefix_walks(model))
+
 
 LLM = GraphNode(name="llm", input_names=["text_inputs"], outputs=[])
 
@@ -62,16 +78,18 @@ def test_growth_on_an_unnamed_loop_is_refused_at_load():
     ({"kv": {"main": LAYOUT["kv"]["main"]}}, "returned no kv_layout for 'kv'/'uncond', which the request opens"),
     ({"kv": {**LAYOUT["kv"], "x": LabelLayout()}}, "returned a kv_layout for 'kv'/'x', which it does not declare"),
 ], ids=["no layout", "a label left out", "an undeclared label"])
-def test_a_request_laid_out_wrong_fails_with_a_500(tmp_path, monkeypatch, layout, message):
+def test_a_request_laid_out_wrong_fails_with_a_500(tmp_path, monkeypatch, caplog, layout, message):
     model = _Model(layout=layout)
     kwargs = _preprocess(model, {"max_output_tokens": 30})
 
     sent = _conduct(model, kwargs, tmp_path, monkeypatch).sent
 
     [failure] = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
-    assert failure.status == 500 and message in failure.error_message, (
-        f"the request failed with {failure.status}: {failure.error_message}"
-    )
+    # a model bug, not the client's: the client gets an error id, the log the reason
+    match = re.fullmatch(r"Ingest failed: internal error \(error id ([0-9a-f]{12})\)", failure.error_message)
+    assert failure.status == 500 and match, f"the request failed with {failure.status}: {failure.error_message}"
+    [logged] = [r.getMessage() for r in caplog.records if f"[error id {match.group(1)}]" in r.getMessage()]
+    assert message in logged
     assert not [msg for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"], (
         "a worker heard of a request the conductor refused"
     )
