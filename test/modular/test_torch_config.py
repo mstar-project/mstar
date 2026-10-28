@@ -34,8 +34,11 @@ def test_recompile_limit_env(monkeypatch, raw, expected):
     assert recompile_limit() == expected
 
 
-# the API server's process, and the module a spawned worker imports to find its target
-@pytest.mark.parametrize("entry", ["mstar.api_server.entrypoint", "mstar.conductor.conductor"])
+# the API server's process, the module a spawned worker imports to find its target, and
+# `python -m mstar.integrations.dynamo`
+@pytest.mark.parametrize(
+    "entry", ["mstar.api_server.entrypoint", "mstar.conductor.conductor", "mstar.integrations.dynamo.worker"],
+)
 def test_compile_cache_defaults_under_the_user_cache(tmp_path, entry):
     """torch writes its /tmp default into the environment when ``torch._dynamo``
     is first imported, so mstar's default has to land before any import does."""

@@ -12,8 +12,9 @@ def _default_compile_caches() -> None:
     starts warm. Importing this package creates the directories.
 
     Must run before anything imports ``torch._dynamo``, which writes torch's
-    own default into the environment. An exported value wins, and without a
-    writable home torch's and Triton's defaults stay.
+    own default into the environment; ``Platform.process_env_defaults`` runs
+    too late for that. An exported value wins, and without a writable home
+    torch's and Triton's defaults stay.
     """
     for var, name in (("TORCHINDUCTOR_CACHE_DIR", "torchinductor"), ("TRITON_CACHE_DIR", "triton")):
         if os.environ.get(var):
