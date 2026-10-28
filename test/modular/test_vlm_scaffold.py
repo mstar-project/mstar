@@ -289,3 +289,34 @@ def test_the_forward_reads_only_tensors_from_preprocess():
     engine_inputs = SimpleNamespace(resources={SAMPLER: SimpleNamespace()}, request_ids=[0])
     with pytest.raises(AssertionError, match="must be tensors"):
         type(llm)._forward(llm, "decode", engine_inputs, input_ids=torch.tensor([1]), cos_3d=(1, 2))
+
+
+# ---------------------------------------------------------------------------
+# Muse Glimmer on the scaffolds
+# ---------------------------------------------------------------------------
+
+
+def test_glimmer_reads_one_cache_through_two_attention_resources():
+    from mstar.model.muse.config import ATTN_FULL, ATTN_SLIDING, KV_CACHE
+    from mstar.model.muse.submodules import LLMSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+
+    llm = object.__new__(LLMSubmodule)
+    rows = [ARNodeInputs(input_seq_len=2, input_ids=torch.tensor([5, 6]))]
+    step = llm.declare_step("prefill_text", [0], rows)
+    assert set(step.steps) == {KV_CACHE, ATTN_SLIDING, ATTN_FULL, SAMPLER, ROPE}
+    # plain 1D positions: the resource advances by the span
+    assert step.steps[ROPE].advance is None
+
+
+def test_glimmer_encoder_declares_windows_and_frames():
+    from mstar.model.muse.config import VISION_FULL, VISION_WINDOW
+    from mstar.model.muse.submodules import VisionEncoderSubmodule
+    from mstar.model.submodule_base import NodeInputs
+
+    encoder = object.__new__(VisionEncoderSubmodule)
+    row = NodeInputs(input_seq_len=8, resource_step_info={VISION_WINDOW: (4, 4), VISION_FULL: (8,)})
+    step = encoder.declare_step("prefill_vision", ["r"], [row])
+    assert [(seg.label, seg.span) for seg in step.segments] == [
+        (VISION_WINDOW, 4), (VISION_WINDOW, 4), (VISION_FULL, 8),
+    ]

@@ -1,0 +1,17 @@
+model: "muse_glimmer"
+max_seq_len: 32768
+node_groups:
+  # Two KV heads, so TP past 2 replicates the KV cache and saves no memory.
+  - node_names: [vision_encoder]
+    ranks: [0]
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2
+
+warmup_requests:
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
+    model_kwargs: {max_output_tokens: 4}
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/edge_action_id_av_0_output.png]
+    model_kwargs: {max_output_tokens: 4}

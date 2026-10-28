@@ -56,6 +56,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
        decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
        batched across requests.
+   * - ``muse_glimmer`` *(Beta)*
+     - ``meta-models/Muse-Glimmer-30B``
+     - Meta's 30B dense agentic VLM (text + image in, text out): sliding-window and
+       NoPE global attention layers 3:1, plus a windowed ViT perception encoder.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -296,6 +300,28 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
 - Canary-Qwen's default KV cache takes about 15 GB (64 requests at 2048 tokens); on a
   smaller GPU, lower ``max_concurrent_requests`` and ``resources.kv_cache.max_num_pages``
   together.
+
+Muse Glimmer (``muse_glimmer``)
+-------------------------------
+
+Meta's Muse Glimmer 30B: text-and-image chat (video is refused), on ``POST
+/generate`` and ``/v1/chat/completions``. bf16 needs one 141 GB GPU, or two
+80 GB ones::
+
+    mstar serve muse_glimmer --gpus 0
+    mstar serve muse_glimmer --config configs/muse_glimmer_tp2.yaml --gpus 0,1
+
+Three in four layers attend a 2048-token sliding window; every layer writes the
+one paged KV cache, and the sliding layers attend it through a windowed
+attention resource. Sampling defaults to the checkpoint's (temperature 1,
+top_p 0.95, top_k 64). ``reasoning_effort`` (``low``, ``medium``, ``high``,
+``xhigh``; default ``high``) sets the template's reasoning strength, and
+``enable_thinking: false`` means ``low``, as the template has no off: the model
+still reasons, at the template's lowest strength. The reply
+is the model's channel stream as generated: reasoning addressed ``to=self``,
+then the answer ``to=user``. Tool calls are refused for now. Images resize with the
+reference's antialiased Lanczos, which torchvision has from 0.27 (torch 2.12); an older
+torchvision falls back to PIL's Lanczos with a warning, and its pixels differ slightly.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------

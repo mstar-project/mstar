@@ -72,6 +72,7 @@ from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
+    as_uint8_chw,
     check_attachments,
     check_plan,
     find_media_spans,
@@ -1169,20 +1170,9 @@ class Qwen3OmniModel(Model):
         raw_audio_inputs = tensors.get("audio_inputs", [])
         raw_video_inputs = tensors.get("video_inputs", [])
 
-        pil_images: list = []
-        for img in raw_image_inputs:
-            # data_worker.py provides images as (C, H, W) float32 in [0, 1]
-            # on the GPU.  HF processors expect PIL/numpy uint8 (H, W, C)
-            # in [0, 255] -- otherwise the default do_rescale=True double-
-            # rescales and the model sees a near-zero (essentially black)
-            # tensor regardless of the actual image content.
-            if img.dtype.is_floating_point:
-                img_u8 = (img * 255.0).clamp(0, 255).to(torch.uint8)
-            else:
-                img_u8 = img
-            if img_u8.dim() == 3 and img_u8.shape[0] in (1, 3):
-                img_u8 = img_u8.permute(1, 2, 0)  # CHW -> HWC
-            pil_images.append(img_u8.cpu().contiguous().numpy())
+        # HF processors expect uint8 (H, W, C): their default do_rescale=True
+        # would rescale the data worker's [0, 1] floats a second time.
+        pil_images = [as_uint8_chw(img).permute(1, 2, 0).numpy() for img in raw_image_inputs]
 
         np_audios: list = []
         for waveform in raw_audio_inputs:
