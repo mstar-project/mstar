@@ -153,7 +153,8 @@ Model families and some output formats need extra packages, exposed as pip *extr
        ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``.
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
-       ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
+       ``mooncake-transfer-engine``. ``vjepa2`` also adds ``transformers`` (the
+       checkpoint's video processor), ``vjepa2_ac`` adds ``flashinfer-python``.
    * - ``.[glm]``
      - GLM runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
