@@ -79,8 +79,11 @@ WORKDIR /mstar-workspace
 ARG MSTAR_REPO=https://github.com/mstar-project/mstar.git
 ARG MSTAR_REF=main
 RUN git clone --depth 1 --branch "${MSTAR_REF}" "${MSTAR_REPO}" ./mstar
-# The toolchain the checkout pins (rust-toolchain.toml).
-RUN cd ./mstar && rustup toolchain install && rustc --version && cargo --version
+# The toolchain the checkout pins (rust-toolchain.toml), also as the default so
+# cargo works outside the clone.
+RUN cd ./mstar && rustup toolchain install \
+    && rustup default "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
+    && cd / && rustc --version && cargo --version
 
 # uv selects the XPU index for PyTorch and TorchCodec in the single install below.
 # torchaudio's latest XPU wheel is 2.11; the import check below checks this pairing.
