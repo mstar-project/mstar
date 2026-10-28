@@ -498,6 +498,10 @@ class Cosmos3Config:
     # torch.compile's defaults, which time some kernel configs on first use;
     # "level" takes the ``mstar serve -O`` level's options (-O2: max-autotune).
     denoise_compile_mode: str = "deterministic"
+    # Compile the cross-request denoise step (two or more requests in one
+    # forward) too, with the same mode. Eager, its norms, rotary and residuals
+    # cost about 80 ms of GPU per extra row at 832x480x121 on a B300.
+    compile_denoise_batched: bool = True
     # torch.compile the reasoner's captured decode step before the CUDA-graph
     # capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the
     # norms', rotary's and residuals' pointwise pieces; fused, the step runs
@@ -567,8 +571,10 @@ class Cosmos3Config:
     def check_compile(self) -> None:
         """Reject compile settings that would be read as something else: a
         non-boolean switch (a yaml ``"false"`` is truthy) or an unknown mode."""
-        if not isinstance(self.compile_denoise, bool):
-            raise ValueError(f"Cosmos3 compile_denoise must be true or false, got {self.compile_denoise!r}.")
+        for name in ("compile_denoise", "compile_denoise_batched"):
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")
         if self.denoise_compile_mode not in DENOISE_COMPILE_MODES:
             raise ValueError(
                 f"Cosmos3 denoise_compile_mode must be one of {DENOISE_COMPILE_MODES}, "

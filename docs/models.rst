@@ -1002,6 +1002,13 @@ bf16, channels-last, one compiled decoder call per latent in Inductor's
 deterministic mode, on the node's own decoder-only copy of the VAE. False
 decodes with the compiled stock ``vae.decode`` on the shared instance.
 
+Two or more requests at the same denoise step run one cross-request forward
+(``max_gen_batch_size``, default 8), compiled with the same mode
+(``compile_denoise_batched``). At 832x480x121 one request's guidance pair is
+24k tokens, which already fills the GPU's GEMM and attention throughput, so a
+batch of N costs N single steps: batching keeps requests in step rather than
+adding throughput. The first batch of each size compiles on arrival.
+
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``

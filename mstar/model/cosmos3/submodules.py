@@ -343,6 +343,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             self.transformer.denoise_step_batched_cfg = torch.compile(
                 self.transformer.denoise_step_batched_cfg, **kwargs,
             )
+            if config.compile_denoise_batched:
+                # One graph per batch composition: dynamo unrolls the
+                # per-request loop, so the first batch of each size compiles.
+                self.transformer.denoise_step_batched = torch.compile(
+                    self.transformer.denoise_step_batched, **kwargs,
+                )
             logger.info("Cosmos3 denoise compute torch.compile enabled (%s)", config.denoise_compile_mode)
 
     def to(self, *args, **kwargs):

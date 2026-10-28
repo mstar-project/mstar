@@ -48,6 +48,15 @@ class _Transformer(torch.nn.Module):
         return a
 
 
+@pytest.mark.parametrize("batched", [True, False])
+def test_batched_denoise_is_compiled_only_when_asked(batched):
+    # a compiled forward replaces the bound method with an instance attribute
+    t = _Transformer()
+    Cosmos3DiTSubmodule(t, Cosmos3Config(compile_denoise_batched=batched))
+    assert "denoise_step" in vars(t) and "denoise_step_batched_cfg" in vars(t)
+    assert ("denoise_step_batched" in vars(t)) is batched
+
+
 def test_no_compile_leaves_every_forward_eager():
     t = _Transformer()
     Cosmos3DiTSubmodule(t, Cosmos3Config(compile_denoise=False))
@@ -64,6 +73,7 @@ def test_defaults_pass_validation():
     ("field", "value", "match"),
     [
         ("denoise_compile_mode", "max-autotune", "denoise_compile_mode must be one of"),
+        ("compile_denoise_batched", "false", "compile_denoise_batched must be true or false"),
         ("compile_denoise", 1, "compile_denoise must be true or false"),
     ],
 )
