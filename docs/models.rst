@@ -397,8 +397,11 @@ needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 ``enable_thinking`` (default true; the template opens a ``<think>`` block) are
 read by the model but are not OpenAI fields — pass them via ``extra_body``.
 Sampling defaults to the checkpoint's generation_config, under whatever the
-request sets; a request's ``min_p`` above 0 is refused (a 400) unless the
-checkpoint sets a ``min_p``, which turns the sampler's min-p filter on.
+request sets. Qwen3.5-27B's sets temperature 0.6, top_k 20 and top_p 0.95,
+and Qwen3.8-27B's temperature 1, top_k 20 and top_p 0.95; the 0.8B, 2B, 4B
+and 9B ship none, so the engine sampler's defaults apply. A request's
+``min_p`` above 0 is refused (a 400) unless the checkpoint sets a ``min_p``,
+which turns the sampler's min-p filter on; none of these does.
 
 Qwen3.8-27B (``qwen3_8_27b``) is the Qwen3.5 architecture and runs on the same
 code, served from ``configs/qwen3_8_27b_tp4.yaml`` (TP4)::

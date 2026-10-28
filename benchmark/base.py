@@ -315,7 +315,7 @@ class Qwen3_5_Dense(Model):
         return {RequestType.T2T, RequestType.I2T, RequestType.V2T}
 
     def get_model_kwargs(self, request_type: RequestType):
-        # Greedy everywhere (mstar's sampler defaults to 0.6), and the same prompt
+        # Greedy everywhere (mstar's default sampling isn't greedy), and the same prompt
         # render: mstar opens a <think> block by default, while the 0.8B/2B templates
         # only do when asked. mstar reads the flat enable_thinking and vLLM/SGLang
         # read chat_template_kwargs.
