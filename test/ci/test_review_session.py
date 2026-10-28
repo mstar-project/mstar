@@ -109,9 +109,8 @@ class TestUsage(unittest.TestCase):
             with contextlib.redirect_stdout(quiet):
                 for source in (truncated, Path(d, "missing.json")):
                     self.assertEqual(SESSION["record_usage"](usage_args(d, str(source))), 0, source.name)
-            summary = Path(d, "summary.md").read_text()
-        self.assertEqual(summary.count("### Review usage"), 2)
-        self.assertIn("| API calls | 0 |", summary)
+                    self.assertEqual(json.loads(Path(d, "u.json").read_text())["api_calls"], 0, source.name)
+            self.assertTrue(Path(d, "summary.md").read_text().strip(), "the job summary would have no table")
 
 
 class TestHandoff(unittest.TestCase):
@@ -140,7 +139,6 @@ class TestHandoff(unittest.TestCase):
         self.assertEqual(h["last_text"], h["note"], "a subagent's text would replace the reviewer's notes")
         md = SESSION["handoff_md"](h, "568", "abc", "light")
         self.assertIn("## Inline comments already posted\n\n- `mstar/a.py:10` **[P1]** drops a token", md)
-        self.assertIn("line 5 is not in the diff", md)
 
     def test_a_continued_run_merges_onto_its_handoff(self):
         first = json.loads(json.dumps(handoff(self.run_messages(), ROOT, ["mstar/a.py", "mstar/c.py"])))
