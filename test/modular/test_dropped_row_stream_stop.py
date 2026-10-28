@@ -8,7 +8,8 @@ info. A dropped row is no longer in the batch, so stopping it raised
 ``KeyError`` there and the main loop failed every request in the batch.
 
 Also: an ``END_PARTITION`` stop (a prefill that sampled a stop token) reports
-the partition done on the step and never reaches the runtime as a loop name.
+the partition done on the step and never reaches the runtime as a loop name;
+from a row inside a loop it fails the request.
 
 Drives the real ``Engine.prepare_inputs``, ``Worker._drop_failed_rids`` and
 ``Worker._postprocess_batch``; the graph runtime and tensor store are stubs
@@ -205,11 +206,17 @@ def test_a_row_that_overstayed_its_loop_stop_is_not_stopped_again():
     assert batch.stream_partition_done_rids == {1}
 
 
-@pytest.mark.parametrize("in_loop", [False, True], ids=["prefill", "in_loop"])
-def test_an_end_partition_stop_reports_the_partition_done(in_loop):
-    """END_PARTITION is never a loop name for the runtime; a row inside a loop
-    stops that loop, so its pass (and the report) can end."""
-    batch, runtime, w = _postprocess(_Sub(stops={1: {END_PARTITION}}), streams=False, in_loop=in_loop)
+def test_an_end_partition_stop_reports_the_partition_done():
+    """END_PARTITION from a row outside any loop is never a loop name for the runtime."""
+    batch, runtime, w = _postprocess(_Sub(stops={1: {END_PARTITION}}), streams=False, in_loop=False)
     assert batch.stream_partition_done_rids == {1}
-    assert runtime.loop_names == ({1: {LOOP}} if in_loop else {})
+    assert runtime.loop_names == {}
     assert not w.reported
+
+
+def test_an_end_partition_stop_inside_a_loop_fails_the_request():
+    batch, runtime, w = _postprocess(_Sub(stops={1: {END_PARTITION}}), streams=False)
+    assert set(w.reported) == {1}
+    assert "END_PARTITION" in w.reported[1] and repr(NODE) in w.reported[1]
+    assert batch.request_ids == [2] and batch.stream_partition_done_rids == set()
+    assert runtime.stopped == []

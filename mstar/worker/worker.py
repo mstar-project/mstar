@@ -712,10 +712,10 @@ class Worker:
         }
 
         # (graph_walk, node) -> innermost enclosing loop, for ending a
-        # stream-terminated loop or an END_PARTITION row's loop in
-        # _postprocess_batch. Structural, so it is derived from the model here
-        # rather than asked of the graph runtime per step -- which also keeps
-        # it identical under both runtimes.
+        # stream-terminated loop and refusing an END_PARTITION from inside a
+        # loop in _postprocess_batch. Structural, so it is derived from the
+        # model here rather than asked of the graph runtime per step -- which
+        # also keeps it identical under both runtimes.
         self._innermost_loop_by_node: dict[tuple[str, str], str] = {}
         if model:
             self._innermost_loop_by_node = self._build_innermost_loop_cache(
@@ -3609,13 +3609,29 @@ class Worker:
             if loop_name is not None:
                 stops.setdefault(rid, set()).add(loop_name)
 
+        # END_PARTITION (e.g. a prefill that sampled a stop token) ends the
+        # partition on this pass's report. Only a row outside any loop can end
+        # its pass here: inside one it would stop only the innermost loop, and
+        # a speculated next iteration would carry no report of it.
+        for rid in [rid for rid, s in stops.items() if END_PARTITION in s]:
+            walk = batch_N.batch.walk_of(rid)
+            if (walk, batch_N.node_name) in self._innermost_loop_by_node:
+                batch_N.node_batch.register_failure(rid, ValueError(
+                    f"check_stop of node {batch_N.node_name!r} returned END_PARTITION "
+                    f"inside a loop of walk {walk!r}; it may end a partition only "
+                    "from a row outside any loop"
+                ), walk)
+            else:
+                del stops[rid]
+                batch_N.node_batch.stream_partition_done_rids.add(rid)
+
         if batch_N.node_batch.failed_requests:
-            # A rid whose stop check raised has no trustworthy stop decision:
-            # routing it would either run its loop forever or end it early.
-            # Fail it here and take it out of the batch before the routing
-            # loops below touch it. Only ever the ones `check_stop_for_batch`
-            # just added: the caller already reported (and cleared) the rids
-            # that failed in prepare_inputs / postprocess.
+            # A rid whose stop check raised (or was refused above) has no
+            # trustworthy stop decision: routing it would either run its loop
+            # forever or end it early. Fail it here and take it out of the
+            # batch before the routing loops below touch it. Only ever the
+            # ones this stop stage just added: the caller already reported
+            # (and cleared) the rids that failed in prepare_inputs / postprocess.
             failed = dict(batch_N.node_batch.failed_requests)
             self._drop_failed_rids(batch_N, outputs, failed)
             self._fail_requests(failed)
@@ -3627,20 +3643,6 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 return
-
-        # END_PARTITION (e.g. a prefill that sampled a stop token) ends the
-        # partition on this pass's report. It is no loop name: a row inside a
-        # loop stops its innermost one instead, so that the pass can end.
-        for rid in [rid for rid, loops in stops.items() if END_PARTITION in loops]:
-            batch_N.node_batch.stream_partition_done_rids.add(rid)
-            loops = stops.pop(rid) - {END_PARTITION}
-            loop_name = self._innermost_loop_by_node.get(
-                (batch_N.batch.walk_of(rid), batch_N.node_name)
-            )
-            if loop_name is not None:
-                loops.add(loop_name)
-            if loops:
-                stops[rid] = loops
 
         # the stop check itself is the direct window above; this stage is its
         # tail (prefix chains, stream-terminated loops, failed rids, partition ends)

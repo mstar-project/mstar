@@ -1022,7 +1022,8 @@ methods are:
    terminates. A prefill samples the first token before its decode loop exists, so a stop
    there is returned as ``END_PARTITION`` (from ``mstar.model.submodule_base``) instead:
    the worker reports the partition done with that pass, and the conductor ends it rather
-   than start decode. ``TokenStepNode`` does this for its prompt walks; Qwen3.5 and
+   than start decode. Return it only from a row outside any loop; from inside one the
+   request fails. ``TokenStepNode`` does this for its prompt walks; Qwen3.5 and
    Command-A+ do it for their last prefill. It suits a partition with nothing left to run
    once generation stops: a model that runs another walk after its loop (Whisper's
    ``align``, BAGEL's image generation) or publishes final-only state at the loop's stop
