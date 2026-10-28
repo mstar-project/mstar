@@ -147,10 +147,10 @@ class PinnedStager:
 
 
 def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
-    """``tensor`` on ``device`` without the host waiting.
+    """``tensor`` on ``device`` without a host stall.
 
     A copy from pageable memory blocks the calling thread until it retires, so on
-    the GPU thread it waits out the step still running there. This writes the
+    the GPU thread it waits out the step still running there. This writes a CPU
     tensor into a pinned buffer with one memcpy on the calling thread (``copy_``
     would split it over the intra-op pool, where a descheduled thread holds up the
     GPU thread) and queues one non-blocking copy from it on the current stream.
@@ -163,7 +163,7 @@ def to_device_nonblocking(tensor: torch.Tensor, device: torch.device | str) -> t
     does so before this.
     """
     device = torch.device(device)
-    if tensor.device == device or not DeviceCapability.of(device).is_accelerator:
+    if tensor.device.type != "cpu" or not DeviceCapability.of(device).is_accelerator:
         return tensor.to(device)
     source = tensor if tensor.is_contiguous() else tensor.contiguous()
     pinned = torch.empty(source.shape, dtype=source.dtype, pin_memory=True)
