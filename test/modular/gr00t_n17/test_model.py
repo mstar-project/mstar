@@ -1291,6 +1291,19 @@ def test_no_instruction_is_served_as_the_empty_instruction():
     assert not same_as_empty("Pick up the cup")
 
 
+@pytest.mark.parametrize("rows", [2, 0], ids=["a history of 2", "no state row"])
+def test_a_state_that_is_not_the_configured_history_is_refused_at_the_request(rows):
+    """The reference asserts ``T == state_history_length``; past ``process_prompt`` a wrong
+    ``T`` fails in a batched forward and takes the batch with it."""
+    model = _model()
+    model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
+    frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
+    state = {"arm": np.zeros((1, rows, 2), np.float32), "grip": np.zeros((1, rows, 1), np.float32)}
+    with pytest.raises(ValueError, match=rf"1 state row\(s\).*got {rows}"):
+        model.process_prompt("", ["text", "image"], ["action"], tensors={"image_inputs": frames},
+                             embodiment_tag="bot", state=state)
+
+
 def test_postprocess_names_every_joint_group_the_way_the_reference_does():
     """One float32 entry per joint group, keyed as NVIDIA's policy keys it
     (``gr00t_policy.py:425-432``). Groups have different widths (9, 1, 7 on DROID), so a

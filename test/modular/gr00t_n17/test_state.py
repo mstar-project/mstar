@@ -15,13 +15,13 @@ _CATEGORIES = 4
 _INPUT, _HIDDEN, _OUTPUT = 5, 7, 3
 
 
-def _config() -> Gr00tN17Config:
+def _config(history: int = 1) -> Gr00tN17Config:
     """Input, hidden and output are three different sizes, so swapped layers fail on shape."""
     return Gr00tN17Config(
         text=None, vision=None, dit=None, bridge=None,
         deepstack_visual_indexes=(), backbone_embedding_dim=0,
         max_state_dim=_INPUT, hidden_size=_HIDDEN, input_embedding_dim=_OUTPUT,
-        max_num_embodiments=_CATEGORIES,
+        max_num_embodiments=_CATEGORIES, state_history_length=history,
     )
 
 
@@ -31,9 +31,9 @@ def _small_integers(shape: torch.Size, generator: torch.Generator) -> torch.Tens
     return torch.randint(-8, 9, shape, generator=generator).float()
 
 
-def _mlp(seed: int = 0) -> CategorySpecificMLP:
+def _mlp(seed: int = 0, history: int = 1) -> CategorySpecificMLP:
     """``CategorySpecificLinear`` allocates with ``torch.empty``, so every parameter is filled."""
-    mlp = build_state_encoder(_config())
+    mlp = build_state_encoder(_config(history))
     generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for parameter in mlp.parameters():
@@ -74,8 +74,8 @@ _IDS = {
 @pytest.mark.parametrize("ids", list(_IDS.values()), ids=list(_IDS))
 @torch.no_grad()
 def test_the_mlp_is_two_per_embodiment_linears_with_a_relu_between(ids, history):
-    """The checkpoint sends one state but the config allows a history: the ``T`` axis the
-    bias broadcasts over, not along."""
+    """The node always sends one token, but the MLP is NVIDIA's and takes any ``T``: the
+    axis the bias broadcasts over, not along."""
     mlp = _mlp()
     cat_ids = torch.tensor(ids)
     x = _state(len(ids), history)
@@ -120,11 +120,13 @@ def test_an_embodiment_reads_its_own_slice_and_no_other(cat):
     assert torch.equal(mlp(x, torch.tensor([cat])), ours)
 
 
-def test_the_state_encoder_is_sized_from_the_config():
+@pytest.mark.parametrize("history", [1, 3])
+def test_the_state_encoder_is_sized_from_the_config(history):
     """``hidden_size`` is the layer between and ``input_embedding_dim`` the output (1024 and
-    1536 in the checkpoint); a swap would only show on real weights, which CI lacks."""
-    encoder = build_state_encoder(_config())
-    assert encoder.layer1.W.shape == (_CATEGORIES, _INPUT, _HIDDEN)
+    1536 in the checkpoint); a swap would only show on real weights, which CI lacks. A
+    history widens the input, as the reference's ``max_state_dim * state_history_length``."""
+    encoder = build_state_encoder(_config(history))
+    assert encoder.layer1.W.shape == (_CATEGORIES, history * _INPUT, _HIDDEN)
     assert encoder.layer1.b.shape == (_CATEGORIES, _HIDDEN)
     assert encoder.layer2.W.shape == (_CATEGORIES, _HIDDEN, _OUTPUT)
     assert encoder.layer2.b.shape == (_CATEGORIES, _OUTPUT)
@@ -139,7 +141,7 @@ _FWD = CurrentForwardPassInfo(request_id="r0", graph_walk=_WALK, fwd_index=0, ra
 _ENGINE = ModelInputsFromEngine(request_ids=["r0"], per_request_info={})
 _EMBODIMENT = 3
 
-# how the walk may carry one request's state -> the history length it means
+# how the walk may carry one request's state -> the history length it holds
 _WALK_STATES = {
     "a bare state vector": ((_INPUT,), 1),
     "a [1, dim] row": ((1, _INPUT), 1),
@@ -148,8 +150,8 @@ _WALK_STATES = {
 }
 
 
-def _node() -> Gr00tN17StateEncoderSubmodule:
-    return Gr00tN17StateEncoderSubmodule(_mlp())
+def _node(history: int = 1) -> Gr00tN17StateEncoderSubmodule:
+    return Gr00tN17StateEncoderSubmodule(_mlp(history=history))
 
 
 def _walk_inputs(shape: tuple[int, ...], seed: int = 5) -> dict[str, list[torch.Tensor]]:
@@ -161,21 +163,20 @@ def _walk_inputs(shape: tuple[int, ...], seed: int = 5) -> dict[str, list[torch.
 
 
 @pytest.mark.parametrize("shape, history", list(_WALK_STATES.values()), ids=list(_WALK_STATES))
-def test_prepare_inputs_gives_the_mlp_the_two_axes_it_indexes(shape, history):
-    """The MLP wants ``[B, T, dim]`` and ``[B]``; only the shape changes, values keep their order."""
-    node = _node()
+def test_prepare_inputs_folds_the_history_into_one_token(shape, history):
+    """The reference's ``state.view(B, 1, -1)``: ``[1, 1, T * dim]`` and ``[B]``, values in
+    their order. One token whatever ``T``, which is what the denoise step concatenates."""
+    node = _node(history)
     walk = _walk_inputs(shape)
     prepared = node.prepare_inputs(_WALK, _FWD, walk)
     tensors = prepared.tensor_inputs
 
     assert set(tensors) == {"state", "embodiment_id"}
-    assert tensors["state"].shape == (1, history, _INPUT)
+    assert tensors["state"].shape == (1, 1, history * _INPUT)
     assert torch.equal(tensors["state"].reshape(-1), walk["state"][0].reshape(-1))
     assert tensors["embodiment_id"].shape == (1,)
     assert tensors["embodiment_id"].tolist() == [_EMBODIMENT]
-    # one token per state row: the engine sizes padding and capture buckets off this, so a
-    # history longer than the checkpoint's 1 must not under-count
-    assert prepared.input_seq_len == history
+    assert prepared.input_seq_len == 1
 
 
 @pytest.mark.parametrize("shape, history", list(_WALK_STATES.values()), ids=list(_WALK_STATES))
@@ -183,7 +184,7 @@ def test_prepare_inputs_gives_the_mlp_the_two_axes_it_indexes(shape, history):
 def test_driving_the_node_is_the_mlp_called_directly(shape, history):
     """prepare_inputs -> preprocess -> forward is the MLP on the same inputs, the same ops
     in the same order (so ``torch.equal``, not a bar), under the key the denoise loop reads."""
-    node = _node()
+    node = _node(history)
     walk = _walk_inputs(shape)
     prepared = node.prepare_inputs(_WALK, _FWD, walk)
     tensors = node.preprocess(_WALK, _ENGINE, [prepared])
@@ -192,9 +193,9 @@ def test_driving_the_node_is_the_mlp_called_directly(shape, history):
     assert set(tensors) == {"state", "embodiment_id"}
     assert list(out) == ["state_features"]
     assert len(out["state_features"]) == 1
-    assert out["state_features"][0].shape == (1, history, _OUTPUT)
+    assert out["state_features"][0].shape == (1, 1, _OUTPUT)
     expected = node.state_encoder(
-        walk["state"][0].reshape(1, history, _INPUT), torch.tensor([_EMBODIMENT]),
+        walk["state"][0].reshape(1, 1, history * _INPUT), torch.tensor([_EMBODIMENT]),
     )
     assert torch.equal(out["state_features"][0], expected)
 
