@@ -614,8 +614,10 @@ The spec types are:
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
        ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
-       state, a streaming encoder's caches): one slot per request and label, ``blocks``
-       naming a shape and dtype for each piece (dtype None: the engine's compute dtype,
+       state, a streaming encoder's caches): one slot per request and label, ``labels``
+       naming every label a request's steps address or fork into (``("main",)`` by default)
+       so that admission reserves a slot for each, ``blocks`` naming a shape and dtype for
+       each piece (dtype None: the engine's compute dtype,
        what its KV caches store), ``num_layers`` copies of each, ``max_slots`` slots
        (deployment-tunable) with slot 0 the sink that padding rows address. A recurrent
        kernel reads the step's ``addressing``. ``declare_step`` gives each row a
