@@ -1470,6 +1470,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "flux2_klein_9b": DiffusionImageAdapter(),
     "z_image_turbo": DiffusionImageAdapter(),
     "glm52": TextChatAdapter(),
+    "qwen3_coder_30b_a3b": TextChatAdapter(),
 }
 
 # One key per size; every size takes the same adapter.
@@ -1478,6 +1479,8 @@ ADAPTER_REGISTRY.update({
 })
 # Qwen3.8-27B is the Qwen3.5 architecture and chat template family.
 ADAPTER_REGISTRY["qwen3_8_27b"] = Qwen3_5Adapter()
+# Qwen3 dense, on the generic text LM like Qwen3-Coder
+ADAPTER_REGISTRY.update({f"qwen3_{size}b": TextChatAdapter() for size in ("0.6", "1.7", "4", "8")})
 
 
 def get_adapter(model_name: str) -> OpenAIAdapter | None:

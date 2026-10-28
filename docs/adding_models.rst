@@ -82,6 +82,22 @@ Plus a handful of things outside that package:
 
 Step 1 covers all of them.
 
+A text-only LLM may need no package of its own
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``mstar/model/text_lm/`` serves any Hugging Face causal-LM checkpoint whose decoder is
+already in ``mstar/model/components/``: one ``LLM`` node, a prefill and a decode loop,
+paged KV with attention, RoPE positions and the sampler declared from the checkpoint's
+``config.json``, its chat template, stop ids from the tokenizer and
+``generation_config.json``, prefix-cache keys over the prompt and the reply, and
+captured decode and packed prefill. The checkpoint's ``model_type`` picks an entry in
+``LM_FAMILIES`` (``mstar/model/text_lm/config.py``): how to read the config, how to build
+the decoder, and how checkpoint keys map to its parameters. Qwen3 dense and MoE
+(``qwen3``, ``qwen3_moe``) are there. A new model of a known family is a registry line
+(``TextLMModel``), a config YAML and a ``TextChatAdapter`` entry; a new family is a
+decoder component plus an ``LM_FAMILIES`` entry. Anything the shared walks cannot
+express (media inputs, extra nodes, drafter heads) still wants its own package.
+
 Step 1 — Register the model
 ---------------------------
 

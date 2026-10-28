@@ -1,4 +1,4 @@
-"""The shared dense Qwen3 LM against HF's ``Qwen3ForCausalLM`` on CPU.
+"""The shared Qwen3 LMs against HF's ``Qwen3ForCausalLM`` and ``Qwen3MoeForCausalLM`` on CPU.
 
 The engine's KV / attention / position resources are stood in for by dense
 fakes (causal SDPA over the accumulated K/V with GQA, and textbook RoPE), so
@@ -11,10 +11,10 @@ import torch.nn.functional as F
 
 pytest.importorskip("transformers")
 
-from transformers import Qwen3Config, Qwen3ForCausalLM  # noqa: E402
+from transformers import Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig, Qwen3MoeForCausalLM  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
-from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig  # noqa: E402
+from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig, Qwen3MoeLM  # noqa: E402
 
 ATTN, KV, POS = "attn", "kv", "rope"
 
@@ -111,6 +111,111 @@ def _pair(tie: bool = False):
         if hasattr(module, "bind_resources") and module is not ours:
             module.bind_resources({ATTN: fake, KV: fake, POS: rope})
     return hf, ours, rope
+
+
+def _bind(ours):
+    fake, rope = _FakeKVAttention(), _FakeRope()
+    for module in ours.modules():
+        if hasattr(module, "bind_resources") and module is not ours:
+            module.bind_resources({ATTN: fake, KV: fake, POS: rope})
+    return rope
+
+
+def _checkpoint_keys(state: dict) -> list:
+    """HF's state dict under the names its checkpoints store: transformers 5 holds an MoE
+    block's experts stacked (``experts.gate_up_proj`` ``(E, 2I, H)``, gate rows first), its
+    checkpoints and transformers 4 one tensor per expert and projection."""
+    out = []
+    for key, value in state.items():
+        key = key.removeprefix("model.")
+        if key.endswith(".experts.gate_up_proj"):
+            gate, up = value.chunk(2, dim=1)
+            for e in range(value.shape[0]):
+                out += [(key.replace("gate_up_proj", f"{e}.gate_proj.weight"), gate[e]),
+                        (key.replace("gate_up_proj", f"{e}.up_proj.weight"), up[e])]
+        elif key.endswith(".experts.down_proj"):
+            out += [(key.replace("down_proj", f"{e}.down_proj.weight"), value[e]) for e in range(value.shape[0])]
+        else:
+            out.append((key, value))
+    return out
+
+
+def _check_prefill_and_decode(hf, ours, rope, vocab_size, atol):
+    torch.manual_seed(3)
+    prompt = torch.randint(0, vocab_size, (7,))
+    with torch.no_grad():
+        expected = hf(prompt[None]).logits[0]
+        actual = ours.logits(ours(ours.embed(prompt), label="main"))
+    assert torch.allclose(actual, expected, atol=atol), (actual - expected).abs().max()
+    rope.next_pos = prompt.numel()
+    seq = prompt.clone()
+    for _ in range(2):
+        nxt = expected[-1].argmax().view(1)
+        seq = torch.cat([seq, nxt])
+        with torch.no_grad():
+            expected = hf(seq[None]).logits[0]
+            step = ours.logits(ours(ours.embed(nxt), label="main"))
+        assert torch.allclose(step[0], expected[-1], atol=atol), (step[0] - expected[-1]).abs().max()
+        rope.next_pos += 1
+
+
+# qwen3_moe: every layer sparse but layer 1, which mlp_only_layers keeps dense
+TINY_MOE = dict(
+    TINY, num_hidden_layers=3, num_experts=6, num_experts_per_tok=2, moe_intermediate_size=24,
+    norm_topk_prob=True, decoder_sparse_step=1, mlp_only_layers=[1],
+)
+
+
+def _moe_pair(**changes):
+    values = dict(TINY_MOE, **changes)
+    torch.manual_seed(0)
+    hf = Qwen3MoeForCausalLM(Qwen3MoeConfig(**values, attn_implementation="eager")).eval()
+    ours = Qwen3MoeLM(Qwen3LMConfig.from_hf(values), attn_key=ATTN, kv_key=KV, pos_key=POS).eval()
+    return hf, ours
+
+
+def test_moe_config_names_its_sparse_layers():
+    cfg = Qwen3LMConfig.from_hf(dict(TINY_MOE, decoder_sparse_step=2, mlp_only_layers=[]))
+    assert [cfg.is_moe_layer(i) for i in range(4)] == [False, True, False, True]
+    assert not Qwen3LMConfig.from_hf(TINY).is_moe_layer(0)
+    with pytest.raises(ValueError, match="Qwen3MoeLM"):
+        Qwen3DenseLM(Qwen3LMConfig.from_hf(TINY_MOE), attn_key=ATTN, kv_key=KV, pos_key=POS)
+
+
+def test_moe_weights_load_completely():
+    hf, ours = _moe_pair()
+    keys = _checkpoint_keys(hf.state_dict())
+    assert any(".experts.5.down_proj.weight" in k for k, _ in keys)
+    ours.load_weights(keys)
+    gate_up = ours.layers[0].mlp.experts.gate_up_proj
+    w = dict(keys)
+    assert torch.equal(gate_up[5, :24], w["layers.0.mlp.experts.5.gate_proj.weight"])
+    assert torch.equal(gate_up[5, 24:], w["layers.0.mlp.experts.5.up_proj.weight"])
+    assert type(ours.layers[1].mlp).__name__ == "ParallelGatedMLP"
+    with pytest.raises(RuntimeError, match="unloaded"):
+        Qwen3MoeLM(Qwen3LMConfig.from_hf(TINY_MOE), attn_key=ATTN, kv_key=KV, pos_key=POS).load_weights(
+            [(k, v) for k, v in keys if ".experts.3." not in k]
+        )
+
+
+def test_moe_prefill_and_decode_logits_match_hf():
+    hf, ours = _moe_pair()
+    ours.load_weights(_checkpoint_keys(hf.state_dict()))
+    _check_prefill_and_decode(hf, ours, _bind(ours), TINY_MOE["vocab_size"], atol=1e-4)
+
+
+def test_moe_tp2_rank_holds_its_expert_slice():
+    hf, _ = _moe_pair(vocab_size=96)
+    keys = _checkpoint_keys(hf.state_dict())
+    rank1 = CommGroup(my_global_rank=1, my_group_rank=1, group_members=[0, 1])
+    config = Qwen3LMConfig.from_hf(dict(TINY_MOE, vocab_size=96))
+    ours = Qwen3MoeLM(config, attn_key=ATTN, kv_key=KV, pos_key=POS, comm_group=rank1)
+    ours.load_weights(keys)
+    w = dict(keys)
+    gate_up, down = ours.layers[2].mlp.experts.gate_up_proj, ours.layers[2].mlp.experts.down_proj
+    assert torch.equal(gate_up[4, :12], w["layers.2.mlp.experts.4.gate_proj.weight"][12:])
+    assert torch.equal(gate_up[4, 12:], w["layers.2.mlp.experts.4.up_proj.weight"][12:])
+    assert torch.equal(down[4], w["layers.2.mlp.experts.4.down_proj.weight"][:, 12:])
 
 
 def test_config_from_hf_fills_head_dim():

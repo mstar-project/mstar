@@ -1,0 +1,15 @@
+model: "qwen3_coder_30b_a3b"
+# Qwen3-Coder-30B-A3B-Instruct, bf16 (~57 GiB of weights), on one 80 GB GPU.
+# The model takes 256k positions; this deployment serves 32k per request
+# (model_kwargs.max_seq_len is the bound the model enforces).
+max_seq_len: 32768
+model_kwargs:
+  max_seq_len: 32768
+resources:
+  kv_cache:
+    # 96 KiB a token (48 layers x 4 KV heads x 128 dims x K and V x bf16):
+    # 1024 pages of 128 tokens = 131k tokens, 12 GiB.
+    max_num_pages: 1024
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]

@@ -74,6 +74,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "flux2_klein_9b": "flux2_klein_9b.yaml",
     "z_image_turbo": "z_image_turbo.yaml",
     "glm52": "glm52_tp8.yaml",
+    "qwen3_coder_30b_a3b": "qwen3_coder_30b_a3b.yaml",
 }
 
 # qwen 3.5 series (dense)
@@ -86,6 +87,10 @@ DEFAULT_CONFIGS.update({
 DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
 # Qwen3.8-27B runs on the Qwen3.5 code; TP4 like the 3.5 27B
 DEFAULT_CONFIGS["qwen3_8_27b"] = "qwen3_8_27b_tp4.yaml"
+# Qwen3 dense, on the generic text LM
+DEFAULT_CONFIGS.update({f"qwen3_{size}b": f"qwen3_{size}b.yaml" for size in ("0.6", "1.7", "4", "8")})
+# text in, text out on the generic text LM: the chat snippets apply
+_TEXT_LM_MODELS = ("qwen3_coder_30b_a3b", "qwen3_0.6b", "qwen3_1.7b", "qwen3_4b", "qwen3_8b")
 
 
 def _repo_root() -> Path:
@@ -144,7 +149,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         "    from mstar import MStarClient",
         f"    client = MStarClient(\"{base}\"{sdk_key})",
     ]
-    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus"):
+    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", *_TEXT_LM_MODELS):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
@@ -205,11 +210,11 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
                  "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
-                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5"):
+                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", *_TEXT_LM_MODELS):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"{oai_key}\")"]
-        if model in ("bagel", "qwen3_omni"):
+        if model in ("bagel", "qwen3_omni", *_TEXT_LM_MODELS):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
         if model in ("orpheus", "qwen3_omni", "kokoro"):

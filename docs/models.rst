@@ -70,6 +70,14 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+   * - ``qwen3_coder_30b_a3b``
+     - ``Qwen/Qwen3-Coder-30B-A3B-Instruct``
+     - Qwen3-Coder (30B/3B active): Qwen3-MoE causal LM (GQA, 128 experts, top-8),
+       bf16 on one 80 GB GPU. Served by the generic text LM (``mstar/model/text_lm``),
+       which takes any ``qwen3`` / ``qwen3_moe`` checkpoint. Tool calls are refused for now.
+   * - ``qwen3_{0.6,1.7,4,8}b``
+     - ``Qwen/Qwen3-8B``
+     - Qwen3 dense causal LM, text chat, on the same generic text LM.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear

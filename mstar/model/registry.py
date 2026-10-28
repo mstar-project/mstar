@@ -35,6 +35,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "parakeet": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
+    "qwen3_coder_30b_a3b": ("mstar.model.text_lm.text_lm_model", "TextLMModel"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_asr": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
     "qwen3_asr_realtime": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
@@ -141,6 +142,9 @@ HF_MODELS: dict[str, dict] = {
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
+    # Qwen3-Coder-30B-A3B-Instruct: the Qwen3-MoE decoder (48 layers, 128 experts, top-8,
+    # GQA 32/4), bf16 (~61 GB), served by the generic text LM on one 80 GB GPU.
+    "qwen3_coder_30b_a3b": {"model_path_hf": "Qwen/Qwen3-Coder-30B-A3B-Instruct"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
     # Qwen3-ASR: AuT audio encoder + dense Qwen3 decoder. ``qwen3_asr`` is
     # the 1.7B transcription model, ``qwen3_asr_realtime`` the 0.6B variant
@@ -200,6 +204,13 @@ HF_MODELS.update({
 # Qwen3.8-27B is the Qwen3.5 architecture (same config.json geometry)
 MODEL_REGISTRY["qwen3_8_27b"] = ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel")
 HF_MODELS["qwen3_8_27b"] = {"model_path_hf": "Qwen/Qwen3.8-27B"}
+
+# Qwen3 dense text models, on the generic text LM like Qwen3-Coder
+qwen_3_dense_sizes = ("0.6", "1.7", "4", "8")
+MODEL_REGISTRY.update({
+    f"qwen3_{size}b": ("mstar.model.text_lm.text_lm_model", "TextLMModel") for size in qwen_3_dense_sizes
+})
+HF_MODELS.update({f"qwen3_{size}b": {"model_path_hf": f"Qwen/Qwen3-{size}B"} for size in qwen_3_dense_sizes})
 
 
 def model_init_kwargs(name: str) -> dict:

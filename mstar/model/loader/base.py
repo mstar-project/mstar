@@ -234,6 +234,22 @@ WHISPER_STACKED_PARAMS: list[StackedParamRule] = [
 ]
 
 
+def hf_expert_stacked_params(num_experts: int) -> list[StackedParamRule]:
+    """Routing for HF's per-expert MoE keys (``….experts.N.{gate,up,down}_proj.weight``)
+    into a block's stacked ``experts.gate_up_proj`` / ``experts.down_proj`` parameters, whose
+    weight loaders read the expert index from the shard id. Put these before
+    ``LLAMA_STACKED_PARAMS``: matching is first-win, and its ``.gate_proj`` rule matches an
+    expert key too."""
+    rules = []
+    for i in range(num_experts):
+        rules += [
+            StackedParamRule(".experts.gate_up_proj", f".experts.{i}.gate_proj.weight", f"gate:{i}"),
+            StackedParamRule(".experts.gate_up_proj", f".experts.{i}.up_proj.weight", f"up:{i}"),
+            StackedParamRule(".experts.down_proj", f".experts.{i}.down_proj.weight", f"down:{i}"),
+        ]
+    return rules
+
+
 def load_hf_weights(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
