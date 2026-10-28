@@ -42,3 +42,10 @@ node_groups:
     ranks: [0]
   - node_names: [dit]
     ranks: [0]
+
+# One image before the server binds, so no client pays the first request's one-time costs (the
+# conductor's tokenizer load, the text encoder's first call): 7.4 s against 0.43 s after, on an H100.
+warmup_requests:
+  - text: warmup
+    output_modalities: [image]
+    model_kwargs: {num_inference_steps: 1}
