@@ -126,6 +126,10 @@ class Resource(ABC):
         """Undo `enable_prefix_cache`. Called before any request."""
         return
 
+    def bind_dependencies(self, resources: Mapping[str, "Resource"]) -> None:
+        """The live resources this one's spec names in `depends_on`, once all are built."""
+        return
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs: Any,
     ) -> CachedPrefix | None:

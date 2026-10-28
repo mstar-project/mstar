@@ -607,6 +607,10 @@ class RecurrentStatePool(Resource):
 
     # Prefix reuse: a hit restores the state a snapshot holds at the agreed length
 
+    def bind_dependencies(self, resources: dict[str, Resource]) -> None:
+        if self.config.kv_cache in resources:
+            self.bind_kv(resources[self.config.kv_cache])
+
     def bind_kv(self, kv: "KVManager") -> None:
         """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names."""
         self._kv = kv
