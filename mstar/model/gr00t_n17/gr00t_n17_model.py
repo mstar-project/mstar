@@ -583,6 +583,14 @@ class Gr00tN17Model(Model):
             language=[prompt or ""],
             state=kwargs["state"],
         )
+        # The reference asserts this; here it is the client's input, so a 400. Past this
+        # point a wrong history only fails in a batched forward, taking its batch with it.
+        rows = out["state"].reshape(-1, self.config.max_state_dim).shape[0]
+        if rows != self.config.state_history_length:
+            raise ValueError(
+                f"gr00t_n17 takes {self.config.state_history_length} state row(s) per joint "
+                f"group, `(1, {self.config.state_history_length}, D)`; got {rows}"
+            )
         return {name: [tensor] for name, tensor in out.items()}
 
     def request_kwargs(self) -> frozenset[str]:

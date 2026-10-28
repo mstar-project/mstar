@@ -281,12 +281,12 @@ class Gr00tN17StateEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        state = inputs["state"][0].reshape(1, -1, inputs["state"][0].shape[-1])
+        # `[T, dim]` -> `[1, 1, T * dim]`: the reference's `state.view(B, 1, -1)`, one
+        # token whatever the history; `process_prompt` has checked T
+        state = inputs["state"][0].reshape(1, 1, -1)
         embodiment_id = inputs["embodiment_id"][0].reshape(-1)
         return NodeInputs(
-            # one token per state row, which is one while the checkpoint's
-            # `state_history_length` is 1
-            input_seq_len=state.shape[1],
+            input_seq_len=1,
             tensor_inputs={"state": state, "embodiment_id": embodiment_id},
         )
 

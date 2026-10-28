@@ -163,7 +163,8 @@ def build_state_encoder(config) -> CategorySpecificMLP:
     """
     return CategorySpecificMLP(
         num_categories=config.max_num_embodiments,
-        input_dim=config.max_state_dim,
+        # the reference folds a state history into the one token's width
+        input_dim=config.max_state_dim * config.state_history_length,
         hidden_dim=config.hidden_size,
         output_dim=config.input_embedding_dim,
     )
