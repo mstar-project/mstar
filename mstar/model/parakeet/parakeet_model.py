@@ -54,6 +54,11 @@ CHECKPOINT_FILES = ["*.json", "*.safetensors"]
 class ParakeetModel(Model):
     """FastConformer encoder + greedy RNN-T / TDT transducer."""
 
+    # one clip in, a transcript out; the transcription route's text part is
+    # unused (Nemotron's prompt is the language kwarg)
+    SUPPORTED_INPUT_MODALITIES = frozenset({"audio", "text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     # full attention, whose position scores grow with the clip's square: the route
     # windows at 600 s, plus slack for containers that decode longer than their header said
     MAX_AUDIO_SECONDS = 610.0

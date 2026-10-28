@@ -46,6 +46,10 @@ logger = logging.getLogger(__name__)
 class Glm52Model(Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
+    # chat, text out
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
 
