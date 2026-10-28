@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -35,27 +36,45 @@ def smt(cpu: int) -> tuple[int, int]:
     return cpu // 128, cpu
 
 
+BOTH = NODE0 | NODE1  # a taskset over both nodes, narrower than the host
+HOST_CPUS = 256
+
+
 def _cpus(setting, local_cpus, allowed, order=smt):
-    return [choose_step_core(setting, slot, local_cpus, allowed, order).cpu
+    return [choose_step_core(setting, slot, local_cpus, allowed, order, host_cpus=HOST_CPUS).cpu
             for slot in range(len(local_cpus))]
 
 
 # ── choice ──────────────────────────────────────────────────────────────────
 
 def test_auto_takes_a_cpu_local_to_the_gpu_one_per_worker():
-    assert _cpus("auto", [NODE0], HOST) == [0]
+    assert _cpus("auto", [NODE0], BOTH) == [0]
     # two ranks on one GPU, or on two GPUs of one NUMA node
-    assert _cpus("auto", [NODE0, NODE0], HOST) == [0, 1]
-    assert _cpus("auto", [NODE0, NODE1, NODE0], HOST) == [0, 32, 1]
-    core = choose_step_core("auto", 0, [NODE0], HOST, smt)
+    assert _cpus("auto", [NODE0, NODE0], BOTH) == [0, 1]
+    assert _cpus("auto", [NODE0, NODE1, NODE0], BOTH) == [0, 32, 1]
+    core = choose_step_core("auto", 0, [NODE0], BOTH, smt, host_cpus=HOST_CPUS)
     assert core.source == "local to its device: 0-31,128-159"
+
+
+def test_auto_leaves_a_mask_that_is_the_whole_host_alone():
+    # one server per GPU with no taskset: the table covers one deployment, so
+    # every server would take the same CPUs
+    assert _cpus("auto", [NODE0, NODE1], HOST) == [None, None]
+    core = choose_step_core("auto", 0, [NODE0], HOST, smt, host_cpus=HOST_CPUS)
+    assert "narrower than the host" in core.source
+    assert api_thread_cpu("auto", HOST, smt, host_cpus=HOST_CPUS) is None
+    # a CPU number pins anywhere
+    assert _cpus(0, [NODE0, NODE1], HOST) == [0, 1]
+    assert api_thread_cpu(0, HOST, smt, host_cpus=HOST_CPUS) == 127
+    # the host's online CPUs by default
+    assert choose_step_core("auto", 0, [None], set(range(os.cpu_count()))).cpu is None
 
 
 def test_smt_siblings_come_after_every_first_thread():
     two_cores = parse_cpu_list("0-1,128-129")
-    assert _cpus("auto", [two_cores] * 3, HOST) == [0, 1, 128]
+    assert _cpus("auto", [two_cores] * 3, BOTH) == [0, 1, 128]
     # without topology the order is numeric
-    assert _cpus("auto", [parse_cpu_list("0,128")] * 2, HOST, order=None) == [0, 128]
+    assert _cpus("auto", [parse_cpu_list("0,128")] * 2, BOTH, order=None) == [0, 128]
 
 
 def test_a_taskset_off_the_gpu_node_falls_back_to_the_process_mask():
@@ -96,14 +115,14 @@ def test_off_and_explicit_values():
 
 
 def test_the_api_server_takes_the_last_cpu_and_the_workers_leave_it():
-    assert api_thread_cpu("auto", HOST, smt) == 127  # the last first hardware thread
-    assert api_thread_cpu("auto", parse_cpu_list("32-39"), smt) == 39
-    assert api_thread_cpu(34, parse_cpu_list("32-39"), smt) == 39
-    assert api_thread_cpu("off", HOST, smt) is None
-    assert api_thread_cpu("auto", {4, 5}, smt) is None  # too small to spare one
+    assert api_thread_cpu("auto", BOTH, smt, HOST_CPUS) == 63  # the last first hardware thread
+    assert api_thread_cpu("auto", parse_cpu_list("32-39"), smt, HOST_CPUS) == 39
+    assert api_thread_cpu(34, parse_cpu_list("32-39"), smt, HOST_CPUS) == 39
+    assert api_thread_cpu("off", BOTH, smt, HOST_CPUS) is None
+    assert api_thread_cpu("auto", {4, 5}, smt, HOST_CPUS) is None  # too small to spare one
     # the workers build their table without it
     allowed = parse_cpu_list("37-39")
-    api = api_thread_cpu("auto", allowed, smt)
+    api = api_thread_cpu("auto", allowed, smt, HOST_CPUS)
     assert _cpus("auto", [None], allowed - {api}) == [37]
     assert _cpus("auto", [None, None], allowed - {api}) == [None, None]
 
@@ -161,6 +180,7 @@ def test_the_worker_picks_its_row_and_logs_it(monkeypatch, caplog):
     monkeypatch.setattr(worker_mod, "current_platform", SimpleNamespace(local_cpus=local.get))
     monkeypatch.setattr(worker_mod, "PINNABLE", True)
     monkeypatch.setattr(worker_mod, "smt_order", smt)
+    monkeypatch.setattr(os, "cpu_count", lambda: 512)  # the 256-CPU mask is then a taskset
     monkeypatch.setattr(worker_mod.os, "sched_getaffinity", lambda pid: set(HOST), raising=False)
     monkeypatch.delenv("MSTAR_STEP_THREAD_CORE", raising=False)
     w = _bare_worker()
@@ -200,6 +220,32 @@ def test_without_sched_setaffinity_the_worker_pins_nothing(monkeypatch, caplog):
         w._choose_step_core(["worker_1"], None)
     assert w._step_core.cpu is None and "no sched_setaffinity" in caplog.text
     w._pin_step_thread()  # a no-op, never reaches os.sched_setaffinity
+
+
+# ── threads a pinned thread starts ─────────────────────────────────────────
+
+@pytest.mark.skipif(not step_threads.PINNABLE, reason="needs os.sched_setaffinity (Linux)")
+def test_a_pool_a_pinned_thread_starts_goes_back_to_the_process_mask():
+    """A new thread copies its creator's mask, so a pool started after the pin
+    sits on the step CPU unless its initializer is ``unpin_thread``."""
+    allowed = frozenset(os.sched_getaffinity(0))
+    if len(allowed) < 2:
+        pytest.skip("needs two allowed CPUs")
+    cpu = max(allowed)
+    seen = {}
+
+    def pinned():
+        step_threads.pin_step_thread(cpu, allowed)
+        with ThreadPoolExecutor(1) as pool:
+            seen["inherited"] = pool.submit(os.sched_getaffinity, 0).result()
+        with ThreadPoolExecutor(1, initializer=step_threads.unpin_thread) as pool:
+            seen["unpinned"] = pool.submit(os.sched_getaffinity, 0).result()
+
+    # pin_step_thread pins the thread that calls it; keep that off pytest's own thread
+    t = threading.Thread(target=pinned)
+    t.start()
+    t.join(30)
+    assert seen == {"inherited": {cpu}, "unpinned": allowed}
 
 
 # ── API server ─────────────────────────────────────────────────────────────
@@ -247,6 +293,7 @@ def test_the_api_server_logs_its_choice(monkeypatch, caplog):
     from mstar.api_server import entrypoint
 
     monkeypatch.setattr(entrypoint, "PINNABLE", True)
+    monkeypatch.setattr(os, "cpu_count", lambda: 256)
     monkeypatch.setattr(entrypoint.os, "sched_getaffinity", lambda pid: set(range(32, 40)), raising=False)
     monkeypatch.delenv("MSTAR_STEP_THREAD_CORE", raising=False)
     server = make_test_api_server(_model_config={"knobs": {"step_thread_core": "auto"}})

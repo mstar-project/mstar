@@ -59,6 +59,7 @@ from mstar.communication.tensors import (
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.utils.containers import ParallelList
+from mstar.utils.step_threads import unpin_thread
 
 logger = logging.getLogger(__name__)
 
@@ -944,6 +945,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
 
     @staticmethod
     def _watch_wakes(q: queue.Queue) -> None:
+        unpin_thread()  # started by the worker's pinned main thread
         # Events are queued in stream order, so sequential waits are exact.
         # None is the close() sentinel.
         while True:

@@ -494,18 +494,22 @@ Worker scheduling
      - The CPU a worker's main, GPU and plan threads share. A step passes
        between them several times, and a thread woken on another core waits
        for it to leave a deep idle state; on one shared CPU it starts at once.
-       ``auto`` gives each worker of the deployment its own CPU: the first
-       one local to its GPU (sysfs ``local_cpulist``) that the process may run
-       on and no earlier worker took, else the first free CPU of the process
-       mask, so a ``taskset`` or cgroup pin is respected. When the mask has
-       fewer than one CPU per worker plus one, nothing is pinned. ``off``
-       leaves the threads on the process mask; a number is the first worker's
-       CPU, and the next workers take the allowed CPUs above it. The API
+       ``auto`` pins only when the process mask is narrower than the host,
+       i.e. the server runs under ``taskset`` or a cpuset (separate servers
+       on one bare host would otherwise all pick the same CPUs); it then
+       gives each worker of the deployment its own CPU: the first one local
+       to its GPU (sysfs ``local_cpulist``) that the process may run on and
+       no earlier worker took, else the first free CPU of the mask. When the
+       mask has fewer than one CPU per worker plus one, nothing is pinned.
+       ``off`` leaves the threads on the process mask; a number pins on any
+       mask: it is the first worker's CPU, and the next workers take the
+       allowed CPUs above it. The API
        server's message thread and the Rust frontend's bridge, which every
        step's tokens pass through next, share the last CPU of the mask, and
        the workers leave that one out (unless ``off``, or the mask has fewer
        than three CPUs). Everything else (intra-op pools, transport threads,
-       the API server's data worker) keeps the process mask. Each worker and
+       the API server's data worker) keeps the process mask, the pools a
+       pinned thread starts later included. Each worker and
        the API server log their CPU and how it was chosen. Read by
        ``knobs.step_thread_core``; no effect where ``os.sched_setaffinity``
        is missing (macOS, Windows).

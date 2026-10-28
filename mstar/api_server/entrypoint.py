@@ -66,7 +66,7 @@ from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
-from mstar.utils.step_threads import PINNABLE, StepCore, api_thread_cpu, pin_step_thread
+from mstar.utils.step_threads import PINNABLE, StepCore, api_thread_cpu, narrowed_mask, pin_step_thread
 
 logger = logging.getLogger(__name__)
 
@@ -509,8 +509,10 @@ class APIServer:
         cpu = api_thread_cpu(knobs.step_thread_core(), self._process_cpus)
         self._result_core = StepCore(cpu, f"last CPU of the process mask {mask}")
         if cpu is None:
-            logger.info("API server: result threads not pinned (step_thread_core %s, mask %s)",
-                        knobs.step_thread_core(), mask)
+            why = ("the mask is the whole host" if knobs.step_thread_core() == "auto"
+                   and not narrowed_mask(self._process_cpus) else f"mask {mask}")
+            logger.info("API server: result threads not pinned (step_thread_core %s, %s)",
+                        knobs.step_thread_core(), why)
         else:
             logger.info("API server: message thread and frontend bridge on CPU %d (%s)",
                         cpu, self._result_core.source)
