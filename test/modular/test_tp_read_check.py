@@ -505,7 +505,10 @@ def test_a_voided_speculations_unread_row_stays_out_of_the_next_read_checked_hea
 FOLLOWERS = ["w0", "w1"]
 
 
-def _leader(tmp_path, streamed=(), nodes=(NODE,)):
+def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
+    """Rank 0 leading ``nodes``; ``consumed[(source, dest)]`` names the signals
+    an edge carries from ``source`` to ``dest``."""
+    consumed = consumed or {}
     tm, _ = _shm_manager(tmp_path)
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
@@ -521,6 +524,7 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,)):
     w._graph_runtime = SimpleNamespace(
         get_sharding_config=lambda r: sharding, get_rid_string=lambda h: h,
         get_rid_handle=lambda r: r, ingest_inputs_batch=lambda block, can_buffer: None,
+        get_consumed_edges=lambda source, dest, walk: {(sig, dest) for sig in consumed.get((source, dest), ())},
     )
     w.engine_manager = SimpleNamespace(get_engine=lambda n: SimpleNamespace(
         take_resident_delta=lambda n: OffloadDelta.new(),
@@ -606,14 +610,18 @@ def test_the_nodes_own_output_coming_back_is_no_read(tmp_path):
 
 def test_a_colocated_encoders_output_is_a_followers_read(tmp_path):
     """An encoder beside rank 0 hands its output to rank 0's node without a
-    read; each follower reads it."""
-    w = _leader(tmp_path)
+    read; each follower reads it. Another led node it is not routed to has
+    nothing to spend, so once the step taking it ran nothing is left pending."""
+    w = _leader(tmp_path, nodes=(NODE, "Talker"), consumed={("vision_encoder", NODE): {"vision_embeds"}})
     w._note_local_lockstep_inputs(
         StoredOutputs(flat_uuids=[21], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
-        ["vision_embeds"],
+        ["vision_embeds"], "vision_encoder", lambda rid: WALK,
     )
 
-    assert _broadcast(w, _step({"r0": [], "r1": ["vision_embeds"]})) == (True, ("r0", "r1"))
+    ran = _step({"r0": [], "r1": ["vision_embeds"]})
+    assert _broadcast(w, ran) == (True, ("r0", "r1"))
+    w._consume_lockstep_reads(ran)
+    assert not w._lockstep_unread
 
 
 def test_one_lockstep_node_taking_an_input_leaves_another_nodes_copy_checked(tmp_path):
@@ -621,10 +629,12 @@ def test_one_lockstep_node_taking_an_input_leaves_another_nodes_copy_checked(tmp
     (BAGEL's ``combine_cfg`` and its LLMs): the first node's step spends only its
     own read, so the second's goes out checked too."""
     other = "LLM_cfg"
-    w = _leader(tmp_path, nodes=(NODE, other))
+    w = _leader(tmp_path, nodes=(NODE, other), consumed={
+        ("combine_cfg", NODE): {"latents"}, ("combine_cfg", other): {"latents"},
+    })
     w._note_local_lockstep_inputs(
         StoredOutputs(flat_uuids=[22], flat_rids=["r1"], signal_idxs=[0], num_tensors=[1]),
-        ["latents"],
+        ["latents"], "combine_cfg", lambda rid: WALK,
     )
     ran = _step({"r1": ["latents"]})
     assert _broadcast(w, ran) == (True, ("r1",))

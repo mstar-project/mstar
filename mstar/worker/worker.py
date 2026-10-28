@@ -1497,6 +1497,8 @@ class Worker:
         any rank (``_drop_rows_whose_read_failed``)."""
         self._lockstep_led = frozenset(self.parallel_nodes & self.parallel_leader_nodes)
         self._lockstep_unread = {}
+        # (producer, walk) -> {signal: the led nodes it is routed to}; structural
+        self._lockstep_consumers: dict[tuple[str, str], dict[str, tuple[str, ...]]] = {}
 
     def _note_lockstep_reads(self, ready: dict[int, list[GraphEdge]]) -> None:
         """Rank 0: the inputs of a lockstep node it leads that landed here by a
@@ -1515,16 +1517,30 @@ class Worker:
                     continue
                 self._lockstep_unread.setdefault(rid, {}).setdefault(edge.next_node, set()).add(edge.name)
 
-    def _note_local_lockstep_inputs(self, stored: StoredOutputs, signals: list[str]) -> None:
+    def _note_local_lockstep_inputs(
+        self, stored: StoredOutputs, signals: list[str], producer: str, walk_of: Callable[[int], str],
+    ) -> None:
         """Rank 0: outputs of a node outside the instance (an encoder beside
-        rank 0), which its lockstep nodes take without a read and each follower
-        reads. Noted for each lockstep node: one that never takes the signal
-        never looks for it, and one whose step takes it spends it."""
-        unread, led = self._lockstep_unread, self._lockstep_led
+        rank 0), which the lockstep nodes they are routed to take without a
+        read and each follower reads. Noted under each of those nodes, since a
+        step of one spends only its own."""
+        unread, consumers = self._lockstep_unread, self._lockstep_consumers
         for rid, sig in zip(stored.flat_rids, stored.signal_idxs, strict=True):
-            by_node = unread.setdefault(rid, {})
-            for node in led:
-                by_node.setdefault(node, set()).add(signals[sig])
+            walk = walk_of(rid)
+            routes = consumers.get((producer, walk))
+            if routes is None:
+                routes = consumers[(producer, walk)] = self._led_consumers(producer, walk)
+            signal = signals[sig]
+            for node in routes.get(signal, ()):
+                unread.setdefault(rid, {}).setdefault(node, set()).add(signal)
+
+    def _led_consumers(self, producer: str, walk: str) -> dict[str, tuple[str, ...]]:
+        """Which led nodes each of ``producer``'s signals goes to in ``walk``."""
+        routes: dict[str, list[str]] = {}
+        for node in sorted(self._lockstep_led):
+            for signal, _ in self._graph_runtime.get_consumed_edges(producer, node, walk):
+                routes.setdefault(signal, []).append(node)
+        return {signal: tuple(nodes) for signal, nodes in routes.items()}
 
     def _step_reads(self, node_batch: ExecutingBatch) -> bool:
         """Rank 0: whether a row of this step takes an input a follower reads,
@@ -3836,7 +3852,7 @@ class Worker:
         else:
             stored = store(rids)
         if self._lockstep_led and batch_N.node_name not in self.parallel_nodes:
-            self._note_local_lockstep_inputs(stored, signals)
+            self._note_local_lockstep_inputs(stored, signals, batch_N.node_name, batch.walk_of)
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
         signal_idxs = stored.signal_idxs
