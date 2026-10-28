@@ -199,8 +199,9 @@ class PlanCacheKey(NamedTuple):
     """Fingerprint of a wrapper ``plan`` call's inputs. When it is unchanged
     between steps the re-plan is skippable."""
     q_seq_lens: tuple
-    page_indices: tuple
-    last_page_lens: tuple
+    # the int32 arrays' bytes
+    page_indices: bytes
+    last_page_lens: bytes
 
 
 class EagerSlotKey(NamedTuple):
